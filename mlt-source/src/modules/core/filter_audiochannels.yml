@@ -1,0 +1,22 @@
+schema_version: 7.2
+type: filter
+identifier: audiochannels
+title: Convert Audio Channel Count
+version: 2
+copyright: Meltytech, LLC
+license: LGPLv2.1
+language: en
+tags:
+  - Audio
+description: Converts the number of audio channels.
+notes: >
+  This is not intended to be created directly. Rather, the loader producer
+  loads it if it is available to automatically all inputs to have the number
+  of audio channels requested by the consumer.
+audio_formats:
+  - f32le
+  - float
+  - s16
+  - s32
+  - s32le
+  - u8

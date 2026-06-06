@@ -1,0 +1,20 @@
+f=webm
+
+acodec=vorbis
+ab=128k
+
+vcodec=libvpx
+g=120
+rc_lookahead=16
+quality=good
+speed=0
+vprofile=0
+slices=4
+vb=2M
+arnr_max_frames=7
+arnr_strength=5
+arnr_type=3
+
+meta.preset.name=WebM
+meta.preset.extension=webm
+meta.preset.note=VP8 video with Ogg Vorbis audio in Matroska container: "Don't be evil"

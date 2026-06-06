@@ -1,0 +1,32 @@
+/**
+ * \namespace mlt
+ * \brief Python bindings for MLT
+ *
+ * Mirrors the \c Mlt:: C++ namespace. Import as:
+ * \code{.py}
+ * import mlt7 as mlt
+ * mlt.Factory().init(None)
+ * profile = mlt.Profile()
+ * producer = mlt.Producer(profile, 'clip.mp4')
+ * \endcode
+ *
+ * \see Mlt::Factory, Mlt::Producer, Mlt::Consumer
+ */
+
+/**
+ * \defgroup python_bindings Python Bindings
+ * \brief Python bindings for MLT
+ *
+ * The Python bindings wrap the \ref mlt++ "MLT C++ API" via SWIG.
+ * The generated module is named \c mlt7 and mirrors the \c Mlt:: C++ namespace.
+ *
+ * \par Usage
+ * \code{.py}
+ * import mlt7 as mlt
+ * mlt.Factory().init(None)
+ * profile = mlt.Profile()
+ * producer = mlt.Producer(profile, 'clip.mp4')
+ * \endcode
+ *
+ * \see Mlt::Factory, Mlt::Producer, Mlt::Consumer
+ */

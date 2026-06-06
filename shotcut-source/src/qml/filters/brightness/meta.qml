@@ -1,0 +1,29 @@
+import QtQuick
+import org.shotcut.qml
+
+Metadata {
+    type: Metadata.Filter
+    name: qsTr("Brightness")
+    mlt_service: "brightness"
+    keywords: qsTr('lightness value exposure', 'search keywords for the Brightness video filter') + ' brightness #rgba #yuv #10bit #color'
+    qml: "ui.qml"
+    icon: 'icon.webp'
+    isFavorite: true
+    gpuAlt: "movit.opacity"
+    help: 'https://forum.shotcut.org/t/brightness/12832/1'
+
+    keyframes {
+        allowAnimateIn: true
+        allowAnimateOut: true
+        simpleProperties: ['level']
+        parameters: [
+            Parameter {
+                name: qsTr('Level')
+                property: 'level'
+                isCurve: true
+                minimum: 0
+                maximum: 2
+            }
+        ]
+    }
+}

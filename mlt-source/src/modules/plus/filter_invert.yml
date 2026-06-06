@@ -1,0 +1,21 @@
+schema_version: 7.2
+type: filter
+identifier: invert
+title: Invert
+version: 2
+copyright: Meltytech, LLC
+creator: Charles Yates
+license: LGPLv2.1
+language: en
+tags:
+  - Video
+image_formats:
+  - yuv422
+parameters:
+  - identifier: alpha
+    type: integer
+    title: Alpha Channel
+    description: A value to overwrite the alpha channel.
+    minimum: 1
+    maximum: 255
+    mutable: yes

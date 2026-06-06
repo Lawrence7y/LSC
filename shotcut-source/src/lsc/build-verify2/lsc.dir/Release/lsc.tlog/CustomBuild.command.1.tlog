@@ -1,0 +1,10 @@
+^D:\PROJECT\直播切片\SHOTCUT-SOURCE\SRC\LSC\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/Project/直播切片/shotcut-source/src/lsc -BD:/Project/直播切片/shotcut-source/src/lsc/build-verify2 --check-stamp-file D:/Project/直播切片/shotcut-source/src/lsc/build-verify2/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

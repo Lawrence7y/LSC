@@ -1,0 +1,15 @@
+import QtQuick
+import org.shotcut.qml
+
+Metadata {
+    type: Metadata.Filter
+    name: qsTr("Crop: Source")
+    keywords: qsTr('trim remove edges', 'search keywords for the Crop: Source video filter') + ' crop: source #rgba #yuv #10bit'
+    mlt_service: "crop"
+    qml: "ui.qml"
+    icon: 'icon.webp'
+    gpuAlt: "movit.crop"
+    allowMultiple: false
+    isClipOnly: true
+    help: 'https://forum.shotcut.org/t/crop-source-video-filter/12840/1'
+}

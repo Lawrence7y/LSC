@@ -1,0 +1,69 @@
+# This files contains a list of plugin parameters that are sensitive to the
+# image resolution. This only works for parameters with type F0R_PARAM_DOUBLE.
+# plugin:
+#   parameter#: scale factor in addition to mlt_frame_resolution_scale
+delogo:
+  x: 1.0
+  y: 1.0
+  w: 1.0
+  h: 1.0
+
+drawbox:
+  x: 1.0
+  y: 1.0
+  w: 1.0
+  h: 1.0
+  t: 1.0
+
+drawgrid:
+  x: 1.0
+  y: 1.0
+  w: 1.0
+  h: 1.0
+  t: 1.0
+
+fillborders:
+  left: 1.0
+  right: 1.0
+  top: 1.0
+  bottom: 1.0
+
+floodfill:
+  x: 1.0
+  y: 1.0
+
+gblur:
+  sigma: 1.0
+  sigmaV: 1.0
+
+pad:
+  x: 1.0
+  y: 1.0
+  width: 1.0
+  height: 1.0
+
+perspective:
+  x0: 1.0
+  y0: 1.0
+  x1: 1.0
+  y1: 1.0
+  x2: 1.0
+  y2: 1.0
+  x3: 1.0
+  y3: 1.0
+
+swaprect:
+  w: 1.0
+  h: 1.0
+  x1: 1.0
+  y1: 1.0
+  x2: 1.0
+  y2: 1.0
+
+vignette:
+  x0: 1.0
+  y0: 1.0
+
+zoompan:
+  x: 1.0
+  y: 1.0

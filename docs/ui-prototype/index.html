@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>直播切片大师 - UI原型</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            background: #2b2b2b;
+            color: #d4d4d4;
+            min-height: 100vh;
+            font-size: 13px;
+        }
+
+        .app-container {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        /* 顶部菜单栏 */
+        .menu-bar {
+            height: 30px;
+            background: #3c3c3c;
+            border-bottom: 1px solid #1a1a1a;
+            display: flex;
+            align-items: center;
+            padding: 0 10px;
+            font-size: 12px;
+        }
+
+        .menu-item {
+            padding: 4px 12px;
+            cursor: pointer;
+            color: #cccccc;
+        }
+
+        .menu-item:hover {
+            background: #505050;
+        }
+
+        /* 主内容区 */
+        .main-area {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* 左侧媒体库 */
+        .media-panel {
+            width: 250px;
+            background: #333333;
+            border-right: 1px solid #1a1a1a;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-header {
+            height: 35px;
+            background: #3c3c3c;
+            border-bottom: 1px solid #1a1a1a;
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .panel-tabs {
+            display: flex;
+            background: #2b2b2b;
+            border-bottom: 1px solid #1a1a1a;
+        }
+
+        .panel-tab {
+            flex: 1;
+            padding: 8px;
+            text-align: center;
+            cursor: pointer;
+            font-size: 11px;
+            border-bottom: 2px solid transparent;
+        }
+
+        .panel-tab.active {
+            background: #3c3c3c;
+            border-bottom-color: #0078d4;
+            color: #ffffff;
+        }
+
+        .media-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+        }
+
+        .media-item {
+            background: #3c3c3c;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            overflow: hidden;
+            cursor: pointer;
+        }
+
+        .media-item:hover {
+            background: #454545;
+        }
+
+        .media-thumbnail {
+            height: 80px;
+            background: #2b2b2b;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+        }
+
+        .media-info {
+            padding: 8px;
+        }
+
+        .media-name {
+            font-size: 12px;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .media-meta {
+            font-size: 10px;
+            color: #888;
+        }
+
+        /* 中间预览区 */
+        .preview-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .preview-container {
+            flex: 1;
+            background: #1a1a1a;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
+        .preview-video {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #555;
+        }
+
+        .preview-overlay {
+            position: absolute;
+            bottom: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            background: rgba(0,0,0,0.8);
+            padding: 8px 20px;
+            border-radius: 20px;
+        }
+
+        .preview-btn {
+            background: none;
+            border: none;
+            color: #d4d4d4;
+            cursor: pointer;
+            font-size: 18px;
+            padding: 5px;
+        }
+
+        .preview-btn:hover {
+            color: #ffffff;
+        }
+
+        .preview-btn.play {
+            font-size: 24px;
+        }
+
+        .timecode {
+            font-family: 'Consolas', monospace;
+            font-size: 14px;
+            color: #0078d4;
+        }
+
+        /* 录制控制区 */
+        .recording-controls {
+            height: 120px;
+            background: #333333;
+            border-top: 1px solid #1a1a1a;
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            gap: 20px;
+        }
+
+        .record-btn {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            border: 3px solid #e74c3c;
+            background: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .record-btn-inner {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #e74c3c;
+        }
+
+        .record-btn:hover .record-btn-inner {
+            background: #c0392b;
+        }
+
+        .control-btns {
+            display: flex;
+            gap: 10px;
+        }
+
+        .ctrl-btn {
+            padding: 8px 16px;
+            background: #4a4a4a;
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: #d4d4d4;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .ctrl-btn:hover {
+            background: #555;
+        }
+
+        .ctrl-btn.active {
+            background: #0078d4;
+            border-color: #0078d4;
+            color: white;
+        }
+
+        .recording-stats {
+            margin-left: auto;
+            display: flex;
+            gap: 30px;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 4px;
+        }
+
+        .stat-value {
+            font-family: 'Consolas', monospace;
+            font-size: 18px;
+            color: #4ec9b0;
+        }
+
+        /* 右侧属性面板 */
+        .properties-panel {
+            width: 280px;
+            background: #333333;
+            border-left: 1px solid #1a1a1a;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .prop-section {
+            border-bottom: 1px solid #1a1a1a;
+        }
+
+        .prop-header {
+            padding: 10px 12px;
+            background: #3c3c3c;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+        }
+
+        .prop-header:hover {
+            background: #454545;
+        }
+
+        .prop-content {
+            padding: 12px;
+        }
+
+        .prop-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .prop-label {
+            width: 80px;
+            font-size: 11px;
+            color: #aaa;
+        }
+
+        .prop-input {
+            flex: 1;
+            background: #2b2b2b;
+            border: 1px solid #555;
+            padding: 6px 10px;
+            border-radius: 3px;
+            color: #d4d4d4;
+            font-size: 12px;
+        }
+
+        .prop-input:focus {
+            border-color: #0078d4;
+            outline: none;
+        }
+
+        select.prop-input {
+            cursor: pointer;
+        }
+
+        .subtitle-list {
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .subtitle-item {
+            padding: 8px;
+            background: #2b2b2b;
+            border-radius: 3px;
+            margin-bottom: 6px;
+            cursor: pointer;
+        }
+
+        .subtitle-item:hover {
+            background: #3c3c3c;
+        }
+
+        .subtitle-time {
+            font-family: 'Consolas', monospace;
+            font-size: 11px;
+            color: #0078d4;
+            margin-bottom: 4px;
+        }
+
+        .subtitle-text {
+            font-size: 12px;
+        }
+
+        /* 直播源选择面板 */
+        .source-panel {
+            padding: 12px;
+        }
+
+        .source-option {
+            display: flex;
+            align-items: center;
+            padding: 10px;
+            background: #2b2b2b;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            border: 2px solid transparent;
+        }
+
+        .source-option:hover {
+            background: #3c3c3c;
+        }
+
+        .source-option.selected {
+            border-color: #0078d4;
+            background: #1a3a4a;
+        }
+
+        .source-icon {
+            width: 40px;
+            height: 40px;
+            background: #4a4a4a;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 12px;
+            font-size: 20px;
+        }
+
+        .source-info {
+            flex: 1;
+        }
+
+        .source-name {
+            font-size: 13px;
+            margin-bottom: 2px;
+        }
+
+        .source-desc {
+            font-size: 11px;
+            color: #888;
+        }
+
+        .source-input {
+            margin-top: 10px;
+        }
+
+        .source-input label {
+            display: block;
+            font-size: 11px;
+            color: #aaa;
+            margin-bottom: 6px;
+        }
+
+        .source-input input {
+            width: 100%;
+            background: #2b2b2b;
+            border: 1px solid #555;
+            padding: 8px 10px;
+            border-radius: 3px;
+            color: #d4d4d4;
+            font-size: 12px;
+        }
+
+        /* 底部时间线 */
+        .timeline-panel {
+            height: 180px;
+            background: #333333;
+            border-top: 1px solid #1a1a1a;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .timeline-toolbar {
+            height: 32px;
+            background: #3c3c3c;
+            border-bottom: 1px solid #1a1a1a;
+            display: flex;
+            align-items: center;
+            padding: 0 10px;
+            gap: 5px;
+        }
+
+        .tl-btn {
+            padding: 4px 10px;
+            background: #4a4a4a;
+            border: 1px solid #555;
+            border-radius: 3px;
+            color: #d4d4d4;
+            cursor: pointer;
+            font-size: 11px;
+        }
+
+        .tl-btn:hover {
+            background: #555;
+        }
+
+        .tl-separator {
+            width: 1px;
+            height: 20px;
+            background: #555;
+            margin: 0 5px;
+        }
+
+        .timeline-content {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        .track-headers {
+            width: 100px;
+            background: #2b2b2b;
+            border-right: 1px solid #1a1a1a;
+        }
+
+        .track-header {
+            height: 40px;
+            display: flex;
+            align-items: center;
+            padding: 0 10px;
+            border-bottom: 1px solid #1a1a1a;
+            font-size: 11px;
+        }
+
+        .track-header.video {
+            color: #4ec9b0;
+        }
+
+        .track-header.audio {
+            color: #569cd6;
+        }
+
+        .track-header.subtitle {
+            color: #ce9178;
+        }
+
+        .tracks-area {
+            flex: 1;
+            position: relative;
+            overflow-x: auto;
+        }
+
+        .track {
+            height: 40px;
+            border-bottom: 1px solid #1a1a1a;
+            position: relative;
+        }
+
+        .clip-block {
+            position: absolute;
+            height: 32px;
+            top: 4px;
+            border-radius: 3px;
+            display: flex;
+            align-items: center;
+            padding: 0 8px;
+            font-size: 10px;
+            cursor: move;
+        }
+
+        .clip-block.video {
+            background: #264f36;
+            border: 1px solid #4ec9b0;
+        }
+
+        .clip-block.audio {
+            background: #1e3a5f;
+            border: 1px solid #569cd6;
+        }
+
+        .clip-block.subtitle {
+            background: #3d2e1f;
+            border: 1px solid #ce9178;
+        }
+
+        .playhead {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            background: #e74c3c;
+            z-index: 10;
+        }
+
+        .playhead::before {
+            content: '';
+            position: absolute;
+            top: -2px;
+            left: -5px;
+            width: 12px;
+            height: 8px;
+            background: #e74c3c;
+            clip-path: polygon(50% 100%, 0 0, 100% 0);
+        }
+
+        /* 状态栏 */
+        .status-bar {
+            height: 24px;
+            background: #007acc;
+            display: flex;
+            align-items: center;
+            padding: 0 15px;
+            font-size: 11px;
+            color: white;
+            gap: 20px;
+        }
+
+        .status-left {
+            display: flex;
+            gap: 15px;
+        }
+
+        .status-right {
+            margin-left: auto;
+            display: flex;
+            gap: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- 顶部菜单栏 -->
+        <div class="menu-bar">
+            <span class="menu-item">文件</span>
+            <span class="menu-item">编辑</span>
+            <span class="menu-item">视图</span>
+            <span class="menu-item">录制</span>
+            <span class="menu-item">剪辑</span>
+            <span class="menu-item">效果</span>
+            <span class="menu-item">导出</span>
+            <span class="menu-item">帮助</span>
+        </div>
+
+        <!-- 主内容区 -->
+        <div class="main-area">
+            <!-- 左侧媒体库 -->
+            <div class="media-panel">
+                <div class="panel-tabs">
+                    <div class="panel-tab active">媒体库</div>
+                    <div class="panel-tab">效果</div>
+                    <div class="panel-tab">字幕</div>
+                </div>
+                <div class="media-content">
+                    <div class="media-item">
+                        <div class="media-thumbnail">🎬</div>
+                        <div class="media-info">
+                            <div class="media-name">直播录制_20260604.mp4</div>
+                            <div class="media-meta">02:15:30 | 1920x1080</div>
+                        </div>
+                    </div>
+                    <div class="media-item">
+                        <div class="media-thumbnail">🎬</div>
+                        <div class="media-info">
+                            <div class="media-name">精彩片段_合集.mp4</div>
+                            <div class="media-meta">00:05:20 | 1920x1080</div>
+                        </div>
+                    </div>
+                    <div class="media-item">
+                        <div class="media-thumbnail">🎵</div>
+                        <div class="media-info">
+                            <div class="media-name">背景音乐.mp3</div>
+                            <div class="media-meta">00:03:45 | 320kbps</div>
+                        </div>
+                    </div>
+                    <div class="media-item">
+                        <div class="media-thumbnail">🖼️</div>
+                        <div class="media-info">
+                            <div class="media-name">水印.png</div>
+                            <div class="media-meta">200x80 | PNG</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 中间预览区 -->
+            <div class="preview-panel">
+                <div class="preview-container">
+                    <div class="preview-video">
+                        <span style="font-size: 48px;">🎬</span>
+                    </div>
+                    <div class="preview-overlay">
+                        <button class="preview-btn">⏮</button>
+                        <button class="preview-btn">⏪</button>
+                        <button class="preview-btn play">▶</button>
+                        <button class="preview-btn">⏩</button>
+                        <button class="preview-btn">⏭</button>
+                        <span class="timecode">00:02:15:12 / 02:15:30:00</span>
+                    </div>
+                </div>
+
+                <!-- 录制控制区 -->
+                <div class="recording-controls">
+                    <button class="record-btn">
+                        <div class="record-btn-inner"></div>
+                    </button>
+                    <div class="control-btns">
+                        <button class="ctrl-btn">暂停</button>
+                        <button class="ctrl-btn">停止</button>
+                        <button class="ctrl-btn active">直播流抓取</button>
+                        <button class="ctrl-btn">屏幕录制</button>
+                    </div>
+                    <div class="recording-stats">
+                        <div class="stat-item">
+                            <div class="stat-label">时长</div>
+                            <div class="stat-value">00:00:00</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">大小</div>
+                            <div class="stat-value">0 MB</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">帧率</div>
+                            <div class="stat-value">30 fps</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-label">码率</div>
+                            <div class="stat-value">8 Mbps</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右侧属性面板 -->
+            <div class="properties-panel">
+                <div class="panel-tabs">
+                    <div class="panel-tab active">直播源</div>
+                    <div class="panel-tab">属性</div>
+                    <div class="panel-tab">字幕</div>
+                </div>
+
+                <!-- 直播源选择 -->
+                <div class="source-panel">
+                    <div class="source-option selected">
+                        <div class="source-icon">📺</div>
+                        <div class="source-info">
+                            <div class="source-name">直播流抓取</div>
+                            <div class="source-desc">输入直播URL直接录制</div>
+                        </div>
+                    </div>
+                    <div class="source-option">
+                        <div class="source-icon">🖥️</div>
+                        <div class="source-info">
+                            <div class="source-name">屏幕录制</div>
+                            <div class="source-desc">录制屏幕指定区域</div>
+                        </div>
+                    </div>
+                    <div class="source-input">
+                        <label>直播流地址</label>
+                        <input type="text" placeholder="输入直播URL...">
+                    </div>
+                    <div style="margin-top: 10px;">
+                        <label style="font-size: 11px; color: #aaa; display: block; margin-bottom: 6px;">平台</label>
+                        <select class="prop-input">
+                            <option>自动检测</option>
+                            <option>抖音</option>
+                            <option>快手</option>
+                            <option>B站</option>
+                            <option>YouTube</option>
+                            <option>Twitch</option>
+                        </select>
+                    </div>
+                    <div style="margin-top: 10px;">
+                        <label style="font-size: 11px; color: #aaa; display: block; margin-bottom: 6px;">画质</label>
+                        <select class="prop-input">
+                            <option>自动</option>
+                            <option>蓝光</option>
+                            <option>超清</option>
+                            <option>高清</option>
+                            <option>标清</option>
+                        </select>
+                    </div>
+                    <button class="ctrl-btn" style="width: 100%; margin-top: 15px; padding: 10px;">开始录制</button>
+                </div>
+
+                <!-- 字幕编辑 -->
+                <div class="prop-section" style="display: none;">
+                    <div class="prop-header">
+                        <span>字幕列表</span>
+                        <span>+ 添加</span>
+                    </div>
+                    <div class="subtitle-list">
+                        <div class="subtitle-item">
+                            <div class="subtitle-time">00:02:15 → 00:02:18</div>
+                            <div class="subtitle-text">大家好，欢迎来到直播间</div>
+                        </div>
+                        <div class="subtitle-item">
+                            <div class="subtitle-time">00:02:20 → 00:02:23</div>
+                            <div class="subtitle-text">今天我们来打排位赛</div>
+                        </div>
+                        <div class="subtitle-item">
+                            <div class="subtitle-time">00:05:30 → 00:05:33</div>
+                            <div class="subtitle-text">这波操作太秀了！</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部时间线 -->
+        <div class="timeline-panel">
+            <div class="timeline-toolbar">
+                <button class="tl-btn">选择</button>
+                <button class="tl-btn">剃刀</button>
+                <button class="tl-btn">滑动</button>
+                <div class="tl-separator"></div>
+                <button class="tl-btn">撤销</button>
+                <button class="tl-btn">重做</button>
+                <div class="tl-separator"></div>
+                <button class="tl-btn">分割</button>
+                <button class="tl-btn">删除</button>
+                <div class="tl-separator"></div>
+                <button class="tl-btn">放大</button>
+                <button class="tl-btn">缩小</button>
+                <button class="tl-btn">适配</button>
+                <div class="tl-separator"></div>
+                <button class="tl-btn">吸附</button>
+                <button class="tl-btn">标记</button>
+            </div>
+            <div class="timeline-content">
+                <div class="track-headers">
+                    <div class="track-header video">🎬 视频</div>
+                    <div class="track-header audio">🎵 音频</div>
+                    <div class="track-header subtitle">📝 字幕</div>
+                </div>
+                <div class="tracks-area">
+                    <div class="track">
+                        <div class="clip-block video" style="left: 5%; width: 12%;">精彩操作 #1</div>
+                        <div class="clip-block video" style="left: 20%; width: 8%;">搞笑时刻</div>
+                        <div class="clip-block video" style="left: 35%; width: 15%;">观众互动</div>
+                        <div class="clip-block video" style="left: 55%; width: 10%;">高能片段</div>
+                    </div>
+                    <div class="track">
+                        <div class="clip-block audio" style="left: 0%; width: 70%;">原声</div>
+                        <div class="clip-block audio" style="left: 75%; width: 20%; background: #2d2d5f; border-color: #7c7cff;">BGM</div>
+                    </div>
+                    <div class="track">
+                        <div class="clip-block subtitle" style="left: 5%; width: 12%;">字幕1</div>
+                        <div class="clip-block subtitle" style="left: 20%; width: 8%;">字幕2</div>
+                        <div class="clip-block subtitle" style="left: 35%; width: 15%;">字幕3</div>
+                    </div>
+                    <div class="playhead" style="left: 25%;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 状态栏 -->
+        <div class="status-bar">
+            <div class="status-left">
+                <span>就绪</span>
+                <span>项目: 直播切片_20260604</span>
+            </div>
+            <div class="status-right">
+                <span>CPU: 15%</span>
+                <span>内存: 2.1 GB</span>
+                <span>GPU: NVIDIA RTX 4060</span>
+                <span>1920x1080 | 30fps</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 直播源选择
+        document.querySelectorAll('.source-option').forEach(option => {
+            option.addEventListener('click', () => {
+                document.querySelectorAll('.source-option').forEach(o => o.classList.remove('selected'));
+                option.classList.add('selected');
+            });
+        });
+
+        // 标签页切换
+        document.querySelectorAll('.panel-tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                const parent = tab.parentElement;
+                parent.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+            });
+        });
+
+        // 片段选择
+        document.querySelectorAll('.clip-block').forEach(clip => {
+            clip.addEventListener('click', (e) => {
+                e.stopPropagation();
+                document.querySelectorAll('.clip-block').forEach(c => c.style.outline = 'none');
+                clip.style.outline = '2px solid #0078d4';
+            });
+        });
+
+        // 字幕选择
+        document.querySelectorAll('.subtitle-item').forEach(item => {
+            item.addEventListener('click', () => {
+                document.querySelectorAll('.subtitle-item').forEach(i => i.style.background = '');
+                item.style.background = '#3c3c3c';
+            });
+        });
+
+        // 媒体项选择
+        document.querySelectorAll('.media-item').forEach(item => {
+            item.addEventListener('click', () => {
+                document.querySelectorAll('.media-item').forEach(i => i.style.border = '');
+                item.style.border = '2px solid #0078d4';
+            });
+        });
+    </script>
+</body>
+</html>

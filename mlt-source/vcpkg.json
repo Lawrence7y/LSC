@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "mlt",
+  "dependencies": [
+    "dirent",
+    "dlfcn-win32",
+    "ffmpeg",
+    "fftw3",
+    "gdk-pixbuf",
+    "glib",
+    "libebur128",
+    "libexif",
+    "libiconv",
+    "libsamplerate",
+    "libvorbis",
+    "libxml2",
+    {
+      "name": "opencv",
+      "features": [
+        "contrib"
+      ]
+    },
+    "pkgconf",
+    "pthreads",
+    "qtbase",
+    "qtsvg",
+    {
+      "name": "rnnoise",
+      "platform": "!windows"
+    },
+    "rtaudio",
+    "rubberband",
+    "sdl2",
+    "frei0r"
+  ]
+}

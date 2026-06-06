@@ -1,0 +1,52 @@
+schema_version: 7.2
+type: filter
+identifier: mono
+title: Mixdown
+version: 3
+copyright: Meltytech, LLC
+creator: Dan Dennedy
+license: LGPLv2.1
+language: en
+tags:
+  - Audio
+description: >
+  Mix all channels of audio into a mono signal and output it as N channels.
+audio_formats:
+  - f32le
+  - float
+  - s16
+  - s32
+  - s32le
+  - u8
+parameters:
+  - identifier: channels
+    argument: yes
+    title: channels
+    type: integer
+    description: >
+      Set the number of output channels.
+      The default is automatic based on consumer request.
+    required: no
+    minimum: 1
+
+  - identifier: input_chmask
+    title: Input Channel Mask
+    type: integer
+    description: >
+      Which input channels to mix together as a bitmask. The default is for
+      the front left and right and center channel, if any.
+    required: no
+    minimum: 0
+    default: 7
+    mutable: yes
+
+  - identifier: output_chmask
+    title: Output Channel Mask
+    type: integer
+    description: >
+      Which output channels to overwrite with the mixed audio as a bitmask.
+      The default is to overwrite all of the channels.
+    required: no
+    minimum: 0
+    default: 0xFFFFFFFF
+    mutable: yes

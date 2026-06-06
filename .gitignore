@@ -1,0 +1,63 @@
+# Build directories
+build/
+*/build/
+*/*/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Qt build artifacts
+*.moc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+*.qm
+*.autosave
+
+# Compiled objects
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Windows specific
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# macOS specific
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Large binary files and dependencies (keep only source)
+deps/
+mlt-source/build/
+shotcut-source/build/
+dlfcn-win32/build/
+
+# User-specific files
+*.user
+*.suo
+
+# Test output
+tests/output/
+test_*.mp4
+
+# Generated files
+*_autogen/
+autogen/

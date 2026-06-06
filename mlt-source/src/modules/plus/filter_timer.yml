@@ -1,0 +1,264 @@
+schema_version: 7.2
+type: filter
+identifier: timer
+title: Timer
+version: 5
+copyright: Meltytech, LLC
+license: LGPLv2.1
+language: en
+tags:
+  - Video
+description: Overlay a timer onto the video. The timer can count up or down.
+image_formats:
+  - rgba
+parameters:
+  - identifier: format
+    title: Format
+    type: string
+    description: >
+      The time format of the overlaid timer text.
+    values:
+      - HH:MM:SS
+      - HH:MM:SS.S
+      - MM:SS
+      - MM:SS.SS
+      - MM:SS.SSS
+      - SS
+      - SS.S
+      - SS.SS
+      - SS.SSS
+    default: SS.SS
+    readonly: no
+    mutable: yes
+    widget: combo
+
+  - identifier: start
+    title: Start
+    type: string
+    description: >
+      The time that the timer will start counting up or down. The text will be
+      frozen at 00:00:00.000 from the start of the filter until the start time
+      has elapsed.
+      Must be in the format HH:MM:SS.SSS
+    default: 00:00:00.000
+    readonly: no
+    mutable: yes
+    widget: text
+
+  - identifier: duration
+    title: Duration
+    type: string
+    description: >
+      The maximum elapsed duration of the timer after the start time has
+      elapsed. The text will be frozen at the duration time after the duration
+      has elapsed.
+      Must be in the format HH:MM:SS.SSS
+    default: 00:00:10.000
+    readonly: no
+    mutable: yes
+    widget: text
+
+  - identifier: offset
+    title: Offset
+    type: string
+    description: >
+      An offset to be added to the timer value. When the direction is "down",
+      the timer will count down to "offset" instead of 00:00:00.000. When the
+      direction is up, the timer will count up starting from "offset".
+      Must be in the format HH:MM:SS.SSS
+    default: 00:00:00.000
+    readonly: no
+    mutable: yes
+    widget: text
+
+  - identifier: speed
+    title: Speed
+    type: float
+    description: >
+      Clock speed multiplier. For example, speed 10.0 makes the timer tick 10
+      seconds for each second of playback.
+
+      Scales Duration but does not affect Start or Offset. For example: start
+      5s, duration 30s, offset 7s and speed 10.0 will have the timer start at
+      playback time 00:00:05.000 with value 00:00:07, count 10 seconds per
+      second of playback and stop at playback time 00:00:08.000 with value
+      00:00:37.
+    default: 1.0
+    readonly: no
+    mutable: yes
+
+  - identifier: direction
+    title: Direction
+    type: string
+    description: >
+      Whether the counter should count up from 00:00:00.000 or down from the
+      duration time.
+    values:
+      - up
+      - down
+    default: up
+    readonly: no
+    mutable: yes
+    widget: combo
+
+  - identifier: geometry
+    title: Geometry
+    type: rect
+    description: A set of X/Y coordinates by which to adjust the text.
+    default: 0%/0%:100%x100%:100
+
+  - identifier: family
+    title: Font family
+    type: string
+    description: >
+      The typeface of the font.
+    default: Sans
+    readonly: no
+    mutable: yes
+    widget: combo
+
+  - identifier: size
+    title: Font size
+    type: integer
+    description: >
+      The size in pixels of the font. 
+    default: 48
+    readonly: no
+    mutable: yes
+    widget: spinner
+
+  - identifier: style
+    title: Font style
+    type: string
+    description: >
+      The style of the font.
+    values:
+      - normal
+      - italic
+    default: normal
+    readonly: no
+    mutable: yes
+    widget: combo
+
+  - identifier: weight
+    title: Font weight
+    type: integer
+    description: The weight of the font.
+    minimum: 100
+    maximum: 1000
+    default: 400
+    readonly: no
+    mutable: yes
+    widget: spinner
+
+  - identifier: fgcolour
+    title: Foreground color
+    type: string
+    description: >
+      A color value is a hexadecimal representation of RGB plus alpha channel 
+      as 0xrrggbbaa. Colors can also be the words: white, black, red, green,
+      or blue. You can also use a HTML-style color values #rrggbb or #aarrggbb.
+    default: 0x000000ff
+    readonly: no
+    mutable: yes
+    widget: color
+
+  - identifier: bgcolour
+    title: Background color
+    type: string
+    description: >
+      A color value is a hexadecimal representation of RGB plus alpha channel 
+      as 0xrrggbbaa. Colors can also be the words: white, black, red, green,
+      or blue. You can also use a HTML-style color values #rrggbb or #aarrggbb.
+    default: 0x00000020
+    readonly: no
+    mutable: yes
+    widget: color
+
+  - identifier: olcolour
+    title: Outline color
+    type: string
+    description: >
+      A color value is a hexadecimal representation of RGB plus alpha channel 
+      as 0xrrggbbaa. Colors can also be the words: white, black, red, green,
+      or blue. You can also use a HTML-style color values #rrggbb or #aarrggbb.
+    readonly: no
+    mutable: yes
+    widget: color
+
+  - identifier: outline
+    title: Outline Width
+    type: string
+    description: >
+      The width of the outline in pixels.
+    readonly: no
+    default: 0
+    minimum: 0
+    maximum: 3
+    mutable: yes
+    widget: spinner
+
+  - identifier: underline
+    title: Underline
+    type: boolean
+    description: Apply underline decoration to the text.
+    default: 0
+    readonly: no
+    mutable: yes
+    widget: checkbox
+    
+  - identifier: strikethrough
+    title: Strikethrough
+    type: boolean
+    description: Apply strikethrough decoration to the text.
+    default: 0
+    readonly: no
+    mutable: yes
+    widget: checkbox
+
+  - identifier: pad
+    title: Padding
+    type: integer
+    description: >
+      The number of pixels to pad the background rectangle beyond edges of text.
+    readonly: no
+    default: 0
+    mutable: yes
+    widget: spinner
+
+  - identifier: halign
+    title: Horizontal alignment
+    description: >
+      Set the horizontal alignment within the geometry rectangle.
+    type: string
+    default: left
+    values:
+      - left
+      - centre
+      - right
+    mutable: yes
+    widget: combo
+
+  - identifier: valign
+    title: Vertical alignment
+    description: >
+      Set the vertical alignment within the geometry rectangle.
+    type: string
+    default: top
+    values:
+      - top
+      - middle
+      - bottom
+    mutable: yes
+    widget: combo
+
+  - identifier: opacity
+    title: Opacity
+    type: float
+    description: Opacity of all elements - text, outline, and background
+    readonly: no
+    default: 1.0
+    minimum: 0
+    maximum: 1.0
+    mutable: yes
+    widget: slider

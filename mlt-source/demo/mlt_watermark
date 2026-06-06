@@ -1,0 +1,6 @@
+melt \
+clip2.dv out=1000 \
+-track \
+watermark1.png out=1000 \
+-transition affine in=0 out=1000 a_track=0 b_track=1 rect=85%/5%:10%x10% \
+$*

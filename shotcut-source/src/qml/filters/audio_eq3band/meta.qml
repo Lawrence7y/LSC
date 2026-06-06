@@ -1,0 +1,27 @@
+import QtQuick
+import org.shotcut.qml
+
+Metadata {
+    type: Metadata.Filter
+    isAudio: true
+    name: qsTr("Equalizer: 3-Band (Bass & Treble)")
+    keywords: qsTr('tone frequency', 'search keywords for the Equalizer: 3-Band audio filter') + ' equalizer: 3-band bass treble'
+    mlt_service: 'ladspa.1204'
+    objectName: '3BandEq'
+    qml: 'ui.qml'
+    help: 'https://forum.shotcut.org/t/equalizer-3-band-bass-treble-audio-filter/12898/1'
+
+    keyframes {
+        allowAnimateIn: true
+        allowAnimateOut: true
+        simpleProperties: ['0', '6', '12']
+        parameters: [
+            Parameter {
+                name: qsTr('Equalizer')
+                property: '0'
+                gangedProperties: ['6', '12']
+                isCurve: false
+            }
+        ]
+    }
+}

@@ -1,0 +1,10 @@
+^D:\PROJECT\直播切片\SHOTCUT-SOURCE\SRC\LSC\BUILD-VERIFY2\CMAKEFILES\8490DBD8A51966BC7141B2A632345D06\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/Project/直播切片/shotcut-source/src/lsc -BD:/Project/直播切片/shotcut-source/src/lsc/build-verify2 --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/Project/直播切片/shotcut-source/src/lsc/build-verify2/lsc.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -1,0 +1,367 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>OpenOtherDialog</class>
+ <widget class="QDialog" name="OpenOtherDialog">
+  <property name="windowModality">
+   <enum>Qt::WindowModality::WindowModal</enum>
+  </property>
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>668</width>
+    <height>478</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Open Other</string>
+  </property>
+  <property name="whatsThis">
+   <string notr="true">https://forum.shotcut.org/t/user-guide-table-of-contents/43285#p-145073-properties-14</string>
+  </property>
+  <property name="sizeGripEnabled">
+   <bool>true</bool>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_19">
+   <item>
+    <widget class="QSplitter" name="splitter">
+     <property name="orientation">
+      <enum>Qt::Orientation::Horizontal</enum>
+     </property>
+     <property name="handleWidth">
+      <number>0</number>
+     </property>
+     <property name="childrenCollapsible">
+      <bool>false</bool>
+     </property>
+     <widget class="QTreeWidget" name="treeWidget">
+      <property name="minimumSize">
+       <size>
+        <width>140</width>
+        <height>0</height>
+       </size>
+      </property>
+      <property name="rootIsDecorated">
+       <bool>false</bool>
+      </property>
+      <property name="itemsExpandable">
+       <bool>false</bool>
+      </property>
+      <property name="expandsOnDoubleClick">
+       <bool>false</bool>
+      </property>
+      <attribute name="headerVisible">
+       <bool>false</bool>
+      </attribute>
+      <column>
+       <property name="text">
+        <string>1</string>
+       </property>
+      </column>
+     </widget>
+     <widget class="QStackedWidget" name="methodTabWidget">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="MinimumExpanding" vsizetype="Preferred">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+       </sizepolicy>
+      </property>
+      <property name="currentIndex">
+       <number>5</number>
+      </property>
+      <widget class="QWidget" name="networkTab">
+       <layout class="QVBoxLayout" name="verticalLayout_3">
+        <item>
+         <widget class="NetworkProducerWidget" name="networkWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="decklinkTab">
+       <layout class="QVBoxLayout" name="verticalLayout_2">
+        <item>
+         <widget class="DecklinkProducerWidget" name="decklinkWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="dshowVideoTab">
+       <layout class="QVBoxLayout" name="verticalLayout_14">
+        <item>
+         <widget class="DirectShowVideoWidget" name="dshowVideoWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="avfoundationTab">
+       <layout class="QVBoxLayout" name="verticalLayout_15">
+        <item>
+         <widget class="AvfoundationProducerWidget" name="avfoundationWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="colorTab">
+       <layout class="QVBoxLayout" name="verticalLayout_4">
+        <item>
+         <widget class="ColorProducerWidget" name="colorWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="textTab">
+       <layout class="QVBoxLayout" name="verticalLayout">
+        <item>
+         <widget class="TextProducerWidget" name="textWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="glaxnimateTab">
+       <layout class="QVBoxLayout" name="verticalLayout_21">
+        <item>
+         <widget class="GlaxnimateProducerWidget" name="glaxnimateWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="noiseTab">
+       <layout class="QVBoxLayout" name="verticalLayout_7">
+        <item>
+         <widget class="NoiseWidget" name="noiseWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="isingTab">
+       <layout class="QVBoxLayout" name="verticalLayout_5">
+        <item>
+         <widget class="IsingWidget" name="isingWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="lissajousTab">
+       <layout class="QVBoxLayout" name="verticalLayout_12">
+        <item>
+         <widget class="LissajousWidget" name="lissajousWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="plasmaTab">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+         <horstretch>10</horstretch>
+         <verstretch>10</verstretch>
+        </sizepolicy>
+       </property>
+       <layout class="QVBoxLayout" name="verticalLayout_13">
+        <item>
+         <widget class="PlasmaWidget" name="plasmaWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="v4lTab">
+       <layout class="QGridLayout" name="gridLayout_3">
+        <item row="0" column="0">
+         <widget class="Video4LinuxWidget" name="v4lWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="colorbarsTab">
+       <layout class="QVBoxLayout" name="verticalLayout_6">
+        <item>
+         <widget class="ColorBarsWidget" name="colorbarsWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="pulseTab">
+       <layout class="QVBoxLayout" name="verticalLayout_8">
+        <item>
+         <widget class="PulseAudioWidget" name="pulseWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="alsaTab">
+       <layout class="QVBoxLayout" name="verticalLayout_10">
+        <item>
+         <widget class="AlsaWidget" name="alsaWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="toneTab">
+       <layout class="QVBoxLayout" name="verticalLayout_17">
+        <item>
+         <widget class="ToneProducerWidget" name="toneWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="countTab">
+       <layout class="QVBoxLayout" name="verticalLayout_18">
+        <item>
+         <widget class="CountProducerWidget" name="countWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="blipTab">
+       <layout class="QVBoxLayout" name="verticalLayout_20">
+        <item>
+         <widget class="BlipProducerWidget" name="blipWidget" native="true"/>
+        </item>
+       </layout>
+      </widget>
+     </widget>
+    </widget>
+   </item>
+   <item>
+    <widget class="QDialogButtonBox" name="buttonBox">
+     <property name="orientation">
+      <enum>Qt::Orientation::Horizontal</enum>
+     </property>
+     <property name="standardButtons">
+      <set>QDialogButtonBox::StandardButton::Cancel|QDialogButtonBox::StandardButton::Ok</set>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>PlasmaWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/plasmawidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>LissajousWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/lissajouswidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>IsingWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/isingwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>Video4LinuxWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/video4linuxwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ColorProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/colorproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>DecklinkProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/decklinkproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>NetworkProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/networkproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ColorBarsWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/colorbarswidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>NoiseWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/noisewidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>PulseAudioWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/pulseaudiowidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>AlsaWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/alsawidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>DirectShowVideoWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/directshowvideowidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>AvfoundationProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/avfoundationproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ToneProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/toneproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>CountProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/countproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>TextProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/textproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>BlipProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/blipproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>GlaxnimateProducerWidget</class>
+   <extends>QWidget</extends>
+   <header>widgets/glaxnimateproducerwidget.h</header>
+   <container>1</container>
+  </customwidget>
+ </customwidgets>
+ <tabstops>
+  <tabstop>buttonBox</tabstop>
+ </tabstops>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>accepted()</signal>
+   <receiver>OpenOtherDialog</receiver>
+   <slot>accept()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>266</x>
+     <y>497</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>157</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>buttonBox</sender>
+   <signal>rejected()</signal>
+   <receiver>OpenOtherDialog</receiver>
+   <slot>reject()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>334</x>
+     <y>497</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>286</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>

@@ -1,0 +1,62 @@
+schema_version: 7.2
+type: filter # consumer, filter, producer, or transition
+identifier: grain
+title: Grain
+version: 1
+copyright: Copyright (C) 2008 Marco Gittler
+license: GPL
+language: en
+creator: Marco Gittler
+tags:
+  - Video # this may produce video
+description: Grain over the Image 
+icon:
+  filename: oldfilm/grain.svg # relative to $MLT_DATA/modules/
+  content-type: image/svg
+
+notes: Implementation or additional usage notes go here.
+bugs: # this can be just for documentation, or the tool may disclose it to help user avoid pitfalls
+  - need to do some speed improvement.
+
+image_formats:
+  - yuv422
+parameters:
+  - identifier: noise
+    title: Noise
+    type: integer
+    description: Maximal value of noise
+    readonly: no
+    required: yes
+    minimum: 0
+    maximum: 200
+    default: 40
+    mutable: yes
+    animation: yes
+    widget: spinner
+    unit: '%'
+
+  - identifier: contrast
+    title: Contrast
+    type: integer
+    description: Adjust contrast for the image
+    readonly: no
+    required: yes
+    minimum: 0
+    maximum: 400
+    default: 160
+    mutable: yes
+    animation: yes
+    widget: spinner
+
+  - identifier: brightness
+    title: Brightness
+    type: integer
+    description: Adjust brightness for the image
+    readonly: no
+    required: yes
+    minimum: 0
+    maximum: 400
+    default: 70
+    mutable: yes
+    animation: yes
+    widget: spinner

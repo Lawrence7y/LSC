@@ -1,0 +1,42 @@
+schema_version: 7.2
+type: filter
+identifier: movit.glow
+title: Glow (GLSL)
+version: 2
+copyright: Meltytech, LLC
+creator: Steinar H. Gunderson
+license: GPLv2
+language: en
+tags:
+  - Video
+description: >
+  Cut out the highlights of the image (everything above a certain threshold),
+  blur them, and overlay them onto the original image.
+image_formats:
+  - glsl
+parameters:
+  - identifier: radius
+    title: Radius
+    type: float
+    minimum: 0.0
+    default: 20.0
+    mutable: yes
+    animation: yes
+
+  - identifier: blur_mix
+    title: Highlight Blurriness
+    type: float
+    minimum: 0.0
+    maximum: 1.0
+    default: 1.0
+    mutable: yes
+    animation: yes
+
+  - identifier: highlight_cutoff
+    title: Highlight Cutoff Threshold
+    type: float
+    minimum: 0.0
+    maximum: 1.0
+    default: 0.2
+    mutable: yes
+    animation: yes
