@@ -193,3 +193,106 @@ def test_select_quality_accepts_legacy_dict_and_new_candidate_keys():
     assert select_quality(info, "原画") == ("https://example.com/source.m3u8", "source")
     assert select_quality(info, "高清") == ("https://example.com/250.m3u8", "250")
     assert select_quality(info, "流畅") == ("https://example.com/150.m3u8", "150")
+
+def test_douyin_adapter_wraps_existing_parser(monkeypatch):
+    from lsc.platforms.douyin import DouyinAdapter
+
+    class FakeDouyinModule:
+        @staticmethod
+        def fetch_page(url):
+            assert url == "https://live.douyin.com/123456"
+            return "<html>fake</html>"
+
+        @staticmethod
+        def extract_ssr_data(html):
+            assert html == "<html>fake</html>"
+            return {
+                "platform": "douyin",
+                "isLive": True,
+                "title": "鏃犵晱濂戠害鐩存挱",
+                "streamerName": "涓绘挱A",
+                "streamUrl": "https://pull.example.com/live.m3u8",
+                "selectedQuality": "origin",
+                "qualityUrls": {"origin": "https://pull.example.com/live.m3u8"},
+            }
+
+    adapter = DouyinAdapter()
+    monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+
+    info = adapter.parse("https://live.douyin.com/123456")
+
+    assert info.platform == "douyin"
+    assert info.is_live is True
+    assert info.title == "鏃犵晱濂戠害鐩存挱"
+    assert info.streamer == "涓绘挱A"
+    assert info.stream_url == "https://pull.example.com/live.m3u8"
+    assert info.headers["Referer"] == "https://live.douyin.com/"
+    assert info.headers["User-Agent"].startswith("Mozilla/5.0")
+
+
+def test_douyin_registry_detection():
+    assert detect_platform("https://live.douyin.com/123456") == "douyin"
+
+
+def test_douyin_adapter_returns_parse_failed_when_fetch_page_is_empty(monkeypatch):
+    from lsc.platforms.base import ERROR_PARSE_FAILED
+    from lsc.platforms.douyin import DouyinAdapter
+
+    class FakeDouyinModule:
+        @staticmethod
+        def fetch_page(url):
+            assert url == "https://live.douyin.com/123456"
+            return ""
+
+        @staticmethod
+        def extract_ssr_data(html):
+            raise AssertionError("extract_ssr_data should not be called")
+
+    adapter = DouyinAdapter()
+    monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+
+    info = adapter.parse("https://live.douyin.com/123456")
+
+    assert info.platform == "douyin"
+    assert info.is_live is False
+    assert info.error_code == ERROR_PARSE_FAILED
+    assert info.headers["Referer"] == "https://live.douyin.com/"
+
+
+def test_douyin_adapter_returns_offline_when_not_live_or_missing_stream(monkeypatch):
+    from lsc.platforms.base import ERROR_OFFLINE
+    from lsc.platforms.douyin import DouyinAdapter
+
+    class FakeDouyinModule:
+        @staticmethod
+        def fetch_page(url):
+            assert url == "https://live.douyin.com/123456"
+            return "<html>fake</html>"
+
+        @staticmethod
+        def extract_ssr_data(html):
+            assert html == "<html>fake</html>"
+            return {
+                "isLive": False,
+                "title": "offline room",
+                "streamerName": "host",
+                "streamUrl": "",
+            }
+
+    adapter = DouyinAdapter()
+    monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+
+    info = adapter.parse("https://live.douyin.com/123456")
+
+    assert info.platform == "douyin"
+    assert info.is_live is False
+    assert info.error_code == ERROR_OFFLINE
+    assert info.raw["isLive"] is False
+
+
+def test_douyin_adapter_does_not_claim_non_live_douyin_pages():
+    from lsc.platforms.douyin import DouyinAdapter
+
+    adapter = DouyinAdapter()
+
+    assert adapter.can_handle("https://www.douyin.com/video/123456") is False

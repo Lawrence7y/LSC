@@ -1,8 +1,9 @@
-"""Regression tests for recording option wiring."""
+﻿"""Regression tests for recording controller option wiring."""
 from __future__ import annotations
 
-import json
 import os
+import sys
+import types
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,105 +17,65 @@ def _qapp() -> QApplication:
     return app
 
 
-def test_douyin_parser_extracts_quality_url_map() -> None:
-    from scripts.douyin_record import extract_ssr_data
-
-    payload = {
-        "data": {
-            "title": "test live",
-            "owner": {"nickname": "主播"},
-            "origin": {"main": {"hls": "https://example.com/origin.m3u8"}},
-            "hd": {"main": {"hls": "https://example.com/hd.m3u8"}},
-            "sd": {"main": {"hls": "https://example.com/sd.m3u8"}},
-        }
-    }
-    encoded = json.dumps(payload, ensure_ascii=False).replace("\\", "\\\\").replace('"', '\\"')
-    html = f'self.__pace_f.push([1,"{encoded}"])'
-
-    info = extract_ssr_data(html)
-
-    assert info["qualityUrls"]["origin"] == "https://example.com/origin.m3u8"
-    assert info["qualityUrls"]["hd"] == "https://example.com/hd.m3u8"
-    assert info["qualityUrls"]["sd"] == "https://example.com/sd.m3u8"
+def _install_fake_capture_module(monkeypatch) -> None:
+    fake_recorder = types.ModuleType("lsc.recorder")
+    fake_capture = types.ModuleType("lsc.recorder.capture")
+    fake_capture._friendly_ffmpeg_message = lambda _code, _stderr: "直播流地址已失效"
+    monkeypatch.setitem(sys.modules, "lsc.recorder", fake_recorder)
+    monkeypatch.setitem(sys.modules, "lsc.recorder.capture", fake_capture)
 
 
-def test_record_page_uses_quality_preset_specific_stream_url() -> None:
-    _qapp()
+class _FakeCapture:
+    def __init__(self):
+        self.calls = []
+        self.status = types.SimpleNamespace(value="recording")
+        self.is_recording = True
 
-    from lsc.gui.pages.record import RecordPage
+    def start(self, url, output_path, *, codec="copy", input_args=None, extra_args=None):
+        self.calls.append(
+            {
+                "url": url,
+                "output_path": output_path,
+                "codec": codec,
+                "input_args": input_args,
+                "extra_args": extra_args or [],
+            }
+        )
+        return True
 
-    class FakeSignal:
-        def __init__(self):
-            self.messages = []
 
-        def emit(self, *args):
-            self.messages.append(args)
-
-    class FakeController:
-        def __init__(self):
-            self.stream_url = ""
-
-        @staticmethod
-        def select_stream_url(info, quality_preset):
-            from lsc.gui.pages.recording_controller import RecordingController
-
-            return RecordingController.select_stream_url(info, quality_preset)
-
-    class FakeConfig:
-        quality_selection = "流畅"
-
-        def __init__(self):
-            self.connected = []
-
-        def set_connected(self, value):
-            self.connected.append(value)
-
-    page = RecordPage.__new__(RecordPage)
-    page._ctrl = FakeController()
-    page._config = FakeConfig()
-    page.status_changed = FakeSignal()
+def test_recording_controller_select_stream_url_uses_real_quality_presets() -> None:
+    from lsc.gui.pages.recording_controller import RecordingController
 
     info = {
-        "isLive": True,
         "streamUrl": "https://example.com/origin.m3u8",
+        "selectedQuality": "origin",
         "qualityUrls": {
             "origin": "https://example.com/origin.m3u8",
             "hd": "https://example.com/hd.m3u8",
             "sd": "https://example.com/sd.m3u8",
         },
-        "streamerName": "主播",
-        "title": "测试直播",
     }
 
-    RecordPage._on_url_parsed(page, info)
-
-    assert page._ctrl.stream_url == "https://example.com/sd.m3u8"
-    assert page._config.connected == [True]
+    assert RecordingController.select_stream_url(info, "原画") == (
+        "https://example.com/origin.m3u8",
+        "origin",
+    )
+    assert RecordingController.select_stream_url(info, "高清") == (
+        "https://example.com/hd.m3u8",
+        "hd",
+    )
+    assert RecordingController.select_stream_url(info, "流畅") == (
+        "https://example.com/sd.m3u8",
+        "sd",
+    )
 
 
 def test_recording_controller_cpu_bitrate_mode_builds_target_bitrate_args(tmp_path) -> None:
     from lsc.gui.pages.recording_controller import RecordingController
-    from lsc.recorder.capture import CaptureStatus
-
-    class FakeCapture:
-        def __init__(self):
-            self.calls = []
-            self.status = CaptureStatus.RECORDING
-
-        def start(self, url, output_path, *, codec="copy", input_args=None, extra_args=None):
-            self.calls.append(
-                {
-                    "url": url,
-                    "output_path": output_path,
-                    "codec": codec,
-                    "input_args": input_args,
-                    "extra_args": extra_args or [],
-                }
-            )
-            return True
 
     ctrl = RecordingController()
-    ctrl._capture = FakeCapture()
+    ctrl._capture = _FakeCapture()
 
     ok, output_path, encoder_used = ctrl.start_recording_with_crf(
         "https://example.com/live.m3u8",
@@ -138,27 +99,9 @@ def test_recording_controller_cpu_bitrate_mode_builds_target_bitrate_args(tmp_pa
 
 def test_recording_controller_nvenc_crf_mode_uses_vbr_cq_args(tmp_path) -> None:
     from lsc.gui.pages.recording_controller import RecordingController
-    from lsc.recorder.capture import CaptureStatus
-
-    class FakeCapture:
-        def __init__(self):
-            self.calls = []
-            self.status = CaptureStatus.RECORDING
-
-        def start(self, url, output_path, *, codec="copy", input_args=None, extra_args=None):
-            self.calls.append(
-                {
-                    "url": url,
-                    "output_path": output_path,
-                    "codec": codec,
-                    "input_args": input_args,
-                    "extra_args": extra_args or [],
-                }
-            )
-            return True
 
     ctrl = RecordingController()
-    ctrl._capture = FakeCapture()
+    ctrl._capture = _FakeCapture()
     ctrl.check_nvenc_available = lambda: True
 
     ok, _output_path, encoder_used = ctrl.start_recording_with_crf(
@@ -180,10 +123,32 @@ def test_recording_controller_nvenc_crf_mode_uses_vbr_cq_args(tmp_path) -> None:
     assert "0" in args
 
 
-def test_friendly_ffmpeg_exit_message_uses_stderr_tail() -> None:
+def test_recording_controller_unlimited_mode_forces_copy(tmp_path) -> None:
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    ctrl = RecordingController()
+    ctrl._capture = _FakeCapture()
+
+    ok, _output_path, encoder_used = ctrl.start_recording_with_crf(
+        "https://example.com/live.m3u8",
+        str(tmp_path),
+        "H.264 CPU",
+        23,
+        param_mode="不限制",
+    )
+
+    assert ok is True
+    assert encoder_used == "Copy"
+    assert ctrl._capture.calls[-1]["extra_args"] == []
+
+
+def test_friendly_ffmpeg_exit_message_uses_stderr_tail(monkeypatch) -> None:
+    _install_fake_capture_module(monkeypatch)
+
     from lsc.gui.pages.recording_controller import friendly_ffmpeg_exit_message
 
     message = friendly_ffmpeg_exit_message(1, "HTTP error 404 Not Found")
+
     assert "直播流地址已失效" in message
 
 
@@ -199,3 +164,38 @@ def test_preflight_recording_returns_error_when_disk_is_low(monkeypatch, tmp_pat
     message = ctrl.preflight_recording(str(tmp_path))
 
     assert "磁盘空间不足" in message
+
+
+def test_parse_douyin_url_uses_platform_layer_legacy_shape(monkeypatch) -> None:
+    from lsc.gui.pages.recording_controller import RecordingController
+    from lsc.platforms.base import StreamInfo
+
+    _qapp()
+
+    def fake_parse_stream(url):
+        assert url == "https://live.douyin.com/123456"
+        return StreamInfo(
+            platform="douyin",
+            room_url=url,
+            stream_url="https://example.com/live.m3u8",
+            title="直播标题",
+            streamer="主播A",
+            is_live=True,
+            quality_urls={"origin": "https://example.com/live.m3u8"},
+            selected_quality="origin",
+            headers={"Referer": "https://live.douyin.com/"},
+        )
+
+    monkeypatch.setattr("lsc.gui.pages.recording_controller.parse_stream", fake_parse_stream)
+
+    ctrl = RecordingController()
+    result = ctrl.parse_douyin_url("https://live.douyin.com/123456")
+
+    assert result["isLive"] is True
+    assert result["platform"] == "douyin"
+    assert result["streamUrl"] == "https://example.com/live.m3u8"
+    assert result["streamerName"] == "主播A"
+    assert result["_inputArgs"] == [
+        "-headers",
+        "Referer: https://live.douyin.com/\r\n",
+    ]

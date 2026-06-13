@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 
 from .base import ERROR_PARSE_FAILED, ERROR_UNSUPPORTED_URL, PlatformAdapter, StreamInfo
 from .direct import DirectAdapter
+from .douyin import DouyinAdapter
 
 QUALITY_PRESET_CANDIDATES = {
     "原画": ["origin", "source", "蓝光", "超清", "FULL_HD1", "uhd", "UHD1", "10000", "400", "hd", "HD1", "sd"],
@@ -12,7 +13,7 @@ QUALITY_PRESET_CANDIDATES = {
     "流畅": ["sd", "SD1", "150", "80", "ld", "origin", "source", "hd"],
 }
 
-_DEFAULT_ADAPTERS: tuple[PlatformAdapter, ...] = (DirectAdapter(),)
+_DEFAULT_ADAPTERS: tuple[PlatformAdapter, ...] = (DirectAdapter(), DouyinAdapter())
 
 
 def get_adapters(adapters: Iterable[PlatformAdapter] | None = None) -> tuple[PlatformAdapter, ...]:

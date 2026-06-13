@@ -1,4 +1,4 @@
-"""Recording controller — business logic extracted from RecordPage.
+﻿"""Recording controller 鈥?business logic extracted from RecordPage.
 
 Separates recording concerns (FFmpeg capture, timer, NVENC probe, URL parsing)
 from pure UI rendering, following the ViewModel / Controller pattern.
@@ -9,12 +9,19 @@ from __future__ import annotations
 import os
 import subprocess
 import time as _time
+import logging
 from argparse import Namespace
 from datetime import datetime, timezone
 
 from PySide6.QtCore import QThread, QTimer, Signal
 
-from lsc import get_logger
+try:
+    from lsc import get_logger
+except ImportError:
+    def get_logger(name: str):
+        return logging.getLogger(name)
+
+from lsc.platforms.registry import parse_stream, select_quality
 
 _log = get_logger(__name__)
 
@@ -100,7 +107,7 @@ class AnalysisWorker(QThread):
             highlights = result.get("highlights", []) if isinstance(result, dict) else []
             self.finished.emit(True, result_path, "", len(highlights))
         except SystemExit as exc:
-            self.finished.emit(False, "", f"分析失败 (exit {exc.code})", 0)
+            self.finished.emit(False, "", f"鍒嗘瀽澶辫触 (exit {exc.code})", 0)
         except Exception as exc:
             self.finished.emit(False, "", str(exc), 0)
 
@@ -144,6 +151,8 @@ class RecordingController:
         self.video_path: str = ""
         self.stream_url: str = ""
         self.page_url: str = ""
+        self.last_stream_info = None
+        self.input_args: list[str] = []
         self.output_dir: str = ""
         self.exported: list[tuple] = []
 
@@ -160,7 +169,7 @@ class RecordingController:
         self.timer = QTimer()
         self.watchdog = QTimer()
 
-    # ── Initialisation ──────────────────────────────────────────
+    # 鈹€鈹€ Initialisation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def init_capture(self, on_status_cb=None):
         """Create StreamCapture instance."""
@@ -174,7 +183,7 @@ class RecordingController:
                 self._capture.set_status_callback(on_status_cb)
         except Exception as exc:
             _log.warning("Failed to initialize capture: %s", exc)
-            self.capture_init_error = str(exc) or "录制器初始化失败"
+            self.capture_init_error = str(exc) or "褰曞埗鍣ㄥ垵濮嬪寲澶辫触"
             self._capture = None
 
     def init_exporter(self):
@@ -188,10 +197,10 @@ class RecordingController:
             self.output_dir = cfg.output_dir
         except Exception as exc:
             _log.warning("Failed to initialize exporter: %s", exc)
-            self.exporter_init_error = str(exc) or "导出器初始化失败"
+            self.exporter_init_error = str(exc) or "瀵煎嚭鍣ㄥ垵濮嬪寲澶辫触"
             self._exporter = None
 
-    # ── Preflight checks ────────────────────────────────────────
+    # 鈹€鈹€ Preflight checks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     _MIN_RECORDING_FREE_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
 
@@ -258,7 +267,7 @@ class RecordingController:
         except (ValueError, ZeroDivisionError):
             return ""
 
-    # ── Capture accessors ───────────────────────────────────────
+    # 鈹€鈹€ Capture accessors 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     @property
     def capture(self):
@@ -272,39 +281,33 @@ class RecordingController:
         """Public API: check if FFmpeg process has crashed.
 
         Returns exit code if crashed, None if healthy or no capture.
-        Safe to call from UI layer — no private-member access needed.
+        Safe to call from UI layer 鈥?no private-member access needed.
         """
         if not self._capture or not self._capture.is_recording:
             return None
         return self._capture.check_and_handle_crash()
 
-    # ── URL parsing ─────────────────────────────────────────────
+    # 鈹€鈹€ URL parsing 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+
+    def parse_stream_url(self, url: str) -> dict:
+        """Parse a supported room URL into the legacy dict consumed by the GUI."""
+        info = parse_stream(url)
+        legacy = info.to_legacy_dict()
+        self.last_stream_info = info
+        self.input_args = list(legacy.get("_inputArgs", []))
+        return legacy
 
     def parse_douyin_url(self, url: str) -> dict:
-        """Parse Douyin page URL to extract stream URL (blocking)."""
-        try:
-            import importlib.util
-            from pathlib import Path
-            script_path = Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "douyin_record.py"
-            if not script_path.exists():
-                return {"isLive": False, "error": "URL 解析脚本不存在"}
-            spec = importlib.util.spec_from_file_location("douyin_record", str(script_path))
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            html = mod.fetch_page(url)
-            if html:
-                return mod.extract_ssr_data(html)
-            return {"isLive": False, "error": "无法获取页面"}
-        except Exception as e:
-            return {"isLive": False, "error": str(e)}
+        """Compatibility wrapper for the old Douyin-only API."""
+        return self.parse_stream_url(url)
 
     def start_url_parse(self, url: str, on_parsed) -> None:
         """Launch async URL parsing. Calls on_parsed(dict) when done."""
-        self._url_parser = UrlParserWorker(url, self.parse_douyin_url)
+        self._url_parser = UrlParserWorker(url, self.parse_stream_url)
         self._url_parser.finished.connect(on_parsed)
         self._url_parser.start()
 
-    # ── NVENC probe ──────────────────────────────────────────────
+    # 鈹€鈹€ NVENC probe 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     @staticmethod
     def check_nvenc_available() -> bool:
@@ -326,15 +329,11 @@ class RecordingController:
         except Exception:
             return False
 
+
     @staticmethod
     def select_stream_url(info: dict, quality_preset: str) -> tuple[str, str]:
         """Pick the best-matching source URL for the requested quality preset."""
-        quality_urls = info.get("qualityUrls") or {}
-        for quality_key in _QUALITY_PRESET_CANDIDATES.get(quality_preset, ()):
-            url = quality_urls.get(quality_key, "")
-            if isinstance(url, str) and url.startswith(("http://", "https://")):
-                return url, quality_key
-        return info.get("streamUrl", ""), info.get("selectedQuality", "")
+        return select_quality(info, quality_preset)
 
     @staticmethod
     def _normalize_bitrate_value(bitrate: str | None, bitrate_unit: str) -> str:
@@ -359,7 +358,7 @@ class RecordingController:
             text = str(numeric).rstrip("0").rstrip(".")
         return f"{text}{suffix}"
 
-    # ── Recording lifecycle ─────────────────────────────────────
+    # 鈹€鈹€ Recording lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def start_recording_with_crf(self, stream_url: str, output_dir: str,
                                   encoder: str, crf: int,
@@ -399,10 +398,10 @@ class RecordingController:
 
         if encoder == "H.264 NVENC":
             if on_status:
-                on_status("检测 NVENC 硬件编码...", "info")
+                on_status("妫€娴?NVENC 纭欢缂栫爜...", "info")
             if not self.check_nvenc_available():
                 if on_status:
-                    on_status("NVENC 不可用，自动切换为 Copy 模式", "warning")
+                    on_status("NVENC 涓嶅彲鐢紝鑷姩鍒囨崲涓?Copy 妯″紡", "warning")
                 encoder_used = "Copy"
 
         if param_mode == "不限制":
@@ -459,7 +458,7 @@ class RecordingController:
                                 extra_args=output_args)
 
         if self._capture.status.value == "recording":
-            # Capture confirmed running — set controller state atomically
+            # Capture confirmed running 鈥?set controller state atomically
             self.is_recording = True
             self.total_sec = 0
             self.record_start_mono = _time.monotonic()
@@ -512,7 +511,7 @@ class RecordingController:
         except Exception:
             return 0.0
 
-    # ── Timer tick ──────────────────────────────────────────────
+    # 鈹€鈹€ Timer tick 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def tick(self) -> int:
         """Update elapsed time using monotonic clock. Returns current total_sec."""
@@ -520,20 +519,20 @@ class RecordingController:
             self.total_sec = int(_time.monotonic() - self.record_start_mono)
         return self.total_sec
 
-    # ── Watchdog ─────────────────────────────────────────────────
+    # 鈹€鈹€ Watchdog 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def watchdog_check(self) -> str:
         """Check FFmpeg health. Returns error message or empty string."""
         if not self._capture or not self.is_recording:
             return ""
-        # Use public API — no private-member access
+        # Use public API 鈥?no private-member access
         exit_code = self._capture.check_and_handle_crash()
         if exit_code is not None:
-            return f"FFmpeg 异常退出 (code {exit_code})"
+            return f"FFmpeg 寮傚父閫€鍑?(code {exit_code})"
         msg = self._capture.check_health()
         return msg
 
-    # ── Export ──────────────────────────────────────────────────
+    # 鈹€鈹€ Export 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def start_export(self, start_sec: float, end_sec: float,
                      output_dir: str, name: str,
@@ -574,7 +573,7 @@ class RecordingController:
         self._batch_export_thread.start()
         return True
 
-    # ── Cleanup ─────────────────────────────────────────────────
+    # 鈹€鈹€ Cleanup 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     def cleanup(self):
         """Release all resources.
@@ -605,3 +604,6 @@ class RecordingController:
                 self._capture.stop()
             else:
                 self._capture.force_cleanup()
+
+
+
