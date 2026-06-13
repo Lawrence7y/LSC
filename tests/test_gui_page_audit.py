@@ -412,3 +412,23 @@ def test_config_panel_exposes_analysis_profile_selector() -> None:
 
     assert panel.analysis_profile == "valorant"
     assert panel._analysis_profile._items == ["valorant", "fps", "generic"]
+
+
+def test_dashboard_refresh_replaces_empty_state_with_sessions() -> None:
+    _qapp()
+
+    from lsc.gui.pages.dashboard import DashboardPage
+
+    page = DashboardPage()
+    page.set_sessions(
+        [
+            {
+                "title": "主播A",
+                "status": "recording",
+                "duration_text": "00:12:30",
+                "path": "D:/recordings/a.mp4",
+            }
+        ]
+    )
+
+    assert page._session_count == 1
