@@ -106,9 +106,11 @@ def test_manager_connect_and_disconnect_room_updates_session(monkeypatch) -> Non
     assert manager.connect_room(room.room_id) is True
     assert room.platform == "bilibili"
     assert room.is_connected is True
+    assert room.selected_quality == "origin"
     assert room.last_error == ""
     assert room.controller.stream_url == "https://example.com/live.m3u8"
     assert room.controller.input_args == ["-headers", "Referer: https://example.com/\r\n"]
+    assert room.controller.selected_quality == "origin"
 
     assert manager.disconnect_room(room.room_id) is True
     assert room.is_connected is False

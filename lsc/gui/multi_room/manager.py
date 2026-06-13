@@ -67,8 +67,10 @@ class MultiRoomManager:
 
         controller = room.controller
         if controller is not None:
+            legacy_info = info.to_legacy_dict()
             controller.stream_url = info.stream_url
-            controller.input_args = info.to_legacy_dict().get("_inputArgs", [])
+            controller.input_args = legacy_info.get("_inputArgs", [])
+            controller.selected_quality = legacy_info.get("selectedQuality", info.selected_quality)
         return True
 
     def disconnect_room(self, room_id: str) -> bool:

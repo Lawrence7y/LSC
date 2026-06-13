@@ -57,6 +57,8 @@ class _FakeManager:
         self.rooms = list(rooms or [])
         self.added_urls: list[str] = []
         self.muted_calls: list[tuple[str, bool]] = []
+        self.start_all_calls: list[tuple[str, str, int]] = []
+        self.stop_all_calls = 0
 
     def list_rooms(self) -> list[RoomSession]:
         return list(self.rooms)
@@ -69,6 +71,14 @@ class _FakeManager:
 
     def mute_room(self, room_id: str, muted: bool) -> None:
         self.muted_calls.append((room_id, muted))
+
+    def start_recording_all(self, output_dir: str, encoder: str, crf: int) -> dict[str, bool]:
+        self.start_all_calls.append((output_dir, encoder, crf))
+        return {room.room_id: True for room in self.rooms}
+
+    def stop_recording_all(self) -> dict[str, bool]:
+        self.stop_all_calls += 1
+        return {room.room_id: False for room in self.rooms}
 
 
 def test_multi_room_page_can_be_instantiated_with_manager() -> None:
@@ -146,3 +156,45 @@ def test_multi_room_page_mute_toggle_forwards_to_manager() -> None:
     page._cards_by_room_id["room-1"]._mute_button.click()
 
     assert manager.muted_calls == [("room-1", False)]
+
+
+def test_multi_room_page_start_recording_all_forwards_to_manager() -> None:
+    _qapp()
+
+    from lsc.gui.pages.multi_room import MultiRoomPage
+
+    manager = _FakeManager([RoomSession(room_id="room-1", room_url="https://live.douyin.com/1")])
+    page = MultiRoomPage(manager=manager)
+
+    result = page.start_recording_all("D:/records", "Copy", 23)
+
+    assert result == {"room-1": True}
+    assert manager.start_all_calls == [("D:/records", "Copy", 23)]
+
+
+def test_multi_room_page_stop_recording_all_forwards_to_manager() -> None:
+    _qapp()
+
+    from lsc.gui.pages.multi_room import MultiRoomPage
+
+    manager = _FakeManager([RoomSession(room_id="room-1", room_url="https://live.douyin.com/1")])
+    page = MultiRoomPage(manager=manager)
+
+    result = page.stop_recording_all()
+
+    assert result == {"room-1": False}
+    assert manager.stop_all_calls == 1
+
+
+def test_dashboard_page_emits_multi_room_navigation_request() -> None:
+    _qapp()
+
+    from lsc.gui.pages.dashboard import DashboardPage
+
+    page = DashboardPage()
+    hits: list[bool] = []
+    page.multi_room_requested.connect(lambda: hits.append(True))
+
+    page._multi_room_btn.click()
+
+    assert hits == [True]

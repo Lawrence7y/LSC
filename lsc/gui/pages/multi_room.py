@@ -1,7 +1,7 @@
 """多房间工作台页面。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -20,6 +20,10 @@ from lsc.gui.multi_room.session import RoomSession
 
 class MultiRoomPage(QWidget):
     """一个可独立实例化的多房间工作台页面。"""
+
+    room_selected = Signal(str)
+    room_record_requested = Signal(str)
+    room_stop_requested = Signal(str)
 
     def __init__(self, manager: MultiRoomManager | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -89,9 +93,31 @@ class MultiRoomPage(QWidget):
         self.load_rooms()
         return room
 
+    def connect_room(self, room_id: str) -> bool:
+        ok = self._manager.connect_room(room_id)
+        self._refresh_room_card(room_id)
+        return ok
+
+    def remove_room(self, room_id: str) -> bool:
+        removed = self._manager.remove_room(room_id)
+        if removed:
+            self.load_rooms()
+        return removed
+
+    def start_recording_all(self, output_dir: str, encoder: str, crf: int) -> dict[str, bool]:
+        return self._manager.start_recording_all(output_dir, encoder, crf)
+
+    def stop_recording_all(self) -> dict[str, bool]:
+        return self._manager.stop_recording_all()
+
     def _add_card(self, room: RoomSession) -> None:
         card = RoomCard(room, self._card_container)
+        card.selected.connect(self.room_selected.emit)
+        card.connect.connect(self.connect_room)
+        card.record.connect(self.room_record_requested.emit)
+        card.stop.connect(self.room_stop_requested.emit)
         card.mute_toggled.connect(self._manager.mute_room)
+        card.remove.connect(self.remove_room)
         self._cards_by_room_id[room.room_id] = card
         self._card_layout.addWidget(card)
 
@@ -107,6 +133,11 @@ class MultiRoomPage(QWidget):
         self._summary_label.setText(f"房间数：{room_count}")
         self._empty_label.setVisible(room_count == 0)
         self._scroll_area.setVisible(room_count > 0)
+
+    def _refresh_room_card(self, room_id: str) -> None:
+        card = self._cards_by_room_id.get(room_id)
+        if card is not None:
+            card.refresh()
 
 
 __all__ = ["MultiRoomPage"]
