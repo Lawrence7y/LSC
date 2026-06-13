@@ -2274,6 +2274,34 @@ class RecordPage(QWidget):
             pos = min(dur, self._preview.position_sec() + 10)
             self._preview.seek_to(pos)
 
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts for common actions."""
+        if event.key() == Qt.Key_Space:
+            self._on_play_pause()
+            event.accept()
+            return
+        if event.key() == Qt.Key_I:
+            self._on_mark_in()
+            event.accept()
+            return
+        if event.key() == Qt.Key_O:
+            self._on_mark_out()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Left:
+            self._on_seek_back()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Right:
+            self._on_seek_fwd()
+            event.accept()
+            return
+        if event.key() == Qt.Key_E and event.modifiers() & Qt.ControlModifier:
+            self._on_export()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     # ── Cleanup ──────────────────────────────────────────────────
 
     def cleanup(self):
