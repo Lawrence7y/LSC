@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 
 from .base import ERROR_PARSE_FAILED, ERROR_UNSUPPORTED_URL, PlatformAdapter, StreamInfo
+from .bilibili import BilibiliAdapter
 from .direct import DirectAdapter
 from .douyin import DouyinAdapter
 
@@ -13,7 +14,7 @@ QUALITY_PRESET_CANDIDATES = {
     "流畅": ["sd", "SD1", "150", "80", "ld", "origin", "source", "hd"],
 }
 
-_DEFAULT_ADAPTERS: tuple[PlatformAdapter, ...] = (DirectAdapter(), DouyinAdapter())
+_DEFAULT_ADAPTERS: tuple[PlatformAdapter, ...] = (DirectAdapter(), DouyinAdapter(), BilibiliAdapter())
 
 
 def get_adapters(adapters: Iterable[PlatformAdapter] | None = None) -> tuple[PlatformAdapter, ...]:

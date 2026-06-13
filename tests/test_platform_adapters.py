@@ -296,3 +296,95 @@ def test_douyin_adapter_does_not_claim_non_live_douyin_pages():
     adapter = DouyinAdapter()
 
     assert adapter.can_handle("https://www.douyin.com/video/123456") is False
+
+
+def test_bilibili_adapter_parses_live_room_with_public_play_info(monkeypatch):
+    from lsc.platforms.bilibili import BILIBILI_HEADERS, BilibiliAdapter
+
+    adapter = BilibiliAdapter()
+    responses = iter(
+        [
+            {
+                "code": 0,
+                "data": {
+                    "room_id": 12345,
+                    "live_status": 1,
+                    "title": "B 站直播标题",
+                    "uname": "主播A",
+                },
+            },
+            {
+                "code": 0,
+                "data": {
+                    "playurl_info": {
+                        "playurl": {
+                            "stream": [
+                                {
+                                    "format": [
+                                        {
+                                            "codec": [
+                                                {
+                                                    "accept_qn": [10000, 400, 250],
+                                                    "base_url": "/live-bvc/master.m3u8",
+                                                    "url_info": [
+                                                        {
+                                                            "host": "https://cn-gotcha204-2.example.com",
+                                                            "extra": "?qn=10000&token=abc",
+                                                        }
+                                                    ],
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
+        ]
+    )
+
+    monkeypatch.setattr(adapter, "_fetch_json", lambda url, params=None: next(responses))
+
+    info = adapter.parse("https://live.bilibili.com/12345")
+
+    assert info.platform == "bilibili"
+    assert info.title == "B 站直播标题"
+    assert info.streamer == "主播A"
+    assert info.stream_url == "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=10000&token=abc"
+    assert info.quality_urls == {
+        "10000": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=10000&token=abc",
+        "400": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=400&token=abc",
+        "250": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=250&token=abc",
+    }
+    assert info.headers == BILIBILI_HEADERS
+
+
+def test_bilibili_adapter_returns_offline_when_room_is_not_live(monkeypatch):
+    from lsc.platforms.bilibili import BilibiliAdapter
+
+    adapter = BilibiliAdapter()
+    monkeypatch.setattr(
+        adapter,
+        "_fetch_json",
+        lambda url, params=None: {
+            "code": 0,
+            "data": {
+                "room_id": 12345,
+                "live_status": 0,
+                "title": "未开播房间",
+                "uname": "主播A",
+            },
+        },
+    )
+
+    info = adapter.parse("https://live.bilibili.com/12345")
+
+    assert info.platform == "bilibili"
+    assert info.is_live is False
+    assert info.error_code == ERROR_OFFLINE
+
+
+def test_bilibili_registry_detection():
+    assert detect_platform("https://live.bilibili.com/12345") == "bilibili"
