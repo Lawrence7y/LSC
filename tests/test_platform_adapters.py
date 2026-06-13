@@ -388,3 +388,91 @@ def test_bilibili_adapter_returns_offline_when_room_is_not_live(monkeypatch):
 
 def test_bilibili_registry_detection():
     assert detect_platform("https://live.bilibili.com/12345") == "bilibili"
+
+
+def test_huya_adapter_parses_public_page_payload(monkeypatch):
+    from lsc.platforms.huya import HUYA_HEADERS, HuyaAdapter
+
+    adapter = HuyaAdapter()
+    html = """
+    <html>
+      <script>
+        window.HNF_GLOBAL_INIT = {
+          "roomInfo": {"tLiveStatus": 1, "sIntroduction": "虎牙直播标题"},
+          "profileInfo": {"nick": "虎牙主播"},
+          "stream": {
+            "data": [{
+              "gameStreamInfoList": [{
+                "sFlvUrl": "https://huya.example.com/live",
+                "sStreamName": "room-123",
+                "sFlvUrlSuffix": "flv",
+                "sFlvAntiCode": "fm=abc&txyp=1"
+              }]
+            }]
+          }
+        };
+      </script>
+    </html>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://www.huya.com/123")
+
+    assert info.platform == "huya"
+    assert info.is_live is True
+    assert info.title == "虎牙直播标题"
+    assert info.streamer == "虎牙主播"
+    assert info.stream_url == "https://huya.example.com/live/room-123.flv?fm=abc&txyp=1"
+    assert info.quality_urls == {"source": "https://huya.example.com/live/room-123.flv?fm=abc&txyp=1"}
+    assert info.selected_quality == "source"
+    assert info.headers == HUYA_HEADERS
+
+
+def test_huya_adapter_returns_offline_when_room_not_live(monkeypatch):
+    from lsc.platforms.huya import HuyaAdapter
+
+    adapter = HuyaAdapter()
+    html = """
+    <script>
+      window.HNF_GLOBAL_INIT = {
+        "roomInfo": {"tLiveStatus": 0, "sIntroduction": "未开播房间"},
+        "profileInfo": {"nick": "虎牙主播"}
+      };
+    </script>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://www.huya.com/123")
+
+    assert info.platform == "huya"
+    assert info.is_live is False
+    assert info.error_code == ERROR_OFFLINE
+    assert "未开播" in info.error
+    assert info.headers["Referer"] == "https://www.huya.com/"
+
+
+def test_huya_adapter_returns_restricted_when_no_public_stream_found(monkeypatch):
+    from lsc.platforms.huya import HuyaAdapter
+
+    adapter = HuyaAdapter()
+    html = """
+    <script>
+      window.HNF_GLOBAL_INIT = {
+        "roomInfo": {"tLiveStatus": 1, "sIntroduction": "限制房间"},
+        "profileInfo": {"nick": "虎牙主播"},
+        "stream": {"data": []}
+      };
+    </script>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://www.huya.com/123")
+
+    assert info.platform == "huya"
+    assert info.is_live is False
+    assert info.error_code == ERROR_RESTRICTED
+    assert "公开流" in info.error
+
+
+def test_huya_registry_detection():
+    assert detect_platform("https://www.huya.com/123") == "huya"
