@@ -191,6 +191,73 @@ class RecordingController:
             self.exporter_init_error = str(exc) or "导出器初始化失败"
             self._exporter = None
 
+    # ── Preflight checks ────────────────────────────────────────
+
+    _MIN_RECORDING_FREE_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
+
+    def preflight_recording(self, output_dir: str) -> str:
+        """Check disk space before recording. Returns error message or empty."""
+        import shutil
+
+        os.makedirs(output_dir, exist_ok=True)
+        _total, _used, free = shutil.disk_usage(output_dir)
+        if free < self._MIN_RECORDING_FREE_BYTES:
+            free_gb = free / (1024 ** 3)
+            return f"磁盘空间不足，当前仅剩 {free_gb:.1f} GB"
+        return ""
+
+    def probe_stream_metadata(self, source: str) -> tuple[str, str]:
+        """Use FFprobe to get stream resolution and frame rate.
+
+        Returns (resolution, fps) tuple, e.g. ("1920x1080", "60 fps").
+        Returns ("", "") on failure.
+        """
+        import json
+
+        from lsc.config import load_config
+
+        cfg = load_config()
+        ffprobe = cfg.ffprobe_path
+        if not ffprobe or not os.path.isfile(ffprobe):
+            return "", ""
+
+        try:
+            cmd = [
+                ffprobe,
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                source,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)  # noqa: S603
+            payload = json.loads(result.stdout or "{}")
+            stream = next(
+                (item for item in payload.get("streams", []) if item.get("codec_type") == "video"),
+                {},
+            )
+            width = stream.get("width")
+            height = stream.get("height")
+            fps_raw = stream.get("avg_frame_rate", "0/1")
+            fps = self._format_frame_rate(fps_raw)
+            resolution = f"{width}x{height}" if width and height else ""
+            return resolution, fps
+        except Exception as exc:
+            _log.debug("Stream metadata probe failed: %s", exc)
+            return "", ""
+
+    @staticmethod
+    def _format_frame_rate(fps_raw: str) -> str:
+        """Convert '60000/1001' style frame rate to '60 fps'."""
+        try:
+            if "/" in fps_raw:
+                num, den = fps_raw.split("/")
+                fps = float(num) / float(den)
+            else:
+                fps = float(fps_raw)
+            return f"{fps:.0f} fps" if fps == int(fps) else f"{fps:.1f} fps"
+        except (ValueError, ZeroDivisionError):
+            return ""
+
     # ── Capture accessors ───────────────────────────────────────
 
     @property

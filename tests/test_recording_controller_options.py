@@ -185,3 +185,17 @@ def test_friendly_ffmpeg_exit_message_uses_stderr_tail() -> None:
 
     message = friendly_ffmpeg_exit_message(1, "HTTP error 404 Not Found")
     assert "直播流地址已失效" in message
+
+
+def test_preflight_recording_returns_error_when_disk_is_low(monkeypatch, tmp_path) -> None:
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    ctrl = RecordingController()
+    monkeypatch.setattr(
+        "shutil.disk_usage",
+        lambda _path: (100 * 1024**3, 95 * 1024**3, 5 * 1024**3),
+    )
+
+    message = ctrl.preflight_recording(str(tmp_path))
+
+    assert "磁盘空间不足" in message
