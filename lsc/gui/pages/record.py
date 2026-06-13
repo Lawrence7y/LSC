@@ -1287,6 +1287,11 @@ class ConfigPanel(QWidget):
         self._export_analysis_btn.clicked.connect(self.export_analysis_requested.emit)
         card.add_widget(self._export_analysis_btn)
 
+        # Analysis profile
+        card.add_widget(_label("分析 Profile"))
+        self._analysis_profile = ChipGroup(["valorant", "fps", "generic"])
+        card.add_widget(self._analysis_profile)
+
         self._layout.addWidget(card)
 
         # Info card
@@ -1451,6 +1456,11 @@ class ConfigPanel(QWidget):
     def bitrate_unit(self) -> str:
         """Current bitrate unit from param panel."""
         return self._param_panel.bitrate_unit()
+
+    @property
+    def analysis_profile(self) -> str:
+        """Currently selected analysis profile."""
+        return self._analysis_profile.selected
 
 
 class RecordPage(QWidget):

@@ -401,3 +401,14 @@ def test_record_page_updates_stream_info_after_recording_start(monkeypatch) -> N
     assert page._config._info_values["res"].text() == "1920x1080"
     assert page._config._info_values["fps"].text() == "60 fps"
     page.cleanup()
+
+
+def test_config_panel_exposes_analysis_profile_selector() -> None:
+    _qapp()
+
+    from lsc.gui.pages.record import ConfigPanel
+
+    panel = ConfigPanel()
+
+    assert panel.analysis_profile == "valorant"
+    assert panel._analysis_profile._items == ["valorant", "fps", "generic"]
