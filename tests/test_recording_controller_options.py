@@ -285,3 +285,35 @@ def test_start_recording_with_crf_defaults_input_args_to_empty_list(tmp_path) ->
 
     assert ok is True
     assert ctrl._capture.calls[-1]["input_args"] == []
+
+
+def test_start_url_parse_uses_parse_stream_url(monkeypatch) -> None:
+    from lsc.gui.pages import recording_controller as module
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    _qapp()
+
+    captured = {}
+
+    class FakeUrlParserWorker:
+        def __init__(self, page_url, parse_fn):
+            captured["page_url"] = page_url
+            captured["parse_fn"] = parse_fn
+            self.finished = types.SimpleNamespace(connect=lambda callback: captured.setdefault("callback", callback))
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(module, "UrlParserWorker", FakeUrlParserWorker)
+
+    ctrl = RecordingController()
+
+    def on_parsed(result):
+        captured["result"] = result
+
+    ctrl.start_url_parse("https://live.douyin.com/123456", on_parsed)
+
+    assert captured["page_url"] == "https://live.douyin.com/123456"
+    assert captured["parse_fn"] == ctrl.parse_stream_url
+    assert captured["callback"] is on_parsed
+    assert captured["started"] is True

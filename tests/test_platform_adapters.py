@@ -100,6 +100,28 @@ def test_direct_flv_url_is_detected_and_parsed():
     assert info.stream_url == url
 
 
+def test_direct_adapter_accepts_query_based_flv_and_m3u8_hints():
+    flv_url = "https://cdn.example.com/live?id=123&type=flv"
+    m3u8_url = "https://media.example.com/watch?format=m3u8&token=abc"
+
+    flv_info = parse_stream(flv_url)
+    m3u8_info = parse_stream(m3u8_url)
+
+    assert DirectAdapter().can_handle(flv_url) is True
+    assert DirectAdapter().can_handle(m3u8_url) is True
+    assert flv_info.platform == "direct"
+    assert flv_info.stream_url == flv_url
+    assert m3u8_info.platform == "direct"
+    assert m3u8_info.stream_url == m3u8_url
+
+
+def test_direct_adapter_keeps_plain_web_pages_outside_direct_scope():
+    adapter = DirectAdapter()
+
+    assert adapter.can_handle("https://example.com/watch?id=123") is False
+    assert adapter.can_handle("https://example.com/live?format=html") is False
+
+
 def test_direct_adapter_rejects_missing_netloc_and_non_http_scheme():
     adapter = DirectAdapter()
 
@@ -298,6 +320,15 @@ def test_douyin_adapter_does_not_claim_non_live_douyin_pages():
     assert adapter.can_handle("https://www.douyin.com/video/123456") is False
 
 
+def test_douyin_adapter_loads_real_script_module_from_repo():
+    from lsc.platforms.douyin import DouyinAdapter
+
+    module = DouyinAdapter()._load_script_module()
+
+    assert callable(module.fetch_page)
+    assert callable(module.extract_ssr_data)
+
+
 def test_bilibili_adapter_parses_live_room_with_public_play_info(monkeypatch):
     from lsc.platforms.bilibili import BILIBILI_HEADERS, BilibiliAdapter
 
@@ -388,6 +419,31 @@ def test_bilibili_adapter_returns_offline_when_room_is_not_live(monkeypatch):
 
 def test_bilibili_registry_detection():
     assert detect_platform("https://live.bilibili.com/12345") == "bilibili"
+
+
+def test_bilibili_short_link_is_classified_as_bilibili_and_returns_parse_failure():
+    url = "https://b23.tv/abc123"
+
+    info = parse_stream(url)
+
+    assert detect_platform(url) == "bilibili"
+    assert info.platform == "bilibili"
+    assert info.is_live is False
+    assert info.error_code in {ERROR_PARSE_FAILED, ERROR_RESTRICTED}
+    assert "短链" in info.error or "b23.tv" in info.error
+
+
+def test_bilibili_adapter_rejects_short_link_as_room_id_parse_failure():
+    from lsc.platforms.bilibili import BilibiliAdapter
+
+    adapter = BilibiliAdapter()
+    info = adapter.parse("https://b23.tv/xyz987")
+
+    assert adapter.can_handle("https://b23.tv/xyz987") is True
+    assert info.platform == "bilibili"
+    assert info.is_live is False
+    assert info.error_code == ERROR_PARSE_FAILED
+    assert "短链" in info.error
 
 
 def test_huya_adapter_parses_public_page_payload(monkeypatch):

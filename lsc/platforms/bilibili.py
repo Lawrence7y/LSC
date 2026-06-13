@@ -16,6 +16,7 @@ BILIBILI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 _ROOM_PATH_RE = re.compile(r"^/(?P<room_id>\d+)/?$")
+_SHORT_LINK_HOSTS = {"b23.tv", "www.b23.tv"}
 
 
 class BilibiliAdapter:
@@ -24,18 +25,27 @@ class BilibiliAdapter:
     def can_handle(self, url: str) -> bool:
         parsed = urlparse((url or "").strip())
         host = parsed.netloc.lower()
+        if host in _SHORT_LINK_HOSTS:
+            return True
         return host == "live.bilibili.com" and bool(_ROOM_PATH_RE.fullmatch(parsed.path))
 
     def parse(self, url: str) -> StreamInfo:
         clean_url = (url or "").strip()
+        if self._is_short_link(clean_url):
+            return self._failed(
+                clean_url,
+                "暂不支持解析 b23.tv 短链，请展开为 B 站直播间地址后再试。",
+                ERROR_PARSE_FAILED,
+            )
+
         room_id = self._extract_room_id(clean_url)
         if not room_id:
-            return self._failed(clean_url, "无法识别 B 站直播间号", ERROR_PARSE_FAILED)
+            return self._failed(clean_url, "无法识别 B 站直播间号。", ERROR_PARSE_FAILED)
 
         room_init = self._fetch_json(ROOM_INIT_URL, params={"id": room_id})
         room_data = room_init.get("data")
         if room_init.get("code") != 0 or not isinstance(room_data, dict):
-            return self._failed(clean_url, "B 站直播间初始化接口返回异常", ERROR_PARSE_FAILED)
+            return self._failed(clean_url, "B 站直播间初始化接口返回异常。", ERROR_PARSE_FAILED)
 
         real_room_id = str(room_data.get("room_id") or room_id)
         title = str(room_data.get("title") or "")
@@ -43,7 +53,7 @@ class BilibiliAdapter:
         if int(room_data.get("live_status") or 0) != 1:
             return self._failed(
                 clean_url,
-                "B 站直播间未开播",
+                "B 站直播间未开播。",
                 ERROR_OFFLINE,
                 raw={"room_init": room_init},
             )
@@ -63,13 +73,13 @@ class BilibiliAdapter:
         )
         play_data = play_info.get("data")
         if play_info.get("code") != 0 or not isinstance(play_data, dict):
-            return self._failed(clean_url, "B 站播放信息接口返回异常", ERROR_PARSE_FAILED)
+            return self._failed(clean_url, "B 站播放信息接口返回异常。", ERROR_PARSE_FAILED)
 
         stream_url, quality_urls = self._extract_play_urls(play_data)
         if not stream_url:
             return self._failed(
                 clean_url,
-                "B 站直播间暂无公开播放地址",
+                "B 站直播间暂无公开播放地址。",
                 ERROR_RESTRICTED,
                 raw={"room_init": room_init, "play_info": play_info},
             )
@@ -92,6 +102,9 @@ class BilibiliAdapter:
         if match is None:
             return ""
         return match.group("room_id")
+
+    def _is_short_link(self, url: str) -> bool:
+        return urlparse(url).netloc.lower() in _SHORT_LINK_HOSTS
 
     def _fetch_json(self, url: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         query = urlencode(params or {})

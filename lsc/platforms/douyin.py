@@ -30,7 +30,7 @@ class DouyinAdapter:
             module = self._load_script_module()
             html = module.fetch_page(clean_url)
             if not html:
-                return self._failed(clean_url, "无法获取抖音直播间页面", ERROR_PARSE_FAILED)
+                return self._failed(clean_url, "无法获取抖音直播间页面。", ERROR_PARSE_FAILED)
             data = module.extract_ssr_data(html) or {}
         except Exception as exc:
             return self._failed(clean_url, f"抖音直播间解析失败: {exc}", ERROR_PARSE_FAILED)
@@ -40,13 +40,13 @@ class DouyinAdapter:
         if not is_live:
             return self._failed(
                 clean_url,
-                str(data.get("error", "") or "抖音直播间未开播"),
+                str(data.get("error", "") or "抖音直播间未开播。"),
                 ERROR_OFFLINE,
                 raw=data if isinstance(data, dict) else {},
             )
 
         raw_quality_urls = data.get("qualityUrls") or {}
-        quality_urls = {}
+        quality_urls: dict[str, str] = {}
         if isinstance(raw_quality_urls, dict):
             quality_urls = {
                 str(key): str(value)

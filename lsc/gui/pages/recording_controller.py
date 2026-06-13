@@ -107,7 +107,7 @@ class AnalysisWorker(QThread):
             highlights = result.get("highlights", []) if isinstance(result, dict) else []
             self.finished.emit(True, result_path, "", len(highlights))
         except SystemExit as exc:
-            self.finished.emit(False, "", f"鍒嗘瀽澶辫触 (exit {exc.code})", 0)
+            self.finished.emit(False, "", f"分析失败 (exit {exc.code})", 0)
         except Exception as exc:
             self.finished.emit(False, "", str(exc), 0)
 
@@ -183,7 +183,7 @@ class RecordingController:
                 self._capture.set_status_callback(on_status_cb)
         except Exception as exc:
             _log.warning("Failed to initialize capture: %s", exc)
-            self.capture_init_error = str(exc) or "褰曞埗鍣ㄥ垵濮嬪寲澶辫触"
+            self.capture_init_error = str(exc) or "录制器初始化失败"
             self._capture = None
 
     def init_exporter(self):
@@ -197,7 +197,7 @@ class RecordingController:
             self.output_dir = cfg.output_dir
         except Exception as exc:
             _log.warning("Failed to initialize exporter: %s", exc)
-            self.exporter_init_error = str(exc) or "瀵煎嚭鍣ㄥ垵濮嬪寲澶辫触"
+            self.exporter_init_error = str(exc) or "导出器初始化失败"
             self._exporter = None
 
     # 鈹€鈹€ Preflight checks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -395,10 +395,10 @@ class RecordingController:
 
         if encoder == "H.264 NVENC":
             if on_status:
-                on_status("妫€娴?NVENC 纭欢缂栫爜...", "info")
+                on_status("检测 NVENC 硬件编码...", "info")
             if not self.check_nvenc_available():
                 if on_status:
-                    on_status("NVENC 涓嶅彲鐢紝鑷姩鍒囨崲涓?Copy 妯″紡", "warning")
+                    on_status("NVENC 不可用，自动切换为 Copy 模式", "warning")
                 encoder_used = "Copy"
 
         if param_mode == "不限制":
@@ -525,7 +525,7 @@ class RecordingController:
         # Use public API 鈥?no private-member access
         exit_code = self._capture.check_and_handle_crash()
         if exit_code is not None:
-            return f"FFmpeg 寮傚父閫€鍑?(code {exit_code})"
+            return f"FFmpeg 异常退出 (code {exit_code})"
         msg = self._capture.check_health()
         return msg
 
