@@ -385,10 +385,7 @@ class RecordingController:
         output_path = os.path.join(output_dir, f"recording_{timestamp}.mp4")
 
         if input_args is None:
-            input_args = [
-                "-headers",
-                "Referer: https://live.douyin.com/\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n",
-            ]
+            input_args = []
 
         output_args: list[str] = []
         encoder_used = encoder

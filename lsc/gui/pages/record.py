@@ -1748,6 +1748,7 @@ class RecordPage(QWidget):
             param_mode=param_mode,
             bitrate=bitrate_value,
             bitrate_unit=bitrate_unit,
+            input_args=self._ctrl.input_args or None,
             on_status=lambda txt, typ: self.status_changed.emit(txt, typ),
         )
 

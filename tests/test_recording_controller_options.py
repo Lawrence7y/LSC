@@ -199,3 +199,89 @@ def test_parse_douyin_url_uses_platform_layer_legacy_shape(monkeypatch) -> None:
         "-headers",
         "Referer: https://live.douyin.com/\r\n",
     ]
+
+
+def test_parse_stream_url_returns_legacy_shape(monkeypatch) -> None:
+    from lsc.gui.pages.recording_controller import RecordingController
+    from lsc.platforms.base import StreamInfo
+
+    _qapp()
+
+    def fake_parse_stream(url):
+        assert url == "https://live.douyin.com/654321"
+        return StreamInfo(
+            platform="douyin",
+            room_url=url,
+            stream_url="https://example.com/stream.m3u8",
+            title="另一场直播",
+            streamer="主播B",
+            is_live=True,
+            quality_urls={"origin": "https://example.com/stream.m3u8"},
+            selected_quality="origin",
+            headers={"Referer": "https://live.douyin.com/"},
+            raw={"room_id": "654321"},
+        )
+
+    monkeypatch.setattr("lsc.gui.pages.recording_controller.parse_stream", fake_parse_stream)
+
+    ctrl = RecordingController()
+    result = ctrl.parse_stream_url("https://live.douyin.com/654321")
+
+    assert result["platform"] == "douyin"
+    assert result["title"] == "另一场直播"
+    assert result["streamerName"] == "主播B"
+    assert result["isLive"] is True
+    assert result["streamUrl"] == "https://example.com/stream.m3u8"
+    assert result["roomUrl"] == "https://live.douyin.com/654321"
+    assert result["qualityUrls"] == {"origin": "https://example.com/stream.m3u8"}
+    assert result["availableQualities"] == ["origin"]
+    assert result["selectedQuality"] == "origin"
+    assert result["_headers"] == {"Referer": "https://live.douyin.com/"}
+    assert result["_inputArgs"] == [
+        "-headers",
+        "Referer: https://live.douyin.com/\r\n",
+    ]
+    assert result["_raw"] == {"room_id": "654321"}
+    assert result["error"] == ""
+    assert result["errorCode"] == ""
+    assert ctrl.input_args == [
+        "-headers",
+        "Referer: https://live.douyin.com/\r\n",
+    ]
+
+
+def test_start_recording_with_crf_passes_explicit_input_args_to_capture(tmp_path) -> None:
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    ctrl = RecordingController()
+    ctrl._capture = _FakeCapture()
+    input_args = ["-headers", "Referer: https://example.com/\r\n"]
+
+    ok, _output_path, _encoder_used = ctrl.start_recording_with_crf(
+        "https://example.com/live.m3u8",
+        str(tmp_path),
+        "H.264 CPU",
+        21,
+        input_args=input_args,
+    )
+
+    assert ok is True
+    assert ctrl._capture.calls[-1]["input_args"] == input_args
+
+
+def test_start_recording_with_crf_defaults_input_args_to_empty_list(tmp_path) -> None:
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    ctrl = RecordingController()
+    ctrl._capture = _FakeCapture()
+
+    ok, _output_path, _encoder_used = ctrl.start_recording_with_crf(
+        "https://example.com/live.m3u8",
+        str(tmp_path),
+        "Copy",
+        21,
+        input_args=None,
+    )
+
+    assert ok is True
+    assert ctrl._capture.calls[-1]["input_args"] == []
