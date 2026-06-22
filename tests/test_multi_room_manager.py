@@ -141,7 +141,7 @@ def test_manager_start_and_stop_recording_uses_room_controller(tmp_path) -> None
 
         def start_recording_with_crf(self, stream_url, output_dir, encoder, crf, **kwargs):
             self.calls.append(("start", stream_url, output_dir, encoder, crf, kwargs))
-            return True, str(tmp_path / "recording.mp4"), encoder
+            return True, str(tmp_path / "recording.mp4"), encoder, ""
 
         def stop_recording(self):
             self.calls.append(("stop",))
@@ -161,6 +161,57 @@ def test_manager_start_and_stop_recording_uses_room_controller(tmp_path) -> None
     assert room.record_output_path.endswith("recording.mp4")
 
 
+def test_manager_start_recording_refreshes_stream_url_before_ffmpeg_start(monkeypatch, tmp_path) -> None:
+    from lsc.gui.multi_room.manager import MultiRoomManager
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.stream_url = "https://example.com/expired.flv"
+            self.input_args = ["-headers", "Referer: https://old.example/\r\n"]
+            self.selected_quality = "250"
+            self.calls: list[tuple] = []
+
+        def start_recording_with_crf(self, stream_url, output_dir, encoder, crf, **kwargs):
+            self.calls.append(("start", stream_url, output_dir, encoder, crf, kwargs))
+            return True, str(tmp_path / "recording.mp4"), encoder, ""
+
+    refreshed = StreamInfo(
+        platform="bilibili",
+        room_url="https://live.bilibili.com/35",
+        stream_url="https://example.com/fresh-250.flv",
+        is_live=True,
+        quality_urls={
+            "250": "https://example.com/fresh-250.flv",
+            "400": "https://example.com/fresh-400.flv",
+        },
+        selected_quality="250",
+        headers={"Referer": "https://live.bilibili.com/"},
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def fake_parse_stream(url: str, *, force_refresh: bool = False):
+        calls.append((url, force_refresh))
+        return refreshed
+
+    monkeypatch.setattr("lsc.gui.multi_room.manager.parse_stream", fake_parse_stream)
+
+    manager = MultiRoomManager(controller_factory=FakeController)
+    room = manager.add_room("https://live.bilibili.com/35")
+    room.is_connected = True
+    room.selected_quality = "250"
+
+    assert manager.start_recording(room.room_id, str(tmp_path), "Copy", 23) is True
+
+    assert calls == [("https://live.bilibili.com/35", True)]
+    assert room.controller.stream_url == "https://example.com/fresh-250.flv"
+    assert room.controller.input_args == ["-headers", "Referer: https://live.bilibili.com/\r\n"]
+    assert room.controller.calls[-1][1] == "https://example.com/fresh-250.flv"
+    assert room.controller.calls[-1][5]["input_args"] == [
+        "-headers",
+        "Referer: https://live.bilibili.com/\r\n",
+    ]
+
+
 def test_manager_start_and_stop_recording_all_is_failure_isolated(tmp_path) -> None:
     from lsc.gui.multi_room.manager import MultiRoomManager
 
@@ -170,14 +221,16 @@ def test_manager_start_and_stop_recording_all_is_failure_isolated(tmp_path) -> N
             self.input_args: list[str] = []
 
         def start_recording_with_crf(self, stream_url, output_dir, encoder, crf, **kwargs):
-            return bool(stream_url), str(tmp_path / "recording.mp4"), encoder
+            if stream_url:
+                return True, str(tmp_path / "recording.mp4"), encoder, ""
+            return False, "", encoder, "直播流地址已失效"
 
         def stop_recording(self):
             return bool(self.stream_url), 1.0, str(tmp_path / "recording.mp4")
 
     manager = MultiRoomManager(controller_factory=FakeController)
     first = manager.add_room("https://example.com/a.m3u8")
-    second = manager.add_room("https://example.com/b.m3u8")
+    second = manager.add_room("not-a-supported-live-url")
     first.is_connected = True
     second.is_connected = True
     first.controller.stream_url = "https://example.com/a.m3u8"
@@ -190,3 +243,25 @@ def test_manager_start_and_stop_recording_all_is_failure_isolated(tmp_path) -> N
     assert started[second.room_id] is False
     assert stopped[first.room_id] is True
     assert stopped[second.room_id] is False
+    # Failed room should carry the refresh/connect error detail.
+    assert second.last_error
+
+
+def test_manager_start_recording_propagates_error_detail(tmp_path) -> None:
+    """When start_recording fails, room.last_error must carry the controller's message."""
+    from lsc.gui.multi_room.manager import MultiRoomManager
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.stream_url = "https://example.com/live.m3u8"
+            self.input_args: list[str] = []
+
+        def start_recording_with_crf(self, stream_url, output_dir, encoder, crf, **kwargs):
+            return False, "", encoder, "连接直播流超时"
+
+    manager = MultiRoomManager(controller_factory=FakeController)
+    room = manager.add_room("https://example.com/live.m3u8")
+    room.is_connected = True
+
+    assert manager.start_recording(room.room_id, str(tmp_path), "Copy", 23) is False
+    assert room.last_error == "连接直播流超时"

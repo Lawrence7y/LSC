@@ -5,11 +5,13 @@ import os
 import sys
 import types
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 
 def _qapp() -> QApplication:
@@ -26,8 +28,9 @@ def _install_record_page_stubs(monkeypatch) -> None:
 
     mpv_widget = types.ModuleType("lsc.gui.components.mpv_widget")
 
-    class _DummyMpvWidget:
+    class _DummyMpvWidget(QWidget):
         def __init__(self, *args, **kwargs):
+            super().__init__()
             self._playing = False
 
         def setStyleSheet(self, _style):
@@ -74,8 +77,14 @@ def _install_record_page_stubs(monkeypatch) -> None:
 
     widgets = types.ModuleType("lsc.gui.components.widgets")
 
-    class _DummyWidget:
+    class _DummyWidget(QWidget):
         def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def add_widget(self, _widget):
+            pass
+
+        def add_layout(self, _layout):
             pass
 
     widgets.Card = _DummyWidget
@@ -88,6 +97,7 @@ def _install_record_page_stubs(monkeypatch) -> None:
 
     theme = types.ModuleType("lsc.gui.theme")
     theme.get_option_button_palette = lambda *args, **kwargs: {}
+    theme.connect_theme_changed = lambda slot: None
     theme.get_theme = lambda: types.SimpleNamespace(
         border_subtle="#000000",
         text_tertiary="#666666",
@@ -105,17 +115,39 @@ def _install_record_page_stubs(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "lsc.gui.theme", theme)
 
 
-def test_record_page_space_i_o_shortcuts_trigger_expected_actions(monkeypatch) -> None:
-    _qapp()
+# Modules whose import-time bindings can be polluted by the stubs above.
+_POLLUTED_MODULES = (
+    "lsc.gui.pages.record",
+    "lsc.gui.pages.recording_controller",
+)
+
+
+@pytest.fixture
+def record_page_stubs(monkeypatch):
+    """Install lightweight stubs for record page heavy dependencies.
+
+    After the test, evict the cached record/recording_controller modules so
+    that subsequent tests re-import them against the REAL modules (the stubs
+    only live in sys.modules for the duration of this test via monkeypatch,
+    but modules imported during the test keep their bound references).
+    """
     _install_record_page_stubs(monkeypatch)
+    yield
+    for mod_name in list(sys.modules):
+        if mod_name in _POLLUTED_MODULES or mod_name.startswith("lsc.gui.pages.record"):
+            sys.modules.pop(mod_name, None)
+
+
+def test_record_page_space_i_o_shortcuts_trigger_expected_actions(record_page_stubs) -> None:
+    _qapp()
 
     from lsc.gui.pages.record import RecordPage
 
     page = RecordPage.__new__(RecordPage)
     hits: list[str] = []
-    monkeypatch.setattr(page, "_on_play_pause", lambda: hits.append("play"))
-    monkeypatch.setattr(page, "_on_mark_in", lambda: hits.append("in"))
-    monkeypatch.setattr(page, "_on_mark_out", lambda: hits.append("out"))
+    page._on_play_pause = lambda: hits.append("play")
+    page._on_mark_in = lambda: hits.append("in")
+    page._on_mark_out = lambda: hits.append("out")
 
     page.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Space, Qt.NoModifier))
     page.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_I, Qt.NoModifier))
@@ -124,9 +156,8 @@ def test_record_page_space_i_o_shortcuts_trigger_expected_actions(monkeypatch) -
     assert hits == ["play", "in", "out"]
 
 
-def test_record_page_start_recording_passes_controller_input_args(monkeypatch, tmp_path) -> None:
+def test_record_page_start_recording_passes_controller_input_args(record_page_stubs, tmp_path) -> None:
     _qapp()
-    _install_record_page_stubs(monkeypatch)
 
     from lsc.gui.pages.record import RecordPage
 
@@ -171,9 +202,35 @@ def test_record_page_start_recording_passes_controller_input_args(monkeypatch, t
                 "kwargs": kwargs,
             }
         )
-        return False, "", encoder
+        return False, "", encoder, "FFmpeg 未找到: /usr/bin/ffmpeg"
 
     page._ctrl.start_recording_with_crf = fake_start_recording_with_crf
 
     assert page._start_recording() is False
     assert calls[-1]["kwargs"]["input_args"] == ["-headers", "Referer: https://example.com/\r\n"]
+
+
+def test_record_page_analyze_current_uses_selected_profile(record_page_stubs, tmp_path) -> None:
+    _qapp()
+
+    from lsc.gui.pages.record import RecordPage
+
+    video_path = tmp_path / "recording.mp4"
+    video_path.write_bytes(b"fake")
+    calls: list[tuple[str, str, str]] = []
+
+    page = RecordPage.__new__(RecordPage)
+    page._ctrl = types.SimpleNamespace(
+        video_path=str(video_path),
+        start_analysis=lambda path, profile, output_dir, callback: calls.append((path, profile, output_dir)) or False,
+    )
+    page._config = types.SimpleNamespace(
+        output_path=str(tmp_path),
+        analysis_profile="fps",
+        set_analyze_enabled=lambda _value: None,
+    )
+    page.status_changed = types.SimpleNamespace(emit=lambda *_args: None)
+
+    page._on_analyze_current()
+
+    assert calls == [(str(video_path), "fps", str(tmp_path))]

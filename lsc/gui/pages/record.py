@@ -5,7 +5,7 @@ Record page - 1:1 replica of ui-design-prototype.html
 import math
 import os
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPolygon
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from lsc.utils.helpers import fmt_time as _fmt_time
 
+from ..components.control_bar import ControlBar as SharedControlBar
 from ..components.mpv_widget import MpvWidget
 from ..components.widgets import Card, ChipGroup, EmptyState, FadeInWidget, InputField, ParamPanel
 from ..theme import get_option_button_palette, get_theme, is_dark
@@ -39,6 +40,54 @@ def _label(text, style="secondary", size=12):
     return lbl
 
 
+class _FullscreenOverlayButton(QPushButton):
+    """Small corner icon button used over video previews."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._exit_mode = False
+        self.setObjectName("previewFullscreenButton")
+        self.setFixedSize(36, 36)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("全屏")
+
+    def set_exit_mode(self, exit_mode: bool) -> None:
+        self._exit_mode = exit_mode
+        self.setToolTip("退出全屏" if exit_mode else "全屏")
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bg = QColor(0, 0, 0, 125 if not self.underMouse() else 170)
+        p.setBrush(bg)
+        p.setPen(QColor(255, 255, 255, 45))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 8, 8)
+
+        p.setPen(QPen(QColor(255, 255, 255, 235), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        if self._exit_mode:
+            # Inward corners: collapse back to the normal preview.
+            p.drawLine(12, 12, 17, 12)
+            p.drawLine(12, 12, 12, 17)
+            p.drawLine(24, 12, 19, 12)
+            p.drawLine(24, 12, 24, 17)
+            p.drawLine(12, 24, 17, 24)
+            p.drawLine(12, 24, 12, 19)
+            p.drawLine(24, 24, 19, 24)
+            p.drawLine(24, 24, 24, 19)
+        else:
+            # Outward corners: enter fullscreen.
+            p.drawLine(10, 10, 16, 10)
+            p.drawLine(10, 10, 10, 16)
+            p.drawLine(26, 10, 20, 10)
+            p.drawLine(26, 10, 26, 16)
+            p.drawLine(10, 26, 16, 26)
+            p.drawLine(10, 26, 10, 20)
+            p.drawLine(26, 26, 20, 26)
+            p.drawLine(26, 26, 26, 20)
+        p.end()
+
+
 class VideoPreview(QWidget):
     """Video preview / recording indicator.
 
@@ -51,6 +100,8 @@ class VideoPreview(QWidget):
     A paintEvent overlay shows a pulsing dot + "正在录制" when recording.
     """
 
+    fullscreen_clicked = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._recording = False
@@ -59,13 +110,16 @@ class VideoPreview(QWidget):
         self.setMinimumSize(400, 225)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # mpv-based video playback (supports growing files)
+        # mpv-based video playback (supports growing files), created lazily
+        # so ordinary page construction and offscreen tests do not start mpv.
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
-        self._mpv_widget = MpvWidget()
-        self._mpv_widget.setStyleSheet("border-radius:14px;")
-        self._mpv_widget.hide()
-        self._layout.addWidget(self._mpv_widget)
+        self._mpv_widget: MpvWidget | None = None
+
+        self._fullscreen_btn = _FullscreenOverlayButton(self)
+        self._fullscreen_btn.clicked.connect(self.fullscreen_clicked.emit)
+        self._fullscreen_btn.show()
+        self._fullscreen_btn.raise_()
 
         # Animation timer for pulsing REC dot during recording
         self._anim_timer = QTimer(self)
@@ -85,47 +139,80 @@ class VideoPreview(QWidget):
             self._anim_timer.stop()
         self.update()
 
+    def _ensure_mpv_widget(self) -> MpvWidget:
+        if self._mpv_widget is None:
+            self._mpv_widget = MpvWidget()
+            self._mpv_widget.setStyleSheet("border-radius:14px;")
+            self._mpv_widget.hide()
+            self._layout.addWidget(self._mpv_widget)
+            self._fullscreen_btn.raise_()
+        return self._mpv_widget
+
+    def set_fullscreen_mode(self, enabled: bool) -> None:
+        self._fullscreen_btn.set_exit_mode(enabled)
+        self._fullscreen_btn.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        margin = 12
+        size = self._fullscreen_btn.size()
+        self._fullscreen_btn.move(
+            max(margin, self.width() - size.width() - margin),
+            max(margin, self.height() - size.height() - margin),
+        )
+        self._fullscreen_btn.raise_()
+
     def play_video(self, path):
         """Play a completed (non-growing) recording."""
         if not os.path.isfile(path):
             return
         self.stop_video()
-        self._mpv_widget.show()
-        self._mpv_widget.play_video(path, live=False)
+        player = self._ensure_mpv_widget()
+        player.show()
+        player.play_video(path, live=False)
         self.update()
 
     def play_live(self, path):
         """Play a growing file during recording (live mode)."""
-        self._mpv_widget.show()
-        self._mpv_widget.play_live(path)
+        player = self._ensure_mpv_widget()
+        player.show()
+        player.play_live(path)
         self.update()
 
     def stop_video(self):
         """Stop video playback."""
-        self._mpv_widget.stop_video()
+        if self._mpv_widget is not None:
+            self._mpv_widget.stop_video()
         self.update()
 
     def is_playing(self):
-        return self._mpv_widget.is_playing()
+        return bool(self._mpv_widget and self._mpv_widget.is_playing())
 
     def toggle_play_pause(self):
-        self._mpv_widget.toggle_play_pause()
+        if self._mpv_widget is not None:
+            self._mpv_widget.toggle_play_pause()
 
     def seek_to(self, sec):
-        self._mpv_widget.seek_to(sec)
+        if self._mpv_widget is not None:
+            self._mpv_widget.seek_to(sec)
 
     def position_sec(self):
+        if self._mpv_widget is None:
+            return 0.0
         return self._mpv_widget.position_sec()
 
     def duration_sec(self):
+        if self._mpv_widget is None:
+            return 0.0
         return self._mpv_widget.duration_sec()
 
     def cleanup(self):
         """Clean up mpv resources."""
-        self._mpv_widget.cleanup()
+        if self._mpv_widget is not None:
+            self._mpv_widget.cleanup()
 
     def paintEvent(self, e):
-        mpv_visible = self._mpv_widget.isVisible()
+        mpv_visible = bool(self._mpv_widget and self._mpv_widget.isVisible())
 
         # When mpv is showing video (recording or playback), avoid painting
         # an opaque background over it — let the video show through.
@@ -162,7 +249,7 @@ class VideoPreview(QWidget):
             p.drawText(text_rect, Qt.AlignVCenter, f"录制中 {self._time}")
         elif self._recording:
             # No live preview yet (mpv not visible) — full overlay
-            p.setBrush(QColor("#000000"))
+            p.setBrush(QColor(c.bg_tertiary))
             p.setPen(QColor(c.border_subtle))
             p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 14, 14)
 
@@ -181,7 +268,7 @@ class VideoPreview(QWidget):
             p.drawText(r.adjusted(0, 40, 0, 0), Qt.AlignCenter, self._time)
         else:
             # Idle state — no video, no recording
-            p.setBrush(QColor("#000000"))
+            p.setBrush(QColor(c.bg_tertiary))
             p.setPen(QColor(c.border_subtle))
             p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 14, 14)
             p.setPen(QColor(c.text_tertiary))
@@ -369,7 +456,7 @@ class InlineTimeline(QWidget):
             return c.accent_success
         if self._cursor_mode == self.CURSOR_RED:
             return c.accent_error
-        return "#ffffff"
+        return c.text_primary
 
     def set_data(self, duration=0, position=0, start=None, end=None):
         self._duration = duration
@@ -965,18 +1052,32 @@ class ControlBar(QWidget):
 
 
 class FullscreenPlayerWindow(QWidget):
-    def __init__(self, preview: VideoPreview, controls: ControlBar, on_exit=None):
+    def __init__(self, preview: VideoPreview, controls: QWidget, on_exit=None):
         super().__init__()
         self._on_exit = on_exit
         self.setWindowTitle("LSC 全屏播放器")
         self.setObjectName("fullscreenPlayer")
         self.setStyleSheet("QWidget#fullscreenPlayer { background:#000000; }")
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(preview, 1)
         lay.addWidget(controls)
+
+        self._minimize_btn = QPushButton("—", self)
+        self._minimize_btn.setObjectName("fullscreenMinimizeButton")
+        self._minimize_btn.setFixedSize(40, 32)
+        self._minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._minimize_btn.setToolTip("最小化")
+        self._minimize_btn.clicked.connect(self.showMinimized)
+        self._minimize_btn.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._minimize_btn.move(max(8, self.width() - self._minimize_btn.width() - 12), 12)
+        self._minimize_btn.raise_()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
@@ -999,7 +1100,6 @@ class ExportedCard(QWidget):
         super().__init__(parent)
         self._hover = False
         self.setMouseTracking(True)
-        c = get_theme()
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedHeight(120)
         self.setMinimumWidth(190)
@@ -1091,7 +1191,6 @@ class ExportedClipsGrid(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        c = get_theme()
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(16)
@@ -1207,7 +1306,6 @@ class ConfigPanel(QWidget):
         self._build()
 
     def _build(self):
-        c = get_theme()
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(16)
@@ -1513,9 +1611,10 @@ class RecordPage(QWidget):
         self._player_layout = player_layout
 
         self._preview = VideoPreview()
+        self._preview.fullscreen_clicked.connect(self._on_fullscreen_toggle)
         player_layout.addWidget(self._preview, 1)
 
-        self._controls = ControlBar()
+        self._controls = SharedControlBar()
         self._controls.play_pause.connect(self._on_play_pause)
         self._controls.mark_in_clicked.connect(self._on_mark_in)
         self._controls.mark_out_clicked.connect(self._on_mark_out)
@@ -1524,7 +1623,6 @@ class RecordPage(QWidget):
         self._controls.seek_fwd.connect(self._on_seek_fwd)
         self._controls.timeline.position_changed.connect(self._on_timeline_seek)
         self._controls.return_live_clicked.connect(self._on_return_to_live)
-        self._controls.fullscreen_clicked.connect(self._on_fullscreen_toggle)
         player_layout.addWidget(self._controls)
 
         left.addWidget(player_section, 3)
@@ -1559,9 +1657,8 @@ class RecordPage(QWidget):
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QScrollArea.NoFrame)
         right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        right_scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
-        right_scroll.setMinimumWidth(280)
-        right_scroll.setMaximumWidth(380)
+        right_scroll.setMinimumWidth(400)
+        right_scroll.setMaximumWidth(420)
         right_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
         self._config = ConfigPanel()
@@ -1569,10 +1666,10 @@ class RecordPage(QWidget):
         self._config.start_record_requested.connect(self._on_record_toggle)
         self._config.analyze_requested.connect(self._on_analyze_current)
         self._config.export_analysis_requested.connect(self._on_export_analysis_results)
+        self._config.setMaximumWidth(380)
         fade_config = FadeInWidget(delay_ms=100)
-        fade_config_layout = QVBoxLayout(fade_config)
-        fade_config_layout.setContentsMargins(0, 0, 0, 0)
-        fade_config_layout.addWidget(self._config)
+        fade_config.addWidget(self._config)
+        fade_config.setMaximumWidth(380)
         right_scroll.setWidget(fade_config)
         lay.addWidget(right_scroll)
 
@@ -1618,6 +1715,7 @@ class RecordPage(QWidget):
         self._preview.setParent(None)
         self._controls.setParent(None)
         self._controls.set_fullscreen(True)
+        self._preview.set_fullscreen_mode(True)
         self._fullscreen_window = FullscreenPlayerWindow(
             self._preview,
             self._controls,
@@ -1635,6 +1733,7 @@ class RecordPage(QWidget):
         self._player_layout.insertWidget(0, self._preview, 1)
         self._player_layout.insertWidget(1, self._controls)
         self._controls.set_fullscreen(False)
+        self._preview.set_fullscreen_mode(False)
         if close_window:
             win._on_exit = None
             win.close()
@@ -1740,7 +1839,7 @@ class RecordPage(QWidget):
         bitrate_value = self._config.bitrate_value
         bitrate_unit = self._config.bitrate_unit
 
-        success, output_path, encoder_used = self._ctrl.start_recording_with_crf(
+        success, output_path, encoder_used, error_msg = self._ctrl.start_recording_with_crf(
             self._ctrl.stream_url,
             output_dir,
             encoder,
@@ -1777,7 +1876,8 @@ class RecordPage(QWidget):
             self._controls.set_playing(True)
             self._emit_stats()
         else:
-            self.status_changed.emit("录制启动失败: FFmpeg 无法连接直播流", "error")
+            detail = error_msg or "FFmpeg 无法连接直播流"
+            self.status_changed.emit(f"录制启动失败: {detail}", "error")
             # Reset UI — no need to stop capture since it never started
             self._preview.set_state(recording=False, connected=False)
             self._controls.set_recording(False)
@@ -1802,10 +1902,11 @@ class RecordPage(QWidget):
             self._ctrl.video_path = output_path
             self._config.set_info("size", f"{size_mb:.1f} MB")
             self.status_changed.emit(f"录制完成: {size_mb:.1f} MB", "success")
-            dur = self._ctrl.probe_video_duration()
-            if dur > 0:
-                self._ctrl.total_sec = dur
-                self._controls.timeline.set_data(duration=dur, position=0)
+            def _on_probed_success(dur):
+                if dur > 0:
+                    self._ctrl.total_sec = dur
+                    self._controls.timeline.set_data(duration=dur, position=0)
+            self._ctrl.probe_video_duration(on_probed=_on_probed_success)
             # Auto-play the completed recording
             if output_path and os.path.isfile(output_path):
                 self._preview.play_video(output_path)
@@ -1819,10 +1920,11 @@ class RecordPage(QWidget):
                 size_mb = os.path.getsize(actual_path) / (1024 * 1024)
                 self._config.set_info("size", f"{size_mb:.1f} MB")
                 self.status_changed.emit(f"录制完成: {size_mb:.1f} MB", "success")
-                dur = self._ctrl.probe_video_duration()
-                if dur > 0:
-                    self._ctrl.total_sec = dur
-                    self._controls.timeline.set_data(duration=dur, position=0)
+                def _on_probed_failure(dur):
+                    if dur > 0:
+                        self._ctrl.total_sec = dur
+                        self._controls.timeline.set_data(duration=dur, position=0)
+                self._ctrl.probe_video_duration(on_probed=_on_probed_failure)
                 # Auto-play the completed recording
                 self._preview.play_video(actual_path)
                 played_output = True
@@ -2065,7 +2167,6 @@ class RecordPage(QWidget):
 
         idx = len(self._ctrl.exported) + 1
         name = f"clip_{idx:03d}_{_fmt_time(self._start_sec).replace(':', '')}.mp4"
-        duration = self._end_sec - self._start_sec
         start_sec = self._start_sec
         end_sec = self._end_sec
 
@@ -2108,7 +2209,7 @@ class RecordPage(QWidget):
         self.status_changed.emit("分析中...", "info")
         started = self._ctrl.start_analysis(
             video_path,
-            "valorant",
+            self._config.analysis_profile,
             output_dir,
             self._on_analysis_done,
         )
