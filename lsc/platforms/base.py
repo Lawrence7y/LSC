@@ -30,6 +30,10 @@ def fetch_url(url: str, *, headers: dict[str, str] | None = None,
 
     Returns the response body as text. Raises on final failure.
     """
+    # 安全检查：只允许 HTTP/HTTPS 协议
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(f"Only HTTP/HTTPS URLs are supported, got: {url}")
+
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -66,6 +70,11 @@ def fetch_head(url: str, *, headers: dict[str, str] | None = None,
     Useful for expanding short links without downloading the response body.
     Returns the original URL if no redirect occurred or on final failure.
     """
+    # 安全检查：只允许 HTTP/HTTPS 协议
+    if not url.startswith(("http://", "https://")):
+        _log.warning("fetch_head called with non-HTTP URL: %s", url)
+        return url
+
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:

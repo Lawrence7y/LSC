@@ -320,6 +320,22 @@ def test_douyin_adapter_does_not_claim_non_live_douyin_pages():
     assert adapter.can_handle("https://www.douyin.com/video/123456") is False
 
 
+def test_douyin_adapter_handles_follow_live_url():
+    from lsc.platforms.douyin import DouyinAdapter
+
+    adapter = DouyinAdapter()
+
+    # 关注直播URL格式: www.douyin.com/follow/live/{room_id}
+    assert adapter.can_handle("https://www.douyin.com/follow/live/4577510133") is True
+    assert adapter.can_handle("https://www.douyin.com/follow/live/4577510133?anchor_id=4253376104366720") is True
+
+    # 非数字房间ID应该不匹配
+    assert adapter.can_handle("https://www.douyin.com/follow/live/abc") is False
+
+    # 其他路径应该不匹配
+    assert adapter.can_handle("https://www.douyin.com/follow/123") is False
+
+
 def test_douyin_adapter_loads_real_script_module_from_repo():
     from lsc.platforms.douyin import DouyinAdapter
 

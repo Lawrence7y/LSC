@@ -30,6 +30,8 @@ DOUYIN_HEADERS = {
 _USER_PROFILE_RE = re.compile(r"^/user/(?P<sec_uid>[^/?#]+)/?$")
 # 直播间URL模式: https://live.douyin.com/xxx
 _LIVE_ROOM_RE = re.compile(r"^/\d+/?$")
+# 关注直播URL模式: https://www.douyin.com/follow/live/xxx
+_FOLLOW_LIVE_RE = re.compile(r"^/follow/live/(?P<room_id>\d+)/?$")
 
 
 class DouyinAdapter(BasePlatformAdapter):
@@ -53,6 +55,10 @@ class DouyinAdapter(BasePlatformAdapter):
         if host in self._USER_HOSTS and bool(_USER_PROFILE_RE.fullmatch(path)):
             return True
 
+        # 关注直播URL: www.douyin.com/follow/live/xxx
+        if host in self._USER_HOSTS and bool(_FOLLOW_LIVE_RE.fullmatch(path)):
+            return True
+
         return False
 
     def parse(self, url: str) -> StreamInfo:
@@ -67,6 +73,13 @@ class DouyinAdapter(BasePlatformAdapter):
             if match:
                 sec_uid = match.group("sec_uid")
                 return self._parse_user_profile(clean_url, sec_uid)
+            
+            # 关注直播URL - 提取房间ID
+            match = _FOLLOW_LIVE_RE.fullmatch(path)
+            if match:
+                room_id = match.group("room_id")
+                live_url = f"https://live.douyin.com/{room_id}"
+                return self._parse_live_room(live_url)
         
         # 直播间URL - 直接解析
         return self._parse_live_room(clean_url)

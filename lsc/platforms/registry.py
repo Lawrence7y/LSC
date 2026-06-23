@@ -84,24 +84,34 @@ class _ParseCache:
         return self._failure_ttl if info.error else self._success_ttl
 
     def _cleanup(self) -> None:
+        """清理过期条目。在锁外调用以减少锁持有时间。"""
         now = time.monotonic()
-        expired = [
-            key
-            for key, (timestamp, info) in self._store.items()
-            if now - timestamp > self._ttl_for(info)
-        ]
-        for key in expired:
-            self._store.pop(key, None)
+        # 先收集需要删除的 key（在锁内）
+        with self._lock:
+            expired = [
+                key
+                for key, (timestamp, info) in self._store.items()
+                if now - timestamp > self._ttl_for(info)
+            ]
+        # 删除过期条目（在锁外，避免长时间持有锁）
+        if expired:
+            with self._lock:
+                for key in expired:
+                    self._store.pop(key, None)
 
     def get(self, url: str, platform: str) -> StreamInfo | None:
         with self._lock:
             self._access_count += 1
-            if self._access_count >= self._cleanup_every:
+            should_cleanup = self._access_count >= self._cleanup_every
+            if should_cleanup:
                 self._access_count = 0
-                self._cleanup()
 
             entry = self._store.get((url, platform))
             if entry is None:
+                # 异步触发清理，不阻塞当前调用
+                if should_cleanup:
+                    import threading
+                    threading.Thread(target=self._cleanup, daemon=True).start()
                 return None
             timestamp, info = entry
             if time.monotonic() - timestamp > self._ttl_for(info):

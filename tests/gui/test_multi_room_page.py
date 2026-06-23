@@ -580,19 +580,18 @@ def test_multi_room_page_responsive_grid_switches_to_one_column() -> None:
 
     # Wide viewport should allow two columns
     page.resize(1440, 900)
-    page._scroll.viewport().resize(1000, 600)
+    page._card_container.resize(1000, 600)
     page._update_grid_columns()
     QApplication.processEvents()
     assert page._grid_columns == 2
 
     # Narrow viewport should switch to one column
-    page._scroll.viewport().resize(600, 600)
+    page._card_container.resize(600, 600)
     page._update_grid_columns()
     QApplication.processEvents()
     assert page._grid_columns == 1
     assert page._page_scroll.widget() is page._page_body
     assert page._splitter.parent() is page._page_body
-    assert page._scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert page._right_scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
 
@@ -666,7 +665,7 @@ def test_added_room_card_becomes_visible_without_page_switch() -> None:
     first_id = next(iter(page._cards))
     first_card = page._cards[first_id]
     assert not first_card.isHidden(), "first card must be shown after _add_card"
-    width = max(340, page._scroll.viewport().width())
+    width = max(340, page._card_container.width())
     height_one = page._card_layout.heightForWidth(width)
 
     # Add second room — must increase the layout's wrapped height.

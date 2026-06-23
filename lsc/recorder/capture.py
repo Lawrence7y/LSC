@@ -6,7 +6,7 @@ import subprocess
 import time
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from threading import Lock
@@ -21,6 +21,13 @@ _FRIENDLY_STDERR_RULES = (
     ("404", "直播流地址已失效"),
     ("timed out", "连接直播流超时"),
     ("Connection refused", "直播服务器拒绝连接"),
+    ("Connection reset", "网络连接被重置"),
+    ("No space left", "磁盘空间不足"),
+    ("permission denied", "文件写入权限不足"),
+    ("Invalid data found", "直播流数据异常"),
+    ("Server returned 5", "服务器返回错误"),
+    ("HTTP error", "HTTP 请求失败"),
+    ("Cookie", "Cookie 无效或已过期"),
 )
 
 STARTUP_PROBE_TIMEOUT_SEC = 5.0
@@ -52,6 +59,54 @@ class CaptureResult:
     duration_sec: float = 0.0
     file_size_mb: float = 0.0
     error: str = ""
+    is_valid: bool = True
+    validation_error: str = ""
+
+
+def validate_recording(output_path: str, min_size_mb: float = 0.1) -> tuple[bool, str]:
+    """Validate a recorded file's integrity.
+
+    Args:
+        output_path: Path to the recorded file.
+        min_size_mb: Minimum file size in MB to be considered valid.
+
+    Returns:
+        Tuple of (is_valid, error_message).
+    """
+    import os
+
+    if not output_path:
+        return False, "输出路径为空"
+
+    if not os.path.isfile(output_path):
+        return False, f"文件不存在: {output_path}"
+
+    file_size = os.path.getsize(output_path)
+    file_size_mb = file_size / (1024 * 1024)
+
+    if file_size_mb < min_size_mb:
+        return False, f"文件太小 ({file_size_mb:.2f} MB)，可能录制失败"
+
+    # Check if file is readable
+    try:
+        with open(output_path, 'rb') as f:
+            # Read first few bytes to check file header
+            header = f.read(12)
+            if len(header) < 12:
+                return False, "文件头不完整"
+
+            # Check for common video file signatures
+            # MP4: ftyp at offset 4
+            if header[4:8] != b'ftyp':
+                # Not MP4, check if it's a valid video format
+                # FLV starts with 'FLV'
+                # MKV starts with 0x1A45DFA3
+                if not (header[:3] == b'FLV' or header[:4] == b'\x1A\x45\xDF\xA3'):
+                    return False, "文件格式异常，可能不是有效的视频文件"
+    except IOError as e:
+        return False, f"文件读取失败: {e}"
+
+    return True, ""
 
 
 class StreamCapture:
@@ -76,7 +131,7 @@ class StreamCapture:
         self._stall_checks = 0
         self._on_status_change: Callable[[CaptureStatus], None] | None = None
         self._stderr_tail: deque[str] = deque(maxlen=20)
-        self._stderr_future = None
+        self._stderr_future: "Future[None] | None" = None
         self._stderr_released = False
         self._last_error: str = ""
 
@@ -143,7 +198,7 @@ class StreamCapture:
         with cls._stderr_executor_lock:
             if cls._stderr_executor is None:
                 cls._stderr_executor = ThreadPoolExecutor(
-                    max_workers=2, thread_name_prefix="lsc-stderr"
+                    max_workers=4, thread_name_prefix="lsc-stderr"
                 )
             cls._stderr_executor_users += 1
             return cls._stderr_executor
@@ -291,11 +346,13 @@ class StreamCapture:
         except FileNotFoundError:
             self._last_error = f"FFmpeg 未找到: {self.ffmpeg}"
             _log.error("FFmpeg not found: %s", self.ffmpeg)
+            self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return False
         except Exception as exc:
             self._last_error = f"启动录制失败: {exc}"
             _log.error("Failed to start capture: %s", exc)
+            self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return False
 
@@ -370,8 +427,20 @@ class StreamCapture:
         duration = self.duration
         output_path = ""
         with self._lock:
+            proc = self._process
             self._process = None
             output_path = self._output_path
+
+        # 关闭所有管道，防止文件描述符泄漏
+        if proc is not None:
+            for pipe_name in ("stdin", "stdout", "stderr"):
+                pipe = getattr(proc, pipe_name, None)
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+
         self._release_stderr_executor_once()
         self._set_status(CaptureStatus.STOPPED)
 
@@ -439,6 +508,14 @@ class StreamCapture:
             except Exception as exc:
                 _log.warning("Error force-killing FFmpeg: %s", exc)
             finally:
+                # 关闭所有管道，防止文件描述符泄漏
+                for pipe_name in ("stdin", "stdout", "stderr"):
+                    pipe = getattr(proc, pipe_name, None)
+                    if pipe is not None:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
                 self._release_stderr_executor_once()
 
     def check_health(self) -> str:

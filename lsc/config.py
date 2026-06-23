@@ -1,9 +1,12 @@
 """LSC 配置模块。"""
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from dataclasses import dataclass, field
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -34,6 +37,27 @@ class ExportProfile:
     resolution: str = ""  # e.g. "1920x1080", "1080x1920", ""
     # 帧率（0=保持源帧率）
     fps: float = 0.0
+
+    def __post_init__(self):
+        """验证参数范围。"""
+        # CRF 范围验证 (0-51)
+        self.crf = max(0, min(51, self.crf))
+
+        # 帧率验证 (非负)
+        if self.fps < 0:
+            self.fps = 0.0
+
+        # 分辨率格式验证
+        if self.resolution:
+            parts = self.resolution.split("x", 1)
+            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                _log.warning("Invalid resolution format: %s, clearing", self.resolution)
+                self.resolution = ""
+            else:
+                w, h = int(parts[0]), int(parts[1])
+                if w <= 0 or h <= 0 or w > 7680 or h > 4320:
+                    _log.warning("Resolution out of range: %s, clearing", self.resolution)
+                    self.resolution = ""
 
     # ── 硬件编码预设 ──
     # 常用硬件编码器快速选择
@@ -183,4 +207,23 @@ def load_config() -> LscConfig:
     return _config_instance
 
 
-__all__ = ["LscConfig", "load_config", "Profile", "ExportProfile"]
+def reload_config() -> LscConfig:
+    """重新加载 LSC 配置。
+
+    当 FFmpeg 路径或其他关键配置变化时调用，强制重新创建单例。
+    """
+    global _config_instance
+    _config_instance = LscConfig()
+    return _config_instance
+
+
+def reset_config() -> None:
+    """重置配置单例。
+
+    下次调用 load_config() 时会重新创建实例。
+    """
+    global _config_instance
+    _config_instance = None
+
+
+__all__ = ["LscConfig", "load_config", "reload_config", "reset_config", "Profile", "ExportProfile"]

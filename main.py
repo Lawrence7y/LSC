@@ -218,9 +218,46 @@ class MainWindow(QMainWindow):
         self._dashboard.set_sessions(sessions)
 
     def closeEvent(self, event):
-        # 关闭窗口时清理所有 Toast
+        """关闭窗口时清理所有资源，防止 FFmpeg 孤儿进程和资源泄漏。"""
+        import logging
+        _log = logging.getLogger(__name__)
+
+        # 1. 停止所有多房间录制和预览
+        try:
+            manager = self._multi_room.manager
+            for room in manager.list_rooms():
+                if room.is_recording:
+                    _log.info("Stopping recording for room %s", room.room_id)
+                    manager.stop_recording(room.room_id)
+                if room.preview_widget is not None:
+                    cleanup = getattr(room.preview_widget, "cleanup", None)
+                    if callable(cleanup):
+                        try:
+                            cleanup()
+                        except Exception:
+                            pass
+        except Exception as exc:
+            _log.warning("Error cleaning up multi-room: %s", exc)
+
+        # 2. 清理录制页
+        try:
+            record_ctrl = getattr(self._record, "_ctrl", None)
+            if record_ctrl is not None:
+                cleanup = getattr(record_ctrl, "cleanup", None)
+                if callable(cleanup):
+                    cleanup()
+            preview = getattr(self._record, "_preview", None)
+            if preview is not None:
+                cleanup = getattr(preview, "cleanup", None)
+                if callable(cleanup):
+                    cleanup()
+        except Exception as exc:
+            _log.warning("Error cleaning up record page: %s", exc)
+
+        # 3. 清理 Toast
         if self._toast_manager is not None:
             self._toast_manager.clear()
+
         super().closeEvent(event)
 
 

@@ -224,8 +224,14 @@ class ClipExporter:
                         export_timed_out = True
                         try:
                             proc.kill()
-                        except Exception:
-                            pass
+                            proc.wait(timeout=5)
+                        except Exception as exc:
+                            # Kill 失败，记录进程信息便于手动清理
+                            import logging
+                            logging.getLogger(__name__).warning(
+                                "Failed to kill FFmpeg export process (PID=%s): %s",
+                                proc.pid, exc
+                            )
 
                 stderr_thread = Thread(target=_stderr_reader, daemon=True)
                 stderr_thread.start()

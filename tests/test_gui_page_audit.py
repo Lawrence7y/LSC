@@ -208,14 +208,15 @@ def test_record_timeline_cursor_uses_theme_text_color_in_light_mode() -> None:
 def test_record_video_preview_initializes_player_lazily(monkeypatch) -> None:
     _qapp()
 
-    from lsc.gui.pages import record as record_module
+    from lsc.gui.pages.record import video_preview as video_preview_module
 
     def fail_if_constructed(*args, **kwargs):
         raise AssertionError("MpvWidget should be lazy")
 
-    monkeypatch.setattr(record_module, "MpvWidget", fail_if_constructed)
+    monkeypatch.setattr(video_preview_module, "MpvWidget", fail_if_constructed)
 
-    preview = record_module.VideoPreview()
+    from lsc.gui.pages.record import RecordPage
+    preview = video_preview_module.VideoPreview()
 
     assert preview._mpv_widget is None
     assert not preview._fullscreen_btn.isHidden()

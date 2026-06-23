@@ -174,13 +174,42 @@ def _refresh_app_style() -> None:
                 ss = generate_stylesheet(_current, dark=dark)
                 _stylesheet_cache[dark] = ss
             app.setStyleSheet(ss)
+            # Use batch update with deferred processing to reduce flicker
+            # Only update visible widgets immediately, defer hidden ones
+            visible_widgets = []
+            hidden_widgets = []
             for w in app.allWidgets():
+                if w.isVisible():
+                    visible_widgets.append(w)
+                else:
+                    hidden_widgets.append(w)
+
+            # Update visible widgets immediately
+            for w in visible_widgets:
                 try:
                     w.style().unpolish(w)
                     w.style().polish(w)
+                    w.update()
                 except Exception:
                     pass
-                w.update()
+
+            # Defer hidden widgets update to avoid blocking
+            if hidden_widgets:
+                from PySide6.QtCore import QTimer
+
+                def _update_hidden():
+                    for w in hidden_widgets:
+                        try:
+                            if not w.isVisible():
+                                continue  # Still hidden, skip
+                            w.style().unpolish(w)
+                            w.style().polish(w)
+                            w.update()
+                        except Exception:
+                            pass
+
+                QTimer.singleShot(50, _update_hidden)
+
         if _rebuild_callback:
             _rebuild_callback()
         _get_notifier().theme_changed.emit()

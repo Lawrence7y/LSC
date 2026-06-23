@@ -51,6 +51,13 @@ class Card(QFrame):
         """添加子布局到卡片布局。"""
         self._layout.addLayout(layout)
 
+    def add_title(self, text: str) -> QLabel:
+        """添加标准卡片标题，返回标题 QLabel。"""
+        title = QLabel(text)
+        title.setObjectName("card_title")
+        self._layout.addWidget(title)
+        return title
+
 
 class ChipGroup(QWidget):
     """一组可选的标签按钮（Chip/Tag 风格）。"""

@@ -50,8 +50,13 @@ class UrlParserWorker(QThread):
         self._parse_fn = parse_fn
 
     def run(self):
-        result = self._parse_fn(self._url)
-        self.finished.emit(result)
+        try:
+            result = self._parse_fn(self._url)
+            self.finished.emit(result)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("UrlParserWorker error: %s", exc)
+            self.finished.emit({"error": str(exc), "isLive": False})
 
 
 class ProbeWorker(QThread):
@@ -597,18 +602,22 @@ class RecordingController:
 
     def stop_recording(self) -> tuple[bool, float, str]:
         """Stop recording. Returns (success, size_mb, output_path)."""
-        self.is_recording = False
         size_mb = 0.0
         output_path = self.video_path
 
         if self._capture and self._capture.is_recording:
             result = self._capture.stop()
+            # 先停止 capture，再更新状态标志，确保状态一致性
+            self.is_recording = False
             if result.success:
                 self.video_path = result.output_path
                 size_mb = result.file_size_mb
                 output_path = result.output_path
                 return True, size_mb, output_path
-        elif self._capture and not self._capture.is_alive() and self.video_path:
+        else:
+            self.is_recording = False
+
+        if self._capture and not self._capture.is_alive() and self.video_path:
             if os.path.isfile(self.video_path):
                 size_mb = os.path.getsize(self.video_path) / (1024 * 1024)
                 return True, size_mb, output_path

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from lsc import get_logger
 from lsc.config import LscConfig
-from lsc.recorder.capture import StreamCapture
+from lsc.recorder.capture import StreamCapture, validate_recording
 
 _log = get_logger(__name__)
 
@@ -24,6 +24,8 @@ class SessionResult:
     duration_sec: float = 0.0
     file_size_mb: float = 0.0
     error: str = ""
+    is_valid: bool = True
+    validation_error: str = ""
 
 
 class _SessionStatus:
@@ -105,12 +107,23 @@ class RecordingSession:
         self._session = _SessionStatus(
             status=self._capture.status.value
         )
+
+        # Validate recording if successful
+        is_valid = True
+        validation_error = ""
+        if result.success and result.output_path:
+            is_valid, validation_error = validate_recording(result.output_path)
+            if not is_valid:
+                _log.warning("Recording validation failed: %s", validation_error)
+
         return SessionResult(
             success=result.success,
             output_path=result.output_path,
             duration_sec=result.duration_sec,
             file_size_mb=result.file_size_mb,
             error=result.error,
+            is_valid=is_valid,
+            validation_error=validation_error,
         )
 
 

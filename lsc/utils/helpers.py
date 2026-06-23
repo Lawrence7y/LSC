@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 from lsc.utils.process_launcher import get_creation_flags
 
@@ -18,6 +19,19 @@ def fmt_time(seconds: float) -> str:
     if h > 0:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def open_in_explorer(path: str) -> None:
+    """在文件管理器中打开指定目录。"""
+    if not path:
+        return
+    folder = path if os.path.isdir(path) else os.path.dirname(path)
+    if sys.platform == "win32":
+        os.startfile(folder)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", folder])
+    else:
+        subprocess.Popen(["xdg-open", folder])
 
 
 def probe_duration(video_path: str, ffprobe: str = "ffprobe") -> float:
@@ -36,4 +50,4 @@ def probe_duration(video_path: str, ffprobe: str = "ffprobe") -> float:
         return 0.0
 
 
-__all__ = ["fmt_time", "probe_duration"]
+__all__ = ["fmt_time", "open_in_explorer", "probe_duration"]

@@ -7,6 +7,8 @@ import re
 import shutil
 from collections.abc import Callable
 from datetime import datetime
+from threading import Lock
+from typing import Any
 from uuid import uuid4
 
 from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Signal, QRunnable, QThreadPool
@@ -21,17 +23,47 @@ PreviewFactory = Callable[[], object]
 
 
 class SizeUpdateRunnable(QRunnable):
-    """Background task to query file size without blocking the GUI thread."""
+    """Background task to query file size without blocking the GUI thread.
 
-    def __init__(self, room, path):
+    Includes caching to avoid redundant file system calls.
+    """
+    _size_cache: dict[str, tuple[float, float]] = {}  # path -> (size_mb, timestamp)
+    _cache_lock: Lock = Lock()
+    _CACHE_TTL = 2.0  # Cache for 2 seconds
+
+    def __init__(self, room: RoomSession, path: str) -> None:
         super().__init__()
         self.room = room
         self.path = path
 
     def run(self):
         try:
+            import time as _time
+            now = _time.time()
+
+            # Check cache first
+            with self._cache_lock:
+                cached = self._size_cache.get(self.path)
+                if cached and (now - cached[1]) < self._CACHE_TTL:
+                    self.room.record_size_mb = cached[0]
+                    return
+
+            # Query file system
             size = os.path.getsize(self.path) / (1024 * 1024)
             self.room.record_size_mb = size
+
+            # Update cache
+            with self._cache_lock:
+                self._size_cache[self.path] = (size, now)
+
+                # Clean old cache entries (keep last 100)
+                if len(self._size_cache) > 100:
+                    oldest_keys = sorted(
+                        self._size_cache.keys(),
+                        key=lambda k: self._size_cache[k][1]
+                    )[:50]
+                    for k in oldest_keys:
+                        del self._size_cache[k]
         except OSError:
             pass
 
@@ -42,8 +74,20 @@ MAX_ROOMS = 12
 MAX_CONCURRENT_PREVIEWS = 4
 # 录制过程中磁盘剩余空间低于此阈值时停止录制（2 GB）
 _MIN_FREE_BYTES_WHILE_RECORDING = 2 * 1024 * 1024 * 1024
+
+# ── Reconnect strategy ───────────────────────────────────────
 _MAX_RECONNECT_ATTEMPTS = 3
-_RECONNECT_DELAY_SEC = 2.0
+_RECONNECT_DELAY_SEC = 2.0  # Base delay for exponential backoff
+_RECONNECT_MAX_DELAY_SEC = 30.0  # Maximum delay between attempts
+_RECONNECT_BACKOFF_FACTOR = 2.0  # Exponential backoff multiplier
+
+# ── Heartbeat intervals (seconds) ────────────────────────────
+# High-frequency: elapsed time, playback position (every tick)
+_HIGH_FREQ_INTERVAL = 1
+# Medium-frequency: file size, FFmpeg health (every N ticks)
+_MEDIUM_FREQ_INTERVAL = 5
+# Low-frequency: disk space check (every N ticks)
+_LOW_FREQ_INTERVAL = 10
 
 
 def _make_room_output_dir(base_dir: str, room: RoomSession) -> str:
@@ -98,6 +142,9 @@ class _ConnectWorker(QThread):
             self.connect_finished.emit(self._room_id, success, error, info)
         except Exception as exc:
             self.connect_finished.emit(self._room_id, False, str(exc), None)
+        except BaseException as exc:
+            # 捕获 KeyboardInterrupt 等系统级异常，确保信号发射
+            self.connect_finished.emit(self._room_id, False, f"连接被中断: {exc}", None)
 
 
 class _BatchRecordWorker(QThread):
@@ -173,6 +220,12 @@ class MultiRoomManager(QObject):
 
         # Global heartbeat timer — created lazily when QCoreApplication exists
         self._global_timer: QTimer | None = None
+
+        # Heartbeat tick counter for layered frequency control
+        self._tick_counter: int = 0
+        # Dirty flags to avoid redundant UI updates
+        self._dirty_recording: bool = False
+        self._dirty_connection: bool = False
 
         # 选区循环试听状态
         self._preview_loop_timer: QTimer | None = None
@@ -319,14 +372,14 @@ class MultiRoomManager(QObject):
     def _temp_config_path(self) -> str:
         return self._config_file_path() + ".tmp"
 
-    def _serialize_room(self, room: RoomSession) -> dict:
+    def _serialize_room(self, room: RoomSession) -> dict[str, Any]:
         """把单个房间序列化为可持久化的 dict。
 
         仅保存用户偏好与选区(跨重启稳定的纯数据),不保存瞬时连接/录制状态、
         controller/preview_widget 等运行时句柄。mark_in/mark_out 仍需对应房间
         重新连接后才有意义的时长,但保留下来可避免用户白标选区。
         """
-        entry: dict = {"url": room.room_url}
+        entry: dict[str, Any] = {"url": room.room_url}
         if room.mark_in is not None:
             entry["mark_in"] = float(room.mark_in)
         if room.mark_out is not None:
@@ -380,7 +433,7 @@ class MultiRoomManager(QObject):
             _log.error("Failed to save rooms: %s", exc)
             return 0
 
-    def _load_json_file(self, path: str) -> dict | None:
+    def _load_json_file(self, path: str) -> dict[str, Any] | None:
         """Load and parse a JSON config file. Returns None on any failure."""
         import json
         try:
@@ -507,10 +560,12 @@ class MultiRoomManager(QObject):
 
         self.room_connect_finished.emit(room_id, success, error)
 
-    def _apply_stream_info(self, room: RoomSession, info) -> bool:
+    def _apply_stream_info(self, room: RoomSession, info: StreamInfo) -> bool:
         """Apply parsed StreamInfo to room session and controller."""
         room.apply_stream_info(info)
         room.preview_error = ""
+        # Mark state changed for UI refresh
+        self._dirty_connection = True
         if not info.is_live or not info.stream_url:
             room.set_error(info.error or "连接失败")
             return False
@@ -934,6 +989,8 @@ class MultiRoomManager(QObject):
         room.is_recording = ok
         room.record_output_path = output_path
         room.record_started_at = datetime.now() if ok else None
+        # Mark state changed for UI refresh
+        self._dirty_recording = True
         if ok:
             # Save recording params for auto-reconnect
             room.reconnect_output_dir = room_output_dir
@@ -958,6 +1015,8 @@ class MultiRoomManager(QObject):
         room.record_started_at = None
         room.reconnect_attempts = 0
         room.reconnect_next_attempt_at = 0.0
+        # Mark state changed for UI refresh
+        self._dirty_recording = True
         if output_path:
             room.record_output_path = output_path
         if output_path:
@@ -1039,6 +1098,9 @@ class MultiRoomManager(QObject):
         )
         worker.room_started.connect(self.batch_record_progress)
         worker.batch_finished.connect(self.batch_record_finished)
+        # 完成后清理引用并释放 QObject
+        worker.batch_finished.connect(lambda: setattr(self, '_batch_record_worker', None))
+        worker.batch_finished.connect(worker.deleteLater)
         # Keep a reference so the worker isn't garbage-collected mid-run.
         self._batch_record_worker = worker
         worker.start()
@@ -1051,13 +1113,15 @@ class MultiRoomManager(QObject):
 
     def start_export(self, room_id: str, start_sec: float, end_sec: float,
                      output_dir: str, title: str = "",
-                     on_done: Callable | None = None,
-                     on_progress: Callable | None = None,
-                     profile=None) -> bool:
+                     on_done: Callable[[bool, str, str, float], None] | None = None,
+                     on_progress: Callable[[float, float, float], None] | None = None,
+                     profile: "ExportProfile | None" = None) -> bool:
         """Start async clip export for a room's recording.
 
         Parameters
         ----------
+        on_done : callable | None
+            完成回调 ``callback(success: bool, path: str, error: str, size_mb: float)``。
         on_progress : callable | None
             进度回调 ``callback(percent: float, elapsed: float, total: float)``。
         profile : ExportProfile | None
@@ -1086,8 +1150,17 @@ class MultiRoomManager(QObject):
     # ── Recording reconnect ─────────────────────────────────
 
     def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str) -> None:
-        """Attempt to reconnect a failed recording, mirroring RecordPage's logic."""
+        """Attempt to reconnect a failed recording with exponential backoff."""
         import time as _time
+        from lsc.utils.error_messages import is_recoverable_error
+
+        # Check if error is recoverable
+        if not is_recoverable_error(error_msg):
+            room.last_error = error_msg
+            room.is_recording = False
+            room.record_started_at = None
+            _log.warning("Room %s non-recoverable error: %s", room.room_id, error_msg)
+            return
 
         if room.reconnect_attempts >= _MAX_RECONNECT_ATTEMPTS:
             room.last_error = error_msg
@@ -1097,11 +1170,17 @@ class MultiRoomManager(QObject):
                          room.room_id, room.reconnect_attempts)
             return
 
+        # Calculate exponential backoff delay
+        delay = min(
+            _RECONNECT_DELAY_SEC * (_RECONNECT_BACKOFF_FACTOR ** room.reconnect_attempts),
+            _RECONNECT_MAX_DELAY_SEC,
+        )
+
         if room.reconnect_next_attempt_at <= 0:
-            room.reconnect_next_attempt_at = _time.monotonic() + _RECONNECT_DELAY_SEC
-            room.last_error = f"{error_msg}，{_RECONNECT_DELAY_SEC:.0f}秒后尝试恢复..."
-            _log.info("Room %s scheduling reconnect attempt %d/%d",
-                      room.room_id, room.reconnect_attempts + 1, _MAX_RECONNECT_ATTEMPTS)
+            room.reconnect_next_attempt_at = _time.monotonic() + delay
+            room.last_error = f"{error_msg}，{delay:.0f}秒后尝试恢复..."
+            _log.info("Room %s scheduling reconnect attempt %d/%d (delay=%.1fs)",
+                      room.room_id, room.reconnect_attempts + 1, _MAX_RECONNECT_ATTEMPTS, delay)
             return
 
         if _time.monotonic() < room.reconnect_next_attempt_at:
@@ -1113,6 +1192,10 @@ class MultiRoomManager(QObject):
                   room.room_id, room.reconnect_attempts, _MAX_RECONNECT_ATTEMPTS)
         room.last_error = f"正在尝试恢复录制 ({room.reconnect_attempts}/{_MAX_RECONNECT_ATTEMPTS})..."
 
+        # 保存原始错误信息和旧文件路径
+        original_error = error_msg
+        old_output_path = room.record_output_path
+
         # Stop the failed recording gracefully
         controller = room.controller
         if controller is not None:
@@ -1122,9 +1205,19 @@ class MultiRoomManager(QObject):
                 pass
         room.is_recording = False
 
+        # 标记旧文件可能损坏（如果存在且大小异常小）
+        if old_output_path and os.path.isfile(old_output_path):
+            try:
+                file_size = os.path.getsize(old_output_path)
+                if file_size < 1024:  # 小于 1KB 可能是损坏的
+                    _log.warning("Room %s old recording file may be corrupted: %s (%d bytes)",
+                                 room.room_id, old_output_path, file_size)
+            except OSError:
+                pass
+
         # Re-parse the stream URL and restart recording
         if not room.reconnect_output_dir:
-            room.last_error = "恢复失败：缺少录制参数"
+            room.last_error = f"恢复失败：缺少录制参数（原始错误: {original_error}）"
             return
 
         ok = self.start_recording(
@@ -1143,7 +1236,15 @@ class MultiRoomManager(QObject):
         else:
             _log.warning("Room %s reconnect attempt %d failed: %s",
                          room.room_id, room.reconnect_attempts, room.last_error)
-            room.reconnect_next_attempt_at = _time.monotonic() + _RECONNECT_DELAY_SEC
+            # 保留原始错误信息
+            if not room.last_error or room.last_error == "录制启动失败":
+                room.last_error = f"恢复失败（原始错误: {original_error}）"
+            # Calculate next delay with exponential backoff
+            next_delay = min(
+                _RECONNECT_DELAY_SEC * (_RECONNECT_BACKOFF_FACTOR ** room.reconnect_attempts),
+                _RECONNECT_MAX_DELAY_SEC,
+            )
+            room.reconnect_next_attempt_at = _time.monotonic() + next_delay
 
     def _start_global_timer(self) -> None:
         timer = self._ensure_global_timer()
@@ -1155,20 +1256,22 @@ class MultiRoomManager(QObject):
             self._global_timer.stop()
 
     def _on_global_tick(self) -> None:
-        """Single 1-second heartbeat for all rooms."""
+        """Layered heartbeat: high/medium/low frequency operations."""
+        self._tick_counter += 1
+        is_medium_tick = (self._tick_counter % _MEDIUM_FREQ_INTERVAL == 0)
+        is_low_tick = (self._tick_counter % _LOW_FREQ_INTERVAL == 0)
+
         for room in list(self._rooms.values()):
             controller = room.controller
             if controller is None:
                 continue
+
+            # ── High-frequency (every 1s): lightweight operations ──
             # Update elapsed time for recording rooms
             if room.is_recording:
                 controller.tick()
-            # 录制文件大小追踪（任务 2.3）
-            if room.is_recording and room.record_output_path:
-                QThreadPool.globalInstance().start(SizeUpdateRunnable(room, room.record_output_path))
-            # Sync playback position from the preview widget so the
-            # timeline cursor follows the actual video without the UI
-            # having to poll the widget on its own timer.
+
+            # Sync playback position from the preview widget
             if room.preview_enabled and not room.preview_paused:
                 widget = room.preview_widget
                 if widget is not None:
@@ -1180,16 +1283,30 @@ class MultiRoomManager(QObject):
                                 controller.current_sec = pos
                         except Exception:
                             pass
-            # Watchdog: check FFmpeg health + auto-reconnect
-            if room.is_recording:
-                error_msg = controller.watchdog_check()
-                if error_msg:
-                    _log.warning("Room %s watchdog: %s", room.room_id, error_msg)
-                    self._attempt_recording_reconnect(room, error_msg)
-            # Runtime disk space guard: stop recording before the disk is full
-            if room.is_recording:
+
+            # ── Medium-frequency (every 5s): file size + health check ──
+            if is_medium_tick:
+                # File size tracking
+                if room.is_recording and room.record_output_path:
+                    QThreadPool.globalInstance().start(
+                        SizeUpdateRunnable(room, room.record_output_path)
+                    )
+
+                # Watchdog: check FFmpeg health + auto-reconnect
+                if room.is_recording:
+                    error_msg = controller.watchdog_check()
+                    if error_msg:
+                        _log.warning("Room %s watchdog: %s", room.room_id, error_msg)
+                        self._attempt_recording_reconnect(room, error_msg)
+                        self._dirty_recording = True
+
+            # ── Low-frequency (every 30s): disk space check ──
+            if is_low_tick and room.is_recording:
                 try:
-                    rec_dir = getattr(controller, "output_dir", "") or os.path.dirname(room.record_output_path or "")
+                    rec_dir = (
+                        getattr(controller, "output_dir", "")
+                        or os.path.dirname(room.record_output_path or "")
+                    )
                     if rec_dir:
                         free = shutil.disk_usage(rec_dir).free
                         if free < _MIN_FREE_BYTES_WHILE_RECORDING:
@@ -1202,7 +1319,14 @@ class MultiRoomManager(QObject):
                             room.last_error = (
                                 f"磁盘空间不足，录制已自动停止（剩余 {free / (1024 ** 3):.1f} GB）"
                             )
+                            self._dirty_recording = True
                 except Exception as exc:
                     _log.debug("Disk space check failed for room %s: %s", room.room_id, exc)
-        # Notify UI to refresh timelines and stats once per tick.
+
+        # Notify UI to refresh timelines and stats.
+        # Always emit on high-frequency ticks for smooth timeline updates.
         self.global_tick.emit()
+
+        # Reset dirty flags after emission
+        self._dirty_recording = False
+        self._dirty_connection = False
