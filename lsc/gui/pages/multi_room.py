@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QCheckBox,
     QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -59,19 +60,11 @@ class DetailPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        self._scroll = QScrollArea()
-        self._scroll.setObjectName("detailPanelScroll")
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setFrameShape(QScrollArea.NoFrame)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._body = QWidget()
-        self._body.setObjectName("detailPanelBody")
-        self._body_layout = QVBoxLayout(self._body)
+        self._body_layout = QVBoxLayout()
         self._body_layout.setContentsMargins(0, 0, 0, 0)
         self._body_layout.setSpacing(0)
         self._body_layout.setAlignment(Qt.AlignTop)
-        self._scroll.setWidget(self._body)
-        root.addWidget(self._scroll)
+        root.addLayout(self._body_layout)
 
         self._empty = EmptyState("选择房间查看详情", "点击左侧房间卡片查看详细信息")
         self._body_layout.addWidget(self._empty)
@@ -552,10 +545,32 @@ class MultiRoomPage(QWidget):
         panel.setEnabled(encoder != "Copy" and value != "不限制")
 
     def _build_ui(self) -> None:
-        # ── Root: left main content + right fixed-width detail panel ──
-        root = QHBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
-        root.setSpacing(20)
+        # ── Root: page-level scroll area containing body ──
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._page_scroll = QScrollArea()
+        self._page_scroll.setWidgetResizable(True)
+        self._page_scroll.setFrameShape(QScrollArea.NoFrame)
+        self._page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._page_scroll.verticalScrollBar().setStyleSheet("QScrollBar { width: 0; }")
+        self._page_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self._page_body = QWidget()
+        self._page_body.setStyleSheet("background:transparent;")
+        page_layout = QHBoxLayout(self._page_body)
+        page_layout.setContentsMargins(24, 24, 24, 24)
+        page_layout.setSpacing(20)
+
+        self._page_scroll.setWidget(self._page_body)
+        root.addWidget(self._page_scroll)
+
+        # ── Splitter for left/right panels ──
+        self._splitter = QSplitter(Qt.Horizontal, self._page_body)
+        self._splitter.setHandleWidth(8)
+        self._splitter.setChildrenCollapsible(False)
+        page_layout.addWidget(self._splitter)
 
         # ── Left side: toolbar, card grid, bottom control/status bar ──
         left_widget = QWidget()
@@ -564,6 +579,7 @@ class MultiRoomPage(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(16)
         self._left_layout = left_layout
+        self._splitter.addWidget(left_widget)
 
         # ── Top toolbar ──
         toolbar = QWidget()
@@ -672,8 +688,6 @@ class MultiRoomPage(QWidget):
         self._clip_card.add_widget(self._clip_list)
         left_layout.addWidget(self._clip_card)
 
-        root.addWidget(left_widget, 1)
-
         # ── Right side: scrollable detail + clip list cards ──
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
@@ -747,7 +761,11 @@ class MultiRoomPage(QWidget):
 
         right_layout.addStretch()
         right_scroll.setWidget(right_widget)
-        root.addWidget(right_scroll)
+        self._right_scroll = right_scroll
+        self._splitter.addWidget(right_scroll)
+
+        # Set initial splitter sizes (left: 60%, right: 40%)
+        self._splitter.setSizes([600, 400])
 
     def _connect_signals(self) -> None:
         self._controls.timeline.position_changed.connect(self._on_timeline_seek)
