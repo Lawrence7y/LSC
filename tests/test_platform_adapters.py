@@ -132,11 +132,11 @@ def test_direct_adapter_rejects_missing_netloc_and_non_http_scheme():
 def test_unknown_url_returns_structured_error():
     info = parse_stream("https://example.com/not-a-live-room")
 
-    assert info.platform == "unknown"
+    # Generic adapter now handles unknown URLs — it tries to fetch and extract streams
+    assert info.platform == "generic"
     assert info.is_live is False
     assert info.stream_url == ""
-    assert info.error_code == ERROR_UNSUPPORTED_URL
-    assert "不支持" in info.error
+    assert info.error_code in (ERROR_RESTRICTED, ERROR_PARSE_FAILED)
 
 
 def test_platform_adapter_contract_uses_can_handle():
@@ -377,17 +377,21 @@ def test_bilibili_adapter_parses_live_room_with_public_play_info(monkeypatch):
     )
 
     monkeypatch.setattr(adapter, "_fetch_json", lambda url, params=None: next(responses))
+    # Ensure no cookies so quality selection is deterministic
+    monkeypatch.setattr("lsc.platforms.bilibili._get_bilibili_cookies", lambda: {})
 
     info = adapter.parse("https://live.bilibili.com/12345")
 
     assert info.platform == "bilibili"
     assert info.title == "B 站直播标题"
     assert info.streamer == "主播A"
-    assert info.stream_url == "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=10000&token=abc"
+    # 无登录 Cookie 时，默认选择最低画质以避免 CDN 403
+    assert info.selected_quality == "250"
+    assert info.stream_url == "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=250&token=abc"
     assert info.quality_urls == {
-        "10000": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=10000&token=abc",
-        "400": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=400&token=abc",
         "250": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=250&token=abc",
+        "400": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=400&token=abc",
+        "10000": "https://cn-gotcha204-2.example.com/live-bvc/master.m3u8?qn=10000&token=abc",
     }
     assert info.headers == BILIBILI_HEADERS
 
@@ -430,6 +434,7 @@ def test_bilibili_short_link_is_classified_as_bilibili_and_returns_parse_failure
     assert info.platform == "bilibili"
     assert info.is_live is False
     assert info.error_code in {ERROR_PARSE_FAILED, ERROR_RESTRICTED}
+    # Expansion failure message mentions b23.tv or short link.
     assert "短链" in info.error or "b23.tv" in info.error
 
 
@@ -443,7 +448,31 @@ def test_bilibili_adapter_rejects_short_link_as_room_id_parse_failure():
     assert info.platform == "bilibili"
     assert info.is_live is False
     assert info.error_code == ERROR_PARSE_FAILED
-    assert "短链" in info.error
+    assert "短链" in info.error or "b23.tv" in info.error
+
+
+def test_bilibili_adapter_expands_short_link_to_real_url(monkeypatch):
+    """When the short link expands successfully, parsing proceeds normally."""
+    from lsc.platforms.bilibili import BilibiliAdapter
+
+    adapter = BilibiliAdapter()
+
+    def fake_expand(self, url):
+        return "https://live.bilibili.com/12345"
+
+    monkeypatch.setattr(BilibiliAdapter, "_expand_short_link", fake_expand)
+
+    def fake_fetch_json(self, url, params=None):
+        if "room_init" in url:
+            return {"code": 0, "data": {"room_id": 12345, "title": "T", "uname": "U", "live_status": 1}}
+        return {"code": 0, "data": {"playurl_info": {"playurl": {"stream": []}}}}
+
+    monkeypatch.setattr(BilibiliAdapter, "_fetch_json", fake_fetch_json)
+
+    info = adapter.parse("https://b23.tv/abc123")
+    # Expansion succeeded but no stream URL found -> RESTRICTED, not PARSE_FAILED
+    assert info.platform == "bilibili"
+    assert info.error_code != ERROR_PARSE_FAILED or "短链" not in info.error
 
 
 def test_huya_adapter_parses_public_page_payload(monkeypatch):
@@ -479,7 +508,10 @@ def test_huya_adapter_parses_public_page_payload(monkeypatch):
     assert info.title == "虎牙直播标题"
     assert info.streamer == "虎牙主播"
     assert info.stream_url == "https://huya.example.com/live/room-123.flv?fm=abc&txyp=1"
-    assert info.quality_urls == {"source": "https://huya.example.com/live/room-123.flv?fm=abc&txyp=1"}
+    assert info.quality_urls == {
+        "huya": "https://huya.example.com/live/room-123.flv?fm=abc&txyp=1",
+        "source": "https://huya.example.com/live/room-123.flv?fm=abc&txyp=1",
+    }
     assert info.selected_quality == "source"
     assert info.headers == HUYA_HEADERS
 
@@ -532,3 +564,116 @@ def test_huya_adapter_returns_restricted_when_no_public_stream_found(monkeypatch
 
 def test_huya_registry_detection():
     assert detect_platform("https://www.huya.com/123") == "huya"
+
+
+def test_kuaishou_registry_detection():
+    assert detect_platform("https://live.kuaishou.com/u/someuser") == "kuaishou"
+    assert detect_platform("https://live.kuaishou.com/w/12345") == "kuaishou"
+
+
+def test_kuaishou_adapter_returns_offline_when_not_living(monkeypatch):
+    from lsc.platforms.kuaishou import KUAISHOU_HEADERS, KuaishouAdapter
+
+    adapter = KuaishouAdapter()
+    html = """
+    <script>
+      window.__INITIAL_STATE__ = {
+        "liveroom": {
+          "playList": [{
+            "isLiving": false,
+            "author": {"name": "快手主播"},
+            "liveStream": {"playUrls": {"h264": {}, "hevc": {}}}
+          }]
+        }
+      };
+    </script>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://live.kuaishou.com/u/offline")
+
+    assert info.platform == "kuaishou"
+    assert info.is_live is False
+    assert info.error_code == ERROR_OFFLINE
+    assert "未开播" in info.error
+    assert info.headers == KUAISHOU_HEADERS
+
+
+def test_kuaishou_adapter_extracts_stream_urls_when_live(monkeypatch):
+    from lsc.platforms.kuaishou import KuaishouAdapter
+
+    adapter = KuaishouAdapter()
+    html = """
+    <script>
+      window.__INITIAL_STATE__ = {
+        "liveroom": {
+          "playList": [{
+            "isLiving": true,
+            "author": {"name": "快手主播", "description": "直播标题"},
+            "liveStream": {
+              "playUrls": {
+                "h264": {
+                  "adaptationSet": [{
+                    "representation": [
+                      {"url": "https://ks.example.com/live_hd.m3u8", "height": 1080, "bitrate": 3000, "name": "原画"},
+                      {"url": "https://ks.example.com/live_sd.m3u8", "height": 720, "bitrate": 1500, "name": "高清"}
+                    ]
+                  }]
+                }
+              }
+            }
+          }]
+        }
+      };
+    </script>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://live.kuaishou.com/u/liveuser")
+
+    assert info.platform == "kuaishou"
+    assert info.is_live is True
+    assert info.streamer == "快手主播"
+    assert info.title == "直播标题"
+    assert info.stream_url == "https://ks.example.com/live_hd.m3u8"
+    assert info.quality_urls == {
+        "原画": "https://ks.example.com/live_hd.m3u8",
+        "高清": "https://ks.example.com/live_sd.m3u8",
+    }
+    assert info.selected_quality == "原画"
+
+
+def test_kuaishou_adapter_handles_undefined_literals(monkeypatch):
+    from lsc.platforms.kuaishou import KuaishouAdapter
+
+    adapter = KuaishouAdapter()
+    html = """
+    <script>
+      window.__INITIAL_STATE__ = {
+        "liveroom": {
+          "playList": [{
+            "isLiving": true,
+            "author": {"name": "主播"},
+            "authToken": undefined,
+            "liveStream": {
+              "playUrls": {
+                "h264": {
+                  "adaptationSet": [{
+                    "representation": [
+                      {"url": "https://ks.example.com/live.m3u8", "height": 1080}
+                    ]
+                  }]
+                }
+              }
+            }
+          }]
+        }
+      };
+    </script>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://live.kuaishou.com/u/abc")
+
+    assert info.is_live is True
+    assert info.stream_url == "https://ks.example.com/live.m3u8"

@@ -1,13 +1,18 @@
 """多直播间工作台的房间卡片组件。"""
 from __future__ import annotations
 
+import hashlib
+
 from PySide6.QtCore import (
     QPropertyAnimation,
     QEvent,
     QEasingCurve,
     QParallelAnimationGroup,
+    QPoint,
     QPointF,
+    QRect,
     QRectF,
+    QSettings,
     QSize,
     Qt,
     Signal,
@@ -26,6 +31,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from lsc.gui.components.preview_surface import PreviewSurface
 from lsc.gui.multi_room.session import RoomSession
 from lsc.gui.theme import connect_theme_changed, get_theme, is_dark
 
@@ -42,6 +48,17 @@ _STATUS_COLORS_ATTR: dict[str, str] = {
     "recording": "accent_warning",
     "error": "accent_error",
 }
+
+# ── Card size presets ─────────────────────────────────────────
+# (name, width, preview_height) — 小号/中号/大号三档预设
+_CARD_PRESETS: list[tuple[str, int, int]] = [
+    ("小", 340, 130),
+    ("中", 440, 200),
+    ("大", 560, 300),
+]
+_DEFAULT_PRESET_INDEX = 1  # 中号
+_CARD_WIDTH_FALLBACK = 440
+_PREVIEW_HEIGHT_FALLBACK = 200
 
 
 class _StatusDot(QWidget):
@@ -110,9 +127,9 @@ class _PlatformTag(QWidget):
 
         c = get_theme()
         brand = _PLATFORM_COLORS.get(key, "#6b7280")
-        # 在深色模式下，黑色/深色品牌标签会融入背景，使用深色但可辨的灰
+        # 在深色模式下，黑色/深色品牌标签会融入背景，提亮到可辨的中灰
         if key == "douyin" and is_dark():
-            brand = c.bg_elevated
+            brand = "#3a3f4a"
         self._bg = QColor(brand)
         self._icon_key = key
         self._text = display_name or key
@@ -128,101 +145,11 @@ class _PlatformTag(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QBrush(self._bg))
-        p.setPen(Qt.PenStyle.NoPen)
+        # 半透明白边框,让深色品牌色标签在深色背景下也有清晰边界
+        edge = QColor(255, 255, 255, 38 if is_dark() else 0)
+        p.setPen(QPen(edge, 1) if edge.alpha() else Qt.PenStyle.NoPen)
         p.drawRoundedRect(0, 0, self.width(), self.height(), 4, 4)
         p.end()
-
-
-class _PreviewArea(QFrame):
-    """预览区域：承载占位图/嵌入预览，并在右上角叠加徽章。"""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._badge_widget: QWidget | None = None
-        self._corner_widget: QWidget | None = None
-        self._controls_widget: QWidget | None = None
-        self._overlay_expanded = False
-        self.setObjectName("previewArea")
-        self.setMouseTracking(True)
-
-    def set_badge_widget(self, widget: QWidget) -> None:
-        self._badge_widget = widget
-        widget.setParent(self)
-        widget.show()
-        self._update_badge_geometry()
-
-    def set_corner_widget(self, widget: QWidget) -> None:
-        self._corner_widget = widget
-        widget.setParent(self)
-        widget.show()
-        self._update_overlay_geometry()
-
-    def set_controls_widget(self, widget: QWidget) -> None:
-        self._controls_widget = widget
-        widget.setParent(self)
-        widget.show()
-        widget.installEventFilter(self)
-        self._update_overlay_geometry()
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._update_badge_geometry()
-        self._update_overlay_geometry()
-
-    def enterEvent(self, event) -> None:
-        super().enterEvent(event)
-        self._set_overlay_expanded(True)
-
-    def leaveEvent(self, event) -> None:
-        super().leaveEvent(event)
-        self._set_overlay_expanded(False)
-
-    def eventFilter(self, obj, event) -> bool:
-        if obj is self._controls_widget and event.type() in (QEvent.Type.Enter, QEvent.Type.MouseMove):
-            self._set_overlay_expanded(True)
-        return super().eventFilter(obj, event)
-
-    def _update_badge_geometry(self) -> None:
-        if self._badge_widget is None:
-            return
-        self._badge_widget.adjustSize()
-        w = self._badge_widget.width()
-        h = self._badge_widget.height()
-        margin = 6
-        self._badge_widget.setGeometry(
-            self.width() - w - margin, margin, w, h
-        )
-
-    def _set_overlay_expanded(self, expanded: bool) -> None:
-        if self._overlay_expanded == expanded:
-            return
-        self._overlay_expanded = expanded
-        self._update_overlay_geometry()
-
-    def _update_overlay_geometry(self) -> None:
-        margin = 8
-        expanded_h = 34
-        y = (
-            max(margin, self.height() - expanded_h - margin)
-            if self._overlay_expanded
-            else self.height() + margin
-        )
-
-        corner_w = self._corner_widget.width() if self._corner_widget is not None else 0
-        if self._controls_widget is not None:
-            controls_w = max(120, self.width() - corner_w - margin * 3)
-            self._controls_widget.setGeometry(margin, y, controls_w, expanded_h)
-            self._controls_widget.raise_()
-
-        if self._corner_widget is not None:
-            self._corner_widget.setGeometry(
-                self.width() - self._corner_widget.width() - margin,
-                y,
-                self._corner_widget.width(),
-                self._corner_widget.height(),
-            )
-            self._corner_widget.raise_()
-
 
 class _PreviewCornerButton(QPushButton):
     """视频预览右下角的全屏图标按钮。"""
@@ -307,51 +234,76 @@ class _MiniTimeline(QWidget):
         p.end()
 
 
-class _CardResizeHandle(QWidget):
-    """房间卡片右下角拖拽手柄，用于调节卡片宽度和预览高度。"""
+class _SizeToggleButton(QWidget):
+    """卡片尺寸切换按钮：hover 时显示，点击循环切换小→中→大，右键弹出菜单。"""
+
+    size_changed = Signal()
 
     def __init__(self, card: "RoomCard", parent=None):
         super().__init__(parent)
         self._card = card
-        self._drag_start = None
-        self._start_width = 0
-        self._start_preview_height = 0
-        self.setObjectName("roomCardResizeHandle")
-        self.setFixedSize(18, 18)
-        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self._visible = False
+        self._hover = False
+        self.setFixedSize(28, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.setToolTip("切换卡片大小（小/中/大）")
+
+    def set_overlay_visible(self, visible: bool) -> None:
+        if self._visible != visible:
+            self._visible = visible
+            self.setVisible(visible)
+
+    def enterEvent(self, event) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start = event.globalPosition()
-            self._start_width = self._card.maximumWidth()
-            self._start_preview_height = self._card._preview_area.height()
+            self._card.cycle_preset()
+            self.size_changed.emit()
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self._show_preset_menu(event.globalPosition().toPoint())
             event.accept()
             return
         super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_start is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            delta = event.globalPosition() - self._drag_start
-            self._card.set_card_size(
-                self._start_width + int(delta.x()),
-                self._start_preview_height + int(delta.y()),
-            )
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
+    def _show_preset_menu(self, pos: QPoint) -> None:
+        menu = QMenu(self)
+        current = self._card._preset_index
+        for i, (name, w, h) in enumerate(_CARD_PRESETS):
+            action = menu.addAction(f"{name}号 ({w}×{h})")
+            action.setCheckable(True)
+            action.setChecked(i == current)
+            action.triggered.connect(lambda checked=False, idx=i: self._apply_preset(idx))
+        menu.exec(pos)
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        self._drag_start = None
-        super().mouseReleaseEvent(event)
+    def _apply_preset(self, index: int) -> None:
+        self._card.set_preset(index)
+        self.size_changed.emit()
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        c = QColor(get_theme().text_tertiary)
-        c.setAlpha(150)
-        p.setPen(QPen(c, 1.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        for offset in (4, 8, 12):
-            p.drawLine(self.width() - offset, self.height() - 2, self.width() - 2, self.height() - offset)
+        bg = QColor(0, 0, 0, 140 if self._hover else 100)
+        p.setBrush(bg)
+        p.setPen(QColor(255, 255, 255, 50))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6, 6)
+        # Draw resize grip icon (3 diagonal dots)
+        pen = QPen(QColor(255, 255, 255, 200 if self._hover else 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        for dx, dy in [(4, -4), (0, 0), (-4, 4)]:
+            cx = self.width() / 2 + dx
+            cy = self.height() / 2 + dy
+            p.drawPoint(QPointF(cx, cy))
         p.end()
 
 
@@ -420,13 +372,15 @@ class RoomCard(QFrame):
         super().__init__(parent)
         self.room = room
         self._selected_state = False
+        self._multi_selected = False
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setObjectName("roomCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        # 高度按内容自适应，宽度最大 440，在常见分辨率下可并排放置两张卡片
+        # 高度按内容自适应,宽度由预设规格控制。
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
-        self.setMaximumWidth(440)
-        self.setMinimumWidth(320)
+        _w = _CARD_PRESETS[_DEFAULT_PRESET_INDEX][1]
+        self.setMinimumWidth(_w)
+        self.setMaximumWidth(_w)
         self._build_ui()
         self._apply_style()
         self.refresh()
@@ -478,12 +432,10 @@ class RoomCard(QFrame):
         inner.addLayout(header)
 
         # ── Preview area ──
-        self._preview_area = _PreviewArea(self)
+        self._preview_area = PreviewSurface(self)
         self._preview_area.setObjectName("roomCardPreviewArea")
-        self._preview_area.setFixedHeight(130)
-        preview_layout = QVBoxLayout(self._preview_area)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
-        self._preview_layout = preview_layout
+        self._preview_area.setFixedHeight(_CARD_PRESETS[_DEFAULT_PRESET_INDEX][2])
+        self._preview_layout = self._preview_area.content_layout
 
         self._preview_placeholder = QWidget(self._preview_area)
         self._preview_placeholder.setMinimumSize(120, 60)
@@ -501,7 +453,7 @@ class RoomCard(QFrame):
         self._ph_text.setWordWrap(True)
         ph_layout.addWidget(self._ph_icon)
         ph_layout.addWidget(self._ph_text)
-        preview_layout.addWidget(self._preview_placeholder)
+        self._preview_layout.addWidget(self._preview_placeholder)
 
         self._embedded_preview: QWidget | None = None
 
@@ -595,8 +547,8 @@ class RoomCard(QFrame):
 
         self._connect_btn = QPushButton("连接", self)
         self._record_btn = QPushButton("录制", self)
-        self._include_cb = _RoomCheckBox("参与批量导出", self)
-        self._include_cb.setToolTip("勾选后，导出选区时会一并导出此房间的录制")
+        self._include_cb = _RoomCheckBox("导出", self)
+        self._include_cb.setToolTip("勾选后,导出选区时会一并导出此房间的录制")
 
         for btn in (self._connect_btn, self._record_btn):
             btn.setObjectName("roomCardActionBtn")
@@ -610,11 +562,15 @@ class RoomCard(QFrame):
         action_row.addWidget(self._connect_btn, 1)
         action_row.addWidget(self._record_btn, 1)
         action_row.addWidget(self._include_cb)
-        self._resize_handle = _CardResizeHandle(self, self)
-        action_row.addWidget(self._resize_handle, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         inner.addLayout(action_row)
 
         root.addLayout(inner)
+
+        # ── Size toggle button (overlay, appears on hover) ──
+        self._size_btn = _SizeToggleButton(self, self)
+        self._size_btn.setVisible(False)
+        self._size_btn.size_changed.connect(self._on_size_changed)
+        self._preset_index = _DEFAULT_PRESET_INDEX
 
         # ── Pulse animation for recording dot ──
         self._pulse_anim = QPropertyAnimation(self._status_dot, b"pulse", self)
@@ -648,13 +604,16 @@ class RoomCard(QFrame):
         if self._selected_state:
             self.setObjectName("roomCardSelected")
             self.setGraphicsEffect(None)
-            from PySide6.QtWidgets import QGraphicsDropShadowEffect
-            c = get_theme()
-            shadow = QGraphicsDropShadowEffect(self)
-            shadow.setBlurRadius(20)
-            shadow.setColor(QColor(c.accent_primary_glow))
-            shadow.setOffset(0, 0)
-            self.setGraphicsEffect(shadow)
+            # 多选时不加阴影(QGraphicsDropShadowEffect 在多卡片下绘制开销大),
+            # 仅靠 QSS 的 accent_primary 边框表达选中态。
+            if not self._multi_selected:
+                from PySide6.QtWidgets import QGraphicsDropShadowEffect
+                c = get_theme()
+                shadow = QGraphicsDropShadowEffect(self)
+                shadow.setBlurRadius(20)
+                shadow.setColor(QColor(c.accent_primary_glow))
+                shadow.setOffset(0, 0)
+                self.setGraphicsEffect(shadow)
         else:
             self.setGraphicsEffect(None)
             self._apply_style()
@@ -715,14 +674,78 @@ class RoomCard(QFrame):
             self._preview_btn.setEnabled(True)
             self._preview_btn.setToolTip("")
 
-    def set_card_size(self, width: int, preview_height: int) -> None:
-        """调节单个房间卡片尺寸，宽度和预览高度都限制在合理范围内。"""
-        width = max(320, min(760, int(width)))
-        preview_height = max(110, min(340, int(preview_height)))
+    def set_card_width(self, width: int) -> None:
+        """设置卡片固定宽度(min==max),FlowLayout 会让它保持该宽度不参与行内扩展。"""
+        self.setMinimumWidth(width)
         self.setMaximumWidth(width)
-        self.setMinimumWidth(min(width, 320))
-        self._preview_area.setFixedHeight(preview_height)
         self.updateGeometry()
+        self._invalidate_parent_layout()
+
+    def set_preview_height(self, height: int) -> None:
+        """设置预览区高度。"""
+        self._preview_area.setFixedHeight(height)
+        self.updateGeometry()
+        self._invalidate_parent_layout()
+
+    def cycle_preset(self) -> None:
+        """循环切换预设: 小→中→大→小。"""
+        self.set_preset((self._preset_index + 1) % len(_CARD_PRESETS))
+
+    def set_preset(self, index: int) -> None:
+        """应用指定预设规格。"""
+        index = max(0, min(len(_CARD_PRESETS) - 1, index))
+        self._preset_index = index
+        _name, w, h = _CARD_PRESETS[index]
+        self.set_card_width(w)
+        self.set_preview_height(h)
+        self._save_preset()
+
+    def _on_size_changed(self) -> None:
+        """尺寸切换后通知父布局重排。"""
+        self._invalidate_parent_layout()
+
+    def reset_card_width(self) -> None:
+        """恢复为默认预设。"""
+        self.set_preset(_DEFAULT_PRESET_INDEX)
+
+    def _invalidate_parent_layout(self) -> None:
+        """宽度/高度变化后通知父布局(FlowLayout)重新换行,并向上传播。"""
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        lay = parent.layout()
+        if lay is not None:
+            lay.invalidate()
+            lay.update()
+        parent.updateGeometry()
+
+    # ── Per-card size persistence ───────────────────────────────
+
+    def _size_settings_key(self) -> str:
+        digest = hashlib.md5(self.room.room_url.encode("utf-8")).hexdigest()[:12]
+        return f"card_preset/{digest}"
+
+    def restore_saved_size(self) -> None:
+        """从 QSettings 恢复该房间上次保存的卡片预设。"""
+        settings = QSettings("LSC", "LiveStreamClipper")
+        val = settings.value(self._size_settings_key())
+        if val is None:
+            self.set_preset(_DEFAULT_PRESET_INDEX)
+            return
+        try:
+            idx = int(val)
+        except (TypeError, ValueError):
+            idx = _DEFAULT_PRESET_INDEX
+        self.set_preset(idx)
+
+    def _save_preset(self) -> None:
+        """持久化当前预设索引。"""
+        settings = QSettings("LSC", "LiveStreamClipper")
+        settings.setValue(self._size_settings_key(), self._preset_index)
+
+    def _notify_size_changed(self) -> None:
+        """兼容旧接口（拖拽手柄已移除，此方法保留供其他调用方使用）。"""
+        self._save_preset()
 
     def set_timeline_data(self, position: float, duration: float) -> None:
         self._timeline.set_data(position, duration)
@@ -740,8 +763,9 @@ class RoomCard(QFrame):
         self._ph_icon.setText(icon)
         self._ph_text.setText(text)
 
-    def set_selected(self, selected: bool) -> None:
+    def set_selected(self, selected: bool, *, multi: bool = False) -> None:
         self._selected_state = selected
+        self._multi_selected = bool(multi and selected)
         self._apply_selected_border()
 
     def show_sync_badge(self, time_text: str) -> None:
@@ -827,7 +851,11 @@ class RoomCard(QFrame):
         else:
             if self._embedded_preview is not None:
                 self._embedded_preview.hide()
-            self._set_placeholder("▶", "预览未开启")
+            # 区分语义:未连接引导「点击连接」,已连接引导「点击预览」
+            if not s.is_connected and not s.is_connecting:
+                self._set_placeholder("📡", "点击连接")
+            else:
+                self._set_placeholder("▶", "点击预览")
             self._preview_placeholder.show()
             self._preview_btn.setEnabled(True)
             self._preview_btn.setToolTip("")
@@ -844,7 +872,13 @@ class RoomCard(QFrame):
             status_key = "connected"
         dot_color = getattr(c, _STATUS_COLORS_ATTR[status_key], c.text_tertiary)
         self._status_dot.set_color(dot_color)
-        self._status_text.setText(s.status_text())
+        status_text = s.status_text()
+        # 录制中时把时长直接显示在卡片状态行,用户一眼可见已录多久
+        if s.is_recording and s.record_started_at is not None:
+            from datetime import datetime
+            elapsed = (datetime.now() - s.record_started_at).total_seconds()
+            status_text = status_text.replace("录制中", f"录制中 {fmt_time(elapsed)}", 1)
+        self._status_text.setText(status_text)
 
         # Pulse animation
         if status_key == "recording":
@@ -906,10 +940,29 @@ class RoomCard(QFrame):
 
     # ── Event overrides ──────────────────────────────────────────────
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_size_button()
+
+    def _place_size_button(self) -> None:
+        """将尺寸切换按钮定位到卡片右上角。"""
+        btn = self._size_btn
+        margin = 4
+        btn.setGeometry(self.width() - btn.width() - margin, margin, btn.width(), btn.height())
+        btn.raise_()
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.selected.emit(self.room.room_id)
         super().mousePressEvent(event)
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        self._size_btn.set_overlay_visible(True)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self._size_btn.set_overlay_visible(False)
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
@@ -922,6 +975,13 @@ class RoomCard(QFrame):
             menu.addAction("停止录制", lambda: self.stop_clicked.emit(self.room.room_id))
         else:
             menu.addAction("开始录制", lambda: self.record_clicked.emit(self.room.room_id))
+        menu.addSeparator()
+        size_menu = menu.addMenu("卡片大小")
+        for i, (name, w, h) in enumerate(_CARD_PRESETS):
+            action = size_menu.addAction(f"{name}号 ({w}×{h})")
+            action.setCheckable(True)
+            action.setChecked(i == self._preset_index)
+            action.triggered.connect(lambda checked=False, idx=i: self.set_preset(idx))
         menu.addSeparator()
         menu.addAction("删除房间", lambda: self.remove_clicked.emit(self.room.room_id))
         menu.exec(event.globalPos())

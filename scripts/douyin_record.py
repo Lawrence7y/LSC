@@ -6,8 +6,6 @@ import json
 import logging
 import os
 import re
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 log = logging.getLogger("lsc.douyin")
 logging.basicConfig(
@@ -15,9 +13,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
+# Unified HTTP defaults (mirrors lsc.platforms.base to avoid importing lsc here).
+_HTTP_TIMEOUT = 12
+_HTTP_RETRIES = 2
+
 
 def fetch_page(url: str) -> str | None:
-    """Fetch the Douyin live page HTML."""
+    """Fetch the Douyin live page HTML with unified timeout and retry."""
+    import time
+    from urllib.error import URLError
+    from urllib.request import Request, urlopen
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -26,13 +32,18 @@ def fetch_page(url: str) -> str | None:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
-    request = Request(url, headers=headers)
-    try:
-        with urlopen(request, timeout=15) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except URLError as exc:
-        log.warning("fetch_page failed url=%s err=%s", url, exc)
-        return None
+    last_exc: Exception | None = None
+    for attempt in range(_HTTP_RETRIES + 1):
+        try:
+            request = Request(url, headers=headers)
+            with urlopen(request, timeout=_HTTP_TIMEOUT) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except (URLError, Exception) as exc:
+            last_exc = exc
+            if attempt < _HTTP_RETRIES:
+                time.sleep(0.5 * (attempt + 1))
+    log.warning("fetch_page failed url=%s err=%s", url, last_exc)
+    return None
 
 
 def extract_ssr_data(html: str) -> dict[str, object]:

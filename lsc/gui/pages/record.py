@@ -7,13 +7,30 @@ import os
 import time as _time
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSettings, Qt, QTimer, Signal
+from lsc import get_logger
+_log = get_logger(__name__)
+
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QPoint,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+    Property,
+)
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPolygon
 from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -24,7 +41,10 @@ from PySide6.QtWidgets import (
 from lsc.utils.helpers import fmt_time as _fmt_time
 
 from ..components.control_bar import ControlBar as SharedControlBar
+from ..components.fullscreen_preview import FullscreenPreview
 from ..components.mpv_widget import MpvWidget
+from ..components.preview_surface import PreviewSurface
+from ..components.timeline import InlineTimeline as SharedTimeline
 from ..components.widgets import Card, ChipGroup, EmptyState, FadeInWidget, InputField, ParamPanel
 from ..theme import get_option_button_palette, get_theme, is_dark
 from .recording_controller import RecordingController
@@ -87,103 +107,167 @@ class _FullscreenOverlayButton(QPushButton):
             p.drawLine(26, 26, 26, 20)
         p.end()
 
-
-class VideoPreview(QWidget):
-    """Video preview / recording indicator.
-
-    Uses mpv (libmpv-2) instead of QMediaPlayer.  mpv can natively
-    play growing (fragmented-MP4) files without stalling at the old EOF,
-    which fixes the black-screen issue completely.
-
-    When recording: mpv plays the growing file in live mode (follows the
-    write head).  When not recording: mpv plays completed files normally.
-    A paintEvent overlay shows a pulsing dot + "正在录制" when recording.
-    """
-
-    fullscreen_clicked = Signal()
+class _RecBadge(QWidget):
+    """录制中徽章:右上角脉冲红点 + 时间,mpv 可见时半透明叠加。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._recording = False
         self._time = "00:00:00"
-        self._connected = False
+        self._visible = False
+        self._pulse = 0.0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        anim = QPropertyAnimation(self, b"pulse", self)
+        anim.setDuration(1200)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+        anim.setLoopCount(-1)
+        self._anim = anim
+        self.adjustSize()
+        self.setVisible(False)
+
+    def get_pulse(self) -> float:
+        return self._pulse
+
+    def set_pulse(self, v: float) -> None:
+        self._pulse = v
+        self.update()
+
+    pulse = Property(float, get_pulse, set_pulse)
+
+    def set_time(self, t: str) -> None:
+        self._time = t
+        self.update()
+
+    def set_recording(self, on: bool) -> None:
+        self._visible = on
+        self.setVisible(on)
+        if on:
+            self._anim.start()
+        else:
+            self._anim.stop()
+            self._pulse = 0.0
+
+    def sizeHint(self) -> QSize:
+        return QSize(160, 30)
+
+    def paintEvent(self, _e) -> None:
+        if not self._visible:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 160))
+        p.drawRoundedRect(r, 8, 8)
+        pulse = 0.5 + 0.5 * self._pulse
+        cx = r.left() + 16
+        cy = r.center().y()
+        p.setBrush(QColor(220, 30, 30, int(100 + 120 * pulse)))
+        p.drawEllipse(QPointF(cx, cy), 6, 6)
+        p.setPen(QColor(255, 255, 255, 200))
+        p.setFont(QFont("JetBrains Mono", 10))
+        p.drawText(QRect(r.left() + 28, r.top(), r.width() - 32, r.height()),
+                   Qt.AlignmentFlag.AlignVCenter, f"录制中 {self._time}")
+        p.end()
+
+
+class VideoPreview(PreviewSurface):
+    """直播录制页预览容器。
+
+    基于共享 `PreviewSurface`:占位 + 嵌入 MpvWidget + 右上 REC 徽章 +
+    右下全屏角标 + 底部 hover 覆盖层(播放/静音)。底部覆盖层与下方
+    `SharedControlBar` 联动(两处都保留播放控制,符合统一设计)。
+
+    保留原 VideoPreview 的全部方法接口,RecordPage 调用点无需改动。
+    """
+
+    fullscreen_clicked = Signal()
+    play_pause_clicked = Signal()
+    mute_toggled = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("recordPreviewArea")
         self.setMinimumSize(400, 225)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # mpv-based video playback (supports growing files), created lazily
-        # so ordinary page construction and offscreen tests do not start mpv.
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
+        # mpv 惰性创建,普通构造与 offscreen 测试不启动 mpv
         self._mpv_widget: MpvWidget | None = None
 
+        # 占位
+        self._placeholder = QLabel("直播画面预览区域")
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder.setObjectName("recordPreviewPlaceholder")
+        self.set_content_widget(self._placeholder)
+
+        # 右上 REC 徽章
+        self._rec_badge = _RecBadge(self)
+        self._rec_badge.setVisible(False)
+        self.set_badge_widget(self._rec_badge)
+
+        # 右下全屏角标
         self._fullscreen_btn = _FullscreenOverlayButton(self)
         self._fullscreen_btn.clicked.connect(self.fullscreen_clicked.emit)
-        self._fullscreen_btn.show()
-        self._fullscreen_btn.raise_()
+        self.set_corner_widget(self._fullscreen_btn)
 
-        # Animation timer for pulsing REC dot during recording
-        self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(50)  # ~20 fps for smooth pulse
-        self._anim_timer.timeout.connect(self.update)
+        # 底部 hover 覆盖层:播放/暂停 + 静音
+        self._overlay = QWidget(self)
+        self._overlay.setObjectName("recordPreviewOverlay")
+        ol = QHBoxLayout(self._overlay)
+        ol.setContentsMargins(8, 4, 8, 4)
+        ol.setSpacing(8)
+        self._play_btn = QPushButton("播放")
+        self._play_btn.setObjectName("ctrlPlay")
+        self._play_btn.setFixedHeight(26)
+        self._play_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._play_btn.clicked.connect(self.play_pause_clicked.emit)
+        self._mute_btn = QPushButton("静音")
+        self._mute_btn.setObjectName("ctrlSecondary")
+        self._mute_btn.setCheckable(True)
+        self._mute_btn.setFixedHeight(26)
+        self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._mute_btn.toggled.connect(self.mute_toggled.emit)
+        ol.addWidget(self._play_btn)
+        ol.addStretch(1)
+        ol.addWidget(self._mute_btn)
+        self.set_controls_widget(self._overlay)
 
-    def set_state(self, recording=False, connected=False, time="00:00:00"):
-        was_recording = self._recording
-        self._recording = recording
-        self._connected = connected
-        self._time = time
-        if recording and not was_recording:
-            # Starting recording — start animation overlay
-            self._anim_timer.start()
-        elif not recording and was_recording:
-            # Stopped recording — stop animation overlay
-            self._anim_timer.stop()
-        self.update()
+        self._recording = False
+        self._time = "00:00:00"
+
+    # ── mpv lifecycle ──────────────────────────────────────────
 
     def _ensure_mpv_widget(self) -> MpvWidget:
         if self._mpv_widget is None:
+            # 先移掉占位,再嵌入 mpv,避免两个 widget 竞争同一个 layout 空间
+            self.clear_content()
             self._mpv_widget = MpvWidget()
             self._mpv_widget.setStyleSheet("border-radius:14px;")
             self._mpv_widget.hide()
-            self._layout.addWidget(self._mpv_widget)
-            self._fullscreen_btn.raise_()
+            self.content_layout.addWidget(self._mpv_widget)
         return self._mpv_widget
 
-    def set_fullscreen_mode(self, enabled: bool) -> None:
-        self._fullscreen_btn.set_exit_mode(enabled)
-        self._fullscreen_btn.raise_()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        margin = 12
-        size = self._fullscreen_btn.size()
-        self._fullscreen_btn.move(
-            max(margin, self.width() - size.width() - margin),
-            max(margin, self.height() - size.height() - margin),
-        )
-        self._fullscreen_btn.raise_()
-
     def play_video(self, path):
-        """Play a completed (non-growing) recording."""
         if not os.path.isfile(path):
             return
         self.stop_video()
         player = self._ensure_mpv_widget()
         player.show()
         player.play_video(path, live=False)
-        self.update()
 
     def play_live(self, path):
-        """Play a growing file during recording (live mode)."""
         player = self._ensure_mpv_widget()
         player.show()
         player.play_live(path)
-        self.update()
 
     def stop_video(self):
-        """Stop video playback."""
         if self._mpv_widget is not None:
             self._mpv_widget.stop_video()
-        self.update()
+            self._mpv_widget.hide()
+        # 恢复占位
+        if self._layout.count() == 0 or self._layout.itemAt(0).widget() is not self._placeholder:
+            self.set_content_widget(self._placeholder)
 
     def is_playing(self):
         return bool(self._mpv_widget and self._mpv_widget.is_playing())
@@ -207,74 +291,32 @@ class VideoPreview(QWidget):
         return self._mpv_widget.duration_sec()
 
     def cleanup(self):
-        """Clean up mpv resources."""
         if self._mpv_widget is not None:
             self._mpv_widget.cleanup()
 
+    # ── state ─────────────────────────────────────────────────
+
+    def set_state(self, recording=False, connected=False, time="00:00:00"):
+        self._recording = recording
+        self._time = time
+        self._rec_badge.set_time(time)
+        self._rec_badge.set_recording(recording)
+        self._play_btn.setText("暂停" if self.is_playing() else "播放")
+
+    def set_fullscreen_mode(self, enabled: bool) -> None:
+        self._fullscreen_btn.set_exit_mode(enabled)
+
     def paintEvent(self, e):
+        # 占位背景:mpv 不可见时画,可见时让视频透出
         mpv_visible = bool(self._mpv_widget and self._mpv_widget.isVisible())
-
-        # When mpv is showing video (recording or playback), avoid painting
-        # an opaque background over it — let the video show through.
-        if mpv_visible and not self._recording:
-            return  # Playback mode — no overlay
-
+        if mpv_visible:
+            return
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         c = get_theme()
-        r = self.rect()
-
-        if self._recording and mpv_visible:
-            # Live preview is active — draw only a small semi-transparent
-            # REC badge in the top-left corner so the video stays visible.
-            p.setPen(Qt.NoPen)
-            t = _time.monotonic()
-            pulse = 0.5 + 0.5 * math.sin(t * 4.0)
-
-            # Badge background
-            badge_rect = QRect(12, 12, 160, 36)
-            p.setBrush(QColor(0, 0, 0, 160))
-            p.drawRoundedRect(badge_rect, 8, 8)
-
-            # Pulsing red dot
-            dot_x, dot_y = badge_rect.left() + 18, badge_rect.center().y()
-            p.setBrush(QColor(220, 30, 30, int(100 + 120 * pulse)))
-            p.drawEllipse(QPointF(dot_x, dot_y), 6, 6)
-
-            # Time text
-            p.setPen(QColor(255, 255, 255, 200))
-            p.setFont(QFont("JetBrains Mono", 11))
-            text_rect = QRect(badge_rect.left() + 32, badge_rect.top(),
-                              badge_rect.width() - 40, badge_rect.height())
-            p.drawText(text_rect, Qt.AlignVCenter, f"录制中 {self._time}")
-        elif self._recording:
-            # No live preview yet (mpv not visible) — full overlay
-            p.setBrush(QColor(c.bg_tertiary))
-            p.setPen(QColor(c.border_subtle))
-            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 14, 14)
-
-            cx, cy = r.center().x(), r.center().y()
-            t = _time.monotonic()
-            pulse = 0.5 + 0.5 * math.sin(t * 4.0)
-            radius = 8 + 4 * pulse
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(220, 30, 30, int(100 + 120 * pulse)))
-            p.drawEllipse(QPointF(cx, cy - 30), radius, radius)
-            p.setPen(QColor(255, 255, 255, 180))
-            p.setFont(QFont("Inter", 14))
-            p.drawText(r.adjusted(0, 10, 0, 0), Qt.AlignCenter, "正在录制")
-            p.setPen(QColor(255, 255, 255, 120))
-            p.setFont(QFont("JetBrains Mono", 12))
-            p.drawText(r.adjusted(0, 40, 0, 0), Qt.AlignCenter, self._time)
-        else:
-            # Idle state — no video, no recording
-            p.setBrush(QColor(c.bg_tertiary))
-            p.setPen(QColor(c.border_subtle))
-            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 14, 14)
-            p.setPen(QColor(c.text_tertiary))
-            p.setFont(QFont("Inter", 13))
-            p.drawText(r, Qt.AlignCenter, "直播画面预览区域")
-
+        p.setBrush(QColor(c.bg_tertiary))
+        p.setPen(QColor(c.border_subtle))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 14, 14)
         p.end()
 
 
@@ -362,735 +404,6 @@ def _icon_pause(p, r, c):
     cx, cy = r.center().x(), r.center().y()
     p.drawRoundedRect(cx - 5, cy - 6, 4, 12, 1, 1)
     p.drawRoundedRect(cx + 1, cy - 6, 4, 12, 1, 1)
-
-
-TIMELINE_HEIGHT = 56
-TIMELINE_TRACK_THICKNESS = 2
-TIMELINE_SELECTION_HEIGHT = 12
-TIMELINE_SELECTION_BORDER_WIDTH = 1
-TIMELINE_CURSOR_LINE_WIDTH = 2
-TIMELINE_CURSOR_DOT_SIZE = 8
-TIMELINE_LABEL_HEIGHT = 18
-TIMELINE_MARKER_WIDTH = 4
-TIMELINE_MARKER_HEIGHT = 8
-TIMELINE_SIDE_PADDING = 8
-TIMELINE_HANDLE_HIT_RADIUS = 10
-
-
-class InlineTimeline(QWidget):
-    marker_clicked = Signal(int)
-    position_changed = Signal(float)
-
-    CURSOR_WHITE, CURSOR_GREEN, CURSOR_RED = 0, 1, 2
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._duration = 0
-        self._position = 0
-        self._start = None
-        self._end = None
-        self._markers = []
-        self._offset = 0
-        self._pixels_per_sec = 6
-        self._drag_mode = None  # None, 'position', 'start', 'end', 'pan'
-        self._drag_start_x = 0
-        self._cursor_mode = self.CURSOR_WHITE
-        self._drag_preview_time = None
-        self._live_clock_text = ""
-        self.setFixedHeight(TIMELINE_HEIGHT)
-        self.setCursor(Qt.OpenHandCursor)
-        self.setMouseTracking(True)
-
-    def current_palette(self) -> dict[str, str]:
-        c = get_theme()
-        return {
-            "container_fill": c.bg_tertiary,
-            "container_border": c.border_subtle,
-            "track": c.border_default,
-            "progress": c.accent_primary,
-            "selection_fill": c.accent_primary_dim,
-            "selection_border": c.accent_primary,
-            "marker": c.accent_primary,
-            "label_fill": c.bg_elevated,
-            "label_border": c.border_default,
-            "label_text": c.text_primary,
-        }
-
-    def track_geometry(self) -> tuple[int, int, int]:
-        r = self.rect()
-        return (
-            r.x() + TIMELINE_SIDE_PADDING,
-            r.right() - TIMELINE_SIDE_PADDING,
-            r.center().y(),
-        )
-
-    def selection_rect(self) -> QRect:
-        track_left, track_right, mid_y = self.track_geometry()
-        if self._start is None or self._end is None or self._duration <= 0:
-            return QRect(track_left, mid_y - TIMELINE_SELECTION_HEIGHT // 2, 0, TIMELINE_SELECTION_HEIGHT)
-        sx = self._time_to_x(self._start)
-        ex = self._time_to_x(self._end)
-        left = max(track_left, min(sx, ex))
-        right = min(track_right, max(sx, ex))
-        return QRect(left, mid_y - TIMELINE_SELECTION_HEIGHT // 2, max(0, right - left), TIMELINE_SELECTION_HEIGHT)
-
-    def cursor_label_text(self) -> str:
-        if self._drag_preview_time is not None:
-            return _fmt_time(self._drag_preview_time)
-        return _fmt_time(self._position)
-
-    def cursor_label_rect(self) -> QRect:
-        x = self._time_to_x(self._drag_preview_time if self._drag_preview_time is not None else self._position)
-        fm = QFontMetrics(QFont("JetBrains Mono", 8, QFont.Weight.Medium))
-        width = fm.horizontalAdvance(self.cursor_label_text()) + 10
-        rect = QRect(x - width // 2, 2, width, TIMELINE_LABEL_HEIGHT)
-        if rect.left() < TIMELINE_SIDE_PADDING:
-            rect.moveLeft(TIMELINE_SIDE_PADDING)
-        if rect.right() > self.rect().right() - TIMELINE_SIDE_PADDING:
-            rect.moveRight(self.rect().right() - TIMELINE_SIDE_PADDING)
-        return rect
-
-    def cursor_color_name(self) -> str:
-        c = get_theme()
-        if self._cursor_mode == self.CURSOR_GREEN:
-            return c.accent_success
-        if self._cursor_mode == self.CURSOR_RED:
-            return c.accent_error
-        return c.text_primary
-
-    def set_data(self, duration=0, position=0, start=None, end=None):
-        self._duration = duration
-        self._position = position
-        self._start = start
-        self._end = end
-        self.update()
-
-    def set_cursor_mode(self, mode):
-        self._cursor_mode = mode
-        self.update()
-
-    def set_live_clock(self, text):
-        self._live_clock_text = text
-        self.update()
-
-    def _drag_preview_text(self):
-        if self._drag_preview_time is None:
-            return ""
-        text = _fmt_time(self._drag_preview_time)
-        if self._live_clock_text:
-            text += f" / 直播 {self._live_clock_text}"
-        return text
-
-    def add_marker(self, start_sec, end_sec, label=""):
-        self._markers.append((start_sec, end_sec, label))
-        self.update()
-
-    def clear_markers(self):
-        self._markers.clear()
-        self.update()
-
-    def _time_to_x(self, t):
-        track_left, track_right, _mid_y = self.track_geometry()
-        if self._duration <= 0:
-            return track_left
-        return track_left + int((t / self._duration) * (track_right - track_left))
-
-    def _x_to_time(self, x):
-        track_left, track_right, _mid_y = self.track_geometry()
-        if track_right <= track_left or self._duration <= 0:
-            return 0
-        ratio = max(0, min(1, (x - track_left) / (track_right - track_left)))
-        return ratio * self._duration
-
-    def _handle_at(self, x):
-        if self._start is None or self._end is None or self._duration <= 0:
-            return None
-        sx = self._time_to_x(self._start)
-        ex = self._time_to_x(self._end)
-        if abs(x - sx) < TIMELINE_HANDLE_HIT_RADIUS:
-            return 'start'
-        if abs(x - ex) < TIMELINE_HANDLE_HIT_RADIUS:
-            return 'end'
-        return None
-
-    def mousePressEvent(self, e):
-        if e.button() != Qt.LeftButton or self._duration <= 0:
-            return
-        x = int(e.position().x())
-        handle = self._handle_at(x)
-        if handle:
-            self._drag_mode = handle
-        elif self._start is not None and self._end is not None:
-            sx = self._time_to_x(self._start)
-            ex = self._time_to_x(self._end)
-            if min(sx, ex) <= x <= max(sx, ex):
-                self._drag_mode = 'range'
-                self._drag_start_x = x
-                self._drag_preview_time = self._x_to_time(x)
-            else:
-                self._drag_mode = 'position'
-                self._position = self._x_to_time(x)
-                self._drag_preview_time = self._position
-                self.position_changed.emit(self._position)
-        else:
-            self._drag_mode = 'position'
-            self._position = self._x_to_time(x)
-            self._drag_preview_time = self._position
-            self.position_changed.emit(self._position)
-        self.setCursor(Qt.ClosedHandCursor if self._drag_mode in ('range', 'pan') else Qt.ArrowCursor)
-        self.update()
-
-    def mouseMoveEvent(self, e):
-        if not self._drag_mode or self._duration <= 0:
-            return
-        x = int(e.position().x())
-        t = self._x_to_time(x)
-        if self._drag_mode == 'position':
-            self._position = t
-            self._drag_preview_time = t
-            self.position_changed.emit(t)
-        elif self._drag_mode == 'start':
-            self._start = t
-            self._drag_preview_time = t
-        elif self._drag_mode == 'end':
-            self._end = t
-            self._drag_preview_time = t
-        elif self._drag_mode == 'range':
-            dx = x - self._drag_start_x
-            dt = dx * self._duration / max(1, self.rect().width() - 16)
-            if self._start is not None and self._end is not None:
-                self._start = max(0, min(self._duration, self._start + dt))
-                self._end = max(0, min(self._duration, self._end + dt))
-                self._drag_preview_time = self._end
-            self._drag_start_x = x
-        self.update()
-
-    def mouseReleaseEvent(self, e):
-        self._drag_mode = None
-        self._drag_preview_time = None
-        self.setCursor(Qt.OpenHandCursor)
-
-    def wheelEvent(self, event):
-        delta = event.angleDelta().y()
-        if delta > 0:
-            self.zoom_in()
-        elif delta < 0:
-            self.zoom_out()
-
-    def zoom_in(self):
-        old_pps = self._pixels_per_sec
-        self._pixels_per_sec = min(60, self._pixels_per_sec * 1.5)
-        # Maintain viewport: adjust offset so current position stays in same place
-        if old_pps > 0 and self._duration > 0:
-            ratio = self._pixels_per_sec / old_pps
-            self._offset = int(self._offset * ratio)
-        self.update()
-
-    def zoom_out(self):
-        old_pps = self._pixels_per_sec
-        self._pixels_per_sec = max(1, self._pixels_per_sec / 1.5)
-        if old_pps > 0 and self._duration > 0:
-            ratio = self._pixels_per_sec / old_pps
-            self._offset = int(self._offset * ratio)
-        self.update()
-
-    def reset_zoom(self):
-        self._pixels_per_sec = 6
-        self.update()
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        c = get_theme()
-        palette = self.current_palette()
-        r = self.rect()
-        track_left, track_right, mid_y = self.track_geometry()
-
-        p.setBrush(QColor(palette["container_fill"]))
-        p.setPen(QColor(palette["container_border"]))
-        p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 8, 8)
-
-        track_pen = QPen(QColor(palette["track"]), TIMELINE_TRACK_THICKNESS)
-        track_pen.setCapStyle(Qt.RoundCap)
-        p.setPen(track_pen)
-        p.drawLine(track_left, mid_y, track_right, mid_y)
-
-        if self._duration > 0:
-            progress_x = self._time_to_x(self._position)
-            progress_pen = QPen(QColor(palette["progress"]), TIMELINE_TRACK_THICKNESS)
-            progress_pen.setCapStyle(Qt.RoundCap)
-            p.setPen(progress_pen)
-            p.drawLine(track_left, mid_y, progress_x, mid_y)
-
-        if self._start is not None and self._end is not None and self._duration > 0:
-            sel_rect = self.selection_rect()
-            p.setBrush(QColor(palette["selection_fill"]))
-            p.setPen(Qt.NoPen)
-            p.drawRoundedRect(sel_rect, 6, 6)
-
-            edge_pen = QPen(QColor(palette["selection_border"]), TIMELINE_SELECTION_BORDER_WIDTH)
-            edge_pen.setCapStyle(Qt.RoundCap)
-            p.setPen(edge_pen)
-            p.drawLine(sel_rect.left(), sel_rect.top() - 2, sel_rect.left(), sel_rect.bottom() + 2)
-            p.drawLine(sel_rect.right(), sel_rect.top() - 2, sel_rect.right(), sel_rect.bottom() + 2)
-
-        marker_top = r.bottom() - TIMELINE_MARKER_HEIGHT - 6
-        for ms, _me, _ml in self._markers:
-            if self._duration <= 0:
-                continue
-            mx = self._time_to_x(ms)
-            p.setBrush(QColor(palette["marker"]))
-            p.setPen(Qt.NoPen)
-            p.drawRoundedRect(
-                mx - TIMELINE_MARKER_WIDTH // 2,
-                marker_top,
-                TIMELINE_MARKER_WIDTH,
-                TIMELINE_MARKER_HEIGHT,
-                1,
-                1,
-            )
-
-        if self._duration > 0:
-            cursor_time = self._drag_preview_time if self._drag_preview_time is not None else self._position
-            x = self._time_to_x(cursor_time)
-            cursor_color = QColor(self.cursor_color_name())
-            line_top = r.top() + TIMELINE_LABEL_HEIGHT + 4
-            line_bottom = marker_top - 4
-
-            if not is_dark() and self._cursor_mode == self.CURSOR_WHITE:
-                outline_pen = QPen(QColor(c.border_strong), TIMELINE_CURSOR_LINE_WIDTH + 1)
-                outline_pen.setCapStyle(Qt.RoundCap)
-                p.setPen(outline_pen)
-                p.drawLine(x, line_top, x, line_bottom)
-
-            cursor_pen = QPen(cursor_color, TIMELINE_CURSOR_LINE_WIDTH)
-            cursor_pen.setCapStyle(Qt.RoundCap)
-            p.setPen(cursor_pen)
-            p.drawLine(x, line_top, x, line_bottom)
-
-            dot_rect = QRect(
-                x - TIMELINE_CURSOR_DOT_SIZE // 2,
-                mid_y - TIMELINE_CURSOR_DOT_SIZE // 2,
-                TIMELINE_CURSOR_DOT_SIZE,
-                TIMELINE_CURSOR_DOT_SIZE,
-            )
-            if not is_dark() and self._cursor_mode == self.CURSOR_WHITE:
-                p.setBrush(QColor(c.border_strong))
-                p.setPen(Qt.NoPen)
-                p.drawEllipse(dot_rect.adjusted(-1, -1, 1, 1))
-            p.setBrush(cursor_color)
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(dot_rect)
-
-            label_text = self._drag_preview_text() or self.cursor_label_text()
-            label_rect = self.cursor_label_rect()
-            p.setBrush(QColor(palette["label_fill"]))
-            p.setPen(QColor(palette["label_border"]))
-            p.drawRoundedRect(label_rect, 4, 4)
-            p.setFont(QFont("JetBrains Mono", 8, QFont.Weight.Medium))
-            p.setPen(QColor(palette["label_text"]))
-            p.drawText(label_rect, Qt.AlignCenter, label_text)
-
-        p.end()
-
-class LegacyControlBar(QWidget):
-    seek_back = Signal()
-    seek_fwd = Signal()
-    play_pause = Signal()
-    export_clicked = Signal()
-    mark_clicked = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(70)
-        self._recording = False
-        self._build()
-
-    def _build(self):
-        c = get_theme()
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(14, 10, 14, 10)
-        lay.setSpacing(12)
-
-        # Seek back
-        self._back = IconButton(34, _icon_seek_back, "后退 10 秒")
-        self._back.setEnabled(False)
-        self._back.clicked.connect(self.seek_back.emit)
-        lay.addWidget(self._back)
-
-        # Play/Pause button
-        self._play = IconButton(34, _icon_play, "播放")
-        self._play.setEnabled(False)
-        self._play.clicked.connect(self.play_pause.emit)
-        lay.addWidget(self._play)
-
-        # Seek forward
-        self._fwd = IconButton(34, _icon_seek_fwd, "前进 10 秒")
-        self._fwd.setEnabled(False)
-        self._fwd.clicked.connect(self.seek_fwd.emit)
-        lay.addWidget(self._fwd)
-
-        # Timeline
-        self._timeline = InlineTimeline()
-        lay.addWidget(self._timeline, 1)
-
-        # Time display: position / duration
-        self._time_label = QLabel("00:00:00 / 00:00:00")
-        self._time_label.setObjectName("label_mono")
-        self._time_label.setAlignment(Qt.AlignCenter)
-        self._time_label.setFixedWidth(140)
-        lay.addWidget(self._time_label)
-
-        # Mark button
-        self._mark = QPushButton("● 标记")
-        self._mark.setFixedSize(70, 32)
-        self._mark.setEnabled(False)
-        self._mark.setStyleSheet(f"""
-            QPushButton {{
-                background:rgba(61,213,152,0.08);
-                color:{c.accent_success};
-                border:1px solid rgba(61,213,152,0.25);
-                border-radius:6px;
-                padding:0 10px;
-                font-size:12px;
-                font-weight:500;
-            }}
-            QPushButton:hover:!disabled {{
-                background:rgba(61,213,152,0.15);
-            }}
-            QPushButton:checked {{
-                background:{c.accent_success};
-                color:white;
-                border-color:{c.accent_success};
-            }}
-            QPushButton:disabled {{ opacity:0.4; }}
-        """)
-        self._mark.setCheckable(True)
-        self._mark.clicked.connect(self.mark_clicked.emit)
-        lay.addWidget(self._mark)
-
-        # Export button
-        self._export = QPushButton("↓ 导出")
-        self._export.setFixedSize(70, 34)
-        self._export.setEnabled(False)
-        self._export.setStyleSheet(f"""
-            QPushButton {{
-                background:{c.accent_primary_dim};
-                color:{c.accent_primary};
-                border:1px solid {c.accent_primary};
-                border-radius:6px;
-                padding:0 14px;
-                font-size:12px;
-                font-weight:500;
-            }}
-            QPushButton:hover:!disabled {{
-                background:{c.accent_primary};
-                color:white;
-            }}
-            QPushButton:disabled {{ opacity:0.4; }}
-        """)
-        self._export.clicked.connect(self.export_clicked.emit)
-        lay.addWidget(self._export)
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        c = get_theme()
-        p.setBrush(QColor(c.bg_secondary))
-        p.setPen(QColor(c.border_subtle))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 14, 14)
-        p.end()
-
-    def set_recording(self, r):
-        self._recording = r
-        # Always keep playback controls enabled so the user can
-        # play/pause, seek, and mark after recording stops.
-        # The play icon is updated separately via set_playing().
-        self._back.setEnabled(True)
-        self._fwd.setEnabled(True)
-        self._mark.setEnabled(True)
-        self._play.setEnabled(True)
-
-    def set_playing(self, playing: bool):
-        self._play._icon_fn = _icon_pause if playing else _icon_play
-        self._play.setToolTip("暂停" if playing else "播放")
-        self._play.update()
-
-    def set_export_enabled(self, e):
-        self._export.setEnabled(e)
-
-    def set_time(self, position, duration):
-        self._time_label.setText(f"{_fmt_time(position)} / {_fmt_time(duration)}")
-
-    @property
-    def timeline(self):
-        return self._timeline
-
-    @property
-    def mark_button(self):
-        return self._mark
-
-
-CONTROL_BAR_HEIGHT = 140
-CONTROL_TIME_LABEL_WIDTH = 172
-CONTROL_ACTION_BUTTON_WIDTH = 84
-CONTROL_ACTION_BUTTON_HEIGHT = 44
-
-
-def _get_control_action_palette(*, active: bool = False, hover: bool = False) -> dict[str, str]:
-    c = get_theme()
-    if active and is_dark():
-        return {
-            "border": c.accent_primary,
-            "background": c.accent_primary,
-            "text": "#ffffff",
-        }
-    if hover and is_dark():
-        return {
-            "border": c.accent_primary,
-            "background": "rgba(255,135,69,0.18)",
-            "text": c.accent_primary,
-        }
-    if is_dark():
-        return {
-            "border": c.accent_primary,
-            "background": c.accent_primary_dim,
-            "text": c.accent_primary,
-        }
-    return get_option_button_palette(c, active=active, hover=hover)
-
-
-class ControlActionButton(QPushButton):
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
-        self._hover = False
-        self.setFixedSize(CONTROL_ACTION_BUTTON_WIDTH, CONTROL_ACTION_BUTTON_HEIGHT)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setMouseTracking(True)
-        self.setCheckable(False)
-
-    def event(self, event):
-        result = super().event(event)
-        if event is not None and event.type() in (QEvent.Polish, QEvent.StyleChange):
-            self.setFixedSize(CONTROL_ACTION_BUTTON_WIDTH, CONTROL_ACTION_BUTTON_HEIGHT)
-        return result
-
-    def current_palette(self) -> dict[str, str]:
-        return _get_control_action_palette(
-            active=self.isChecked(),
-            hover=(self._hover and not self.isChecked()),
-        )
-
-    def enterEvent(self, event):
-        self._hover = True
-        self.update()
-        if event is not None:
-            super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hover = False
-        self.update()
-        if event is not None:
-            super().leaveEvent(event)
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        if not self.isEnabled():
-            p.setOpacity(0.4)
-        palette = self.current_palette()
-        p.setBrush(QColor(palette["background"]))
-        p.setPen(QColor(palette["border"]))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 8, 8)
-        p.setPen(QColor(palette["text"]))
-        p.setFont(QFont("Inter", 13, QFont.Weight.DemiBold))
-        p.drawText(self.rect().adjusted(10, 0, -10, 0), Qt.AlignCenter, self.text())
-        p.end()
-
-
-class ControlBar(QWidget):
-    seek_back = Signal()
-    seek_fwd = Signal()
-    play_pause = Signal()
-    export_clicked = Signal()
-    mark_in_clicked = Signal()
-    mark_out_clicked = Signal()
-    return_live_clicked = Signal()
-    fullscreen_clicked = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(CONTROL_BAR_HEIGHT)
-        self._recording = False
-        self._live_available = False
-        self._build()
-
-    def _build(self):
-        c = get_theme()
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(10)
-
-        self._timeline = InlineTimeline()
-        self._timeline.setFixedHeight(TIMELINE_HEIGHT)
-        root.addWidget(self._timeline)
-
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(10)
-        root.addLayout(row)
-
-        self._back = IconButton(44, _icon_seek_back, "后退 10 秒")
-        self._back.setEnabled(False)
-        self._back.clicked.connect(self.seek_back.emit)
-        row.addWidget(self._back)
-
-        self._play = IconButton(48, _icon_play, "播放")
-        self._play.setEnabled(False)
-        self._play.clicked.connect(self.play_pause.emit)
-        row.addWidget(self._play)
-
-        self._fwd = IconButton(44, _icon_seek_fwd, "前进 10 秒")
-        self._fwd.setEnabled(False)
-        self._fwd.clicked.connect(self.seek_fwd.emit)
-        row.addWidget(self._fwd)
-
-        self._time_label = QLabel("00:00:00 / 00:00:00")
-        self._time_label.setObjectName("label_mono")
-        self._time_label.setAlignment(Qt.AlignCenter)
-        self._time_label.setFixedWidth(CONTROL_TIME_LABEL_WIDTH)
-        self._time_label.setStyleSheet(f"font-size:14px;font-weight:600;color:{c.text_primary};font-family:'JetBrains Mono',monospace;")
-        row.addWidget(self._time_label)
-        row.addStretch(1)
-
-        self._mark_in = ControlActionButton("入点")
-        self._mark_in.setEnabled(False)
-        self._mark_in.setCheckable(True)
-        self._mark_in.setToolTip("将当前时间设为片段开始")
-        self._mark_in.clicked.connect(self.mark_in_clicked.emit)
-        row.addWidget(self._mark_in)
-
-        self._mark_out = ControlActionButton("出点")
-        self._mark_out.setEnabled(False)
-        self._mark_out.setCheckable(True)
-        self._mark_out.setToolTip("将当前时间设为片段结束")
-        self._mark_out.clicked.connect(self.mark_out_clicked.emit)
-        row.addWidget(self._mark_out)
-
-        self._export = ControlActionButton("导出")
-        self._export.setEnabled(False)
-        self._export.clicked.connect(self.export_clicked.emit)
-        row.addWidget(self._export)
-
-        self._return_live = ControlActionButton("回直播")
-        self._return_live.setEnabled(False)
-        self._return_live.setToolTip("切回当前直播画面")
-        self._return_live.clicked.connect(self.return_live_clicked.emit)
-        row.addWidget(self._return_live)
-
-        self._fullscreen = ControlActionButton("全屏")
-        self._fullscreen.setToolTip("进入全屏播放器")
-        self._fullscreen.clicked.connect(self.fullscreen_clicked.emit)
-        row.addWidget(self._fullscreen)
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        c = get_theme()
-        p.setBrush(QColor(c.bg_secondary))
-        p.setPen(QColor(c.border_subtle))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 10, 10)
-        p.end()
-
-    def set_recording(self, r):
-        self._recording = r
-        self._back.setEnabled(True)
-        self._fwd.setEnabled(True)
-        self._mark_in.setEnabled(True)
-        self._mark_out.setEnabled(True)
-        self._play.setEnabled(True)
-
-    def set_playing(self, playing: bool):
-        self._play._icon_fn = _icon_pause if playing else _icon_play
-        self._play.setToolTip("暂停" if playing else "播放")
-        self._play.update()
-
-    def set_range_state(self, has_in=False, has_out=False):
-        self._mark_in.setChecked(has_in)
-        self._mark_out.setChecked(has_out)
-        self._mark_in.update()
-        self._mark_out.update()
-
-    def set_export_enabled(self, e):
-        self._export.setEnabled(e)
-        self._export.update()
-
-    def set_live_available(self, enabled: bool):
-        self._live_available = enabled
-        self._return_live.setEnabled(enabled)
-        self._return_live.update()
-
-    def set_fullscreen(self, enabled: bool):
-        self._fullscreen.setText("退出" if enabled else "全屏")
-        self._fullscreen.setToolTip("退出全屏播放器" if enabled else "进入全屏播放器")
-        self._fullscreen.update()
-
-    def set_time(self, position, duration):
-        self._time_label.setText(f"{_fmt_time(position)} / {_fmt_time(duration)}")
-
-    @property
-    def timeline(self):
-        return self._timeline
-
-    @property
-    def mark_in_button(self):
-        return self._mark_in
-
-    @property
-    def mark_out_button(self):
-        return self._mark_out
-
-
-class FullscreenPlayerWindow(QWidget):
-    def __init__(self, preview: VideoPreview, controls: QWidget, on_exit=None):
-        super().__init__()
-        self._on_exit = on_exit
-        self.setWindowTitle("LSC 全屏播放器")
-        self.setObjectName("fullscreenPlayer")
-        self.setStyleSheet("QWidget#fullscreenPlayer { background:#000000; }")
-        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(0)
-        lay.addWidget(preview, 1)
-        lay.addWidget(controls)
-
-        self._minimize_btn = QPushButton("—", self)
-        self._minimize_btn.setObjectName("fullscreenMinimizeButton")
-        self._minimize_btn.setFixedSize(40, 32)
-        self._minimize_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._minimize_btn.setToolTip("最小化")
-        self._minimize_btn.clicked.connect(self.showMinimized)
-        self._minimize_btn.raise_()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._minimize_btn.move(max(8, self.width() - self._minimize_btn.width() - 12), 12)
-        self._minimize_btn.raise_()
-
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key_Escape:
-            self.close()
-            return
-        super().keyPressEvent(e)
-
-    def closeEvent(self, e):
-        callback = self._on_exit
-        self._on_exit = None
-        if callback:
-            callback()
-        super().closeEvent(e)
 
 
 class ExportedCard(QWidget):
@@ -1497,6 +810,10 @@ class ConfigPanel(QWidget):
             self._connect_btn.setText("连接")
             self._connect_btn.setEnabled(True)
 
+    def set_connecting(self):
+        self._connect_btn.setText("连接中...")
+        self._connect_btn.setEnabled(False)
+
     def set_recording(self, recording):
         if recording:
             self._start_btn.setText("停止录制")
@@ -1585,8 +902,10 @@ class RecordPage(QWidget):
         self._pending_reconnect_reason = ""
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 3
+        self._reconnect_token = 0
         self._analysis_video_path = ""
         self._analysis_highlights: list[dict] = []
+        self._preview_was_playing_before_hide = False
 
         self._build()
 
@@ -1612,6 +931,9 @@ class RecordPage(QWidget):
 
         self._preview = VideoPreview()
         self._preview.fullscreen_clicked.connect(self._on_fullscreen_toggle)
+        # 底部 hover 覆盖层与下方 SharedControlBar 联动(两处都保留播放控制)
+        self._preview.play_pause_clicked.connect(self._on_play_pause)
+        self._preview.mute_toggled.connect(self._on_preview_mute)
         player_layout.addWidget(self._preview, 1)
 
         self._controls = SharedControlBar()
@@ -1626,6 +948,15 @@ class RecordPage(QWidget):
         player_layout.addWidget(self._controls)
 
         left.addWidget(player_section, 3)
+
+        # Export progress bar (hidden by default)
+        self._export_progress_bar = QProgressBar()
+        self._export_progress_bar.setFixedHeight(20)
+        self._export_progress_bar.setRange(0, 100)
+        self._export_progress_bar.setTextVisible(True)
+        self._export_progress_bar.setFormat("导出中 %p%")
+        self._export_progress_bar.setVisible(False)
+        left.addWidget(self._export_progress_bar)
 
         results_scroll = QScrollArea()
         results_scroll.setWidgetResizable(True)
@@ -1692,7 +1023,7 @@ class RecordPage(QWidget):
                 config_panel.set_analyze_enabled(True)
             timer = getattr(self._ctrl, "timer", None)
             if timer is not None and hasattr(timer, "start"):
-                timer.start(200)
+                timer.start(1000)
 
     def _emit_stats(self):
         recording = 1 if getattr(self._ctrl, "is_recording", False) else 0
@@ -1712,31 +1043,53 @@ class RecordPage(QWidget):
     def _enter_fullscreen(self):
         if self._fullscreen_window is not None:
             return
-        self._preview.setParent(None)
+        # 惰性确保 MpvWidget 已创建(全屏 reparent 的是 MpvWidget 而非整个预览容器)
+        mpv = self._preview._ensure_mpv_widget() if hasattr(self._preview, "_ensure_mpv_widget") else None
+        if mpv is None:
+            self._status_changed.emit("预览未就绪,无法全屏", "warning")
+            return
+        # detach 控制栏;FullscreenPreview 会把 MpvWidget + 控制栏 reparent 进全屏窗口
         self._controls.setParent(None)
         self._controls.set_fullscreen(True)
         self._preview.set_fullscreen_mode(True)
-        self._fullscreen_window = FullscreenPlayerWindow(
-            self._preview,
-            self._controls,
-            on_exit=lambda: self._exit_fullscreen(close_window=False),
+
+        def _on_restore(_widget, controls):
+            # widget 已 reparent 回 controls 的父级之外;放回 player_layout
+            if controls is not None:
+                controls.setParent(None)
+            self._player_layout.insertWidget(0, self._preview, 1)
+            self._player_layout.insertWidget(1, self._controls)
+            self._controls.set_fullscreen(False)
+            self._preview.set_fullscreen_mode(False)
+            self._fullscreen_window = None
+
+        fp = FullscreenPreview(
+            self,
+            get_widget=lambda: self._preview._mpv_widget,
+            get_controls=lambda: self._controls,
+            get_position=lambda: self._preview.position_sec(),
+            get_duration=lambda: self._preview.duration_sec(),
+            is_paused=lambda: not self._preview.is_playing(),
+            is_muted=lambda: bool(self._preview._mpv_widget and getattr(self._preview._mpv_widget, '_muted', False)),
+            on_toggle_play=lambda: self._preview.toggle_play_pause(),
+            on_toggle_mute=lambda: self._preview._mpv_widget.set_muted(not getattr(self._preview._mpv_widget, '_muted', False)) if self._preview._mpv_widget else None,
+            on_seek=lambda v: self._preview.seek_to(float(v)),
+            on_restore=_on_restore,
+            title="LSC 全屏播放器",
         )
-        self._fullscreen_window.showFullScreen()
+        fp.enter()
+        self._fullscreen_window = fp
 
     def _exit_fullscreen(self, close_window=True):
-        win = self._fullscreen_window
-        if win is None:
+        fp = self._fullscreen_window
+        if fp is None:
             return
-        self._fullscreen_window = None
-        self._preview.setParent(None)
-        self._controls.setParent(None)
-        self._player_layout.insertWidget(0, self._preview, 1)
-        self._player_layout.insertWidget(1, self._controls)
-        self._controls.set_fullscreen(False)
-        self._preview.set_fullscreen_mode(False)
-        if close_window:
-            win._on_exit = None
+        win = fp.window()
+        if close_window and win is not None:
             win.close()
+        else:
+            # closeEvent 已触发 on_restore;手动触发兜底
+            fp._close()
 
     # ── Connect ─────────────────────────────────────────────────
 
@@ -1746,14 +1099,24 @@ class RecordPage(QWidget):
             self.status_changed.emit("请输入直播间链接", "warning")
             return
 
+        # 新连接会重置所有 pending 的重连状态，使旧重连回调失效
+        self._reconnect_token += 1
+        self._pending_reconnect_reason = ""
+        self._reconnect_attempts = 0
+
         self._ctrl.page_url = url
         self._ctrl.stream_url = url
-        self._config.set_connected(True)
+        self._config.set_connecting()
         self._controls.set_live_available(bool(self._ctrl.page_url))
         self.status_changed.emit("连接中...", "info")
         self._ctrl.start_url_parse(url, self._on_url_parsed)
 
-    def _on_url_parsed(self, info):
+    def _on_url_parsed(self, info, token=None):
+        # token 用于区分重连会话；若 token 不匹配说明用户在解析完成前已停止/重置，应忽略旧回调
+        if token is not None and token != getattr(self, "_reconnect_token", 0):
+            _log.debug("Stale reconnect callback ignored (token=%s, current=%s)", token, self._reconnect_token)
+            return
+
         if info.get('isLive'):
             stream_url, _selected_quality = self._ctrl.select_stream_url(
                 info,
@@ -1765,6 +1128,10 @@ class RecordPage(QWidget):
             self._config.set_connected(True)
             pending_reconnect_reason = getattr(self, "_pending_reconnect_reason", "")
             if pending_reconnect_reason:
+                # 再次检查 token，因为 pending 状态可能在解析期间被其他操作重置
+                if token is not None and token != getattr(self, "_reconnect_token", 0):
+                    _log.debug("Reconnect state changed during parse, ignoring callback")
+                    return
                 reason = pending_reconnect_reason
                 self._pending_reconnect_reason = ""
                 self.status_changed.emit(f"直播流已恢复，正在继续录制: {streamer} - {title}", "success")
@@ -1778,6 +1145,9 @@ class RecordPage(QWidget):
         else:
             error = info.get('error', '直播未开播或链接无效')
             if getattr(self, "_pending_reconnect_reason", ""):
+                if token is not None and token != getattr(self, "_reconnect_token", 0):
+                    _log.debug("Reconnect state changed during parse, ignoring callback")
+                    return
                 self._pending_reconnect_reason = ""
                 self.status_changed.emit(f"自动恢复失败: {error}", "error")
                 self._stop_recording()
@@ -1817,7 +1187,7 @@ class RecordPage(QWidget):
         self._controls.set_recording(True)
         self._controls.set_range_state(False, False)
         self._controls.set_export_enabled(False)
-        self._controls.timeline.set_cursor_mode(InlineTimeline.CURSOR_WHITE)
+        self._controls.timeline.set_cursor_mode(SharedTimeline.CURSOR_WHITE)
 
         # NOTE: Do NOT set is_recording=True or start timers here.
         # Let the controller handle state — it sets is_recording and
@@ -1935,7 +1305,7 @@ class RecordPage(QWidget):
         self._controls.set_recording(False)
         self._controls.set_export_enabled(False)
         self._controls.set_range_state(False, False)
-        self._controls.timeline.set_cursor_mode(InlineTimeline.CURSOR_WHITE)
+        self._controls.timeline.set_cursor_mode(SharedTimeline.CURSOR_WHITE)
         self._has_start = False
         self._start_sec = None
         self._end_sec = None
@@ -1944,8 +1314,6 @@ class RecordPage(QWidget):
         if hasattr(self._config, "set_export_analysis_enabled"):
             self._config.set_export_analysis_enabled(bool(getattr(self, "_analysis_highlights", [])))
         self._controls.set_playing(played_output)
-        if played_output:
-            self._ctrl.timer.start(200)
         self._emit_stats()
 
     # ── Play / Pause ────────────────────────────────────────────
@@ -1967,8 +1335,13 @@ class RecordPage(QWidget):
             else:
                 self._preview.play_video(self._ctrl.video_path)
                 self._controls.set_playing(True)
-                self._ctrl.timer.start(200)
+                self._ctrl.timer.start(1000)
             return
+
+    def _on_preview_mute(self, muted: bool) -> None:
+        """底部覆盖层静音切换:委托 mpv,与 SharedControlBar 状态独立。"""
+        if self._preview._mpv_widget is not None:
+            self._preview._mpv_widget.set_muted(muted)
 
     # ── Timer tick ──────────────────────────────────────────────
 
@@ -1992,7 +1365,7 @@ class RecordPage(QWidget):
             self._controls.timeline.set_live_clock(datetime.now().strftime("%H:%M:%S"))
             current_pos = self._live_cursor_sec if self._live_cursor_sec is not None else total
             display_end = self._end_sec if self._end_sec is not None else (current_pos if self._has_start else None)
-            cursor_mode = InlineTimeline.CURSOR_RED if self._has_start else InlineTimeline.CURSOR_WHITE
+            cursor_mode = SharedTimeline.CURSOR_RED if self._has_start else SharedTimeline.CURSOR_WHITE
             self._controls.timeline.set_cursor_mode(cursor_mode)
             pos = current_pos if not self._has_start else display_end
             self._controls.timeline.set_data(
@@ -2048,9 +1421,16 @@ class RecordPage(QWidget):
         if getattr(self, "_reconnect_attempts", 0) >= getattr(self, "_max_reconnect_attempts", 3):
             return False
 
+        self._reconnect_token += 1
+        token = self._reconnect_token
         self._pending_reconnect_reason = reason
         self._reconnect_attempts = getattr(self, "_reconnect_attempts", 0) + 1
-        self._ctrl.start_url_parse(page_url, self._on_url_parsed)
+        # 绑定本次重连的 token，回调中若 token 已过期则忽略，避免用户停止后旧回调仍启动录制
+        # 重连时强制刷新缓存，避免 10 秒失败缓存导致用户点“重试”后仍返回旧错误
+        self._ctrl._force_next_parse_refresh = True
+        self._ctrl.start_url_parse(
+            page_url, lambda info: self._on_url_parsed(info, token=token)
+        )
         return True
 
     # ── Mark / Export ────────────────────────────────────────────
@@ -2074,7 +1454,7 @@ class RecordPage(QWidget):
         self._controls.set_range_state(has_in, has_out)
         self._controls.set_export_enabled(can_export)
         self._controls.timeline.set_cursor_mode(
-            InlineTimeline.CURSOR_RED if has_in and not has_out else InlineTimeline.CURSOR_WHITE
+            SharedTimeline.CURSOR_RED if has_in and not has_out else SharedTimeline.CURSOR_WHITE
         )
 
     def _apply_range_to_timeline(self, position=None, duration=None):
@@ -2091,9 +1471,12 @@ class RecordPage(QWidget):
 
     def _on_mark_in(self):
         pos, dur = self._current_range_time()
-        self._start_sec = pos
-        if self._end_sec is not None and self._end_sec <= self._start_sec:
-            self._end_sec = None
+        if self._end_sec is not None and pos > self._end_sec:
+            # 入点超过出点时，自动交换（与多房间工作台行为一致）
+            self._start_sec = self._end_sec
+            self._end_sec = pos
+        else:
+            self._start_sec = pos
         self._sync_range_controls()
         preview_end = self._end_sec
         if preview_end is None and self._ctrl.is_recording:
@@ -2109,51 +1492,16 @@ class RecordPage(QWidget):
         pos, dur = self._current_range_time()
         if self._start_sec is None:
             self._start_sec = max(0.0, pos - 10.0)
+        elif pos < self._start_sec:
+            # 出点小于入点时，自动交换（与多房间工作台行为一致）
+            self._end_sec = self._start_sec
+            self._start_sec = pos
+            self._sync_range_controls()
+            self._apply_range_to_timeline(position=pos, duration=max(dur, pos, self._end_sec or 0))
+            return
         self._end_sec = pos
         self._sync_range_controls()
         self._apply_range_to_timeline(position=pos, duration=max(dur, pos, self._start_sec or 0))
-
-    def _on_mark(self):
-        self._on_mark_in()
-        return
-        if self._ctrl.is_recording:
-            # During recording: mark based on recording elapsed time
-            if self._has_start:
-                self._has_start = False
-                self._start_sec = None
-                self._end_sec = None
-                self._controls.mark_button.setChecked(False)
-                self._controls.set_export_enabled(False)
-                self._controls.timeline.set_cursor_mode(InlineTimeline.CURSOR_WHITE)
-            else:
-                self._has_start = True
-                self._start_sec = self._ctrl.total_sec
-                self._end_sec = self._ctrl.total_sec
-                self._controls.mark_button.setChecked(True)
-                self._controls.set_export_enabled(True)
-                self._controls.timeline.set_cursor_mode(InlineTimeline.CURSOR_RED)
-        else:
-            # During playback: mark based on current playback position
-            pos = self._preview.position_sec()
-            dur = self._preview.duration_sec() or self._ctrl.total_sec
-            if self._has_start:
-                self._has_start = False
-                self._start_sec = None
-                self._end_sec = None
-                self._controls.mark_button.setChecked(False)
-                self._controls.set_export_enabled(False)
-                self._controls.timeline.set_cursor_mode(InlineTimeline.CURSOR_WHITE)
-            else:
-                self._has_start = True
-                self._start_sec = pos
-                self._end_sec = min(pos + 10, dur) if dur > 0 else pos
-                self._controls.mark_button.setChecked(True)
-                self._controls.set_export_enabled(True)
-                self._controls.timeline.set_cursor_mode(InlineTimeline.CURSOR_RED)
-                self._controls.timeline.set_data(
-                    duration=dur, position=pos,
-                    start=self._start_sec, end=self._end_sec,
-                )
 
     def _on_export(self):
         if not self._has_start or self._start_sec is None or self._end_sec is None:
@@ -2166,7 +1514,8 @@ class RecordPage(QWidget):
         # Export is also allowed during playback of completed recordings.
 
         idx = len(self._ctrl.exported) + 1
-        name = f"clip_{idx:03d}_{_fmt_time(self._start_sec).replace(':', '')}.mp4"
+        # 注意:不带 .mp4 后缀,ClipExporter.export_clip 会在拼输出路径时自动追加。
+        name = f"clip_{idx:03d}_{_fmt_time(self._start_sec).replace(':', '')}"
         start_sec = self._start_sec
         end_sec = self._end_sec
 
@@ -2179,13 +1528,17 @@ class RecordPage(QWidget):
             name,
             on_done=lambda ok, path, err, sz, export_name=name, export_idx=idx, export_start=start_sec, export_end=end_sec:
                 self._on_export_done(ok, path, err, sz, export_name, export_idx, export_start, export_end),
+            on_progress=self._on_export_progress,
         ):
             self._controls.set_export_enabled(False)
+            self._export_progress_bar.setValue(0)
+            self._export_progress_bar.setVisible(True)
         else:
             reason = getattr(self._ctrl, "exporter_init_error", "") or "导出器不可用或源文件不存在"
             self.status_changed.emit(f"片段导出失败: {reason}", "error")
 
     def _on_export_done(self, success, path, error, size_mb, name, idx, start_sec, end_sec):
+        self._export_progress_bar.setVisible(False)
         if success:
             size = f"{size_mb:.1f} MB"
             self._ctrl.exported.append((name, start_sec, end_sec, size, path))
@@ -2197,6 +1550,12 @@ class RecordPage(QWidget):
             self.status_changed.emit(f"片段导出失败: {error}", "error")
         self._controls.set_export_enabled(True)
         self._on_clear_range()
+
+    def _on_export_progress(self, percent: float, elapsed: float, total: float) -> None:
+        """Update export progress bar from ExportWorker."""
+        self._export_progress_bar.setValue(int(min(percent, 100)))
+        if total > 0:
+            self._export_progress_bar.setFormat(f"导出中 {_fmt_time(elapsed)}/{_fmt_time(total)} · %p%")
 
     def _on_analyze_current(self):
         video_path = getattr(self._ctrl, "video_path", "")
@@ -2309,8 +1668,19 @@ class RecordPage(QWidget):
             return
         clip = self._ctrl.exported[idx]
         path = clip[4] if len(clip) >= 5 else ""
+        start_sec = clip[1] if len(clip) >= 2 else 0
+        end_sec = clip[2] if len(clip) >= 3 else 0
         if path and os.path.isfile(path):
             self.set_video_path(path)
+            # Restore the original selection range so user can see where the clip came from
+            if end_sec > start_sec:
+                self._start_sec = start_sec
+                self._end_sec = end_sec
+                self._sync_range_controls()
+                self._apply_range_to_timeline(
+                    position=start_sec,
+                    duration=float(self._ctrl.total_sec or end_sec),
+                )
 
     def _on_clear_range(self):
         self._has_start = False
@@ -2318,7 +1688,7 @@ class RecordPage(QWidget):
         self._end_sec = None
         self._controls.set_range_state(False, False)
         self._controls.set_export_enabled(False)
-        self._controls.timeline.set_cursor_mode(InlineTimeline.CURSOR_WHITE)
+        self._controls.timeline.set_cursor_mode(SharedTimeline.CURSOR_WHITE)
 
     # ── Seek ─────────────────────────────────────────────────────
 
@@ -2413,6 +1783,31 @@ class RecordPage(QWidget):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    # ── Page visibility ──────────────────────────────────────────
+
+    def showEvent(self, event):
+        """Re-start preview when page becomes visible again."""
+        super().showEvent(event)
+        if self._preview_was_playing_before_hide:
+            if self._ctrl.is_recording and self._ctrl.stream_url:
+                self._preview.play_live(self._ctrl.stream_url)
+                self._controls.set_playing(True)
+            elif self._ctrl.video_path and os.path.isfile(self._ctrl.video_path):
+                self._preview.play_video(self._ctrl.video_path)
+                self._controls.set_playing(True)
+                self._ctrl.timer.start(1000)
+            self._preview_was_playing_before_hide = False
+
+    def hideEvent(self, event):
+        """Stop preview when page is hidden to save bandwidth/CPU."""
+        super().hideEvent(event)
+        if self._preview.is_playing():
+            self._preview_was_playing_before_hide = True
+            self._preview.stop_video()
+            self._controls.set_playing(False)
+            if not self._ctrl.is_recording:
+                self._ctrl.timer.stop()
 
     # ── Cleanup ──────────────────────────────────────────────────
 

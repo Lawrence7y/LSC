@@ -1,4 +1,0 @@
-fspp
-smartblur
-vaguedenoiser
-unsharp

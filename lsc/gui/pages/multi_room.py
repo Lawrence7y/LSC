@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from PySide6.QtCore import QSettings
 
+from lsc.gui.components.flow_layout import FlowLayout
 from lsc.gui.components.room_card import RoomCard
 from lsc.gui.components.control_bar import ControlBar
 from lsc.gui.components.clip_list import ClipListWidget, ClipSegment
@@ -35,8 +36,10 @@ from lsc.gui.undo import Command, UndoStack
 from lsc.utils.helpers import fmt_time
 
 # ── Grid configuration ────────────────────────────────────────
-_CARD_MAX_WIDTH = 440
-_CARD_MIN_WIDTH = 360
+# _CARD_MIN_WIDTH 仅用于「名义列数」计算(方向键导航 & 响应式测试),
+# 实际换行由 FlowLayout 按每张卡片自身宽度完成。
+_CARD_MAX_WIDTH = 560
+_CARD_MIN_WIDTH = 340
 _GRID_H_SPACING = 8
 _GRID_VMARGIN = 12
 _GRID_HMARGIN = 10
@@ -640,11 +643,13 @@ class MultiRoomPage(QWidget):
 
         self._card_container = QWidget()
         self._card_container.setStyleSheet("background:transparent;")
-        self._card_layout = QGridLayout(self._card_container)
+        self._card_layout = FlowLayout(self._card_container, spacing=_GRID_H_SPACING)
         self._card_layout.setContentsMargins(_GRID_HMARGIN, _GRID_VMARGIN, _GRID_HMARGIN, _GRID_VMARGIN)
-        self._card_layout.setHorizontalSpacing(_GRID_H_SPACING)
-        self._card_layout.setVerticalSpacing(_GRID_H_SPACING)
-        self._card_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        self._card_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # FlowLayout 依赖 heightForWidth 在 QScrollArea 内自适应高度
+        _sp = self._card_container.sizePolicy()
+        _sp.setHeightForWidth(True)
+        self._card_container.setSizePolicy(_sp)
         self._scroll.setWidget(self._card_container)
 
         # 空状态覆盖层，居中显示于滚动区域
@@ -860,15 +865,26 @@ class MultiRoomPage(QWidget):
         card.include_toggled.connect(self._on_include_toggled)
         self._cards[room.room_id] = card
 
-        # Preview widgets are created lazily on first preview start, so
-        # nothing to embed here.
+        # FlowLayout 自动按卡片自身宽度换行,无需手动指定行列。
+        self._card_layout.addWidget(card)
+        # 关键修复:新创建的 QWidget 默认是 hidden 状态,而 FlowLayout.doLayout
+        # 会用 QWidgetItem.isEmpty()(返回 widget->isHidden())过滤掉 hidden 的
+        # 卡片。若不显式 show(),新卡片会被 FlowLayout 跳过、永不排布,表现为
+        # 「添加房间后卡片不显示,切到其他页面再切回来才出现」(切页触发的 show
+        # 级联让 isHidden() 变 False,FlowLayout 才纳入它)。显式 show() 一行解决。
+        card.show()
+        card.restore_saved_size()
+        self._card_layout.invalidate()
+        self._card_container.updateGeometry()
+        # Deferred sync: wait for Qt to process the layout before calculating
+        # scroll area heights. layout.activate() alone is insufficient because
+        # child widget size hints may not be resolved yet.
+        QTimer.singleShot(50, lambda c=card: self._deferred_after_add(c))
 
-        # Add to grid layout, 顶部对齐避免卡片被纵向拉伸
-        count = len(self._cards) - 1  # 0-based index
-        row = count // self._grid_columns
-        col = count % self._grid_columns
-        self._card_layout.addWidget(card, row, col, alignment=Qt.AlignTop)
+    def _deferred_after_add(self, card: RoomCard) -> None:
+        """Called after layout settles: sync heights, update columns, scroll to card."""
         self._update_grid_columns()
+        self._scroll.ensureWidgetVisible(card, 0, 0)
 
     def _save_timeline_marks_to_room(self, room_id: str | None) -> None:
         """将当前 timeline 的入/出点保存到指定房间（选区独立化的关键）。"""
@@ -1922,27 +1938,22 @@ class MultiRoomPage(QWidget):
     # ── Grid rebuild ─────────────────────────────────────────
 
     def _rebuild_grid(self) -> None:
-        """Re-layout cards in grid order after a removal or column change.
-
-        QGridLayout.addWidget 在 widget 已存在时会自动更新位置，
-        无需先 removeWidget，避免不必要的 detach/reparent 开销。
-        """
-        for idx, (room_id, card) in enumerate(self._cards.items()):
-            row = idx // self._grid_columns
-            col = idx % self._grid_columns
-            self._card_layout.addWidget(card, row, col, alignment=Qt.AlignTop)
+        """FlowLayout 自身负责换行,这里只需触发一次重排。"""
+        self._card_layout.invalidate()
 
     def _update_grid_columns(self) -> None:
-        """根据滚动区域可用宽度动态决定卡片列数（1~4 列）。"""
+        """计算「名义列数」,仅供方向键导航使用。
+
+        实际换行由 FlowLayout 按每张卡片自身宽度完成,与该值无关。
+        保留该方法以兼容响应式测试。
+        """
         viewport = self._scroll.viewport()
         if viewport is None:
             return
         available = viewport.width() - _GRID_HMARGIN * 2
-        # 支持 1~4 列，根据可用宽度自动计算
         new_columns = max(1, min(4, available // (_CARD_MIN_WIDTH + _GRID_H_SPACING)))
         if new_columns != self._grid_columns:
             self._grid_columns = new_columns
-            self._rebuild_grid()
 
     # ── Refresh ──────────────────────────────────────────────
 

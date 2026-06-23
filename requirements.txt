@@ -1,0 +1,17 @@
+# LSC (直播切片多人) — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+# For development/testing:  pip install -r requirements.txt pytest
+
+# GUI framework
+PySide6>=6.5,<7
+
+# Video preview (optional — the app degrades to a placeholder if missing)
+# Requires the native libmpv shared library to be installed separately:
+#   - Windows: place mpv-2.dll / mpv-1.dll next to the executable or in PATH
+#   - macOS:   brew install mpv
+#   - Linux:   install libmpv2 / mpv-libs from your package manager
+python-mpv>=1.0,<2
+
+# Test dependencies (uncomment if running the test suite)
+# pytest>=7.4,<9

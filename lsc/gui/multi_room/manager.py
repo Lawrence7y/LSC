@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
 from collections.abc import Callable
 from datetime import datetime
 from uuid import uuid4
@@ -38,6 +40,27 @@ _log = logging.getLogger(__name__)
 # ── Resource limits ──────────────────────────────────────────
 MAX_ROOMS = 12
 MAX_CONCURRENT_PREVIEWS = 4
+# 录制过程中磁盘剩余空间低于此阈值时停止录制（2 GB）
+_MIN_FREE_BYTES_WHILE_RECORDING = 2 * 1024 * 1024 * 1024
+_MAX_RECONNECT_ATTEMPTS = 3
+_RECONNECT_DELAY_SEC = 2.0
+
+
+def _make_room_output_dir(base_dir: str, room: RoomSession) -> str:
+    """生成可读的多房间录制子目录名，避免纯 uuid 难以辨认。
+
+    格式: {platform}_{streamer}_{room_id_short}
+    非法文件名字符会被替换为下划线，并以 room_id 后 6 位保证唯一性。
+    """
+    platform = re.sub(r"[^\w\-]", "_", (room.platform or "unknown")).strip("_")[:20]
+    streamer = re.sub(r"[^\w\-]", "_", (room.streamer_name or "room")).strip("_")[:30]
+    short_id = room.room_id[-6:]
+    name = f"{platform}_{streamer}_{short_id}"
+    # 防止连续下划线或首尾下划线
+    name = re.sub(r"_+", "_", name).strip("_")
+    if not name:
+        name = f"room_{short_id}"
+    return os.path.join(base_dir, name)
 
 
 class _ConnectWorker(QThread):
@@ -156,6 +179,7 @@ class MultiRoomManager(QObject):
         self._loop_room_id: str | None = None
         self._loop_start: float = 0.0
         self._loop_end: float = 0.0
+        self._loop_native: bool = False
 
     def _ensure_global_timer(self) -> QTimer | None:
         """Create the global timer if a QCoreApplication is available."""
@@ -231,21 +255,16 @@ class MultiRoomManager(QObject):
         room = self._rooms.pop(room_id, None)
         if room is None:
             return False
+        # 若正在循环试听这个房间,停止 timer,避免删房后空转。
+        if self._loop_room_id == room_id:
+            self.stop_range_loop()
         if room.preview_enabled:
             self.stop_preview(room_id)
         if room.is_recording:
             self.stop_recording(room_id)
 
         # Cancel pending async connect
-        worker = self._connect_workers.pop(room_id, None)
-        if worker and worker.isRunning():
-            # _ConnectWorker 重写了 run()，没有事件循环，quit() 无效。
-            # 使用 requestInterruption() 让 run() 主动退出，并等待一段时间。
-            worker.requestInterruption()
-            if not worker.wait(3000):
-                _log.warning("Connect worker for room %s did not stop in time", room_id)
-                worker.terminate()
-                worker.wait(1000)
+        self._cancel_connect_worker(room_id)
 
         controller = room.controller
         if controller is not None:
@@ -300,6 +319,26 @@ class MultiRoomManager(QObject):
     def _temp_config_path(self) -> str:
         return self._config_file_path() + ".tmp"
 
+    def _serialize_room(self, room: RoomSession) -> dict:
+        """把单个房间序列化为可持久化的 dict。
+
+        仅保存用户偏好与选区(跨重启稳定的纯数据),不保存瞬时连接/录制状态、
+        controller/preview_widget 等运行时句柄。mark_in/mark_out 仍需对应房间
+        重新连接后才有意义的时长,但保留下来可避免用户白标选区。
+        """
+        entry: dict = {"url": room.room_url}
+        if room.mark_in is not None:
+            entry["mark_in"] = float(room.mark_in)
+        if room.mark_out is not None:
+            entry["mark_out"] = float(room.mark_out)
+        # include_in_cut / preview_muted 与默认值不同时才存,减少噪声
+        # (RoomSession 的默认值见 session.py 字段定义)
+        if room.include_in_cut is not True:
+            entry["include_in_cut"] = room.include_in_cut
+        if room.preview_muted is not True:
+            entry["preview_muted"] = room.preview_muted
+        return entry
+
     def save_rooms(self) -> int:
         """Persist the current room list atomically.
 
@@ -312,9 +351,9 @@ class MultiRoomManager(QObject):
         import json
 
         data = {
-            "version": 1,
+            "version": 2,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "rooms": [{"url": room.room_url} for room in self._rooms.values()],
+            "rooms": [self._serialize_room(room) for room in self._rooms.values()],
         }
 
         path = self._config_file_path()
@@ -348,7 +387,8 @@ class MultiRoomManager(QObject):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else None
-        except Exception:
+        except Exception as exc:
+            _log.debug("Failed to load JSON from %s: %s", path, exc)
             return None
 
     def load_rooms(self) -> int:
@@ -383,8 +423,25 @@ class MultiRoomManager(QObject):
             url = item.get("url", "").strip()
             if not url:
                 continue
-            if self.add_room(url) is not None:
-                loaded += 1
+            room = self.add_room(url)
+            if room is None:
+                continue
+            loaded += 1
+            # 恢复用户偏好与选区(向后兼容:缺失字段保持 RoomSession 默认值)
+            if "mark_in" in item and item["mark_in"] is not None:
+                try:
+                    room.mark_in = float(item["mark_in"])
+                except (TypeError, ValueError):
+                    pass
+            if "mark_out" in item and item["mark_out"] is not None:
+                try:
+                    room.mark_out = float(item["mark_out"])
+                except (TypeError, ValueError):
+                    pass
+            if "include_in_cut" in item:
+                room.include_in_cut = bool(item["include_in_cut"])
+            if "preview_muted" in item:
+                room.preview_muted = bool(item["preview_muted"])
 
         _log.info("Loaded %d rooms from %s", loaded, path)
         return loaded
@@ -465,13 +522,29 @@ class MultiRoomManager(QObject):
             controller.selected_quality = legacy_info.get("selectedQuality", info.selected_quality)
         return True
 
+    def _cancel_connect_worker(self, room_id: str) -> None:
+        """取消进行中的异步连接 worker,避免其完成后回写覆盖用户的断开/删除意图。"""
+        worker = self._connect_workers.pop(room_id, None)
+        if worker and worker.isRunning():
+            # _ConnectWorker 重写了 run(),没有事件循环,quit() 无效。
+            # 用 requestInterruption() 让 run() 主动退出,并等待一段时间。
+            worker.requestInterruption()
+            if not worker.wait(3000):
+                _log.warning("Connect worker for room %s did not stop in time", room_id)
+                worker.terminate()
+                worker.wait(1000)
+
     def disconnect_room(self, room_id: str) -> bool:
         room = self.get_room(room_id)
         if room is None:
             return False
+        # 先取消进行中的连接,否则 worker 跑完会通过 _on_connect_finished 把
+        # is_connected 重新置 True,覆盖用户的断开意图。
+        self._cancel_connect_worker(room_id)
         if room.preview_enabled:
             self.stop_preview(room_id)
         room.is_connected = False
+        room.is_connecting = False
         room.preview_error = ""
         return True
 
@@ -631,35 +704,74 @@ class MultiRoomManager(QObject):
         This gives users a one-click way to re-synchronise all multi-room
         previews to "now" after seeking backwards in one of them. Returns
         the number of previews that were aligned.
+
+        For live streams the duration reported by mpv is often 0, so we use
+        the maximum current playback position across all selected previews as
+        the live edge target instead.
         """
-        aligned = 0
+        candidate_positions: list[float] = []
+        active_rooms: list[RoomSession] = []
         for room in list(self._rooms.values()):
             if not room.preview_enabled or room.preview_widget is None:
                 continue
+            active_rooms.append(room)
+            pos = self.get_preview_position(room.room_id)
+            if pos > 0:
+                candidate_positions.append(pos)
             duration = self.get_preview_duration(room.room_id)
-            if duration <= 0:
-                duration = float(getattr(room.controller, "total_sec", 0) or 0)
             if duration > 0:
-                self.seek_preview(room.room_id, duration)
-                aligned += 1
+                candidate_positions.append(duration)
+            total = float(getattr(room.controller, "total_sec", 0) or 0)
+            if total > 0:
+                candidate_positions.append(total)
+
+        if not candidate_positions:
+            return 0
+
+        target = max(candidate_positions)
+        aligned = 0
+        for room in active_rooms:
+            self.seek_preview(room.room_id, target)
+            aligned += 1
         return aligned
 
     # ── Range loop preview ─────────────────────────────────
 
     def start_range_loop(self, room_id: str, start: float, end: float) -> None:
-        """循环播放 [start, end]，每 200ms 检查位置，越界则 seek 回 start。"""
+        """循环播放 [start, end]。
+
+        优先使用 mpv 原生 A-B 循环（精度高、无 polling 开销）；
+        若预览组件不支持，则回退到 50ms 轮询检查位置并手动 seek。
+        """
         self.stop_range_loop()
         self._loop_room_id = room_id
         self._loop_start = start
         self._loop_end = end
         self.seek_preview(room_id, start)
-        self._preview_loop_timer = QTimer(self)
-        self._preview_loop_timer.setInterval(200)
-        self._preview_loop_timer.timeout.connect(self._on_loop_tick)
-        self._preview_loop_timer.start()
+        room = self.get_room(room_id)
+        widget = room.preview_widget if room else None
+        if widget is not None and hasattr(widget, "set_ab_loop"):
+            try:
+                self._loop_native = widget.set_ab_loop(start, end)
+            except Exception:
+                self._loop_native = False
+        if not self._loop_native:
+            self._preview_loop_timer = QTimer(self)
+            self._preview_loop_timer.setInterval(50)
+            self._preview_loop_timer.timeout.connect(self._on_loop_tick)
+            self._preview_loop_timer.start()
 
     def stop_range_loop(self) -> None:
         """停止选区循环播放。"""
+        if self._loop_native:
+            room = self.get_room(self._loop_room_id or "")
+            widget = room.preview_widget if room else None
+            if widget is not None and hasattr(widget, "clear_ab_loop"):
+                try:
+                    widget.clear_ab_loop()
+                except Exception:
+                    pass
+            self._loop_native = False
         if self._preview_loop_timer is not None:
             self._preview_loop_timer.stop()
             self._preview_loop_timer = None
@@ -667,7 +779,7 @@ class MultiRoomManager(QObject):
 
     def is_range_loop_active(self) -> bool:
         """返回当前是否正在循环试听。"""
-        return self._preview_loop_timer is not None and self._preview_loop_timer.isActive()
+        return self._loop_room_id is not None
 
     def _on_loop_tick(self) -> None:
         """循环试听的心跳：检查播放位置是否超出选区，若是则 seek 回起点。"""
@@ -709,8 +821,54 @@ class MultiRoomManager(QObject):
         if callable(set_headers_fn) and headers:
             set_headers_fn(headers)
 
-        widget.play(stream_url)
+        widget.play_live(stream_url)
         widget.set_muted(room.preview_muted)
+
+    def refresh_stream_url(self, room_id: str) -> bool:
+        """Re-parse the stream to get a fresh CDN URL. Returns True on success."""
+        room = self.get_room(room_id)
+        if room is None:
+            return False
+        try:
+            info = parse_stream(room.room_url, force_refresh=True)
+        except Exception as exc:
+            _log.warning("refresh_stream_url failed for %s: %s", room_id, exc)
+            return False
+        if not info.is_live or not info.stream_url:
+            return False
+        room.apply_stream_info(info)
+        controller = room.controller
+        if controller is not None:
+            legacy_info = info.to_legacy_dict()
+            controller.stream_url = info.stream_url
+            controller.input_args = legacy_info.get("_inputArgs", [])
+        return True
+
+    def refresh_stream_url_async(self, room_id: str, callback: Callable[[str, bool], None]) -> None:
+        """Refresh stream URL in a background thread, then call callback(room_id, success)."""
+        room = self.get_room(room_id)
+        if room is None:
+            callback(room_id, False)
+            return
+
+        class _RefreshWorker(QThread):
+            finished = Signal(str, bool)
+
+            def __init__(self, manager, rid):
+                super().__init__()
+                self._manager = manager
+                self._rid = rid
+                self.finished.connect(callback)
+
+            def run(self):
+                ok = self._manager.refresh_stream_url(self._rid)
+                self.finished.emit(self._rid, ok)
+
+        worker = _RefreshWorker(self, room_id)
+        worker.finished.connect(lambda *_: worker.deleteLater())
+        worker.start()
+        # Store reference to prevent garbage collection
+        self._connect_workers[f"_refresh_{room_id}"] = worker
 
     # ── Mute ─────────────────────────────────────────────────
 
@@ -754,8 +912,13 @@ class MultiRoomManager(QObject):
         input_args = controller.input_args
 
         # 为每个房间创建独立子目录，避免多房间同时录制时文件名冲突导致覆盖
-        import os
-        room_output_dir = os.path.join(output_dir, room.room_id)
+        room_output_dir = _make_room_output_dir(output_dir, room)
+        # 若可读目录名已存在（同名主播+同 short_id 概率极低），追加序号避免覆盖
+        original_room_output_dir = room_output_dir
+        suffix = 1
+        while os.path.exists(room_output_dir):
+            room_output_dir = f"{original_room_output_dir}_{suffix}"
+            suffix += 1
         os.makedirs(room_output_dir, exist_ok=True)
 
         ok, output_path, _encoder_used, error_msg = controller.start_recording_with_crf(
@@ -771,6 +934,16 @@ class MultiRoomManager(QObject):
         room.is_recording = ok
         room.record_output_path = output_path
         room.record_started_at = datetime.now() if ok else None
+        if ok:
+            # Save recording params for auto-reconnect
+            room.reconnect_output_dir = room_output_dir
+            room.reconnect_encoder = encoder
+            room.reconnect_crf = crf
+            room.reconnect_param_mode = param_mode
+            room.reconnect_bitrate = bitrate or ""
+            room.reconnect_bitrate_unit = bitrate_unit
+            room.reconnect_attempts = 0
+            room.reconnect_next_attempt_at = 0.0
         if not ok:
             room.last_error = error_msg or "录制启动失败"
         return ok
@@ -783,6 +956,8 @@ class MultiRoomManager(QObject):
         ok, _size_mb, output_path = controller.stop_recording()
         room.is_recording = False
         room.record_started_at = None
+        room.reconnect_attempts = 0
+        room.reconnect_next_attempt_at = 0.0
         if output_path:
             room.record_output_path = output_path
         if output_path:
@@ -908,6 +1083,68 @@ class MultiRoomManager(QObject):
 
     # ── Global heartbeat ─────────────────────────────────────
 
+    # ── Recording reconnect ─────────────────────────────────
+
+    def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str) -> None:
+        """Attempt to reconnect a failed recording, mirroring RecordPage's logic."""
+        import time as _time
+
+        if room.reconnect_attempts >= _MAX_RECONNECT_ATTEMPTS:
+            room.last_error = error_msg
+            room.is_recording = False
+            room.record_started_at = None
+            _log.warning("Room %s reconnect exhausted (%d attempts), giving up",
+                         room.room_id, room.reconnect_attempts)
+            return
+
+        if room.reconnect_next_attempt_at <= 0:
+            room.reconnect_next_attempt_at = _time.monotonic() + _RECONNECT_DELAY_SEC
+            room.last_error = f"{error_msg}，{_RECONNECT_DELAY_SEC:.0f}秒后尝试恢复..."
+            _log.info("Room %s scheduling reconnect attempt %d/%d",
+                      room.room_id, room.reconnect_attempts + 1, _MAX_RECONNECT_ATTEMPTS)
+            return
+
+        if _time.monotonic() < room.reconnect_next_attempt_at:
+            return
+
+        room.reconnect_attempts += 1
+        room.reconnect_next_attempt_at = 0.0
+        _log.info("Room %s attempting reconnect %d/%d",
+                  room.room_id, room.reconnect_attempts, _MAX_RECONNECT_ATTEMPTS)
+        room.last_error = f"正在尝试恢复录制 ({room.reconnect_attempts}/{_MAX_RECONNECT_ATTEMPTS})..."
+
+        # Stop the failed recording gracefully
+        controller = room.controller
+        if controller is not None:
+            try:
+                controller.stop_recording()
+            except Exception:
+                pass
+        room.is_recording = False
+
+        # Re-parse the stream URL and restart recording
+        if not room.reconnect_output_dir:
+            room.last_error = "恢复失败：缺少录制参数"
+            return
+
+        ok = self.start_recording(
+            room.room_id,
+            room.reconnect_output_dir,
+            room.reconnect_encoder,
+            room.reconnect_crf,
+            param_mode=room.reconnect_param_mode,
+            bitrate=room.reconnect_bitrate,
+            bitrate_unit=room.reconnect_bitrate_unit,
+        )
+        if ok:
+            _log.info("Room %s reconnect succeeded", room.room_id)
+            room.reconnect_attempts = 0
+            room.reconnect_next_attempt_at = 0.0
+        else:
+            _log.warning("Room %s reconnect attempt %d failed: %s",
+                         room.room_id, room.reconnect_attempts, room.last_error)
+            room.reconnect_next_attempt_at = _time.monotonic() + _RECONNECT_DELAY_SEC
+
     def _start_global_timer(self) -> None:
         timer = self._ensure_global_timer()
         if timer is not None and not timer.isActive():
@@ -943,11 +1180,29 @@ class MultiRoomManager(QObject):
                                 controller.current_sec = pos
                         except Exception:
                             pass
-            # Watchdog: check FFmpeg health
+            # Watchdog: check FFmpeg health + auto-reconnect
             if room.is_recording:
                 error_msg = controller.watchdog_check()
                 if error_msg:
-                    room.last_error = error_msg
                     _log.warning("Room %s watchdog: %s", room.room_id, error_msg)
+                    self._attempt_recording_reconnect(room, error_msg)
+            # Runtime disk space guard: stop recording before the disk is full
+            if room.is_recording:
+                try:
+                    rec_dir = getattr(controller, "output_dir", "") or os.path.dirname(room.record_output_path or "")
+                    if rec_dir:
+                        free = shutil.disk_usage(rec_dir).free
+                        if free < _MIN_FREE_BYTES_WHILE_RECORDING:
+                            _log.warning(
+                                "Room %s disk space low (%.1f GB left), stopping recording",
+                                room.room_id,
+                                free / (1024 ** 3),
+                            )
+                            self.stop_recording(room.room_id)
+                            room.last_error = (
+                                f"磁盘空间不足，录制已自动停止（剩余 {free / (1024 ** 3):.1f} GB）"
+                            )
+                except Exception as exc:
+                    _log.debug("Disk space check failed for room %s: %s", room.room_id, exc)
         # Notify UI to refresh timelines and stats once per tick.
         self.global_tick.emit()

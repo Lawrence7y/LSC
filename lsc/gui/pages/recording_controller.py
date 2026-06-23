@@ -1,4 +1,4 @@
-﻿"""Recording controller 鈥?business logic extracted from RecordPage.
+"""Recording controller - business logic extracted from RecordPage.
 
 Separates recording concerns (FFmpeg capture, timer, NVENC probe, URL parsing)
 from pure UI rendering, following the ViewModel / Controller pattern.
@@ -11,7 +11,7 @@ import subprocess
 import time as _time
 import logging
 from argparse import Namespace
-from datetime import datetime, timezone
+from datetime import datetime
 
 from PySide6.QtCore import QThread, QTimer, Signal
 
@@ -21,6 +21,7 @@ except ImportError:
     def get_logger(name: str):
         return logging.getLogger(name)
 
+from lsc.exporter.clip import ClipExporter
 from lsc.platforms.registry import parse_stream, select_quality
 
 _log = get_logger(__name__)
@@ -36,11 +37,6 @@ def friendly_ffmpeg_exit_message(exit_code: int, stderr_tail: str) -> str:
     from lsc.recorder.capture import _friendly_ffmpeg_message
 
     return _friendly_ffmpeg_message(exit_code, stderr_tail)
-_QUALITY_PRESET_CANDIDATES = {
-    "原画": ["origin", "FULL_HD1", "uhd", "UHD1", "hd", "HD1", "sd", "SD1", "SD2", "ld", "ao"],
-    "高清": ["hd", "HD1", "uhd", "UHD1", "FULL_HD1", "sd", "SD1", "origin", "SD2", "ld", "ao"],
-    "流畅": ["sd", "SD1", "SD2", "ld", "hd", "HD1", "uhd", "UHD1", "origin", "FULL_HD1", "ao"],
-}
 
 
 class UrlParserWorker(QThread):
@@ -58,12 +54,32 @@ class UrlParserWorker(QThread):
         self.finished.emit(result)
 
 
+class ProbeWorker(QThread):
+    """Background thread for non-blocking ffprobe video duration queries."""
+
+    finished = Signal(float)
+
+    def __init__(self, video_path: str, probe_fn):
+        super().__init__()
+        self._video_path = video_path
+        self._probe_fn = probe_fn
+
+    def run(self):
+        try:
+            dur = self._probe_fn(self._video_path)
+            self.finished.emit(dur)
+        except Exception:
+            self.finished.emit(0.0)
+
+
 class ExportWorker(QThread):
     """Background thread for clip export."""
 
     finished = Signal(bool, str, str, float)  # success, path, error, size_mb
+    progress = Signal(float, float, float)  # percent, elapsed_sec, total_sec
 
-    def __init__(self, exporter, video_path, start, end, output_dir, title):
+    def __init__(self, exporter, video_path, start, end, output_dir, title,
+                 profile=None):
         super().__init__()
         self._exporter = exporter
         self._video_path = video_path
@@ -71,13 +87,21 @@ class ExportWorker(QThread):
         self._end = end
         self._output_dir = output_dir
         self._title = title
+        self._profile = profile
 
     def run(self):
+        kwargs = {"title": self._title, "progress_callback": self._on_progress}
+        if self._profile is not None:
+            kwargs["profile"] = self._profile
         result = self._exporter.export_clip(
             self._video_path, self._start, self._end, self._output_dir,
-            title=self._title,
+            **kwargs,
         )
         self.finished.emit(result.success, result.output_path, result.error, result.file_size_mb)
+
+    def _on_progress(self, percent: float, elapsed: float, total: float) -> None:
+        """FFmpeg 进度回调，转发到 Qt 信号。"""
+        self.progress.emit(percent, elapsed, total)
 
 
 class AnalysisWorker(QThread):
@@ -126,7 +150,12 @@ class BatchExportWorker(QThread):
 
     def run(self):
         try:
-            results = self._exporter.export_all(self._video_path, self._highlights, self._output_dir)
+            results = list(self._exporter.export_all(
+                self._video_path, self._highlights, self._output_dir
+            ))
+            ClipExporter.save_export_manifest(
+                self._video_path, self._output_dir, results
+            )
             exported_count = sum(1 for result in results if result.success)
             self.finished.emit(True, exported_count, len(self._highlights), "", results)
         except Exception as exc:
@@ -140,12 +169,53 @@ class RecordingController:
     Emits signals via Qt signals on the RecordPage.
     """
 
+    _nvenc_cache: bool | None = None
+    _nvenc_checking: bool = False
+
+    def start_nvenc_check(self):
+        """Asynchronously check NVENC availability and cache the result."""
+        cls = self.__class__
+        if cls._nvenc_cache is not None or cls._nvenc_checking:
+            return
+        cls._nvenc_checking = True
+        
+        import threading
+        def _check():
+            try:
+                available = self.check_nvenc_available()
+                cls._nvenc_cache = available
+            except Exception:
+                cls._nvenc_cache = False
+            finally:
+                cls._nvenc_checking = False
+                
+        thread = threading.Thread(target=_check, daemon=True)
+        thread.start()
+
+    def is_nvenc_available(self) -> bool:
+        """Get cached NVENC availability, or run synchronous check if not yet resolved."""
+        # If mocked on the instance, bypass the cache and run the mock directly
+        if self.check_nvenc_available != self.__class__.check_nvenc_available:
+            return self.check_nvenc_available()
+
+        cls = self.__class__
+        if cls._nvenc_cache is not None:
+            return cls._nvenc_cache
+        # If not cached yet, run it synchronously as fallback
+        available = self.check_nvenc_available()
+        cls._nvenc_cache = available
+        return available
+
     def __init__(self):
         self.is_recording = False
         self.has_start = False
         self.start_sec: float | None = None
         self.end_sec: float | None = None
         self.total_sec: int = 0
+        # Current playback position in seconds (for multi-room timeline/seek).
+        # Updated by seek operations and synced from the preview widget when
+        # available. Distinct from total_sec (recording elapsed time).
+        self.current_sec: float = 0.0
         self.record_start_mono: float = 0.0
 
         self.video_path: str = ""
@@ -155,6 +225,11 @@ class RecordingController:
         self.input_args: list[str] = []
         self.output_dir: str = ""
         self.exported: list[tuple] = []
+        self.selected_quality: str = ""
+        # 编码参数(录制启动后回写),供详情面板展示
+        self.encoder: str = ""
+        self.record_profile: str = ""
+        self.crf: int | None = None
 
         self._capture = None
         self._exporter = None
@@ -169,7 +244,10 @@ class RecordingController:
         self.timer = QTimer()
         self.watchdog = QTimer()
 
-    # 鈹€鈹€ Initialisation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+        # Trigger background check for NVENC availability
+        self.start_nvenc_check()
+
+    # -- Initialisation -------------------------------------------------
 
     def init_capture(self, on_status_cb=None):
         """Create StreamCapture instance."""
@@ -200,19 +278,42 @@ class RecordingController:
             self.exporter_init_error = str(exc) or "导出器初始化失败"
             self._exporter = None
 
-    # 鈹€鈹€ Preflight checks 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Preflight checks -----------------------------------------------
 
-    _MIN_RECORDING_FREE_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
+    # Base minimum free space for a single recording stream (8 GB ≈ 15 min @ 1080p).
+    _MIN_RECORDING_FREE_BYTES_PER_STREAM = 8 * 1024 * 1024 * 1024
 
-    def preflight_recording(self, output_dir: str) -> str:
-        """Check disk space before recording. Returns error message or empty."""
+    @classmethod
+    def preflight_recording(cls, output_dir: str, concurrent_streams: int = 1) -> str:
+        """Check disk space before recording.
+
+        The required free space scales with the number of concurrent recording
+        streams so that multi-room recording does not exhaust disk prematurely.
+
+        Parameters
+        ----------
+        output_dir : str
+            Target output directory.
+        concurrent_streams : int
+            Number of streams that will be recorded simultaneously. Defaults to 1.
+
+        Returns
+        -------
+        str
+            Error message if disk space is insufficient, otherwise empty string.
+        """
         import shutil
 
         os.makedirs(output_dir, exist_ok=True)
         _total, _used, free = shutil.disk_usage(output_dir)
-        if free < self._MIN_RECORDING_FREE_BYTES:
+        required = cls._MIN_RECORDING_FREE_BYTES_PER_STREAM * max(1, concurrent_streams)
+        if free < required:
             free_gb = free / (1024 ** 3)
-            return f"磁盘空间不足，当前仅剩 {free_gb:.1f} GB"
+            required_gb = required / (1024 ** 3)
+            return (
+                f"磁盘空间不足，当前仅剩 {free_gb:.1f} GB，"
+                f"需要 {required_gb:.1f} GB（{concurrent_streams} 路并发录制）"
+            )
         return ""
 
     def probe_stream_metadata(self, source: str) -> tuple[str, str]:
@@ -267,7 +368,7 @@ class RecordingController:
         except (ValueError, ZeroDivisionError):
             return ""
 
-    # 鈹€鈹€ Capture accessors 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Capture accessors ----------------------------------------------
 
     @property
     def capture(self):
@@ -281,17 +382,22 @@ class RecordingController:
         """Public API: check if FFmpeg process has crashed.
 
         Returns exit code if crashed, None if healthy or no capture.
-        Safe to call from UI layer 鈥?no private-member access needed.
+        Safe to call from UI layer - no private-member access needed.
         """
         if not self._capture or not self._capture.is_recording:
             return None
         return self._capture.check_and_handle_crash()
 
-    # 鈹€鈹€ URL parsing 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- URL parsing ----------------------------------------------------
 
-    def parse_stream_url(self, url: str) -> dict:
+    def parse_stream_url(self, url: str, *, force_refresh: bool = False) -> dict:
         """Parse a supported room URL into the legacy dict consumed by the GUI."""
-        info = parse_stream(url)
+        # Only pass force_refresh when explicitly requested so monkey-patched
+        # test fakes that only accept a single ``url`` argument keep working.
+        if force_refresh:
+            info = parse_stream(url, force_refresh=True)
+        else:
+            info = parse_stream(url)
         legacy = info.to_legacy_dict()
         self.last_stream_info = info
         self.input_args = list(legacy.get("_inputArgs", []))
@@ -303,11 +409,19 @@ class RecordingController:
 
     def start_url_parse(self, url: str, on_parsed) -> None:
         """Launch async URL parsing. Calls on_parsed(dict) when done."""
-        self._url_parser = UrlParserWorker(url, self.parse_stream_url)
+        # 通过实例标志控制是否强制刷新缓存，避免改变 start_url_parse 的签名
+        # 和破坏现有测试对 parse_fn == self.parse_stream_url 的断言。
+        force_refresh = getattr(self, "_force_next_parse_refresh", False)
+        self._force_next_parse_refresh = False
+        if force_refresh:
+            parse_fn = lambda u: self.parse_stream_url(u, force_refresh=True)
+        else:
+            parse_fn = self.parse_stream_url
+        self._url_parser = UrlParserWorker(url, parse_fn)
         self._url_parser.finished.connect(on_parsed)
         self._url_parser.start()
 
-    # 鈹€鈹€ NVENC probe 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- NVENC probe ----------------------------------------------------
 
     @staticmethod
     def check_nvenc_available() -> bool:
@@ -358,7 +472,7 @@ class RecordingController:
             text = str(numeric).rstrip("0").rstrip(".")
         return f"{text}{suffix}"
 
-    # 鈹€鈹€ Recording lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Recording lifecycle --------------------------------------------
 
     def start_recording_with_crf(self, stream_url: str, output_dir: str,
                                   encoder: str, crf: int,
@@ -366,7 +480,7 @@ class RecordingController:
                                   bitrate: str | None = None,
                                   bitrate_unit: str = "kbps",
                                   input_args: list[str] | None = None,
-                                  on_status=None) -> tuple[bool, str, str]:
+                                  on_status=None) -> tuple[bool, str, str, str]:
         """Start recording with explicit CRF value.
 
         CRF is respected for all encoder modes:
@@ -376,9 +490,17 @@ class RecordingController:
 
         Sets is_recording and record_start_mono atomically so the UI
         layer doesn't need to set them separately.
+
+        Returns
+        -------
+        tuple[bool, str, str, str]
+            (success, output_path, encoder_used, error_message)
+            error_message is empty on success.
         """
         if not self._capture:
-            return False, "", encoder
+            return False, "", encoder, "录制组件未初始化"
+        if not stream_url:
+            return False, "", encoder, "直播流地址为空"
 
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -396,7 +518,7 @@ class RecordingController:
         if encoder == "H.264 NVENC":
             if on_status:
                 on_status("检测 NVENC 硬件编码...", "info")
-            if not self.check_nvenc_available():
+            if not self.is_nvenc_available():
                 if on_status:
                     on_status("NVENC 不可用，自动切换为 Copy 模式", "warning")
                 encoder_used = "Copy"
@@ -455,7 +577,7 @@ class RecordingController:
                                 extra_args=output_args)
 
         if self._capture.status.value == "recording":
-            # Capture confirmed running 鈥?set controller state atomically
+            # Capture confirmed running - set controller state atomically
             self.is_recording = True
             self.total_sec = 0
             self.record_start_mono = _time.monotonic()
@@ -464,9 +586,14 @@ class RecordingController:
             self.end_sec = None
             self.stream_url = stream_url
             self.video_path = output_path
-            return True, output_path, encoder_used
+            # 回写编码参数,供详情面板(DetailPanel)读取展示。
+            self.encoder = encoder_used
+            self.record_profile = param_mode
+            self.crf = crf
+            return True, output_path, encoder_used, ""
         else:
-            return False, "", encoder_used
+            error_msg = getattr(self._capture, "last_error", "") or "录制启动失败"
+            return False, "", encoder_used, error_msg
 
     def stop_recording(self) -> tuple[bool, float, str]:
         """Stop recording. Returns (success, size_mb, output_path)."""
@@ -488,9 +615,10 @@ class RecordingController:
 
         return False, size_mb, output_path
 
-    def probe_video_duration(self) -> float:
-        """Use FFprobe to get actual video duration."""
-        if not self.video_path or not os.path.isfile(self.video_path):
+    def probe_video_duration_sync(self, video_path: str = "") -> float:
+        """Synchronously use FFprobe to get actual video duration."""
+        target_path = video_path or self.video_path
+        if not target_path or not os.path.isfile(target_path):
             return 0.0
         try:
             import json
@@ -500,7 +628,7 @@ class RecordingController:
             if not ffprobe or not os.path.isfile(ffprobe):
                 return 0.0
             cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
-                   "-show_format", self.video_path]
+                   "-show_format", target_path]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             data = json.loads(result.stdout)
             dur = float(data.get("format", {}).get("duration", 0))
@@ -508,7 +636,22 @@ class RecordingController:
         except Exception:
             return 0.0
 
-    # 鈹€鈹€ Timer tick 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    def probe_video_duration(self, on_probed=None) -> float:
+        """Use FFprobe to get actual video duration.
+
+        If on_probed callback is specified, run asynchronously and return 0.0.
+        Otherwise, run synchronously and return the duration.
+        """
+        if on_probed is None:
+            return self.probe_video_duration_sync()
+
+        # Async mode
+        self._probe_worker = ProbeWorker(self.video_path, self.probe_video_duration_sync)
+        self._probe_worker.finished.connect(on_probed)
+        self._probe_worker.start()
+        return 0.0
+
+    # -- Timer tick -----------------------------------------------------
 
     def tick(self) -> int:
         """Update elapsed time using monotonic clock. Returns current total_sec."""
@@ -516,33 +659,44 @@ class RecordingController:
             self.total_sec = int(_time.monotonic() - self.record_start_mono)
         return self.total_sec
 
-    # 鈹€鈹€ Watchdog 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Watchdog -------------------------------------------------------
 
     def watchdog_check(self) -> str:
         """Check FFmpeg health. Returns error message or empty string."""
         if not self._capture or not self.is_recording:
             return ""
-        # Use public API 鈥?no private-member access
+        # Use public API - no private-member access
         exit_code = self._capture.check_and_handle_crash()
         if exit_code is not None:
             return f"FFmpeg 异常退出 (code {exit_code})"
         msg = self._capture.check_health()
         return msg
 
-    # 鈹€鈹€ Export 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Export ---------------------------------------------------------
 
     def start_export(self, start_sec: float, end_sec: float,
                      output_dir: str, name: str,
-                     on_done) -> bool:
-        """Start async clip export. Returns True if export was started."""
+                     on_done, profile=None, on_progress=None) -> bool:
+        """Start async clip export. Returns True if export was started.
+
+        Parameters
+        ----------
+        profile : ExportProfile | None
+            编码配置。若为 None 则使用 ClipExporter 的默认配置。
+        on_progress : callable | None
+            进度回调 ``callback(percent, elapsed, total)``。
+        """
         if not self._exporter or not self.video_path or not os.path.isfile(self.video_path):
             return False
 
         self._export_thread = ExportWorker(
             self._exporter, self.video_path,
             start_sec, end_sec, output_dir, name,
+            profile=profile,
         )
         self._export_thread.finished.connect(on_done)
+        if on_progress is not None:
+            self._export_thread.progress.connect(on_progress)
         self._export_thread.start()
         return True
 
@@ -570,7 +724,7 @@ class RecordingController:
         self._batch_export_thread.start()
         return True
 
-    # 鈹€鈹€ Cleanup 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # -- Cleanup --------------------------------------------------------
 
     def cleanup(self):
         """Release all resources.
@@ -582,25 +736,24 @@ class RecordingController:
         self.timer.stop()
         self.watchdog.stop()
 
-        # Wait for background QThreads to finish
-        if self._export_thread and self._export_thread.isRunning():
-            self._export_thread.quit()
-            self._export_thread.wait(5000)
-        if self._analysis_thread and self._analysis_thread.isRunning():
-            self._analysis_thread.quit()
-            self._analysis_thread.wait(5000)
-        if self._batch_export_thread and self._batch_export_thread.isRunning():
-            self._batch_export_thread.quit()
-            self._batch_export_thread.wait(5000)
-        if self._url_parser and self._url_parser.isRunning():
-            self._url_parser.quit()
-            self._url_parser.wait(5000)
+        # Wait for background QThreads to finish.
+        # These workers override run() and do not run an event loop, so
+        # quit() has no effect; we wait for them to finish naturally and
+        # terminate only as a last resort.
+        for worker, name in (
+            (self._export_thread, "export"),
+            (self._analysis_thread, "analysis"),
+            (self._batch_export_thread, "batch_export"),
+            (self._url_parser, "url_parser"),
+        ):
+            if worker and worker.isRunning():
+                if not worker.wait(5000):
+                    _log.warning("%s worker did not stop in time, terminating", name)
+                    worker.terminate()
+                    worker.wait(1000)
 
         if self._capture:
             if self._capture.is_recording:
                 self._capture.stop()
             else:
                 self._capture.force_cleanup()
-
-
-

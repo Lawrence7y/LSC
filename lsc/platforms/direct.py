@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from urllib.parse import parse_qsl, urlparse
 
-from .base import PlatformAdapter, StreamInfo
+from .base import BasePlatformAdapter, StreamInfo
 
 _DIRECT_SUFFIXES = (".m3u8", ".flv")
 _DIRECT_QUERY_FORMAT_KEYS = {"type", "format", "container", "ext"}
@@ -11,8 +11,9 @@ _DIRECT_QUERY_URL_KEYS = {"url", "play_url", "stream", "stream_url", "src", "tar
 _DIRECT_HINT_TOKENS = (".m3u8", ".flv", "m3u8", "flv")
 
 
-class DirectAdapter(PlatformAdapter):
+class DirectAdapter(BasePlatformAdapter):
     platform = "direct"
+    display_name = "直链"
 
     def can_handle(self, url: str) -> bool:
         clean_url = (url or "").strip()
@@ -25,9 +26,8 @@ class DirectAdapter(PlatformAdapter):
 
     def parse(self, url: str) -> StreamInfo:
         clean_url = (url or "").strip()
-        return StreamInfo(
-            platform=self.platform,
-            room_url=clean_url,
+        return self._success(
+            clean_url,
             stream_url=clean_url,
             title="公开直播流",
             streamer="直链",

@@ -1,16 +1,15 @@
 """FFmpeg-based live stream capture."""
 from __future__ import annotations
 
-import contextlib
 import os
 import subprocess
-import sys
 import time
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
-from threading import Thread
+from threading import Lock
 
 from lsc import get_logger
 from lsc.config import LscConfig
@@ -23,6 +22,9 @@ _FRIENDLY_STDERR_RULES = (
     ("timed out", "连接直播流超时"),
     ("Connection refused", "直播服务器拒绝连接"),
 )
+
+STARTUP_PROBE_TIMEOUT_SEC = 5.0
+STARTUP_PROBE_INTERVAL_SEC = 0.1
 
 
 def _friendly_ffmpeg_message(exit_code: int, stderr_tail: str) -> str:
@@ -38,7 +40,6 @@ class CaptureStatus(Enum):
     IDLE = "idle"
     CONNECTING = "connecting"
     RECORDING = "recording"
-    PAUSED = "paused"
     STOPPED = "stopped"
     ERROR = "error"
 
@@ -56,9 +57,17 @@ class CaptureResult:
 class StreamCapture:
     """FFmpeg-based live stream capture."""
 
+    # Shared thread pool for stderr readers across all capture instances.
+    # Limiting workers to 2 keeps thread stack usage low even when many
+    # rooms are recording simultaneously.
+    _stderr_executor: ThreadPoolExecutor | None = None
+    _stderr_executor_users: int = 0
+    _stderr_executor_lock: Lock = Lock()
+
     def __init__(self, config: LscConfig):
         self.config = config
         self.ffmpeg = config.ffmpeg_path
+        self._lock = Lock()
         self._process: subprocess.Popen | None = None
         self._status = CaptureStatus.IDLE
         self._output_path = ""
@@ -66,49 +75,125 @@ class StreamCapture:
         self._last_file_size = 0
         self._stall_checks = 0
         self._on_status_change: Callable[[CaptureStatus], None] | None = None
-        self._stderr_tail: deque[str] = deque(maxlen=80)
-        self._stderr_thread: Thread | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=20)
+        self._stderr_future = None
+        self._stderr_released = False
+        self._last_error: str = ""
 
     @property
     def status(self) -> CaptureStatus:
-        return self._status
+        with self._lock:
+            return self._status
+
+    @property
+    def last_error(self) -> str:
+        """Last error message from a failed start/stop operation."""
+        return self._last_error
 
     @property
     def is_recording(self) -> bool:
-        return self._status == CaptureStatus.RECORDING
+        with self._lock:
+            return self._status == CaptureStatus.RECORDING
 
     @property
     def duration(self) -> float:
-        if self._start_time <= 0:
-            return 0.0
-        return time.time() - self._start_time
+        with self._lock:
+            if self._start_time <= 0:
+                return 0.0
+            return time.time() - self._start_time
 
     def set_status_callback(self, cb: Callable[[CaptureStatus], None]):
         """Set callback for status changes."""
         self._on_status_change = cb
 
     def _set_status(self, status: CaptureStatus):
-        self._status = status
+        with self._lock:
+            self._status = status
         if self._on_status_change:
-            with contextlib.suppress(Exception):
+            try:
                 self._on_status_change(status)
+            except Exception as exc:
+                _log.warning("status callback raised: status=%s err=%s", status, exc)
 
     def _start_stderr_reader(self) -> None:
-        """Start a background thread to read FFmpeg stderr into ring buffer."""
+        """Start a background thread to read FFmpeg stderr into ring buffer.
+
+        Uses a shared thread pool so that many concurrent captures do not
+        create one thread each (each Python thread costs ~8 MB of stack on
+        Windows).
+        """
         if self._process is None or self._process.stderr is None:
             return
 
-        def _reader() -> None:
-            for line in self._process.stderr:
-                self._stderr_tail.append(line.rstrip())
+        proc = self._process
+        executor = self._acquire_stderr_executor()
+        self._stderr_future = executor.submit(self._stderr_reader_loop, proc)
 
-        self._stderr_thread = Thread(target=_reader, daemon=True)
-        self._stderr_thread.start()
+    def _stderr_reader_loop(self, proc: subprocess.Popen) -> None:
+        """Read lines from proc.stderr until the pipe closes."""
+        try:
+            for line in proc.stderr:
+                self._stderr_tail.append(line.rstrip())
+        except Exception:
+            # Pipe closed or process already gone; reader exits cleanly.
+            pass
+
+    @classmethod
+    def _acquire_stderr_executor(cls) -> ThreadPoolExecutor:
+        with cls._stderr_executor_lock:
+            if cls._stderr_executor is None:
+                cls._stderr_executor = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="lsc-stderr"
+                )
+            cls._stderr_executor_users += 1
+            return cls._stderr_executor
+
+    @classmethod
+    def _release_stderr_executor(cls) -> None:
+        with cls._stderr_executor_lock:
+            cls._stderr_executor_users -= 1
+            if cls._stderr_executor_users <= 0 and cls._stderr_executor is not None:
+                cls._stderr_executor.shutdown(wait=False)
+                cls._stderr_executor = None
+
+    def _release_stderr_executor_once(self) -> None:
+        """确保每个实例只释放一次共享 stderr executor，防止并发路径重复释放。"""
+        with self._lock:
+            if self._stderr_released:
+                return
+            self._stderr_released = True
+        self._release_stderr_executor()
 
     @property
     def stderr_tail(self) -> str:
         """Return the last stderr lines as a single string."""
         return "\n".join(self._stderr_tail)
+
+    def _output_has_started(self) -> bool:
+        """Return True once FFmpeg has written any media bytes."""
+        try:
+            return os.path.isfile(self._output_path) and os.path.getsize(self._output_path) > 0
+        except OSError:
+            return False
+
+    def _wait_for_startup_data(self) -> bool:
+        """Wait briefly until FFmpeg proves the input stream is producing data."""
+        deadline = time.monotonic() + max(0.0, STARTUP_PROBE_TIMEOUT_SEC)
+        while True:
+            if self._output_has_started():
+                return True
+            if self._process is not None and self._process.poll() is not None:
+                return self._output_has_started()
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(STARTUP_PROBE_INTERVAL_SEC)
+
+    def _startup_failure_message(self) -> str:
+        """Build a user-facing error for a stream that never produced data."""
+        proc = self._process
+        if proc is not None and proc.poll() is not None:
+            return _friendly_ffmpeg_message(proc.returncode or -1, self.stderr_tail)
+        return "启动录制失败：没有收到直播数据，请确认直播已开播或链接未过期"
 
     def start(self, url: str, output_path: str, *,
               codec: str = "copy",
@@ -125,7 +210,11 @@ class StreamCapture:
         Returns:
             True if capture started successfully
         """
-        if self._status == CaptureStatus.RECORDING:
+        with self._lock:
+            already_recording = self._status == CaptureStatus.RECORDING
+            self._last_error = ""
+
+        if already_recording:
             _log.warning("Already recording, force-stopping old capture first")
             self._force_kill()
             self._set_status(CaptureStatus.STOPPED)
@@ -164,37 +253,12 @@ class StreamCapture:
         _log.info("Starting capture: %s -> %s", url, output_path)
         self._set_status(CaptureStatus.CONNECTING)
 
-        # Build a clean environment: prioritize FFmpeg's directory in PATH
-        # to avoid DLL conflicts from PySide6/Qt bundling older FFmpeg DLLs
-        env = os.environ.copy()
-        ffmpeg_dir = os.path.dirname(os.path.abspath(self.ffmpeg))
-        path_dirs = env.get("PATH", "").split(os.pathsep)
-        # Remove directories containing competing avcodec/avformat DLLs
-        clean_path = []
-        for d in path_dirs:
-            if d and os.path.isdir(d):
-                has_avcodec = any(f.startswith("avcodec-") and f.endswith(".dll")
-                                  for f in os.listdir(d) if os.path.isfile(os.path.join(d, f)))
-                if has_avcodec and os.path.normcase(d) != os.path.normcase(ffmpeg_dir):
-                    _log.debug("Removing conflicting DLL path: %s", d)
-                    continue
-            clean_path.append(d)
-        env["PATH"] = ffmpeg_dir + os.pathsep + os.pathsep.join(clean_path)
-
-        # Windows: use CREATE_NO_WINDOW to prevent console popups
-        creation_flags = 0
-        if sys.platform == "win32":
-            creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
-            # Clear DLL directories added by PySide6/Qt (AddDllDirectory is
-            # inherited by child processes and can cause avcodec version conflicts)
-            try:
-                import ctypes
-                ctypes.windll.kernel32.SetDllDirectoryW(None)
-            except Exception as exc:
-                _log.debug("SetDllDirectoryW failed: %s", exc)
+        # Build a clean environment and platform-specific launch flags
+        from lsc.utils.process_launcher import prepare_launch
+        env, creation_flags, cwd = prepare_launch(self.ffmpeg)
 
         try:
-            self._process = subprocess.Popen(  # noqa: S603
+            proc = subprocess.Popen(  # noqa: S603
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
@@ -203,23 +267,34 @@ class StreamCapture:
                 encoding="utf-8",
                 errors="replace",
                 env=env,
-                cwd=ffmpeg_dir,
+                cwd=cwd,
                 creationflags=creation_flags,
             )
-            self._output_path = output_path
-            self._start_time = time.time()
-            self._last_file_size = 0
-            self._stall_checks = 0
-            self._stderr_tail.clear()
+            with self._lock:
+                self._process = proc
+                self._output_path = output_path
+                self._start_time = time.time()
+                self._last_file_size = 0
+                self._stall_checks = 0
+                self._stderr_released = False
+                self._stderr_tail.clear()
             self._start_stderr_reader()
+            if not self._wait_for_startup_data():
+                self._last_error = self._startup_failure_message()
+                _log.error("Capture startup did not receive stream data: %s", self._last_error)
+                self._force_kill()
+                self._set_status(CaptureStatus.ERROR)
+                return False
             self._set_status(CaptureStatus.RECORDING)
             _log.info("Capture started (PID: %d)", self._process.pid)
             return True
         except FileNotFoundError:
+            self._last_error = f"FFmpeg 未找到: {self.ffmpeg}"
             _log.error("FFmpeg not found: %s", self.ffmpeg)
             self._set_status(CaptureStatus.ERROR)
             return False
         except Exception as exc:
+            self._last_error = f"启动录制失败: {exc}"
             _log.error("Failed to start capture: %s", exc)
             self._set_status(CaptureStatus.ERROR)
             return False
@@ -230,60 +305,89 @@ class StreamCapture:
         1. Send 'q' via stdin for graceful FFmpeg shutdown (flushes output)
         2. wait(timeout=5) — give FFmpeg time to finish
         3. terminate() + wait(timeout=3) — SIGTERM equivalent
-        4. kill() — force SIGKILL as last resort
+        4. kill() + final wait(timeout=5) — force SIGKILL as last resort
+
+        The final wait is also bounded: if FFmpeg still refuses to exit,
+        we log its PID and release resources without blocking the caller.
 
         Returns:
             CaptureResult with success status and file info
         """
-        if self._status != CaptureStatus.RECORDING or not self._process:
-            return CaptureResult(False, "", error="Not recording")
+        with self._lock:
+            if self._status != CaptureStatus.RECORDING or not self._process:
+                return CaptureResult(False, "", error="Not recording")
+            proc = self._process
 
         _log.info("Stopping capture...")
+        orphaned_pid: int | None = None
 
         # Level 1: graceful 'q' command
         try:
-            if self._process.poll() is None and self._process.stdin is not None:
-                self._process.stdin.write(b"q")
-                self._process.stdin.flush()
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write("q")
+                proc.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             _log.debug("stdin write failed (FFmpeg may have exited): %s", exc)
 
+        # Helper to bound every wait attempt and avoid hanging the caller.
+        def _wait_with_deadline(timeout: float) -> bool:
+            try:
+                proc.wait(timeout=timeout)
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+            except Exception as exc:
+                _log.warning("Unexpected error waiting for FFmpeg: %s", exc)
+                return False
+
         # Level 2: wait for graceful exit
-        try:
-            self._process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+        if not _wait_with_deadline(5):
             # Level 3: terminate
             _log.debug("FFmpeg didn't exit in 5s, sending terminate")
-            self._process.terminate()
             try:
-                self._process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+                proc.terminate()
+            except Exception as exc:
+                _log.warning("FFmpeg terminate failed: %s", exc)
+            if not _wait_with_deadline(3):
                 # Level 4: force kill
                 _log.warning("FFmpeg didn't terminate in 3s, force killing")
-                self._process.kill()
-                self._process.wait(timeout=5)
-        except Exception as exc:
-            _log.warning("Error during stop, force killing: %s", exc)
-            if self._process and self._process.poll() is None:
-                self._process.kill()
-                with contextlib.suppress(Exception):
-                    self._process.wait(timeout=5)
+                try:
+                    proc.kill()
+                except Exception as exc:
+                    _log.warning("FFmpeg kill failed: %s", exc)
+                if not _wait_with_deadline(5):
+                    # Final safety net: do not block forever.
+                    try:
+                        orphaned_pid = proc.pid
+                    except Exception:
+                        pass
+                    _log.error(
+                        "FFmpeg process %s refused to exit after kill; "
+                        "leaving it orphan and releasing capture resources",
+                        orphaned_pid,
+                    )
 
         duration = self.duration
-        self._process = None
+        output_path = ""
+        with self._lock:
+            self._process = None
+            output_path = self._output_path
+        self._release_stderr_executor_once()
         self._set_status(CaptureStatus.STOPPED)
 
-        if os.path.isfile(self._output_path):
-            size_mb = os.path.getsize(self._output_path) / (1024 * 1024)
+        if os.path.isfile(output_path):
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
             _log.info("Capture stopped: %.1fs, %.1fMB", duration, size_mb)
-            return CaptureResult(True, self._output_path, duration, size_mb)
+            return CaptureResult(True, output_path, duration, size_mb)
         return CaptureResult(False, "", error="Output file not created")
 
     def is_alive(self) -> bool:
         """Check if the FFmpeg process is still running."""
-        if not self._process:
+        with self._lock:
+            proc = self._process
+        if not proc:
             return False
-        return self._process.poll() is None
+        return proc.poll() is None
 
     def check_and_handle_crash(self) -> int | None:
         """Check if FFmpeg process has crashed. Returns exit code if crashed, None if healthy.
@@ -291,13 +395,17 @@ class StreamCapture:
         If crashed, internally cleans up state and sets status to ERROR.
         Safe to call from any thread — no private-member access needed by callers.
         """
-        if not self._process:
+        with self._lock:
+            proc = self._process
+        if not proc:
             return None
-        exit_code = self._process.poll()
+        exit_code = proc.poll()
         if exit_code is not None:
             # Process has exited
             _log.warning("FFmpeg process exited unexpectedly (code=%d)", exit_code)
-            self._process = None
+            with self._lock:
+                self._process = None
+            self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return exit_code
         return None
@@ -315,53 +423,55 @@ class StreamCapture:
 
         Uses terminate() before kill() to allow FFmpeg to flush output.
         """
-        if self._process:
+        with self._lock:
+            proc = self._process
+            self._process = None
+        if proc:
             try:
-                if self._process.poll() is None:
-                    self._process.terminate()
+                if proc.poll() is None:
+                    proc.terminate()
                     try:
-                        self._process.wait(timeout=3)
+                        proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        self._process.kill()
-                        self._process.wait(timeout=5)
+                        proc.kill()
+                        proc.wait(timeout=5)
                     _log.info("Force-killed FFmpeg process")
             except Exception as exc:
                 _log.warning("Error force-killing FFmpeg: %s", exc)
             finally:
-                self._process = None
+                self._release_stderr_executor_once()
 
     def check_health(self) -> str:
         """Check capture health. Returns status message or empty if OK."""
-        if self._status != CaptureStatus.RECORDING:
-            return ""
-        if not self.is_alive():
-            rc = self._process.returncode if self._process else -1
+        with self._lock:
+            if self._status != CaptureStatus.RECORDING:
+                return ""
+            proc = self._process
+            output_path = self._output_path
+            if proc is None:
+                return ""
+        if proc.poll() is not None:
+            rc = proc.returncode
+            with self._lock:
+                self._process = None
+            self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return _friendly_ffmpeg_message(rc, self.stderr_tail)
         # Check if file is growing
-        if os.path.isfile(self._output_path):
-            cur_size = os.path.getsize(self._output_path)
-            if cur_size == self._last_file_size and cur_size > 0:
-                self._stall_checks += 1
+        if os.path.isfile(output_path):
+            cur_size = os.path.getsize(output_path)
+            with self._lock:
+                if cur_size == self._last_file_size and cur_size > 0:
+                    self._stall_checks += 1
+                    stall_checks = self._stall_checks
+                else:
+                    self._stall_checks = 0
+                    stall_checks = 0
+                self._last_file_size = cur_size
+            if stall_checks >= 3:
                 _log.warning(
                     "Output file not growing, stream may be stalled (checks=%d)",
-                    self._stall_checks,
+                    stall_checks,
                 )
-                if self._stall_checks >= 3:
-                    return "输出文件长时间未增长，录制可能已卡住"
-            else:
-                self._stall_checks = 0
-            self._last_file_size = cur_size
+                return "输出文件长时间未增长，录制可能已卡住"
         return ""
-
-    def pause(self):
-        """Pause the capture (not supported on Windows)."""
-        if self._status != CaptureStatus.RECORDING:
-            return
-        _log.info("Pause not supported on Windows")
-
-    def resume(self):
-        """Resume the capture."""
-        if self._status != CaptureStatus.PAUSED:
-            return
-        _log.info("Resume not supported on Windows")

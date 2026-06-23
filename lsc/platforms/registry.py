@@ -11,8 +11,11 @@ from .base import ERROR_PARSE_FAILED, ERROR_UNSUPPORTED_URL, PlatformAdapter, St
 from .bilibili import BilibiliAdapter
 from .direct import DirectAdapter
 from .douyin import DouyinAdapter
+from .douyu import DouyuAdapter
+from .generic import GenericPageAdapter
 from .huya import HuyaAdapter
 from .kuaishou import KuaishouAdapter
+from .xiaohongshu import XiaohongshuAdapter
 
 _log = logging.getLogger(__name__)
 
@@ -35,6 +38,9 @@ _DEFAULT_ADAPTERS: tuple[PlatformAdapter, ...] = (
     BilibiliAdapter(),
     HuyaAdapter(),
     KuaishouAdapter(),
+    DouyuAdapter(),
+    XiaohongshuAdapter(),
+    GenericPageAdapter(),  # Last — fallback for unknown platforms
 )
 
 # Host -> platform identifiers routing table. Allows parse_stream to skip
@@ -51,6 +57,10 @@ _URL_ROUTER: dict[str, tuple[str, ...]] = {
     "huya.com": ("huya",),
     "live.kuaishou.com": ("kuaishou",),
     "kuaishou.com": ("kuaishou",),
+    "www.douyu.com": ("douyu",),
+    "douyu.com": ("douyu",),
+    "www.xiaohongshu.com": ("xiaohongshu",),
+    "xhslink.com": ("xiaohongshu",),
 }
 
 

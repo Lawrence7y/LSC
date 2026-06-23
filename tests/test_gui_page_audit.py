@@ -118,6 +118,109 @@ def test_settings_page_load_does_not_trigger_theme_refresh(monkeypatch) -> None:
     assert calls == []
 
 
+def test_light_theme_uses_readable_disabled_and_empty_state_colors() -> None:
+    from lsc.gui.theme import LIGHT, generate_stylesheet
+
+    stylesheet = generate_stylesheet(LIGHT, dark=False)
+
+    assert "QPushButton:disabled { color: #6f7685;" in stylesheet
+    assert "background: #e3e7ee;" in stylesheet
+    assert "QLabel#empty_state {\n        color: #6f7685;" in stylesheet
+
+
+def test_light_theme_primary_buttons_use_segmented_pill_style() -> None:
+    from lsc.gui.theme import LIGHT, generate_stylesheet
+
+    stylesheet = generate_stylesheet(LIGHT, dark=False)
+
+    assert "QPushButton#btnPrimary {" in stylesheet
+    assert "background: rgba(230,114,47,0.12);" in stylesheet
+    assert "color: #e6722f;" in stylesheet
+    assert "border: 1px solid #e6722f;" in stylesheet
+    assert "border-radius: 18px;" in stylesheet
+    assert "QPushButton#btnPrimary:disabled { background: #e3e7ee; color: #6f7685;" in stylesheet
+
+
+def test_light_theme_add_room_button_has_visible_text() -> None:
+    from lsc.gui.theme import LIGHT, generate_stylesheet
+
+    stylesheet = generate_stylesheet(LIGHT, dark=False)
+
+    assert "QPushButton#addRoomButton {" in stylesheet
+    assert "QPushButton#addRoomButton {\n        background: rgba(230,114,47,0.12); color: #e6722f;" in stylesheet
+    assert "QPushButton#addRoomButton:disabled { background: #e3e7ee; color: #6f7685;" in stylesheet
+
+
+def test_light_theme_hover_states_stay_distinct_from_white_surfaces() -> None:
+    from lsc.gui.theme import LIGHT, generate_stylesheet
+
+    stylesheet = generate_stylesheet(LIGHT, dark=False)
+
+    assert "QPushButton:hover {\n        background: #dfe5ee;" in stylesheet
+    assert "QPushButton#btnSecondary:hover {\n        background: #dfe5ee;" in stylesheet
+    assert "QPushButton#roomCardSmallBtn:hover {\n        background: #dfe5ee;" in stylesheet
+    assert "border-color: rgba(0,0,0,0.22);" in stylesheet
+
+
+def test_control_bar_play_button_has_readable_disabled_state() -> None:
+    from lsc.gui.theme import DARK, LIGHT, generate_stylesheet
+
+    light = generate_stylesheet(LIGHT, dark=False)
+    dark = generate_stylesheet(DARK, dark=True)
+
+    assert "QPushButton#ctrlPlay:disabled { color: #6f7685;" in light
+    assert "QPushButton#ctrlPlay:disabled {" in dark
+    assert "border-color:" in light
+    assert "background:" in light
+
+
+def test_workbench_control_bar_uses_icons_not_fragile_glyph_text() -> None:
+    _qapp()
+
+    from lsc.gui.components.control_bar import ControlBar
+
+    bar = ControlBar()
+
+    assert bar._play.text() == ""
+    assert not bar._play.icon().isNull()
+    assert bar._back.text() == "10s"
+    assert not bar._back.icon().isNull()
+    assert bar._fwd.text() == "10s"
+    assert not bar._fwd.icon().isNull()
+    assert not bar._fullscreen.isVisible()
+
+
+def test_record_timeline_cursor_uses_theme_text_color_in_light_mode() -> None:
+    _qapp()
+
+    from lsc.gui.theme import set_dark
+    from lsc.gui.components.timeline import InlineTimeline
+
+    set_dark(False)
+    timeline = InlineTimeline()
+
+    try:
+        assert timeline.cursor_color_name() == "#1a1d26"
+    finally:
+        set_dark(True)
+
+
+def test_record_video_preview_initializes_player_lazily(monkeypatch) -> None:
+    _qapp()
+
+    from lsc.gui.pages import record as record_module
+
+    def fail_if_constructed(*args, **kwargs):
+        raise AssertionError("MpvWidget should be lazy")
+
+    monkeypatch.setattr(record_module, "MpvWidget", fail_if_constructed)
+
+    preview = record_module.VideoPreview()
+
+    assert preview._mpv_widget is None
+    assert not preview._fullscreen_btn.isHidden()
+
+
 def test_settings_page_persists_bitrate_defaults() -> None:
     _qapp()
     settings = _settings()
@@ -229,7 +332,7 @@ def test_set_video_path_loads_player_and_timeline(tmp_path: Path) -> None:
     assert page._controls.playing == [True]
     assert page._controls.timeline.data == {"duration": 12.5, "position": 0}
     assert page._controls.times == [(0, 12.5)]
-    assert page._ctrl.timer.started == [200]
+    assert page._ctrl.timer.started == [1000]
 
 
 def test_set_video_path_enables_analyze_button(tmp_path: Path) -> None:
@@ -316,6 +419,20 @@ def test_exported_clip_click_replays_exported_file(tmp_path: Path) -> None:
         def set_playing(self, value):
             self.playing.append(value)
 
+        def set_range_state(self, *args, **kwargs):
+            pass
+
+        def set_export_enabled(self, *args, **kwargs):
+            pass
+
+        class _Timeline:
+            def set_data(self, **kwargs):
+                pass
+            def set_cursor_mode(self, *args, **kwargs):
+                pass
+
+        timeline = _Timeline()
+
     page = RecordPage.__new__(RecordPage)
     page._ctrl = FakeController()
     page._preview = FakePreview()
@@ -331,12 +448,14 @@ def test_exported_clip_click_replays_exported_file(tmp_path: Path) -> None:
 def test_record_page_controls_keep_timeline_and_buttons_visible() -> None:
     _qapp()
 
-    from lsc.gui.pages.record import CONTROL_ACTION_BUTTON_HEIGHT, RecordPage, TIMELINE_HEIGHT
+    from lsc.gui.components.timeline import TIMELINE_HEIGHT
+    from lsc.gui.pages.record import RecordPage
 
     page = RecordPage()
 
     assert page._controls.timeline.height() == TIMELINE_HEIGHT
-    assert page._controls._mark_in.height() >= CONTROL_ACTION_BUTTON_HEIGHT
+    assert not page._controls._mark_in.isHidden()
+    assert not page._controls._mark_out.isHidden()
     assert page._controls._time_label.width() >= 172
     page.cleanup()
 

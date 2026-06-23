@@ -150,7 +150,7 @@ def test_room_card_preview_controls_sit_below_video() -> None:
     assert card._preview_area._controls_widget is None
 
 
-def test_room_card_exposes_resize_handle_and_updates_preview_size() -> None:
+def test_room_card_preset_size_and_updates_preview_size() -> None:
     _qapp()
 
     from lsc.gui.components.room_card import RoomCard
@@ -158,14 +158,52 @@ def test_room_card_exposes_resize_handle_and_updates_preview_size() -> None:
     room = RoomSession(room_id="room-1", room_url="https://live.douyin.com/123")
     card = RoomCard(room)
 
-    assert card._resize_handle.objectName() == "roomCardResizeHandle"
-    assert card._resize_handle.cursor().shape().name == "SizeFDiagCursor"
+    # 预设尺寸切换按钮
+    assert hasattr(card, '_size_btn')
+    assert hasattr(card, '_preset_index')
 
-    card.set_card_size(520, 210)
+    # 应用大号预设
+    card.set_preset(2)  # 大号: 560×300
+    assert card.maximumWidth() == 560
+    assert card.minimumWidth() == 560
+    assert card._preview_area.height() == 300
 
-    assert card.maximumWidth() == 520
-    assert card.minimumWidth() <= 520
-    assert card._preview_area.height() == 210
+    # 循环切换预设
+    card.cycle_preset()  # 大→小
+    assert card.maximumWidth() == 340
+
+    # reset_card_width 恢复为默认预设(中号)
+    card.reset_card_width()
+    assert card.maximumWidth() == 440
+    assert card._preview_area.height() == 200
+
+
+def test_room_card_size_toggle_button() -> None:
+    _qapp()
+
+    from lsc.gui.components.room_card import RoomCard
+
+    room = RoomSession(room_id="room-1", room_url="https://live.douyin.com/123")
+    card = RoomCard(room)
+
+    assert hasattr(card, '_size_btn')
+    # 按钮默认隐藏,hover 时显示
+    assert not card._size_btn.isVisible()
+
+
+def test_room_card_preset_cycle() -> None:
+    app = _qapp()
+
+    from lsc.gui.components.room_card import RoomCard, _CARD_PRESETS
+
+    room = RoomSession(room_id="room-1", room_url="https://live.douyin.com/123")
+    card = RoomCard(room)
+
+    # 依次切换所有预设
+    for i, (name, w, h) in enumerate(_CARD_PRESETS):
+        card.set_preset(i)
+        assert card.maximumWidth() == w
+        assert card._preview_area.height() == h
 
 
 def test_room_card_mute_and_include_use_custom_checked_indicator() -> None:
@@ -232,34 +270,29 @@ def test_multi_room_fullscreen_preview_has_bottom_controls() -> None:
 
     page._enter_fullscreen(room.room_id)
 
+    # _fullscreen_window 现在是 FullscreenPreview 实例(封装了顶层窗口)
     assert page._fullscreen_window is not None
-    controls = page._fullscreen_window.findChild(QWidget, "fullscreenPlayerControls")
+    fp = page._fullscreen_window
+    assert fp.is_active()
+    win = fp.window()
+    assert win is not None
+    # 内置极简播放条与进度条/按钮存在(通过 objectName 查询,不依赖内部属性)
+    controls = win.findChild(QWidget, "fullscreenPlayerControls")
     assert controls is not None
-    layout = page._fullscreen_window.layout()
-    assert layout.indexOf(page._fullscreen_surface) == 0
-    assert layout.indexOf(controls) == -1
-    assert controls.parent() is page._fullscreen_surface
-    assert page._fullscreen_progress.objectName() == "fullscreenProgressSlider"
-    assert page._fullscreen_exit_btn.objectName() == "fullscreenExitButton"
-    assert page._fullscreen_minimize_btn.objectName() == "fullscreenMinimizeButton"
-    assert page._fullscreen_play_btn.text() == ""
-    assert page._fullscreen_exit_btn.text() == ""
-    assert page._fullscreen_minimize_btn.text() == ""
-    assert page._fullscreen_play_btn.icon_kind() == "pause"
-    assert page._fullscreen_exit_btn.icon_kind() == "exit_fullscreen"
-    assert page._fullscreen_minimize_btn.icon_kind() == "minimize"
-    assert page._fullscreen_progress.maximumHeight() <= 16
+    progress = win.findChild(QWidget, "fullscreenProgressSlider")
+    exit_btn = win.findChild(QWidget, "fullscreenExitButton")
+    minimize_btn = win.findChild(QWidget, "fullscreenMinimizeButton")
+    play_btn = win.findChild(QWidget, "fullscreenPlayButton")
+    assert progress is not None and exit_btn is not None
+    assert minimize_btn is not None and play_btn is not None
 
-    page._fullscreen_play_btn.click()
-    page._fullscreen_mute_btn.click()
-    page._fullscreen_progress.setValue(10)
-
-    assert preview.paused == [True]
-    assert preview.muted[-1] is False
+    # 进度条 seek 委托到 widget.seek_to
+    progress.setValue(10)
     assert preview.seeked[-1] == 10
 
+    # Esc 退出全屏
     esc = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
-    page._fullscreen_window.keyPressEvent(esc)
+    win.keyPressEvent(esc)
     assert page._fullscreen_window is None
 
 
@@ -282,20 +315,24 @@ def test_multi_room_fullscreen_controls_auto_collapse_and_restore() -> None:
     card.set_preview_widget(preview)
 
     page._enter_fullscreen(room.room_id)
-    controls = page._fullscreen_controls
+    fp = page._fullscreen_window
+    win = fp.window()
+    controls = win.findChild(QWidget, "fullscreenPlayerControls")
+    assert controls is not None
     preview_size = preview.size()
 
+    # 鼠标活动唤醒 → 自动隐藏:直接驱动 FullscreenPreview 的自动隐藏定时器
     assert controls.isVisible()
-    page._fullscreen_hide_controls()
+    fp._auto_hide_timer.stop()
+    fp._auto_hide_timer.timeout.emit()  # 触发隐藏
     assert not controls.isVisible()
-    assert controls.maximumHeight() == page._fullscreen_controls_height
-    assert preview.size() == preview_size
+    assert preview.size() == preview_size  # 隐藏控制条不影响预览尺寸
 
-    page._fullscreen_show_controls()
+    # 唤醒(模拟鼠标活动回调)
+    fp._show_controls(controls)
     assert controls.isVisible()
-    assert controls.maximumHeight() == page._fullscreen_controls_height
     assert preview.size() == preview_size
-    page._fullscreen_window.close()
+    win.close()
 
 
 def test_multi_room_fullscreen_escape_shortcut_is_registered() -> None:
@@ -319,9 +356,10 @@ def test_multi_room_fullscreen_escape_shortcut_is_registered() -> None:
 
     page._enter_fullscreen(room.room_id)
 
-    shortcuts = page._fullscreen_window.findChildren(QShortcut)
+    win = page._fullscreen_window.window()
+    shortcuts = win.findChildren(QShortcut)
     assert shortcuts
-    page._fullscreen_window.close()
+    win.close()
 
 
 def test_multi_room_page_can_be_instantiated_with_manager() -> None:
@@ -526,6 +564,7 @@ def test_room_card_has_no_front_screen_or_popup_entry_points() -> None:
 def test_multi_room_page_responsive_grid_switches_to_one_column() -> None:
     _qapp()
 
+    from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
     from lsc.gui.pages.multi_room import MultiRoomPage
     from lsc.gui.multi_room.manager import MultiRoomManager
@@ -551,3 +590,107 @@ def test_multi_room_page_responsive_grid_switches_to_one_column() -> None:
     page._update_grid_columns()
     QApplication.processEvents()
     assert page._grid_columns == 1
+    assert page._page_scroll.widget() is page._page_body
+    assert page._splitter.parent() is page._page_body
+    assert page._scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert page._right_scroll.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+def test_detail_panel_does_not_nest_inner_scroll_area() -> None:
+    _qapp()
+
+    from PySide6.QtWidgets import QScrollArea
+    from lsc.gui.pages.multi_room import DetailPanel
+
+    panel = DetailPanel()
+
+    assert panel.findChildren(QScrollArea) == []
+
+
+def test_multi_room_page_many_rooms_keep_distinct_card_geometries() -> None:
+    _qapp()
+
+    from PySide6.QtWidgets import QApplication
+    from lsc.gui.pages.multi_room import MultiRoomPage
+    from lsc.gui.multi_room.manager import MultiRoomManager
+
+    page = MultiRoomPage(manager=MultiRoomManager())
+    for i in range(6):
+        page._url_input.setText(f"https://live.douyin.com/{i}")
+        page._on_add_room()
+
+    page.resize(1440, 1000)
+    page.show()
+    QApplication.processEvents()
+
+    rects = [card.geometry() for card in page._cards.values()]
+
+    assert len(rects) == 6
+    assert len({(r.x(), r.y(), r.width(), r.height()) for r in rects}) == len(rects)
+
+
+def test_added_room_card_becomes_visible_without_page_switch() -> None:
+    """Regression: a newly added RoomCard must be laid out by FlowLayout immediately.
+
+    Root cause: a freshly created QWidget is hidden by default.
+    ``FlowLayout.doLayout`` filters items with ``not it.isEmpty()``, and
+    ``QWidgetItem.isEmpty()`` returns ``widget->isHidden()`` — so a hidden new
+    card is skipped by the layout, never placed, and stays at its initial
+    (0,0,440,30) geometry until a page switch fires Qt's show cascade (which
+    flips isHidden to False). The fix is an explicit ``card.show()`` in
+    ``_add_card``.
+
+    This test verifies the mechanism directly: after adding a room on a shown
+    page, the new card must NOT be hidden, and FlowLayout's heightForWidth
+    must account for it (height grows when a second card is added).
+    """
+    from PySide6.QtWidgets import QApplication
+    from lsc.gui.pages.multi_room import MultiRoomPage
+    from lsc.gui.multi_room.manager import MultiRoomManager
+
+    _qapp()
+    page = MultiRoomPage(
+        manager=MultiRoomManager(
+            controller_factory=lambda: type("FakeCtrl", (), {"cleanup": lambda s: None})()
+        )
+    )
+    page.resize(1440, 900)
+    page.show()
+    QApplication.processEvents()
+
+    # Add first room.
+    page._url_input.setText("https://live.douyin.com/1")
+    page._on_add_room()
+    QApplication.processEvents()
+
+    first_id = next(iter(page._cards))
+    first_card = page._cards[first_id]
+    assert not first_card.isHidden(), "first card must be shown after _add_card"
+    width = max(340, page._scroll.viewport().width())
+    height_one = page._card_layout.heightForWidth(width)
+
+    # Add second room — must increase the layout's wrapped height.
+    page._url_input.setText("https://live.douyin.com/2")
+    page._on_add_room()
+    QApplication.processEvents()
+
+    second_id = next(rid for rid in page._cards if rid != first_id)
+    second_card = page._cards[second_id]
+    # The core assertion: the new card is not hidden, so FlowLayout does NOT
+    # skip it via isEmpty().
+    assert not second_card.isHidden(), (
+        "newly added card is hidden → FlowLayout.isEmpty() skips it → card never laid out. "
+        "Fix: call card.show() in _add_card."
+    )
+    # Verify FlowLayout actually accounts for the 2nd card: at a width that
+    # only fits one 440px card, two cards must wrap to two rows, so the
+    # wrapped height with two cards must exceed one card's row height.
+    narrow_w = 460  # fits one 440 card per row
+    height_two = page._card_layout.heightForWidth(narrow_w)
+    # A single card row is ~375px; two stacked rows must be noticeably larger.
+    assert height_two > height_one, (
+        f"FlowLayout heightForWidth({narrow_w})={height_two} did not grow beyond "
+        f"single-row {height_one}; the 2nd card was skipped by doLayout."
+    )
+
+

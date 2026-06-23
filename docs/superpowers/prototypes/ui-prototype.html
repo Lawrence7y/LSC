@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSC 多人切片 - UI 原型</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg-primary:#0c0e12;--bg-secondary:#14161c;--bg-tertiary:#1c1f28;--bg-elevated:#242733;
+  --text-primary:#f0f1f5;--text-secondary:#9aa0b0;--text-tertiary:#5c6270;
+  --border-subtle:rgba(255,255,255,0.06);--border-default:rgba(255,255,255,0.10);--border-strong:rgba(255,255,255,0.15);
+  --accent:#ff8c42;--accent-dim:rgba(255,140,66,0.15);--accent-glow:rgba(255,140,66,0.35);
+  --success:#3dd598;--success-dim:rgba(61,213,152,0.12);
+  --warning:#ffc542;--warning-dim:rgba(255,197,66,0.12);
+  --error:#ff6b6b;--error-dim:rgba(255,107,107,0.12);
+  --shadow-sm:0 1px 3px rgba(0,0,0,0.3);
+  --shadow-md:0 4px 12px rgba(0,0,0,0.4);
+  --shadow-lg:0 8px 30px rgba(0,0,0,0.5);
+  --shadow-glow:0 0 20px var(--accent-glow);
+  --sidebar-w:200px;--font-mono:'JetBrains Mono','Cascadia Code','Consolas',monospace;
+  --font-sans:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
+  --radius:8px;--radius-lg:10px;--radius-xl:12px;
+  --transition:all 0.2s cubic-bezier(0.16,1,0.3,1);
+}
+html{transition:background 0.4s ease}
+body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);height:100vh;overflow:hidden;display:flex;transition:background 0.4s ease,color 0.3s ease}
+
+/* Light theme */
+body.light{
+  --bg-primary:#f5f6f8;--bg-secondary:#ffffff;--bg-tertiary:#eef0f4;--bg-elevated:#ffffff;
+  --text-primary:#1a1d26;--text-secondary:#5c6270;--text-tertiary:#9aa0b0;
+  --border-subtle:rgba(0,0,0,0.06);--border-default:rgba(0,0,0,0.10);--border-strong:rgba(0,0,0,0.15);
+  --accent:#e6722f;--accent-dim:rgba(230,114,47,0.12);--accent-glow:rgba(230,114,47,0.25);
+  --success:#2cb980;--success-dim:rgba(44,185,128,0.12);
+  --warning:#e5a830;--warning-dim:rgba(229,168,48,0.12);
+  --error:#e05050;--error-dim:rgba(224,80,80,0.12);
+  --shadow-sm:0 1px 3px rgba(0,0,0,0.08);
+  --shadow-md:0 4px 12px rgba(0,0,0,0.1);
+  --shadow-lg:0 8px 30px rgba(0,0,0,0.12);
+  --shadow-glow:0 0 20px rgba(230,114,47,0.15);
+}
+body.light .sidebar{background:#f0f1f4;border-right-color:rgba(0,0,0,0.08)}
+body.light .sidebar-logo{color:#e6722f;border-bottom-color:rgba(0,0,0,0.06)}
+body.light .nav-btn{color:#5c6270}.body-light .nav-btn:hover{background:rgba(0,0,0,0.04);color:#1a1d26}
+body.light .nav-btn.active{background:rgba(230,114,47,0.1);color:#e6722f;border-color:#e6722f}
+body.light .theme-btn{border-color:#e6722f;color:#5c6270}
+body.light .theme-btn.active{background:rgba(230,114,47,0.1);color:#e6722f}
+body.light .sidebar-bottom{border-top-color:rgba(0,0,0,0.06)}
+body.light .topbar{background:#fff;border-bottom-color:rgba(0,0,0,0.06)}
+body.light .detail-panel{background:#fff;border-left-color:rgba(0,0,0,0.06)}
+body.light .room-card{background:#fff;border-color:rgba(0,0,0,0.08)}
+body.light .room-card:hover{border-color:rgba(0,0,0,0.15)}
+body.light .room-card.selected{box-shadow:0 0 0 1.5px #e6722f,0 2px 12px rgba(230,114,47,0.12)}
+body.light .card-header{border-bottom-color:rgba(0,0,0,0.05)}
+body.light .card-status{border-bottom-color:rgba(0,0,0,0.05)}
+body.light .card-controls{border-top-color:rgba(0,0,0,0.05)}
+body.light .control-bar-wrap{background:#fff;border-top-color:rgba(0,0,0,0.06)}
+body.light .timeline-container{background:#eef0f4;border-color:rgba(0,0,0,0.08)}
+body.light .statusbar{background:#fff;border-top-color:rgba(0,0,0,0.06)}
+body.light .settings-card{background:#fff;border-color:rgba(0,0,0,0.08)}
+body.light .modal{background:#fff;border-color:rgba(0,0,0,0.1)}
+body.light .toast{background:#fff;border-color:rgba(0,0,0,0.1);box-shadow:0 4px 16px rgba(0,0,0,0.1)}
+body.light .input-field{background:#f5f6f8;border-color:rgba(0,0,0,0.1)}
+body.light .input-field:focus{border-color:#e6722f}
+body.light .detail-row{border-bottom-color:rgba(0,0,0,0.05)}
+body.light .stat-card{background:#fff;border-color:rgba(0,0,0,0.06)}
+body.light .stat-card:hover{border-color:rgba(0,0,0,0.12)}
+body.light .history-table th{border-bottom-color:rgba(0,0,0,0.06)}
+body.light .history-table td{border-bottom-color:rgba(0,0,0,0.04)}
+body.light .history-table tr:hover td{background:rgba(0,0,0,0.02)}
+body.light .ctrl-icon-btn{border-color:rgba(0,0,0,0.1);color:#5c6270}
+body.light .ctrl-icon-btn:hover{border-color:#e6722f;color:#e6722f;background:rgba(230,114,47,0.08)}
+body.light .ctrl-play{border-color:#e6722f;color:#e6722f}
+body.light .ctrl-play:hover{background:#e6722f;color:#fff}
+body.light .mark-in{border-color:#2cb980;color:#2cb980}
+body.light .mark-in:hover,.body-light .mark-in.active{background:#2cb980;color:#fff}
+body.light .mark-out{border-color:#e05050;color:#e05050}
+body.light .mark-out:hover,.body-light .mark-out.active{background:#e05050;color:#fff}
+body.light .export-btn{border-color:#e6722f;background:rgba(230,114,47,0.08);color:#e6722f}
+body.light .export-btn:hover{background:#e6722f;color:#fff}
+body.light .timeline-handle{background:#e6722f;border-color:#fff}
+body.light .timeline-cursor{background:#1a1d26}
+body.light .timeline-cursor-dot{background:#1a1d26}
+body.light .timeline-cursor-label{background:#fff;border-color:rgba(0,0,0,0.1);color:#1a1d26}
+body.light .platform-tag.douyin{background:#1a1a1a}
+body.light .platform-tag.huya{background:#FF9500}
+body.light .modal-header{border-bottom-color:rgba(0,0,0,0.06)}
+body.light .modal-footer{border-top-color:rgba(0,0,0,0.06)}
+
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border-default);border-radius:3px}::-webkit-scrollbar-thumb:hover{background:var(--text-tertiary)}
+
+/* ===== Sidebar ===== */
+.sidebar{width:var(--sidebar-w);background:var(--bg-secondary);display:flex;flex-direction:column;flex-shrink:0;user-select:none;border-right:1px solid var(--border-subtle);transition:background 0.4s ease,border-color 0.3s ease}
+.sidebar-logo{padding:20px 16px;font-size:15px;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border-subtle);letter-spacing:0.5px;display:flex;align-items:center;gap:8px;transition:color 0.3s ease}
+.sidebar-logo svg{width:20px;height:20px}
+.sidebar-nav{flex:1;padding:12px 10px;display:flex;flex-direction:column;gap:4px}
+.nav-btn{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:var(--radius);border:1.5px solid transparent;background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer;transition:var(--transition);width:100%;text-align:left;font-family:inherit}
+.nav-btn:hover{background:var(--bg-tertiary);color:var(--text-primary)}
+.nav-btn.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}
+.nav-btn .icon{width:20px;height:18px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.nav-btn .icon svg{width:18px;height:18px}
+.sidebar-bottom{padding:10px;border-top:1px solid var(--border-subtle);transition:border-color 0.3s ease}
+.theme-btn{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:var(--radius);border:1.5px solid var(--accent);background:transparent;color:var(--text-secondary);font-size:13px;cursor:pointer;width:100%;transition:var(--transition);font-family:inherit}
+.theme-btn:hover{background:var(--bg-tertiary);color:var(--text-primary)}
+.theme-btn.active{background:var(--accent-dim);color:var(--accent)}
+.theme-btn .icon{width:20px;height:18px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.theme-btn .icon svg{width:18px;height:18px}
+
+/* ===== Main ===== */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+
+/* ===== Topbar ===== */
+.topbar{height:52px;background:var(--bg-secondary);border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;padding:0 20px;gap:8px;flex-shrink:0;transition:background 0.4s ease,border-color 0.3s ease}
+.topbar-title{font-size:15px;font-weight:600;margin-right:auto;letter-spacing:-0.01em}
+
+/* ===== Buttons ===== */
+.btn{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;border-radius:6px;border:1.5px solid var(--accent);background:transparent;color:var(--accent);font-size:12px;cursor:pointer;transition:var(--transition);font-family:inherit;white-space:nowrap;font-weight:500}
+.btn:hover{background:var(--accent-dim);transform:translateY(-1px);box-shadow:var(--shadow-sm)}
+.btn:active{transform:translateY(0) scale(0.98)}
+.btn.primary{background:var(--accent);color:#fff}.btn.primary:hover{filter:brightness(1.1);box-shadow:var(--shadow-glow)}
+.btn.danger{border-color:var(--error);color:var(--error)}.btn.danger:hover{background:var(--error-dim)}
+.btn.success{border-color:var(--success);color:var(--success)}.btn.success:hover{background:var(--success-dim)}
+.btn.sm{padding:4px 10px;font-size:11px;gap:4px}.btn.sm svg{width:11px;height:11px}
+.btn.icon-only{padding:6px;border:1.5px solid var(--border-default);color:var(--text-secondary)}
+.btn.icon-only:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim)}
+
+/* ===== Pages ===== */
+.page{display:none;flex:1;overflow:hidden}.page.active{display:flex;flex-direction:column}
+
+/* ===== Dashboard ===== */
+.dash-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;padding:20px}
+.stat-card{background:var(--bg-secondary);border:1px solid var(--border-subtle);border-radius:var(--radius-lg);padding:18px 20px;transition:var(--transition);position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent);opacity:0;transition:opacity 0.3s ease}
+.stat-card:hover{border-color:var(--border-default);transform:translateY(-2px);box-shadow:var(--shadow-md)}
+.stat-card:hover::before{opacity:1}
+.stat-card .stat-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:12px}
+.stat-card .stat-value{font-size:28px;font-weight:700;letter-spacing:-0.02em;margin-bottom:4px}
+.stat-card .stat-label{font-size:12px;color:var(--text-secondary)}
+.dash-section{padding:0 20px 20px}
+.dash-section h3{font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text-primary)}
+.history-table{width:100%;border-collapse:collapse}
+.history-table th{text-align:left;padding:8px 12px;font-size:10px;font-weight:600;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.06em;border-bottom:1px solid var(--border-subtle)}
+.history-table td{padding:8px 12px;font-size:12px;color:var(--text-secondary);border-bottom:1px solid var(--border-subtle);transition:background 0.15s ease}
+.history-table tr{transition:background 0.15s ease}
+.history-table tr:hover td{background:var(--bg-tertiary)}
+.badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:11px;font-size:10px;font-weight:600}
+.badge.success{background:var(--success-dim);color:var(--success)}.badge.error{background:var(--error-dim);color:var(--error)}.badge.warning{background:var(--warning-dim);color:var(--warning)}.badge.info{background:var(--accent-dim);color:var(--accent)}
+
+/* ===== Workbench ===== */
+.workbench{flex:1;display:flex;overflow:hidden}
+.card-grid{flex:1;padding:14px;overflow-y:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px;align-content:start}
+.detail-panel{width:260px;background:var(--bg-secondary);border-left:1px solid var(--border-subtle);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden;transition:background 0.4s ease,border-color 0.3s ease}
+.detail-header{padding:14px 16px;border-bottom:1px solid var(--border-subtle);font-size:13px;font-weight:600}
+.detail-body{flex:1;overflow-y:auto;padding:12px 16px}
+.detail-row{display:flex;justify-content:space-between;padding:5px 0;font-size:12px;border-bottom:1px solid var(--border-subtle);transition:border-color 0.3s ease}
+.detail-row .label{color:var(--text-tertiary)}.detail-row .value{color:var(--text-secondary);font-weight:500;text-align:right;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ===== Room Card ===== */
+.room-card{background:var(--bg-secondary);border-radius:var(--radius-lg);border:1.5px solid var(--border-subtle);overflow:hidden;transition:var(--transition);cursor:pointer;position:relative}
+.room-card:hover{border-color:var(--border-default);transform:translateY(-2px);box-shadow:var(--shadow-md)}
+.room-card.selected{border-color:var(--accent);box-shadow:0 0 0 1.5px var(--accent),0 4px 20px var(--accent-glow)}
+.room-card.selected::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent);z-index:1}
+.card-header{padding:8px 12px;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border-subtle);transition:border-color 0.3s ease}
+.platform-tag{padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;color:#fff;flex-shrink:0;display:inline-flex;align-items:center;gap:4px}
+.platform-tag svg{width:12px;height:12px;flex-shrink:0}
+.platform-tag.douyin{background:#1A1A1A}.platform-tag.bilibili{background:#00A1D6}.platform-tag.huya{background:#FF9500}.platform-tag.custom{background:#555}
+.card-title{font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:var(--text-secondary)}
+.card-remove{width:22px;height:22px;border:none;background:transparent;color:var(--text-tertiary);cursor:pointer;border-radius:4px;display:flex;align-items:center;justify-content:center;transition:var(--transition);flex-shrink:0}
+.card-remove:hover{background:var(--error-dim);color:var(--error);transform:scale(1.1)}
+.preview-area{height:130px;background:#0a0a0a;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.preview-placeholder{color:var(--text-tertiary);font-size:12px;text-align:center}
+.preview-placeholder .icon{font-size:28px;display:block;margin-bottom:4px;opacity:0.5}
+.preview-live{position:absolute;top:6px;left:6px;background:var(--error);color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+@keyframes fadeInUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes scaleIn{from{opacity:0;transform:scale(0.95)}to{opacity:1;transform:scale(1)}}
+.preview-mute-badge{position:absolute;top:6px;right:6px;background:rgba(0,0,0,0.7);color:#fff;padding:2px 5px;border-radius:3px;font-size:10px;backdrop-filter:blur(4px)}
+.recording-badge{position:absolute;bottom:6px;left:6px;background:rgba(229,57,53,0.9);color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;display:flex;align-items:center;gap:3px;backdrop-filter:blur(4px)}
+.recording-badge .rec-dot{width:5px;height:5px;background:#fff;border-radius:50%;animation:pulse 1s infinite}
+.card-status{padding:6px 12px;display:flex;align-items:center;gap:5px;font-size:11px;border-bottom:1px solid var(--border-subtle);transition:border-color 0.3s ease}
+.status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:background 0.3s ease}
+.status-dot.idle{background:var(--text-tertiary)}.status-dot.connected{background:var(--success)}.status-dot.recording{background:var(--error);animation:pulse 1.5s infinite}.status-dot.error{background:var(--error)}
+.status-text{color:var(--text-tertiary)}
+.preview-controls{display:flex;align-items:center;gap:3px;padding:6px 12px;flex-wrap:wrap}
+.card-controls{padding:8px 12px;display:flex;align-items:center;gap:4px;flex-wrap:wrap;border-top:1px solid var(--border-subtle);transition:border-color 0.3s ease}
+.cut-checkbox{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-tertiary);margin-left:auto;cursor:pointer;transition:color 0.15s ease}
+.cut-checkbox:hover{color:var(--text-secondary)}
+.cut-checkbox input{accent-color:var(--accent)}
+
+/* ===== Control Bar ===== */
+.control-bar-wrap{background:var(--bg-secondary);border-top:1px solid var(--border-subtle);padding:10px 16px 12px;flex-shrink:0;transition:background 0.4s ease,border-color 0.3s ease}
+.timeline-container{position:relative;height:64px;background:var(--bg-tertiary);border-radius:var(--radius);border:1px solid var(--border-subtle);overflow:hidden;cursor:crosshair;margin-bottom:10px;user-select:none;transition:background 0.4s ease,border-color 0.3s ease}
+.timeline-container:hover{border-color:var(--border-default)}
+.timeline-track{position:absolute;top:50%;left:40px;right:40px;height:3px;background:var(--border-default);transform:translateY(-50%);border-radius:2px}
+.timeline-progress{position:absolute;top:50%;left:40px;height:3px;background:linear-gradient(90deg,var(--accent),#ff5e3a);transform:translateY(-50%);border-radius:2px;pointer-events:none;transition:width 0.1s linear}
+.timeline-selection{position:absolute;top:50%;height:24px;background:var(--accent-dim);border:1.5px solid var(--accent);border-radius:5px;transform:translateY(-50%);pointer-events:none;z-index:2;transition:left 0.05s,width 0.05s}
+.timeline-handle{position:absolute;top:50%;width:12px;height:32px;background:var(--accent);border-radius:4px;transform:translate(-50%,-50%);cursor:ew-resize;z-index:3;border:2px solid var(--bg-primary);transition:left 0.05s,transform 0.15s ease,box-shadow 0.15s ease}
+.timeline-handle:hover{transform:translate(-50%,-50%) scaleY(1.15);box-shadow:0 0 10px var(--accent-glow)}
+.timeline-handle.dragging{transform:translate(-50%,-50%) scaleY(1.2);box-shadow:0 0 16px var(--accent-glow)}
+.timeline-cursor{position:absolute;top:0;bottom:0;width:2px;background:var(--text-primary);transform:translateX(-50%);pointer-events:none;z-index:4;transition:left 0.1s linear}
+.timeline-cursor-dot{position:absolute;top:50%;width:10px;height:10px;background:var(--text-primary);border-radius:50%;transform:translate(-50%,-50%);z-index:5;pointer-events:none;transition:left 0.1s linear,transform 0.15s ease}
+.timeline-container:hover .timeline-cursor-dot{transform:translate(-50%,-50%) scale(1.3)}
+.timeline-cursor-label{position:absolute;top:2px;padding:2px 8px;background:var(--bg-elevated);border:1px solid var(--border-default);border-radius:4px;font-family:var(--font-mono);font-size:10px;font-weight:500;color:var(--text-primary);transform:translateX(-50%);z-index:6;white-space:nowrap;pointer-events:none;transition:left 0.1s linear,opacity 0.15s ease;box-shadow:var(--shadow-sm)}
+.timeline-ticks{position:absolute;bottom:2px;left:40px;right:40px;height:14px;pointer-events:none}
+.timeline-tick{position:absolute;bottom:0;font-family:var(--font-mono);font-size:8px;color:var(--text-tertiary);transform:translateX(-50%)}
+.timeline-tick::before{content:'';position:absolute;bottom:12px;left:50%;width:1px;height:4px;background:var(--border-default);transform:translateX(-50%)}
+.timeline-room-label{position:absolute;top:4px;left:8px;font-size:10px;color:var(--text-tertiary);font-weight:500;pointer-events:none;z-index:7}
+.timeline-bubble{position:absolute;top:50%;padding:3px 10px;background:var(--accent);color:#fff;border-radius:6px;font-family:var(--font-mono);font-size:11px;font-weight:600;transform:translate(-50%,-150%);z-index:8;pointer-events:none;white-space:nowrap;box-shadow:var(--shadow-md);animation:scaleIn 0.15s ease}
+.timeline-bubble::after{content:'';position:absolute;bottom:-4px;left:50%;transform:translateX(-50%);border-left:5px solid transparent;border-right:5px solid transparent;border-top:5px solid var(--accent)}
+.control-row{display:flex;align-items:center;gap:8px}
+.ctrl-icon-btn{width:36px;height:36px;border-radius:var(--radius);border:1.5px solid var(--border-default);background:transparent;color:var(--text-secondary);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:var(--transition)}
+.ctrl-icon-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim);transform:translateY(-1px)}
+.ctrl-icon-btn:active{transform:translateY(0) scale(0.95)}
+.ctrl-icon-btn svg{width:16px;height:16px}
+.ctrl-play{width:40px;height:40px;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent)}
+.ctrl-play:hover{background:var(--accent);color:#fff;box-shadow:var(--shadow-glow)}
+.ctrl-play svg{width:18px;height:18px}
+.time-label{font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text-primary);min-width:150px;text-align:center;letter-spacing:0.02em}
+.mark-btn{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;transition:var(--transition);border:1.5px solid;font-family:inherit}
+.mark-in{border-color:var(--success);color:var(--success);background:transparent}
+.mark-in:hover,.mark-in.active{background:var(--success);color:#fff;box-shadow:0 0 12px rgba(61,213,152,0.3)}
+.mark-out{border-color:var(--error);color:var(--error);background:transparent}
+.mark-out:hover,.mark-out.active{background:var(--error);color:#fff;box-shadow:0 0 12px rgba(255,107,107,0.3)}
+.export-btn{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:var(--transition);border:1.5px solid var(--accent);background:var(--accent-dim);color:var(--accent);font-family:inherit}
+.export-btn:hover{background:var(--accent);color:#fff;box-shadow:var(--shadow-glow)}
+.export-btn:disabled{opacity:0.35;cursor:not-allowed;transform:none!important;box-shadow:none!important}
+
+/* ===== Status Bar ===== */
+.statusbar{height:36px;background:var(--bg-secondary);border-top:1px solid var(--border-subtle);display:flex;align-items:center;padding:0 20px;gap:16px;font-size:11px;color:var(--text-tertiary);flex-shrink:0;transition:background 0.4s ease,border-color 0.3s ease}
+.statusbar .stat{display:flex;align-items:center;gap:4px}
+.statusbar .dot{width:6px;height:6px;border-radius:50%}
+.statusbar .spacer{flex:1}
+.statusbar .error-summary{color:var(--error)}
+
+/* ===== Settings ===== */
+.settings-scroll{flex:1;overflow-y:auto;padding:20px}
+.settings-card{background:var(--bg-secondary);border:1px solid var(--border-subtle);border-radius:var(--radius-lg);padding:20px;margin-bottom:16px;transition:var(--transition)}
+.settings-card:hover{border-color:var(--border-default)}
+.settings-card h3{font-size:14px;font-weight:600;margin-bottom:16px;color:var(--text-primary)}
+.field-label{font-size:12px;color:var(--text-secondary);margin-bottom:6px;font-weight:500}
+.chip-group{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.chip{padding:6px 16px;border-radius:6px;border:1.5px solid var(--accent);background:transparent;color:var(--text-secondary);font-size:12px;cursor:pointer;transition:var(--transition);font-family:inherit;font-weight:500}
+.chip:hover{background:var(--accent-dim);color:var(--accent);transform:translateY(-1px)}
+.chip:active{transform:translateY(0) scale(0.97)}
+.chip.active{background:var(--accent);color:#fff;border-color:var(--accent);box-shadow:0 0 12px var(--accent-glow)}
+.input-field{width:100%;padding:8px 12px;background:var(--bg-tertiary);border:1.5px solid var(--border-default);border-radius:6px;color:var(--text-primary);font-size:13px;outline:none;transition:var(--transition);font-family:inherit}
+.input-field:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+.input-row{display:flex;gap:8px;margin-bottom:12px}
+
+/* ===== Modal ===== */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;opacity:0;visibility:hidden;transition:all 0.25s ease;backdrop-filter:blur(4px)}
+.modal-overlay.show{opacity:1;visibility:visible}
+.modal{background:var(--bg-secondary);border:1px solid var(--border-default);border-radius:var(--radius-xl);width:520px;max-height:80vh;overflow-y:auto;box-shadow:var(--shadow-lg);transform:translateY(20px) scale(0.97);transition:transform 0.25s cubic-bezier(0.16,1,0.3,1)}
+.modal-overlay.show .modal{transform:translateY(0) scale(1)}
+.modal-header{padding:14px 18px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;justify-content:space-between;transition:border-color 0.3s ease}
+.modal-header h2{font-size:15px;font-weight:600}
+.modal-close{width:26px;height:26px;border:none;background:transparent;cursor:pointer;border-radius:6px;color:var(--text-tertiary);display:flex;align-items:center;justify-content:center;transition:var(--transition)}
+.modal-close:hover{background:var(--bg-tertiary);color:var(--text-primary);transform:scale(1.1)}
+.modal-body{padding:18px}
+.modal-footer{padding:12px 18px;border-top:1px solid var(--border-subtle);display:flex;justify-content:flex-end;gap:8px;transition:border-color 0.3s ease}
+
+/* ===== Toast ===== */
+.toast-container{position:fixed;top:16px;right:16px;z-index:2000;display:flex;flex-direction:column;gap:6px}
+.toast{background:var(--bg-elevated);border:1px solid var(--border-default);border-radius:8px;padding:10px 16px;font-size:12px;box-shadow:var(--shadow-md);display:flex;align-items:center;gap:8px;animation:toastIn 0.3s cubic-bezier(0.16,1,0.3,1);max-width:300px;color:var(--text-primary)}
+.toast.success{border-left:3px solid var(--success)}.toast.error{border-left:3px solid var(--error)}.toast.info{border-left:3px solid var(--accent)}
+@keyframes toastIn{from{transform:translateX(120%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+/* ===== Empty ===== */
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:50px 20px;color:var(--text-tertiary);grid-column:1/-1}
+.empty-state .icon{font-size:40px;margin-bottom:8px;opacity:0.3}.empty-state p{font-size:13px}
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-logo">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    LSC 多人切片
+  </div>
+  <div class="sidebar-nav">
+    <button class="nav-btn active" data-page="dashboard" onclick="switchPage('dashboard',this)">
+      <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg></span>
+      仪表盘
+    </button>
+    <button class="nav-btn" data-page="workbench" onclick="switchPage('workbench',this)">
+      <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></span>
+      工作台
+    </button>
+    <button class="nav-btn" data-page="settings" onclick="switchPage('settings',this)">
+      <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></span>
+      设置
+    </button>
+  </div>
+  <div class="sidebar-bottom">
+    <button class="theme-btn active" id="themeBtn" onclick="toggleTheme()">
+      <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></span>
+      <span class="theme-label">深色模式</span>
+    </button>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Dashboard -->
+  <div class="page active" id="page-dashboard">
+    <div class="topbar"><div class="topbar-title">仪表盘</div></div>
+    <div style="flex:1;overflow-y:auto">
+      <div class="dash-grid" id="dashGrid"></div>
+      <div class="dash-section">
+        <h3>最近导出</h3>
+        <table class="history-table"><thead><tr><th>时间</th><th>房间</th><th>片段</th><th>大小</th><th>状态</th></tr></thead><tbody id="historyBody"></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Workbench -->
+  <div class="page" id="page-workbench">
+    <div class="topbar">
+      <div class="topbar-title">多房间工作台</div>
+      <button class="btn primary" onclick="showModal('addRoomModal')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>添加房间</button>
+      <button class="btn success" onclick="batchRecord()"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="7"/></svg>批量录制</button>
+      <button class="btn danger" onclick="batchStop()"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>批量停止</button>
+      <button class="btn" onclick="toggleMuteAll()"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>全部静音</button>
+    </div>
+    <div class="workbench">
+      <div class="card-grid" id="cardGrid"></div>
+      <div class="detail-panel">
+        <div class="detail-header">房间详情</div>
+        <div class="detail-body" id="detailBody"></div>
+      </div>
+    </div>
+    <div class="control-bar-wrap">
+      <div class="timeline-container" id="timelineContainer">
+        <div class="timeline-room-label" id="tlRoomLabel">选择房间查看时间线</div>
+        <div class="timeline-track"></div>
+        <div class="timeline-progress" id="tlProgress" style="width:0"></div>
+        <div class="timeline-selection" id="tlSelection" style="display:none"></div>
+        <div class="timeline-handle" id="tlHandleStart" style="display:none"></div>
+        <div class="timeline-handle" id="tlHandleEnd" style="display:none"></div>
+        <div class="timeline-cursor" id="tlCursor" style="left:40px"></div>
+        <div class="timeline-cursor-dot" id="tlCursorDot" style="left:40px"></div>
+        <div class="timeline-cursor-label" id="tlCursorLabel" style="left:40px">00:00:00</div>
+        <div class="timeline-ticks" id="tlTicks"></div>
+      </div>
+      <div class="control-row">
+        <button class="ctrl-icon-btn" onclick="seekBack()" title="后退 10 秒"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.5 8L7.5 12l5 4"/><path d="M19.5 8l-5 4 5 4"/></svg></button>
+        <button class="ctrl-icon-btn ctrl-play" id="btnPlay" onclick="togglePlay()" title="播放"><svg viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg></button>
+        <button class="ctrl-icon-btn" onclick="seekFwd()" title="前进 10 秒"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11.5 8l5 4-5 4"/><path d="M4.5 8l5 4-5 4"/></svg></button>
+        <div class="time-label" id="timeLabel">00:00:00 / 00:00:00</div>
+        <div style="flex:1"></div>
+        <button class="mark-btn mark-in" id="btnMarkIn" onclick="markIn()">入点</button>
+        <button class="mark-btn mark-out" id="btnMarkOut" onclick="markOut()">出点</button>
+        <button class="export-btn" id="btnExport" onclick="doExport()" disabled>导出</button>
+        <button class="btn sm" id="btnReturnLive" onclick="returnLive()"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>回直播</button>
+        <button class="btn sm" onclick="toggleFullscreen()"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>全屏</button>
+      </div>
+    </div>
+    <div class="statusbar">
+      <div class="stat"><span>房间:</span><strong id="statTotal">0</strong></div>
+      <div class="stat"><span class="dot" style="background:var(--success)"></span><span>已连接:</span><strong id="statConnected">0</strong></div>
+      <div class="stat"><span class="dot" style="background:var(--error)"></span><span>录制中:</span><strong id="statRecording">0</strong></div>
+      <div class="stat"><span class="dot" style="background:var(--accent)"></span><span>预览中:</span><strong id="statPreview">0</strong></div>
+      <span class="spacer"></span>
+      <span class="error-summary" id="errorSummary"></span>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div class="page" id="page-settings">
+    <div class="topbar"><div class="topbar-title">设置</div></div>
+    <div class="settings-scroll">
+      <div class="settings-card">
+        <h3>通用设置</h3>
+        <div class="field-label">默认输出目录</div>
+        <div class="input-row"><input class="input-field" value="C:\Users\Admin\LSC\output"><button class="btn sm" style="flex-shrink:0">浏览</button></div>
+        <div class="field-label">主题</div>
+        <div class="chip-group"><button class="chip" onclick="selectChip(this)">跟随系统</button><button class="chip active" onclick="selectChip(this)">深色</button><button class="chip" onclick="selectChip(this)">浅色</button></div>
+      </div>
+      <div class="settings-card">
+        <h3>录制设置</h3>
+        <div class="field-label">默认编码器</div>
+        <div class="chip-group"><button class="chip active" onclick="selectChip(this)">H.264 NVENC</button><button class="chip" onclick="selectChip(this)">H.264 CPU</button><button class="chip" onclick="selectChip(this)">Copy</button></div>
+        <div class="field-label">默认画质</div>
+        <div class="chip-group"><button class="chip active" onclick="selectChip(this)">原画</button><button class="chip" onclick="selectChip(this)">高清</button><button class="chip" onclick="selectChip(this)">流畅</button></div>
+      </div>
+      <div class="settings-card">
+        <h3>编码参数</h3>
+        <div class="field-label">编码参数模式</div>
+        <div class="chip-group"><button class="chip active" onclick="selectChip(this)">CRF 质量</button><button class="chip" onclick="selectChip(this)">码率限制</button><button class="chip" onclick="selectChip(this)">不限制</button></div>
+        <div class="field-label">CRF 值</div>
+        <div class="input-row"><input class="input-field" value="23" style="width:80px"><span style="font-size:12px;color:var(--text-tertiary);line-height:36px">范围 18–28，越小画质越高</span></div>
+        <div class="field-label">默认码率</div>
+        <div class="input-row"><input class="input-field" value="8000" style="width:120px"><input class="input-field" value="kbps" style="width:80px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="addRoomModal">
+  <div class="modal">
+    <div class="modal-header"><h2>添加直播间</h2><button class="modal-close" onclick="hideModal('addRoomModal')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="modal-body">
+      <div class="field-label">直播间 URL</div>
+      <input class="input-field" id="addRoomUrl" placeholder="粘贴直播间链接..." style="margin-bottom:8px">
+      <div style="font-size:11px;color:var(--text-tertiary)">支持: 抖音、B站、虎牙、通用 m3u8/flv 直链</div>
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="hideModal('addRoomModal')">取消</button><button class="btn primary" onclick="addRoom()">添加</button></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="exportModal">
+  <div class="modal">
+    <div class="modal-header"><h2>导出片段</h2><button class="modal-close" onclick="hideModal('exportModal')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+    <div class="modal-body">
+      <div class="field-label">选择参与导出的房间</div>
+      <div id="exportRoomList" style="border:1px solid var(--border-subtle);border-radius:var(--radius);overflow:hidden;margin-bottom:12px"></div>
+      <div class="field-label">时间段</div>
+      <div style="font-family:var(--font-mono);font-size:13px;color:var(--accent);margin-bottom:4px" id="exportTimeRange">00:00:00 → 00:00:00</div>
+    </div>
+    <div class="modal-footer"><button class="btn" onclick="hideModal('exportModal')">取消</button><button class="btn primary" onclick="executeExport()">开始导出</button></div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+const PI={douyin:'<svg viewBox="0 0 24 24" fill="#fff"><path d="M16.6 5.82s.51.5 0 0A4.28 4.28 0 0 1 15.54 3h-3.09v12.4a2.59 2.59 0 0 1-2.59 2.5c-1.42 0-2.6-1.16-2.6-2.6 0-1.72 1.66-3.01 3.37-2.48V9.66c-3.45-.46-6.43 2.22-6.43 5.64 0 3.33 2.76 5.7 5.69 5.7 3.14 0 5.69-2.55 5.69-5.7V9.01a7.35 7.35 0 0 0 4.3 1.38V7.3s-1.88.09-3.24-1.48z"/></svg>',bilibili:'<svg viewBox="0 0 24 24" fill="#fff"><path d="M17.813 4.653h.854c1.51.054 2.769.578 3.773 1.574 1.004.995 1.524 2.249 1.56 3.76v7.36c-.036 1.51-.556 2.769-1.56 3.773s-2.262 1.524-3.773 1.56H5.333c-1.51-.036-2.769-.556-3.773-1.56S.036 18.858 0 17.347v-7.36c.036-1.511.556-2.765 1.56-3.76 1.004-.996 2.262-1.52 3.773-1.574h.774l-1.174-1.12a1.234 1.234 0 0 1-.373-.906c0-.356.124-.658.373-.907l.027-.027c.267-.249.573-.373.92-.373.347 0 .653.124.92.373L9.653 4.44c.071.071.134.142.187.213h4.267a.836.836 0 0 1 .16-.213l2.853-2.747c.267-.249.573-.373.92-.373.347 0 .662.151.929.4.267.249.391.551.391.907 0 .355-.124.657-.373.906zM5.333 7.24c-.746.018-1.373.276-1.88.773-.506.498-.769 1.13-.786 1.894v7.52c.017.764.28 1.395.786 1.893.507.498 1.134.756 1.88.773h13.334c.746-.017 1.373-.275 1.88-.773.506-.498.769-1.129.786-1.893v-7.52c-.017-.765-.28-1.396-.786-1.894-.507-.497-1.134-.755-1.88-.773H5.333zm4 5.427a1.334 1.334 0 1 1 0-2.668 1.334 1.334 0 0 1 0 2.668zm5.334 0a1.334 1.334 0 1 1 0-2.668 1.334 1.334 0 0 1 0 2.668z"/></svg>',huya:'<svg viewBox="0 0 24 24" fill="#fff"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 5h2v6h-2zm0 8h2v2h-2z"/></svg>',custom:'<svg viewBox="0 0 24 24" fill="#fff"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>'};
+const PLATFORMS=[{key:'douyin',name:'抖音'},{key:'bilibili',name:'B站'},{key:'huya',name:'虎牙'},{key:'custom',name:'直链'}];
+
+let rooms=[],selectedRoomId=null,nextId=1,isPlaying=false,isDark=true;
+let markInTime=null,markOutTime=null,cursorTime=0,totalDuration=3600;
+let tlDragging=null,tlDragStartX=0,tlDragStartIn=0,tlDragStartOut=0;
+
+function createRoom(url){
+  const p=PLATFORMS[Math.floor(Math.random()*3)];
+  const names=[['小明同学','深夜聊天室'],['游戏大神','王者荣耀冲分'],['美食达人','探店美食'],['音乐现场','吉他弹唱'],['户外探险','徒步旅行'],['技术分享','编程教学']];
+  const n=names[(nextId-1)%names.length];
+  return{id:'room_'+nextId++,url:url||'',platform:p.key,platformName:p.name,streamer:n[0],title:n[1],connected:false,previewEnabled:false,previewPaused:false,previewMuted:true,recording:false,includeInCut:true,error:'',output:'',recordStart:null,duration:Math.floor(2400+Math.random()*3600),position:0};
+}
+
+function addRoom(){const url=document.getElementById('addRoomUrl').value.trim();rooms.push(createRoom(url));document.getElementById('addRoomUrl').value='';hideModal('addRoomModal');toast('房间已添加','success');render()}
+function removeRoom(id){const r=rooms.find(x=>x.id===id);if(r?.recording){toast('请先停止录制','error');return}rooms=rooms.filter(x=>x.id!==id);if(selectedRoomId===id)selectedRoomId=null;toast('房间已移除','info');render()}
+function selectRoom(id){selectedRoomId=id;render()}
+function connectRoom(id){const r=rooms.find(x=>x.id===id);if(!r)return;r.connected=true;r.error='';toast(r.streamer+' 已连接','success');render()}
+function disconnectRoom(id){const r=rooms.find(x=>x.id===id);if(!r||r.recording)return;r.connected=false;r.previewEnabled=false;r.previewPaused=false;render()}
+function startPreview(id){const r=rooms.find(x=>x.id===id);if(!r||!r.connected)return;r.previewEnabled=true;r.previewPaused=false;render()}
+function pausePreview(id){const r=rooms.find(x=>x.id===id);if(!r)return;r.previewPaused=true;render()}
+function resumePreview(id){const r=rooms.find(x=>x.id===id);if(!r)return;r.previewPaused=false;render()}
+function toggleMute(id){const r=rooms.find(x=>x.id===id);if(r){r.previewMuted=!r.previewMuted;render()}}
+function startRecord(id){const r=rooms.find(x=>x.id===id);if(!r||!r.connected)return;r.recording=true;r.recordStart=new Date().toLocaleTimeString();r.output='output/'+r.platform+'_'+Date.now()+'.mp4';toast(r.streamer+' 开始录制','success');render()}
+function stopRecord(id){const r=rooms.find(x=>x.id===id);if(!r)return;r.recording=false;toast(r.streamer+' 停止录制','info');render()}
+function toggleInclude(id,c){const r=rooms.find(x=>x.id===id);if(r)r.includeInCut=c}
+function batchRecord(){const t=rooms.filter(r=>r.connected&&!r.recording);if(!t.length){toast('没有可录制的房间','error');return}t.forEach(r=>{r.recording=true;r.recordStart=new Date().toLocaleTimeString();r.output='output/'+r.platform+'_'+Date.now()+'.mp4'});toast(t.length+' 个房间开始录制','success');render()}
+function batchStop(){const t=rooms.filter(r=>r.recording);if(!t.length){toast('没有正在录制的房间','error');return}t.forEach(r=>{r.recording=false});toast(t.length+' 个房间停止录制','info');render()}
+function toggleMuteAll(){const all=rooms.every(r=>r.previewMuted);rooms.forEach(r=>{r.previewMuted=!all});toast(all?'已取消全部静音':'已全部静音','info');render()}
+
+function switchPage(name,btn){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.getElementById('page-'+name).classList.add('active');document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active')}
+
+function toggleTheme(){
+  isDark=!isDark;
+  document.body.classList.toggle('light',!isDark);
+  const btn=document.getElementById('themeBtn');
+  btn.classList.toggle('active',isDark);
+  btn.querySelector('.theme-label').textContent=isDark?'深色模式':'浅色模式';
+  btn.querySelector('.icon').innerHTML=isDark?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>':'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>';
+}
+function selectChip(el){el.parentElement.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));el.classList.add('active')}
+function showModal(id){document.getElementById(id).classList.add('show')}
+function hideModal(id){document.getElementById(id).classList.remove('show')}
+
+function toast(msg,type){const c=document.getElementById('toastContainer'),t=document.createElement('div');t.className='toast '+(type||'info');t.textContent=msg;c.appendChild(t);setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity 0.3s';setTimeout(()=>t.remove(),300)},3000)}
+
+function fmtTime(s){if(s<0)s=0;const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=Math.floor(s%60);return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0')}
+
+// ===== Timeline =====
+let bubbleEl=null;
+function showBubble(x,text){
+  if(!bubbleEl){bubbleEl=document.createElement('div');bubbleEl.className='timeline-bubble';document.getElementById('timelineContainer').appendChild(bubbleEl)}
+  bubbleEl.style.left=x+'px';bubbleEl.textContent=text;bubbleEl.style.display='block';
+}
+function hideBubble(){if(bubbleEl)bubbleEl.style.display='none'}
+
+function renderTimeline(){
+  const r=rooms.find(x=>x.id===selectedRoomId);
+  const tc=document.getElementById('timelineContainer');
+  const trackL=40,trackR=tc.clientWidth-40,trackW=trackR-trackL;
+  if(!r){document.getElementById('tlRoomLabel').textContent='选择房间查看时间线';document.getElementById('tlProgress').style.width='0';document.getElementById('tlSelection').style.display='none';document.getElementById('tlHandleStart').style.display='none';document.getElementById('tlHandleEnd').style.display='none';document.getElementById('tlCursor').style.left=trackL+'px';document.getElementById('tlCursorDot').style.left=trackL+'px';document.getElementById('tlCursorLabel').style.left=trackL+'px';document.getElementById('tlCursorLabel').textContent='00:00:00';document.getElementById('timeLabel').textContent='00:00:00 / 00:00:00';renderTicks(0,0);return}
+  document.getElementById('tlRoomLabel').textContent=r.streamer+' - '+r.title;
+  totalDuration=r.duration;
+  const pct=r.position/Math.max(1,totalDuration);
+  const cx=trackL+pct*trackW;
+  document.getElementById('tlProgress').style.width=Math.max(0,pct*trackW)+'px';
+  document.getElementById('tlCursor').style.left=cx+'px';
+  document.getElementById('tlCursorDot').style.left=cx+'px';
+  document.getElementById('tlCursorLabel').style.left=cx+'px';
+  document.getElementById('tlCursorLabel').textContent=fmtTime(r.position);
+  document.getElementById('timeLabel').textContent=fmtTime(r.position)+' / '+fmtTime(r.duration);
+  if(markInTime!==null&&markOutTime!==null){
+    const s=Math.min(markInTime,markOutTime),e=Math.max(markInTime,markOutTime);
+    const sx=trackL+(s/totalDuration)*trackW,ex=trackL+(e/totalDuration)*trackW;
+    const sel=document.getElementById('tlSelection');sel.style.display='block';sel.style.left=sx+'px';sel.style.width=(ex-sx)+'px';
+    document.getElementById('tlHandleStart').style.display='block';document.getElementById('tlHandleStart').style.left=sx+'px';
+    document.getElementById('tlHandleEnd').style.display='block';document.getElementById('tlHandleEnd').style.left=ex+'px';
+    document.getElementById('btnExport').disabled=false;
+  } else {
+    document.getElementById('tlSelection').style.display='none';
+    document.getElementById('tlHandleStart').style.display='none';
+    document.getElementById('tlHandleEnd').style.display='none';
+    document.getElementById('btnExport').disabled=true;
+  }
+  renderTicks(trackL,trackW);
+}
+
+function renderTicks(trackL,trackW){const el=document.getElementById('tlTicks');el.innerHTML='';if(totalDuration<=0)return;const span=totalDuration;const step=span<=60?5:span<=300?15:span<=1200?60:300;for(let t=0;t<=totalDuration;t+=step){const x=(t/totalDuration)*trackW;const d=document.createElement('div');d.className='timeline-tick';d.style.left=x+'px';d.textContent=fmtTime(t);el.appendChild(d)}}
+
+// Timeline drag
+(function(){
+  const tc=document.getElementById('timelineContainer');
+  function getTime(e){const r=rooms.find(x=>x.id===selectedRoomId);if(!r)return 0;const rect=tc.getBoundingClientRect(),trackL=40,trackR=rect.width-40,x=Math.max(trackL,Math.min(trackR,e.clientX-rect.left));return((x-trackL)/(trackR-trackL))*r.duration}
+  function getX(e){return e.clientX-tc.getBoundingClientRect().left}
+  tc.addEventListener('mousedown',e=>{
+    const r=rooms.find(x=>x.id===selectedRoomId);if(!r)return;
+    const rect=tc.getBoundingClientRect(),trackL=40,trackR=rect.width-40,trackW=trackR-trackL;
+    const cx=getX(e);
+    if(markInTime!==null&&markOutTime!==null){
+      const s=Math.min(markInTime,markOutTime),ec=Math.max(markInTime,markOutTime);
+      const sx=trackL+(s/r.duration)*trackW,ex=trackL+(ec/r.duration)*trackW;
+      if(Math.abs(cx-sx)<10){tlDragging='start';document.getElementById('tlHandleStart').classList.add('dragging');showBubble(sx,fmtTime(s));e.preventDefault();return}
+      if(Math.abs(cx-ex)<10){tlDragging='end';document.getElementById('tlHandleEnd').classList.add('dragging');showBubble(ex,fmtTime(ec));e.preventDefault();return}
+      if(cx>sx&&cx<ex){tlDragging='range';tlDragStartX=cx;tlDragStartIn=markInTime;tlDragStartOut=markOutTime;e.preventDefault();return}
+    }
+    tlDragging='cursor';const t=getTime(e);r.position=t;cursorTime=t;showBubble(getX(e),fmtTime(t));renderTimeline();render();
+  });
+  document.addEventListener('mousemove',e=>{
+    if(!tlDragging)return;
+    const r=rooms.find(x=>x.id===selectedRoomId);if(!r)return;
+    const rect=tc.getBoundingClientRect(),trackL=40,trackR=rect.width-40,trackW=trackR-trackL;
+    const t=getTime(e),cx=getX(e);
+    if(tlDragging==='cursor'){r.position=t;cursorTime=t;showBubble(cx,fmtTime(t))}
+    else if(tlDragging==='start'){markInTime=t;showBubble(trackL+(t/r.duration)*trackW,fmtTime(t))}
+    else if(tlDragging==='end'){markOutTime=t;showBubble(trackL+(t/r.duration)*trackW,fmtTime(t))}
+    else if(tlDragging==='range'){const dx=cx-tlDragStartX;const dt=(dx/trackW)*r.duration;markInTime=Math.max(0,Math.min(r.duration,tlDragStartIn+dt));markOutTime=Math.max(0,Math.min(r.duration,tlDragStartOut+dt))}
+    renderTimeline();render();
+  });
+  document.addEventListener('mouseup',()=>{tlDragging=null;document.querySelectorAll('.timeline-handle').forEach(h=>h.classList.remove('dragging'));hideBubble()});
+  tc.addEventListener('mouseleave',hideBubble);
+})();
+
+function seekBack(){const r=rooms.find(x=>x.id===selectedRoomId);if(r){r.position=Math.max(0,r.position-10);cursorTime=r.position;renderTimeline();render()}}
+function seekFwd(){const r=rooms.find(x=>x.id===selectedRoomId);if(r){r.position=Math.min(r.duration,r.position+10);cursorTime=r.position;renderTimeline();render()}}
+function togglePlay(){isPlaying=!isPlaying;const btn=document.getElementById('btnPlay');btn.innerHTML=isPlaying?'<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>':'<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>';btn.title=isPlaying?'暂停':'播放'}
+function markIn(){const r=rooms.find(x=>x.id===selectedRoomId);if(!r)return;markInTime=r.position;document.getElementById('btnMarkIn').classList.toggle('active',markInTime!==null);if(markOutTime!==null&&markInTime>markOutTime){const t=markInTime;markInTime=markOutTime;markOutTime=t}renderTimeline()}
+function markOut(){const r=rooms.find(x=>x.id===selectedRoomId);if(!r)return;markOutTime=r.position;document.getElementById('btnMarkOut').classList.toggle('active',markOutTime!==null);if(markInTime!==null&&markOutTime<markInTime){const t=markInTime;markInTime=markOutTime;markOutTime=t}renderTimeline()}
+function returnLive(){const r=rooms.find(x=>x.id===selectedRoomId);if(r&&r.connected){r.position=r.duration;cursorTime=r.position;renderTimeline();render();toast('已回到直播','info')}}
+function toggleFullscreen(){toast('全屏模式（原型演示）','info')}
+function doExport(){const r=rooms.find(x=>x.id===selectedRoomId);if(!r||markInTime===null||markOutTime===null)return;const s=Math.min(markInTime,markOutTime),e=Math.max(markInTime,markOutTime);document.getElementById('exportTimeRange').textContent=fmtTime(s)+' → '+fmtTime(e);document.getElementById('exportRoomList').innerHTML=rooms.filter(rm=>rm.includeInCut).map(rm=>'<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-subtle);font-size:12px"><span class="platform-tag '+rm.platform+'" style="font-size:10px;padding:1px 5px">'+(PI[rm.platform]||'')+rm.platformName+'</span><span style="flex:1">'+rm.streamer+'</span><span class="badge '+(rm.recording?'success':'warning')+'">'+(rm.recording?'录制中':'未录制')+'</span></div>').join('');showModal('exportModal')}
+function executeExport(){hideModal('exportModal');const s=Math.min(markInTime,markOutTime),e=Math.max(markInTime,markOutTime);toast(rooms.filter(r=>r.includeInCut).length+' 个房间导出中 ('+fmtTime(s)+' → '+fmtTime(e)+')','info');setTimeout(()=>toast('导出完成','success'),2000)}
+
+setInterval(()=>{if(!isPlaying)return;const r=rooms.find(x=>x.id===selectedRoomId);if(!r)return;r.position=Math.min(r.duration,r.position+1);cursorTime=r.position;renderTimeline();render()},1000);
+
+function render(){renderCards();renderDetail();renderStats();renderTimeline()}
+
+function renderCards(){
+  const g=document.getElementById('cardGrid');
+  if(!rooms.length){g.innerHTML='<div class="empty-state"><div class="icon">+</div><p>点击上方"添加房间"开始</p></div>';return}
+  g.innerHTML=rooms.map(r=>{
+    const sel=r.id===selectedRoomId?'selected':'';
+    const sc=r.recording?'recording':r.connected?'connected':r.error?'error':'idle';
+    const st=r.recording?'录制中':r.connected?'已连接':r.error?'连接失败':'未连接';
+    let pv='';
+    if(r.previewEnabled&&!r.previewPaused){
+      pv='<div style="width:100%;height:100%;background:linear-gradient(135deg,#0d1117,#161b22);display:flex;align-items:center;justify-content:center"><div style="color:#3a5;opacity:0.6;font-size:11px">&#9654; 预览画面</div></div>';
+      if(r.recording)pv+='<div class="recording-badge"><span class="rec-dot"></span> REC</div>';
+      if(r.previewMuted)pv+='<div class="preview-mute-badge"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg></div>';
+    } else if(r.previewEnabled&&r.previewPaused){
+      pv='<div style="width:100%;height:100%;background:linear-gradient(135deg,#0d1117,#161b22);display:flex;align-items:center;justify-content:center;opacity:0.4"><div style="color:#888;font-size:11px">&#10074;&#10074; 已暂停</div></div>';
+      if(r.recording)pv+='<div class="recording-badge"><span class="rec-dot"></span> REC</div>';
+    } else {
+      pv='<div class="preview-placeholder"><span class="icon"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></span>'+(r.connected?'点击"开启预览"':'请先连接')+'</div>';
+    }
+    let pb;if(!r.previewEnabled)pb='<button class="btn sm" onclick="event.stopPropagation();startPreview(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>预览</button>';
+    else if(r.previewPaused)pb='<button class="btn sm" onclick="event.stopPropagation();resumePreview(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>恢复</button>';
+    else pb='<button class="btn sm" onclick="event.stopPropagation();pausePreview(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>暂停</button>';
+    const mb=r.previewMuted?'<button class="btn sm" onclick="event.stopPropagation();toggleMute(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg></button>':'<button class="btn sm" onclick="event.stopPropagation();toggleMute(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg></button>';
+    const rb=r.recording?'<button class="btn sm danger" onclick="event.stopPropagation();stopRecord(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>停止</button>':'<button class="btn sm success" onclick="event.stopPropagation();startRecord(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="7"/></svg>录制</button>';
+    const cb=r.connected?'<button class="btn sm" onclick="event.stopPropagation();disconnectRoom(\''+r.id+'\')" style="color:var(--text-tertiary);border-color:var(--border-default)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>断开</button>':'<button class="btn sm primary" onclick="event.stopPropagation();connectRoom(\''+r.id+'\')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>连接</button>';
+    return '<div class="room-card '+sel+'" onclick="selectRoom(\''+r.id+'\')"><div class="card-header"><span class="platform-tag '+r.platform+'">'+(PI[r.platform]||'')+r.platformName+'</span><span class="card-title">'+r.streamer+' - '+r.title+'</span><button class="card-remove" onclick="event.stopPropagation();removeRoom(\''+r.id+'\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div><div class="preview-area">'+pv+'</div><div class="card-status"><span class="status-dot '+sc+'"></span><span class="status-text">'+st+(r.error?' · '+r.error:'')+'</span></div><div class="preview-controls">'+(r.previewEnabled?pb+mb:pb)+'</div><div class="card-controls">'+cb+(r.connected?rb:'')+'<label class="cut-checkbox" onclick="event.stopPropagation()"><input type="checkbox" '+(r.includeInCut?'checked':'')+' onchange="toggleInclude(\''+r.id+'\',this.checked)">参与切割</label></div></div>';
+  }).join('');
+}
+
+function renderDetail(){const el=document.getElementById('detailBody');const r=rooms.find(x=>x.id===selectedRoomId);if(!r){el.innerHTML='<div class="empty-state" style="padding:30px 10px"><p>选择房间查看详情</p></div>';return}el.innerHTML='<div class="detail-row"><span class="label">平台</span><span class="value">'+r.platformName+'</span></div><div class="detail-row"><span class="label">主播</span><span class="value">'+r.streamer+'</span></div><div class="detail-row"><span class="label">标题</span><span class="value">'+r.title+'</span></div><div class="detail-row"><span class="label">连接</span><span class="value">'+(r.connected?'已连接':'未连接')+'</span></div><div class="detail-row"><span class="label">预览</span><span class="value">'+(r.previewEnabled?(r.previewPaused?'已暂停':'播放中'):'未开启')+'</span></div><div class="detail-row"><span class="label">静音</span><span class="value">'+(r.previewMuted?'是':'否')+'</span></div><div class="detail-row"><span class="label">录制</span><span class="value">'+(r.recording?'录制中':'未录制')+'</span></div><div class="detail-row"><span class="label">参与切割</span><span class="value">'+(r.includeInCut?'是':'否')+'</span></div><div class="detail-row"><span class="label">时长</span><span class="value">'+fmtTime(r.duration)+'</span></div>'+(r.recordStart?'<div class="detail-row"><span class="label">录制开始</span><span class="value">'+r.recordStart+'</span></div>':'')+(r.output?'<div class="detail-row"><span class="label">输出</span><span class="value" style="font-size:10px;word-break:break-all;max-width:120px">'+r.output+'</span></div>':'')+(r.error?'<div class="detail-row"><span class="label">错误</span><span class="value" style="color:var(--error)">'+r.error+'</span></div>':'')+'<div style="margin-top:12px;font-size:10px;color:var(--text-tertiary)"><div style="margin-bottom:3px">URL:</div><div style="word-break:break-all;background:var(--bg-tertiary);padding:5px 7px;border-radius:4px;font-family:var(--font-mono)">'+(r.url||'(demo)')+'</div></div>'}
+
+function renderStats(){document.getElementById('statTotal').textContent=rooms.length;document.getElementById('statConnected').textContent=rooms.filter(r=>r.connected).length;document.getElementById('statRecording').textContent=rooms.filter(r=>r.recording).length;document.getElementById('statPreview').textContent=rooms.filter(r=>r.previewEnabled&&!r.previewPaused).length;const e=rooms.filter(r=>r.error).length;document.getElementById('errorSummary').textContent=e?e+' 个房间有错误':''}
+
+function renderDashboard(){const g=document.getElementById('dashGrid');g.innerHTML=[{icon:'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3dd598" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',bg:'var(--success-dim)',value:rooms.length,label:'总房间数'},{icon:'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff8c42" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',bg:'var(--accent-dim)',value:rooms.filter(r=>r.connected).length,label:'已连接'},{icon:'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3" fill="#ff6b6b"/></svg>',bg:'var(--error-dim)',value:rooms.filter(r=>r.recording).length,label:'录制中'},{icon:'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5b8def" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',bg:'rgba(91,141,239,0.12)',value:'3',label:'已导出片段'}].map(i=>'<div class="stat-card"><div class="stat-icon" style="background:'+i.bg+'">'+i.icon+'</div><div class="stat-value">'+i.value+'</div><div class="stat-label">'+i.label+'</div></div>').join('');document.getElementById('historyBody').innerHTML='<tr><td>14:32:18</td><td>小明同学</td><td>00:05:30 → 00:12:45</td><td>86MB</td><td><span class="badge success">成功</span></td></tr><tr><td>14:28:05</td><td>游戏大神</td><td>00:02:00 → 00:08:30</td><td>124MB</td><td><span class="badge success">成功</span></td></tr><tr><td>14:25:40</td><td>美食达人</td><td>00:10:00 → 00:15:00</td><td>-</td><td><span class="badge error">失败</span></td></tr>'}
+
+(function(){
+  const urls=['https://live.douyin.com/123456','https://live.bilibili.com/789012','https://www.huya.com/345678'];
+  urls.forEach(u=>rooms.push(createRoom(u)));
+  rooms[0].connected=true;rooms[0].previewEnabled=true;rooms[0].previewMuted=true;rooms[0].position=330;
+  rooms[1].connected=true;rooms[1].previewEnabled=true;rooms[1].previewPaused=true;rooms[1].recording=true;rooms[1].recordStart=new Date().toLocaleTimeString();rooms[1].output='output/bilibili_技术分享_1718000000.mp4';rooms[1].position=1200;
+  rooms[2].error='主播未开播';
+  selectedRoomId=rooms[0].id;
+  markInTime=120;markOutTime=450;
+  document.getElementById('btnMarkIn').classList.add('active');
+  document.getElementById('btnMarkOut').classList.add('active');
+  render();renderDashboard();
+})();
+</script>
+</body>
+</html>

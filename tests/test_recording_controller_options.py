@@ -1,4 +1,4 @@
-﻿"""Regression tests for recording controller option wiring."""
+"""Regression tests for recording controller option wiring."""
 from __future__ import annotations
 
 import os
@@ -30,6 +30,7 @@ class _FakeCapture:
         self.calls = []
         self.status = types.SimpleNamespace(value="recording")
         self.is_recording = True
+        self.last_error = ""
 
     def start(self, url, output_path, *, codec="copy", input_args=None, extra_args=None):
         self.calls.append(
@@ -42,6 +43,20 @@ class _FakeCapture:
             }
         )
         return True
+
+
+class _FailingCapture:
+    """Capture stub that simulates a failed start (e.g. FFmpeg not found)."""
+
+    def __init__(self, error: str = "FFmpeg 未找到: /bad/path"):
+        self.calls = []
+        self.status = types.SimpleNamespace(value="error")
+        self.is_recording = False
+        self.last_error = error
+
+    def start(self, url, output_path, *, codec="copy", input_args=None, extra_args=None):
+        self.calls.append({"url": url, "output_path": output_path})
+        return False
 
 
 def test_recording_controller_select_stream_url_uses_real_quality_presets() -> None:
@@ -77,7 +92,7 @@ def test_recording_controller_cpu_bitrate_mode_builds_target_bitrate_args(tmp_pa
     ctrl = RecordingController()
     ctrl._capture = _FakeCapture()
 
-    ok, output_path, encoder_used = ctrl.start_recording_with_crf(
+    ok, output_path, encoder_used, _error_msg = ctrl.start_recording_with_crf(
         "https://example.com/live.m3u8",
         str(tmp_path),
         "H.264 CPU",
@@ -104,7 +119,7 @@ def test_recording_controller_nvenc_crf_mode_uses_vbr_cq_args(tmp_path) -> None:
     ctrl._capture = _FakeCapture()
     ctrl.check_nvenc_available = lambda: True
 
-    ok, _output_path, encoder_used = ctrl.start_recording_with_crf(
+    ok, _output_path, encoder_used, _error_msg = ctrl.start_recording_with_crf(
         "https://example.com/live.m3u8",
         str(tmp_path),
         "H.264 NVENC",
@@ -129,7 +144,7 @@ def test_recording_controller_unlimited_mode_forces_copy(tmp_path) -> None:
     ctrl = RecordingController()
     ctrl._capture = _FakeCapture()
 
-    ok, _output_path, encoder_used = ctrl.start_recording_with_crf(
+    ok, _output_path, encoder_used, _error_msg = ctrl.start_recording_with_crf(
         "https://example.com/live.m3u8",
         str(tmp_path),
         "H.264 CPU",
@@ -155,15 +170,65 @@ def test_friendly_ffmpeg_exit_message_uses_stderr_tail(monkeypatch) -> None:
 def test_preflight_recording_returns_error_when_disk_is_low(monkeypatch, tmp_path) -> None:
     from lsc.gui.pages.recording_controller import RecordingController
 
-    ctrl = RecordingController()
     monkeypatch.setattr(
         "shutil.disk_usage",
         lambda _path: (100 * 1024**3, 95 * 1024**3, 5 * 1024**3),
     )
 
-    message = ctrl.preflight_recording(str(tmp_path))
+    message = RecordingController.preflight_recording(str(tmp_path))
 
     assert "磁盘空间不足" in message
+    assert "1 路并发录制" in message
+
+
+def test_preflight_recording_scales_threshold_with_concurrent_streams(monkeypatch, tmp_path) -> None:
+    """Multi-room recording must require free space proportional to stream count."""
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    # 30 GB free: enough for 1 stream (8 GB) but not for 4 streams (32 GB).
+    monkeypatch.setattr(
+        "shutil.disk_usage",
+        lambda _path: (100 * 1024**3, 70 * 1024**3, 30 * 1024**3),
+    )
+
+    # Single stream should pass.
+    assert RecordingController.preflight_recording(str(tmp_path), concurrent_streams=1) == ""
+
+    # Four concurrent streams should fail and mention the stream count.
+    message = RecordingController.preflight_recording(str(tmp_path), concurrent_streams=4)
+    assert "磁盘空间不足" in message
+    assert "4 路并发录制" in message
+
+
+def test_preflight_recording_accepts_zero_or_negative_streams(monkeypatch, tmp_path) -> None:
+    """Defensive: concurrent_streams <= 0 should be treated as 1."""
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    monkeypatch.setattr(
+        "shutil.disk_usage",
+        lambda _path: (100 * 1024**3, 80 * 1024**3, 20 * 1024**3),
+    )
+
+    assert RecordingController.preflight_recording(str(tmp_path), concurrent_streams=0) == ""
+    assert RecordingController.preflight_recording(str(tmp_path), concurrent_streams=-3) == ""
+
+
+def test_start_recording_with_crf_returns_error_detail_on_failure(tmp_path) -> None:
+    """When capture fails to start, the error message must be propagated to the caller."""
+    from lsc.gui.pages.recording_controller import RecordingController
+
+    ctrl = RecordingController()
+    ctrl._capture = _FailingCapture(error="FFmpeg 未找到: /bad/path")
+
+    ok, _output_path, _encoder_used, error_msg = ctrl.start_recording_with_crf(
+        "https://example.com/live.m3u8",
+        str(tmp_path),
+        "Copy",
+        23,
+    )
+
+    assert ok is False
+    assert error_msg == "FFmpeg 未找到: /bad/path"
 
 
 def test_parse_douyin_url_uses_platform_layer_legacy_shape(monkeypatch) -> None:
@@ -257,7 +322,7 @@ def test_start_recording_with_crf_passes_explicit_input_args_to_capture(tmp_path
     ctrl._capture = _FakeCapture()
     input_args = ["-headers", "Referer: https://example.com/\r\n"]
 
-    ok, _output_path, _encoder_used = ctrl.start_recording_with_crf(
+    ok, _output_path, _encoder_used, _error_msg = ctrl.start_recording_with_crf(
         "https://example.com/live.m3u8",
         str(tmp_path),
         "H.264 CPU",
@@ -275,7 +340,7 @@ def test_start_recording_with_crf_defaults_input_args_to_empty_list(tmp_path) ->
     ctrl = RecordingController()
     ctrl._capture = _FakeCapture()
 
-    ok, _output_path, _encoder_used = ctrl.start_recording_with_crf(
+    ok, _output_path, _encoder_used, _error_msg = ctrl.start_recording_with_crf(
         "https://example.com/live.m3u8",
         str(tmp_path),
         "Copy",
