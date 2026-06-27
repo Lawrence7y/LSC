@@ -1,3 +1,8 @@
-[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
-Unknown input options: platform. Allowed options: cache, context, experimentalCacheExpiry, experimentalLogSideEffects, external, fs, input, jsx, logLevel, makeAbsoluteExternalsRelative, maxParallelFileOps, moduleContext, onLog, onwarn, perf, plugins, preserveEntrySignatures, preserveSymlinks, shimMissingExports, strictDeprecations, treeshake, watch
-Unknown input options: platform. Allowed options: cache, context, experimentalCacheExpiry, experimentalLogSideEffects, external, fs, input, jsx, logLevel, makeAbsoluteExternalsRelative, maxParallelFileOps, moduleContext, onLog, onwarn, perf, plugins, preserveEntrySignatures, preserveSymlinks, shimMissingExports, strictDeprecations, treeshake, watch
+[37180:0627/170734.069:ERROR:backend_impl.cc(1365)] Unable to map Index file
+[37180:0627/170734.071:ERROR:backend_impl.cc(1365)] Unable to map Index file
+[37180:0627/170734.108:ERROR:cache_util_win.cc(20)] Unable to move the cache: ¾Ü¾ø·ÃÎÊ¡£ (0x5)
+[37180:0627/170734.108:ERROR:cache_util_win.cc(20)] Unable to move the cache: ¾Ü¾ø·ÃÎÊ¡£ (0x5)
+[37180:0627/170734.113:ERROR:disk_cache.cc(208)] Unable to create cache
+[37180:0627/170734.114:ERROR:gpu_disk_cache.cc(676)] Gpu Cache Creation failed: -2
+[37180:0627/170734.115:ERROR:disk_cache.cc(208)] Unable to create cache
+[37180:0627/170734.116:ERROR:gpu_disk_cache.cc(676)] Gpu Cache Creation failed: -2

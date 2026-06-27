@@ -684,7 +684,6 @@ def register_room_handlers(server, bridge):
         if not room_id:
             return {'error': 'room_id is required'}
 
-        # 前端可直接传入当前播放位置（秒），避免 Electron 模式下 _get_current_pos 恒返回 0
         time_value = data.get('time')
 
         def _mark():
@@ -692,17 +691,21 @@ def register_room_handlers(server, bridge):
             room = manager.get_room(room_id)
             if room is None:
                 return None
+            if time_value is None and 'time' in data:
+                # time: null → 删除入点
+                room.mark_in = None
+                room.mark_in_wallclock = None
+                return None
             if time_value is not None:
                 room.mark_in = float(time_value)
             else:
                 room.mark_in = _get_current_pos(room)
-            # 记录墙钟时间戳（monotonic），用于精确对齐录制文件位置
             room.mark_in_wallclock = _time.monotonic()
             return room.mark_in
 
         value = await asyncio.get_running_loop().run_in_executor(None, lambda: bridge.call(_mark))
         _broadcast_rooms()
-        return {'success': value is not None, 'mark_in': value}
+        return {'success': True, 'mark_in': value}
 
     @server.on('set_mark_out')
     async def handle_set_mark_out(data):
@@ -710,7 +713,6 @@ def register_room_handlers(server, bridge):
         if not room_id:
             return {'error': 'room_id is required'}
 
-        # 前端可直接传入当前播放位置（秒），避免 Electron 模式下 _get_current_pos 恒返回 0
         time_value = data.get('time')
 
         def _mark():
@@ -718,17 +720,21 @@ def register_room_handlers(server, bridge):
             room = manager.get_room(room_id)
             if room is None:
                 return None
+            if time_value is None and 'time' in data:
+                # time: null → 删除出点
+                room.mark_out = None
+                room.mark_out_wallclock = None
+                return None
             if time_value is not None:
                 room.mark_out = float(time_value)
             else:
                 room.mark_out = _get_current_pos(room)
-            # 记录墙钟时间戳（monotonic），用于精确对齐录制文件位置
             room.mark_out_wallclock = _time.monotonic()
             return room.mark_out
 
         value = await asyncio.get_running_loop().run_in_executor(None, lambda: bridge.call(_mark))
         _broadcast_rooms()
-        return {'success': value is not None, 'mark_out': value}
+        return {'success': True, 'mark_out': value}
 
     @server.on('toggle_play_pause')
     async def handle_toggle_play_pause(data):
@@ -841,8 +847,12 @@ def register_room_handlers(server, bridge):
 
         def _export():
             room = manager.get_room(room_id)
-            if room is None or not room.record_output_path or not os.path.isfile(room.record_output_path):
-                return False, '录制文件不存在'
+            if room is None:
+                return False, '房间不存在'
+            if not room.record_output_path:
+                return False, '该房间没有录制文件（请先开始录制再导出切片）'
+            if not os.path.isfile(room.record_output_path):
+                return False, f'录制文件不存在: {room.record_output_path}'
             if room.mark_in is None or room.mark_out is None:
                 return False, '请先设置入点和出点'
 

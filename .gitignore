@@ -71,6 +71,12 @@ __pycache__/
 .venv/
 venv/
 
+# Node / Electron
+node_modules/
+lsc-electron/release/
+lsc-electron/dist/
+lsc-electron/out/
+
 # Unrelated prototype/scratch files
 bun-socket-v2.ts
 figma-plugin-code.ts

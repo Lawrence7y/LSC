@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert } from 'antd'
-import { PlusOutlined, VideoCameraOutlined } from '@ant-design/icons'
+import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
@@ -10,11 +10,7 @@ import { ClipList } from './components/ClipList'
 import { RecordSettings } from './components/RecordSettings'
 import { ClipSegment } from '@/types'
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
-import { ExportQueue, ExportJob } from '@/components/ExportQueue'
 import { formatTime } from '@/utils/time'
-
-// 扩展 ExportJob 以携带 preset_id，便于失败重试时复用原始导出预设
-type WorkbenchExportJob = ExportJob & { preset_id?: string }
 
 export default function Workbench() {
   const { isConnected, send, on } = useWebSocket()
@@ -33,7 +29,6 @@ export default function Workbench() {
     return undefined
   }, [connectionStatus])
   const clips = useAppStore((state) => state.clips)
-  const recentClips = useAppStore((state) => state.recentClips)
   const setSelectedRoomId = useAppStore((state) => state.setSelectedRoomId)
   const addClip = useAppStore((state) => state.addClip)
   const setClips = useAppStore((state) => state.setClips)
@@ -41,12 +36,12 @@ export default function Workbench() {
   const [url, setUrl] = useState('')
   const [previewClip, setPreviewClip] = useState<ClipSegment | null>(null)
   const [exportPresetId, setExportPresetId] = useState(getDefaultPreset().id)
-  const [exportJobs, setExportJobs] = useState<WorkbenchExportJob[]>([])
   const [analyzing, setAnalyzing] = useState(false)
   const [analysisResults, setAnalysisResults] = useState<{start: number; end: number; score: number}[]>([])
   const [showAnalysisModal, setShowAnalysisModal] = useState(false)
   const [loopPreview, setLoopPreview] = useState(false)
   const [timelineZoom, setTimelineZoom] = useState(1)
+  const [allMuted, setAllMuted] = useState(false)
   const [sortBy, setSortBy] = useState<string>('default')
   const loopTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [fullscreenRoomId, setFullscreenRoomId] = useState<string | null>(null)
@@ -116,18 +111,6 @@ export default function Workbench() {
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
   }, [])
-
-  // Workbench 卸载时停止所有后端预览，防止 FFmpeg 空转 + segment 堆积
-  useEffect(() => {
-    return () => {
-      const currentRooms = useAppStore.getState().rooms
-      for (const room of currentRooms) {
-        if (room.preview_enabled) {
-          send('enable_preview', { room_id: room.room_id, enabled: false, mode: 'mse' })
-        }
-      }
-    }
-  }, [send])
 
   // Sync store's selectedRoomId with multi-select state
   useEffect(() => {
@@ -237,47 +220,32 @@ export default function Workbench() {
   useEffect(() => {
     const unsubs: (() => void)[] = []
     unsubs.push(on('clip_completed', (data: any) => {
-      if (data?.job_id) {
-        setExportJobs(prev => prev.map(j =>
-          j.id === data.job_id
-            ? { ...j, status: 'completed' as const, progress: 100, outputPath: data.output_path }
-            : j
-        ))
+      // 更新切片列表中对应切片的导出状态
+      if (data?.room_id && typeof data.start === 'number' && typeof data.end === 'number') {
+        const store = useAppStore.getState()
+        const updatedClips = store.clips.map(c =>
+          c.start === data.start && c.end === data.end && c.room_id === data.room_id
+            ? { ...c, exported: true, outputPath: data.output_path }
+            : c
+        )
+        store.setClips(updatedClips)
+        message.success('切片导出完成')
       }
     }))
-    // 导出失败/取消：后端通过 clip_failed 通知，避免队列永久 running
+    // 导出失败/取消：后端通过 clip_failed 通知
     unsubs.push(on('clip_failed', (data: { job_id?: string; error?: string }) => {
-      if (data?.job_id) {
-        const isCancelled = data.error === '导出已取消'
-        setExportJobs(prev => prev.map(j =>
-          j.id === data.job_id
-            ? { ...j, status: isCancelled ? 'cancelled' as const : 'failed' as const, error: data.error || '导出失败' }
-            : j
-        ))
-        if (!isCancelled && data.error) {
-          message.error(`导出失败：${data.error}`)
-        }
+      const isCancelled = data.error === '导出已取消'
+      if (!isCancelled && data.error) {
+        message.error(`导出失败：${data.error}`)
       }
     }))
-    // 导出进度上报
-    unsubs.push(on('export_progress', (data: { job_id?: string; percent?: number }) => {
-      if (data?.job_id && typeof data.percent === 'number') {
-        const pct = data.percent
-        setExportJobs(prev => prev.map(j =>
-          j.id === data.job_id
-            ? { ...j, progress: Math.max(0, Math.min(99, Math.round(pct))) }
-            : j
-        ))
-      }
+    // 导出进度上报（目前无 UI 展示，保留监听）
+    unsubs.push(on('export_progress', () => {
+      // 进度更新可通过 toast 或 ClipList 中的进度指示器展示
     }))
-    // export_clip 提交响应：失败时立即置 failed，避免队列永久 running
+    // export_clip 提交响应：失败时立即提示
     unsubs.push(on('export_clip_response', (data: { success?: boolean; error?: string; job_id?: string }) => {
       if (data?.job_id && data?.success === false) {
-        setExportJobs(prev => prev.map(j =>
-          j.id === data.job_id
-            ? { ...j, status: 'failed' as const, error: data.error || '导出启动失败' }
-            : j
-        ))
         message.error(`导出失败：${data.error || '未知错误'}`)
       }
     }))
@@ -462,7 +430,16 @@ export default function Workbench() {
     const registry = (window as any).__msePlayers
     const video = registry?.[roomId]?.player?.videoElement as HTMLVideoElement | undefined
     if (video) {
-      try { video.currentTime = time } catch { /* may fail if not ready */ }
+      if (video.buffered.length > 0) {
+        const bufStart = video.buffered.start(0)
+        const bufEnd = video.buffered.end(video.buffered.length - 1)
+        if (time >= bufStart && time <= bufEnd) {
+          try { video.currentTime = time } catch {}
+        } else {
+          video.currentTime = Math.max(bufStart, bufEnd - 0.5)
+          video.play().catch(() => {})
+        }
+      }
     }
     send('seek', { room_id: roomId, time })
   }, [send])
@@ -552,10 +529,6 @@ export default function Workbench() {
     selectedRoomIds.forEach(rid => handleAddClip(rid))
   }, [selectedRoomIds, handleAddClip])
 
-  const handleControlFullscreen = useCallback(() => {
-    if (selectedRoomId) setFullscreenRoomId(prev => prev === selectedRoomId ? null : selectedRoomId)
-  }, [selectedRoomId])
-
   const handleGoLive = useCallback(() => {
     selectedRoomIds.forEach(rid => {
       const registry = (window as any).__msePlayers
@@ -578,37 +551,47 @@ export default function Workbench() {
     })
   }, [selectedRoomIds, send])
 
+  const handleDeleteMarker = useCallback((type: 'in' | 'out') => {
+    selectedRoomIds.forEach(rid => {
+      if (type === 'in') {
+        send('set_mark_in', { room_id: rid, time: null })
+      } else {
+        send('set_mark_out', { room_id: rid, time: null })
+      }
+    })
+    message.info(type === 'in' ? '已删除入点' : '已删除出点')
+  }, [selectedRoomIds, send])
+
   // 删除切片
   const handleDeleteClip = (index: number) => {
     setClips(clips.filter((_, i) => i !== index))
   }
 
   // 导出切片
-  const handleExportClip = (clip: ClipSegment) => {
+  const handleExportClip = (clip: ClipSegment, _index?: number) => {
     setPreviewClip(clip)
+  }
+
+  // 打开导出的文件
+  const handleOpenExportFile = (outputPath: string) => {
+    if (window.electronAPI) {
+      window.electronAPI.openPath(outputPath)
+    }
   }
 
   const handleConfirmExport = () => {
     if (!previewClip) return
+    // 检查该房间是否有可用的录制文件
     const room = rooms.find(r => r.room_id === previewClip.room_id)
-    const jobId = `export-${Date.now()}`
-
-    // Add job to queue
-    const newJob: WorkbenchExportJob = {
-      id: jobId,
-      roomName: room?.streamer_name || '未知房间',
-      label: previewClip.label || '切片',
-      startTime: formatTime(previewClip.start),
-      startSeconds: previewClip.start,
-      endSeconds: previewClip.end,
-      duration: previewClip.end - previewClip.start,
-      progress: 0,
-      status: 'running',
-      roomId: previewClip.room_id!,
-      createdAt: Date.now(),
-      preset_id: exportPresetId,
+    if (!room) {
+      message.error('房间不存在')
+      return
     }
-    setExportJobs(prev => [...prev, newJob])
+    if (!room.record_output_path) {
+      message.error('该房间没有录制文件，请先开始录制再导出切片')
+      return
+    }
+    const jobId = `export-${Date.now()}`
 
     send('export_clip', {
       room_id: previewClip.room_id,
@@ -715,42 +698,7 @@ export default function Workbench() {
     message.success(`已导入 ${newClips.length} 个高光片段`)
   }
 
-  // ── 导出队列管理 ──
-  const handleCancelJob = (jobId: string) => {
-    // 通知后端取消导出，停止 FFmpeg 进程。
-    // 不在此处立即置 cancelled —— 等 clip_failed（error='导出已取消'）到达后再置，
-    // 避免后端取消失败时 UI 与实际状态不一致。
-    send('cancel_export', { job_id: jobId })
-  }
-
-  const handleRetryJob = (jobId: string) => {
-    const job = exportJobs.find(j => j.id === jobId)
-    if (!job) return
-    // 重试生成新 jobId 并重置状态，避免与残留映射碰撞
-    const newJobId = `export-${Date.now()}`
-    setExportJobs(prev => prev.map(j =>
-      j.id === jobId
-        ? { ...j, id: newJobId, status: 'running' as const, progress: 0, error: undefined }
-        : j
-    ))
-    send('export_clip', {
-      room_id: job.roomId,
-      start: job.startSeconds,
-      end: job.endSeconds,
-      label: job.label,
-      preset_id: job.preset_id,
-      job_id: newJobId,
-    })
-  }
-
-  const handleRemoveJob = (jobId: string) => {
-    setExportJobs(prev => prev.filter(j => j.id !== jobId))
-  }
-
-  const handleClearCompleted = () => {
-    setExportJobs(prev => prev.filter(j => j.status !== 'completed'))
-  }
-
+  // ── 导出文件操作 ──
   const handleOpenExportFolder = (outputPath: string) => {
     if (window.electronAPI) {
       // 优先用 showItemInFolder 在资源管理器中高亮定位文件，
@@ -763,13 +711,7 @@ export default function Workbench() {
     }
   }
 
-  // 点击最近切片：选中房间并跳转到入点
-  const handleRecentClipClick = (clip: ClipSegment) => {
-    if (!clip.room_id) return
-    setSelectedRoomId(clip.room_id)
-    mseSeek(clip.room_id, clip.start)
-  }
-
+  // 点击切片：选中房间并跳转到入点
   const selectedRoom = rooms.find(r => r.room_id === selectedRoomId)
 
   // Sort rooms (memoize to prevent new array reference on every render)
@@ -940,6 +882,23 @@ export default function Workbench() {
           >
             全选
           </Button>
+          <Button
+            size="small"
+            type={allMuted ? 'primary' : 'default'}
+            icon={allMuted ? <MutedOutlined /> : <SoundOutlined />}
+            onClick={() => {
+              const newMuted = !allMuted
+              setAllMuted(newMuted)
+              rooms.forEach(r => {
+                if (r.preview_enabled) {
+                  send('set_preview_muted', { room_id: r.room_id, muted: newMuted })
+                }
+              })
+            }}
+            disabled={rooms.length === 0}
+          >
+            {allMuted ? '取消静音' : '静音'}
+          </Button>
           <Tooltip title={batchRecordTooltip}>
             <span>
               <Button
@@ -1017,12 +976,12 @@ export default function Workbench() {
             onMarkIn={handleControlMarkIn}
             onMarkOut={handleControlMarkOut}
             onAddClip={handleControlAddClip}
-            onFullscreen={handleControlFullscreen}
             onToggleLoop={handleToggleLoop}
             onGoLive={handleGoLive}
             zoomLevel={timelineZoom}
             onZoomChange={setTimelineZoom}
             onMarkerDrag={handleMarkerDrag}
+            onDeleteMarker={handleDeleteMarker}
           />
         </div>
 
@@ -1065,86 +1024,16 @@ export default function Workbench() {
           {/* 录制设置 */}
           <RecordSettings />
 
-          {/* 导出队列 */}
-          <ExportQueue
-            jobs={exportJobs}
-            onCancel={handleCancelJob}
-            onRetry={handleRetryJob}
-            onRemove={handleRemoveJob}
-            onOpenFolder={handleOpenExportFolder}
-            onClearCompleted={handleClearCompleted}
-          />
-
           {/* 切片列表 */}
           <ClipList
             clips={clips}
             onDelete={handleDeleteClip}
             onExport={handleExportClip}
+            onOpenFile={handleOpenExportFile}
+            onOpenFolder={handleOpenExportFolder}
           />
         </div>
       </div>
-
-      {/* 最近切片栏 */}
-      {recentClips.length > 0 && (
-        <div style={{
-          padding: '12px 24px',
-          background: 'var(--bg-secondary)',
-          borderTop: '1px solid var(--border-default)',
-          flexShrink: 0,
-          maxHeight: 120,
-          overflow: 'hidden',
-        }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>最近切片</div>
-          <div
-            role="list"
-            style={{
-              display: 'flex',
-              gap: 12,
-              overflowX: 'auto',
-              paddingBottom: 4,
-            }}
-          >
-            {recentClips.map((clip, index) => {
-              const room = rooms.find(r => r.room_id === clip.room_id)
-              const roomName = clip.room_name || room?.streamer_name || '未知房间'
-              return (
-                <div
-                  key={`${clip.room_id}-${clip.start}-${index}`}
-                  role="listitem"
-                  tabIndex={0}
-                  onClick={() => handleRecentClipClick(clip)}
-                  onKeyDown={(e) => {
-                    // Enter/Space 触发与点击相同的主操作
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault()
-                      handleRecentClipClick(clip)
-                    }
-                  }}
-                  style={{
-                    minWidth: 180,
-                    padding: '10px 12px',
-                    background: 'var(--bg-primary)',
-                    borderRadius: 8,
-                    border: '1px solid var(--border-default)',
-                    cursor: 'pointer',
-                    flexShrink: 0,
-                  }}
-                >
-                  <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 6, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {roomName}
-                  </div>
-                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                    {formatTime(clip.start)} - {formatTime(clip.end)}
-                  </div>
-                  <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
-                    时长 {formatTime(clip.end - clip.start)}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
 
       {/* 导出预览弹窗 */}
       <Modal

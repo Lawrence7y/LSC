@@ -51,7 +51,7 @@ function pushSettingsToRenderer() {
   }
 }
 function getBackendDir() {
-  const devBackend = path.join(process.cwd(), "..", "python-backend");
+  const devBackend = path.join(__dirname, "../../../python-backend");
   if (fs.existsSync(devBackend)) {
     return devBackend;
   }
@@ -265,6 +265,7 @@ function killBackend() {
 function createTray() {
   let image = electron.nativeImage.createEmpty();
   const iconCandidates = [
+    path.join(__dirname, "../../assets/icon.ico"),
     path.join(__dirname, "../../build/icon.png"),
     path.join(__dirname, "../../build/icon.ico"),
     path.join(process.resourcesPath, "icon.png")
@@ -397,12 +398,12 @@ function createWindow() {
     height: 920,
     minWidth: 1360,
     minHeight: 800,
+    icon: path.join(__dirname, "../../assets/icon.ico"),
     webPreferences: {
       preload: path.join(__dirname, "../preload/preload.js"),
       contextIsolation: true,
       nodeIntegration: false
     },
-    // hiddenInset 仅 macOS 有效，其他平台使用默认标题栏
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     show: false
   });
@@ -410,7 +411,7 @@ function createWindow() {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
     mainWindow.webContents.openDevTools();
   } else {
-    mainWindow.loadFile(path.join(__dirname, "../dist/index.html"));
+    mainWindow.loadFile(path.join(__dirname, "../../dist/index.html"));
   }
   mainWindow.once("ready-to-show", () => {
     mainWindow == null ? void 0 : mainWindow.show();

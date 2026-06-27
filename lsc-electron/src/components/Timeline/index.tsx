@@ -16,6 +16,7 @@ interface TimelineProps {
   onMarkIn: () => void
   onMarkOut: () => void
   onMarkerDrag?: (type: 'in' | 'out', time: number) => void
+  onDeleteMarker?: (type: 'in' | 'out') => void
   buffered?: number
   clips?: TimelineClip[]
   height?: number
@@ -25,7 +26,7 @@ interface TimelineProps {
 
 const DEFAULT_CLIP_COLOR = 'rgba(52, 199, 89, 0.25)'
 const SNAP_THRESHOLD = 0.5
-const TICK_INTERVALS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600]
+const TICK_INTERVALS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 14400, 21600, 43200]
 
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600)
@@ -100,6 +101,7 @@ export function Timeline({
   onMarkIn,
   onMarkOut,
   onMarkerDrag,
+  onDeleteMarker,
   buffered = 0,
   clips = [],
   height = 60,
@@ -112,6 +114,8 @@ export function Timeline({
   const [draggingMarker, setDraggingMarker] = useState<'in' | 'out' | null>(null)
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const [trackWidth, setTrackWidth] = useState(800)
+  const rafRef = useRef<number | null>(null)
+  const pendingTimeRef = useRef<number | null>(null)
 
   const zoom = zoomLevel
   const effectiveDuration = useMemo(() => Math.max(duration || 1, 1), [duration])
@@ -127,7 +131,7 @@ export function Timeline({
   }, [])
 
   const tickInterval = useMemo(
-    () => chooseTickInterval(effectiveDuration, zoom, 80, trackWidth * zoom),
+    () => chooseTickInterval(effectiveDuration, zoom, 120, trackWidth),
     [effectiveDuration, zoom, trackWidth]
   )
 
@@ -164,20 +168,31 @@ export function Timeline({
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const time = getTimeFromX(e.clientX)
     setHoverTime(time)
-    if (draggingMarker && onMarkerDrag) {
-      const snapped = snapTime(time)
-      onMarkerDrag(draggingMarker, snapped)
-      return
-    }
-    if (isDragging) {
-      const snapped = snapTime(time)
-      onSeek(snapped)
-    }
+    pendingTimeRef.current = time
+    if (rafRef.current !== null) return
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null
+      const t = pendingTimeRef.current
+      if (t === null) return
+      if (draggingMarker && onMarkerDrag) {
+        const snapped = snapTime(t)
+        onMarkerDrag(draggingMarker, snapped)
+        return
+      }
+      if (isDragging) {
+        const snapped = snapTime(t)
+        onSeek(snapped)
+      }
+    })
   }, [getTimeFromX, isDragging, onSeek, snapTime, draggingMarker, onMarkerDrag])
 
   const handleMouseUp = useCallback(() => {
     setIsDragging(false)
     setDraggingMarker(null)
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
   }, [])
 
   const handleMouseLeave = useCallback(() => {
@@ -303,7 +318,14 @@ export function Timeline({
                 className="lsc-timeline__marker lsc-timeline__marker--in"
                 style={{ left: `${markerInPct}%` }}
                 onMouseDown={(e) => handleMarkerMouseDown(e, 'in')}
-              />
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onDeleteMarker?.('in')
+                }}
+              >
+                <span className="lsc-timeline__marker-label">入 {markIn !== null ? formatTime(markIn) : ''}</span>
+              </div>
             )}
 
             {markerOutPct !== null && (
@@ -311,7 +333,14 @@ export function Timeline({
                 className="lsc-timeline__marker lsc-timeline__marker--out"
                 style={{ left: `${markerOutPct}%` }}
                 onMouseDown={(e) => handleMarkerMouseDown(e, 'out')}
-              />
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  onDeleteMarker?.('out')
+                }}
+              >
+                <span className="lsc-timeline__marker-label">出 {markOut !== null ? formatTime(markOut) : ''}</span>
+              </div>
             )}
 
             <div className="lsc-timeline__playhead" style={{ left: `${progressPct}%` }} />

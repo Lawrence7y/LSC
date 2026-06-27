@@ -6,7 +6,6 @@ import {
   PauseCircleOutlined,
   StepForwardOutlined,
   ScissorOutlined,
-  FullscreenOutlined,
   AimOutlined,
   SyncOutlined,
   ThunderboltOutlined,
@@ -31,12 +30,12 @@ interface ControlBarProps {
   onMarkIn: () => void
   onMarkOut: () => void
   onAddClip: () => void
-  onFullscreen: () => void
   onToggleLoop?: () => void
   onGoLive?: () => void
   zoomLevel?: number
   onZoomChange?: (zoom: number) => void
   onMarkerDrag?: (type: 'in' | 'out', time: number) => void
+  onDeleteMarker?: (type: 'in' | 'out') => void
 }
 
 /**
@@ -54,13 +53,13 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (prev.onMarkIn !== next.onMarkIn) return false
   if (prev.onMarkOut !== next.onMarkOut) return false
   if (prev.onAddClip !== next.onAddClip) return false
-  if (prev.onFullscreen !== next.onFullscreen) return false
   if (prev.onToggleLoop !== next.onToggleLoop) return false
   if (prev.previewPos !== next.previewPos) return false
   if (prev.zoomLevel !== next.zoomLevel) return false
   if (prev.onZoomChange !== next.onZoomChange) return false
   if (prev.onGoLive !== next.onGoLive) return false
   if (prev.onMarkerDrag !== next.onMarkerDrag) return false
+  if (prev.onDeleteMarker !== next.onDeleteMarker) return false
 
   const a = prev.room
   const b = next.room
@@ -89,12 +88,12 @@ export const ControlBar = memo(function ControlBar({
   onMarkIn,
   onMarkOut,
   onAddClip,
-  onFullscreen,
   onToggleLoop,
   onGoLive,
   zoomLevel = 1,
   onZoomChange,
   onMarkerDrag,
+  onDeleteMarker,
 }: ControlBarProps) {
   // 录制中时每秒刷新一次时间显示，非录制时不触发
   const [tick, setTick] = useState(0)
@@ -176,6 +175,7 @@ export const ControlBar = memo(function ControlBar({
         onMarkIn={onMarkIn}
         onMarkOut={onMarkOut}
         onMarkerDrag={onMarkerDrag}
+        onDeleteMarker={onDeleteMarker}
         height={60}
         zoomLevel={zoomLevel}
         onZoomChange={onZoomChange}
@@ -286,14 +286,6 @@ export const ControlBar = memo(function ControlBar({
               添加切片
             </Button>
           </Tooltip>
-          <Tooltip title="全屏预览">
-            <Button 
-              type="text" size="small"
-              icon={<FullscreenOutlined />}
-              onClick={onFullscreen}
-              disabled={isDisabled}
-            />
-          </Tooltip>
           {onToggleLoop && (
             <Tooltip title={loopPreview ? '停止试听选区' : '试听选区（循环播放入/出点）'}>
               <Button
@@ -304,36 +296,6 @@ export const ControlBar = memo(function ControlBar({
                 disabled={!hasSelection}
               />
             </Tooltip>
-          )}
-          {onZoomChange && (
-            <Space size={0}>
-              <Tooltip title="缩小">
-                <Button
-                  type="text" size="small"
-                  icon={<ZoomOutOutlined />}
-                  onClick={() => onZoomChange(Math.max(1, zoomLevel / 1.5))}
-                  disabled={zoomLevel <= 1}
-                />
-              </Tooltip>
-              <span style={{ fontSize: 11, color: 'var(--text-tertiary)', minWidth: 32, textAlign: 'center' }}>
-                {zoomLevel.toFixed(1)}x
-              </span>
-              <Tooltip title="放大">
-                <Button
-                  type="text" size="small"
-                  icon={<ZoomInOutlined />}
-                  onClick={() => onZoomChange(Math.min(20, zoomLevel * 1.5))}
-                />
-              </Tooltip>
-              <Tooltip title="重置缩放">
-                <Button
-                  type="text" size="small"
-                  icon={<CompressOutlined />}
-                  onClick={() => onZoomChange(1)}
-                  disabled={zoomLevel === 1}
-                />
-              </Tooltip>
-            </Space>
           )}
           {onZoomChange && (
             <>

@@ -1,80 +1,11 @@
 import { useEffect, useState, useCallback } from 'react'
-import { Card, Select, InputNumber, Space, Button, message, Tooltip } from 'antd'
+import { Card, Select, Slider, Space, Button, message } from 'antd'
 import { FolderOpenOutlined, SaveOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { RecordSettings as RecordSettingsType } from '@/types'
 
 const { Option } = Select
-
-interface ChipOption<T extends string> {
-  value: T
-  label: string
-  tooltip?: string
-}
-
-function ChipGroup<T extends string>({
-  options,
-  value,
-  onChange,
-}: {
-  options: ChipOption<T>[]
-  value: T
-  onChange: (value: T) => void
-}) {
-  return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-      {options.map((opt) => (
-        <Tooltip key={opt.value} title={opt.tooltip} placement="top">
-          <Button
-            size="small"
-            type={value === opt.value ? 'primary' : 'default'}
-            onClick={() => onChange(opt.value)}
-            style={{ borderRadius: 14, minWidth: 64 }}
-          >
-            {opt.label}
-          </Button>
-        </Tooltip>
-      ))}
-    </div>
-  )
-}
-
-const qualityOptions: ChipOption<string>[] = [
-  { value: '原画', label: '原画', tooltip: '直接拷贝直播流，不重新编码，画质无损但文件较大' },
-  { value: '蓝光', label: '蓝光', tooltip: '优先选择平台最高清晰度，画质最佳' },
-  { value: '超清', label: '超清', tooltip: '选择平台提供的超清画质流' },
-  { value: '高清', label: '高清', tooltip: '重编码或选择高清分辨率，平衡画质与体积' },
-  { value: '流畅', label: '流畅', tooltip: '低码率编码或选择标清流，适合网络条件差时使用' },
-]
-
-const encoderOptions: ChipOption<string>[] = [
-  {
-    value: 'libx264',
-    label: 'libx264',
-    tooltip: 'H.264 CPU 软编码：兼容性最好，CPU 占用较高',
-  },
-  {
-    value: 'libx265',
-    label: 'libx265',
-    tooltip: 'H.265 CPU 软编码：文件体积更小，但兼容性较差且 CPU 占用高',
-  },
-  {
-    value: 'copy',
-    label: 'copy',
-    tooltip: '直接拷贝直播流：速度最快、画质无损，但无法精确剪辑',
-  },
-  {
-    value: 'h264_nvenc',
-    label: 'h264_nvenc',
-    tooltip: 'NVIDIA GPU 硬编码：CPU 占用低、速度快，需要 NVIDIA 显卡',
-  },
-  {
-    value: 'hevc_nvenc',
-    label: 'hevc_nvenc',
-    tooltip: 'NVIDIA GPU HEVC 硬编码：文件体积更小，需要 NVIDIA 显卡',
-  },
-]
 
 export function RecordSettings() {
   const { isConnected, send } = useWebSocket()
@@ -134,92 +65,99 @@ export function RecordSettings() {
         background: 'var(--bg-secondary)',
       }}
     >
-      {/* 画质预设 */}
-      <div style={{ marginBottom: 12 }}>
-        <Tooltip title="选择录制使用的直播流清晰度或重编码目标画质">
-          <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 4, display: 'inline-block' }}>
-            画质预设
-          </div>
-        </Tooltip>
-        <ChipGroup
-          options={qualityOptions}
+      {/* 画质预设（标签和下拉框同一行） */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flexShrink: 0, width: 36 }}>画质</span>
+        <Select
           value={settings.quality}
           onChange={(v) => update('quality', v)}
-        />
+          style={{ flex: 1 }}
+          size="small"
+        >
+          <Option value="原画">原画（直接拷贝，画质无损）</Option>
+          <Option value="蓝光">蓝光（平台最高清晰度）</Option>
+          <Option value="超清">超清（超清画质流）</Option>
+          <Option value="高清">高清（平衡画质与体积）</Option>
+          <Option value="流畅">流畅（低码率，网络差）</Option>
+        </Select>
       </div>
 
-      {/* 编码器 */}
-      <div style={{ marginBottom: 12 }}>
-        <Tooltip title="编码器决定使用 CPU 还是 GPU 进行编码，以及输出文件的兼容性和体积">
-          <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 4, display: 'inline-block' }}>
-            编码器
-          </div>
-        </Tooltip>
-        <ChipGroup
-          options={encoderOptions}
+      {/* 编码器（标签和下拉框同一行） */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flexShrink: 0, width: 36 }}>编码器</span>
+        <Select
           value={settings.encoder}
           onChange={(v) => update('encoder', v)}
-        />
+          style={{ flex: 1 }}
+          size="small"
+        >
+          <Option value="libx264">libx264（CPU 软编，兼容好）</Option>
+          <Option value="libx265">libx265（CPU HEVC，体积小）</Option>
+          <Option value="copy">copy（直接拷贝，最快）</Option>
+          <Option value="h264_nvenc">h264_nvenc（NVIDIA GPU）</Option>
+          <Option value="hevc_nvenc">hevc_nvenc（NVIDIA HEVC）</Option>
+        </Select>
       </div>
 
       {/* 编码参数 */}
-      <div style={{ marginBottom: 12 }}>
-        <Tooltip title="CRF 按恒定质量编码（画质优先），码率限制按固定码率编码（大小可控）">
-          <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 4, display: 'inline-block' }}>
-            编码参数
-          </div>
-        </Tooltip>
-        <Select
-          value={settings.param_mode}
-          onChange={(v) => update('param_mode', v)}
-          style={{ width: '100%', marginBottom: 8 }}
-          size="small"
-        >
-          <Option value="CRF 质量">CRF 质量 - 值越小质量越高</Option>
-          <Option value="码率限制">码率限制 - 固定码率编码</Option>
-          <Option value="不限制">不限制 - 不设编码参数上限</Option>
-        </Select>
-
-        {settings.param_mode === 'CRF 质量' && settings.encoder !== 'copy' && (
-          <Space style={{ width: '100%' }}>
-            <Tooltip title="CRF 数值越小画质越好、文件越大；数值越大文件越小、画质越低">
-              <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>CRF:</span>
-            </Tooltip>
-            <InputNumber
-              value={settings.crf}
-              onChange={(v) => update('crf', v ?? 23)}
-              min={0}
-              max={51}
-              size="small"
-              style={{ width: 80 }}
-            />
-            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-              (18=高质量 23=默认 28=小体积)
-            </span>
-          </Space>
-        )}
-
-        {settings.param_mode === '码率限制' && settings.encoder !== 'copy' && (
-          <Space style={{ width: '100%' }}>
-            <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>码率:</span>
-            <InputNumber
-              value={parseInt(settings.bitrate) || 0}
-              onChange={(v) => update('bitrate', String(v ?? 8000))}
-              min={100}
-              max={100000}
-              size="small"
-              style={{ width: 100 }}
-            />
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 4 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 2 }}>编码参数</div>
             <Select
-              value={settings.bitrate_unit}
-              onChange={(v) => update('bitrate_unit', v)}
+              value={settings.param_mode}
+              onChange={(v) => update('param_mode', v)}
+              style={{ width: '100%' }}
               size="small"
-              style={{ width: 80 }}
             >
-              <Option value="kbps">kbps</Option>
-              <Option value="Mbps">Mbps</Option>
+              <Option value="CRF 质量">CRF 质量</Option>
+              <Option value="码率限制">码率限制</Option>
+              <Option value="不限制">不限制</Option>
             </Select>
-          </Space>
+          </div>
+          {settings.param_mode === '码率限制' && settings.encoder !== 'copy' && (
+            <div style={{ flex: 1, display: 'flex', gap: 4 }}>
+              <Select
+                value={settings.bitrate_unit}
+                onChange={(v) => update('bitrate_unit', v)}
+                style={{ width: 80 }}
+                size="small"
+              >
+                <Option value="kbps">kbps</Option>
+                <Option value="Mbps">Mbps</Option>
+              </Select>
+              <Select
+                value={String(settings.bitrate)}
+                onChange={(v) => update('bitrate', v)}
+                style={{ flex: 1 }}
+                size="small"
+              >
+                {[1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000, 20000].map(b => (
+                  <Option key={b} value={String(b)}>{b}</Option>
+                ))}
+              </Select>
+            </div>
+          )}
+        </div>
+
+        {/* CRF Slider */}
+        {settings.param_mode === 'CRF 质量' && settings.encoder !== 'copy' && (
+          <div style={{ padding: '0 4px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-tertiary)' }}>
+              <span>18（小体积）</span>
+              <span style={{ fontWeight: 600, color: 'var(--brand-400)' }}>CRF {settings.crf}</span>
+              <span>28（高质量）</span>
+            </div>
+            <Slider
+              min={18}
+              max={28}
+              value={settings.crf}
+              onChange={(v) => update('crf', v)}
+              marks={{ 18: '', 23: '23', 28: '' }}
+              tooltip={{ open: false }}
+              style={{ width: '100%', margin: '4px 0' }}
+            />
+          </div>
         )}
       </div>
 

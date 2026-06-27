@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
-import { Layout, Menu, Badge, Button, Tooltip } from 'antd'
+import { Layout, Menu, Badge, Button } from 'antd'
 import {
   HomeOutlined,
   DesktopOutlined,
@@ -128,20 +128,17 @@ export default function MainLayout() {
           padding: '20px 16px 24px',
           borderBottom: '1px solid var(--border-default)',
         }}>
-          <div style={{
-            width: 32,
-            height: 32,
-            borderRadius: 8,
-            background: 'var(--brand-500)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
-          }}>
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--text-50)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/>
-            </svg>
-          </div>
+          <img 
+            src="/assets/logo.png" 
+            alt="LSC Logo" 
+            style={{
+              width: 32,
+              height: 32,
+              borderRadius: 8,
+              objectFit: 'cover',
+              flexShrink: 0,
+            }} 
+          />
           <div>
             <div style={{
               fontSize: 15,
@@ -176,44 +173,26 @@ export default function MainLayout() {
 
         {/* Footer */}
         <div style={{
-          padding: '12px 0 16px',
+          padding: '10px 0 14px',
           borderTop: '1px solid var(--border-default)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: 6,
         }}>
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            padding: '8px 16px',
-            margin: '0 8px',
-            borderRadius: 6,
-            cursor: 'default',
-            color: isConnected ? 'var(--state-success)' : 'var(--state-error)',
-            fontSize: 13,
-            transition: 'background 0.15s ease',
-          }}>
-            <Badge
-              status={isConnected ? 'success' : 'error'}
-              text={isConnected ? '已连接后端' : '后端未连接'}
-            />
-          </div>
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: '4px 16px 0',
-          }}>
-            <Tooltip title={appSettings.theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}>
-              <Button
-                type="text"
-                size="small"
-                icon={<BulbOutlined />}
-                onClick={handleToggleTheme}
-                style={{ color: 'var(--text-50)' }}
-              >
-                {appSettings.theme === 'dark' ? '浅色' : '深色'}
-              </Button>
-            </Tooltip>
-          </div>
+          <Badge
+            status={isConnected ? 'success' : 'error'}
+            text={<span style={{ fontSize: 12, color: isConnected ? 'var(--state-success)' : 'var(--state-error)' }}>{isConnected ? '已连接' : '未连接'}</span>}
+          />
+          <Button
+            type="text"
+            size="small"
+            icon={<BulbOutlined />}
+            onClick={handleToggleTheme}
+            style={{ color: 'var(--text-50)', fontSize: 12 }}
+          >
+            {appSettings.theme === 'dark' ? '浅色' : '深色'}
+          </Button>
         </div>
       </Sider>
 

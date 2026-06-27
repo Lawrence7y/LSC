@@ -64,13 +64,10 @@ function pushSettingsToRenderer(): void {
 // ===== Python 后端管理 =====
 
 function getBackendDir(): string {
-  // 注意：vite-plugin-electron dev 模式下 app.isPackaged 会误判为 true，
-  // 因此不能依赖 app.isPackaged 区分环境。直接检查路径是否存在更可靠。
-  const devBackend = path.join(process.cwd(), '..', 'python-backend')
+  const devBackend = path.join(__dirname, '../../../python-backend')
   if (fs.existsSync(devBackend)) {
     return devBackend
   }
-  // 打包环境：python-backend 已通过 extraResources 打包到 resources 目录
   return path.join(process.resourcesPath, 'python-backend')
 }
 
@@ -320,6 +317,7 @@ function createTray(): void {
 
   // 尝试多个图标路径兜底
   const iconCandidates = [
+    path.join(__dirname, '../../assets/icon.ico'),
     path.join(__dirname, '../../build/icon.png'),
     path.join(__dirname, '../../build/icon.ico'),
     path.join(process.resourcesPath, 'icon.png'),
@@ -475,22 +473,21 @@ function createWindow() {
     height: 920,
     minWidth: 1360,
     minHeight: 800,
+    icon: path.join(__dirname, '../../assets/icon.ico'),
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
-    // hiddenInset 仅 macOS 有效，其他平台使用默认标题栏
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     show: false,
   })
 
-  // 开发环境加载 Vite 开发服务器
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
     mainWindow.webContents.openDevTools()
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
+    mainWindow.loadFile(path.join(__dirname, '../../dist/index.html'))
   }
 
   mainWindow.once('ready-to-show', () => {

@@ -1,30 +1,29 @@
 import { Card, List, Button, Space, Tag, Empty } from 'antd'
-import { DeleteOutlined, ExportOutlined } from '@ant-design/icons'
+import { DeleteOutlined, ExportOutlined, FolderOpenOutlined, FolderOutlined } from '@ant-design/icons'
 import { ClipSegment } from '@/types'
 import { formatTime } from '@/utils/time'
 
 interface ClipListProps {
   clips: ClipSegment[]
   onDelete: (index: number) => void
-  onExport: (clip: ClipSegment) => void
+  onExport: (clip: ClipSegment, index: number) => void
+  onOpenFile?: (path: string) => void
+  onOpenFolder?: (path: string) => void
 }
 
-// 本地独有：以「X分Y秒」形式展示时长（与 RoomCard 的 HH:MM:SS 用途不同，故未抽到 utils）
 function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60)
   const s = Math.floor(seconds % 60)
-  if (m > 0) {
-    return `${m}分${s}秒`
-  }
+  if (m > 0) return `${m}分${s}秒`
   return `${s}秒`
 }
 
-export function ClipList({ clips, onDelete, onExport }: ClipListProps) {
+export function ClipList({ clips, onDelete, onExport, onOpenFile, onOpenFolder }: ClipListProps) {
   return (
-    <Card 
-      size="small" 
+    <Card
+      size="small"
       title="切片列表"
-      style={{ 
+      style={{
         margin: '8px 16px 16px',
         flex: 1,
         overflow: 'hidden',
@@ -32,12 +31,12 @@ export function ClipList({ clips, onDelete, onExport }: ClipListProps) {
         flexDirection: 'column',
         background: 'var(--bg-secondary)',
       }}
-      styles={{ 
-        body: { 
-          flex: 1, 
+      styles={{
+        body: {
+          flex: 1,
           overflow: 'auto',
           padding: '0 8px 8px',
-        } 
+        }
       }}
       extra={
         <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
@@ -46,8 +45,8 @@ export function ClipList({ clips, onDelete, onExport }: ClipListProps) {
       }
     >
       {clips.length === 0 ? (
-        <Empty 
-          image={Empty.PRESENTED_IMAGE_SIMPLE} 
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
           description="暂无切片"
           style={{ margin: '20px 0' }}
         />
@@ -56,7 +55,7 @@ export function ClipList({ clips, onDelete, onExport }: ClipListProps) {
           dataSource={clips}
           renderItem={(clip, index) => (
             <List.Item
-              style={{ 
+              style={{
                 padding: '8px 12px',
                 background: 'var(--bg-tertiary)',
                 borderRadius: 6,
@@ -64,8 +63,8 @@ export function ClipList({ clips, onDelete, onExport }: ClipListProps) {
               }}
             >
               <div style={{ width: '100%' }}>
-                <div style={{ 
-                  display: 'flex', 
+                <div style={{
+                  display: 'flex',
                   justifyContent: 'space-between',
                   alignItems: 'center',
                   marginBottom: 4,
@@ -74,23 +73,40 @@ export function ClipList({ clips, onDelete, onExport }: ClipListProps) {
                     {clip.label}
                   </span>
                   <Space size={4}>
-                    <Button 
-                      type="text" 
-                      size="small" 
-                      icon={<ExportOutlined />}
-                      onClick={() => onExport(clip)}
-                    />
-                    <Button 
-                      type="text" 
-                      size="small" 
+                    {clip.exported && clip.outputPath ? (
+                      <>
+                        <Button
+                          type="text"
+                          size="small"
+                          icon={<FolderOpenOutlined />}
+                          onClick={() => onOpenFile?.(clip.outputPath!)}
+                        />
+                        <Button
+                          type="text"
+                          size="small"
+                          icon={<FolderOutlined />}
+                          onClick={() => onOpenFolder?.(clip.outputPath!)}
+                        />
+                      </>
+                    ) : (
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<ExportOutlined />}
+                        onClick={() => onExport(clip, index)}
+                      />
+                    )}
+                    <Button
+                      type="text"
+                      size="small"
                       icon={<DeleteOutlined />}
                       danger
                       onClick={() => onDelete(index)}
                     />
                   </Space>
                 </div>
-                <div style={{ 
-                  fontSize: 12, 
+                <div style={{
+                  fontSize: 12,
                   color: 'var(--text-tertiary)',
                   display: 'flex',
                   gap: 8,
@@ -99,6 +115,9 @@ export function ClipList({ clips, onDelete, onExport }: ClipListProps) {
                   <Tag style={{ margin: 0 }}>
                     {formatDuration(clip.end - clip.start)}
                   </Tag>
+                  {clip.exported && (
+                    <Tag color="green" style={{ margin: 0 }}>已导出</Tag>
+                  )}
                 </div>
               </div>
             </List.Item>

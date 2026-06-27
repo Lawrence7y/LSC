@@ -37,6 +37,8 @@ export interface ClipSegment {
   thumbnail_path?: string
   room_id?: string
   room_name?: string
+  exported?: boolean
+  outputPath?: string
 }
 
 // 流信息
