@@ -103,6 +103,38 @@ def extract_ssr_data(html: str) -> dict[str, object]:
                 return current.strip()
         return ""
 
+    def find_value_by_path(obj: object, path: str) -> str:
+        parts = path.split(".")
+        _INVALID_VALUES = {"", "$undefined", "undefined", "null", "None", "0", "false", "False"}
+
+        def search(current: object, part_idx: int) -> str:
+            if part_idx == len(parts):
+                if isinstance(current, (str, int, float)):
+                    val = str(current).strip()
+                    if val and val not in _INVALID_VALUES:
+                        return val
+                return ""
+
+            part = parts[part_idx]
+
+            if isinstance(current, dict):
+                if part in current:
+                    val = search(current[part], part_idx + 1)
+                    if val:
+                        return val
+                for v in current.values():
+                    val = search(v, part_idx)
+                    if val:
+                        return val
+            elif isinstance(current, list):
+                for item in current:
+                    val = search(item, part_idx)
+                    if val:
+                        return val
+            return ""
+
+        return search(obj, 0)
+
     def is_valid_url(value: object) -> bool:
         return isinstance(value, str) and value.startswith(("http://", "https://"))
 
@@ -111,12 +143,13 @@ def extract_ssr_data(html: str) -> dict[str, object]:
     available_qualities = info["availableQualities"]
     assert isinstance(available_qualities, list)
 
+    # 1. Concatenate all pace_f string payloads
     search_pos = 0
+    chunks = []
     while search_pos < len(html):
         start_idx = html.find(prefix, search_pos)
         if start_idx < 0:
             break
-
         start_idx += len(prefix)
         end_idx = html.find('"])', start_idx)
         if end_idx < 0:
@@ -124,87 +157,158 @@ def extract_ssr_data(html: str) -> dict[str, object]:
         if end_idx < 0:
             search_pos = start_idx
             continue
-
-        json_str = html[start_idx:end_idx]
-        json_str = json_str.replace('\\"', '"')
-        json_str = json_str.replace("\\\\", "\x01")
-        json_str = json_str.replace("\\/", "/")
-        json_str = json_str.replace("\x01", "\\")
-
+        
+        raw_str = html[start_idx:end_idx]
         try:
-            doc = json.loads(json_str)
-        except json.JSONDecodeError:
-            search_pos = end_idx + 3
-            continue
+            decoded = json.loads('"' + raw_str + '"')
+            chunks.append(decoded)
+        except Exception:
+            s = raw_str.replace('\\"', '"').replace('\\/', '/').replace('\\\\', '\\')
+            chunks.append(s)
+            
+        search_pos = end_idx + 3
 
-        root = doc if isinstance(doc, dict) else {}
-        data = root.get("data", {})
-        if not isinstance(data, dict):
-            data = {}
+    full_payload = "".join(chunks)
 
-        if not info["title"]:
-            info["title"] = pick_first(data, title_fields) or pick_first(root, title_fields)
-        if not info["streamerName"]:
-            info["streamerName"] = pick_first(data, streamer_fields) or pick_first(root, streamer_fields)
-        if not info["roomId"]:
-            info["roomId"] = pick_first(data, room_id_fields) or pick_first(root, room_id_fields)
+    # 2. Sequentially parse JSON objects from full_payload using raw_decode
+    decoder = json.JSONDecoder()
+    pos = 0
+    chunk_pattern = re.compile(r'([a-zA-Z0-9_$]+):(?:([HLIMSJTH])([a-f0-9]+)?,)?')
 
-        for quality in quality_keys:
-            if quality in available_qualities:
-                continue
-            main = ((data.get(quality) or {}).get("main") or {}) if isinstance(data.get(quality), dict) else {}
-            flv_url = str(main.get("flv") or "").replace("\\u0026", "&")
-            hls_url = str(main.get("hls") or "").replace("\\u0026", "&")
-            preferred_url = flv_url if is_valid_url(flv_url) else hls_url
-            if not is_valid_url(preferred_url):
-                continue
+    while pos < len(full_payload):
+        match = chunk_pattern.search(full_payload, pos)
+        if not match:
+            break
+        
+        header_end = match.end()
+        start_pos = header_end
+        if start_pos < len(full_payload) and full_payload[start_pos] == ',':
+            start_pos += 1
+            
+        if start_pos < len(full_payload) and full_payload[start_pos] in ('{', '['):
+            try:
+                doc, end_idx = decoder.raw_decode(full_payload, start_pos)
+                
+                # Extract meta info using recursive path finder
+                # Extract meta info using recursive path finder
+                if not info["title"]:
+                    title_paths = [
+                        "roomStore.roomInfo.room.title",
+                        "room.title",
+                        "liveRoom.title",
+                        "liveRoom.name",
+                    ]
+                    for p in title_paths:
+                        val = find_value_by_path(doc, p)
+                        if val and not val.startswith("$"):
+                            info["title"] = val
+                            break
+                            
+                if not info["streamerName"]:
+                    streamer_paths = [
+                        "roomStore.roomInfo.room.owner.nickname",
+                        "roomStore.roomInfo.anchor.nickname",
+                        "owner.nickname",
+                        "anchor.nickname",
+                        "user.nickname",
+                    ]
+                    for p in streamer_paths:
+                        val = find_value_by_path(doc, p)
+                        if val and not val.startswith("$"):
+                            info["streamerName"] = val
+                            break
+                            
+                if not info["roomId"]:
+                    room_id_paths = [
+                        "roomStore.roomInfo.room.id_str",
+                        "room.id_str",
+                        "roomId",
+                        "room_id",
+                    ]
+                    for p in room_id_paths:
+                        val = find_value_by_path(doc, p)
+                        if val and not val.startswith("$"):
+                            info["roomId"] = val
+                            break
 
-            available_qualities.append(quality)
-            quality_urls[quality] = preferred_url
-            if not info["streamUrl"]:
-                info["streamUrl"] = preferred_url
-                info["backupStreamUrl"] = hls_url if is_valid_url(hls_url) else preferred_url
-                info["selectedQuality"] = quality
-                info["isLive"] = True
+                root = doc if isinstance(doc, dict) else {}
+                data = root.get("data", {})
+                if not isinstance(data, dict):
+                    data = {}
 
-        camera_list = data.get("cameraInfoList", [])
-        if isinstance(camera_list, list):
-            for camera in camera_list:
-                if not isinstance(camera, dict):
-                    continue
-                h264 = camera.get("h264Stream", {})
-                if not isinstance(h264, dict):
-                    continue
+                if not info["title"]:
+                    val = pick_first(data, title_fields) or pick_first(root, title_fields)
+                    if val and not val.startswith("$"):
+                        info["title"] = val
+                if not info["streamerName"]:
+                    val = pick_first(data, streamer_fields) or pick_first(root, streamer_fields)
+                    if val and not val.startswith("$"):
+                        info["streamerName"] = val
+                if not info["roomId"]:
+                    val = pick_first(data, room_id_fields) or pick_first(root, room_id_fields)
+                    if val and not val.startswith("$"):
+                        info["roomId"] = val
 
-                hls_pull = str(h264.get("hls_pull_url") or "").replace("\\u0026", "&")
-                if not info["streamUrl"] and is_valid_url(hls_pull):
-                    info["streamUrl"] = hls_pull
-                    info["backupStreamUrl"] = hls_pull
-                    info["selectedQuality"] = "h264_hls"
-                    info["isLive"] = True
-                    quality_urls.setdefault("h264_hls", hls_pull)
-                    if "h264_hls" not in available_qualities:
-                        available_qualities.append("h264_hls")
-
-                hls_map = h264.get("hls_pull_url_map", {})
-                if not isinstance(hls_map, dict):
-                    continue
-                for quality in ["FULL_HD1", "UHD1", "HD1", "SD1", "SD2"]:
+                for quality in quality_keys:
                     if quality in available_qualities:
                         continue
-                    quality_url = str(hls_map.get(quality) or "").replace("\\u0026", "&")
-                    if not is_valid_url(quality_url):
+                    main = ((data.get(quality) or {}).get("main") or {}) if isinstance(data.get(quality), dict) else {}
+                    flv_url = str(main.get("flv") or "").replace("\\u0026", "&")
+                    hls_url = str(main.get("hls") or "").replace("\\u0026", "&")
+                    preferred_url = flv_url if is_valid_url(flv_url) else hls_url
+                    if not is_valid_url(preferred_url):
                         continue
+
                     available_qualities.append(quality)
-                    quality_urls[quality] = quality_url
+                    quality_urls[quality] = preferred_url
                     if not info["streamUrl"]:
-                        info["streamUrl"] = quality_url
+                        info["streamUrl"] = preferred_url
+                        info["backupStreamUrl"] = hls_url if is_valid_url(hls_url) else preferred_url
                         info["selectedQuality"] = quality
                         info["isLive"] = True
-                    if not info["backupStreamUrl"]:
-                        info["backupStreamUrl"] = quality_url
 
-        search_pos = end_idx + 3
+                camera_list = data.get("cameraInfoList", [])
+                if isinstance(camera_list, list):
+                    for camera in camera_list:
+                        if not isinstance(camera, dict):
+                            continue
+                        h264 = camera.get("h264Stream", {})
+                        if not isinstance(h264, dict):
+                            continue
+
+                        hls_pull = str(h264.get("hls_pull_url") or "").replace("\\u0026", "&")
+                        if not info["streamUrl"] and is_valid_url(hls_pull):
+                            info["streamUrl"] = hls_pull
+                            info["backupStreamUrl"] = hls_pull
+                            info["selectedQuality"] = "h264_hls"
+                            info["isLive"] = True
+                            quality_urls.setdefault("h264_hls", hls_pull)
+                            if "h264_hls" not in available_qualities:
+                                available_qualities.append("h264_hls")
+
+                        hls_map = h264.get("hls_pull_url_map", {})
+                        if not isinstance(hls_map, dict):
+                            continue
+                        for quality in ["FULL_HD1", "UHD1", "HD1", "SD1", "SD2"]:
+                            if quality in available_qualities:
+                                continue
+                            quality_url = str(hls_map.get(quality) or "").replace("\\u0026", "&")
+                            if not is_valid_url(quality_url):
+                                continue
+                            available_qualities.append(quality)
+                            quality_urls[quality] = quality_url
+                            if not info["streamUrl"]:
+                                info["streamUrl"] = quality_url
+                                info["selectedQuality"] = quality
+                                info["isLive"] = True
+                            if not info["backupStreamUrl"]:
+                                info["backupStreamUrl"] = quality_url
+
+                pos = end_idx
+                continue
+            except Exception:
+                pass
+        pos = start_pos
 
     if not info["streamUrl"]:
         match = re.search(r'hls_pull_url[^"]*?(https?://pull-hls[^"]+\.m3u8\?expire=\d+\\u0026[^"]+)', html)

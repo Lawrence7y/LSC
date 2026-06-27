@@ -94,9 +94,9 @@ class ExportProfile:
 
         # 码率控制
         if self.rate_mode == "crf":
-            # NVENC 使用 -cq 而非 -crf
+            # NVENC 使用 -cq 而非 -crf，且必须配合 -rc vbr 才生效
             if self.is_hardware:
-                args += ["-cq", str(self.crf)]
+                args += ["-rc", "vbr", "-cq", str(self.crf)]
             else:
                 args += ["-crf", str(self.crf)]
         elif self.rate_mode == "bitrate":

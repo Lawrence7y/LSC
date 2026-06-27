@@ -1,0 +1,6 @@
+Cache keys with electron: [
+  "D:\\Project\\直播切片多人\\_test_electron.js"
+]
+Module.builtinModules: ["electron/js2c/browser_init","electron/js2c/isolated_bundle","electron/js2c/node_init","electron/js2c/renderer_init","electron/js2c/sandbox_bundle","electron/js2c/utility_init","electron/js2c/worker_init"]
+process.versions.electron: 28.3.3
+process.type: undefined

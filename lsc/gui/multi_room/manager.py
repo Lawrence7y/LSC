@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import time as _time
 from collections.abc import Callable
 from datetime import datetime
 from threading import Lock
@@ -147,6 +148,40 @@ class _ConnectWorker(QThread):
             self.connect_finished.emit(self._room_id, False, f"连接被中断: {exc}", None)
 
 
+class _MetadataProbeWorker(QThread):
+    """Background thread for non-blocking ffprobe of stream resolution/fps.
+
+    连接成功后异步探测直播流分辨率与帧率，避免 ffprobe 子进程阻塞 UI。
+    结果通过 ``probe_finished`` 信号回传主线程，由 manager 回填 RoomSession。
+    """
+
+    probe_finished = Signal(str, str, str)  # room_id, resolution, fps
+
+    def __init__(self, room_id: str, stream_url: str, controller: object):
+        super().__init__()
+        self._room_id = room_id
+        self._stream_url = stream_url
+        self._controller = controller
+
+    def run(self):
+        try:
+            if self.isInterruptionRequested():
+                return
+            probe_fn = getattr(self._controller, "probe_stream_metadata", None)
+            if not callable(probe_fn):
+                return
+            resolution, fps = probe_fn(self._stream_url)
+            if self.isInterruptionRequested():
+                return
+            self.probe_finished.emit(self._room_id, resolution, fps)
+        except Exception as exc:
+            _log.debug("Metadata probe failed for room %s: %s", self._room_id, exc)
+            self.probe_finished.emit(self._room_id, "", "")
+        except BaseException as exc:
+            _log.debug("Metadata probe aborted for room %s: %s", self._room_id, exc)
+            self.probe_finished.emit(self._room_id, "", "")
+
+
 class _BatchRecordWorker(QThread):
     """Background thread for non-blocking batch recording start.
 
@@ -216,6 +251,7 @@ class MultiRoomManager(QObject):
         self._preview_factory = preview_factory
         self._rooms: dict[str, RoomSession] = {}
         self._connect_workers: dict[str, _ConnectWorker] = {}
+        self._metadata_probe_workers: dict[str, _MetadataProbeWorker] = {}
         self._batch_record_worker: _BatchRecordWorker | None = None
 
         # Global heartbeat timer — created lazily when QCoreApplication exists
@@ -318,6 +354,12 @@ class MultiRoomManager(QObject):
 
         # Cancel pending async connect
         self._cancel_connect_worker(room_id)
+
+        # Cancel pending metadata probe (avoid late callback into a removed room)
+        probe = self._metadata_probe_workers.pop(room_id, None)
+        if probe is not None and probe.isRunning():
+            probe.requestInterruption()
+            probe.wait(1000)
 
         controller = room.controller
         if controller is not None:
@@ -555,10 +597,40 @@ class MultiRoomManager(QObject):
         if success and info is not None:
             # Reuse the StreamInfo parsed in the worker thread — no second HTTP request.
             self._apply_stream_info(room, info)
+            # 异步探测分辨率/帧率回填详情面板（原详情面板"帧率"恒为 --）。
+            if info.stream_url:
+                self._probe_metadata_async(room_id, info.stream_url)
         else:
             room.set_error(error or "连接失败")
 
         self.room_connect_finished.emit(room_id, success, error)
+
+    def _probe_metadata_async(self, room_id: str, stream_url: str) -> None:
+        """启动后台 ffprobe 探测直播流分辨率/帧率，结果回填 RoomSession。"""
+        room = self.get_room(room_id)
+        if room is None or room.controller is None:
+            return
+        # 若已有探测在跑，先取消旧的
+        existing = self._metadata_probe_workers.pop(room_id, None)
+        if existing is not None and existing.isRunning():
+            existing.requestInterruption()
+            existing.wait(2000)
+        worker = _MetadataProbeWorker(room_id, stream_url, room.controller)
+        worker.probe_finished.connect(self._on_probe_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._metadata_probe_workers[room_id] = worker
+        worker.start()
+
+    def _on_probe_finished(self, room_id: str, resolution: str, fps: str) -> None:
+        """ffprobe 探测完成回调（主线程执行）：回填分辨率/帧率并刷新 UI。"""
+        self._metadata_probe_workers.pop(room_id, None)
+        room = self.get_room(room_id)
+        if room is None:
+            return
+        room.stream_resolution = resolution
+        room.stream_fps = fps
+        self._dirty_connection = True
+
 
     def _apply_stream_info(self, room: RoomSession, info: StreamInfo) -> bool:
         """Apply parsed StreamInfo to room session and controller."""
@@ -640,9 +712,25 @@ class MultiRoomManager(QObject):
         room.preview_paused = False
         room.preview_error = ""
 
-        # Actually play the stream via mpv widget
-        self._play_stream(room)
+        # 播放交由调用方在 widget 嵌入卡片并 reparent/rebind 后触发
+        # （见 play_preview_stream）。此处不抢跑播放：mpv 若绑定到尚未稳定的
+        # HWND，reparent 后句柄变更会导致首帧渲染丢失、画面黑屏。
         return True
+
+    def play_preview_stream(self, room_id: str) -> None:
+        """在 widget 嵌入卡片并完成 rebind 后播放直播流。
+
+        ``start_preview`` 仅创建 widget 并置状态，真正的 ``mpv.play`` 必须在
+        reparent/rebind 之后再触发，否则在 Windows 上 reparent 改变 HWND 会让
+        绑定到旧句柄的播放请求失效，表现为预览黑屏。本方法封装了
+        ``_play_stream``，供 ``MultiRoomPage._on_preview`` 在延迟回调中调用。
+        """
+        room = self.get_room(room_id)
+        if room is None:
+            return
+        if not room.preview_enabled:
+            return
+        self._play_stream(room)
 
     def pause_preview(self, room_id: str) -> bool:
         room = self.get_room(room_id)
@@ -953,7 +1041,10 @@ class MultiRoomManager(QObject):
 
     def start_recording(self, room_id: str, output_dir: str, encoder: str, crf: int,
                         param_mode: str = "CRF 质量", bitrate: str | None = None,
-                        bitrate_unit: str = "kbps") -> bool:
+                        bitrate_unit: str = "kbps",
+                        resolution: str | None = None,
+                        framerate: str | None = None,
+                        audio_bitrate: str | None = None) -> bool:
         room = self.get_room(room_id)
         controller = None if room is None else room.controller
         if room is None or controller is None:
@@ -961,6 +1052,24 @@ class MultiRoomManager(QObject):
         if not room.is_connected:
             room.last_error = "房间未连接"
             return False
+        # Pre-flight disk space check (2GB threshold per project memory constraint)
+        from lsc.gui.pages.recording_controller import RecordingController
+        preflight = RecordingController.preflight_recording(output_dir, concurrent_streams=1)
+        if preflight:
+            # 默认目录不可写或空间不足，回退到 ~/.lsc/output（用户主目录，通常可写）
+            fallback_base = os.path.join(os.path.expanduser('~'), '.lsc', 'output')
+            if os.path.abspath(fallback_base) != os.path.abspath(output_dir):
+                _log.warning("预检失败 %s，回退到 %s", output_dir, fallback_base)
+                fallback_preflight = RecordingController.preflight_recording(fallback_base, concurrent_streams=1)
+                if not fallback_preflight:
+                    output_dir = fallback_base
+                    preflight = ""
+                else:
+                    _log.warning("回退目录预检也失败: %s", fallback_preflight)
+            if preflight:
+                room.last_error = preflight
+                _log.warning("录制预检失败: %s", preflight)
+                return False
         if not self._refresh_room_stream_for_recording(room):
             return False
         stream_url = controller.stream_url
@@ -974,7 +1083,19 @@ class MultiRoomManager(QObject):
         while os.path.exists(room_output_dir):
             room_output_dir = f"{original_room_output_dir}_{suffix}"
             suffix += 1
-        os.makedirs(room_output_dir, exist_ok=True)
+        try:
+            os.makedirs(room_output_dir, exist_ok=True)
+        except OSError:
+            # 默认目录不可写（如沙箱环境），回退到 ~/.lsc/output
+            fallback_base = os.path.join(os.path.expanduser('~'), '.lsc', 'output')
+            fallback_dir = os.path.join(fallback_base, os.path.basename(room_output_dir))
+            _log.warning("录制目录不可写 %s，回退到 %s", room_output_dir, fallback_dir)
+            room_output_dir = fallback_dir
+            try:
+                os.makedirs(room_output_dir, exist_ok=True)
+            except OSError as exc:
+                room.last_error = f"录制目录不可写，请在设置中修改输出目录（{exc.strerror or exc}）"
+                return False
 
         ok, output_path, _encoder_used, error_msg = controller.start_recording_with_crf(
             stream_url,
@@ -985,10 +1106,18 @@ class MultiRoomManager(QObject):
             bitrate=bitrate,
             bitrate_unit=bitrate_unit,
             input_args=input_args or None,
+            resolution=resolution,
+            framerate=framerate,
+            audio_bitrate=audio_bitrate,
         )
         room.is_recording = ok
         room.record_output_path = output_path
         room.record_started_at = datetime.now() if ok else None
+        if ok:
+            import time as _time
+            room.recording_start_mono = getattr(controller, 'recording_start_mono', 0.0) or _time.monotonic()
+        else:
+            room.recording_start_mono = None
         # Mark state changed for UI refresh
         self._dirty_recording = True
         if ok:
@@ -1113,28 +1242,57 @@ class MultiRoomManager(QObject):
 
     def start_export(self, room_id: str, start_sec: float, end_sec: float,
                      output_dir: str, title: str = "",
-                     on_done: Callable[[bool, str, str, float], None] | None = None,
+                     on_done: Callable[[bool, str, str, float, str], None] | None = None,
                      on_progress: Callable[[float, float, float], None] | None = None,
-                     profile: "ExportProfile | None" = None) -> bool:
+                     profile: "ExportProfile | None" = None) -> str:
         """Start async clip export for a room's recording.
 
         Parameters
         ----------
         on_done : callable | None
-            完成回调 ``callback(success: bool, path: str, error: str, size_mb: float)``。
+            完成回调 ``callback(success, path, error, size_mb, thumbnail_path)``。
         on_progress : callable | None
             进度回调 ``callback(percent: float, elapsed: float, total: float)``。
         profile : ExportProfile | None
             编码配置。若为 None 则使用默认配置。
+
+        Returns
+        -------
+        str
+            export_id（非空字符串）表示已启动；空字符串表示启动失败。
+            可传给 :meth:`cancel_export` 取消该任务。
         """
         room = self.get_room(room_id)
         if room is None:
-            return False
+            return ""
         controller = room.controller
         if controller is None:
-            return False
+            return ""
         return controller.start_export(start_sec, end_sec, output_dir, title, on_done,
                                        profile=profile, on_progress=on_progress)
+
+    def cancel_export(self, export_id: str) -> bool:
+        """取消指定 export_id 的导出任务。
+
+        Returns
+        -------
+        bool
+            True 表示已发送 kill 信号；False 表示任务不存在或已结束。
+        """
+        # export_id 可能注册在任意房间的 controller 上，需要遍历查找
+        for room in self._rooms.values():
+            controller = room.controller
+            if controller is None:
+                continue
+            # RecordingController 维护全局 _export_workers，但实例独立
+            # 这里遍历所有 controller 尝试取消
+            if hasattr(controller, 'cancel_export'):
+                try:
+                    if controller.cancel_export(export_id):
+                        return True
+                except Exception:
+                    _log.exception("cancel_export failed for export_id=%s", export_id)
+        return False
 
     # ── Cut ──────────────────────────────────────────────────
 
@@ -1151,7 +1309,6 @@ class MultiRoomManager(QObject):
 
     def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str) -> None:
         """Attempt to reconnect a failed recording with exponential backoff."""
-        import time as _time
         from lsc.utils.error_messages import is_recoverable_error
 
         # Check if error is recoverable
@@ -1297,8 +1454,19 @@ class MultiRoomManager(QObject):
                     error_msg = controller.watchdog_check()
                     if error_msg:
                         _log.warning("Room %s watchdog: %s", room.room_id, error_msg)
-                        self._attempt_recording_reconnect(room, error_msg)
-                        self._dirty_recording = True
+                        # 移入后台线程执行重连，避免 start_recording 的 HTTP 刷新 + FFmpeg 启动阻塞 Qt 主线程
+                        # 项目记忆硬约束：录制启动/预览重连操作必须执行在后台线程
+                        import threading
+                        def _reconnect_in_background(room=room, error_msg=error_msg):
+                            try:
+                                self._attempt_recording_reconnect(room, error_msg)
+                            except Exception as exc:
+                                _log.error("Room %s reconnect failed: %s", room.room_id, exc)
+                            finally:
+                                # 标记 dirty 让下次 tick 刷新 UI（不能在非主线程直接 emit signal）
+                                self._dirty_recording = True
+                        t = threading.Thread(target=_reconnect_in_background, daemon=True)
+                        t.start()
 
             # ── Low-frequency (every 30s): disk space check ──
             if is_low_tick and room.is_recording:

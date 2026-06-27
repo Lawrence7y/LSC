@@ -1,0 +1,6 @@
+process.resourcesPath: D:\Project\直播切片多人\lsc-electron\node_modules\electron\dist\resources
+process.defaultApp: undefined
+asar NOT found: Invalid package D:\Project\直播切片多人\lsc-electron\node_modules\electron\dist\resources\electron.asar
+electron (no node_modules) error: Cannot find module 'electron'
+Require stack:
+- D:\Project\直播切片多人\_test_electron.js

@@ -10,10 +10,10 @@ from typing import ClassVar
 from urllib.parse import urlparse
 
 from .base import (
+    DEFAULT_USER_AGENT,
     ERROR_OFFLINE,
     ERROR_PARSE_FAILED,
     BasePlatformAdapter,
-    DEFAULT_USER_AGENT,
     StreamInfo,
     fetch_json,
     fetch_url,
@@ -66,21 +66,21 @@ class DouyinAdapter(BasePlatformAdapter):
         parsed = urlparse(clean_url)
         host = parsed.netloc.lower()
         path = parsed.path.rstrip("/")
-        
+
         # 用户主页URL - 需要先获取直播间ID
         if host in ("www.douyin.com", "douyin.com"):
             match = _USER_PROFILE_RE.fullmatch(path)
             if match:
                 sec_uid = match.group("sec_uid")
                 return self._parse_user_profile(clean_url, sec_uid)
-            
+
             # 关注直播URL - 提取房间ID
             match = _FOLLOW_LIVE_RE.fullmatch(path)
             if match:
                 room_id = match.group("room_id")
                 live_url = f"https://live.douyin.com/{room_id}"
                 return self._parse_live_room(live_url)
-        
+
         # 直播间URL - 直接解析
         return self._parse_live_room(clean_url)
 
@@ -95,11 +95,11 @@ class DouyinAdapter(BasePlatformAdapter):
                     "该用户未在直播或无法获取直播间信息。",
                     ERROR_OFFLINE,
                 )
-            
+
             # 使用获取到的直播间ID构造直播URL并解析
             live_url = f"https://live.douyin.com/{live_room_id}"
             return self._parse_live_room(live_url)
-            
+
         except Exception as exc:
             return self._failed(url, f"获取用户直播信息失败: {exc}", ERROR_PARSE_FAILED)
 
@@ -123,13 +123,13 @@ class DouyinAdapter(BasePlatformAdapter):
 
         except Exception as exc:
             _log.debug("抖音API获取直播间ID失败: %s", exc)
-        
+
         # 备用方案: 尝试从用户页面HTML中提取
         try:
             return self._extract_room_from_page(sec_uid)
         except Exception as exc:
             _log.debug("抖音页面提取直播间ID失败: %s", exc)
-        
+
         return ""
 
     def _extract_room_from_page(self, sec_uid: str) -> str:
@@ -137,7 +137,7 @@ class DouyinAdapter(BasePlatformAdapter):
         url = f"https://www.douyin.com/user/{sec_uid}"
         try:
             html = fetch_url(url, headers=DOUYIN_HEADERS)
-            
+
             # 尝试从HTML中提取直播间ID
             # 常见模式: "room_id":"123456" 或 roomId:123456
             patterns = [
@@ -145,15 +145,15 @@ class DouyinAdapter(BasePlatformAdapter):
                 r'"roomId"\s*:\s*"?(\d+)"?',
                 r'room_id=(\d+)',
             ]
-            
+
             for pattern in patterns:
                 match = re.search(pattern, html)
                 if match:
                     return match.group(1)
-                    
+
         except Exception as exc:
             _log.debug("抖音页面提取房间号失败: %s", exc)
-        
+
         return ""
 
     def _parse_live_room(self, url: str) -> StreamInfo:
@@ -188,11 +188,57 @@ class DouyinAdapter(BasePlatformAdapter):
         if stream_url and not quality_urls:
             quality_urls = {"origin": stream_url}
 
+        # Fallback: try to extract title / streamer from HTML <title> tag
+        _INVALID = {"", "$undefined", "undefined", "null", "None", "false", "广告投放"}
+        title = str(data.get("title", "") or "")
+        streamer = str(data.get("streamerName", "") or "")
+        room_id = str(data.get("roomId", "") or "")
+
+        if title in _INVALID:
+            title = ""
+        if streamer in _INVALID:
+            streamer = ""
+        if room_id in _INVALID:
+            room_id = ""
+
+        if not title or not streamer:
+            title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+            if title_match:
+                page_title = title_match.group(1).strip()
+                # 过滤无效标题
+                if page_title in _INVALID or len(page_title) < 2:
+                    page_title = ""
+                if page_title:
+                    # 移除常见后缀
+                    for suffix in ["- 抖音直播", "_抖音直播", " - 抖音", "的抖音直播间", "的直播间"]:
+                        if page_title.endswith(suffix):
+                            page_title = page_title[: -len(suffix)].strip()
+                    # 尝试分割主播名和标题
+                    if not title and not streamer:
+                        parts = re.split(r"\s*[-_|｜]\s*", page_title, maxsplit=1)
+                        if len(parts) >= 2 and parts[0].strip() and parts[1].strip():
+                            streamer = parts[0].strip()
+                            title = parts[1].strip()
+                        elif page_title:
+                            title = page_title
+                            streamer = "抖音主播"
+                    elif not title:
+                        title = page_title
+                    elif not streamer:
+                        parts = re.split(r"\s*[-_|｜]\s*", page_title, maxsplit=1)
+                        if parts and parts[0].strip():
+                            streamer = parts[0].strip()
+
+        if not title:
+            title = f"抖音直播 {room_id}" if room_id else "抖音直播"
+        if not streamer:
+            streamer = "抖音主播"
+
         return self._success(
             url,
             stream_url=stream_url,
-            title=str(data.get("title", "") or ""),
-            streamer=str(data.get("streamerName", "") or ""),
+            title=title,
+            streamer=streamer,
             is_live=True,
             quality_urls=quality_urls,
             selected_quality=str(data.get("selectedQuality", "") or next(iter(quality_urls), "")),

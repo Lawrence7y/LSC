@@ -172,6 +172,7 @@ class FullscreenPreview(QObject):
         self._play_btn: _FullscreenIconButton | None = None
         self._mute_btn: QCheckBox | None = None
         self._time_label: QLabel | None = None
+        self._return_live_btn: QPushButton | None = None
         self._controls_height = 74
         self._timer: QTimer | None = None
         self._auto_hide_timer: QTimer | None = None
@@ -249,9 +250,19 @@ class FullscreenPreview(QObject):
 
         self._place_controls(surface, controls)
 
+        # 回直播浮窗按钮（偏离直播边缘时显示在右上角）
+        self._return_live_btn = QPushButton("回直播", surface)
+        self._return_live_btn.setObjectName("returnLiveButton")
+        self._return_live_btn.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._return_live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._return_live_btn.setVisible(False)
+        self._return_live_btn.clicked.connect(self._on_return_live_click)
+        self._place_return_live(surface)
+
         def _surface_resize_event(event) -> None:
             QWidget.resizeEvent(surface, event)
             self._place_controls(surface, controls)
+            self._place_return_live(surface)
 
         surface.resizeEvent = _surface_resize_event
 
@@ -369,7 +380,7 @@ class FullscreenPreview(QObject):
             self._on_seek(int(value))
 
         play_btn.clicked.connect(lambda: self._on_toggle_play())
-        mute_btn.toggled.connect(lambda v: self._on_toggle_mute())
+        mute_btn.toggled.connect(lambda v: self._on_toggle_mute(v))
         progress.valueChanged.connect(_seek)
         self._syncing = syncing
         return controls
@@ -377,22 +388,33 @@ class FullscreenPreview(QObject):
     def _sync_builtin(self) -> None:
         if self._progress is None:
             return
-        duration = max(0.0, float(self._get_duration() or 0.0))
-        position = max(0.0, float(self._get_position() or 0.0))
-        if duration > 0:
-            position = min(position, duration)
-        self._syncing["active"] = True
-        self._progress.setRange(0, max(0, int(duration)))
-        self._progress.setValue(max(0, int(position)))
-        self._syncing["active"] = False
-        if self._time_label is not None:
-            self._time_label.setText(f"{fmt_time(position)} / {fmt_time(duration)}")
-        if self._play_btn is not None:
-            self._play_btn.set_icon_kind("play" if self._is_paused() else "pause")
-        if self._mute_btn is not None:
-            self._mute_btn.blockSignals(True)
-            self._mute_btn.setChecked(bool(self._is_muted()))
-            self._mute_btn.blockSignals(False)
+        try:
+            duration = max(0.0, float(self._get_duration() or 0.0))
+            position = max(0.0, float(self._get_position() or 0.0))
+            if duration > 0:
+                position = min(position, duration)
+            self._syncing["active"] = True
+            self._progress.setRange(0, max(0, int(duration)))
+            self._progress.setValue(max(0, int(position)))
+            self._syncing["active"] = False
+            if self._time_label is not None:
+                self._time_label.setText(f"{fmt_time(position)} / {fmt_time(duration)}")
+            if self._play_btn is not None:
+                self._play_btn.set_icon_kind("play" if self._is_paused() else "pause")
+            if self._mute_btn is not None:
+                self._mute_btn.blockSignals(True)
+                self._mute_btn.setChecked(bool(self._is_muted()))
+                self._mute_btn.blockSignals(False)
+            # 回直播浮窗：偏离直播边缘超过 5 秒时显示
+            if self._return_live_btn is not None:
+                behind = duration - position if duration > 0 else 0
+                self._return_live_btn.setVisible(behind > 5.0)
+        except Exception:
+            # 回调可能引用已销毁的 widget，连续失败时停止定时器避免反复崩溃
+            import logging
+            logging.getLogger(__name__).debug("全屏预览同步失败，停止定时器")
+            if self._timer is not None:
+                self._timer.stop()
 
     def _show_controls(self, controls: QWidget) -> None:
         controls.setVisible(True)
@@ -409,6 +431,25 @@ class FullscreenPreview(QObject):
             self._controls_height,
         )
         controls.raise_()
+
+    def _place_return_live(self, surface: QWidget) -> None:
+        """定位回直播浮窗按钮在 surface 右上角。"""
+        if self._return_live_btn is None:
+            return
+        self._return_live_btn.adjustSize()
+        w = self._return_live_btn.width()
+        h = self._return_live_btn.height()
+        margin = 12
+        self._return_live_btn.setGeometry(surface.width() - w - margin, margin, w, h)
+        self._return_live_btn.raise_()
+
+    def _on_return_live_click(self) -> None:
+        """点击回直播：seek 到最新直播画面。"""
+        duration = max(0.0, float(self._get_duration() or 0.0))
+        if duration > 0:
+            self._on_seek(int(duration))
+        if self._return_live_btn is not None:
+            self._return_live_btn.setVisible(False)
 
     def _minimize(self) -> None:
         if self._win is not None:
@@ -437,6 +478,7 @@ class FullscreenPreview(QObject):
         self._play_btn = None
         self._mute_btn = None
         self._time_label = None
+        self._return_live_btn = None
         self._surface = None
         self._win = None
         # 调用方负责把 widget / controls 放回原容器

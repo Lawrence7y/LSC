@@ -1,11 +1,12 @@
 """撤销/重做基础框架 —— Command 模式 UndoStack。
 
-仅覆盖有破坏性的操作（删除房间、清空切片），不追求全覆盖。
+覆盖有破坏性的操作：删除房间、添加/删除/清空切片片段。
+不追求全覆盖（普通选区调整、连接/录制等不可逆操作不纳入）。
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 
 @dataclass(frozen=True)

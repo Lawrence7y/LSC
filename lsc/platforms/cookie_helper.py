@@ -1,9 +1,9 @@
 """B站直播流Cookie认证支持。"""
+import json
 import logging
 import os
-import json
-import sqlite3
 import shutil
+import sqlite3
 import tempfile
 
 _log = logging.getLogger(__name__)
@@ -95,19 +95,19 @@ def load_cookies_from_file(cookie_file: str) -> dict[str, str]:
     - JSON格式
     """
     cookies = {}
-    
+
     if not os.path.exists(cookie_file):
         return cookies
-    
+
     try:
-        with open(cookie_file, "r", encoding="utf-8") as f:
+        with open(cookie_file, encoding="utf-8") as f:
             content = f.read()
-            
+
         # 尝试JSON格式
         if content.strip().startswith("{"):
             data = json.loads(content)
             return data
-        
+
         # 尝试Netscape格式
         for line in content.split("\n"):
             line = line.strip()
@@ -118,10 +118,10 @@ def load_cookies_from_file(cookie_file: str) -> dict[str, str]:
                 name = parts[5]
                 value = parts[6]
                 cookies[name] = value
-                
+
     except Exception as e:
         _log.warning("读取cookie文件失败: %s", e)
-    
+
     return cookies
 
 
@@ -140,7 +140,7 @@ def get_bilibili_cookies() -> dict[str, str]:
             return json.loads(env_cookies)
         except Exception:
             pass
-    
+
     # 2. 配置文件
     config_dir = os.path.expanduser("~/.lsc/cookies")
     cookie_file = os.path.join(config_dir, "bilibili.json")
@@ -148,13 +148,13 @@ def get_bilibili_cookies() -> dict[str, str]:
         cookies = load_cookies_from_file(cookie_file)
         if cookies:
             return cookies
-    
+
     # 3. 浏览器cookies
     import sys
     cookies = get_chrome_cookies_for_domain("bilibili.com")
     if not cookies:
         cookies = get_edge_cookies_for_domain("bilibili.com")
-    
+
     if sys.platform == "win32":
         if not cookies:
             _log.warning(
@@ -166,7 +166,7 @@ def get_bilibili_cookies() -> dict[str, str]:
                 "检测到浏览器中的B站Cookie值（如 SESSDATA）为空（受Windows浏览器安全加密限制）。"
                 "如需录制高画质流，请使用浏览器插件将Cookie导出为JSON，并保存到 ~/.lsc/cookies/bilibili.json"
             )
-    
+
     return cookies
 
 
@@ -179,11 +179,11 @@ def save_cookies(cookies: dict[str, str], platform: str = "bilibili"):
     """保存cookies到配置文件。"""
     config_dir = os.path.expanduser("~/.lsc/cookies")
     os.makedirs(config_dir, exist_ok=True)
-    
+
     cookie_file = os.path.join(config_dir, f"{platform}.json")
     with open(cookie_file, "w", encoding="utf-8") as f:
         json.dump(cookies, f, indent=2, ensure_ascii=False)
-    
+
     _log.info("Cookies已保存到: %s", cookie_file)
 
 

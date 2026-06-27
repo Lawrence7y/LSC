@@ -3,11 +3,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QPolygonF, QShortcut
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QCheckBox, QPushButton,
+    QCheckBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtGui import QPainter, QColor, QPen, QPolygonF, QShortcut, QKeySequence
-from PySide6.QtCore import Qt, QObject, QTimer, QEvent, QPointF, Signal
 
 from lsc.utils.helpers import fmt_time
 
@@ -102,7 +108,7 @@ class FullscreenPreview(QObject):
     closed = Signal()  # 全屏关闭信号
 
     def __init__(self, room_id: str, widget: QWidget, card: QWidget,
-                 manager: "MultiRoomManager", parent_page: "MultiRoomPage"):
+                 manager: MultiRoomManager, parent_page: MultiRoomPage):
         super().__init__(parent_page)
         self._room_id = room_id
         self._widget = widget

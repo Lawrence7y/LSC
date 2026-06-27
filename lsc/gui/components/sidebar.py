@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QWidget
 
 from lsc.gui.theme import connect_theme_changed, get_theme, is_dark, toggle_theme
 
@@ -18,11 +18,15 @@ _SUN_PATH = "M12 7a5 5 0 100 10 5 5 0 000-10zM2 13h2a1 1 0 001-1 1 1 0 00-1-1H2a
 
 _MOON_PATH = "M9 2a7 7 0 100 14 9 9 0 018.87-7.53A8 8 0 119 2z"
 
-_NAV_ITEMS: list[tuple[str, str, str]] = [
-    ("dashboard", "仪表盘", "M4 5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5zm10 0a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1V5zM4 15a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-4zm10-2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1v-6z"),
-    ("workbench", "工作台", "M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"),
-    ("record", "直播录制", "M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a1 1 0 1 1 0-2h2V6a5 5 0 0 1 10 0v5h2a1 1 0 1 1 0 2h-2z"),
-    ("settings", "设置", "M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7zm7.43-2.53c.04-.32.07-.64.07-.97s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.97l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.66c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.66c.61-.25 1.17-.58 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65z"),
+_LOGO_PATH = (
+    "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 "
+    "14.5v-9l6 4.5-6 4.5z"
+)
+
+_NAV_ITEMS: list[tuple[str, str, str, str]] = [
+    ("dashboard", "仪表盘", "M4 5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5zm10 0a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1V5zM4 15a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-4zm10-2a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1v-6z", "Ctrl+1"),
+    ("workbench", "工作台", "M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5", "Ctrl+2"),
+    ("settings", "设置", "M12 15.5A3.5 3.5 0 1 0 12 8.5a3.5 3.5 0 0 0 0 7zm7.43-2.53c.04-.32.07-.64.07-.97s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.97l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.66c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.66c.61-.25 1.17-.58 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65z", "Ctrl+3"),
 ]
 
 
@@ -48,22 +52,28 @@ def _render_svg_icon(svg_path: str, color: str, size: int = 18) -> QIcon:
 class NavButton(QPushButton):
     """侧边栏导航按钮。"""
 
-    def __init__(self, page_key: str, label: str, svg_path: str, parent=None):
+    def __init__(self, page_key: str, label: str, svg_path: str, shortcut: str = "", parent=None):
         super().__init__(parent)
         self.page_key = page_key
         self._svg_path = svg_path
         self._active = False
         self._hover = False
+        self._shortcut = shortcut
         self.setText(label)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(42)
+        self.setFixedHeight(44)
         self.setObjectName("navButton")
         from PySide6.QtCore import QSize
 
-        self.setIconSize(QSize(18, 18))
+        self.setIconSize(QSize(20, 20))
         self.setProperty("active", False)
         self._refresh_icon()
-        # 状态徽标(如「录制中 N / 错误 M」),默认隐藏
+        self._shortcut_label: QLabel | None = None
+        if shortcut:
+            self._shortcut_label = QLabel(shortcut, self)
+            self._shortcut_label.setObjectName("navShortcut")
+            self._shortcut_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._shortcut_label.setVisible(False)
         self._badge_label = QLabel("", self)
         self._badge_label.setObjectName("navBadge")
         self._badge_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -72,6 +82,29 @@ class NavButton(QPushButton):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._layout_badge()
+        self._layout_shortcut()
+
+    def _layout_shortcut(self) -> None:
+        if self._shortcut_label is None:
+            return
+        if self._active or self._hover:
+            self._shortcut_label.setVisible(True)
+            c = get_theme()
+            self._shortcut_label.setStyleSheet(
+                f"color: {c.text_tertiary}; background: transparent; "
+                f"font-size: 10px; font-family: 'JetBrains Mono', Consolas, monospace;"
+            )
+            self._shortcut_label.adjustSize()
+            sw = self._shortcut_label.width()
+            sh = self._shortcut_label.height()
+            self._shortcut_label.setGeometry(
+                self.width() - sw - 12,
+                (self.height() - sh) // 2,
+                sw, sh
+            )
+            self._shortcut_label.raise_()
+        else:
+            self._shortcut_label.setVisible(False)
 
     def _layout_badge(self) -> None:
         if not self._badge_label.isVisible():
@@ -79,8 +112,8 @@ class NavButton(QPushButton):
         self._badge_label.adjustSize()
         bw = self._badge_label.width()
         bh = self._badge_label.height()
-        # 右侧居中,留 10px 边距
-        self._badge_label.setGeometry(self.width() - bw - 10, (self.height() - bh) // 2, bw, bh)
+        offset = 40 if (self._shortcut_label and self._shortcut_label.isVisible()) else 10
+        self._badge_label.setGeometry(self.width() - bw - offset, (self.height() - bh) // 2, bw, bh)
         self._badge_label.raise_()
 
     def set_badge(self, text: str, *, kind: str = "info") -> None:
@@ -116,11 +149,15 @@ class NavButton(QPushButton):
     def enterEvent(self, event) -> None:
         self._hover = True
         self._refresh_icon()
+        if self._shortcut_label is not None:
+            self._layout_shortcut()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
         self._hover = False
         self._refresh_icon()
+        if self._shortcut_label is not None:
+            self._shortcut_label.setVisible(False)
         super().leaveEvent(event)
 
     def _icon_color(self) -> str:
@@ -182,30 +219,47 @@ class Sidebar(QFrame):
     def _build_ui(self) -> None:
         container = QWidget(self)
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(10, 16, 10, 16)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 12, 8, 12)
+        layout.setSpacing(2)
 
-        # App header
+        # App header — 品牌区
         header = QWidget()
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(8, 0, 8, 12)
-        header_layout.setSpacing(2)
+        header.setObjectName("sidebarBrandHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(6, 2, 6, 10)
+        header_layout.setSpacing(8)
+
+        # Logo 图标
+        self._logo_label = QLabel()
+        self._logo_label.setFixedSize(32, 32)
+        self._logo_label.setObjectName("sidebarLogo")
+        self._refresh_logo()
+
+        # 标题文字区
+        title_box = QWidget()
+        title_layout = QVBoxLayout(title_box)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(1)
         self._header_title = QLabel("LSC")
         self._header_title.setObjectName("sidebarTitle")
         self._header_subtitle = QLabel("直播切片系统")
         self._header_subtitle.setObjectName("sidebarSubtitle")
-        header_layout.addWidget(self._header_title)
-        header_layout.addWidget(self._header_subtitle)
+        title_layout.addWidget(self._header_title)
+        title_layout.addWidget(self._header_subtitle)
+
+        header_layout.addWidget(self._logo_label)
+        header_layout.addWidget(title_box, 1)
         layout.addWidget(header)
 
         sep = QFrame()
         sep.setObjectName("h_line")
         sep.setFixedHeight(1)
         layout.addWidget(sep)
-        layout.addSpacing(8)
+        layout.addSpacing(6)
 
-        for page_key, label, svg_path in _NAV_ITEMS:
-            btn = NavButton(page_key, label, svg_path, self)
+        for item in _NAV_ITEMS:
+            page_key, label, svg_path, shortcut = item
+            btn = NavButton(page_key, label, svg_path, shortcut, self)
             btn.clicked.connect(lambda checked, k=page_key: self._on_nav_click(k))
             self._nav_buttons[page_key] = btn
             layout.addWidget(btn)
@@ -226,9 +280,17 @@ class Sidebar(QFrame):
 
     def _refresh_theme(self) -> None:
         """主题变化时刷新侧边栏图标。"""
+        self._refresh_logo()
         self._theme_button.refresh()
         self._refresh_nav_buttons()
         self.update()
+
+    def _refresh_logo(self) -> None:
+        """刷新 Logo 图标。"""
+        c = get_theme()
+        icon = _render_svg_icon(_LOGO_PATH, c.accent_primary, size=28)
+        pixmap = icon.pixmap(28, 28)
+        self._logo_label.setPixmap(pixmap)
 
     def _on_nav_click(self, page_key: str) -> None:
         self._current_page = page_key

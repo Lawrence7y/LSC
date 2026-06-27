@@ -1,17 +1,16 @@
 """Adapter for Xiaohongshu (小红书/RED) live room URLs."""
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 from urllib.parse import urlparse
 
 from .base import (
+    DEFAULT_USER_AGENT,
     ERROR_OFFLINE,
     ERROR_PARSE_FAILED,
     ERROR_RESTRICTED,
     BasePlatformAdapter,
-    DEFAULT_USER_AGENT,
     StreamInfo,
     fetch_url,
 )

@@ -1,7 +1,7 @@
 """对话框组件 — 导出确认等模态对话框。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -18,7 +18,6 @@ from lsc.config import ExportProfile
 from lsc.gui.components.clip_list import ClipSegment
 from lsc.gui.theme import get_theme
 from lsc.utils.helpers import fmt_time
-
 
 # 编码器选项：(显示名, codec 值)
 _ENCODER_OPTIONS = [
@@ -147,14 +146,13 @@ class ExportConfirmDialog(QDialog):
         btn_row.addStretch()
 
         cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedHeight(36)
+        cancel_btn.setObjectName("btnSecondary")
         cancel_btn.setCursor(Qt.PointingHandCursor)
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(cancel_btn)
 
         confirm_btn = QPushButton("确认导出")
         confirm_btn.setObjectName("btnPrimary")
-        confirm_btn.setFixedHeight(36)
         confirm_btn.setCursor(Qt.PointingHandCursor)
         confirm_btn.clicked.connect(self.accept)
         btn_row.addWidget(confirm_btn)

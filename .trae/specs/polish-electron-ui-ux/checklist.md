@@ -1,0 +1,25 @@
+# Checklist
+
+- [x] Zustand store 已创建并集中管理 rooms、clips、settings、connection
+- [x] Workbench 不再维护本地 rooms 副本，数据从 store 读取
+- [x] Dashboard 统计与工作台完全一致
+- [x] Settings 页面设置保存后有成功反馈
+- [x] WebSocket 消息统一写入 store，页面切换不丢失数据
+- [x] 后端已实现房间配置持久化（save/load rooms）
+- [x] 程序启动后自动恢复已保存的房间列表
+- [x] RoomCard 左上角显示状态 badge（录制中/已连接/未连接/失败）
+- [x] RoomCard 底部显示 2px 录制 mini-seekbar
+- [x] RoomCard 连接失败时预览区显示错误原因
+- [x] RoomCard 选中态为 1px 主题色边框 + 外发光
+- [x] 录制设置编码器、画质预设使用 chip 选择器
+- [x] CRF、编码器、码率模式有悬浮提示
+- [x] Dashboard 新增最近录制历史列表
+- [x] Dashboard 新增磁盘存储使用条
+- [x] 导出切片前弹出预览弹窗
+- [x] 工作台底部新增最近切片横向滚动区
+- [x] 批量操作按钮不可用时给出原因提示
+- [x] 连接状态指示清晰可见
+- [x] Ant Design 组件圆角、阴影与 token.css 一致
+- [x] `npx tsc --noEmit` 通过
+- [x] `npm run build` 通过
+- [x] Python 后端测试通过

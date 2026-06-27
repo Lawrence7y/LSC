@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from lsc.gui.components.widgets import Card, ChipGroup, InputField
+from lsc.gui.components.widgets import Card, ChipGroup, InputField, PageHeader
 from lsc.gui.theme import connect_theme_changed, is_dark, set_dark
 
 
@@ -48,6 +48,14 @@ class SettingsPage(QWidget):
         connect_theme_changed(self._on_external_theme_change)
 
     def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # 页面标题栏
+        self._page_header = PageHeader("设置", "管理输出目录、录制参数与应用主题")
+        outer.addWidget(self._page_header)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
@@ -55,17 +63,9 @@ class SettingsPage(QWidget):
 
         inner = QWidget()
         main = QVBoxLayout(inner)
-        main.setContentsMargins(24, 24, 24, 24)
-        main.setSpacing(24)
+        main.setContentsMargins(20, 16, 20, 20)
+        main.setSpacing(20)
         main.setAlignment(Qt.AlignTop)
-
-        title = QLabel("设置")
-        title.setObjectName("page_title")
-        main.addWidget(title)
-
-        subtitle = QLabel("管理输出目录、录制参数与应用主题")
-        subtitle.setObjectName("label_secondary")
-        main.addWidget(subtitle)
 
         g = Card()
         g.add_widget(_section_title("通用设置"))
@@ -79,7 +79,6 @@ class SettingsPage(QWidget):
         out_lay.addWidget(self._output_dir)
         self._browse_btn = QPushButton("浏览")
         self._browse_btn.setObjectName("btnPrimary")
-        self._browse_btn.setFixedHeight(36)
         self._browse_btn.setFixedWidth(72)
         self._browse_btn.clicked.connect(self._on_browse_output)
         out_lay.addWidget(self._browse_btn)
@@ -139,10 +138,7 @@ class SettingsPage(QWidget):
 
         main.addStretch()
         scroll.setWidget(inner)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
+        outer.addWidget(scroll, 1)
 
     def _save(self, key: str, value: str):
         self._settings.setValue(key, value)

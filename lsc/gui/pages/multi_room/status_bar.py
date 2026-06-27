@@ -1,28 +1,54 @@
 """Status bar and bottom bar for the multi-room workbench."""
 from __future__ import annotations
 
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtGui import QPainter, QColor
-from PySide6.QtCore import QTimer
 
 from lsc.gui.components.control_bar import ControlBar
-from lsc.gui.theme import get_theme, is_dark, connect_theme_changed
+from lsc.gui.theme import connect_theme_changed, get_theme, is_dark
 
 
 class StatusBar(QWidget):
-    """底部状态栏。"""
+    """底部状态栏，内容溢出时显示水平滚动条。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(36)
+        self._message_timer = QTimer(self)
+        self._message_timer.setSingleShot(True)
+        self._message_timer.timeout.connect(lambda: self._message_label.setText(""))
         self._build()
 
     def _build(self):
         self.setObjectName("multiRoomStatusBar")
         self._stat_dots: list[QLabel] = []
-        layout = QHBoxLayout(self)
+
+        # 外层布局：QScrollArea 包裹内容，溢出时显示水平滚动条
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }"
+                             "QScrollBar:horizontal { height: 4px; background: transparent; }"
+                             "QScrollBar::handle:horizontal { background: rgba(128,128,128,0.4); border-radius: 2px; min-width: 30px; }"
+                             "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { height: 0; }")
+
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        layout = QHBoxLayout(content)
         layout.setContentsMargins(20, 0, 20, 0)
         layout.setSpacing(16)
 
@@ -54,6 +80,9 @@ class StatusBar(QWidget):
         self._error_label = QLabel("")
         self._error_label.setObjectName("statusBarError")
         layout.addWidget(self._error_label)
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
     def _make_stat(self, label: str, value: str, dot_name: str = "") -> QWidget:
         w = QWidget()
@@ -91,9 +120,10 @@ class StatusBar(QWidget):
 
     def show_message(self, text: str, timeout_ms: int = 5000) -> None:
         """Show a temporary status message (toast-like)."""
+        self._message_timer.stop()
         self._message_label.setText(text)
         if timeout_ms > 0:
-            QTimer.singleShot(timeout_ms, lambda: self._message_label.setText(""))
+            self._message_timer.start(timeout_ms)
 
     def show_progress(self, percent: float) -> None:
         """显示导出进度条。"""
@@ -116,8 +146,8 @@ class _BottomBar(QWidget):
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(10)
+        root.setContentsMargins(12, 6, 12, 6)
+        root.setSpacing(6)
 
         self._controls = ControlBar()
         self._controls.set_draw_background(False)
@@ -134,7 +164,7 @@ class _BottomBar(QWidget):
         # 亮色模式下白底容器在浅灰页面上几乎无边，使用更强的描边保证可见
         pen_color = c.border_subtle if is_dark() else c.border_strong
         p.setPen(QColor(pen_color))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 10, 10)
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 12, 12)
         p.end()
 
     def refresh_theme(self) -> None:

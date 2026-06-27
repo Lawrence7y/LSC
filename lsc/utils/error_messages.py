@@ -1,128 +1,82 @@
-"""把底层错误翻译成用户可读的中文提示。"""
-from __future__ import annotations
+"""
+Error message humanization for user-facing error display.
+
+Maps raw FFmpeg/network/OS errors to readable Chinese messages.
+Used by the WebSocket handler to return friendly messages to the frontend.
+"""
 
 import re
 
-_PATTERNS: list[tuple[re.Pattern, str, str]] = [
-    # HTTP 错误
+
+_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # HTTP / Network
     (re.compile(r"403|Forbidden", re.I),
-     "access_denied",
      "平台拒绝了连接（403）。可能主播未开播，或需要登录 Cookie。"),
     (re.compile(r"404|Not Found", re.I),
-     "not_found",
-     "未找到直播流（404）。主播可能已下播或链接已失效。"),
-    (re.compile(r"429|Too Many Requests", re.I),
-     "rate_limited",
-     "请求过于频繁（429）。请稍后再试。"),
-    (re.compile(r"5\d{2}|Server Error", re.I),
-     "server_error",
-     "服务器错误。请稍后再试。"),
-
-    # 网络错误
+     "直播流地址不存在（404）。主播可能已下播。"),
     (re.compile(r"Connection refused|ECONNREFUSED", re.I),
-     "conn_refused",
      "无法连接到直播服务器。请检查网络或稍后重试。"),
-    (re.compile(r"Connection reset|ECONNRESET", re.I),
-     "conn_reset",
-     "连接被重置。网络可能不稳定，请稍后重试。"),
     (re.compile(r"Connection timed out|ETIMEDOUT", re.I),
-     "conn_timeout",
-     "连接超时。请检查网络或稍后重试。"),
-    (re.compile(r"timeout|timed out", re.I),
-     "timeout",
-     "操作超时。请检查网络或稍后重试。"),
-    (re.compile(r"name resolution|dns|getaddrinfo|ENOTFOUND", re.I),
-     "dns_error",
-     "无法解析服务器地址。请检查网络连接。"),
-    (re.compile(r"Network is unreachable|ENETUNREACH", re.I),
-     "network_unreachable",
-     "网络不可达。请检查网络连接。"),
+     "连接直播服务器超时。网络不稳定或服务器无响应。"),
+    (re.compile(r"Name or service not known|getaddrinfo", re.I),
+     "域名解析失败。请检查网络连接。"),
 
-    # 磁盘/文件错误
-    (re.compile(r"No space left|ENOSPC", re.I),
-     "disk_full",
+    # Stream / Recording
+    (re.compile(r"Stream not found|No stream|Input/output error.*stream", re.I),
+     "未找到直播流。主播可能已下播或流地址已过期。"),
+    (re.compile(r"No space left|ENOSPC|disk full", re.I),
      "磁盘空间不足，无法继续录制。请清理输出目录。"),
-    (re.compile(r"permission denied|EACCES", re.I),
-     "permission_denied",
-     "权限不足。请检查输出目录的写入权限。"),
-    (re.compile(r"Read-only file system|EROFS", re.I),
-     "readonly_fs",
-     "文件系统只读。请检查输出目录。"),
-    (re.compile(r"File name too long|ENAMETOOLONG", re.I),
-     "filename_too_long",
-     "文件名过长。请缩短房间名称或输出路径。"),
+    (re.compile(r"Permission denied|EACCES|WinError 5|拒绝访问", re.I),
+     "文件写入权限不足。请检查输出目录权限。"),
+    (re.compile(r"Server returned 5\d\d|Internal Server Error", re.I),
+     "直播平台服务器异常，请稍后重试。"),
 
-    # FFmpeg 错误
-    (re.compile(r"ffmpeg.*error|ffmpeg.*failed", re.I),
-     "ffmpeg_error",
+    # FFmpeg
+    (re.compile(r"Invalid data found when processing input", re.I),
+     "无法解析直播流数据。流格式可能不受支持。"),
+    (re.compile(r"Decoder.*not found|cannot find codec", re.I),
+     "缺少视频解码器。请确保 FFmpeg 安装完整。"),
+    (re.compile(r"Encoder.*not found|cannot find encoder", re.I),
+     "缺少视频编码器。请检查编码器设置。"),
+    (re.compile(r"error.*ffmpeg|ffmpeg.*error", re.I),
      "录制引擎出错。请检查编码器设置或重启应用。"),
-    (re.compile(r"Invalid data found|corrupt", re.I),
-     "invalid_data",
-     "直播流数据异常。可能需要切换清晰度或重试。"),
-    (re.compile(r"Stream not found|No stream", re.I),
-     "no_stream",
-     "未找到直播流。主播可能已下播。"),
 
-    # 平台特定错误
-    (re.compile(r"Cookie|cookie.*invalid|cookie.*expired", re.I),
-     "cookie_invalid",
-     "Cookie 无效或已过期。请更新浏览器 Cookie。"),
-    (re.compile(r"login|登录|认证", re.I),
-     "login_required",
-     "需要登录才能访问。请检查 Cookie 或登录状态。"),
-    (re.compile(r"region|地区|geo.?block", re.I),
-     "region_blocked",
-     "该直播在当前地区不可用。可能需要使用代理。"),
+    # Platform-specific
+    (re.compile(r"Cookie|登录|login required", re.I),
+     "需要登录凭证。请检查 Cookie 配置。"),
+    (re.compile(r"直播间未开播|房间未开播|not live", re.I),
+     "该直播间当前未开播。"),
+    (re.compile(r"解析流地址失败|parse.*fail|extract.*fail", re.I),
+     "无法解析直播流地址。平台可能已更新协议。"),
+
+    # Quality / Format
+    (re.compile(r"Unsupported codec|unsupported format", re.I),
+     "不支持的视频格式。请尝试切换编码器。"),
 ]
 
 
 def humanize_error(raw: str) -> str:
-    """返回用户友好的错误描述。未匹配则返回原文（加前缀）。"""
-    if not raw:
-        return ""
-    for pattern, _code, msg in _PATTERNS:
-        if pattern.search(raw):
+    """Convert raw technical error to user-friendly Chinese message.
+
+    Returns the original message with a prefix if no pattern matches.
+    """
+    if not raw or not isinstance(raw, str):
+        return "发生未知错误"
+
+    raw_stripped = raw.strip()
+
+    for pattern, msg in _PATTERNS:
+        if pattern.search(raw_stripped):
             return msg
-    return f"发生错误：{raw}"
+
+    # No match: return original with prefix
+    # Truncate very long messages
+    if len(raw_stripped) > 200:
+        raw_stripped = raw_stripped[:200] + "..."
+
+    return f"发生错误：{raw_stripped}"
 
 
-def get_error_code(raw: str) -> str:
-    """返回错误代码。未匹配则返回 'unknown'。"""
-    if not raw:
-        return ""
-    for pattern, code, _msg in _PATTERNS:
-        if pattern.search(raw):
-            return code
-    return "unknown"
-
-
-def is_recoverable_error(raw: str) -> bool:
-    """判断错误是否可恢复（适合自动重连）。"""
-    code = get_error_code(raw)
-    # 这些错误通常是暂时性的，可以尝试重连
-    recoverable_codes = {
-        "timeout", "conn_timeout", "conn_reset", "conn_refused",
-        "network_unreachable", "no_stream", "invalid_data",
-        "rate_limited", "server_error",
-    }
-    return code in recoverable_codes
-
-
-def get_retry_suggestion(raw: str) -> str:
-    """返回重试建议。"""
-    code = get_error_code(raw)
-    suggestions = {
-        "timeout": "建议：检查网络连接，或切换到更稳定的网络。",
-        "conn_timeout": "建议：服务器响应慢，可稍后重试。",
-        "conn_reset": "建议：网络不稳定，可尝试重连。",
-        "conn_refused": "建议：服务器可能维护中，请稍后重试。",
-        "dns_error": "建议：检查网络连接或 DNS 设置。",
-        "disk_full": "建议：清理磁盘空间或更改输出目录。",
-        "permission_denied": "建议：以管理员身份运行或更改输出目录。",
-        "cookie_invalid": "建议：更新浏览器 Cookie。",
-        "login_required": "建议：检查登录状态或更新 Cookie。",
-        "region_blocked": "建议：使用代理或 VPN。",
-        "rate_limited": "建议：等待几分钟后重试。",
-        "server_error": "建议：服务器异常，请稍后重试。",
-    }
-    return suggestions.get(code, "")
+def friendly_connect_error(raw: str) -> str:
+    """Specialized version for connection-stage errors (more context)."""
+    return humanize_error(raw)

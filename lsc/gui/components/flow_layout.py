@@ -14,10 +14,16 @@ from PySide6.QtWidgets import QLayout, QLayoutItem, QWidget, QWidgetItem
 class FlowLayout(QLayout):
     """横向排列、自动换行的流式布局。"""
 
-    def __init__(self, parent: QWidget | None = None, spacing: int = 8):
+    def __init__(self, parent: QWidget | None = None, spacing: int = 8, max_per_row: int = 0):
         super().__init__(parent)
         self._items: list[QLayoutItem] = []
         self._spacing = spacing
+        self._max_per_row = max_per_row  # 0 = 不限制
+
+    def set_max_per_row(self, max_per_row: int) -> None:
+        """设置每行最大 item 数，0 表示不限制。"""
+        self._max_per_row = max(0, max_per_row)
+        self.invalidate()
 
     # ── item management ──────────────────────────────────────────
     def addItem(self, item: QLayoutItem) -> None:  # noqa: N802 (Qt API)
@@ -115,7 +121,9 @@ class FlowLayout(QLayout):
         for it in items:
             w = self._item_width(it)
             gap = spacing if cur else 0
-            if cur and x0 + cur_w + gap + w > right + 1:
+            # 换行条件：宽度超出 或 达到每行最大数量限制
+            max_reached = self._max_per_row > 0 and len(cur) >= self._max_per_row
+            if cur and (max_reached or x0 + cur_w + gap + w > right + 1):
                 rows.append(cur)
                 cur = []
                 cur_w = 0

@@ -1,0 +1,176 @@
+@import './tokens.css';
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--background-900);
+  color: var(--text-50);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 13px;
+  overflow: hidden;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Theme transition: smoothly animate all color/background changes
+ * !important 必要：需覆盖组件内联样式与既有 transition 声明，确保切换主题时
+ * 所有元素的颜色/背景/边框/阴影统一平滑过渡。仅在 .theme-transition 临时类
+ * 存在时生效，切换完成后移除该类，不影响日常交互。 */
+.theme-transition * {
+  transition: background-color 0.3s ease,
+              color 0.3s ease,
+              border-color 0.3s ease,
+              box-shadow 0.3s ease !important;
+}
+
+#root {
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--background-700);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--background-600);
+}
+
+/* Ant Design Theme Overrides
+ * 说明：antd v5 使用 CSS-in-JS 运行时注入样式，注入顺序与外联 CSS 不可控，
+ * 同等特异度下外联样式可能被 antd 覆盖，因此此处统一使用 !important 强制生效。
+ * 此外 antd 组件内部结构可能含多层 className，提高特异度难以稳定覆盖，
+ * 故保留 !important 以确保主题色（背景/文本/边框等）在 dark/light 下一致。
+ * 如后续切换到 antd ConfigProvider token 方案，可逐步移除这些 !important。
+ */
+.ant-layout {
+  background: var(--background-900) !important;
+}
+
+.ant-layout-sider {
+  background: var(--background-800) !important;
+  border-right: 1px solid var(--border-default) !important;
+}
+
+.ant-menu {
+  background: transparent !important;
+  border-right: none !important;
+}
+
+.ant-menu-item {
+  color: var(--text-300) !important;
+  border-radius: 6px !important;
+  margin: 2px 8px !important;
+  height: 36px !important;
+  line-height: 36px !important;
+}
+
+.ant-menu-item:hover {
+  background: var(--bg-tertiary) !important;
+  color: var(--text-50) !important;
+}
+
+.ant-menu-item-selected {
+  background: rgba(0, 122, 255, 0.12) !important;
+  color: var(--text-50) !important;
+  border-left: 3px solid var(--brand-500) !important;
+}
+
+.ant-menu-item-selected::after {
+  display: none !important;
+}
+
+.ant-card {
+  background: var(--background-800) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: var(--radius) !important;
+}
+
+.ant-card-head {
+  border-bottom: 1px solid var(--border-default) !important;
+  color: var(--text-50) !important;
+}
+
+.ant-card-body {
+  color: var(--text-50) !important;
+}
+
+.ant-btn-primary {
+  background: var(--brand-500) !important;
+  border-color: var(--brand-500) !important;
+  color: #ffffff !important;
+}
+
+.ant-btn-primary:hover {
+  background: var(--brand-400) !important;
+  border-color: var(--brand-400) !important;
+  color: #ffffff !important;
+}
+
+.ant-input {
+  background: var(--background-700) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text-50) !important;
+}
+
+.ant-input:focus,
+.ant-input-focused {
+  border-color: var(--brand-500) !important;
+  box-shadow: 0 0 0 1px var(--brand-500) !important;
+}
+
+.ant-select-selector {
+  background: var(--background-700) !important;
+  border: 1px solid var(--border-default) !important;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text-50) !important;
+}
+
+.ant-select-arrow {
+  color: var(--text-400) !important;
+}
+
+.ant-tag {
+  border-radius: 6px !important;
+}
+
+.ant-progress-bg {
+  background: var(--brand-500) !important;
+}
+
+.ant-empty-description {
+  color: var(--text-400) !important;
+}
+
+.ant-list-item {
+  border-bottom-color: var(--border-default) !important;
+}
+
+.ant-space {
+  color: var(--text-50) !important;
+}
+
+.ant-typography {
+  color: var(--text-50) !important;
+}
+
+.ant-typography.ant-typography-secondary {
+  color: var(--text-400) !important;
+}

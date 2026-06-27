@@ -1,0 +1,14 @@
+default_app.asar exists: true
+default_app main error: require() of ES Module D:\Project\直播切片多人\lsc-electron\node_modules\electron\dist\resources\default_app.asar\main.js from D:\Project\直播切片多人\_test_electron.js not supported.
+main.js is treated as an ES module file as it is a .js file whose nearest parent package.json contains "type": "module" which declares all .js files in that package scope as ES modules.
+Instead rename main.js to end in .cjs, change the requiring code to use dynamic import() which is available in all CommonJS modules, or change "type": "module" to "type": "commonjs" in D:\Project\直播切片多人\lsc-electron\node_modules\electron\dist\resources\default_app.asar\package.json to treat all .js files as CommonJS (using .mjs for all ES modules instead).
+
+process._linkedBinding: function
+
+global.electron: undefined
+globalThis.electron: undefined
+
+process.argv0: D:\Project\直播切片多人\lsc-electron\node_modules\electron\dist\electron.exe
+process.execPath: D:\Project\直播切片多人\lsc-electron\node_modules\electron\dist\electron.exe
+
+Global paths: ["C:\\Users\\Administrator\\.node_modules","C:\\Users\\Administrator\\.node_libraries","D:\\Project\\直播切片多人\\lsc-electron\\node_modules\\electron\\dist\\lib\\node"]

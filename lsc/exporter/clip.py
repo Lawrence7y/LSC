@@ -15,14 +15,17 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Thread
+from uuid import uuid4
 
 from lsc import get_logger
-from lsc.config import LscConfig, ExportProfile
+from lsc.config import ExportProfile, LscConfig
+from lsc.utils.process_launcher import prepare_launch
 
 _log = get_logger(__name__)
 
@@ -56,18 +59,31 @@ class ExportResult:
     error: str = ""
 
 
+def _cleanup_tmp(path: str) -> None:
+    """安全删除临时文件，忽略不存在的情况。"""
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 class ClipExporter:
     """FFmpeg-based clip exporter with thumbnail and vertical crop support."""
 
     # Shared pool for thumbnail generation so exports don't block each other.
     _thumbnail_executor: ThreadPoolExecutor | None = None
+    _thumbnail_lock = threading.Lock()
 
     @classmethod
     def _get_thumbnail_executor(cls) -> ThreadPoolExecutor:
+        # 双重检查锁定，避免并发创建多个线程池
         if cls._thumbnail_executor is None:
-            cls._thumbnail_executor = ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="lsc-thumb"
-            )
+            with cls._thumbnail_lock:
+                if cls._thumbnail_executor is None:
+                    cls._thumbnail_executor = ThreadPoolExecutor(
+                        max_workers=4, thread_name_prefix="lsc-thumb"
+                    )
         return cls._thumbnail_executor
 
     def __init__(self, config: LscConfig):
@@ -83,7 +99,8 @@ class ClipExporter:
                     vertical_crop: bool = False,
                     codec: str = "",
                     profile: ExportProfile | None = None,
-                    progress_callback=None) -> ExportResult:
+                    progress_callback=None,
+                    on_process=None) -> ExportResult:
         """Export a single clip from the video.
 
         Parameters
@@ -94,6 +111,10 @@ class ClipExporter:
         progress_callback : callable | None
             进度回调函数 ``callback(percent: float, elapsed: float, total: float)``。
             当提供时使用 ``-progress pipe:1`` 实时读取 FFmpeg 进度。
+        on_process : callable | None
+            FFmpeg 进程启动回调 ``callback(proc: subprocess.Popen)``。
+            当使用 Popen 模式（提供 progress_callback）时在进程创建后触发，
+            供调用方追踪并取消该进程。
         """
         if not os.path.isfile(video_path):
             return ExportResult(False, "", clip_index, title or f"clip_{clip_index}",
@@ -195,13 +216,36 @@ class ClipExporter:
 
         cmd += [output_path]
 
+        # 原子写入：先写临时文件，成功后 rename，失败时清理
+        # tmp 文件名包含唯一标识，防止并发导出相同标题片段时碰撞
+        # 保持 .mp4 扩展名以便 FFmpeg 识别格式，uuid 作为文件名的一部分
+        base, ext = os.path.splitext(output_path)
+        tmp_output_path = f"{base}.{uuid4().hex[:8]}_tmp{ext}"
+        cmd[-1] = tmp_output_path  # 替换最终输出路径为临时文件
+
         try:
+            # 准备进程启动环境（避免 Windows 控制台弹窗 + avcodec DLL 冲突）
+            env, creation_flags, cwd = prepare_launch(self.ffmpeg)
+            popen_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "env": env,
+                "cwd": cwd,
+            }
+            if creation_flags:
+                popen_kwargs["creationflags"] = creation_flags
             if has_callback:
                 # 使用 Popen 逐行读取进度
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace",
-                )
+                proc = subprocess.Popen(cmd, **popen_kwargs)
+                # 通知调用方进程已启动，便于追踪并取消该 FFmpeg 进程
+                if on_process is not None:
+                    try:
+                        on_process(proc)
+                    except Exception:
+                        pass
                 state: dict[str, int] = {}
                 last_reported_percent = -1.0
                 last_reported_time = 0.0
@@ -269,26 +313,41 @@ class ClipExporter:
                 watchdog_thread.join(timeout=2)
 
                 if export_timed_out:
+                    _cleanup_tmp(tmp_output_path)
                     return ExportResult(False, output_path, clip_index, safe_title,
                                         error="Export timed out")
                 if proc.returncode != 0:
+                    _cleanup_tmp(tmp_output_path)
                     error_tail = "\n".join(stderr_tail)
                     return ExportResult(False, output_path, clip_index, safe_title,
                                         error=error_tail[-500:] or "Export failed")
             else:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=300,
-                    encoding="utf-8", errors="replace"
+                    encoding="utf-8", errors="replace",
+                    env=env, cwd=cwd,
+                    **({"creationflags": creation_flags} if creation_flags else {}),
                 )
                 if result.returncode != 0:
+                    _cleanup_tmp(tmp_output_path)
                     return ExportResult(False, output_path, clip_index, safe_title,
                                         error=result.stderr[-500:])
         except subprocess.TimeoutExpired:
+            _cleanup_tmp(tmp_output_path)
             return ExportResult(False, output_path, clip_index, safe_title,
                                 error="Export timed out")
         except Exception as e:
+            _cleanup_tmp(tmp_output_path)
             return ExportResult(False, output_path, clip_index, safe_title,
                                 error=str(e))
+
+        # 原子写入：临时文件 rename 到最终路径
+        try:
+            os.replace(tmp_output_path, output_path)
+        except OSError as exc:
+            _cleanup_tmp(tmp_output_path)
+            return ExportResult(False, output_path, clip_index, safe_title,
+                                error=f"Failed to finalize output: {exc}")
 
         # Verify output
         if not os.path.isfile(output_path):
@@ -413,7 +472,11 @@ class ClipExporter:
             thumb_path
         ]
 
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        env, creation_flags, cwd = prepare_launch(self.ffmpeg)
+        run_kwargs = {"capture_output": True, "timeout": 30, "env": env, "cwd": cwd}
+        if creation_flags:
+            run_kwargs["creationflags"] = creation_flags
+        result = subprocess.run(cmd, **run_kwargs)
         if result.returncode == 0 and os.path.isfile(thumb_path):
             return thumb_path
         return ""

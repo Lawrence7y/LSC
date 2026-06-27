@@ -535,6 +535,100 @@ def test_multi_room_page_room_limit_enforced() -> None:
     assert manager.room_count() == MAX_ROOMS
 
 
+def test_start_preview_does_not_play_before_reparent() -> None:
+    """Regression: 预览的 mpv.play 必须在 widget reparent/rebind 之后触发。
+
+    早期实现中 ``start_preview`` 在 widget 刚创建、尚未嵌入卡片时就调
+    ``play_live``，随后 reparent 改变 HWND 让首帧渲染丢失，表现为黑屏。
+    本测试断言：``start_preview`` 不直接播放，``play_preview_stream`` 才播放。
+    """
+    _qapp()
+
+    from lsc.gui.multi_room.manager import MultiRoomManager
+
+    play_calls: list[str] = []
+
+    class FakeWidget:
+        def __init__(self):
+            self._muted = True
+
+        def is_available(self):
+            return True
+
+        def set_stream_headers(self, headers):
+            pass
+
+        def play_live(self, url):
+            play_calls.append(url)
+
+        def set_muted(self, muted):
+            self._muted = muted
+
+    manager = MultiRoomManager(
+        controller_factory=lambda: type("FakeCtrl", (), {"cleanup": lambda s: None})(),
+        preview_factory=FakeWidget,
+    )
+    room = manager.add_room("https://live.douyin.com/123")
+    assert room is not None
+    # 模拟连接成功（绕过网络）
+    room.is_connected = True
+    from lsc.platforms.base import StreamInfo
+
+    info = StreamInfo(
+        platform="douyin",
+        room_url="https://live.douyin.com/123",
+        stream_url="https://cdn.example.com/live.flv",
+        is_live=True,
+    )
+    room.apply_stream_info(info)
+
+    # start_preview 只建 widget + 置状态，不应触发播放
+    ok = manager.start_preview(room.room_id)
+    assert ok is True
+    assert play_calls == [], "start_preview 不应在 reparent 前播放"
+
+    # play_preview_stream 才真正播放
+    manager.play_preview_stream(room.room_id)
+    assert play_calls == ["https://cdn.example.com/live.flv"]
+
+
+def test_clip_list_undo_redo_for_add_remove_clear() -> None:
+    """Regression: 切片增删/清空可通过 UndoStack 撤销重做。"""
+    _qapp()
+
+    from lsc.gui.components.clip_list import ClipListWidget
+    from lsc.gui.undo import UndoStack
+
+    stack = UndoStack(limit=50)
+    clip_list = ClipListWidget()
+    clip_list.set_undo_stack(stack)
+
+    idx = clip_list.add_segment(1.0, 5.0)
+    assert idx == 0
+    assert clip_list.count() == 1
+
+    # 撤销添加 -> 应清空
+    assert stack.undo() is True
+    assert clip_list.count() == 0
+    # 重做 -> 恢复
+    assert stack.redo() is True
+    assert clip_list.count() == 1
+
+    # 添加第二段后删除第一段，再撤销删除
+    clip_list.add_segment(6.0, 10.0)
+    assert clip_list.count() == 2
+    clip_list.remove_segment(0)
+    assert clip_list.count() == 1
+    assert stack.undo() is True  # 撤销删除
+    assert clip_list.count() == 2
+
+    # 清空并撤销
+    clip_list.clear()
+    assert clip_list.count() == 0
+    assert stack.undo() is True
+    assert clip_list.count() == 2
+
+
 def test_dashboard_page_emits_multi_room_navigation_request() -> None:
     _qapp()
 

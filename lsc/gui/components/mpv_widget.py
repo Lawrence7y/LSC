@@ -178,6 +178,18 @@ class MpvWidget(QWidget):
         if self._mpv is None:
             return
 
+        # 防御：rebind 必须绑定到有效的原生句柄，否则 mpv 会渲染到一个
+        # 无效/不可见句柄而表现为静默黑屏。仍继续尝试，但记录以便排查。
+        try:
+            wid = self.winId()
+        except Exception:
+            wid = 0
+        if not wid:
+            _log.warning(
+                "rebind_video_output: widget winId is 0 (not yet native); "
+                "preview may render into a dead handle and show blank."
+            )
+
         path = self._current_path
         live = self._live_mode
         was_playing = self._playing
@@ -379,15 +391,17 @@ class MpvWidget(QWidget):
     # ── 内部实现 ───────────────────────────────────────────────
 
     def _play(self, path: str, *, live: bool) -> None:
-        """统一播放入口。"""
+        """统一播放入口。
+
+        live/非 live 都设 ``loop-file=no``：直播流跟随写入头（mpv 自动跟进
+        live edge，无需循环）；非直播文件单次播放。循环播放由
+        ``set_live_mode``/``set_ab_loop`` 按需开启，不在此处处理。
+        """
         self._live_mode = live
         self._current_path = path
         if self._mpv is not None:
             try:
-                if live:
-                    self._mpv["loop-file"] = "no"
-                else:
-                    self._mpv["loop-file"] = "no"
+                self._mpv["loop-file"] = "no"
                 # Rebuild mpv instance if headers are set — ensures headers
                 # are passed as startup options (required by some mpv versions
                 # for reliable CDN access, especially Huya/Bilibili FLV streams).

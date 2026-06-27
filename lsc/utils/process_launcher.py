@@ -6,10 +6,10 @@ checks scattered throughout the codebase.
 """
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
-import logging
 
 _log = logging.getLogger(__name__)
 

@@ -1,0 +1,141 @@
+{
+  "data": [
+    {
+      "id": "page-dashboard",
+      "title": "仪表盘",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1782325800000,
+      "canvasData": {
+        "x": 620,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/dashboard.html",
+        "interactions": [
+          {
+            "domId": "nav-multi-room",
+            "targetPageId": "page-multi-room",
+            "transitionLabel": "导航到多房间管理"
+          },
+          {
+            "domId": "nav-settings",
+            "targetPageId": "page-settings",
+            "transitionLabel": "导航到设置"
+          },
+          {
+            "domId": "cta-multi-room",
+            "targetPageId": "page-multi-room",
+            "transitionLabel": "管理房间"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-multi-room",
+      "title": "多房间管理",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1782325800000,
+      "canvasData": {
+        "x": 0,
+        "y": 0,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/multi-room.html",
+        "interactions": [
+          {
+            "domId": "nav-dashboard",
+            "targetPageId": "page-dashboard",
+            "transitionLabel": "导航到仪表盘"
+          },
+          {
+            "domId": "nav-settings",
+            "targetPageId": "page-settings",
+            "transitionLabel": "导航到设置"
+          },
+          {
+            "domId": "add-room",
+            "targetPageId": "page-multi-room",
+            "transitionLabel": "添加房间"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-multi-room-v2",
+      "title": "多房间管理 v2",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1782364000000,
+      "canvasData": {
+        "x": 620,
+        "y": 754,
+        "group": 1
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/multi-room-v2.html",
+        "interactions": [
+          {
+            "domId": "nav-dashboard",
+            "targetPageId": "page-dashboard",
+            "transitionLabel": "导航到仪表盘"
+          },
+          {
+            "domId": "nav-settings",
+            "targetPageId": "page-settings",
+            "transitionLabel": "导航到设置"
+          },
+          {
+            "domId": "add-room",
+            "targetPageId": "page-multi-room-v2",
+            "transitionLabel": "添加房间"
+          }
+        ]
+      }
+    },
+    {
+      "id": "page-settings",
+      "title": "设置",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1782325800000,
+      "canvasData": {
+        "x": 620,
+        "y": 377,
+        "group": 0
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/settings.html",
+        "interactions": [
+          {
+            "domId": "nav-dashboard",
+            "targetPageId": "page-dashboard",
+            "transitionLabel": "导航到仪表盘"
+          },
+          {
+            "domId": "nav-multi-room",
+            "targetPageId": "page-multi-room",
+            "transitionLabel": "导航到多房间管理"
+          }
+        ]
+      }
+    }
+  ],
+  "config": {
+    "autoLayout": true,
+    "deviceType": "desktop",
+    "projectName": "直播切片工具 UI 设计",
+    "designLibrary": {
+      "name": "苹果",
+      "id": "dl_builtin_apple",
+      "version": null,
+      "scope": "built-in-global",
+      "path": "c:\\Users\\Administrator\\.trae-cn\\design_libraries\\dl_builtin_apple",
+      "versionSource": "metadata.json"
+    },
+    "showEdge": true
+  }
+}

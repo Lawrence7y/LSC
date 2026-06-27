@@ -23,6 +23,7 @@ class PreviewSurface(QFrame):
         self._badge_widget: QWidget | None = None
         self._corner_widget: QWidget | None = None
         self._controls_widget: QWidget | None = None
+        self._return_live_widget: QWidget | None = None
         self._overlay_expanded = False
         self.setObjectName("previewArea")
         self.setMouseTracking(True)
@@ -70,9 +71,21 @@ class PreviewSurface(QFrame):
         """注入底部 hover 覆盖层控制条。"""
         self._controls_widget = widget
         widget.setParent(self)
-        widget.show()
+        # WA_StyledBackground 确保 QSS 的 rgba 背景生效，否则 QWidget 会使用
+        # 默认调色板背景（浅色模式下接近白色），表现为"白色遮挡预览区"。
+        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # 初始隐藏，鼠标进入预览区时才显示
+        widget.setVisible(False)
         widget.installEventFilter(self)
         self._update_overlay_geometry()
+
+    def set_return_live_widget(self, widget: QWidget) -> None:
+        """注入"回直播"浮窗按钮，定位在右上角徽章下方。"""
+        self._return_live_widget = widget
+        widget.setParent(self)
+        widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        widget.setVisible(False)
+        self._update_return_live_geometry()
 
     # ── geometry & hover ───────────────────────────────────────
 
@@ -80,6 +93,7 @@ class PreviewSurface(QFrame):
         super().resizeEvent(event)
         self._update_badge_geometry()
         self._update_overlay_geometry()
+        self._update_return_live_geometry()
 
     def enterEvent(self, event) -> None:
         super().enterEvent(event)
@@ -107,27 +121,48 @@ class PreviewSurface(QFrame):
         if self._overlay_expanded == expanded:
             return
         self._overlay_expanded = expanded
+        # 用 setVisible 真正隐藏/显示控件，而非移出屏幕。
+        # 旧实现把控件移到 y=height+margin 处，但 QFrame 默认不裁剪子控件，
+        # 导致"隐藏"的控件仍渲染在预览区下方，表现为白色/灰色条遮挡。
+        if self._controls_widget is not None:
+            self._controls_widget.setVisible(expanded)
         self._update_overlay_geometry()
 
     def _update_overlay_geometry(self) -> None:
         margin = 8
         expanded_h = 34
-        y = (
-            max(margin, self.height() - expanded_h - margin)
-            if self._overlay_expanded
-            else self.height() + margin
-        )
 
-        corner_w = self._corner_widget.width() if self._corner_widget is not None else 0
-        if self._controls_widget is not None:
+        # 角标按钮始终固定在右下角，不受 hover 状态影响
+        if self._corner_widget is not None:
+            cw = self._corner_widget.width()
+            ch = self._corner_widget.height()
+            self._corner_widget.setGeometry(
+                self.width() - cw - margin,
+                self.height() - ch - margin,
+                cw, ch,
+            )
+            self._corner_widget.raise_()
+
+        # 控制条仅在展开时定位（已通过 setVisible 控制可见性）
+        if self._controls_widget is not None and self._overlay_expanded:
+            y = max(margin, self.height() - expanded_h - margin)
+            corner_w = self._corner_widget.width() if self._corner_widget is not None else 0
             controls_w = max(120, self.width() - corner_w - margin * 3)
             self._controls_widget.setGeometry(margin, y, controls_w, expanded_h)
             self._controls_widget.raise_()
 
-        if self._corner_widget is not None:
-            self._corner_widget.setGeometry(
-                self.width() - self._corner_widget.width() - margin,
-                y,
-                self._corner_widget.width(),
-                self._corner_widget.height(),
-            )
+    def _update_return_live_geometry(self) -> None:
+        """定位"回直播"浮窗按钮在右上角徽章下方。"""
+        if self._return_live_widget is None:
+            return
+        self._return_live_widget.adjustSize()
+        w = self._return_live_widget.width()
+        h = self._return_live_widget.height()
+        margin = 6
+        # 徽章高度 + 间距，使浮窗位于徽章下方
+        badge_bottom = 0
+        if self._badge_widget is not None:
+            badge_bottom = self._badge_widget.geometry().bottom() + margin
+        y = max(margin, badge_bottom)
+        self._return_live_widget.setGeometry(self.width() - w - margin, y, w, h)
+        self._return_live_widget.raise_()

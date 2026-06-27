@@ -1,0 +1,85 @@
+======================================================================
+  LSC 直播切片系统 - Computer Use 自动化测试报告
+======================================================================
+  测试时间: 2026-06-23 22:08:05
+  测试耗时: 59.3s
+  测试总数: 17
+  通过: 17  |  失败: 0
+  通过率: 100.0%
+======================================================================
+
+   1. [PASS] 应用启动
+      详情: 进程正在运行
+      截图: D:\Project\直播切片多人\test_screenshots\01_app_launched.png
+
+   2. [PASS] 仪表盘页面加载
+      详情: 仪表盘页面已显示
+      截图: D:\Project\直播切片多人\test_screenshots\02_dashboard.png
+
+   3. [PASS] 导航到 仪表盘
+      详情: 已点击导航到 仪表盘
+      截图: D:\Project\直播切片多人\test_screenshots\03_nav_仪表盘.png
+
+   4. [PASS] 导航到 多房间工作台
+      详情: 已点击导航到 多房间工作台
+      截图: D:\Project\直播切片多人\test_screenshots\03_nav_多房间工作台.png
+
+   5. [PASS] 导航到 直播录制
+      详情: 已点击导航到 直播录制
+      截图: D:\Project\直播切片多人\test_screenshots\03_nav_直播录制.png
+
+   6. [PASS] 导航到 设置
+      详情: 已点击导航到 设置
+      截图: D:\Project\直播切片多人\test_screenshots\03_nav_设置.png
+
+   7. [PASS] 多房间工作台页面
+      详情: 多房间工作台页面已显示
+      截图: D:\Project\直播切片多人\test_screenshots\04_multi_room.png
+
+   8. [PASS] 添加房间对话框
+      详情: 添加房间对话框已弹出
+      截图: D:\Project\直播切片多人\test_screenshots\04b_add_room_dialog.png
+
+   9. [PASS] 录制页面
+      详情: 录制页面已显示
+      截图: D:\Project\直播切片多人\test_screenshots\06_record_page.png
+
+  10. [PASS] 设置页面
+      详情: 设置页面已显示
+      截图: D:\Project\直播切片多人\test_screenshots\07_settings_page.png
+
+  11. [PASS] 主题切换
+      详情: 已切换主题
+      截图: D:\Project\直播切片多人\test_screenshots\08_theme_toggled.png
+
+  12. [PASS] 快捷键 Ctrl+1
+      详情: 通过快捷键导航到 仪表盘
+      截图: D:\Project\直播切片多人\test_screenshots\09_shortcut_仪表盘.png
+
+  13. [PASS] 快捷键 Ctrl+2
+      详情: 通过快捷键导航到 多房间工作台
+      截图: D:\Project\直播切片多人\test_screenshots\09_shortcut_多房间工作台.png
+
+  14. [PASS] 快捷键 Ctrl+3
+      详情: 通过快捷键导航到 录制页面
+      截图: D:\Project\直播切片多人\test_screenshots\09_shortcut_录制页面.png
+
+  15. [PASS] 快捷键 Ctrl+4
+      详情: 通过快捷键导航到 设置页面
+      截图: D:\Project\直播切片多人\test_screenshots\09_shortcut_设置页面.png
+
+  16. [PASS] 应用响应性
+      详情: 5次快速切换耗时 5.02s
+      截图: D:\Project\直播切片多人\test_screenshots\10_responsive.png
+
+  17. [PASS] 应用关闭
+      详情: 应用已关闭
+      截图: D:\Project\直播切片多人\test_screenshots\11_app_closed.png
+
+----------------------------------------------------------------------
+  测试环境:
+    - Python: 3.12.10
+    - 屏幕分辨率: 2560x1440
+    - 操作系统: win32
+    - 测试工具: pyautogui (模拟 Computer Use)
+----------------------------------------------------------------------

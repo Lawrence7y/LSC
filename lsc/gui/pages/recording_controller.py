@@ -6,12 +6,14 @@ from pure UI rendering, following the ViewModel / Controller pattern.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time as _time
-import logging
 from argparse import Namespace
 from datetime import datetime
+from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import QThread, QTimer, Signal
 
@@ -23,6 +25,7 @@ except ImportError:
 
 from lsc.exporter.clip import ClipExporter
 from lsc.platforms.registry import parse_stream, select_quality
+from lsc.recorder.capture import validate_recording
 
 _log = get_logger(__name__)
 
@@ -80,7 +83,7 @@ class ProbeWorker(QThread):
 class ExportWorker(QThread):
     """Background thread for clip export."""
 
-    finished = Signal(bool, str, str, float)  # success, path, error, size_mb
+    finished = Signal(bool, str, str, float, str)  # success, path, error, size_mb, thumbnail_path
     progress = Signal(float, float, float)  # percent, elapsed_sec, total_sec
 
     def __init__(self, exporter, video_path, start, end, output_dir, title,
@@ -93,78 +96,62 @@ class ExportWorker(QThread):
         self._output_dir = output_dir
         self._title = title
         self._profile = profile
+        self._proc = None  # FFmpeg Popen 进程引用，供 cancel 使用
+        self._cancelled = False
 
     def run(self):
-        kwargs = {"title": self._title, "progress_callback": self._on_progress}
+        kwargs = {"title": self._title, "progress_callback": self._on_progress,
+                  "on_process": self._on_process}
         if self._profile is not None:
             kwargs["profile"] = self._profile
         result = self._exporter.export_clip(
             self._video_path, self._start, self._end, self._output_dir,
             **kwargs,
         )
-        self.finished.emit(result.success, result.output_path, result.error, result.file_size_mb)
+        # 如果被取消，覆盖错误信息以让前端识别为取消
+        if self._cancelled and not result.success:
+            import dataclasses
+            result = dataclasses.replace(
+                result, success=False, output_path="",
+                error="导出已取消", file_size_mb=0.0, thumbnail_path="",
+            )
+        self.finished.emit(
+            result.success, result.output_path, result.error,
+            result.file_size_mb, result.thumbnail_path or "",
+        )
+
+    def _on_process(self, proc) -> None:
+        """保存 FFmpeg 进程引用，供 cancel 使用。"""
+        self._proc = proc
 
     def _on_progress(self, percent: float, elapsed: float, total: float) -> None:
         """FFmpeg 进度回调，转发到 Qt 信号。"""
         self.progress.emit(percent, elapsed, total)
 
+    def cancel(self) -> bool:
+        """请求取消导出：终止 FFmpeg 进程并标记为已取消。
 
-class AnalysisWorker(QThread):
-    """Background thread for recording analysis."""
-
-    finished = Signal(bool, str, str, int)  # success, result_path, error, highlight_count
-
-    def __init__(self, video_path: str, profile_name: str, output_dir: str):
-        super().__init__()
-        self._video_path = video_path
-        self._profile_name = profile_name
-        self._output_dir = output_dir
-
-    def run(self):
+        Returns
+        -------
+        bool
+            True 表示已成功发送 kill 信号；False 表示进程已退出或未启动。
+        """
+        if self._cancelled:
+            return False
+        self._cancelled = True
+        proc = self._proc
+        if proc is None:
+            return False
         try:
-            from lsc.cli import cmd_analyze
-
-            base_name = os.path.splitext(os.path.basename(self._video_path))[0]
-            result_path = os.path.join(self._output_dir, f"{base_name}_lsc_analysis.json")
-            args = Namespace(
-                video=self._video_path,
-                config="",
-                profile=self._profile_name,
-                output=result_path,
-            )
-            result = cmd_analyze(args)
-            highlights = result.get("highlights", []) if isinstance(result, dict) else []
-            self.finished.emit(True, result_path, "", len(highlights))
-        except SystemExit as exc:
-            self.finished.emit(False, "", f"分析失败 (exit {exc.code})", 0)
-        except Exception as exc:
-            self.finished.emit(False, "", str(exc), 0)
+            if proc.poll() is None:  # 仍在运行
+                proc.kill()
+                return True
+        except Exception:
+            pass
+        return False
 
 
-class BatchExportWorker(QThread):
-    """Background thread for batch highlight export."""
-
-    finished = Signal(bool, int, int, str, object)  # success, exported_count, total_count, error, results
-
-    def __init__(self, exporter, video_path: str, highlights: list, output_dir: str):
-        super().__init__()
-        self._exporter = exporter
-        self._video_path = video_path
-        self._highlights = highlights
-        self._output_dir = output_dir
-
-    def run(self):
-        try:
-            results = list(self._exporter.export_all(
-                self._video_path, self._highlights, self._output_dir
-            ))
-            ClipExporter.save_export_manifest(
-                self._video_path, self._output_dir, results
-            )
-            exported_count = sum(1 for result in results if result.success)
-            self.finished.emit(True, exported_count, len(self._highlights), "", results)
-        except Exception as exc:
-            self.finished.emit(False, 0, len(self._highlights), str(exc), [])
+from lsc.gui.common_workers import AnalysisWorker, BatchExportWorker
 
 
 class RecordingController:
@@ -183,7 +170,7 @@ class RecordingController:
         if cls._nvenc_cache is not None or cls._nvenc_checking:
             return
         cls._nvenc_checking = True
-        
+
         import threading
         def _check():
             try:
@@ -193,7 +180,7 @@ class RecordingController:
                 cls._nvenc_cache = False
             finally:
                 cls._nvenc_checking = False
-                
+
         thread = threading.Thread(target=_check, daemon=True)
         thread.start()
 
@@ -222,6 +209,10 @@ class RecordingController:
         # available. Distinct from total_sec (recording elapsed time).
         self.current_sec: float = 0.0
         self.record_start_mono: float = 0.0
+        # 暴露给外部读取的录制开始时间戳（monotonic），用于墙钟时间轴对齐
+        # 由 start_recording_with_crf() 在录制成功启动时设置，供 manager 读取
+        # 并回填到 RoomSession.recording_start_mono
+        self.recording_start_mono: float = 0.0
 
         self.video_path: str = ""
         self.stream_url: str = ""
@@ -239,6 +230,7 @@ class RecordingController:
         self._capture = None
         self._exporter = None
         self._export_thread: ExportWorker | None = None
+        self._export_workers: dict[str, ExportWorker] = {}  # export_id -> worker
         self._analysis_thread: AnalysisWorker | None = None
         self._batch_export_thread: BatchExportWorker | None = None
         self._url_parser: UrlParserWorker | None = None
@@ -309,7 +301,10 @@ class RecordingController:
         """
         import shutil
 
-        os.makedirs(output_dir, exist_ok=True)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            return f"录制目录不可写：{output_dir}（{exc.strerror or exc}）。请在设置中修改输出目录。"
         _total, _used, free = shutil.disk_usage(output_dir)
         required = cls._MIN_RECORDING_FREE_BYTES_PER_STREAM * max(1, concurrent_streams)
         if free < required:
@@ -433,16 +428,31 @@ class RecordingController:
         """Quick test: can FFmpeg use h264_nvenc on this system?"""
         try:
             from lsc.config import load_config
+            from lsc.utils.process_launcher import prepare_launch
             cfg = load_config()
             ffmpeg = cfg.ffmpeg_path
             if not ffmpeg or not os.path.isfile(ffmpeg):
                 return False
+            # 必须走 prepare_launch 以兼容打包版（FFmpeg 在 exe 旁）：
+            # 否则裸 subprocess.run 找不到 ffmpeg 而误判 NVENC 不可用，
+            # 导致录制被错误降级为 Copy 模式。
+            env, creation_flags, cwd = prepare_launch(ffmpeg)
+            run_kwargs: dict[str, Any] = {
+                "capture_output": True,
+                "text": True,
+                "timeout": 10,
+                "env": env,
+            }
+            if cwd:
+                run_kwargs["cwd"] = cwd
+            if creation_flags:
+                run_kwargs["creationflags"] = creation_flags
             result = subprocess.run(
                 [ffmpeg, "-y", "-loglevel", "error",
                  "-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=1",
                  "-c:v", "h264_nvenc", "-frames:v", "1",
                  "-f", "null", "-"],
-                capture_output=True, text=True, timeout=10,
+                **run_kwargs,
             )
             return result.returncode == 0
         except Exception:
@@ -485,7 +495,10 @@ class RecordingController:
                                   bitrate: str | None = None,
                                   bitrate_unit: str = "kbps",
                                   input_args: list[str] | None = None,
-                                  on_status=None) -> tuple[bool, str, str, str]:
+                                  on_status=None,
+                                  resolution: str | None = None,
+                                  framerate: str | None = None,
+                                  audio_bitrate: str | None = None) -> tuple[bool, str, str, str]:
         """Start recording with explicit CRF value.
 
         CRF is respected for all encoder modes:
@@ -495,6 +508,15 @@ class RecordingController:
 
         Sets is_recording and record_start_mono atomically so the UI
         layer doesn't need to set them separately.
+
+        Parameters
+        ----------
+        resolution, framerate : str | None
+            Reserved for future video filter support. Currently accepted
+            but not applied (stream is recorded at native resolution/fps).
+        audio_bitrate : str | None
+            Audio bitrate string, e.g. "128k", "96k". Falls back to "128k"
+            when None or empty.
 
         Returns
         -------
@@ -509,10 +531,14 @@ class RecordingController:
 
         os.makedirs(output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(output_dir, f"recording_{timestamp}.mp4")
+        unique_suffix = uuid4().hex[:6]
+        output_path = os.path.join(output_dir, f"recording_{timestamp}_{unique_suffix}.mp4")
 
         if input_args is None:
             input_args = []
+
+        # Normalize audio bitrate (fallback to 128k for backward compat)
+        audio_br = (audio_bitrate or "128k").strip() or "128k"
 
         output_args: list[str] = []
         encoder_used = encoder
@@ -548,7 +574,7 @@ class RecordingController:
             output_args += ["-b:v", target_bitrate, "-maxrate", target_bitrate]
             if bufsize:
                 output_args += ["-bufsize", bufsize]
-            output_args += ["-c:a", "aac", "-b:a", "128k"]
+            output_args += ["-c:a", "aac", "-b:a", audio_br]
             self._capture.start(stream_url, output_path,
                                 codec="custom", input_args=input_args,
                                 extra_args=output_args)
@@ -556,7 +582,7 @@ class RecordingController:
             # Use -preset medium for better compression efficiency than fast
             # (same CRF = smaller file, slightly higher CPU usage)
             output_args += ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf)]
-            output_args += ["-c:a", "aac", "-b:a", "128k"]
+            output_args += ["-c:a", "aac", "-b:a", audio_br]
             self._capture.start(stream_url, output_path,
                                 codec="custom", input_args=input_args,
                                 extra_args=output_args)
@@ -565,14 +591,14 @@ class RecordingController:
             output_args += ["-b:v", target_bitrate, "-maxrate", target_bitrate]
             if bufsize:
                 output_args += ["-bufsize", bufsize]
-            output_args += ["-c:a", "aac", "-b:a", "128k"]
+            output_args += ["-c:a", "aac", "-b:a", audio_br]
             self._capture.start(stream_url, output_path,
                                 codec="custom", input_args=input_args,
                                 extra_args=output_args)
         elif encoder_used == "H.264 NVENC":
             # NVENC uses -cq (constant quality) which is the NVENC equivalent of CRF
             output_args += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
-            output_args += ["-c:a", "aac", "-b:a", "128k"]
+            output_args += ["-c:a", "aac", "-b:a", audio_br]
             self._capture.start(stream_url, output_path,
                                 codec="custom", input_args=input_args,
                                 extra_args=output_args)
@@ -586,6 +612,7 @@ class RecordingController:
             self.is_recording = True
             self.total_sec = 0
             self.record_start_mono = _time.monotonic()
+            self.recording_start_mono = self.record_start_mono
             self.has_start = False
             self.start_sec = None
             self.end_sec = None
@@ -605,6 +632,26 @@ class RecordingController:
         size_mb = 0.0
         output_path = self.video_path
 
+        def _validated(success: bool, path: str) -> tuple[bool, float, str]:
+            """对录制产物做完整性校验。
+
+            被强制 kill 的 FFmpeg 可能产出截断/无效 mp4。仅凭
+            ``os.path.getsize`` 无法识别，会让 UI 误报成功。与
+            ``session.py`` 的做法对齐：校验文件头与最小体积，无效则标失败。
+            """
+            nonlocal size_mb
+            if not success or not path:
+                return success, size_mb, path
+            valid, reason = validate_recording(path)
+            if not valid:
+                _log.warning("Recording validation failed for %s: %s", path, reason)
+                if os.path.isfile(path):
+                    size_mb = os.path.getsize(path) / (1024 * 1024)
+                return False, size_mb, path
+            if os.path.isfile(path):
+                size_mb = os.path.getsize(path) / (1024 * 1024)
+            return True, size_mb, path
+
         if self._capture and self._capture.is_recording:
             result = self._capture.stop()
             # 先停止 capture，再更新状态标志，确保状态一致性
@@ -613,14 +660,13 @@ class RecordingController:
                 self.video_path = result.output_path
                 size_mb = result.file_size_mb
                 output_path = result.output_path
-                return True, size_mb, output_path
+                return _validated(True, output_path)
         else:
             self.is_recording = False
 
         if self._capture and not self._capture.is_alive() and self.video_path:
             if os.path.isfile(self.video_path):
-                size_mb = os.path.getsize(self.video_path) / (1024 * 1024)
-                return True, size_mb, output_path
+                return _validated(True, self.video_path)
 
         return False, size_mb, output_path
 
@@ -631,6 +677,7 @@ class RecordingController:
             return 0.0
         try:
             import json
+
             from lsc.config import load_config
             cfg = load_config()
             ffprobe = cfg.ffprobe_path
@@ -685,8 +732,8 @@ class RecordingController:
 
     def start_export(self, start_sec: float, end_sec: float,
                      output_dir: str, name: str,
-                     on_done, profile=None, on_progress=None) -> bool:
-        """Start async clip export. Returns True if export was started.
+                     on_done, profile=None, on_progress=None) -> str:
+        """Start async clip export. Returns export_id (non-empty string) if started.
 
         Parameters
         ----------
@@ -694,20 +741,50 @@ class RecordingController:
             编码配置。若为 None 则使用 ClipExporter 的默认配置。
         on_progress : callable | None
             进度回调 ``callback(percent, elapsed, total)``。
+
+        Returns
+        -------
+        str
+            export_id（非空字符串）表示已启动；空字符串表示启动失败。
+            export_id 可传给 :meth:`cancel_export` 取消该任务。
         """
         if not self._exporter or not self.video_path or not os.path.isfile(self.video_path):
-            return False
+            return ""
 
         self._export_thread = ExportWorker(
             self._exporter, self.video_path,
             start_sec, end_sec, output_dir, name,
             profile=profile,
         )
-        self._export_thread.finished.connect(on_done)
+        export_id = uuid4().hex
+        # 完成后从映射中移除，避免字典无限增长
+        def _on_finished(*args):
+            self._export_workers.pop(export_id, None)
+            try:
+                on_done(*args)
+            except Exception:
+                _log.exception("on_done callback raised in start_export")
+        self._export_thread.finished.connect(_on_finished)
         if on_progress is not None:
             self._export_thread.progress.connect(on_progress)
+        self._export_workers[export_id] = self._export_thread
         self._export_thread.start()
-        return True
+        return export_id
+
+    def cancel_export(self, export_id: str) -> bool:
+        """取消指定 export_id 的导出任务。
+
+        Returns
+        -------
+        bool
+            True 表示已发送 kill 信号；False 表示任务不存在或已结束。
+        """
+        worker = self._export_workers.get(export_id)
+        if worker is None:
+            return False
+        ok = worker.cancel()
+        # 不在此处弹出 worker，等 finished 信号触发后由 _on_finished 清理
+        return ok
 
     def start_analysis(self, video_path: str, profile_name: str,
                        output_dir: str, on_done) -> bool:

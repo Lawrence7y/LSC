@@ -1,0 +1,11 @@
+- [x] VideoPreview.tsx 的 `initPlayer` 不再发送 `enable_preview` 请求
+- [x] VideoPreview.tsx 的 useEffect cleanup 只清理本地 MsePlayer，不发送 `enable_preview { enabled: false }`
+- [x] VideoPreview.tsx 的 useEffect 依赖只有 `[active, roomId]`，不依赖不稳定函数引用
+- [x] VideoPreview.tsx 的 `onReady`/`onError` 通过 useRef 包裹，不触发重新渲染
+- [x] 后端 MseStreamer `on_error` 回调自动清理 `preview_enabled = False` 和 `_mse_streamers`
+- [x] 后端 `on_error` 回调广播 `rooms_updated`，前端状态与后端一致
+- [x] 后端 `_handle_mse_preview` enable 分支有防重入机制（正在启动时拒绝重复请求）
+- [x] `npx tsc --noEmit` 通过
+- [x] `python -m pytest -q` 不新增失败（10 个失败均为预存问题，与本 spec 无关）
+- [ ] 用户视角：点击"启用预览"后状态稳定不闪烁（需用户重启程序验证）
+- [ ] 用户视角：FFmpeg 失败后自动回到"启用预览"按钮状态（需用户重启程序验证）

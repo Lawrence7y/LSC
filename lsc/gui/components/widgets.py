@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from PySide6.QtCore import (
+    QByteArray,
     QEasingCurve,
     QEvent,
     QObject,
     QPropertyAnimation,
-    QByteArray,
     Qt,
-    Signal,
     QTimer,
+    Signal,
 )
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
@@ -34,10 +34,10 @@ class Card(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
-        self.setFrameShape(QFrame.StyledPanel)
+        self.setFrameShape(QFrame.NoFrame)
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(20, 20, 20, 20)
-        self._layout.setSpacing(14)
+        self._layout.setContentsMargins(16, 16, 16, 16)
+        self._layout.setSpacing(12)
 
     @property
     def layout(self):
@@ -632,12 +632,83 @@ class ToastManager(QObject):
             toast.dismiss()
 
 
+class PageHeader(QWidget):
+    """专业页面标题栏 — 包含标题、副标题和操作按钮区。
+
+    用于每个页面顶部，提供统一的视觉层次和操作入口。
+    左侧：标题 + 副标题；右侧：操作按钮区。
+    """
+
+    def __init__(self, title: str = "", subtitle: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("pageHeader")
+        self.setFixedHeight(64)
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(20, 12, 20, 12)
+        root.setSpacing(12)
+
+        # 左侧：标题区
+        title_box = QWidget()
+        title_layout = QVBoxLayout(title_box)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(2)
+
+        self._title_label = QLabel(title)
+        self._title_label.setObjectName("pageHeaderTitle")
+        self._subtitle_label = QLabel(subtitle)
+        self._subtitle_label.setObjectName("pageHeaderSubtitle")
+        self._subtitle_label.setVisible(bool(subtitle))
+
+        title_layout.addWidget(self._title_label)
+        title_layout.addWidget(self._subtitle_label)
+        root.addWidget(title_box)
+
+        root.addStretch()
+
+        # 右侧：操作按钮区
+        self._actions_box = QWidget()
+        self._actions_layout = QHBoxLayout(self._actions_box)
+        self._actions_layout.setContentsMargins(0, 0, 0, 0)
+        self._actions_layout.setSpacing(8)
+        root.addWidget(self._actions_box)
+
+    def set_title(self, text: str) -> None:
+        """设置主标题。"""
+        self._title_label.setText(text)
+
+    def set_subtitle(self, text: str) -> None:
+        """设置副标题。空字符串则隐藏。"""
+        self._subtitle_label.setText(text)
+        self._subtitle_label.setVisible(bool(text))
+
+    def add_action(self, widget: QWidget) -> None:
+        """添加操作控件到右侧按钮区。"""
+        self._actions_layout.addWidget(widget)
+
+    def add_separator(self) -> None:
+        """添加一个垂直分隔线。"""
+        sep = QFrame()
+        sep.setObjectName("v_line")
+        sep.setFixedWidth(1)
+        self._actions_layout.addWidget(sep)
+
+    def clear_actions(self) -> None:
+        """清空所有操作控件。"""
+        while self._actions_layout.count():
+            item = self._actions_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+
 __all__ = [
     "Card",
     "ChipGroup",
     "EmptyState",
     "FadeInWidget",
     "InputField",
+    "PageHeader",
     "ParamPanel",
     "Toast",
     "ToastManager",

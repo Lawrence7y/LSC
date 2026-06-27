@@ -103,7 +103,7 @@ def validate_recording(output_path: str, min_size_mb: float = 0.1) -> tuple[bool
                 # MKV starts with 0x1A45DFA3
                 if not (header[:3] == b'FLV' or header[:4] == b'\x1A\x45\xDF\xA3'):
                     return False, "文件格式异常，可能不是有效的视频文件"
-    except IOError as e:
+    except OSError as e:
         return False, f"文件读取失败: {e}"
 
     return True, ""
@@ -131,7 +131,7 @@ class StreamCapture:
         self._stall_checks = 0
         self._on_status_change: Callable[[CaptureStatus], None] | None = None
         self._stderr_tail: deque[str] = deque(maxlen=20)
-        self._stderr_future: "Future[None] | None" = None
+        self._stderr_future: Future[None] | None = None
         self._stderr_released = False
         self._last_error: str = ""
 
@@ -274,7 +274,11 @@ class StreamCapture:
             self._force_kill()
             self._set_status(CaptureStatus.STOPPED)
 
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        output_dir_path = os.path.dirname(output_path) or "."
+        try:
+            os.makedirs(output_dir_path, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(f"录制目录不可写：{output_dir_path}（{exc.strerror or exc}）") from exc
 
         cmd = [self.ffmpeg, "-y", "-loglevel", "warning"]
 
@@ -432,16 +436,16 @@ class StreamCapture:
             output_path = self._output_path
 
         # 关闭所有管道，防止文件描述符泄漏
-        if proc is not None:
-            for pipe_name in ("stdin", "stdout", "stderr"):
-                pipe = getattr(proc, pipe_name, None)
-                if pipe is not None:
-                    try:
-                        pipe.close()
-                    except Exception:
-                        pass
+        self._close_proc_pipes(proc)
 
         self._release_stderr_executor_once()
+
+        # 如果有孤儿进程，标记为 ERROR 而非 STOPPED
+        if orphaned_pid is not None:
+            self._set_status(CaptureStatus.ERROR)
+            _log.warning("Capture stopped with orphaned FFmpeg PID %s", orphaned_pid)
+            return CaptureResult(False, "", error=f"FFmpeg 进程未正常退出 (PID={orphaned_pid})")
+
         self._set_status(CaptureStatus.STOPPED)
 
         if os.path.isfile(output_path):
@@ -474,10 +478,25 @@ class StreamCapture:
             _log.warning("FFmpeg process exited unexpectedly (code=%d)", exit_code)
             with self._lock:
                 self._process = None
+            # 关闭管道，防止文件描述符泄漏（与 stop() 路径保持一致）
+            self._close_proc_pipes(proc)
             self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return exit_code
         return None
+
+    @staticmethod
+    def _close_proc_pipes(proc: subprocess.Popen | None) -> None:
+        """关闭 FFmpeg 进程的所有管道，防止文件描述符泄漏。"""
+        if proc is None:
+            return
+        for pipe_name in ("stdin", "stdout", "stderr"):
+            pipe = getattr(proc, pipe_name, None)
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
 
     def force_cleanup(self) -> None:
         """Force-kill FFmpeg and clean up. Safe to call even after stop().
@@ -496,24 +515,30 @@ class StreamCapture:
             proc = self._process
             self._process = None
         if proc:
+            pid = proc.pid
             try:
                 if proc.poll() is None:
+                    _log.debug("Terminating FFmpeg process %d", pid)
                     proc.terminate()
                     try:
                         proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
+                        _log.warning("FFmpeg %d did not terminate, killing", pid)
                         proc.kill()
-                        proc.wait(timeout=5)
-                    _log.info("Force-killed FFmpeg process")
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            _log.error("FFmpeg %d refused to die after kill", pid)
+                    _log.info("Force-killed FFmpeg process %d", pid)
             except Exception as exc:
-                _log.warning("Error force-killing FFmpeg: %s", exc)
+                _log.warning("Error force-killing FFmpeg %d: %s", pid, exc)
             finally:
-                # 关闭所有管道，防止文件描述符泄漏
                 for pipe_name in ("stdin", "stdout", "stderr"):
                     pipe = getattr(proc, pipe_name, None)
                     if pipe is not None:
                         try:
-                            pipe.close()
+                            if not pipe.closed:
+                                pipe.close()
                         except Exception:
                             pass
                 self._release_stderr_executor_once()
@@ -531,6 +556,8 @@ class StreamCapture:
             rc = proc.returncode
             with self._lock:
                 self._process = None
+            # 关闭管道，防止文件描述符泄漏（与 stop() 路径保持一致）
+            self._close_proc_pipes(proc)
             self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return _friendly_ffmpeg_message(rc, self.stderr_tail)

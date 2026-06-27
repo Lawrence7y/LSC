@@ -1,0 +1,47 @@
+{
+  "root": {
+    "nodeId": "gen-project-shell",
+    "kind": "project-shell",
+    "pageIds": ["page-dashboard", "page-multi-room", "page-settings"],
+    "output": "partials/project-shell.html",
+    "sharedRegions": ["sidebar", "pageFrame"],
+    "privateRegions": [],
+    "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+    "status": "generated",
+    "children": [
+      {
+        "nodeId": "gen-page-dashboard",
+        "kind": "page-leaf",
+        "pageIds": ["page-dashboard"],
+        "output": "pages/dashboard.html",
+        "sharedRegions": [],
+        "privateRegions": ["dashboard content"],
+        "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+        "status": "planned",
+        "children": []
+      },
+      {
+        "nodeId": "gen-page-multi-room",
+        "kind": "page-leaf",
+        "pageIds": ["page-multi-room"],
+        "output": "pages/multi-room.html",
+        "sharedRegions": [],
+        "privateRegions": ["multi-room content"],
+        "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+        "status": "planned",
+        "children": []
+      },
+      {
+        "nodeId": "gen-page-settings",
+        "kind": "page-leaf",
+        "pageIds": ["page-settings"],
+        "output": "pages/settings.html",
+        "sharedRegions": [],
+        "privateRegions": ["settings content"],
+        "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+        "status": "planned",
+        "children": []
+      }
+    ]
+  }
+}
