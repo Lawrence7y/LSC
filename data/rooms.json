@@ -1,0 +1,29 @@
+{
+  "rooms": [
+    {
+      "room_id": "67b21abefe9b4055a3796275bfccd078",
+      "room_url": "https://www.douyin.com/follow/live/994154756317?action_type=click&anchor_id=105525949232&enter_method_temai=undefined&follow_status=&is_livehead_preview_mini_window_show=0&is_replaced_live=0&live_position=2&mini_window_show_type=mouse_hover&request_id=20260628171039032C137AA69DCD64B8B3&room_id=7656074072765319946&search_tab=undefined&web_card_rank=&web_live_page=",
+      "platform": "",
+      "platform_name": "",
+      "streamer_name": "",
+      "stream_title": "",
+      "stream_url": "",
+      "is_connecting": false,
+      "is_connected": false,
+      "is_recording": false,
+      "record_output_path": "",
+      "record_started_at": null,
+      "record_size_mb": 0,
+      "last_error": "",
+      "preview_enabled": false,
+      "preview_paused": false,
+      "preview_muted": true,
+      "mark_in": null,
+      "mark_out": null,
+      "mark_in_wallclock": null,
+      "mark_out_wallclock": null,
+      "recording_start_mono": null,
+      "preview_latency": 2
+    }
+  ]
+}

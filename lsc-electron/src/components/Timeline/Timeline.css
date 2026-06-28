@@ -1,0 +1,253 @@
+.lsc-timeline {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  flex-direction: column;
+  padding: 6px 0 4px;
+}
+
+.lsc-timeline__scroll {
+  flex: 1;
+  overflow-x: auto;
+  overflow-y: visible;
+  position: relative;
+  padding: 16px 12px 4px;
+}
+
+.lsc-timeline__scroll::-webkit-scrollbar {
+  width: 3px;
+  height: 3px;
+}
+.lsc-timeline__scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.lsc-timeline__scroll::-webkit-scrollbar-thumb {
+  background: var(--text-400, #8e8e93);
+  border-radius: 2px;
+  opacity: 0.35;
+}
+
+.lsc-timeline__inner {
+  position: relative;
+  height: 100%;
+  min-width: 100%;
+}
+
+.lsc-timeline__timecode {
+  position: absolute;
+  bottom: 0;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  justify-content: space-between;
+  pointer-events: none;
+  z-index: 8;
+}
+
+.lsc-timeline__timecode span {
+  font-size: 10px;
+  color: var(--text-tertiary, #707070);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+.lsc-timeline__ruler {
+  position: relative;
+  height: 16px;
+  margin-top: 4px;
+  pointer-events: none;
+}
+
+.lsc-timeline__tick {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  background: var(--text-400, #8e8e93);
+  opacity: 0.4;
+}
+
+.lsc-timeline__tick.major {
+  height: 10px;
+  opacity: 0.65;
+}
+
+.lsc-timeline__tick.minor {
+  height: 5px;
+  opacity: 0.3;
+}
+
+.lsc-timeline__tick-label {
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 9px;
+  color: var(--text-300, #6b7280);
+  white-space: nowrap;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+.lsc-timeline__track {
+  width: 100%;
+  height: 3px;
+  background: var(--background-700);
+  border-radius: 2px;
+  position: relative;
+  transition: height 0.12s ease;
+  overflow: visible;
+  margin-top: 2px;
+}
+
+.lsc-timeline__scroll:hover .lsc-timeline__track {
+  height: 5px;
+}
+
+.lsc-timeline__buffered,
+.lsc-timeline__progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.lsc-timeline__buffered {
+  background: var(--border-default);
+}
+
+.lsc-timeline__progress {
+  background: var(--accent-primary, #007aff);
+}
+
+.lsc-timeline__selection {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: rgba(245, 166, 35, 0.12);
+  z-index: 2;
+  pointer-events: none;
+}
+
+.lsc-timeline__clip {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 2px;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.lsc-timeline__marker {
+  position: absolute;
+  top: -8px;
+  bottom: -8px;
+  width: 4px;
+  z-index: 6;
+  cursor: ew-resize;
+  pointer-events: auto;
+}
+
+.lsc-timeline__marker::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 4px;
+  height: 100%;
+  border-radius: 2px;
+}
+
+.lsc-timeline__marker--in::before {
+  background: var(--state-success, #34c759);
+}
+
+.lsc-timeline__marker--out::before {
+  background: var(--state-error, #ff3b30);
+}
+
+.lsc-timeline__marker::after {
+  content: '';
+  position: absolute;
+  top: -6px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.lsc-timeline__marker--in::after {
+  background: var(--state-success, #34c759);
+}
+
+.lsc-timeline__marker--out::after {
+  background: var(--state-error, #ff3b30);
+}
+
+.lsc-timeline__marker-label {
+  position: absolute;
+  bottom: -18px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 9px;
+  white-space: nowrap;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  pointer-events: none;
+  background: var(--bg-secondary, rgba(0,0,0,0.8));
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.lsc-timeline__marker--in .lsc-timeline__marker-label {
+  color: var(--state-success, #34c759);
+}
+
+.lsc-timeline__marker--out .lsc-timeline__marker-label {
+  color: var(--state-error, #ff3b30);
+}
+
+.lsc-timeline__playhead {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent-primary, #007aff);
+  z-index: 5;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  box-shadow: 0 0 6px rgba(0, 122, 255, 0.35);
+  pointer-events: none;
+}
+
+.lsc-timeline__scroll:hover .lsc-timeline__playhead {
+  opacity: 1;
+}
+
+.lsc-timeline__tooltip {
+  position: absolute;
+  top: -24px;
+  transform: translateX(-50%);
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.85));
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.12));
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: var(--text-50);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 10;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  backdrop-filter: blur(8px);
+}
+
+.lsc-timeline__scroll:hover .lsc-timeline__tooltip {
+  opacity: 1;
+}

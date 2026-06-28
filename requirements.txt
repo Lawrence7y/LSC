@@ -1,0 +1,13 @@
+# LSC (直播切片多人) — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+# For development/testing:  pip install -r requirements.txt pytest
+
+# Qt event loop for python-backend (Signal/Slot, QTimer)
+PySide6>=6.5,<7
+
+# Python WebSocket backend (Electron version)
+websockets>=12.0
+
+# Test dependencies (uncomment if running the test suite)
+# pytest>=7.4,<9
