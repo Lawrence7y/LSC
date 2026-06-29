@@ -199,6 +199,7 @@ class StreamInfo:
     raw: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     error_code: str = ""
+    category: str = ""
 
     def to_legacy_dict(self) -> dict[str, Any]:
         """Return the dictionary shape consumed by the current GUI code."""
@@ -217,6 +218,7 @@ class StreamInfo:
             "_headers": dict(self.headers),
             "_inputArgs": headers_to_ffmpeg_input_args(self.headers),
             "_raw": dict(self.raw),
+            "category": self.category,
         }
 
 
@@ -294,6 +296,7 @@ class BasePlatformAdapter(abc.ABC):
         selected_quality: str = "",
         headers: dict[str, str] | None = None,
         raw: dict[str, Any] | None = None,
+        category: str = "",
     ) -> StreamInfo:
         """Build a successful StreamInfo for this platform."""
         return StreamInfo(
@@ -307,6 +310,7 @@ class BasePlatformAdapter(abc.ABC):
             selected_quality=selected_quality,
             headers=headers or {},
             raw=raw or {},
+            category=category,
         )
 
     def _can_handle_by_hosts(

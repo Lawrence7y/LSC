@@ -195,12 +195,34 @@ class LSCWebSocketBackend:
             _log.info("WebSocket server thread exited")
 
     async def _broadcast_coroutine(self):
-        """协程版广播循环：从 bridge 队列取消息并发送。"""
+        """协程版广播循环：从 bridge 队列取消息并发送。
+
+        合并连续的 rooms_updated 消息：多房间同时变更状态时，
+        Qt 信号会快速触发多次 _queue_rooms_update，每次都序列化全部房间。
+        合并为只发送最新的一条，减少前端 JSON.parse 负载。
+        """
         while not self._shutdown:
             msg = self.bridge.get_broadcast(block=False)
             if msg is None:
                 await asyncio.sleep(0.1)
                 continue
+            msg_type = msg.get('type')
+            if msg_type == 'rooms_updated':
+                while True:
+                    next_msg = self.bridge.get_broadcast(block=False)
+                    if next_msg is None:
+                        break
+                    if next_msg.get('type') != 'rooms_updated':
+                        data = json.dumps(msg)
+                        clients = list(self.server.clients)
+                        if clients:
+                            await asyncio.gather(
+                                *[client.send(data) for client in clients],
+                                return_exceptions=True,
+                            )
+                        msg = next_msg
+                        break
+                    msg = next_msg
             data = json.dumps(msg)
             clients = list(self.server.clients)
             if not clients:

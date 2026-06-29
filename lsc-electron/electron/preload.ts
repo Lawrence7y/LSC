@@ -29,8 +29,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 文件操作
   selectDirectory: () => ipcRenderer.invoke('select-directory'),
   openPath: (path: string) => ipcRenderer.invoke('open-path', path),
-  // 在资源管理器中高亮定位文件（区别于 openPath 会用默认程序打开文件）
   showItemInFolder: (path: string) => ipcRenderer.invoke('show-item-in-folder', path),
+
+  // 自动更新
+  checkForUpdate: () => ipcRenderer.invoke('check-for-update'),
+  downloadUpdate: () => ipcRenderer.invoke('download-update'),
+  installUpdate: () => ipcRenderer.invoke('install-update'),
+  onUpdateStatus: (callback: (status: any) => void) => {
+    ipcRenderer.on('update-status', (_event, status) => callback(status))
+  },
+  removeUpdateStatusListeners: () => {
+    ipcRenderer.removeAllListeners('update-status')
+  },
 })
 
 contextBridge.exposeInMainWorld('app', {

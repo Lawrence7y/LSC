@@ -1,4 +1,5 @@
 "use strict";
+Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 const electron = require("electron");
 const path = require("path");
 const fs = require("fs");
@@ -7,6 +8,27 @@ const BACKEND_WS_URL_RE = /\bWebSocket server (?:ready at|listening on)\s+(ws:\/
 function extractBackendWsUrl(output) {
   const match = BACKEND_WS_URL_RE.exec(output);
   return match ? match[1] : null;
+}
+function appLog(level, module2, msg) {
+  try {
+    const logDir = path.join(electron.app.getPath("userData"), "logs");
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    const logFile = path.join(logDir, "debug.log");
+    const line = `${(/* @__PURE__ */ new Date()).toISOString()} [${level}] [${module2}] ${msg}
+`;
+    fs.appendFileSync(logFile, line, "utf-8");
+    if (level === "ERROR") {
+      console.error(line.trim());
+    } else if (level === "WARN") {
+      console.warn(line.trim());
+    } else {
+      console.log(line.trim());
+    }
+  } catch (err) {
+    console.error("[appLog] 日志写入失败:", err);
+  }
 }
 let backendProcess = null;
 let mainWindow = null;
@@ -28,21 +50,24 @@ function loadSettings() {
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath, "utf-8");
       const parsed = JSON.parse(content);
+      appLog("INFO", "Settings", `读取本地设置成功: ${content.trim()}`);
       return {
         autoLaunch: !!parsed.autoLaunch,
         minimizeToTray: !!parsed.minimizeToTray
       };
     }
   } catch (err) {
-    console.error("[loadSettings] 读取设置失败:", err);
+    appLog("ERROR", "Settings", `读取设置失败: ${err}`);
   }
   return { autoLaunch: false, minimizeToTray: false };
 }
 function saveSettings(settings) {
   try {
-    fs.writeFileSync(getSettingsFilePath(), JSON.stringify(settings, null, 2), "utf-8");
+    const content = JSON.stringify(settings, null, 2);
+    fs.writeFileSync(getSettingsFilePath(), content, "utf-8");
+    appLog("INFO", "Settings", `保存设置到本地成功: ${content.trim()}`);
   } catch (err) {
-    console.error("[saveSettings] 写入设置失败:", err);
+    appLog("ERROR", "Settings", `写入设置失败: ${err}`);
   }
 }
 function pushSettingsToRenderer() {
@@ -76,7 +101,7 @@ function consumeBackendOutput(data) {
     backendWsUrl = wsUrl;
     writeLog(`[backend-url-detected] ${wsUrl}
 `);
-    console.log("[spawnBackend] backend WebSocket URL:", wsUrl);
+    appLog("INFO", "Backend", `检测到后端 WebSocket URL: ${wsUrl}`);
   }
 }
 function detectPython() {
@@ -86,7 +111,7 @@ function detectPython() {
       child_process.execSync(`${cmd} --version`, { stdio: "ignore" });
       return cmd;
     } catch (err) {
-      console.error(`[detectPython] ${cmd} 不可用:`, err);
+      appLog("WARN", "DetectPython", `${cmd} 不可用: ${err}`);
     }
   }
   try {
@@ -98,14 +123,14 @@ function detectPython() {
         for (const ver of versions) {
           const p = path.join(wbPythonDir, ver, process.platform === "win32" ? "python.exe" : "python");
           if (fs.existsSync(p)) {
-            console.log(`[detectPython] 使用 WorkBuddy 管理的 Python: ${p}`);
+            appLog("INFO", "DetectPython", `使用 WorkBuddy 管理的 Python: ${p}`);
             return p;
           }
         }
       }
     }
   } catch (err) {
-    console.error("[detectPython] 检查 WorkBuddy Python 失败:", err);
+    appLog("ERROR", "DetectPython", `检查 WorkBuddy Python 失败: ${err}`);
   }
   try {
     const bundled = path.join(process.resourcesPath, "python", "python.exe");
@@ -113,7 +138,7 @@ function detectPython() {
       return bundled;
     }
   } catch (err) {
-    console.error("[detectPython] 检查打包内 Python 失败:", err);
+    appLog("ERROR", "DetectPython", `检查打包内 Python 失败: ${err}`);
   }
   return null;
 }
@@ -123,20 +148,20 @@ function spawnBackend() {
   const interpreter = detectPython();
   backendWsUrl = null;
   backendOutputBuffer = "";
-  console.log("[spawnBackend]", { backendDir, backendEntry, interpreter, exists: fs.existsSync(backendEntry) });
+  appLog("INFO", "Backend", `正在启动后端: interpreter=${interpreter}, entry=${backendEntry}, exists=${fs.existsSync(backendEntry)}`);
   const logDir = path.join(electron.app.getPath("userData"), "logs");
-  console.log("[spawnBackend] userData=", electron.app.getPath("userData"), "logDir=", logDir);
+  appLog("INFO", "Backend", `日志目录: ${logDir}`);
   try {
     fs.mkdirSync(logDir, { recursive: true });
   } catch (err) {
-    console.error("[spawnBackend] 创建日志目录失败:", err);
+    appLog("ERROR", "Backend", `创建日志目录失败: ${err}`);
   }
   try {
     if (backendLogStream) {
       try {
         backendLogStream.end();
       } catch (err) {
-        console.error("[spawnBackend] 关闭旧日志流失败:", err);
+        appLog("ERROR", "Backend", `关闭旧日志流失败: ${err}`);
       }
     }
     backendLogStream = fs.createWriteStream(getBackendLogPath(), { flags: "a" });
@@ -144,7 +169,7 @@ function spawnBackend() {
       backendLogStream = null;
     });
   } catch (err) {
-    console.error("[spawnBackend] 创建日志流失败:", err);
+    appLog("ERROR", "Backend", `创建日志流失败: ${err}`);
     backendLogStream = null;
   }
   if (!interpreter) {
@@ -153,7 +178,7 @@ function spawnBackend() {
     writeLog(`
 [spawn-failed] ${msg}
 `);
-    console.error("[spawnBackend]", msg);
+    appLog("ERROR", "Backend", msg);
     return;
   }
   writeLog(`
@@ -200,7 +225,7 @@ function spawnBackend() {
     try {
       backendLogStream == null ? void 0 : backendLogStream.end();
     } catch (err) {
-      console.error("[backend-exit] 关闭日志流失败:", err);
+      appLog("ERROR", "Backend", `关闭日志流失败: ${err}`);
     }
     backendLogStream = null;
     backendProcess = null;
@@ -226,14 +251,16 @@ function killBackend() {
     if (process.platform === "win32") {
       try {
         child_process.execSync(`taskkill /T /F /PID ${pid}`, { stdio: "ignore" });
+        appLog("INFO", "Backend", `成功终止 Windows 后端进程 tree (PID: ${pid})`);
       } catch (err) {
-        console.error("[killBackend] taskkill 失败:", err);
+        appLog("ERROR", "Backend", `taskkill 失败: ${err}`);
       }
     } else {
       try {
         process.kill(pid, "SIGTERM");
+        appLog("INFO", "Backend", `发送 SIGTERM 至后端进程 (PID: ${pid})`);
       } catch (err) {
-        console.error("[killBackend] SIGTERM 失败:", err);
+        appLog("ERROR", "Backend", `SIGTERM 失败: ${err}`);
         return;
       }
       const maxAttempts = 30;
@@ -243,14 +270,15 @@ function killBackend() {
         try {
           process.kill(pid, 0);
         } catch (err) {
-          console.error("[killBackend] 进程已退出:", err);
+          appLog("INFO", "Backend", `后端进程 (PID: ${pid}) 已退出`);
           return;
         }
         if (attempts >= maxAttempts) {
           try {
             process.kill(pid, "SIGKILL");
+            appLog("WARN", "Backend", `超时，强杀进程 (PID: ${pid})`);
           } catch (err) {
-            console.error("[killBackend] SIGKILL 失败:", err);
+            appLog("ERROR", "Backend", `SIGKILL 失败: ${err}`);
           }
           return;
         }
@@ -259,7 +287,7 @@ function killBackend() {
       setTimeout(checkAlive, 100);
     }
   } catch (err) {
-    console.error("[killBackend] 终止后端失败:", err);
+    appLog("ERROR", "Backend", `终止后端失败: ${err}`);
   }
 }
 function createTray() {
@@ -280,7 +308,7 @@ function createTray() {
         }
       }
     } catch (err) {
-      console.error("[createTray] 加载图标失败:", p, err);
+      appLog("ERROR", "Tray", `加载图标失败: ${p} ${err}`);
     }
   }
   try {
@@ -314,8 +342,9 @@ function createTray() {
         mainWindow.focus();
       }
     });
+    appLog("INFO", "Tray", "托盘菜单创建成功");
   } catch (err) {
-    console.error("[createTray] 托盘创建失败:", err);
+    appLog("ERROR", "Tray", `托盘创建失败: ${err}`);
   }
 }
 function _isSafePath(p) {
@@ -340,12 +369,20 @@ function _isSafePath(p) {
   return true;
 }
 function registerWindowIpc() {
-  electron.ipcMain.handle("get-app-version", () => electron.app.getVersion());
-  electron.ipcMain.handle("get-backend-ws-url", () => backendWsUrl);
+  electron.ipcMain.handle("get-app-version", () => {
+    appLog("INFO", "IPC", "获取应用版本");
+    return electron.app.getVersion();
+  });
+  electron.ipcMain.handle("get-backend-ws-url", () => {
+    appLog("INFO", "IPC", `获取后端 WebSocket URL: ${backendWsUrl}`);
+    return backendWsUrl;
+  });
   electron.ipcMain.handle("minimize-window", () => {
+    appLog("INFO", "IPC", "最小化窗口");
     mainWindow == null ? void 0 : mainWindow.minimize();
   });
   electron.ipcMain.handle("maximize-window", () => {
+    appLog("INFO", "IPC", "切换最大化/还原");
     if (mainWindow && mainWindow.isMaximized()) {
       mainWindow.unmaximize();
     } else {
@@ -353,41 +390,52 @@ function registerWindowIpc() {
     }
   });
   electron.ipcMain.handle("close-window", () => {
+    appLog("INFO", "IPC", "关闭窗口");
     mainWindow == null ? void 0 : mainWindow.close();
   });
   electron.ipcMain.handle("select-directory", async () => {
+    appLog("INFO", "IPC", "打开选择文件夹对话框");
     if (!mainWindow) return null;
     const result = await electron.dialog.showOpenDialog(mainWindow, {
       properties: ["openDirectory"]
     });
+    appLog("INFO", "IPC", `文件夹选择结果: ${result.filePaths[0] || "已取消"}`);
     return result.canceled ? null : result.filePaths[0];
   });
   electron.ipcMain.handle("open-path", async (_event, openPathStr) => {
+    appLog("INFO", "IPC", `请求打开路径: ${openPathStr}`);
     if (!_isSafePath(openPathStr)) {
       writeLog(`[open-path-rejected] ${openPathStr}
 `);
+      appLog("WARN", "IPC", `打开路径被拒绝 (不安全): ${openPathStr}`);
       return { success: false, error: "不允许打开此类型文件" };
     }
     const errMsg = await electron.shell.openPath(openPathStr);
     if (errMsg) {
       writeLog(`[open-path-failed] ${openPathStr} ${errMsg}
 `);
+      appLog("ERROR", "IPC", `打开路径失败: ${openPathStr} ${errMsg}`);
       return { success: false, error: errMsg };
     }
+    appLog("INFO", "IPC", `成功打开路径: ${openPathStr}`);
     return { success: true };
   });
   electron.ipcMain.handle("show-item-in-folder", async (_event, filePath) => {
+    appLog("INFO", "IPC", `请求在目录中显示文件: ${filePath}`);
     if (!_isSafePath(filePath)) {
       writeLog(`[show-item-in-folder-rejected] ${filePath}
 `);
+      appLog("WARN", "IPC", `在目录中显示文件被拒绝: ${filePath}`);
       return { success: false, error: "不允许打开此路径" };
     }
     try {
       electron.shell.showItemInFolder(filePath);
+      appLog("INFO", "IPC", `成功在目录中显示文件: ${filePath}`);
       return { success: true };
     } catch (e) {
       writeLog(`[show-item-in-folder-failed] ${filePath} ${e}
 `);
+      appLog("ERROR", "IPC", `在目录中显示文件失败: ${filePath} ${e}`);
       return { success: false, error: String(e) };
     }
   });
@@ -402,27 +450,50 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, "../preload/preload.js"),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: false
+      // 禁用后台节流，确保预览/录制计时器在窗口非活跃时仍精确运行
     },
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     show: false
   });
+  mainWindow.webContents.on("console-message", (_event, _level, message) => {
+    appLog("INFO", "renderer", message);
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    appLog("ERROR", "createWindow", `LOAD FAILED: code=${errorCode} desc=${errorDescription} url=${validatedURL}`);
+  });
+  mainWindow.webContents.on("crashed", () => {
+    appLog("ERROR", "createWindow", `RENDERER CRASHED`);
+  });
   if (process.env.VITE_DEV_SERVER_URL) {
+    appLog("INFO", "createWindow", `加载开发服务器: ${process.env.VITE_DEV_SERVER_URL}`);
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
     mainWindow.webContents.openDevTools();
   } else {
-    mainWindow.loadFile(path.join(__dirname, "../../dist/index.html"));
+    const indexPath = path.join(__dirname, "../../dist/index.html");
+    appLog("INFO", "createWindow", `加载生产网页资源: ${indexPath}`);
+    mainWindow.loadFile(indexPath).catch((err) => {
+      appLog("ERROR", "createWindow", `加载 index.html 失败: ${err.message}`);
+    });
   }
   mainWindow.once("ready-to-show", () => {
-    mainWindow == null ? void 0 : mainWindow.show();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      appLog("INFO", "createWindow", "窗口准备就绪并显示");
+    }
   });
   mainWindow.on("close", (e) => {
     if (settingsCache.minimizeToTray && tray && mainWindow && !mainWindow.isDestroyed()) {
       e.preventDefault();
       mainWindow.hide();
+      appLog("INFO", "createWindow", "拦截窗口关闭，最小化到系统托盘");
+    } else {
+      appLog("INFO", "createWindow", "窗口即将关闭并退出进程");
     }
   });
   mainWindow.webContents.once("did-finish-load", () => {
+    appLog("INFO", "createWindow", "网页加载完成，推送初始设置");
     pushSettingsToRenderer();
     if (pythonDetectError) {
       mainWindow == null ? void 0 : mainWindow.webContents.send("backend-error", pythonDetectError);
@@ -431,11 +502,12 @@ function createWindow() {
 }
 function registerAppSettingsIpc() {
   electron.ipcMain.handle("app:set-auto-launch", (_event, enabled) => {
+    appLog("INFO", "IPC", `设置开机自启: ${enabled}`);
     settingsCache.autoLaunch = !!enabled;
     try {
       electron.app.setLoginItemSettings({ openAtLogin: !!enabled });
     } catch (err) {
-      console.error("[set-auto-launch] 设置开机启动失败:", err);
+      appLog("ERROR", "IPC", `设置开机启动失败: ${err}`);
     }
     saveSettings(settingsCache);
     pushSettingsToRenderer();
@@ -445,6 +517,7 @@ function registerAppSettingsIpc() {
     return settingsCache.autoLaunch;
   });
   electron.ipcMain.handle("app:set-minimize-to-tray", (_event, enabled) => {
+    appLog("INFO", "IPC", `设置最小化到托盘: ${enabled}`);
     settingsCache.minimizeToTray = !!enabled;
     saveSettings(settingsCache);
     pushSettingsToRenderer();
@@ -454,12 +527,13 @@ function registerAppSettingsIpc() {
     return settingsCache.minimizeToTray;
   });
 }
+electron.app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 electron.app.whenReady().then(() => {
   settingsCache = loadSettings();
   try {
     electron.app.setLoginItemSettings({ openAtLogin: settingsCache.autoLaunch });
   } catch (err) {
-    console.error("[whenReady] 同步开机启动设置失败:", err);
+    appLog("ERROR", "App", `同步开机启动设置失败: ${err}`);
   }
   registerAppSettingsIpc();
   registerWindowIpc();
@@ -468,6 +542,7 @@ electron.app.whenReady().then(() => {
   createTray();
 });
 electron.app.on("before-quit", () => {
+  appLog("INFO", "App", "应用即将退出");
   killBackend();
 });
 process.on("exit", () => {
@@ -486,4 +561,5 @@ electron.app.on("activate", () => {
     mainWindow.focus();
   }
 });
+exports.appLog = appLog;
 //# sourceMappingURL=main.js.map

@@ -1,7 +1,8 @@
-"""录制服务 — 封装录制业务逻辑，与 UI 无关。
+"""录制服务 — 录制生命周期门面，封装录制业务逻辑，与 UI 无关。
 
-RecordingService 是录制功能的统一入口，
+RecordingService 是录制功能的统一入口（Facade），
 单房间录制页和多房间工作台都通过它来操作录制。
+完整管理录制生命周期：解析直播流 → 启动 FFmpeg 录制 → 跟踪状态 → 停止并校验文件。
 
 设计原则：
 - 不依赖 Qt / PySide6，便于单元测试
@@ -685,10 +686,17 @@ class RecordingService:
 
     @classmethod
     def preflight_check(cls, output_dir: str, concurrent_streams: int = 1) -> str:
-        """录制前预检。
+        """录制前磁盘空间预检。
+
+        在开始录制前检查输出目录所在磁盘的可用空间是否满足要求。
+        每路并发录制至少需要 8 GB 可用空间。
+
+        Args:
+            output_dir: 输出目录路径
+            concurrent_streams: 并发录制路数，默认 1
 
         Returns:
-            错误信息字符串，空字符串表示通过
+            错误信息字符串；空字符串表示检查通过，非空字符串表示空间不足
         """
         import shutil
 

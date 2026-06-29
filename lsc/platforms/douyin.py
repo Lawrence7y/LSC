@@ -193,6 +193,7 @@ class DouyinAdapter(BasePlatformAdapter):
         title = str(data.get("title", "") or "")
         streamer = str(data.get("streamerName", "") or "")
         room_id = str(data.get("roomId", "") or "")
+        category = str(data.get("category", "") or "")
 
         if title in _INVALID:
             title = ""
@@ -200,6 +201,8 @@ class DouyinAdapter(BasePlatformAdapter):
             streamer = ""
         if room_id in _INVALID:
             room_id = ""
+        if category in _INVALID:
+            category = ""
 
         if not title or not streamer:
             title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
@@ -244,6 +247,7 @@ class DouyinAdapter(BasePlatformAdapter):
             selected_quality=str(data.get("selectedQuality", "") or next(iter(quality_urls), "")),
             headers=dict(DOUYIN_HEADERS),
             raw={},  # discard extracted SSR payload on success to save memory
+            category=category,
         )
 
     def _failed(self, url: str, error: str, code: str, raw: dict | None = None) -> StreamInfo:

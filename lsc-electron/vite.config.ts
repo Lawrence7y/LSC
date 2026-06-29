@@ -16,7 +16,7 @@ export default defineConfig({
             minify: false,
             outDir: 'dist-electron/main',
             rollupOptions: {
-              external: ['electron', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
+              external: ['electron', 'electron-updater', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
             },
           },
         },
@@ -30,7 +30,7 @@ export default defineConfig({
             minify: false,
             outDir: 'dist-electron/preload',
             rollupOptions: {
-              external: ['electron', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
+              external: ['electron', 'electron-updater', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
             },
           },
         },

@@ -88,6 +88,7 @@ def extract_ssr_data(html: str) -> dict[str, object]:
         "selectedQuality": "",
         "availableQualities": [],
         "qualityUrls": {},
+        "category": "",
     }
 
     def pick_first(obj: dict[str, object], fields: list[str]) -> str:
@@ -157,7 +158,7 @@ def extract_ssr_data(html: str) -> dict[str, object]:
         if end_idx < 0:
             search_pos = start_idx
             continue
-        
+
         raw_str = html[start_idx:end_idx]
         try:
             decoded = json.loads('"' + raw_str + '"')
@@ -165,7 +166,7 @@ def extract_ssr_data(html: str) -> dict[str, object]:
         except Exception:
             s = raw_str.replace('\\"', '"').replace('\\/', '/').replace('\\\\', '\\')
             chunks.append(s)
-            
+
         search_pos = end_idx + 3
 
     full_payload = "".join(chunks)
@@ -179,16 +180,16 @@ def extract_ssr_data(html: str) -> dict[str, object]:
         match = chunk_pattern.search(full_payload, pos)
         if not match:
             break
-        
+
         header_end = match.end()
         start_pos = header_end
         if start_pos < len(full_payload) and full_payload[start_pos] == ',':
             start_pos += 1
-            
+
         if start_pos < len(full_payload) and full_payload[start_pos] in ('{', '['):
             try:
                 doc, end_idx = decoder.raw_decode(full_payload, start_pos)
-                
+
                 # Extract meta info using recursive path finder
                 # Extract meta info using recursive path finder
                 if not info["title"]:
@@ -203,7 +204,7 @@ def extract_ssr_data(html: str) -> dict[str, object]:
                         if val and not val.startswith("$"):
                             info["title"] = val
                             break
-                            
+
                 if not info["streamerName"]:
                     streamer_paths = [
                         "roomStore.roomInfo.room.owner.nickname",
@@ -217,7 +218,7 @@ def extract_ssr_data(html: str) -> dict[str, object]:
                         if val and not val.startswith("$"):
                             info["streamerName"] = val
                             break
-                            
+
                 if not info["roomId"]:
                     room_id_paths = [
                         "roomStore.roomInfo.room.id_str",
@@ -322,5 +323,20 @@ def extract_ssr_data(html: str) -> dict[str, object]:
                 quality_urls.setdefault("regex_hls", stream_url)
                 if "regex_hls" not in available_qualities:
                     available_qualities.append("regex_hls")
+
+    if not info.get("category"):
+        category_paths = [
+            "roomStore.roomInfo.room.category",
+            "roomStore.roomInfo.category",
+            "liveRoom.category",
+            "anchor.category",
+            "data.category",
+            "room.category",
+        ]
+        for p in category_paths:
+            val = find_value_by_path(doc if isinstance(doc, dict) else {}, p)
+            if val and not val.startswith("$"):
+                info["category"] = val
+                break
 
     return info

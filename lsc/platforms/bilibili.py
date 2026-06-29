@@ -20,6 +20,7 @@ from .base import (
 _log = logging.getLogger(__name__)
 
 ROOM_INIT_URL = "https://api.live.bilibili.com/room/v1/Room/room_init"
+GET_INFO_URL = "https://api.live.bilibili.com/room/v1/Room/getInfo"
 PLAY_INFO_URL = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
 BILIBILI_HEADERS = {
     "Referer": "https://live.bilibili.com/",
@@ -112,6 +113,52 @@ class BilibiliAdapter(BasePlatformAdapter):
         real_room_id = str(room_data.get("room_id") or room_id)
         title = str(room_data.get("title") or "")
         streamer = str(room_data.get("uname") or "")
+        category = str(room_data.get("area_name") or room_data.get("parent_area_name") or "")
+
+        # getInfo 和 play_info 都只需要 real_room_id，并行请求节省 0.5-2 秒
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            # getInfo 获取主播名/标题/分区名称（room_init 不返回这些字段）
+            info_future = None
+            if not title or not streamer or not category:
+                info_future = pool.submit(
+                    self._fetch_json, GET_INFO_URL, params={"room_id": real_room_id}
+                )
+            # play_info 获取播放地址
+            play_future = pool.submit(
+                self._fetch_json,
+                PLAY_INFO_URL,
+                params={
+                    "room_id": real_room_id,
+                    "protocol": "0,1",
+                    "format": "0,1,2",
+                    "codec": "0,1",
+                    "qn": "10000",
+                    "platform": "web",
+                    "dolby": "5",
+                    "panorama": "1",
+                },
+            )
+
+            if info_future is not None:
+                try:
+                    room_info = info_future.result(timeout=12)
+                    info_data = room_info.get("data") if room_info.get("code") == 0 else None
+                    if isinstance(info_data, dict):
+                        if not title:
+                            title = str(info_data.get("title") or "")
+                        if not streamer:
+                            streamer = str(info_data.get("uname") or "")
+                        if not category:
+                            category = str(info_data.get("area_v2_name") or info_data.get("parent_area_name") or "")
+                        if int(room_data.get("live_status") or 0) != 1:
+                            if int(info_data.get("live_status") or 0) == 1:
+                                room_data["live_status"] = 1
+                except Exception as exc:
+                    _log.debug("B站 getInfo 请求失败: %s", exc)
+
+            play_info = play_future.result(timeout=12)
+
         if int(room_data.get("live_status") or 0) != 1:
             return self._failed(
                 clean_url,
@@ -120,19 +167,6 @@ class BilibiliAdapter(BasePlatformAdapter):
                 raw={"room_init": room_init},
             )
 
-        play_info = self._fetch_json(
-            PLAY_INFO_URL,
-            params={
-                "room_id": real_room_id,
-                "protocol": "0,1",
-                "format": "0,1,2",
-                "codec": "0,1",
-                "qn": "10000",
-                "platform": "web",
-                "dolby": "5",
-                "panorama": "1",
-            },
-        )
         play_data = play_info.get("data")
         if play_info.get("code") != 0 or not isinstance(play_data, dict):
             return self._failed(clean_url, "B 站播放信息接口返回异常。", ERROR_PARSE_FAILED)
@@ -164,6 +198,7 @@ class BilibiliAdapter(BasePlatformAdapter):
             quality_urls=quality_urls,
             selected_quality=selected_quality,
             headers=_build_headers_with_cookies(),
+            category=category,
             raw={},  # discard large API responses on success to save memory
         )
 

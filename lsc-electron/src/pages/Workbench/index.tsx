@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert } from 'antd'
-import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined } from '@ant-design/icons'
+import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
@@ -11,7 +11,7 @@ import { RecordSettings } from './components/RecordSettings'
 import { ClipSegment } from '@/types'
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
 import { formatTime } from '@/utils/time'
-
+import { getAligner } from '@/utils/previewAudioAligner'
 export default function Workbench() {
   const { isConnected, send, on } = useWebSocket()
   const rooms = useAppStore((state) => state.rooms)
@@ -43,9 +43,14 @@ export default function Workbench() {
   const [timelineZoom, setTimelineZoom] = useState(1)
   const [allMuted, setAllMuted] = useState(false)
   const [sortBy, setSortBy] = useState<string>('default')
+  const [aligning, setAligning] = useState(false)
+  const aligningRoomIdsRef = useRef<Set<string>>(new Set())
   const loopTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [fullscreenRoomId, setFullscreenRoomId] = useState<string | null>(null)
+  // 两级放大：第一级为“区域放大”（填满左侧面板），第二级为“全屏”（fixed 覆盖视口）
+  const [expandedRoomId, setExpandedRoomId] = useState<string | null>(null)
   const [selectedRoomIds, setSelectedRoomIds] = useState<Set<string>>(new Set())
+  const selectedRoomIdsRef = useRef<Set<string>>(new Set())
   const [lastClickedIndex, setLastClickedIndex] = useState<number | null>(null)
   const pendingRoomSavesRef = useRef(0)
   const pendingAddUrlRef = useRef('')
@@ -76,23 +81,24 @@ export default function Workbench() {
         lastPreviewPositionsRef.current = next
         setPreviewPositions(next)
       }
-    }, 500)
+    }, 200)  // S4: 从 500ms 提升到 200ms，时间线播放头更平滑
     return () => clearInterval(id)
   }, [])
 
-  // Escape 键退出全屏（capture 阶段拦截，避免触发其他快捷键如 mark_in/out）
+  // Escape 键退出放大（capture 阶段拦截，避免触发其他快捷键如 mark_in/out）
   useEffect(() => {
-    if (fullscreenRoomId === null) return
+    if (expandedRoomId === null) return
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
         e.stopPropagation()
+        setExpandedRoomId(null)
         setFullscreenRoomId(null)
       }
     }
     window.addEventListener('keydown', handleKeyDown, true)
     return () => window.removeEventListener('keydown', handleKeyDown, true)
-  }, [fullscreenRoomId])
+  }, [expandedRoomId])
 
   // 程序切到后台后再切回前台时，恢复所有 MSE player 的播放
   useEffect(() => {
@@ -114,16 +120,18 @@ export default function Workbench() {
 
   // Sync store's selectedRoomId with multi-select state
   useEffect(() => {
+    selectedRoomIdsRef.current = selectedRoomIds
     setSelectedRoomId(selectedRoomIds.size === 1 ? [...selectedRoomIds][0] : null)
   }, [selectedRoomIds, setSelectedRoomId])
 
   // 反向同步：当 store 的 selectedRoomId 变化（例如从 Dashboard 跳转过来）且不在多选集合中时，
-  // 将其同步到 selectedRoomIds，确保 Workbench 选中该房间
+  // 将其同步到 selectedRoomIds，确保 Workbench 选中该房间。
+  // 注意：不依赖 selectedRoomIds，改用 ref 读取，避免取消勾选时 effect 误触发导致循环。
   useEffect(() => {
-    if (selectedRoomId && !selectedRoomIds.has(selectedRoomId)) {
+    if (selectedRoomId && !selectedRoomIdsRef.current.has(selectedRoomId)) {
       setSelectedRoomIds(new Set([selectedRoomId]))
     }
-  }, [selectedRoomId, selectedRoomIds])
+  }, [selectedRoomId])
 
   // 获取房间列表
   useEffect(() => {
@@ -261,6 +269,7 @@ export default function Workbench() {
 
   // 添加房间
   const handleAddRoom = async () => {
+    console.log('[Workbench] 用户操作: 添加房间, url:', url);
     if (loading) return
     const trimmedUrl = url.trim()
     if (!trimmedUrl) {
@@ -291,11 +300,13 @@ export default function Workbench() {
 
   // 连接房间
   const handleConnect = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 连接房间, roomId:', roomId);
     send('connect_room', { room_id: roomId })
   }, [send])
 
   // 断开房间
   const handleDisconnect = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 断开房间连接, roomId:', roomId);
     send('disconnect_room', { room_id: roomId })
   }, [send])
 
@@ -303,36 +314,54 @@ export default function Workbench() {
   const handleToggleMute = useCallback((roomId: string) => {
     const room = useAppStore.getState().rooms.find((r) => r.room_id === roomId)
     if (!room) return
+    console.log('[Workbench] 用户操作: 切换静音状态, roomId:', roomId, 'newMuted:', !room.preview_muted);
+    // 取消静音时显式 resume AudioContext，确保 Web Audio 路由有输出
+    if (room.preview_muted) {
+      const ctx = getAligner().getContextSync()
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch((e) => {
+          console.warn('[Workbench] Failed to resume AudioContext on unmute:', e)
+        })
+      }
+    }
     send('set_preview_muted', { room_id: roomId, muted: !room.preview_muted })
   }, [send])
 
   // 开始录制
   const handleStartRecord = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 开始录制, roomId:', roomId);
     send('start_recording', { room_id: roomId })
   }, [send])
 
   // 停止录制
   const handleStopRecord = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 停止录制, roomId:', roomId);
     send('stop_recording', { room_id: roomId })
   }, [send])
 
   // 启用/停止预览（Electron 模式：后端 FFmpeg 抓帧推送）
   const handleTogglePreview = useCallback((roomId: string, enabled: boolean) => {
+    console.log('[Workbench] 用户操作: 切换预览状态, roomId:', roomId, 'enabled:', enabled);
     send('enable_preview', { room_id: roomId, enabled, mode: 'mse' })
   }, [send])
 
-  // 全屏预览（点击同一房间切换全屏）
+  // 放大预览（单级：点击放大到左侧面板，再次点击退出；全屏由 video 原生 controls 提供）
   const handleFullscreen = useCallback((roomId: string) => {
-    setFullscreenRoomId(prev => prev === roomId ? null : roomId)
+    setExpandedRoomId(prev => prev === roomId ? null : roomId)
+    setFullscreenRoomId(null)
   }, [])
 
   // 删除房间
   const handleRemove = useCallback((roomId: string) => {
-    // 项目记忆硬约束："Fullscreen preview must be exited before deleting a
-    // room to avoid crashes"。若该房间正处于全屏预览，先退出全屏再删除，
+    console.log('[Workbench] 用户操作: 删除房间, roomId:', roomId);
+    // 项目记忆硬约束：“Fullscreen preview must be exited before deleting a
+    // room to avoid crashes”。若该房间正处于全屏预览，先退出全屏再删除，
     // 避免 VideoPreview 组件实例继续渲染已删除房间的 MSE streamer 导致崩溃。
     if (fullscreenRoomId === roomId) {
       setFullscreenRoomId(null)
+    }
+    if (expandedRoomId === roomId) {
+      setExpandedRoomId(null)
     }
     pendingRoomSavesRef.current += 1
     send('remove_room', { room_id: roomId })
@@ -341,10 +370,11 @@ export default function Workbench() {
       next.delete(roomId)
       return next
     })
-  }, [send, fullscreenRoomId])
+  }, [send, fullscreenRoomId, expandedRoomId])
 
   // 选择房间（支持 Ctrl/Shift 多选）
   const handleSelect = useCallback((roomId: string, e: React.MouseEvent) => {
+    console.log('[Workbench] 用户操作: 选择/切换选中状态, roomId:', roomId);
     const currentRooms = useAppStore.getState().rooms
     const roomIndex = currentRooms.findIndex(r => r.room_id === roomId)
 
@@ -374,6 +404,36 @@ export default function Workbench() {
     }
   }, [lastClickedIndex])
 
+  // Checkbox 多选切换（无需 Ctrl 键，点击即切换选中/取消）
+  const handleToggleMultiSelect = useCallback((roomId: string, e: React.MouseEvent) => {
+    const currentRooms = useAppStore.getState().rooms
+    const roomIndex = currentRooms.findIndex(r => r.room_id === roomId)
+
+    if (e.shiftKey && lastClickedIndex !== null) {
+      // Shift+Click on checkbox: range selection
+      const start = Math.min(lastClickedIndex, roomIndex)
+      const end = Math.max(lastClickedIndex, roomIndex)
+      const rangeIds = currentRooms.slice(start, end + 1).map(r => r.room_id)
+      setSelectedRoomIds(prev => {
+        const next = new Set(prev)
+        rangeIds.forEach(id => next.add(id))
+        return next
+      })
+    } else {
+      // Normal click on checkbox: toggle selection
+      setSelectedRoomIds(prev => {
+        const next = new Set(prev)
+        if (next.has(roomId)) {
+          next.delete(roomId)
+        } else {
+          next.add(roomId)
+        }
+        return next
+      })
+    }
+    setLastClickedIndex(roomIndex)
+  }, [lastClickedIndex])
+
   // 批量录制（绑定快捷键 Ctrl+R，需二次确认以防误触）
   const handleBatchRecord = useCallback(() => {
     const connectableRooms = useAppStore.getState().rooms.filter(r => r.is_connected && !r.is_recording)
@@ -381,6 +441,7 @@ export default function Workbench() {
       message.info('没有可录制的房间')
       return
     }
+    console.log('[Workbench] 用户操作: 批量录制, 房间数:', connectableRooms.length)
     Modal.confirm({
       title: '确认批量录制',
       content: `将开始录制 ${connectableRooms.length} 个房间`,
@@ -401,6 +462,7 @@ export default function Workbench() {
       message.info('没有正在录制的房间')
       return
     }
+    console.log('[Workbench] 用户操作: 批量停止, 房间数:', recordingRooms.length)
     Modal.confirm({
       title: '确认批量停止',
       content: `将停止 ${recordingRooms.length} 个房间的录制`,
@@ -427,6 +489,7 @@ export default function Workbench() {
 
   // 直接控制 MSE player 的 video 元素（Electron 模式下后端无法控制 MSE video）
   const mseSeek = useCallback((roomId: string, time: number) => {
+    console.log('[Workbench] MSE seek:', roomId, 'time:', time.toFixed(2))
     const registry = (window as any).__msePlayers
     const video = registry?.[roomId]?.player?.videoElement as HTMLVideoElement | undefined
     if (video) {
@@ -445,6 +508,7 @@ export default function Workbench() {
   }, [send])
 
   const mseTogglePlayPause = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 播放/暂停切换, roomId:', roomId)
     const registry = (window as any).__msePlayers
     const video = registry?.[roomId]?.player?.videoElement as HTMLVideoElement | undefined
     if (video) {
@@ -456,18 +520,21 @@ export default function Workbench() {
 
   // 时间线跳转（多选时同步 seek 所有选中房间）
   const handleTimelineSeek = useCallback((time: number) => {
+    console.log('[Workbench] 用户操作: 时间线跳转, time:', time.toFixed(2), '房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => mseSeek(rid, time))
   }, [selectedRoomIds, mseSeek])
 
   // 设置入点
   const handleMarkIn = useCallback((roomId: string) => {
     const time = getPreviewCurrentTime(roomId)
+    console.log('[Workbench] 用户操作: 设置入点, roomId:', roomId, 'time:', time.toFixed(2))
     send('set_mark_in', { room_id: roomId, time })
   }, [send, getPreviewCurrentTime])
 
   // 设置出点
   const handleMarkOut = useCallback((roomId: string) => {
     const time = getPreviewCurrentTime(roomId)
+    console.log('[Workbench] 用户操作: 设置出点, roomId:', roomId, 'time:', time.toFixed(2))
     send('set_mark_out', { room_id: roomId, time })
   }, [send, getPreviewCurrentTime])
 
@@ -477,6 +544,7 @@ export default function Workbench() {
     const currentClips = useAppStore.getState().clips
     const room = currentRooms.find(r => r.room_id === roomId)
     if (room && room.mark_in !== null && room.mark_out !== null) {
+      console.log('[Workbench] 用户操作: 添加切片, roomId:', roomId, 'mark_in:', room.mark_in, 'mark_out:', room.mark_out)
       const newClip: ClipSegment = {
         start: room.mark_in,
         end: room.mark_out,
@@ -493,10 +561,12 @@ export default function Workbench() {
   // ── 稳定的 ControlBar / RoomCard 回调 ──
 
   const handleControlPlayPause = useCallback(() => {
+    console.log('[Workbench] 用户操作: 控制栏播放/暂停, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => mseTogglePlayPause(rid))
   }, [selectedRoomIds, mseTogglePlayPause])
 
   const handleControlSeekBack = useCallback(() => {
+    console.log('[Workbench] 用户操作: 后退10秒, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => {
       const cur = getPreviewCurrentTime(rid)
       mseSeek(rid, Math.max(0, cur - 10))
@@ -504,6 +574,7 @@ export default function Workbench() {
   }, [selectedRoomIds, getPreviewCurrentTime, mseSeek])
 
   const handleControlSeekFwd = useCallback(() => {
+    console.log('[Workbench] 用户操作: 前进10秒, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => {
       const cur = getPreviewCurrentTime(rid)
       mseSeek(rid, cur + 10)
@@ -511,6 +582,7 @@ export default function Workbench() {
   }, [selectedRoomIds, getPreviewCurrentTime, mseSeek])
 
   const handleControlMarkIn = useCallback(() => {
+    console.log('[Workbench] 用户操作: 控制栏设置入点, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => {
       const time = getPreviewCurrentTime(rid)
       send('set_mark_in', { room_id: rid, time })
@@ -518,6 +590,7 @@ export default function Workbench() {
   }, [selectedRoomIds, send, getPreviewCurrentTime])
 
   const handleControlMarkOut = useCallback(() => {
+    console.log('[Workbench] 用户操作: 控制栏设置出点, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => {
       const time = getPreviewCurrentTime(rid)
       send('set_mark_out', { room_id: rid, time })
@@ -526,22 +599,147 @@ export default function Workbench() {
 
   const handleControlAddClip = useCallback(() => {
     if (selectedRoomIds.size === 0) return
+    console.log('[Workbench] 用户操作: 控制栏添加切片, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => handleAddClip(rid))
   }, [selectedRoomIds, handleAddClip])
 
   const handleGoLive = useCallback(() => {
+    console.log('[Workbench] 用户操作: 跳转到直播最新位置, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => {
       const registry = (window as any).__msePlayers
-      const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
-      if (video && video.buffered.length > 0) {
-        const bufEnd = video.buffered.end(video.buffered.length - 1)
-        video.currentTime = Math.max(0, bufEnd - 0.5)
-        video.play().catch(() => {})
+      const entry = registry?.[rid]
+      const player = entry?.player
+      if (player && typeof player.resumePlayback === 'function') {
+        // 使用 MSE player 的 resumePlayback() 方法：
+        // 1. 自动 seek 到缓冲区末尾
+        // 2. 重置 live-edge 对齐标志，允许后续自动校准
+        // 3. 触发 _tryPlay() 延迟重试机制
+        player.resumePlayback()
+      } else {
+        // 备用逻辑：player 不可用时直接操作 video 元素
+        const video = entry?.player?.videoElement as HTMLVideoElement | undefined
+        if (video && video.buffered.length > 0) {
+          const bufEnd = video.buffered.end(video.buffered.length - 1)
+          video.currentTime = Math.max(0, bufEnd - 0.5)
+          video.play().catch(() => {})
+        }
       }
     })
   }, [selectedRoomIds])
 
+  // Phase 3: 音频对齐结果监听器
+  useEffect(() => {
+    const unsub = on('align_preview_audio_response', (data: any) => {
+      setAligning(false)
+      if (!data?.success || !data?.offsets) {
+        console.warn('[Workbench] 音频对齐失败:', data?.error)
+        message.warning('音频对齐失败，已使用缓冲区对齐')
+        return
+      }
+      const offsets = data.offsets as Record<string, number>
+      const scores = (data.scores || {}) as Record<string, number>
+      const referenceRoomId = data.reference_room_id as string
+      const registry = (window as any).__msePlayers
+      let alignedCount = 0
+      let mutedCount = 0
+      aligningRoomIdsRef.current.forEach(rid => {
+        const offset = offsets[rid]
+        if (offset === undefined) return
+
+        // 回传 content_offset 到后端（用于导出时补偿）
+        send('set_content_offset', { room_id: rid, offset })
+
+        if (offset < 0.05) { alignedCount++; return }
+        const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
+        if (video && video.buffered.length > 0) {
+          const bufStart = video.buffered.start(0)
+          const target = Math.max(bufStart, video.currentTime - offset)
+          try { video.currentTime = target } catch {}
+          video.play().catch(() => {})
+          alignedCount++
+        }
+      })
+
+      // 自动静音非参考房间（快的房间），消除多路音频叠加的回声/空灵感
+      aligningRoomIdsRef.current.forEach(rid => {
+        const offset = offsets[rid]
+        if (offset !== undefined && offset > 0.05 && rid !== referenceRoomId) {
+          send('set_preview_muted', { room_id: rid, muted: true })
+          mutedCount++
+        }
+      })
+
+      const scoreValues = Object.values(scores) as number[]
+      const avgScore = scoreValues.length > 0
+        ? scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length
+        : 0
+      console.log('[Workbench] 音频对齐完成: aligned=' + alignedCount + ', avgScore=' + avgScore.toFixed(3))
+      const muteMsg = mutedCount > 0 ? `，已静音 ${mutedCount} 个快房间消除回声` : ''
+      message.success(`已精确对齐 ${alignedCount} 个直播间（置信度 ${Math.round(avgScore * 100)}%）${muteMsg}`)
+    })
+    return () => unsub()
+  }, [on, send])
+
+  const handleAlignLive = useCallback(async () => {
+    if (selectedRoomIds.size === 0) return
+    console.log('[Workbench] 用户操作: 一键对齐, 房间数:', selectedRoomIds.size)
+    const registry = (window as any).__msePlayers
+    if (!registry) return
+
+    // Phase 1: 即时缓冲对齐
+    let minBufferEnd = Infinity
+    selectedRoomIds.forEach(rid => {
+      const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
+      if (video && video.buffered.length > 0) {
+        const end = video.buffered.end(video.buffered.length - 1)
+        if (end < minBufferEnd) minBufferEnd = end
+      }
+    })
+    if (minBufferEnd === Infinity) return
+    const targetTime = Math.max(0, minBufferEnd - 1)
+    selectedRoomIds.forEach(rid => {
+      const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
+      if (video) {
+        try { video.currentTime = targetTime } catch {}
+        video.play().catch(() => {})
+      }
+    })
+
+    // 少于 2 个房间时不需要音频对齐
+    if (selectedRoomIds.size < 2) {
+      message.success(`已对齐 ${selectedRoomIds.size} 个直播间`)
+      return
+    }
+    message.info('已粗略对齐，正在精确对齐...')
+
+    // Phase 2: 并行音频捕获 + 后端 FFT 计算
+    setAligning(true)
+    aligningRoomIdsRef.current = new Set(selectedRoomIds)
+    try {
+      const aligner = getAligner()
+      const capturePromises = [...selectedRoomIds].map(async rid => {
+        const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
+        if (!video) return null
+        const pcm = await aligner.captureAudio(rid, video, 3.0)
+        if (!pcm) return null
+        return { room_id: rid, sample_rate: 16000, pcm_base64: aligner.base64Encode(pcm) }
+      })
+      const results = (await Promise.all(capturePromises)).filter((r): r is { room_id: string; sample_rate: number; pcm_base64: string } => r !== null)
+      if (results.length < 2) {
+        setAligning(false)
+        message.warning('音频捕获不足，已使用缓冲区对齐')
+        return
+      }
+      send('align_preview_audio', { rooms: results })
+    } catch (err) {
+      setAligning(false)
+      console.error('[Workbench] 音频对齐异常:', err)
+      message.warning('音频对齐失败，已使用缓冲区对齐')
+    }
+  }, [selectedRoomIds, send])
+
   const handleMarkerDrag = useCallback((type: 'in' | 'out', time: number) => {
+    console.log('[Workbench] 用户操作: 标记拖拽, type:', type, 'time:', time.toFixed(2))
     selectedRoomIds.forEach(rid => {
       if (type === 'in') {
         send('set_mark_in', { room_id: rid, time })
@@ -552,6 +750,7 @@ export default function Workbench() {
   }, [selectedRoomIds, send])
 
   const handleDeleteMarker = useCallback((type: 'in' | 'out') => {
+    console.log('[Workbench] 用户操作: 删除标记, type:', type)
     selectedRoomIds.forEach(rid => {
       if (type === 'in') {
         send('set_mark_in', { room_id: rid, time: null })
@@ -564,16 +763,19 @@ export default function Workbench() {
 
   // 删除切片
   const handleDeleteClip = (index: number) => {
+    console.log('[Workbench] 用户操作: 删除切片, index:', index)
     setClips(clips.filter((_, i) => i !== index))
   }
 
   // 导出切片
   const handleExportClip = (clip: ClipSegment, _index?: number) => {
+    console.log('[Workbench] 用户操作: 导出切片, roomId:', clip.room_id, 'label:', clip.label)
     setPreviewClip(clip)
   }
 
   // 打开导出的文件
   const handleOpenExportFile = (outputPath: string) => {
+    console.log('[Workbench] 用户操作: 打开导出文件, path:', outputPath)
     if (window.electronAPI) {
       window.electronAPI.openPath(outputPath)
     }
@@ -581,6 +783,7 @@ export default function Workbench() {
 
   const handleConfirmExport = () => {
     if (!previewClip) return
+    console.log('[Workbench] 用户操作: 确认导出, roomId:', previewClip.room_id, 'start:', previewClip.start, 'end:', previewClip.end, 'preset:', exportPresetId)
     // 检查该房间是否有可用的录制文件
     const room = rooms.find(r => r.room_id === previewClip.room_id)
     if (!room) {
@@ -616,7 +819,7 @@ export default function Workbench() {
 
   const handleToggleLoop = useCallback(() => {
     if (loopPreviewRef.current) {
-      // Stop loop
+      console.log('[Workbench] 用户操作: 停止循环试听')
       setLoopPreview(false)
       if (loopTimerRef.current) {
         clearInterval(loopTimerRef.current)
@@ -637,6 +840,7 @@ export default function Workbench() {
     // Start loop: seek to mark_in then periodically check and seek back
     mseSeek(currentSelectedId, room.mark_in)
     setLoopPreview(true)
+    console.log('[Workbench] 用户操作: 开始循环试听, roomId:', currentSelectedId, 'mark_in:', room.mark_in, 'mark_out:', room.mark_out)
 
     // 定时器回调中通过 store 实时读取最新 state，避免闭包陈旧（M16）
     loopTimerRef.current = setInterval(() => {
@@ -666,6 +870,7 @@ export default function Workbench() {
       message.warning('该房间没有录制文件可分析')
       return
     }
+    console.log('[Workbench] 用户操作: 启动场景分析, roomId:', selectedRoomId)
     setAnalyzing(true)
     send('start_analysis', { room_id: selectedRoomId, threshold: 0.3 })
   }
@@ -693,6 +898,7 @@ export default function Workbench() {
       label: `${room?.streamer_name || '房间'} - 高光 ${i + 1}`,
       room_id: selectedRoomId!,
     }))
+    console.log('[Workbench] 用户操作: 导入分析结果, 片段数:', newClips.length)
     setClips([...clips, ...newClips])
     setShowAnalysisModal(false)
     message.success(`已导入 ${newClips.length} 个高光片段`)
@@ -700,6 +906,7 @@ export default function Workbench() {
 
   // ── 导出文件操作 ──
   const handleOpenExportFolder = (outputPath: string) => {
+    console.log('[Workbench] 用户操作: 打开导出文件夹, path:', outputPath)
     if (window.electronAPI) {
       // 优先用 showItemInFolder 在资源管理器中高亮定位文件，
       // 避免 openPath 用默认播放器打开 .mp4（与"打开文件夹"按钮语义不符）。
@@ -712,7 +919,9 @@ export default function Workbench() {
   }
 
   // 点击切片：选中房间并跳转到入点
+  // 多选时取第一个选中房间作为时间线代表，确保时间线正常显示
   const selectedRoom = rooms.find(r => r.room_id === selectedRoomId)
+    || (selectedRoomIds.size > 0 ? rooms.find(r => r.room_id === [...selectedRoomIds][0]) : undefined)
 
   // Sort rooms (memoize to prevent new array reference on every render)
   const sortedRooms = useMemo(() => [...rooms].sort((a, b) => {
@@ -765,7 +974,7 @@ export default function Workbench() {
           selectedRoomIds.forEach(rid => handleToggleMute(rid))
           break
         case 'fullscreen':
-          if (firstSelectedId) setFullscreenRoomId(prev => prev === firstSelectedId ? null : firstSelectedId)
+          if (firstSelectedId) handleFullscreen(firstSelectedId)
           break
         case 'batch:record':
           handleBatchRecord()
@@ -884,6 +1093,15 @@ export default function Workbench() {
           </Button>
           <Button
             size="small"
+            icon={<SyncOutlined />}
+            onClick={handleAlignLive}
+            loading={aligning}
+            disabled={aligning || selectedRoomIds.size === 0}
+          >
+            {aligning ? '对齐中' : '一键对齐'}
+          </Button>
+          <Button
+            size="small"
             type={allMuted ? 'primary' : 'default'}
             icon={allMuted ? <MutedOutlined /> : <SoundOutlined />}
             onClick={() => {
@@ -929,7 +1147,8 @@ export default function Workbench() {
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         {/* 左侧：房间卡片 + 控制栏 */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          {/* 房间卡片网格 */}
+
+          {/* 房间卡片网格 — 放大通过 CSS position:fixed 在 RoomCard 内部实现，不销毁实例 */}
           <div style={{ flex: 1, overflow: 'auto', padding: '16px 24px' }}>
             {rooms.length === 0 ? (
               <Empty
@@ -954,7 +1173,8 @@ export default function Workbench() {
                       onTogglePreview={handleTogglePreview}
                       onToggleMute={handleToggleMute}
                       onFullscreen={handleFullscreen}
-                      fullscreenRoomId={fullscreenRoomId}
+                      onToggleMultiSelect={handleToggleMultiSelect}
+                      expandedRoomId={expandedRoomId}
                     />
                   </Col>
                 ))}

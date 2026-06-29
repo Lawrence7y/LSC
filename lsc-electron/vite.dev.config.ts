@@ -11,7 +11,12 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    host: '127.0.0.1',
+    proxy: {
+      '/ws': {
+        target: 'ws://localhost:9876',
+        ws: true,
+      },
+    },
   },
   build: {
     outDir: 'dist',

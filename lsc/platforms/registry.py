@@ -1,4 +1,10 @@
-"""Registry helpers for platform adapters."""
+"""平台适配器注册中心 — 管理直播平台适配器的发现、解析和画质选择。
+
+提供 Protocol + Registry 模式：
+- 所有平台适配器实现统一的 PlatformAdapter 协议
+- 注册中心维护适配器列表，按 host 路由到可能匹配的平台
+- 解析结果按 URL 缓存，避免频繁请求平台 API
+"""
 from __future__ import annotations
 
 import logging
@@ -15,6 +21,7 @@ from .douyu import DouyuAdapter
 from .generic import GenericPageAdapter
 from .huya import HuyaAdapter
 from .kuaishou import KuaishouAdapter
+from .weibo import WeiboAdapter
 from .xiaohongshu import XiaohongshuAdapter
 
 _log = logging.getLogger(__name__)
@@ -40,6 +47,7 @@ _DEFAULT_ADAPTERS: tuple[PlatformAdapter, ...] = (
     KuaishouAdapter(),
     DouyuAdapter(),
     XiaohongshuAdapter(),
+    WeiboAdapter(),
     GenericPageAdapter(),  # Last — fallback for unknown platforms
 )
 
@@ -61,6 +69,9 @@ _URL_ROUTER: dict[str, tuple[str, ...]] = {
     "douyu.com": ("douyu",),
     "www.xiaohongshu.com": ("xiaohongshu",),
     "xhslink.com": ("xiaohongshu",),
+    "weibo.com": ("weibo",),
+    "www.weibo.com": ("weibo",),
+    "live.weibo.com": ("weibo",),
 }
 
 
@@ -142,12 +153,35 @@ def _candidate_platforms_for_url(url: str) -> tuple[str, ...] | None:
 
 
 def get_adapters(adapters: Iterable[PlatformAdapter] | None = None) -> tuple[PlatformAdapter, ...]:
+    """获取平台适配器列表。
+
+    传入自定义适配器列表时返回其元组形式；
+    传入 None 时返回默认的全局适配器集合。
+
+    Args:
+        adapters: 适配器可迭代对象，为 None 时使用默认适配器
+
+    Returns:
+        平台适配器元组
+    """
     if adapters is None:
         return _DEFAULT_ADAPTERS
     return tuple(adapters)
 
 
 def detect_platform(url: str, adapters: Iterable[PlatformAdapter] | None = None) -> str:
+    """检测 URL 对应的平台标识符。
+
+    遍历所有适配器，返回第一个能处理该 URL 的平台标识符。
+    未找到匹配适配器时返回 "unknown"。
+
+    Args:
+        url: 直播间 URL
+        adapters: 适配器列表，为 None 时使用默认适配器
+
+    Returns:
+        平台标识符（如 "bilibili"、"douyin"），或 "unknown"
+    """
     clean_url = (url or "").strip()
     for adapter in get_adapters(adapters):
         if adapter.can_handle(clean_url):
@@ -172,6 +206,20 @@ def parse_stream(
     *,
     force_refresh: bool = False,
 ) -> StreamInfo:
+    """解析直播间 URL，返回流信息。
+
+    根据 URL 的 host 路由到可能匹配的平台适配器，
+    逐个调用适配器的 parse() 方法获取 StreamInfo。
+    结果会按 URL 和平台缓存，避免频繁请求平台 API。
+
+    Args:
+        url: 直播间 URL
+        adapters: 适配器列表，为 None 时使用默认适配器
+        force_refresh: 是否强制刷新，忽略缓存
+
+    Returns:
+        StreamInfo 对象；解析失败时返回错误信息
+    """
     clean_url = (url or "").strip()
     adapter_list = get_adapters(adapters)
 
@@ -215,6 +263,18 @@ def parse_stream(
 
 
 def select_quality(info: StreamInfo | Mapping[str, object], quality_preset: str) -> tuple[str, str]:
+    """根据画质预设选择直播流地址。
+
+    按 QUALITY_PRESET_CANDIDATES 的候选顺序匹配第一个可用的流地址。
+    如果预设匹配失败，回退到适配器已选中的画质。
+
+    Args:
+        info: StreamInfo 对象或包含 qualityUrls/streamUrl/selectedQuality 的字典
+        quality_preset: 画质预设，如 "原画"、"高清"、"流畅"
+
+    Returns:
+        (stream_url, quality_key) 元组
+    """
     if isinstance(info, StreamInfo):
         quality_urls = info.quality_urls
         stream_url = info.stream_url

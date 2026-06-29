@@ -2,21 +2,29 @@
   "name": "lsc-electron",
   "version": "1.0.0",
   "description": "LSC 直播切片系统 - Electron 版本",
+  "author": "Lawrence7y",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lawrence7y/LSC"
+  },
   "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "vite --config vite.config.ts",
     "build": "tsc && vite build && electron-builder",
     "preview": "vite preview",
     "electron": "vite --config vite.config.ts",
-    "electron:build": "tsc --noEmit && vite build && electron-builder"
+    "electron:build": "tsc --noEmit && vite build && electron-builder",
+    "release": "vite build && electron-builder --publish always"
   },
   "dependencies": {
     "@ant-design/icons": "^5.2.6",
     "antd": "^5.12.0",
     "dayjs": "^1.11.10",
+    "electron-updater": "^6.8.9",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
+    "tesseract.js": "^7.0.0",
     "zustand": "^4.4.7"
   },
   "devDependencies": {
@@ -34,6 +42,7 @@
   "build": {
     "appId": "com.lsc.app",
     "productName": "LSC 直播切片系统",
+    "icon": "assets/icon.ico",
     "directories": {
       "output": "release"
     },
@@ -45,8 +54,22 @@
       {
         "from": "../python-backend",
         "to": "python-backend"
+      },
+      {
+        "from": "../lsc",
+        "to": "lsc"
+      },
+      {
+        "from": "../scripts",
+        "to": "scripts"
       }
     ],
+    "publish": {
+      "provider": "github",
+      "owner": "Lawrence7y",
+      "repo": "LSC",
+      "releaseType": "release"
+    },
     "win": {
       "target": "nsis"
     },

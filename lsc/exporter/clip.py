@@ -1,14 +1,29 @@
 """
 LSC Clip Exporter
 =================
-Exports highlight clips from video using FFmpeg.
 
-Features:
-  - Precise time-based cutting with re-encoding at cut points
-  - Thumbnail generation at highlight midpoint
-  - Vertical crop (9:16) for short video platforms
-  - Batch export with progress tracking
-  - Configurable encoding profile (software/hardware encoders)
+ClipExporter 是直播切片系统（LSC）的导出核心，负责将识别出的高光片段
+从原始视频中精确截取并编码为独立的 MP4 文件。
+
+整体架构
+--------
+- 单片段导出入口：:meth:`ClipExporter.export_clip`，构建 FFmpeg 命令并执行，
+  使用 ``-ss`` 快速定位 + ``-t`` 时长截取实现精确切片。
+- 批量导出入口：:meth:`ClipExporter.export_all`，以生成器模式逐个产出
+  :class:`ExportResult`，便于上游流式处理而无需缓存全量结果。
+- 原子写入保证：导出结果先写入 ``uuid`` 命名的临时文件，FFmpeg 成功退出
+  后再通过 ``os.replace`` 更名为最终路径，避免用户看到半成品文件。
+- 缩略图异步生成：利用共享线程池在后台抽取关键帧，不阻塞主导出流程。
+
+关键特性
+--------
+- 双编码模式：``copy``（流拷贝，零重编码）与 ``reencode``（libx264/HW 重编码）。
+- Copy 模式自动回退：存在视频滤镜（如 9:16 裁剪）或 ``start_sec > 0``
+  （非零起点无法保证关键帧对齐）时，自动降级到 ``libx264`` 以保证切口精度。
+- 实时进度回调：通过 ``-progress pipe:1`` 读取 FFmpeg 进度，支持进程追踪
+  与取消（``on_process``），并内置 300 秒看门狗防止卡死。
+- 路径安全防护：文件名消毒（移除 Windows 非法字符）+ ``os.path.realpath``
+  双重校验，防止路径遍历攻击。
 """
 
 import json
@@ -69,7 +84,24 @@ def _cleanup_tmp(path: str) -> None:
 
 
 class ClipExporter:
-    """FFmpeg-based clip exporter with thumbnail and vertical crop support."""
+    """基于 FFmpeg 的片段导出器，支持缩略图与竖屏裁剪。
+
+    生命周期
+    --------
+    ``__init__(config)`` → :meth:`export_clip` 或 :meth:`export_all`
+    → 产出 :class:`ExportResult`。
+
+    导出模式
+    --------
+    - ``copy``：直接拷贝视频/音频流，速度最快，但切片精度受限于关键帧位置；
+      适合完整 GOP 对齐的场景。
+    - ``reencode``：使用 ``libx264``（或硬件编码器）重新编码，确保起止时间
+      精确，但耗时更长。
+
+    Copy 模式在以下情况自动回退到 ``libx264``：
+    - 配置了视频滤镜（如 9:16 裁剪、缩放）；
+    - 起始时间 ``start_sec > 0``（非零起点无法保证关键帧对齐）。
+    """
 
     # Shared pool for thumbnail generation so exports don't block each other.
     _thumbnail_executor: ThreadPoolExecutor | None = None
@@ -77,7 +109,11 @@ class ClipExporter:
 
     @classmethod
     def _get_thumbnail_executor(cls) -> ThreadPoolExecutor:
-        # 双重检查锁定，避免并发创建多个线程池
+        """获取（或惰性创建）缩略图生成专用线程池。
+
+        使用双重检查锁定确保多线程环境下只创建一个 ThreadPoolExecutor，
+        避免并发导出时重复创建线程池导致资源浪费。
+        """
         if cls._thumbnail_executor is None:
             with cls._thumbnail_lock:
                 if cls._thumbnail_executor is None:
@@ -101,20 +137,58 @@ class ClipExporter:
                     profile: ExportProfile | None = None,
                     progress_callback=None,
                     on_process=None) -> ExportResult:
-        """Export a single clip from the video.
+        """从视频中导出单个片段。
 
-        Parameters
-        ----------
+        FFmpeg 切片命令结构
+        -------------------
+        使用 ``-ss <start_sec> -i <video_path> -t <duration>`` 实现快速定位
+        与时长截取。视频/音频编码参数由 :class:`ExportProfile` 提供；
+        若配置了视频滤镜则追加 ``-vf`` 参数。
+
+        编码模式与回退逻辑
+        ------------------
+        - ``copy`` 模式（``profile.is_copy``）直接拷贝视频/音频流，速度最快；
+          但若存在视频滤镜（如 9:16 裁剪）或 ``start_sec > 0``，
+          则自动回退到 ``libx264`` + ``medium`` preset 以保证切口精度。
+        - ``reencode`` 模式始终使用 ``libx264``（或配置的硬件编码器）重新编码。
+
+        原子写入
+        --------
+        输出先写入 ``<safe_title>.<uuid8>_tmp.mp4``，FFmpeg 成功退出后
+        通过 ``os.replace`` 更名为最终路径；失败时自动清理临时文件，
+        避免生成半成品文件。
+
+        进度回调
+        --------
+        当提供 ``progress_callback`` 时，使用 ``-progress pipe:1`` 让 FFmpeg
+        将进度写入 stdout；主线程逐行解析 ``out_time_ms`` 并节流回调
+        （百分比变化 ≥1% 或间隔 ≥200ms），同时后台线程收集 stderr 尾部
+        用于错误诊断。
+
+        参数
+        ----
+        video_path : str
+            源视频文件路径。
+        start_sec, end_sec : float
+            切片起止时间（秒）。
+        output_dir : str
+            输出目录，不存在则自动创建。
+        title : str
+            片段标题，用于生成文件名（自动消毒 Windows 非法字符及路径遍历字符）。
+        clip_index : int
+            片段序号，用于日志与默认文件名。
+        vertical_crop : bool
+            是否应用 9:16 竖屏裁剪滤镜。
+        codec : str
+            视频编码器名称，仅当 ``profile`` 为 ``None`` 时生效。
         profile : ExportProfile | None
-            完整的编码配置。若提供则覆盖 codec/vertical_crop 参数；
-            若为 None 则使用 config 中的默认 profile。
+            完整编码配置；提供时覆盖 ``codec`` 与 ``vertical_crop`` 参数。
         progress_callback : callable | None
-            进度回调函数 ``callback(percent: float, elapsed: float, total: float)``。
-            当提供时使用 ``-progress pipe:1`` 实时读取 FFmpeg 进度。
+            进度回调 ``callback(percent: float, elapsed: float, total: float)``。
+            提供时启用 ``-progress pipe:1`` 与 ``Popen`` 模式。
         on_process : callable | None
-            FFmpeg 进程启动回调 ``callback(proc: subprocess.Popen)``。
-            当使用 Popen 模式（提供 progress_callback）时在进程创建后触发，
-            供调用方追踪并取消该进程。
+            进程启动回调 ``callback(proc: subprocess.Popen)``，
+            用于追踪并可选取消 FFmpeg 进程。
         """
         if not os.path.isfile(video_path):
             return ExportResult(False, "", clip_index, title or f"clip_{clip_index}",
@@ -151,7 +225,9 @@ class ClipExporter:
             output_path = f"{base_output_path[:-4]}_{suffix}.mp4"
             suffix += 1
 
-        # 确定使用的编码 profile
+        # 确定使用的编码 profile：优先使用外部传入的完整配置；
+        # 若未提供则回退到 config 中的默认 profile，并将 legacy 的
+        # codec / vertical_crop 参数合并进去以保持向后兼容。
         if profile is None:
             # 合并旧的 codec/vertical_crop 参数到默认 profile
             profile = self.export_cfg
@@ -172,9 +248,14 @@ class ClipExporter:
                     resolution=profile.resolution, fps=profile.fps,
                 )
 
-        # 视频滤镜需要重编码；copy 模式下若有滤镜则回退到 libx264。
-        # 另外，copy 模式下从非 0 秒开始切片会导致切口落在关键帧上而不精确，
-        # 因此只要 start_sec > 0 也自动回退到软件编码以保证切口准确。
+        # Copy 模式回退逻辑（Copy mode fallback）
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # 1) 视频滤镜（如 9:16 裁剪、缩放）无法在 copy 模式下应用，
+        #    必须重编码，因此只要存在 filter_args 即触发回退。
+        # 2) Copy 模式从非 0 秒开始切片时，FFmpeg 只能 seek 到最近的关键帧，
+        #    导致实际切口晚于 start_sec，精度不足；
+        #    因此只要 start_sec > 0 也强制回退到 libx264。
+        # 回退后统一使用 libx264 + medium preset，保留原 profile 的其他参数。
         filter_args = profile.ffmpeg_filter_args()
         effective_profile = profile
         needs_reencode = bool(profile.is_copy and filter_args)
@@ -238,7 +319,10 @@ class ClipExporter:
             if creation_flags:
                 popen_kwargs["creationflags"] = creation_flags
             if has_callback:
-                # 使用 Popen 逐行读取进度
+                # 使用 Popen 模式：实时读取 stdout 中的进度行，
+                # 同时后台线程收集 stderr 尾部用于错误诊断，
+                # 并启动 watchdog 线程在 300 秒无响应时强制终止进程。
+                # 调用方可通过 on_process 获取 Popen 对象以追踪或取消任务。
                 proc = subprocess.Popen(cmd, **popen_kwargs)
                 # 通知调用方进程已启动，便于追踪并取消该 FFmpeg 进程
                 if on_process is not None:
@@ -253,6 +337,7 @@ class ClipExporter:
                 export_timed_out = False
 
                 def _stderr_reader() -> None:
+                    """后台线程：持续读取 FFmpeg stderr 并保留尾部用于错误诊断。"""
                     try:
                         for line in proc.stderr:
                             stderr_tail.append(line.rstrip())
@@ -322,6 +407,8 @@ class ClipExporter:
                     return ExportResult(False, output_path, clip_index, safe_title,
                                         error=error_tail[-500:] or "Export failed")
             else:
+                # 无进度回调时使用 subprocess.run 简化执行，统一 300 秒超时；
+                # 错误信息截取 stderr 尾部 500 字符返回。
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=300,
                     encoding="utf-8", errors="replace",
@@ -391,12 +478,12 @@ class ClipExporter:
 
     def export_all(self, video_path: str, highlights: list, output_dir: str, *,
                    vertical_crop: bool = False):
-        """
-        Export all highlights as individual clips.
+        """批量导出所有高光片段。
 
-        Yields each :class:`ExportResult` as soon as it is produced so
-        callers can process or display results incrementally without
-        holding the full list in memory.
+        以生成器逐个产出 :class:`ExportResult`，便于上游流式处理
+        （如实时更新 UI 或逐条写入数据库），无需缓存全量结果。
+
+        每个片段的标题由轮次（round_number）、得分（score）与描述拼接而成。
         """
         os.makedirs(output_dir, exist_ok=True)
 
@@ -461,7 +548,12 @@ class ClipExporter:
 
     def _generate_thumbnail(self, video_path: str, time_sec: float,
                             output_dir: str, name: str) -> str:
-        """Generate a thumbnail at the specified time."""
+        """在指定时间点生成缩略图。
+
+        使用 FFmpeg ``-ss <time> -vframes 1`` 抽取单帧，
+        通过 ``-q:v 3`` 控制 JPEG 质量（范围 2-31，越小质量越高）。
+        仅由共享线程池在后台调用，不阻塞主导出流程。
+        """
         thumb_path = os.path.join(output_dir, f"{name}_thumb.jpg")
 
         cmd = [

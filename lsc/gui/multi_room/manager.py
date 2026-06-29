@@ -1,4 +1,27 @@
-"""Manager for multi-room workbench sessions."""
+"""Manager for multi-room workbench sessions.
+
+MultiRoomManager is the central orchestration layer for the multi-room
+live-stream recording and preview workbench. It owns the lifecycle of every
+``RoomSession``—connecting to live streams, starting/stopping previews and
+recordings, persisting room state across restarts, and broadcasting
+heartbeat signals so the UI can refresh timelines without polling.
+
+Key concepts:
+- **RoomSession**: A lightweight data object (see ``session.py``) that
+  tracks a single room's connection state, controller, preview widget,
+  recording path, and user selections.
+- **Controller**: An FFmpeg-backed ``RecordingController`` created lazily per
+  room. It is responsible for actual capture, export, and metadata probing.
+- **Preview widget**: An ``MpvWidget`` (libmpv) instance created lazily; up
+  to ``MAX_CONCURRENT_PREVIEWS`` can be active simultaneously to limit
+  resource consumption.
+- **Global heartbeat**: A 1-second ``QTimer`` that fires layered updates
+  (high/medium/low frequency) for elapsed time, file-size tracking, and
+  disk-space monitoring.
+- **Audio alignment**: An offline cross-correlation pass that computes
+  per-room time offsets so multi-room clips can be synchronised to a common
+  reference frame.
+"""
 from __future__ import annotations
 
 import logging
@@ -12,12 +35,23 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
-from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Signal, QRunnable, QThreadPool
+from PySide6.QtCore import (
+    QCoreApplication,
+    QObject,
+    QRunnable,
+    QThread,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
 
+from lsc.core.services.recording_service import RecordingService
 from lsc.platforms.base import StreamInfo
 from lsc.platforms.registry import parse_stream, select_quality
 
 from .session import RoomSession
+
+from lsc.editor.audio_aligner import AUDIO_DURATION, _SEEK_BUFFER
 
 ControllerFactory = Callable[[], object]
 PreviewFactory = Callable[[], object]
@@ -231,6 +265,47 @@ class _BatchRecordWorker(QThread):
         self.batch_finished.emit(started, len(self._room_ids))
 
 
+class _AudioAlignWorker(QThread):
+    """Background thread for audio cross-correlation alignment.
+
+    Extracts audio PCM from each room's source (recording file or live stream)
+    via FFmpeg, then computes time offsets using numpy cross-correlation.
+    Results are emitted via ``align_done`` signal back to the main thread.
+
+    The worker accepts a list of ``rooms_data`` dicts, each describing a
+    room's audio source path or stream URL and an optional seek offset
+    (used to capture only the most recent segment of a long recording).
+    ``align_rooms`` in ``lsc.editor.audio_aligner`` performs the heavy
+    lifting; this worker's only responsibility is to run it off the GUI
+    thread and ferry the structured result back via Qt signals.
+    """
+
+    align_done = Signal(dict)  # result dict matching AlignResult fields
+
+    def __init__(self, rooms_data: list[dict[str, Any]], ffmpeg_path: str):
+        super().__init__()
+        self._rooms_data = rooms_data
+        self._ffmpeg_path = ffmpeg_path
+
+    def run(self):
+        if self.isInterruptionRequested():
+            return
+        try:
+            from lsc.editor.audio_aligner import align_rooms
+            result = align_rooms(self._rooms_data, self._ffmpeg_path)
+            self.align_done.emit({
+                "success": result.success,
+                "offsets": result.offsets,
+                "reference_room_id": result.reference_room_id,
+                "method": result.method,
+                "correlation_scores": result.correlation_scores,
+                "error": result.error,
+            })
+        except Exception as exc:
+            _log.warning("音频对齐失败: %s", exc, exc_info=True)
+            self.align_done.emit({"success": False, "error": str(exc)})
+
+
 class MultiRoomManager(QObject):
     """Own room session lifecycle and batch operations."""
 
@@ -240,6 +315,14 @@ class MultiRoomManager(QObject):
     # Emitted on every global tick so the UI can refresh timelines and
     # recording elapsed-time displays without polling on its own timer.
     global_tick = Signal()
+    # Emitted on medium-frequency ticks (every 5s) when recording rooms
+    # have updated file sizes, so the backend can broadcast rooms_updated.
+    medium_tick = Signal()
+    # Emitted on low-frequency ticks (every 30s) when a recording room has
+    # low disk space, so the UI can surface a warning before FFmpeg dies.
+    # (Reserved for future use; currently stop_recording handles this inline.)
+    # Emitted when audio cross-correlation alignment completes.
+    align_finished = Signal(dict)  # result dict
 
     def __init__(
         self,
@@ -253,6 +336,7 @@ class MultiRoomManager(QObject):
         self._connect_workers: dict[str, _ConnectWorker] = {}
         self._metadata_probe_workers: dict[str, _MetadataProbeWorker] = {}
         self._batch_record_worker: _BatchRecordWorker | None = None
+        self._audio_align_worker: _AudioAlignWorker | None = None
 
         # Global heartbeat timer — created lazily when QCoreApplication exists
         self._global_timer: QTimer | None = None
@@ -284,18 +368,26 @@ class MultiRoomManager(QObject):
     def _create_controller(self) -> object:
         if self._controller_factory is not None:
             return self._controller_factory()
-        from lsc.gui.pages.recording_controller import RecordingController
-        controller = RecordingController()
-        # 初始化录制和导出组件，否则录制功能无法使用
-        controller.init_capture()
-        controller.init_exporter()
-        return controller
+        try:
+            from lsc.gui.pages.recording_controller import RecordingController
+            controller = RecordingController()
+            # 初始化录制和导出组件，否则录制功能无法使用
+            controller.init_capture()
+            controller.init_exporter()
+            return controller
+        except ImportError:
+            # RecordingController 已移除（PySide6 GUI 层），Electron 后端不需要 controller
+            return None
 
     def _create_preview(self) -> object:
         if self._preview_factory is not None:
             return self._preview_factory()
-        from lsc.gui.components.mpv_widget import MpvWidget
-        return MpvWidget()
+        try:
+            from lsc.gui.components.mpv_widget import MpvWidget
+            return MpvWidget()
+        except ImportError:
+            # MpvWidget 已移除（PySide6 GUI 层），Electron 后端不需要 preview widget
+            return None
 
     # ── Room CRUD ────────────────────────────────────────────
 
@@ -329,18 +421,32 @@ class MultiRoomManager(QObject):
         return room
 
     def get_room(self, room_id: str) -> RoomSession | None:
+        """Return the ``RoomSession`` for ``room_id``, or ``None`` if not found."""
         return self._rooms.get(room_id)
 
     def list_rooms(self) -> list[RoomSession]:
+        """Return all currently managed ``RoomSession`` objects."""
         return list(self._rooms.values())
 
     def room_count(self) -> int:
+        """Return the number of rooms currently managed."""
         return len(self._rooms)
 
     def max_rooms(self) -> int:
+        """Return the hard upper limit on concurrently managed rooms."""
         return MAX_ROOMS
 
     def remove_room(self, room_id: str) -> bool:
+        """Remove a room and clean up all associated resources.
+
+        Stops any active preview or recording, cancels pending async workers
+        (connect, metadata probe, refresh), disposes the controller and
+        preview widget, and persists the updated room list. If this was the
+        last room, the global heartbeat timer is also stopped.
+
+        Returns:
+            True if the room was found and removed; False otherwise.
+        """
         room = self._rooms.pop(room_id, None)
         if room is None:
             return False
@@ -662,6 +768,15 @@ class MultiRoomManager(QObject):
                 worker.wait(1000)
 
     def disconnect_room(self, room_id: str) -> bool:
+        """Disconnect a room from its live stream.
+
+        Cancels any pending async connection, stops the preview if active,
+        and clears connection-related state. The room object itself is
+        retained so the user can reconnect later.
+
+        Returns:
+            True if the room was found and disconnected.
+        """
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -678,10 +793,22 @@ class MultiRoomManager(QObject):
     # ── Preview ──────────────────────────────────────────────
 
     def get_active_preview_count(self) -> int:
+        """Return the number of rooms with an enabled, un-paused preview."""
         return sum(1 for r in self._rooms.values()
                    if r.preview_enabled and not r.preview_paused)
 
     def start_preview(self, room_id: str) -> bool:
+        """Enable preview playback for a connected room.
+
+        A preview widget is created lazily on first use. The method enforces
+        ``MAX_CONCURRENT_PREVIEWS``; if the limit is reached the request is
+        rejected and an error is set on the room.
+
+        Returns:
+            True if the preview was started; False if the room is not
+            connected, the widget could not be created, or the concurrency
+            limit was reached.
+        """
         room = self.get_room(room_id)
         if room is None or not room.is_connected:
             return False
@@ -733,6 +860,12 @@ class MultiRoomManager(QObject):
         self._play_stream(room)
 
     def pause_preview(self, room_id: str) -> bool:
+        """Pause the preview widget without tearing down the mpv instance.
+
+        Returns:
+            True if the room's preview was paused; False if the room or
+            preview does not exist.
+        """
         room = self.get_room(room_id)
         if room is None or not room.preview_enabled:
             return False
@@ -744,6 +877,12 @@ class MultiRoomManager(QObject):
         return True
 
     def resume_preview(self, room_id: str) -> bool:
+        """Resume a previously paused preview widget.
+
+        Returns:
+            True if the room's preview was resumed; False if the room or
+            preview does not exist.
+        """
         room = self.get_room(room_id)
         if room is None or not room.preview_enabled:
             return False
@@ -755,6 +894,16 @@ class MultiRoomManager(QObject):
         return True
 
     def stop_preview(self, room_id: str) -> bool:
+        """Stop preview playback and release the preview widget.
+
+        The underlying mpv instance is stopped but retained on the room so
+        that a subsequent ``start_preview`` can resume without a full
+        re-creation.
+
+        Returns:
+            True if the room's preview was stopped; False if the room does
+            not exist.
+        """
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -767,6 +916,11 @@ class MultiRoomManager(QObject):
         return True
 
     def set_preview_muted(self, room_id: str, muted: bool) -> None:
+        """Set the mute state of the room's preview widget.
+
+        The preference is also persisted on ``RoomSession.preview_muted`` so
+        it survives across preview stop/start cycles.
+        """
         room = self.get_room(room_id)
         if room is None:
             return
@@ -878,6 +1032,104 @@ class MultiRoomManager(QObject):
             aligned += 1
         return aligned
 
+    # ── Audio cross-correlation alignment ────────────────────
+
+    def start_audio_align(self, room_ids: list[str]) -> bool:
+        """Launch background audio cross-correlation alignment for selected rooms.
+
+        Only rooms that are actively recording can participate in audio
+        alignment, because the algorithm relies on local recording files
+        (which are guaranteed to be in sync with the preview). Non-
+        recording rooms fall back to buffer-based alignment instead.
+
+        Args:
+            room_ids: List of room identifiers to align. Must contain at
+                least two valid recording rooms.
+
+        Returns:
+            True if the alignment worker was started successfully (or if
+                the call was short-circuited due to insufficient recording
+                rooms). Failures are reported through the
+                ``align_finished`` signal instead.
+        """
+        from lsc.config import load_config as _load_config
+        _cfg = _load_config()
+        ffmpeg_path = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+
+        _log.info("开始音频对齐: 请求房间=%s", room_ids)
+
+        rooms_data: list[dict[str, Any]] = []
+        skipped_names: list[str] = []
+        for rid in room_ids:
+            room = self.get_room(rid)
+            if room is None or not room.stream_info:
+                _log.warning("对齐跳过: room_id=%s, 原因=房间不存在或无stream_info", rid)
+                continue
+            if room.is_recording and room.record_output_path and room.recording_start_mono:
+                elapsed = _time.monotonic() - room.recording_start_mono
+                seek = max(0.0, elapsed - AUDIO_DURATION - _SEEK_BUFFER)
+                _log.info("对齐房间: room_id=%s, 主播=%s, 录制文件=%s, seek=%.1fs, elapsed=%.1fs", rid, room.streamer_name, room.record_output_path, seek, elapsed)
+                rooms_data.append({
+                    "room_id": rid,
+                    "source": room.record_output_path,
+                    "seek": seek,
+                    "is_recording": True,
+                    "streamer_name": room.streamer_name,
+                })
+            else:
+                name = room.streamer_name or rid[:8]
+                reason = "未在录制" if not room.is_recording else ("无录制文件" if not room.record_output_path else "无录制开始时间")
+                _log.warning("对齐跳过: room_id=%s, 主播=%s, 原因=%s", rid, name, reason)
+                skipped_names.append(name)
+                continue
+
+        if len(rooms_data) < 2:
+            skipped = "、".join(skipped_names) if skipped_names else "所选房间"
+            _log.warning("音频对齐中止: 有效录制房间=%d, 跳过=%s", len(rooms_data), skipped)
+            self._on_align_finished({
+                "success": False,
+                "error": f"未录制的直播间不能参与音频对齐（{skipped} 未在录制），请先开始录制",
+            })
+            return True
+
+        _log.info("启动对齐worker: 有效房间=%s, ffmpeg=%s", [rd["room_id"] for rd in rooms_data], ffmpeg_path)
+        worker = _AudioAlignWorker(rooms_data, ffmpeg_path)
+        worker.align_done.connect(self._on_align_finished)
+        worker.finished.connect(lambda: worker.deleteLater())
+        self._audio_align_worker = worker
+        worker.start()
+        return True
+
+    def _on_align_finished(self, result: dict) -> None:
+        """Handle the completion of an audio alignment job.
+
+        On success, each room's ``content_offset`` is updated with the
+        computed time delta so that previews can be synchronised when the
+        UI requests it. The raw result dict is then forwarded to the
+        ``align_finished`` signal for the UI to consume.
+
+        Args:
+            result: Alignment result dictionary containing at least
+                ``success`` (bool), ``offsets`` (dict of room_id → float),
+                and optionally ``error``, ``reference_room_id``, and
+                ``correlation_scores``.
+        """
+        if result.get("success"):
+            offsets = result.get("offsets", {})
+            _log.info(
+                "音频对齐完成: reference=%s, method=%s, offsets=%s",
+                result.get("reference_room_id"),
+                result.get("method"),
+                {k: f"{v:.4f}" for k, v in offsets.items()},
+            )
+            for rid, offset in offsets.items():
+                room = self.get_room(rid)
+                if room is not None:
+                    room.content_offset = float(offset)
+        else:
+            _log.warning("音频对齐失败: error=%s", result.get("error"))
+        self.align_finished.emit(result)
+
     # ── Range loop preview ─────────────────────────────────
 
     def start_range_loop(self, room_id: str, start: float, end: float) -> None:
@@ -973,7 +1225,9 @@ class MultiRoomManager(QObject):
         if room is None:
             return False
         try:
-            info = parse_stream(room.room_url, force_refresh=True)
+            # 利用 30 秒缓存避免每次预览都重新发 HTTP 请求；
+            # 缓存过期或 URL 失效时自动重新解析
+            info = parse_stream(room.room_url, force_refresh=False)
         except Exception as exc:
             _log.warning("refresh_stream_url failed for %s: %s", room_id, exc)
             return False
@@ -1045,22 +1299,55 @@ class MultiRoomManager(QObject):
                         resolution: str | None = None,
                         framerate: str | None = None,
                         audio_bitrate: str | None = None) -> bool:
+        """Start FFmpeg recording for a single connected room.
+
+        The method performs a pre-flight disk-space check, refreshes the
+        short-lived CDN URL, creates a per-room output sub-directory to
+        avoid filename collisions in multi-room scenarios, and delegates to
+        ``RecordingController.start_recording_with_crf``. On success the
+        room's recording state and reconnect parameters are updated so that
+        an automatic reconnect can resume if the stream drops.
+
+        Args:
+            room_id: Target room identifier.
+            output_dir: Base directory for all room recordings.
+            encoder: FFmpeg video encoder name (e.g. ``libx264``).
+            crf: Constant Rate Factor for quality control.
+            param_mode: ``"CRF 质量"`` or ``"CBR 码率"``.
+            bitrate: Target bitrate string (used only in CBR mode).
+            bitrate_unit: Unit for ``bitrate`` (``"kbps"`` or ``"Mbps"``).
+            resolution: Optional output resolution override.
+            framerate: Optional output framerate override.
+            audio_bitrate: Optional audio bitrate override.
+
+        Returns:
+            True if recording started successfully.
+        """
+        _log.info("[录制诊断] start_recording called for room_id=%s", room_id)
         room = self.get_room(room_id)
-        controller = None if room is None else room.controller
-        if room is None or controller is None:
+        if room is None:
+            _log.warning("[录制诊断] room not found: %s", room_id)
             return False
+        controller = room.controller
+        if controller is None:
+            _log.warning("[录制诊断] controller is None for room %s (is_connected=%s)", room_id, room.is_connected)
+            room.last_error = "录制控制器未初始化"
+            return False
+        _log.info("[录制诊断] controller OK, is_connected=%s, stream_url=%s", room.is_connected, bool(getattr(controller, 'stream_url', None)))
         if not room.is_connected:
             room.last_error = "房间未连接"
             return False
         # Pre-flight disk space check (2GB threshold per project memory constraint)
-        from lsc.gui.pages.recording_controller import RecordingController
-        preflight = RecordingController.preflight_recording(output_dir, concurrent_streams=1)
+        preflight = RecordingService.preflight_check(output_dir, concurrent_streams=1)
         if preflight:
-            # 默认目录不可写或空间不足，回退到 ~/.lsc/output（用户主目录，通常可写）
+            # Fallback chain for unwritable / full output directories:
+            #   1. If the configured dir fails, try ~/.lsc/output (user home, usually writable).
+            #   2. If that also fails, surface the error and abort so FFmpeg
+            #      doesn't start and immediately die mid-write.
             fallback_base = os.path.join(os.path.expanduser('~'), '.lsc', 'output')
             if os.path.abspath(fallback_base) != os.path.abspath(output_dir):
                 _log.warning("预检失败 %s，回退到 %s", output_dir, fallback_base)
-                fallback_preflight = RecordingController.preflight_recording(fallback_base, concurrent_streams=1)
+                fallback_preflight = RecordingService.preflight_check(fallback_base, concurrent_streams=1)
                 if not fallback_preflight:
                     output_dir = fallback_base
                     preflight = ""
@@ -1070,12 +1357,19 @@ class MultiRoomManager(QObject):
                 room.last_error = preflight
                 _log.warning("录制预检失败: %s", preflight)
                 return False
+        _log.info("[录制诊断] refreshing stream for recording...")
         if not self._refresh_room_stream_for_recording(room):
+            _log.warning("[录制诊断] stream refresh failed, last_error=%s", room.last_error)
             return False
         stream_url = controller.stream_url
         input_args = controller.input_args
+        _log.info("[录制诊断] stream refreshed, stream_url=%s", bool(stream_url))
 
-        # 为每个房间创建独立子目录，避免多房间同时录制时文件名冲突导致覆盖
+        # Per-room output directory:
+        #   - Uses a readable name (platform_streamer_shortid) instead of a raw UUID.
+        #   - Appends a numeric suffix if the directory already exists, which can
+        #     happen when two rooms point at the same streamer/short_id combo.
+        #   - Falls back to ~/.lsc/output on OSError (e.g. sandboxed environments).
         room_output_dir = _make_room_output_dir(output_dir, room)
         # 若可读目录名已存在（同名主播+同 short_id 概率极低），追加序号避免覆盖
         original_room_output_dir = room_output_dir
@@ -1097,6 +1391,7 @@ class MultiRoomManager(QObject):
                 room.last_error = f"录制目录不可写，请在设置中修改输出目录（{exc.strerror or exc}）"
                 return False
 
+        _log.info("[录制诊断] calling start_recording_with_crf, output_dir=%s", room_output_dir)
         ok, output_path, _encoder_used, error_msg = controller.start_recording_with_crf(
             stream_url,
             room_output_dir,
@@ -1110,6 +1405,7 @@ class MultiRoomManager(QObject):
             framerate=framerate,
             audio_bitrate=audio_bitrate,
         )
+        _log.info("[录制诊断] start_recording_with_crf returned ok=%s, error_msg=%s", ok, error_msg)
         room.is_recording = ok
         room.record_output_path = output_path
         room.record_started_at = datetime.now() if ok else None
@@ -1135,6 +1431,15 @@ class MultiRoomManager(QObject):
         return ok
 
     def stop_recording(self, room_id: str) -> bool:
+        """Stop FFmpeg recording for a room and reset reconnect state.
+
+        Delegates to ``RecordingController.stop_recording``, clears the
+        room's recording flags, and triggers an async duration probe so the
+        UI can show the final clip length once FFprobe reports back.
+
+        Returns:
+            True if the controller accepted the stop request.
+        """
         room = self.get_room(room_id)
         controller = None if room is None else room.controller
         if room is None or controller is None:
@@ -1160,11 +1465,11 @@ class MultiRoomManager(QObject):
     def start_recording_all(self, output_dir: str, encoder: str, crf: int,
                             param_mode: str = "CRF 质量", bitrate: str | None = None,
                             bitrate_unit: str = "kbps") -> dict[str, bool]:
+        """Start recording on every managed room (synchronous, blocking)."""
         rooms = self.list_rooms()
         # Pre-flight: ensure disk space scales with concurrent stream count.
         if rooms:
-            from lsc.gui.pages.recording_controller import RecordingController
-            preflight = RecordingController.preflight_recording(
+            preflight = RecordingService.preflight_check(
                 output_dir, concurrent_streams=len(rooms)
             )
             if preflight:
@@ -1206,8 +1511,7 @@ class MultiRoomManager(QObject):
             return False
 
         # Pre-flight: ensure disk space scales with concurrent stream count.
-        from lsc.gui.pages.recording_controller import RecordingController
-        preflight = RecordingController.preflight_recording(
+        preflight = RecordingService.preflight_check(
             output_dir, concurrent_streams=len(rooms)
         )
         if preflight:
@@ -1236,6 +1540,7 @@ class MultiRoomManager(QObject):
         return True
 
     def stop_recording_all(self) -> dict[str, bool]:
+        """Stop recording on every managed room and return per-room results."""
         return {r.room_id: self.stop_recording(r.room_id) for r in self.list_rooms()}
 
     # ── Export ───────────────────────────────────────────────
@@ -1297,6 +1602,7 @@ class MultiRoomManager(QObject):
     # ── Cut ──────────────────────────────────────────────────
 
     def get_rooms_for_cut(self) -> list[RoomSession]:
+        """Return rooms that have opted in to the cut/export pipeline."""
         return [r for r in self.list_rooms() if r.include_in_cut]
 
     def get_total_recording_size_mb(self) -> float:
@@ -1308,7 +1614,20 @@ class MultiRoomManager(QObject):
     # ── Recording reconnect ─────────────────────────────────
 
     def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str) -> None:
-        """Attempt to reconnect a failed recording with exponential backoff."""
+        """Attempt to reconnect a failed recording with exponential backoff.
+
+        The reconnection strategy is:
+        1. Validate that the error is recoverable (network hiccup, not a
+           codec or permission failure).
+        2. Enforce a hard cap of ``_MAX_RECONNECT_ATTEMPTS`` so we don't
+           loop forever on a permanently dead stream.
+        3. Compute delay = min(base * factor ** attempts, max_delay).
+           The first retry happens after ~2s; subsequent retries double
+           the wait up to 30s.
+        4. On each attempt, stop the failed FFmpeg process, optionally
+           flag the old file as corrupt (if < 1KB), re-parse the CDN URL,
+           and call ``start_recording`` with the saved parameters.
+        """
         from lsc.utils.error_messages import is_recoverable_error
 
         # Check if error is recoverable
@@ -1413,7 +1732,27 @@ class MultiRoomManager(QObject):
             self._global_timer.stop()
 
     def _on_global_tick(self) -> None:
-        """Layered heartbeat: high/medium/low frequency operations."""
+        """Layered heartbeat: high/medium/low frequency operations.
+
+        Runs every 1 second. A modulo counter gates medium-frequency
+        work (every 5 ticks) and low-frequency work (every 10 ticks).
+        This single-timer design avoids spawning multiple QTimer objects
+        and keeps all room updates in one deterministic pass.
+
+        Layered breakdown:
+        - **High-frequency (every tick)**: controller ``tick()`` for elapsed
+          time, and sync of preview playback position into the controller.
+        - **Medium-frequency (every 5s)**: file-size polling via
+          ``SizeUpdateRunnable`` and FFmpeg watchdog health-check. Failed
+          recordings trigger an auto-reconnect in a background thread to
+          keep the UI responsive.
+        - **Low-frequency (every 10s)**: disk-space guard; if free space
+          drops below ``_MIN_FREE_BYTES_WHILE_RECORDING`` the recording is
+          stopped automatically to prevent a mid-write crash.
+
+        Dirty flags are reset after signal emission so the UI only refreshes
+        when something actually changed.
+        """
         self._tick_counter += 1
         is_medium_tick = (self._tick_counter % _MEDIUM_FREQ_INTERVAL == 0)
         is_low_tick = (self._tick_counter % _LOW_FREQ_INTERVAL == 0)
@@ -1494,6 +1833,14 @@ class MultiRoomManager(QObject):
         # Notify UI to refresh timelines and stats.
         # Always emit on high-frequency ticks for smooth timeline updates.
         self.global_tick.emit()
+
+        # Medium-frequency: emit signal so backend can broadcast updated
+        # file sizes for recording rooms (rooms_updated with fresh record_size_mb).
+        if is_medium_tick:
+            self.medium_tick.emit()
+
+        if is_low_tick:
+            self.low_tick.emit()
 
         # Reset dirty flags after emission
         self._dirty_recording = False

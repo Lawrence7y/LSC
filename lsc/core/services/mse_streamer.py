@@ -1,26 +1,28 @@
 """
-MSE (Media Source Extensions) streamer for Electron preview.
+MSE (Media Source Extensions) 流式传输服务 — 用于 Electron 预览。
 
-Transcodes a live stream to fragmented MP4 and pushes segments
-through a callback, allowing the Electron frontend to assemble
-them via MediaSource API for smooth <video> playback.
+通过 FFmpeg 将直播流转码为分片 MP4（fragmented MP4），
+并通过 WebSocket 回调推送给 Electron 前端，
+前端通过 MediaSource API 将片段组装到 <video> 元素实现平滑播放。
 
-Key design:
-- FFmpeg outputs fragmented MP4 to a pipe
-- Init segment (ftyp+moov) is captured first, sent once
-- Subsequent moof+mdat segments are sent as they arrive
-- Segment boundaries detected by ftyp/moof box markers
+关键设计：
+- FFmpeg 通过管道输出 fMP4 到 stdout
+- 首先捕获 init segment（ftyp+moov），只发送一次
+- 后续的 moof+mdat 片段实时推送到前端
+- 通过 ftyp/moof 等 MP4 box 标记检测片段边界
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import threading
 import time
 from typing import Callable
 
+from lsc.config import load_config
 from lsc.utils.process_launcher import prepare_launch
 
 _log = logging.getLogger(__name__)
@@ -34,11 +36,68 @@ _MDAT_MARKER = b'mdat'
 # Max segment size before forcing a split (512KB)
 _MAX_SEGMENT_BYTES = 512 * 1024
 
+# NVENC availability cache (checked once per process lifetime)
+_nvenc_available: bool | None = None
+
+
+def _check_nvenc() -> bool:
+    """Quick test: can FFmpeg use h264_nvenc on this system?"""
+    global _nvenc_available
+    if _nvenc_available is not None:
+        return _nvenc_available
+    try:
+        cfg = load_config()
+        ffmpeg = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+        if not ffmpeg or not os.path.isfile(ffmpeg):
+            _nvenc_available = False
+            return False
+        env, creation_flags, cwd = prepare_launch(ffmpeg)
+        run_kwargs: dict = {
+            "capture_output": True,
+            "text": True,
+            "timeout": 10,
+            "env": env,
+        }
+        if cwd:
+            run_kwargs["cwd"] = cwd
+        if creation_flags:
+            run_kwargs["creationflags"] = creation_flags
+        result = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error",
+             "-f", "lavfi", "-i", "testsrc=duration=1:size=256x256:rate=1",
+             "-c:v", "h264_nvenc", "-frames:v", "1",
+             "-f", "null", "-"],
+            **run_kwargs,
+        )
+        _nvenc_available = result.returncode == 0
+    except Exception:
+        _nvenc_available = False
+    return _nvenc_available
+
+
+def _set_stream_nonblocking(stream) -> None:
+    """Set a file-like stream to non-blocking mode (best-effort)."""
+    try:
+        fd = stream.fileno()
+        if os.name == 'nt':
+            try:
+                import msvcrt
+                handle = msvcrt.get_osfhandle(fd)
+                msvcrt.set_osfhandle_nonblocking(handle, True)
+            except (ImportError, OSError):
+                pass
+        else:
+            import fcntl
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except (AttributeError, OSError, ImportError):
+        pass
+
 
 class MseStreamer:
-    """Streams a live source as fragmented MP4 segments via callback.
+    """将直播源以 fMP4 片段形式通过回调推送到前端。
 
-    Usage::
+    使用方式::
 
         streamer = MseStreamer(
             url="http://example.com/live.m3u8",
@@ -48,6 +107,12 @@ class MseStreamer:
         streamer.start()
         # ... later ...
         streamer.stop()
+
+    fMP4（分片 MP4）格式说明：
+    - init segment（ftyp + moov）：包含编解码器信息和样本表，只发送一次
+    - media segment（moof + mdat）：包含实际的音视频帧，持续生成
+    - 每个片段通过 MP4 box 标记（ftyp/moof/mdat）自动识别边界
+    - 前端通过 MediaSource API 按序追加片段实现低延迟直播
     """
 
     def __init__(
@@ -59,6 +124,9 @@ class MseStreamer:
         width: int = 0,
         height: int = 0,
         fps: int = 0,
+        headers: dict[str, str] | None = None,
+        video_bitrate: str = "",
+        crf_value: int = 0,
     ):
         self._url = url
         self._on_init = on_init_segment
@@ -67,6 +135,9 @@ class MseStreamer:
         self._width = width
         self._height = height
         self._fps = fps
+        self._headers = headers
+        self._video_bitrate = video_bitrate
+        self._crf_value = crf_value
         self._ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
         self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
@@ -96,8 +167,18 @@ class MseStreamer:
         self._on_init(self._last_init_segment)
         return True
 
-    def start(self) -> bool:
-        """Start the FFmpeg transcoding process and segment reader thread."""
+    def start(self, startup_probe_timeout: float = 2.0) -> bool:
+        """启动 FFmpeg 转码进程和分段读取线程。
+
+        构建 FFmpeg 命令行并启动，随后启动后台线程读取 fMP4 输出。
+        包含启动探测逻辑，等待 init segment 产出或 FFmpeg 异常退出。
+
+        Args:
+            startup_probe_timeout: 启动探测超时时间（秒）
+
+        Returns:
+            True 表示启动成功，False 表示 FFmpeg 异常退出
+        """
         if self._running:
             _log.warning("MseStreamer already running")
             return False
@@ -105,7 +186,7 @@ class MseStreamer:
         # Build scale filter if resolution specified
         vf_parts: list[str] = []
         if self._width > 0 and self._height > 0:
-            vf_parts.append(f"scale={self._width}:{self._height}")
+            vf_parts.append(f"scale={self._width}:{self._height}:force_original_aspect_ratio=decrease")
 
         vf_arg = [f"fps={self._fps}"] if self._fps > 0 else []
 
@@ -129,12 +210,45 @@ class MseStreamer:
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
+        ]
+
+        # 插入 HTTP headers（B站/虎牙/斗鱼 CDN 强制检查 Referer，缺少会 403）
+        if self._headers:
+            header_str = "\r\n".join(f"{k}: {v}" for k, v in self._headers.items()) + "\r\n"
+            cmd += ["-headers", header_str]
+
+        cmd += [
             "-i", self._url,
             "-map", "0:v",
             "-map", "0:a?",  # 音频轨可选，无音频时不报错
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
+        ]
+
+        # 编码器选择：NVENC 硬件编码优先（大幅降低 CPU 占用），不可用时回退到 libx264 软编码
+        use_nvenc = _check_nvenc()
+        if use_nvenc:
+            cmd += [
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",       # 平衡速度与质量
+                "-tune", "ll",          # 低延迟
+                "-rc", "cbr",
+                "-b:v", self._video_bitrate or "2500k",
+                "-maxrate", str(int((self._video_bitrate or "2500k").replace("k", "")) * 12 // 10) + "k",
+                "-bufsize", str(int((self._video_bitrate or "2500k").replace("k", "")) * 2) + "k",
+            ]
+        else:
+            crf = self._crf_value or 28
+            bitrate = self._video_bitrate or "1500k"
+            max_bitrate = str(int(bitrate.replace("k", "")) * 4 // 3) + "k"
+            cmd += [
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", str(crf),
+                "-b:v", bitrate,
+                "-maxrate", max_bitrate,
+                "-bufsize", str(int(bitrate.replace("k", "")) * 2) + "k",
+            ]
+
+        cmd += [
             "-pix_fmt", "yuv420p",
             "-g", "30",  # keyframe every 30 frames (~1s at 30fps)
             "-c:a", "aac",
@@ -144,7 +258,7 @@ class MseStreamer:
             "-shortest",
             "-f", "mp4",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-            "-frag_duration", "500000",  # 500ms fragments
+            "-frag_duration", "1000000",  # 1000ms fragments
             "pipe:1",
         ]
         if self._url.lower().endswith('.m3u8'):
@@ -202,20 +316,26 @@ class MseStreamer:
         self._stderr_thread.start()
         _log.info("MseStreamer started for %s", self._url[:80])
 
-        # 启动探测：等 2 秒检查 FFmpeg 是否已退出（URL 无效/流离线时会快速退出）
-        time.sleep(2)
-        if self._process.poll() is not None:
-            # FFmpeg 已退出，等 _read_stderr 线程收集完错误输出
-            time.sleep(0.5)
-            self._running = False
-            if not self._error_reported:
-                self._error_reported = True
-                err_msg = self._last_stderr.strip()[:500] if self._last_stderr else "FFmpeg 进程异常退出"
-                _log.error("FFmpeg exited immediately: %s", err_msg)
-                if self._on_error:
-                    self._on_error(f"流连接失败: {err_msg}")
-            return False
+        # 启动探测：轮询检查 init segment 是否已产出或 FFmpeg 是否已退出
+        # 比固定 sleep 更快——init 产出后立即返回，不必等满 probe_timeout
+        deadline = time.monotonic() + startup_probe_timeout
+        while time.monotonic() < deadline:
+            if self._init_sent:
+                return True
+            proc = self._process
+            if proc is not None and proc.poll() is not None:
+                time.sleep(0.3)
+                self._running = False
+                if not self._error_reported:
+                    self._error_reported = True
+                    err_msg = self._last_stderr.strip()[:500] if self._last_stderr else "FFmpeg 进程异常退出"
+                    _log.error("FFmpeg exited immediately: %s", err_msg)
+                    if self._on_error:
+                        self._on_error(f"流连接失败: {err_msg}")
+                return False
+            time.sleep(0.15)
 
+        # 超时但未退出 → 假定成功（init 可能在探测后才产出）
         return True
 
     def _read_stderr(self) -> None:
@@ -251,6 +371,17 @@ class MseStreamer:
             except Exception as exc:
                 _log.warning("Error stopping FFmpeg: %s", exc)
             finally:
+                # 显式关闭管道，防止文件描述符泄漏（Windows 上尤为重要）
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if proc.stderr:
+                        proc.stderr.close()
+                except Exception:
+                    pass
                 self._process = None
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2)
@@ -259,30 +390,63 @@ class MseStreamer:
         _log.info("MseStreamer stopped")
 
     def _read_segments(self) -> None:
-        """Read fMP4 output from FFmpeg stdout and emit segments."""
-        if self._process is None or self._process.stdout is None:
+        """从 FFmpeg stdout 读取 fMP4 输出并按片段分发。
+
+        读取线程以 daemon 方式运行，持续从 FFmpeg 的 stdout 管道读取数据。
+        通过识别 ftyp/moof/mdat 等 MP4 box 标记来分割片段：
+        - ftyp + moov 组成 init segment，只发送一次
+        - moof + mdat 组成 media segment，持续发送
+
+        包含无数据超时检测（10 秒），用于诊断 FFmpeg hang 住的情况。
+        """
+        # 保存局部引用，避免 stop() 并发置 None 导致 AttributeError
+        proc = self._process
+        if proc is None or proc.stdout is None:
             return
 
         # Buffer for incomplete reads
         buf = bytearray()
         # Track seen box types to detect init segment boundaries
         seen_ftyp = False
+        # 非阻塞读取：避免 FFmpeg hang 住时线程永久阻塞
+        _use_nonblocking = hasattr(proc.stdout, 'fileno') and callable(getattr(proc.stdout, 'fileno'))
+        if _use_nonblocking:
+            _set_stream_nonblocking(proc.stdout)
+        # 上次收到数据的时间戳，用于检测 FFmpeg hang 住
+        last_data_time = time.monotonic()
+        _NO_DATA_TIMEOUT = 5.0  # 5 秒无数据则认为 FFmpeg hang 住（从 10s 缩短以更快检测）
 
         try:
             while self._running:
-                chunk = self._process.stdout.read(4096)
+                try:
+                    if _use_nonblocking:
+                        chunk = os.read(proc.stdout.fileno(), 65536)
+                    else:
+                        chunk = proc.stdout.read(65536)
+                except (BlockingIOError, OSError):
+                    # 没有数据可读，检查进程状态和超时
+                    if proc.poll() is not None:
+                        break
+                    if time.monotonic() - last_data_time > _NO_DATA_TIMEOUT:
+                        if self._running and not self._error_reported and self._on_error:
+                            self._error_reported = True
+                            _log.error("FFmpeg stdout read timeout (%ds): no data received", _NO_DATA_TIMEOUT)
+                            self._on_error("流编码无响应：读取超时")
+                        break
+                    time.sleep(0.05)
+                    continue
+
                 if not chunk:
-                    if self._process.poll() is not None:
+                    if proc.poll() is not None:
                         # Process exited
                         stderr_output = b""
-                        if self._process.stderr:
+                        if proc.stderr:
                             try:
-                                stderr_output = self._process.stderr.read(4096)
+                                stderr_output = proc.stderr.read(4096)
                             except Exception:
                                 pass
                         if self._running and not self._error_reported and self._on_error:
                             self._error_reported = True
-                            # 优先使用 stderr 守护线程收集的完整日志，回退到一次性读取
                             err_msg = (self._last_stderr or stderr_output.decode("utf-8", errors="replace"))[:500]
                             _log.error("FFmpeg exited unexpectedly: %s", err_msg)
                             self._on_error(f"流编码异常终止: {err_msg}" if err_msg else "流编码异常终止")
@@ -290,6 +454,7 @@ class MseStreamer:
                     time.sleep(0.01)
                     continue
 
+                last_data_time = time.monotonic()
                 buf.extend(chunk)
 
                 # Process complete segments from buffer
@@ -300,12 +465,10 @@ class MseStreamer:
 
                     if not seen_ftyp and ftyp_idx != -1:
                         # Found ftyp - extract init segment
-                        # The init segment starts at ftyp and goes through moov
                         init_start = max(0, ftyp_idx - 4)  # Include box size
                         moov_idx = buf.find(_MOOV_MARKER, ftyp_idx + 4)
 
                         if moov_idx != -1:
-                            # Find the end of moov box
                             if moov_idx >= 4:
                                 moov_size = int.from_bytes(buf[moov_idx - 4:moov_idx], "big")
                                 init_end = moov_idx - 4 + moov_size
@@ -321,7 +484,6 @@ class MseStreamer:
                                     continue
 
                     if seen_ftyp and moof_idx != -1 and moof_idx >= 4:
-                        # Found moof - extract media segment (moof + mdat)
                         seg_start = moof_idx - 4
                         mdat_idx = buf.find(_MDAT_MARKER, moof_idx + 4)
 

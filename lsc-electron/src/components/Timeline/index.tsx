@@ -22,6 +22,7 @@ interface TimelineProps {
   height?: number
   zoomLevel?: number
   onZoomChange?: (zoom: number) => void
+  windowStart?: number
 }
 
 const DEFAULT_CLIP_COLOR = 'rgba(52, 199, 89, 0.25)'
@@ -53,9 +54,11 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-function chooseTickInterval(duration: number, zoom: number, targetSpacingPx: number, trackWidthPx: number): number {
+function chooseTickInterval(duration: number, zoom: number, targetSpacingPx: number, trackWidthPx: number, visibleWidthPx: number): number {
   const visibleDuration = duration / zoom
-  const secondsPerPixel = visibleDuration / Math.max(trackWidthPx, 1)
+  // 使用可见区域宽度计算秒/像素，而非 trackWidthPx（放大后 trackWidthPx 是 zoom 倍宽度）
+  const effectiveWidth = Math.max(visibleWidthPx || trackWidthPx / zoom, 1)
+  const secondsPerPixel = visibleDuration / effectiveWidth
   const rawInterval = targetSpacingPx * secondsPerPixel
   for (const interval of TICK_INTERVALS) {
     if (interval >= rawInterval) return interval
@@ -107,6 +110,7 @@ export function Timeline({
   height = 60,
   zoomLevel = 1,
   onZoomChange,
+  windowStart = 0,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
@@ -114,25 +118,34 @@ export function Timeline({
   const [draggingMarker, setDraggingMarker] = useState<'in' | 'out' | null>(null)
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const [trackWidth, setTrackWidth] = useState(800)
+  const [scrollWidth, setScrollWidth] = useState(800)
   const rafRef = useRef<number | null>(null)
   const pendingTimeRef = useRef<number | null>(null)
+  const [snapFlash, setSnapFlash] = useState<{ time: number; type: 'in' | 'out' | 'playhead' } | null>(null)
+  const snapFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const ws = windowStart
 
   const zoom = zoomLevel
   const effectiveDuration = useMemo(() => Math.max(duration || 1, 1), [duration])
 
   useEffect(() => {
     const track = trackRef.current
+    const scroll = scrollRef.current
     if (!track) return
-    const updateWidth = () => setTrackWidth(track.clientWidth)
+    const updateWidth = () => {
+      setTrackWidth(track.clientWidth)
+      if (scroll) setScrollWidth(scroll.clientWidth)
+    }
     updateWidth()
     const observer = new ResizeObserver(updateWidth)
     observer.observe(track)
+    if (scroll) observer.observe(scroll)
     return () => observer.disconnect()
   }, [])
 
   const tickInterval = useMemo(
-    () => chooseTickInterval(effectiveDuration, zoom, 120, trackWidth),
-    [effectiveDuration, zoom, trackWidth]
+    () => chooseTickInterval(effectiveDuration, zoom, 120, trackWidth, scrollWidth),
+    [effectiveDuration, zoom, trackWidth, scrollWidth]
   )
 
   const getTimeFromX = useCallback((clientX: number): number => {
@@ -162,8 +175,15 @@ export function Timeline({
     }
     setIsDragging(true)
     const snapped = snapTime(time)
-    onSeek(snapped)
-  }, [getTimeFromX, onMarkIn, onMarkOut, onSeek, snapTime, draggingMarker])
+    if (Math.abs(snapped - time) > 0.01 && snapFlashTimer.current === null) {
+      setSnapFlash({ time: snapped, type: 'playhead' })
+      snapFlashTimer.current = setTimeout(() => {
+        setSnapFlash(null)
+        snapFlashTimer.current = null
+      }, 200)
+    }
+    onSeek(snapped + ws)
+  }, [getTimeFromX, onMarkIn, onMarkOut, onSeek, snapTime, draggingMarker, ws])
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const time = getTimeFromX(e.clientX)
@@ -176,15 +196,15 @@ export function Timeline({
       if (t === null) return
       if (draggingMarker && onMarkerDrag) {
         const snapped = snapTime(t)
-        onMarkerDrag(draggingMarker, snapped)
+        onMarkerDrag(draggingMarker, snapped + ws)
         return
       }
       if (isDragging) {
         const snapped = snapTime(t)
-        onSeek(snapped)
+        onSeek(snapped + ws)
       }
     })
-  }, [getTimeFromX, isDragging, onSeek, snapTime, draggingMarker, onMarkerDrag])
+  }, [getTimeFromX, isDragging, onSeek, snapTime, draggingMarker, onMarkerDrag, ws])
 
   const handleMouseUp = useCallback(() => {
     setIsDragging(false)
@@ -265,8 +285,8 @@ export function Timeline({
           style={{ width: innerWidth, position: 'relative', height: '100%' }}
         >
           <div className="lsc-timeline__timecode">
-            <span>{formatTime(0)}</span>
-            <span>{formatTime(effectiveDuration)}</span>
+            <span>{formatTime(ws)}</span>
+            <span>{formatTime(ws + effectiveDuration)}</span>
           </div>
 
           <div className="lsc-timeline__ruler">
@@ -279,7 +299,7 @@ export function Timeline({
                   style={{ left: `${pct}%` }}
                 >
                   {isMajor && (
-                    <span className="lsc-timeline__tick-label">{formatTickTime(time)}</span>
+                    <span className="lsc-timeline__tick-label">{formatTickTime(time + ws)}</span>
                   )}
                 </div>
               )
@@ -315,7 +335,9 @@ export function Timeline({
 
             {markerInPct !== null && (
               <div
-                className="lsc-timeline__marker lsc-timeline__marker--in"
+                className={`lsc-timeline__marker lsc-timeline__marker--in ${
+                  snapFlash?.type === 'in' ? 'lsc-timeline__marker--snap' : ''
+                }`}
                 style={{ left: `${markerInPct}%` }}
                 onMouseDown={(e) => handleMarkerMouseDown(e, 'in')}
                 onContextMenu={(e) => {
@@ -324,13 +346,15 @@ export function Timeline({
                   onDeleteMarker?.('in')
                 }}
               >
-                <span className="lsc-timeline__marker-label">入 {markIn !== null ? formatTime(markIn) : ''}</span>
+                <span className="lsc-timeline__marker-label">入 {markIn !== null ? formatTime(markIn + ws) : ''}</span>
               </div>
             )}
 
             {markerOutPct !== null && (
               <div
-                className="lsc-timeline__marker lsc-timeline__marker--out"
+                className={`lsc-timeline__marker lsc-timeline__marker--out ${
+                  snapFlash?.type === 'out' ? 'lsc-timeline__marker--snap' : ''
+                }`}
                 style={{ left: `${markerOutPct}%` }}
                 onMouseDown={(e) => handleMarkerMouseDown(e, 'out')}
                 onContextMenu={(e) => {
@@ -339,15 +363,20 @@ export function Timeline({
                   onDeleteMarker?.('out')
                 }}
               >
-                <span className="lsc-timeline__marker-label">出 {markOut !== null ? formatTime(markOut) : ''}</span>
+                <span className="lsc-timeline__marker-label">出 {markOut !== null ? formatTime(markOut + ws) : ''}</span>
               </div>
             )}
 
-            <div className="lsc-timeline__playhead" style={{ left: `${progressPct}%` }} />
+            <div
+              className={`lsc-timeline__playhead ${
+                snapFlash?.type === 'playhead' ? 'lsc-timeline__playhead--snap' : ''
+              }`}
+              style={{ left: `${progressPct}%` }}
+            />
 
             {hoverPct !== null && (
               <div className="lsc-timeline__tooltip" style={{ left: `${hoverPct}%` }}>
-                {formatTime(hoverTime!)}
+                {formatTime(hoverTime! + ws)}
               </div>
             )}
           </div>

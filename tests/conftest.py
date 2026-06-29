@@ -10,20 +10,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from lsc.config import LscConfig
 
 
-@pytest.fixture(scope="session")
-def qapp():
-    """提供全局 QApplication 实例。
-
-    所有 Qt 相关的测试都应该使用此 fixture，
-    确保整个测试会话中只有一个 QApplication 实例。
-    """
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    yield app
-    app.quit()
 
 
 @pytest.fixture
@@ -39,3 +25,4 @@ def sample_config(tmp_path):
         output_path=str(tmp_path / "output"),
         output_dir=str(tmp_path / "output"),
     )
+

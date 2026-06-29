@@ -2,6 +2,8 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import { LoadingOutlined, PlayCircleOutlined } from '@ant-design/icons'
 import { MsePlayer, MsePlayerState } from '@/services/mediaSourcePlayer'
 import { drainPendingMseSegments, getMseInitCache } from '@/hooks/useWebSocket'
+import { useAppStore } from '@/store/appStore'
+import { getAligner } from '@/utils/previewAudioAligner'
 
 interface VideoPreviewProps {
   /** Room ID for the video stream */
@@ -34,20 +36,32 @@ export function VideoPreview({
 }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const playerRef = useRef<MsePlayer | null>(null)
+  const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null)
+  const gainNodeRef = useRef<GainNode | null>(null)
   const [state, setState] = useState<MsePlayerState>('idle')
   const [error, setError] = useState<string | null>(null)
-  // 超时检测：加载后 15 秒未收到任何帧则报错
+  // 超时检测：加载后 30 秒未收到任何帧则报错。
+  // B站等平台首次预览需要 refresh_stream_url（重新解析直播页面），耗时可达 10+ 秒。
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const hasReceivedDataRef = useRef(false)
+  // 首次超时后自动重试一次，避免 B站首次预览因 URL 刷新慢而失败
+  const autoRetriedRef = useRef(false)
 
   // Refs hold the latest props without being listed as useEffect deps,
   // so changing send/onReady/onError identities do not trigger init→stop→init loops.
   const onReadyRef = useRef(onReady)
   const onErrorRef = useRef(onError)
   const sendRef = useRef(send)
+  const mutedRef = useRef(muted)
   onReadyRef.current = onReady
   onErrorRef.current = onError
   sendRef.current = send
+  mutedRef.current = muted
+
+  // 本地静音覆盖：解决全屏原生控件改变静音后经 WS→后端节流→rooms_updated
+  // 用 stale prop 覆盖用户操作的竞态问题
+  const [localMutedOverride, setLocalMutedOverride] = useState<boolean | null>(null)
+  const localMutedOverrideRef = useRef<boolean | null>(null)
 
   // Clean up the local MsePlayer only — never notifies the backend.
   const cleanupPlayer = useCallback(() => {
@@ -69,6 +83,16 @@ export function VideoPreview({
       mode: 'mse',
     })
   }, [roomId, cleanupPlayer])
+
+  // S6: 重试 loading 状态，防止用户连续点击
+  const [retrying, setRetrying] = useState(false)
+  const handleRetry = useCallback(() => {
+    if (retrying) return
+    setRetrying(true)
+    stopAndNotify()
+    // 3 秒后自动恢复按钮（允许用户再次尝试）
+    setTimeout(() => setRetrying(false), 3000)
+  }, [retrying, stopAndNotify])
 
   // Feed init segment to player
   const feedInit = useCallback((data: ArrayBuffer) => {
@@ -99,11 +123,25 @@ export function VideoPreview({
     loadTimeoutRef.current = setTimeout(() => {
       if (!hasReceivedDataRef.current && playerRef.current) {
         console.warn(`[VideoPreview] 预览加载超时 (${roomId})`)
+        // 首次超时自动重试一次：重新请求 init 段，适用于 B站首次预览 URL 刷新慢的场景
+        if (!autoRetriedRef.current) {
+          autoRetriedRef.current = true
+          console.log(`[VideoPreview] Auto-retrying preview for ${roomId}`)
+          sendRef.current('request_mse_init', { room_id: roomId })
+          // 重新设置 30 秒超时等待重试结果（B站 URL 刷新可能需要 10+ 秒）
+          if (loadTimeoutRef.current) {
+            clearTimeout(loadTimeoutRef.current)
+          }
+          loadTimeoutRef.current = setTimeout(() => {
+            if (!hasReceivedDataRef.current && playerRef.current) {
+              setError('预览加载超时，请检查直播流是否正常')
+            }
+          }, 30000)
+          return
+        }
         setError('预览加载超时，请检查直播流是否正常')
-        // 不再通知后端关闭预览 —— 该房间可能有其他 VideoPreview（全屏）正在使用
-        // 后端 streamer 的生命周期应由用户主动点击"停止预览"控制
       }
-    }, 15000)
+    }, 30000)
 
     const player = new MsePlayer({
       videoElement: videoRef.current,
@@ -125,12 +163,38 @@ export function VideoPreview({
         hasReceivedDataRef.current = true  // 收到错误也算有回馈
         onErrorRef.current?.(msg)
       },
+      onSourceOpen: () => {
+        // MediaSource.sourceopen 触发后 video.src 已绑定到新 MediaSource，
+        // 此时创建 Web Audio 路由才安全。若在 player.start() 之前创建，
+        // start() 内部的 stop() → video.load() 会断开 MediaElementSource 连接。
+        if (!audioSourceRef.current && videoRef.current) {
+          try {
+            const ctx = getAligner().getContextSync()
+            if (ctx.state === 'suspended') {
+              ctx.resume().catch((e) => {
+                console.warn(`[VideoPreview] Failed to resume AudioContext on sourceopen for ${roomId}:`, e)
+              })
+            }
+            const source = ctx.createMediaElementSource(videoRef.current)
+            const gain = ctx.createGain()
+            gain.gain.value = (localMutedOverride ?? muted) ? 0 : 1
+            source.connect(gain)
+            gain.connect(ctx.destination)
+            audioSourceRef.current = source
+            gainNodeRef.current = gain
+            console.log(`[VideoPreview] Web Audio routing created on sourceopen for ${roomId}`)
+          } catch (e) {
+            console.warn(`[VideoPreview] Failed to create Web Audio routing for ${roomId}:`, e)
+          }
+        }
+      },
     })
 
     playerRef.current = player
     onReadyRef.current?.(player)
 
     // Start receiving segments (backend enable_preview is owned by the parent)
+    // player.start() 内部会创建 MediaSource 并触发 sourceopen → onSourceOpen 回调
     player.start(roomId)
 
     // 优先用缓存的 init 段 feedInit，避免等待 request_mse_init 往返（200-500ms）
@@ -152,6 +216,16 @@ export function VideoPreview({
         playerRef.current.stop()
         playerRef.current = null
       }
+      // 清理 Web Audio 路由，防止重新挂载时旧 source 绑定到已移除的 video 元素
+      if (audioSourceRef.current) {
+        try { audioSourceRef.current.disconnect() } catch {}
+        audioSourceRef.current = null
+      }
+      if (gainNodeRef.current) {
+        try { gainNodeRef.current.disconnect() } catch {}
+        gainNodeRef.current = null
+      }
+      autoRetriedRef.current = false
       setState('idle')
       setError(null)
     }
@@ -162,7 +236,7 @@ export function VideoPreview({
     if (active && videoRef.current) {
       // Register this room's player in a global registry for WS handler access
       const registry = (window as any).__msePlayers || {}
-      registry[roomId] = { feedInit, feedMedia, player: playerRef.current }
+      registry[roomId] = { feedInit, feedMedia, player: playerRef.current, audioSource: audioSourceRef.current, gainNode: gainNodeRef.current }
       ;(window as any).__msePlayers = registry
       // 主动请求后端补发 init 段，消除 mse_init 早于 rooms_updated 到达的竞态
       sendRef.current('request_mse_init', { room_id: roomId })
@@ -194,15 +268,57 @@ export function VideoPreview({
     }
   }, [active, roomId, feedInit, feedMedia])
 
-  // 同步 muted prop 到 MsePlayer 和 video 元素
+  // 同步 muted prop 到 GainNode（替代 video.muted）
+  // GainNode 控制扬声器输出音量，不影响 MediaElementSource 的音频数据
   useEffect(() => {
-    if (playerRef.current) {
-      playerRef.current.setMuted(muted)
+    const effectiveMuted = localMutedOverride ?? muted
+    if (gainNodeRef.current) {
+      gainNodeRef.current.gain.value = effectiveMuted ? 0 : 1
     }
+    // video.muted 仅用于原生控件的显示状态，不影响 Web Audio 路由
     if (videoRef.current) {
-      videoRef.current.muted = muted
+      videoRef.current.muted = effectiveMuted
+    }
+    // 取消静音时显式 resume AudioContext，确保 Web Audio 路由有输出
+    if (!effectiveMuted) {
+      const ctx = getAligner().getContextSync()
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch((e) => {
+          console.warn(`[VideoPreview] Failed to resume AudioContext on unmute for ${roomId}:`, e)
+        })
+      }
+    }
+  }, [muted, localMutedOverride, roomId])
+
+  // 后端 rooms_updated 确认：当 muted prop 与本地覆盖值一致时清除覆盖
+  useEffect(() => {
+    if (localMutedOverrideRef.current !== null && muted === localMutedOverrideRef.current) {
+      localMutedOverrideRef.current = null
+      setLocalMutedOverride(null)
     }
   }, [muted])
+
+  // 全屏时用户通过原生 controls 改变静音状态，需要同步回后端。
+  // volumechange 事件在 video.muted 被 React prop 设置和原生控件设置时都会触发，
+  // 通过 mutedRef 区分：若 video.muted !== mutedRef.current 说明是原生控件改的。
+  // 同时设置本地覆盖 + 乐观更新 store，避免 rooms_updated 用 stale prop 覆盖用户操作。
+  useEffect(() => {
+    if (!active || !videoRef.current) return
+    const video = videoRef.current
+    const handleVolumeChange = () => {
+      if (video.muted !== mutedRef.current) {
+        // 设置本地覆盖，立即反映到 UI
+        localMutedOverrideRef.current = video.muted
+        setLocalMutedOverride(video.muted)
+        // 乐观更新 store，房间卡片的静音图标立即响应
+        useAppStore.getState().updateRoom(roomId, { preview_muted: video.muted })
+        // 同步到后端
+        sendRef.current('set_preview_muted', { room_id: roomId, muted: video.muted })
+      }
+    }
+    video.addEventListener('volumechange', handleVolumeChange)
+    return () => video.removeEventListener('volumechange', handleVolumeChange)
+  }, [active, roomId])
 
   const showLoading = state === 'loading'
   const showError = state === 'error' || error
@@ -227,7 +343,7 @@ export function VideoPreview({
       <video
         ref={videoRef}
         controls={controls}
-        muted={muted}
+        muted={false}
         playsInline
         style={{
           width: '100%',
@@ -280,19 +396,20 @@ export function VideoPreview({
             {error || '预览不可用'}
           </span>
           <button
-            onClick={stopAndNotify}
+            onClick={handleRetry}
+            disabled={retrying}
             style={{
               marginTop: 8,
               padding: '4px 12px',
               fontSize: 12,
-              background: 'var(--brand-500)',
+              background: retrying ? 'var(--text-500)' : 'var(--brand-500)',
               color: '#fff',
               border: 'none',
               borderRadius: 4,
-              cursor: 'pointer',
+              cursor: retrying ? 'not-allowed' : 'pointer',
             }}
           >
-            重试
+            {retrying ? '重试中...' : '重试'}
           </button>
         </div>
       )}

@@ -1,16 +1,10 @@
-/**
- * MediaSource Player for Electron MSE preview.
- *
- * Receives fragmented MP4 segments (init + media) from WebSocket
- * and feeds them to a <video> element via MediaSource API.
- */
-
 export type MsePlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'error'
 
 export interface MsePlayerOptions {
   videoElement: HTMLVideoElement
   onStateChange?: (state: MsePlayerState) => void
   onError?: (error: string) => void
+  onSourceOpen?: () => void
   debug?: boolean
 }
 
@@ -53,6 +47,28 @@ function toHex(value: number): string {
   return value.toString(16).padStart(2, '0')
 }
 
+/**
+ * MediaSource Player for Electron MSE preview.
+ *
+ * 基于 MediaSource Extensions (MSE) 的直播流播放器，用于在 Electron 渲染进程中
+ * 实时预览多房间直播切片。接收后端通过 WebSocket 推送的 fMP4 分片（init segment +
+ * media segments），喂给 `<video>` 元素实现低延迟播放。
+ *
+ * 核心流程：
+ * 1. 后端 FFmpeg 将 H.264/AAC 直播流转码为 fMP4 格式，通过 WebSocket 推送 init
+ *    段（ftyp + moov）和 media 段（moof + mdat）。
+ * 2. 前端创建 MediaSource，绑定到 video.src，监听 sourceopen 后创建 SourceBuffer。
+ * 3. init 段首先 append，建立解码上下文；media 段持续 append，video 自动播放。
+ * 4. 缓冲区超过 310s 时自动 trim 至 300s，既保留回看能力，又防止内存泄漏。
+ * 5. live-edge 对齐：MSE 直播流 duration=Infinity，currentTime 默认 0，
+ *    可能落在 buffered 范围外导致 play() pending；首次 updateend 检测到该情况时
+ *    自动 seek 至 live edge（buffered.end - 0.2s），确保 readyState 升到 2+。
+ *
+ * 与后端 MSE Streamer 的对接：
+ * - WebSocket 消息类型 `mse_init` → 调用 feedInit()
+ * - WebSocket 消息类型 `mse_segment` → 调用 feedMedia()
+ * - 后端负责按 GOP 边界切分 fMP4 分片并推送；前端只负责 append 和播放控制。
+ */
 export class MsePlayer {
   private _video: HTMLVideoElement
   private _mediaSource: MediaSource | null = null
@@ -60,6 +76,7 @@ export class MsePlayer {
   private _state: MsePlayerState = 'idle'
   private _onStateChange?: (state: MsePlayerState) => void
   private _onError?: (error: string) => void
+  private _onSourceOpen?: () => void
   private _debug: boolean
   private _pendingSegments: Uint8Array[] = []
   private _initReceived = false
@@ -68,16 +85,23 @@ export class MsePlayer {
   private _abortController: AbortController | null = null
   // play() 延迟重试机制：避免 play() 被 pause() 中断或静默失败
   private _playRetryTimer: ReturnType<typeof setTimeout> | null = null
-  // 标记是否已执行 live-edge 对齐（去重，避免反复 seek）
+  // 标记是否已执行 live-edge 对齐（去顶，避免反复 seek）
   private _liveEdgeAligned = false
   // 标记是否正在执行 SourceBuffer trim（remove）：trim 完成触发的 updateend
   // 不再递归进入 trim 分支，仅处理 _pendingSegments，避免链式 updateend 卡死
   private _isTrimming = false
+  // 最大待处理分段数：超出时丢弃最旧的，避免主线程卡顿时无限堆积
+  private readonly _maxPendingSegments = 20
+  // 卡顿检测：记录上次 currentTime 变化的时间和位置
+  private _stallCheckTimer: ReturnType<typeof setInterval> | null = null
+  private _lastStallTime = 0
+  private _lastStallPosition = 0
 
   constructor(options: MsePlayerOptions) {
     this._video = options.videoElement
     this._onStateChange = options.onStateChange
     this._onError = options.onError
+    this._onSourceOpen = options.onSourceOpen
     this._debug = options.debug ?? false
   }
 
@@ -89,18 +113,37 @@ export class MsePlayer {
     return this._video
   }
 
-  /** Start receiving init + media segments. */
+  /** Start receiving init + media segments.
+   *
+   * 重置所有内部状态（pending segments、init received、live-edge 标志），
+   * 创建新的 MediaSource 并绑定到 video 元素，进入 loading 状态等待后端推送 init 段。
+   *
+   * @param _url - 预留参数，当前版本未使用（流地址由后端 WebSocket 推送决定）
+   */
   start(_url: string): void {
     this.stop()
     this._pendingSegments = []
     this._initReceived = false
     this._initSegment = null
     this._liveEdgeAligned = false
+    this._lastStallTime = 0
+    this._lastStallPosition = 0
     this._setState('loading')
     this._initMediaSource()
+    this._startStallDetection()
   }
 
-  /** Feed init segment (ftyp + moov boxes). Must be called before media segments. */
+  /**
+   * 喂入 init segment（ftyp + moov boxes）。
+   *
+   * 建立 SourceBuffer 解码上下文，必须在 media segment 之前调用。
+   * 若 SourceBuffer 尚未就绪，init 段会被 unshift 到 pending 队列头部，
+   * 等待 _flushPending() 在 sourceopen 或 updateend 时处理。
+   *
+   * 重复调用会被忽略（init received 标志位保护）。
+   *
+   * @param data - init segment 的原始二进制数据（ArrayBuffer）
+   */
   feedInit(data: ArrayBuffer): void {
     if (this._state === 'error') return
     if (this._initReceived) {
@@ -134,24 +177,32 @@ export class MsePlayer {
     }
   }
 
-  /** Feed media segment (moof + mdat boxes). */
+  /**
+   * 喂入 media segment（moof + mdat boxes）。
+   *
+   * 若 init 段未就绪或 SourceBuffer 正在 updating，media 段进入 pending 队列。
+   * pending 超过 {@link _maxPendingSegments}（20 条）时丢弃最旧分段，优先保证直播低延迟。
+   * SourceBuffer 空闲时 append，触发 updateend → _flushPending() 循环，持续消费队列。
+   *
+   * @param data - media segment 的原始二进制数据（ArrayBuffer）
+   */
   feedMedia(data: ArrayBuffer): void {
     if (this._state === 'error') return
 
     const seg = new Uint8Array(data)
     if (!this._initReceived || (this._sourceBuffer && this._sourceBuffer.updating)) {
       this._pendingSegments.push(seg)
-      if (this._pendingSegments.length > 60) {
-        // Too many pending segments, drop oldest
+      if (this._pendingSegments.length > this._maxPendingSegments) {
+        // 保留最新的分段，丢弃最旧的（直播流丢弃旧帧优于堆积）
         this._pendingSegments.shift()
-        this._log('Dropping oldest segment (buffer full)')
+        this._log(`Dropping oldest segment (pending > ${this._maxPendingSegments})`)
       }
       return
     }
 
     if (this._sourceBuffer && !this._sourceBuffer.updating) {
       try {
-        this._sourceBuffer.appendBuffer(seg.buffer as ArrayBuffer)
+        this._sourceBuffer.appendBuffer(seg.buffer.slice(seg.byteOffset, seg.byteOffset + seg.byteLength) as ArrayBuffer)
         this._log(`Media segment appended (${data.byteLength} bytes)`)
         // 持续收到媒体分段说明流正在播放，确保状态为 playing。
         this._markPlaying()
@@ -191,15 +242,27 @@ export class MsePlayer {
     }
   }
 
-  /** 重置 live-edge 对齐标志，允许下次 updateend 重新对齐 currentTime。
-   * 用于全屏切换后恢复小预览播放：player 仍存活但 currentTime 可能落后 buffered 范围，
-   * 重置后新 segment 到达会触发 live-edge 对齐。 */
+  /**
+   * 重置 live-edge 对齐标志，允许下次 updateend 重新对齐 currentTime。
+   *
+   * 用于全屏切换后恢复小预览播放：player 实例仍存活，但 currentTime 可能已落后
+   * 于 buffered 范围；重置后新 segment 到达会触发 live-edge 对齐逻辑。
+   */
   resetLiveEdgeAligned(): void {
     this._liveEdgeAligned = false
   }
 
-  /** 恢复播放（从后台切回前台时主动调用）。
-   *  重置 _tryPlay 重试计数，seek 到 live edge，调用 play()。 */
+  /**
+   * 恢复播放（从后台切回前台时主动调用）。
+   *
+   * 操作：
+   * 1. 若 currentTime 不在 buffered 范围内，seek 到缓冲区内最近的点（bufEnd - 0.5s）。
+   * 2. 重置 live-edge 对齐标志，允许重新对齐。
+   * 3. 调用 _tryPlay() 以延迟重试机制恢复播放。
+   *
+   * @remarks
+   * 仅当状态非 idle/error 时生效；paused 状态不自动恢复（尊重用户主动暂停）。
+   */
   resumePlayback(): void {
     if (this._state === 'error' || this._state === 'idle') return
     if (this._video && this._video.buffered.length > 0) {
@@ -220,14 +283,28 @@ export class MsePlayer {
     return this._video?.currentTime ?? 0
   }
 
-  /** Stop and clean up. */
+  /**
+   * 停止播放并清理所有资源。
+   *
+   * 操作：
+   * 1. 取消待执行的 play() 重试定时器。
+   * 2. 暂停 video，移除 src，调用 load() 释放解码器。
+   * 3. 调用 _cleanup() 结束 MediaSource 流，释放 Object URL。
+   * 4. 清空 pending segments、init received 标志，回到 idle 状态。
+   */
   stop(): void {
+    // 停止卡顿检测
+    this._stopStallDetection()
     // 取消所有待执行的 play 重试
     if (this._playRetryTimer) {
       clearTimeout(this._playRetryTimer)
       this._playRetryTimer = null
     }
     this._setState('idle')
+    // S5: abort SourceBuffer 防止 pending 的 append 阻塞 _cleanup
+    if (this._sourceBuffer) {
+      try { this._sourceBuffer.abort() } catch {}
+    }
     if (this._video) {
       this._video.pause()
       this._video.removeAttribute('src')
@@ -239,6 +316,17 @@ export class MsePlayer {
     this._initSegment = null
   }
 
+  /**
+   * 初始化 MediaSource 并绑定到 video 元素。
+   *
+   * 步骤：
+   * 1. 清理旧 MediaSource/SourceBuffer（_cleanup）。
+   * 2. 创建新 MediaSource，通过 URL.createObjectURL 赋值给 video.src。
+   * 3. 创建 AbortController，统一管理所有 MediaSource 事件监听器，便于 _cleanup 时批量移除。
+   * 4. 监听 sourceopen：MediaSource 就绪后，若有 init segment 则创建 SourceBuffer，
+   *    并 flush 缓冲的 pending segments。
+   * 5. 监听 sourceended / sourceclose 用于日志诊断。
+   */
   private _initMediaSource(): void {
     this._cleanup()
     try {
@@ -251,6 +339,10 @@ export class MsePlayer {
       this._mediaSource.addEventListener('sourceopen', () => {
         if (!this._mediaSource || this._mediaSource.readyState !== 'open') return
 
+        // 通知外部（VideoPreview）MediaSource 已打开，此时 video.src 已绑定到新 MediaSource，
+        // 可以安全地创建 Web Audio 路由（createMediaElementSource）
+        this._onSourceOpen?.()
+
         try {
           if (this._initSegment) {
             this._createSourceBuffer()
@@ -261,6 +353,11 @@ export class MsePlayer {
           this._flushPending()
 
           this._log(`MediaSource opened${this._sourceBuffer ? ', SourceBuffer created' : ''}`)
+
+          // 通知外部：MediaSource 已 open，video.src 已绑定。
+          // VideoPreview 在此回调中创建 Web Audio 路由（createMediaElementSource），
+          // 确保不会因 player.start() 内部的 stop()/load() 断开音频连接。
+          this._onSourceOpen?.()
         } catch (e) {
           this._handleError(`MediaSource init failed: ${e}`)
         }
@@ -279,6 +376,25 @@ export class MsePlayer {
     }
   }
 
+  /**
+   * 刷新 pending 队列中的 segments 到 SourceBuffer。
+   *
+   * 行为：
+   * - 每次只 append 一个 segment，避免 SourceBuffer.updating 溢出。
+   * - append 后若 buffer 仍在 updating，立即退出，等待下一次 updateend 触发继续。
+   *
+   * 缓冲区管理（trim 策略）：
+   * - 当 buffered 总时长超过 310s 时，移除 [bufStart, bufEnd - 300] 区间的旧数据，
+   *   保留最近 5 分钟供用户回看。
+   * - 使用 _isTrimming 标志防止 remove() 触发的 updateend 递归进入 trim 分支，
+   *   避免链式回调导致 SourceBuffer 卡在 updating=true。
+   *
+   * @remarks
+   * 此方法在多个时机被调用：
+   * - sourceopen 事件（MediaSource 就绪）
+   * - SourceBuffer updateend 事件（每次 append 完成）
+   * - feedInit / feedMedia（数据到达时尝试直接 append）
+   */
   private _flushPending(): void {
     if (!this._sourceBuffer || this._sourceBuffer.updating) return
 
@@ -287,41 +403,36 @@ export class MsePlayer {
     // 分支，避免 trim 的 updateend 链式递归导致 SourceBuffer 卡在 updating=true。
     const wasTrimming = this._isTrimming
 
-    while (this._pendingSegments.length > 0) {
+    // 修复：每次只 append 一个 segment，不使用 while 循环。
+    // Chromium 可能在下一个微任务才设置 sourceBuffer.updating=true，
+    // while 循环中多次 append 会触发 InvalidStateError。
+    // 下一个 updateend 事件会继续消费 pending 队列。
+    if (this._pendingSegments.length > 0) {
       const seg = this._pendingSegments.shift()!
       try {
-        this._sourceBuffer.appendBuffer(seg.buffer as ArrayBuffer)
+        this._sourceBuffer.appendBuffer(seg.buffer.slice(seg.byteOffset, seg.byteOffset + seg.byteLength) as ArrayBuffer)
         this._log(`Flushed pending segment (${seg.byteLength} bytes)`)
-        // Only append one per updateend cycle
-        if (this._sourceBuffer.updating) break
       } catch (e) {
         this._handleError(`Pending segment append failed: ${e}`)
-        break
       }
     }
 
-    // Trim SourceBuffer to prevent memory leak (keep last 30s)
-    // 注意：duration=Infinity 时 Infinity > 45 恒为 true，
-    // remove(0, Infinity - 30) 即 remove(0, Infinity) 会抛 InvalidAccessError，
-    // 且 SourceBuffer 可能卡在 updating=true 状态阻止后续 append。
-    // 改为基于 video.buffered 的实际范围计算 trim 窗口。
-    // 仅在非 trim 状态下执行 trim（!wasTrimming），防止 trim 的 updateend 递归。
+    // Trim SourceBuffer to prevent memory leak (keep last 2min for timeline seek-back)
+    // 优化：阈值从 310s 降到 130s，减少单次 trim 数据量和阻塞时间
     if (!wasTrimming && this._sourceBuffer && !this._sourceBuffer.updating && this._video) {
       const buffered = this._video.buffered
       if (buffered.length > 0) {
         const bufStart = buffered.start(0)
         const bufEnd = buffered.end(buffered.length - 1)
         const bufDuration = bufEnd - bufStart
-        if (bufDuration > 45) {
-          const removeEnd = bufEnd - 30
+        if (bufDuration > 130) {
+          const removeEnd = bufEnd - 120
           if (removeEnd > bufStart) {
             try {
-              // 先置位 _isTrimming，remove() 完成触发的 updateend 会据此跳过 trim
               this._isTrimming = true
               this._sourceBuffer.remove(bufStart, removeEnd)
             } catch {
               this._isTrimming = false
-              // Remove may fail if buffer is being updated, ignore
             }
           }
         }
@@ -334,6 +445,20 @@ export class MsePlayer {
     }
   }
 
+  /**
+   * 创建 SourceBuffer 并注册事件监听器。
+   *
+   * 编解码器选择逻辑：
+   * 1. 从 init segment 中解析 avcC box，提取 H.264 profile/level，构造精确 codecs 字符串。
+   * 2. 若检测到 mp4a/esds 则附加 AAC 音频轨道（mp4a.40.2）。
+   * 3. 用 MediaSource.isTypeSupported() 验证浏览器支持；不支持则尝试去掉音频轨的 fallback。
+   *
+   * 注册的事件：
+   * - updateend：append 完成后 flush pending，诊断日志，触发 live-edge 对齐或 _markPlaying。
+   * - error：转发到 _handleError。
+   * - video loadeddata / canplay / playing / seeked：作为 readyState 升级的备用触发器，
+   *   确保 _markPlaying 在解码就绪时被调用。
+   */
   private _createSourceBuffer(): void {
     if (!this._mediaSource || this._mediaSource.readyState !== 'open' || this._sourceBuffer) return
 
@@ -353,6 +478,18 @@ export class MsePlayer {
     if (!selectedMime) {
       this._handleError(`Browser does not support H.264 MSE playback (${mime})`)
       return
+    }
+
+    if (selectedMime === fallback && mime !== fallback) {
+      console.warn('[MsePlayer] Audio codec not supported by browser, falling back to video-only — no audio will be available')
+    }
+
+    if (selectedMime === fallback && mime.includes(',mp4a')) {
+      console.warn('[MsePlayer] Audio codec not supported, falling back to video-only — no audio will be available')
+    }
+
+    if (selectedMime === fallback && mime.includes(',mp4a')) {
+      console.warn('[MsePlayer] Audio codec not supported by browser, falling back to video-only — no audio will be available')
     }
 
     this._sourceBuffer = this._mediaSource.addSourceBuffer(selectedMime)
@@ -444,6 +581,14 @@ export class MsePlayer {
     }
   }
 
+  /**
+   * 清理 MediaSource / SourceBuffer 资源。
+   *
+   * 操作：
+   * 1. 若 MediaSource 仍处于 open，调用 endOfStream() 正常结束流。
+   * 2. 释放 Object URL（URL.revokeObjectURL）。
+   * 3. 将 _sourceBuffer 和 _mediaSource 置 null，等待下次 start() 重新初始化。
+   */
   private _cleanup(): void {
     if (this._sourceBuffer) {
       try {
@@ -459,6 +604,14 @@ export class MsePlayer {
     }
   }
 
+  /**
+   * 切换播放器状态并通知外部回调。
+   *
+   * 状态流转：idle → loading → playing ⇄ paused → error
+   * 切到 playing 时自动触发 _tryPlay() 以延迟重试机制启动 video 播放。
+   *
+   * @param state - 目标状态
+   */
   private _setState(state: MsePlayerState): void {
     if (this._state !== state) {
       this._state = state
@@ -509,7 +662,7 @@ export class MsePlayer {
         } else {
           this._log('play() timeout, max retries reached')
         }
-      }, 500)
+      }, 300)
       this._video.play().then(() => {
         if (settled) return
         settled = true
@@ -538,9 +691,10 @@ export class MsePlayer {
 
   /** 数据成功写入 SourceBuffer 后切到 playing（若当前可播放）。
 
-  仅在 idle/loading 且非 error/paused 时切换，避免覆盖错误或用户主动暂停态。
-  不直接调 _setState('playing') 以免在 paused 时抢回播放控制。
-  */
+   仅在 idle/loading 且非 error/paused 时切换，避免覆盖错误或用户主动暂停态。
+   不直接调 _setState('playing') 以免在 paused 时抢回播放控制。
+   在多个 readyState 升级路径（updateend、loadeddata、canplay、playing、seeked）中被调用。
+   */
   private _markPlaying(): void {
     if (this._state === 'error' || this._state === 'paused') return
     if (this._state !== 'playing') {
@@ -551,6 +705,72 @@ export class MsePlayer {
   private _log(msg: string): void {
     if (this._debug) {
       console.log(`[MsePlayer] ${msg}`)
+    }
+  }
+
+  /**
+   * 卡顿检测：定期检查 currentTime 是否在前进。
+   * 检测间隔 500ms，容忍 1.5 秒停滞（从原来的 1s/3s 缩短）。
+   * 恢复策略：
+   *   a. currentTime 在缓冲区外 → seek 到 bufEnd-0.3
+   *   b. currentTime 在缓冲区内 → 重新 play()
+   *   c. 缓冲区为空 → 等待新数据到达（不盲目 seek）
+   */
+  private _startStallDetection(): void {
+    this._stopStallDetection()
+    this._stallCheckTimer = setInterval(() => {
+      if (this._state !== 'playing') return
+      const ct = this._video?.currentTime ?? 0
+      if (Math.abs(ct - this._lastStallPosition) > 0.1) {
+        // currentTime 在变化，播放正常
+        this._lastStallPosition = ct
+        this._lastStallTime = 0
+        return
+      }
+      // currentTime 停滞
+      if (this._lastStallTime === 0) {
+        this._lastStallTime = Date.now()
+        return
+      }
+      const stallDuration = Date.now() - this._lastStallTime
+      if (stallDuration < 1500) return // 容忍 1.5 秒内的停滞
+
+      // 超过 1.5 秒卡顿，尝试恢复
+      this._log(`Stall detected (${(stallDuration / 1000).toFixed(1)}s), attempting recovery`)
+      this._lastStallTime = 0
+
+      const video = this._video
+      if (!video || video.buffered.length === 0) {
+        // 缓冲区为空，等待新数据到达，不盲目 seek
+        this._log('Stall recovery: buffer empty, waiting for data')
+        return
+      }
+
+      const bufEnd = video.buffered.end(video.buffered.length - 1)
+      const bufStart = video.buffered.start(0)
+
+      // 检查 currentTime 是否在缓冲区范围内
+      if (ct < bufStart || ct > bufEnd - 0.3) {
+        // currentTime 落在缓冲区外，seek 到缓冲区末尾
+        const target = Math.max(bufStart, bufEnd - 0.3)
+        this._log(`Stall recovery: seek ${ct.toFixed(2)} -> ${target.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
+        try {
+          video.currentTime = target
+        } catch {}
+        this._liveEdgeAligned = false
+        this._tryPlay(0)
+      } else {
+        // currentTime 在缓冲区内但卡住了，尝试重新 play
+        this._log(`Stall recovery: re-trigger play() at ${ct.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
+        this._tryPlay(0)
+      }
+    }, 500)
+  }
+
+  private _stopStallDetection(): void {
+    if (this._stallCheckTimer) {
+      clearInterval(this._stallCheckTimer)
+      this._stallCheckTimer = null
     }
   }
 }

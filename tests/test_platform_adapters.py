@@ -349,50 +349,63 @@ def test_bilibili_adapter_parses_live_room_with_public_play_info(monkeypatch):
     from lsc.platforms.bilibili import BILIBILI_HEADERS, BilibiliAdapter
 
     adapter = BilibiliAdapter()
-    responses = iter(
-        [
-            {
-                "code": 0,
-                "data": {
-                    "room_id": 12345,
-                    "live_status": 1,
-                    "title": "B 站直播标题",
-                    "uname": "主播A",
-                },
-            },
-            {
-                "code": 0,
-                "data": {
-                    "playurl_info": {
-                        "playurl": {
-                            "stream": [
+    room_init_payload = {
+        "code": 0,
+        "data": {
+            "room_id": 12345,
+            "live_status": 1,
+            "title": "B 站直播标题",
+            "uname": "主播A",
+        },
+    }
+    play_info_payload = {
+        "code": 0,
+        "data": {
+            "playurl_info": {
+                "playurl": {
+                    "stream": [
+                        {
+                            "format": [
                                 {
-                                    "format": [
+                                    "codec": [
                                         {
-                                            "codec": [
+                                            "accept_qn": [10000, 400, 250],
+                                            "base_url": "/live-bvc/master.m3u8",
+                                            "url_info": [
                                                 {
-                                                    "accept_qn": [10000, 400, 250],
-                                                    "base_url": "/live-bvc/master.m3u8",
-                                                    "url_info": [
-                                                        {
-                                                            "host": "https://cn-gotcha204-2.example.com",
-                                                            "extra": "?qn=10000&token=abc",
-                                                        }
-                                                    ],
+                                                    "host": "https://cn-gotcha204-2.example.com",
+                                                    "extra": "?qn=10000&token=abc",
                                                 }
-                                            ]
+                                            ],
                                         }
                                     ]
                                 }
                             ]
                         }
-                    }
-                },
-            },
-        ]
-    )
+                    ]
+                }
+            }
+        },
+    }
 
-    monkeypatch.setattr(adapter, "_fetch_json", lambda url, params=None: next(responses))
+    def mock_fetch(url, params=None):
+        if "room_init" in url:
+            return room_init_payload
+        elif "getRoomPlayInfo" in url:
+            return play_info_payload
+        elif "getInfoByRoom" in url:
+            return {
+                "code": 0,
+                "data": {
+                    "title": "B 站直播标题",
+                    "uname": "主播A",
+                    "area_v2_name": "无畏契约",
+                    "parent_area_name": "单机游戏",
+                }
+            }
+        return {"code": 0, "data": {}}
+
+    monkeypatch.setattr(adapter, "_fetch_json", mock_fetch)
     # Ensure no cookies so quality selection is deterministic
     monkeypatch.setattr("lsc.platforms.bilibili._get_bilibili_cookies", lambda: {})
 

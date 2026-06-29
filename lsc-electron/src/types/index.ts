@@ -23,10 +23,21 @@ export interface RoomSession {
   mark_out_wallclock?: number | null
   recording_start_mono?: number | null
   preview_latency?: number
+  /** 音频互相关偏移量（秒），表示该房间内容相对于最慢参考房间的时间差。
+   *
+   * 正值含义：该房间的内容比最慢房间快（直播进度领先，需 seek 回退才能与基准同步）；
+   * 负值则相反。
+   *
+   * 导出多房间切片时，该偏移量会被用于补偿各房间录制文件的起始时间，确保
+   * 多轨音画同步。
+   */
+  content_offset?: number
   // Electron 模式预览帧（base64 JPEG 字符串，由后端 FFmpeg 抓帧推送）
   preview_frame_data?: string
   // MSE 预览错误信息（FFmpeg 异常、编解码失败等）
   mse_error?: string
+  // 直播分区分类
+  category?: string
 }
 
 // 切片相关
@@ -39,6 +50,7 @@ export interface ClipSegment {
   room_name?: string
   exported?: boolean
   outputPath?: string
+  job_id?: string
 }
 
 // 流信息
@@ -64,6 +76,7 @@ export interface RecordSettings {
   framerate: string
   audio_codec: string
   audio_bitrate: string
+  preview_quality: string
 }
 
 // 导出预设
@@ -105,6 +118,26 @@ export interface ElectronAPI {
   openPath: (path: string) => Promise<{ success: boolean; error?: string }>
   // 在资源管理器中高亮定位文件（区别于 openPath 会用默认程序打开文件）
   showItemInFolder?: (path: string) => Promise<{ success: boolean; error?: string }>
+  // 应用自动更新接口
+  checkForUpdate: () => Promise<{ success: boolean; error?: string }>
+  downloadUpdate: () => Promise<{ success: boolean; error?: string }>
+  installUpdate: () => void
+  onUpdateStatus: (callback: (status: any) => void) => void
+  removeUpdateStatusListeners: () => void
+}
+
+// 依赖检测状态
+export interface DependencyItem {
+  available: boolean
+  path: string
+  version: string
+}
+
+export interface DependencyStatus {
+  ffmpeg: DependencyItem
+  ffprobe: DependencyItem
+  nvenc: { available: boolean }
+  python: { version: string; path: string }
 }
 
 // 通用应用设置（主题/语言/开机自启/最小化到托盘）

@@ -2,6 +2,37 @@
 
 基于 Python + PySide6 + FFmpeg 的多直播间切片系统，支持多平台直播流录制、实时预览和片段导出。
 
+## 🚀 快速安装 (Windows用户)
+
+### Electron桌面应用版本 (推荐)
+
+**最新安装包**: [LSC 直播切片系统 Setup 1.0.0.exe](lsc-electron/release/LSC%20直播切片系统%20Setup%201.0.0.exe) (84 MB)
+
+1. 下载安装包
+2. 双击运行安装程序
+3. 选择安装目录
+4. 启动应用开始使用
+
+**前置要求**:
+- Windows 10/11 (64位)
+- Python 3.10+ (用于后端服务)
+- FFmpeg (可选,用于视频处理)
+
+**文档**:
+- [快速开始指南](README_BUILD.md)
+- [更新说明](CHANGELOG.md)
+- [测试指南](TESTING_GUIDE.md)
+
+### Python原生版本 (开发者)
+
+```bash
+# 安装依赖
+pip install PySide6 python-mpv
+
+# 运行
+python main.py
+```
+
 ## 产品定位
 
 LSC 是一款**直播录制 + 快速切片工具**，专注于：

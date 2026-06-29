@@ -61,6 +61,8 @@ class DouyuAdapter(BasePlatformAdapter):
         # Extract title and streamer
         title = self._extract_field(html, r'"room_name"\s*:\s*"([^"]*)"')
         streamer = self._extract_field(html, r'"nickname"\s*:\s*"([^"]*)"')
+        category = self._extract_field(html, r'"game_name"\s*:\s*"([^"]*)"') or \
+                   self._extract_field(html, r'"cate_name"\s*:\s*"([^"]*)"') or ""
 
         return self._success(
             clean_url,
@@ -71,6 +73,7 @@ class DouyuAdapter(BasePlatformAdapter):
             quality_urls={"source": stream_url},
             selected_quality="source",
             headers=dict(DOUYU_HEADERS),
+            category=category,
         )
 
     def _extract_stream_url(self, html: str, room_id: str) -> str:

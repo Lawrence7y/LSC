@@ -99,6 +99,69 @@ export function RecordSettings() {
         </Select>
       </div>
 
+      {/* 预览画质 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flexShrink: 0, width: 36 }}>预览画质</span>
+        <Select
+          value={settings.preview_quality}
+          onChange={(v) => update('preview_quality', v)}
+          style={{ flex: 1 }}
+          size="small"
+        >
+          <Option value="原画">原画（不缩放）</Option>
+          <Option value="高清">高清 720p</Option>
+          <Option value="标清">标清 480p</Option>
+          <Option value="流畅">流畅 360p</Option>
+        </Select>
+      </div>
+
+      {/* 录制分辨率 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flexShrink: 0, width: 36 }}>分辨率</span>
+        <Select
+          value={settings.resolution}
+          onChange={(v) => update('resolution', v)}
+          style={{ flex: 1 }}
+          size="small"
+        >
+          <Option value="原画">原画</Option>
+          <Option value="1920:1080">1080p (1920×1080)</Option>
+          <Option value="1280:720">720p (1280×720)</Option>
+          <Option value="854:480">480p (854×480)</Option>
+        </Select>
+      </div>
+
+      {/* 录制帧率 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flexShrink: 0, width: 36 }}>帧率</span>
+        <Select
+          value={settings.framerate}
+          onChange={(v) => update('framerate', v)}
+          style={{ flex: 1 }}
+          size="small"
+        >
+          <Option value="原画">原画</Option>
+          <Option value="60">60 fps</Option>
+          <Option value="30">30 fps</Option>
+          <Option value="24">24 fps</Option>
+        </Select>
+      </div>
+
+      {/* 音频编码 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', flexShrink: 0, width: 36 }}>音频</span>
+        <Select
+          value={settings.audio_bitrate}
+          onChange={(v) => update('audio_bitrate', v)}
+          style={{ flex: 1 }}
+          size="small"
+        >
+          <Option value="128k">AAC 128k</Option>
+          <Option value="192k">AAC 192k</Option>
+          <Option value="256k">AAC 256k</Option>
+        </Select>
+      </div>
+
       {/* 编码参数 */}
       <div style={{ marginBottom: 10 }}>
         <div style={{ display: 'flex', gap: 8, marginBottom: 4 }}>
@@ -116,26 +179,29 @@ export function RecordSettings() {
             </Select>
           </div>
           {settings.param_mode === '码率限制' && settings.encoder !== 'copy' && (
-            <div style={{ flex: 1, display: 'flex', gap: 4 }}>
-              <Select
-                value={settings.bitrate_unit}
-                onChange={(v) => update('bitrate_unit', v)}
-                style={{ width: 80 }}
-                size="small"
-              >
-                <Option value="kbps">kbps</Option>
-                <Option value="Mbps">Mbps</Option>
-              </Select>
-              <Select
-                value={String(settings.bitrate)}
-                onChange={(v) => update('bitrate', v)}
-                style={{ flex: 1 }}
-                size="small"
-              >
-                {[1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000, 20000].map(b => (
-                  <Option key={b} value={String(b)}>{b}</Option>
-                ))}
-              </Select>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 2 }}>码率</div>
+              <div style={{ display: 'flex', gap: 4 }}>
+                <Select
+                  value={settings.bitrate_unit}
+                  onChange={(v) => update('bitrate_unit', v)}
+                  style={{ width: 80 }}
+                  size="small"
+                >
+                  <Option value="kbps">kbps</Option>
+                  <Option value="Mbps">Mbps</Option>
+                </Select>
+                <Select
+                  value={String(settings.bitrate)}
+                  onChange={(v) => update('bitrate', v)}
+                  style={{ flex: 1 }}
+                  size="small"
+                >
+                  {[1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000, 20000].map(b => (
+                    <Option key={b} value={String(b)}>{b}</Option>
+                  ))}
+                </Select>
+              </div>
             </div>
           )}
         </div>

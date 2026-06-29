@@ -11,17 +11,17 @@ let _sharedHandlersRefCount = 0
 let _sharedHandlersCleanup: (() => void) | null = null
 
 // 模块级 MSE init 段缓存：消除 mse_init 早于 VideoPreview 挂载到达的竞态。
-// key = roomId, value = hex-encoded init segment data
+// key = roomId, value = base64-encoded init segment data
 const _mseInitCache: Record<string, string> = {}
 
 // 模块级 MSE media 段缓存：消除 mse_segment 早于 VideoPreview 挂载到达的竞态。
-// key = roomId, value = hex-encoded media segment data 数组（最多 10 个，约 5 秒）。
+// key = roomId, value = base64-encoded media segment data 数组（最多 10 个，约 5 秒）。
 // player 注册时会回放缓存，避免初始几秒丢帧导致黑屏。
 const _mseSegmentCache: Record<string, string[]> = {}
 const _MSE_SEGMENT_CACHE_MAX = 10
 
-function _cacheMseInit(roomId: string, hexData: string): void {
-  _mseInitCache[roomId] = hexData
+function _cacheMseInit(roomId: string, b64Data: string): void {
+  _mseInitCache[roomId] = b64Data
   // 最多缓存 20 个房间的 init 段，避免内存无限增长
   const keys = Object.keys(_mseInitCache)
   if (keys.length > 20) {
@@ -29,12 +29,12 @@ function _cacheMseInit(roomId: string, hexData: string): void {
   }
 }
 
-function _cacheMseSegment(roomId: string, hexData: string): void {
+function _cacheMseSegment(roomId: string, b64Data: string): void {
   if (!_mseSegmentCache[roomId]) {
     _mseSegmentCache[roomId] = []
   }
   const arr = _mseSegmentCache[roomId]
-  arr.push(hexData)
+  arr.push(b64Data)
   // 超出上限丢弃最旧
   while (arr.length > _MSE_SEGMENT_CACHE_MAX) {
     arr.shift()
@@ -55,43 +55,44 @@ function _drainMseSegmentCache(roomId: string): string[] {
  * 这是消除"mse_segment 早于 player 注册到达"竞态的关键路径。
  */
 export function drainPendingMseSegments(roomId: string): ArrayBuffer[] {
-  const hexArr = _drainMseSegmentCache(roomId)
-  return hexArr.map(hex => _decodeHexSegment(hex))
+  const b64Arr = _drainMseSegmentCache(roomId)
+  return b64Arr.map(b64 => _decodeBase64Segment(b64))
 }
 
 /** 获取某房间缓存的 init 段（不解码，返回 ArrayBuffer 或 null）。
  * 供 VideoPreview 创建 player 时优先用缓存 init 段 feedInit，
  * 避免等待 request_mse_init 往返。 */
 export function getMseInitCache(roomId: string): ArrayBuffer | null {
-  const hex = _mseInitCache[roomId]
-  if (!hex) return null
-  return _decodeHexSegment(hex)
+  const b64 = _mseInitCache[roomId]
+  if (!b64) return null
+  return _decodeBase64Segment(b64)
 }
 
-function _decodeHexSegment(hexData: string): ArrayBuffer {
-  const total = hexData.length / 2
-  const bytes = new Uint8Array(total)
-  for (let i = 0, j = 0; i < total; i++, j += 2) {
-    bytes[i] = (parseInt(hexData.charAt(j), 16) << 4) | parseInt(hexData.charAt(j + 1), 16)
+function _decodeBase64Segment(b64Data: string): ArrayBuffer {
+  const binary = atob(b64Data)
+  const len = binary.length
+  const bytes = new Uint8Array(len)
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i)
   }
   return bytes.buffer
 }
 
-function _feedMseSegment(roomId: string, hexData: string, type: 'init' | 'segment'): void {
+function _feedMseSegment(roomId: string, b64Data: string, type: 'init' | 'segment'): void {
   try {
     // 缓存 init 段，供后续 VideoPreview 挂载时直接取用
     if (type === 'init') {
-      _cacheMseInit(roomId, hexData)
+      _cacheMseInit(roomId, b64Data)
     }
 
-    const buffer = _decodeHexSegment(hexData)
+    const buffer = _decodeBase64Segment(b64Data)
     const registry = (window as any).__msePlayers as Record<string, any> | undefined
     const player = registry?.[roomId]
     if (!player) {
       // player 未注册时缓存 media 段，避免初始几秒丢帧。
       // init 段已通过 _cacheMseInit 缓存，此处只处理 media 段。
       if (type === 'segment') {
-        _cacheMseSegment(roomId, hexData)
+        _cacheMseSegment(roomId, b64Data)
       }
       return
     }
@@ -125,6 +126,19 @@ function _attachSharedWebSocketHandlers(): () => void {
   const unsubConnected = wsClient.on('connected', () => {
     useAppStore.getState().setConnectionStatus('connected')
     wsClient.send('get_disk_usage', {})
+    wsClient.send('get_settings', {})
+    // S1: WS 重连后自动恢复所有预览。重连成功后，对 store 中 preview_enabled=true
+    // 的房间重新发送 enable_preview(mse)，确保后端 MseStreamer 重建（旧进程可能已随
+    // 断连终止）。使用 setTimeout 避免阻塞 get_settings 的处理。
+    setTimeout(() => {
+      const rooms = useAppStore.getState().rooms
+      for (const room of rooms) {
+        if (room.preview_enabled && room.is_connected) {
+          console.log(`[WS] Reconnecting preview for room ${room.room_id} after WS reconnect`)
+          wsClient.send('enable_preview', { room_id: room.room_id, enabled: true, mode: 'mse' })
+        }
+      }
+    }, 500)
   })
   const unsubDisconnected = wsClient.on('disconnected', () => {
     useAppStore.getState().setConnectionStatus('disconnected')
@@ -163,14 +177,25 @@ function _attachSharedWebSocketHandlers(): () => void {
 
   const handleSettings = (data: any) => {
     if (data) {
-      useAppStore.getState().setSettings(data)
+      const { appSettings: savedAppSettings, ...recordSettings } = data
+      useAppStore.getState().setSettings(recordSettings)
+      if (savedAppSettings && typeof savedAppSettings === 'object') {
+        useAppStore.getState().setAppSettings(savedAppSettings)
+        if (savedAppSettings.theme) {
+          if (savedAppSettings.theme === 'dark') {
+            document.documentElement.classList.add('dark')
+          } else {
+            document.documentElement.classList.remove('dark')
+          }
+        }
+      }
     }
   }
   const unsubSettingsLoaded = wsClient.on('settings_loaded', handleSettings)
   const unsubSettingsResponse = wsClient.on('get_settings_response', handleSettings)
 
   // 用白名单校验 connection_status，避免任意值污染状态
-  const validStatus = ['connected', 'connecting', 'disconnected']
+  const validStatus = ['connected', 'connecting', 'disconnected', 'reconnect_failed']
   const unsubConnectionStatus = wsClient.on('connection_status', (data: { status: unknown }) => {
     if (data && typeof data.status === 'string' && validStatus.includes(data.status)) {
       useAppStore.getState().setConnectionStatus(data.status as ConnectionStatus)
@@ -182,10 +207,10 @@ function _attachSharedWebSocketHandlers(): () => void {
     useAppStore.getState().setConnectionStatus('connecting')
   })
 
-  // 重连次数耗尽：更新为 disconnected，UI 可据此提示用户重启应用
+  // 重连次数耗尽：更新为 reconnect_failed，UI 可据此提示用户手动重连
   const unsubReconnectFailed = wsClient.on('reconnect_failed', () => {
     console.error('WebSocket reconnect failed: max attempts reached, backend may be unavailable')
-    useAppStore.getState().setConnectionStatus('disconnected')
+    useAppStore.getState().setConnectionStatus('reconnect_failed')
   })
 
   const handleDiskUsage = (data: any) => {
@@ -195,6 +220,12 @@ function _attachSharedWebSocketHandlers(): () => void {
   }
   const unsubDiskUsage = wsClient.on('disk_usage', handleDiskUsage)
   const unsubDiskUsageResponse = wsClient.on('get_disk_usage_response', handleDiskUsage)
+
+  const unsubDepStatus = wsClient.on('check_dependencies_response', (data: any) => {
+    if (data && data.dependencies) {
+      useAppStore.getState().setDependencyStatus(data.dependencies)
+    }
+  })
 
   const unsubMseInit = wsClient.on('mse_init', (data: { room_id: string; data: string }) => {
     if (data?.room_id && data?.data) {
@@ -244,13 +275,13 @@ function _attachSharedWebSocketHandlers(): () => void {
       const roomId = data.room_id
 
       // 后端尚未就绪，但前端可能已通过 mse_init 广播收到了 init 段
-      const cachedHex = _mseInitCache[roomId]
-      if (cachedHex) {
+      const cachedB64 = _mseInitCache[roomId]
+      if (cachedB64) {
         try {
           const registry = (window as any).__msePlayers as Record<string, any> | undefined
           const player = registry?.[roomId]
           if (player) {
-            player.feedInit(_decodeHexSegment(cachedHex))
+            player.feedInit(_decodeBase64Segment(cachedB64))
             console.log(`MSE init delivered from frontend cache for ${roomId}`)
             return
           }
@@ -291,6 +322,7 @@ function _attachSharedWebSocketHandlers(): () => void {
     unsubReconnectFailed()
     unsubDiskUsage()
     unsubDiskUsageResponse()
+    unsubDepStatus()
     unsubMseInit()
     unsubMseSegment()
     unsubMseError()
@@ -325,5 +357,9 @@ export function useWebSocket() {
     return wsClient.on(event, handler)
   }, [])
 
-  return { isConnected: connectionStatus === 'connected', send, on }
+  const reconnect = useCallback(() => {
+    wsClient.reconnect()
+  }, [])
+
+  return { isConnected: connectionStatus === 'connected', connectionStatus, send, on, reconnect }
 }

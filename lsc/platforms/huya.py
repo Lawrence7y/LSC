@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .base import (
+    DEFAULT_USER_AGENT,
     ERROR_OFFLINE,
     ERROR_PARSE_FAILED,
     ERROR_RESTRICTED,
@@ -18,7 +19,7 @@ from .base import (
 
 HUYA_HEADERS = {
     "Referer": "https://www.huya.com/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": DEFAULT_USER_AGENT,
 }
 _ROOM_PATH_RE = re.compile(r"^/[^/?#]+/?$")
 
@@ -45,6 +46,54 @@ class HuyaAdapter(BasePlatformAdapter):
         profile_info = data.get("profileInfo")
         profile_info = profile_info if isinstance(profile_info, dict) else {}
 
+        # 多级回退：当 roomInfo/profileInfo 字段缺失时从 HTML <title> 和 stream 数据补全
+        title = str(room_info.get("sIntroduction") or "")
+        streamer = str(profile_info.get("nick") or "")
+        category = ""
+        # 尝试从 stream 数据的 gameLiveInfo 补全
+        stream_data = data.get("stream")
+        stream_data = stream_data if isinstance(stream_data, dict) else {}
+        for item in stream_data.get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            gli = item.get("gameLiveInfo") or {}
+            if not isinstance(gli, dict):
+                continue
+            if not title:
+                title = str(gli.get("roomName") or gli.get("sRoomName") or gli.get("introduction") or "")
+            if not streamer:
+                streamer = str(gli.get("nick") or gli.get("sNick") or gli.get("ownerNick") or "")
+            category = str(gli.get("gameFullName") or gli.get("sGameFullName") or "")
+            break
+        if not title or not streamer:
+            # 最终回退：从 HTML <title> 标签提取（虎牙格式通常为 "主播名 - 房间标题"）
+            try:
+                title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+                if title_match:
+                    page_title = title_match.group(1).strip()
+                    # 虎牙页面标题格式: "主播名 - 房间标题-虎牙直播" 或 "主播名 房间标题 虎牙直播"
+                    if "-虎牙直播" in page_title:
+                        page_title = page_title.replace("-虎牙直播", "").strip()
+                    if " - " in page_title and not streamer:
+                        parts = page_title.rsplit(" - ", 1)
+                        if len(parts) == 2:
+                            streamer = streamer or parts[0].strip()
+                            title = title or parts[1].strip()
+                    elif " " in page_title and not streamer:
+                        parts = page_title.rsplit(" ", 1)
+                        if len(parts) == 2:
+                            streamer = streamer or parts[0].strip()
+                            title = title or parts[1].strip()
+                    else:
+                        title = title or page_title
+            except Exception:
+                pass
+        # 覆盖回 room_info/profile_info 以便后续使用
+        if title:
+            room_info["sIntroduction"] = title
+        if streamer:
+            profile_info["nick"] = streamer
+
         if int(room_info.get("tLiveStatus") or 0) != 1:
             return self._failed(clean_url, "虎牙直播间未开播", ERROR_OFFLINE, raw=data)
 
@@ -61,6 +110,7 @@ class HuyaAdapter(BasePlatformAdapter):
             quality_urls=quality_urls,
             selected_quality="source",
             headers=dict(HUYA_HEADERS),
+            category=category,
             raw={},  # discard large HTML/JSON payload on success to save memory
         )
 

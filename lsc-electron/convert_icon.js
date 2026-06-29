@@ -3,33 +3,53 @@ const ico = require('sharp-ico');
 const fs = require('fs');
 const path = require('path');
 
-// 源图片路径 (用户提供的图片)
-const inputPath = 'C:\\Users\\Administrator\\AppData\\Roaming\\QoderCN\\SharedClientCache\\cache\\images\\task-10c\\cd2a0eea-d9f3-4dcd-a0b6-a9340ec5893a-9e7d88c9.jpg';
-// 目标 .ico 路径
-const outputPath = path.join(__dirname, 'assets', 'icon.ico');
-// 目标 PNG 路径 (用于 React 侧边栏)
-const outputPngPath = path.join(__dirname, 'assets', 'logo.png');
+// Input and output paths
+const inputPng = path.join(__dirname, '..', 'extracted_icon.png');
+const outputIco = path.join(__dirname, 'assets', 'icon.ico');
+const outputPng = path.join(__dirname, 'assets', 'logo.png');
 
-async function convert() {
+console.log('Reading icon:', inputPng);
+
+// Read the PNG image
+const pngBuffer = fs.readFileSync(inputPng);
+
+// Define sizes for ICO (including 256x256)
+const sizes = [16, 32, 48, 64, 128, 256];
+
+async function createIcon() {
     try {
-        // 读取并转换图片为 PNG buffer
-        const pngBuffer = await sharp(inputPath)
-            .resize(256, 256)
-            .png()
-            .toBuffer();
-
-        // 保存 PNG 用于 React 侧边栏
-        fs.writeFileSync(outputPngPath, pngBuffer);
-        console.log('PNG logo generated at:', outputPngPath);
-
-        // 转换为 ICO 格式 (包含多种尺寸以兼容 Windows 托盘和窗口图标)
-        const icoBuffer = await ico.encode([pngBuffer]);
-        fs.writeFileSync(outputPath, icoBuffer);
-        console.log('ICO icon generated at:', outputPath);
+        // Create resized images for each size
+        const buffers = [];
         
+        for (const size of sizes) {
+            const resized = await sharp(pngBuffer)
+                .resize(size, size, {
+                    fit: 'contain',
+                    background: { r: 0, g: 0, b: 0, alpha: 0 }
+                })
+                .png()
+                .toBuffer();
+            
+            buffers.push(resized);
+            console.log(`  Added size: ${size}x${size}`);
+        }
+        
+        // Convert to ICO format using sharp-ico
+        const icoBuffer = await ico.encode(buffers);
+        
+        // Save ICO file
+        fs.writeFileSync(outputIco, icoBuffer);
+        console.log('\nGenerated ICO file:', outputIco);
+        
+        // Also save PNG version
+        fs.copyFileSync(inputPng, outputPng);
+        console.log('Generated PNG file:', outputPng);
+        
+        console.log('\nDone!');
     } catch (error) {
-        console.error('Error converting icon:', error);
+        console.error('Error creating icon:', error);
+        process.exit(1);
     }
 }
 
-convert();
+createIcon();

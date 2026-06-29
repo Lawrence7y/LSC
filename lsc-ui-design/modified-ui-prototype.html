@@ -1,0 +1,1406 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSC - 修改后 UI 原型</title>
+<style>
+/* ===== DESIGN TOKENS (from tokens.css) ===== */
+:root {
+  --brand-50: #e8f2ff; --brand-100: #cfe5ff; --brand-200: #9fcbff;
+  --brand-300: #66abff; --brand-400: #2e8dff; --brand-500: #007aff;
+  --brand-600: #0064d6; --brand-700: #004fad; --brand-800: #003b82; --brand-900: #00275a;
+  --background-50: #ffffff; --background-100: #f7f7fa; --background-200: #f2f2f7;
+  --background-300: #e5e5ea; --background-400: #d1d1d6; --background-500: #aeaeb2;
+  --background-600: #8e8e93; --background-700: #3a3a3c; --background-800: #1c1c1e; --background-900: #000000;
+  --text-50: #f5f5f7; --text-100: #e3e3e8; --text-200: #c7c7cc; --text-300: #aeaeb2;
+  --text-400: #8e8e93; --text-500: #6e6e73; --text-600: #48484a; --text-700: #3c3c43;
+  --state-success: #34c759; --state-error: #ff3b30; --state-warning: #ff9500;
+  --border-default: rgba(255,255,255,0.08);
+  --bg-primary: var(--background-900); --bg-secondary: var(--background-800); --bg-tertiary: var(--background-700);
+  --text-primary: var(--text-50); --text-secondary: var(--text-200); --text-tertiary: var(--text-400);
+  --accent-primary: var(--brand-500); --accent-primary-dim: var(--brand-400);
+  --shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.36);
+  --shadow-md: 0 4px 8px -2px rgba(0,0,0,0.44);
+  --shadow-lg: 0 8px 24px -8px rgba(0,0,0,0.50);
+  --font-sans: 'SF Pro Display','PingFang SC',system-ui,-apple-system,sans-serif;
+  --font-mono: 'SF Mono','JetBrains Mono','Menlo',monospace;
+  --radius: 14px; --radius-sm: 10px; --radius-md: 8px; --radius-lg: 18px;
+}
+:root:not(.dark), html:not(.dark) {
+  --background-700: #f0f1f4; --background-800: #ffffff; --background-900: #f5f6f8;
+  --text-50: #1a1d23; --text-100: #3c3c43; --text-200: #4a5160; --text-300: #6b7280; --text-400: #8e8e93;
+  --border-default: rgba(0,0,0,0.08);
+  --bg-primary: #f5f6f8; --bg-secondary: #ffffff; --bg-tertiary: #f0f1f4;
+  --text-primary: #1a1d23; --text-secondary: #4a5160; --text-tertiary: #6b7280;
+  --shadow-sm: 0 1px 2px 0 rgba(0,0,0,0.06);
+  --shadow-md: 0 2px 6px rgba(0,0,0,0.08);
+  --shadow-lg: 0 6px 16px rgba(0,0,0,0.10);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: var(--font-sans); background: var(--bg-primary); color: var(--text-50);
+  transition: background-color .3s ease, color .3s ease; overflow: hidden; height: 100vh;
+}
+.theme-transition * { transition: background-color .3s ease, color .3s ease, border-color .3s ease, box-shadow .3s ease !important; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--text-400); border-radius: 3px; opacity: 0.5; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ===== LAYOUT ===== */
+.app-layout { display: flex; height: 100vh; overflow: hidden; }
+
+/* ===== SIDEBAR (问题7: 连接状态+重连移到此处, 问题8: 主题切换在底部居中) ===== */
+.sidebar {
+  width: 200px; background: var(--bg-secondary); border-right: 1px solid var(--border-default);
+  height: 100vh; display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0;
+}
+.sidebar-logo {
+  display: flex; align-items: center; gap: 10px; padding: 20px 16px 24px;
+  border-bottom: 1px solid var(--border-default);
+}
+.sidebar-logo .logo-icon {
+  width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(135deg, var(--brand-400), var(--brand-600));
+  display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px; color: #fff; flex-shrink: 0;
+}
+.sidebar-logo .logo-title { font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--text-50); line-height: 1; }
+.sidebar-logo .logo-sub { font-size: 10px; font-weight: 400; color: var(--text-400); margin-top: 2px; letter-spacing: 0.01em; }
+
+.sidebar-nav { flex: 1; padding: 12px 0; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px; padding: 10px 16px; cursor: pointer;
+  font-size: 14px; color: var(--text-200); transition: all .15s ease; border-left: 3px solid transparent;
+}
+.nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text-50); }
+.nav-item.active { color: var(--accent-primary); border-left-color: var(--accent-primary); background: rgba(0,122,255,0.08); }
+.nav-item svg { width: 18px; height: 18px; flex-shrink: 0; }
+
+/* 问题7+8: Footer - 连接状态(4种状态) + 重连按钮 + 主题切换(底部居中) */
+.sidebar-footer {
+  padding: 10px 12px 14px; border-top: 1px solid var(--border-default);
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.conn-status-container {
+  display: flex; flex-direction: column; align-items: center; gap: 6px; width: 100%;
+}
+.conn-status-row {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); border: 1px solid var(--border-default);
+  width: 100%;
+}
+.conn-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  box-shadow: 0 0 8px currentColor;
+}
+.conn-dot.connected { background: var(--state-success); color: var(--state-success); }
+.conn-dot.connecting { background: var(--state-warning); color: var(--state-warning); animation: pulse 1.5s infinite; }
+.conn-dot.disconnected { background: var(--state-error); color: var(--state-error); }
+.conn-dot.reconnect_failed { background: var(--state-error); color: var(--state-error); }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.conn-label { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.reconnect-btn {
+  display: none; align-items: center; justify-content: center; gap: 4px;
+  padding: 4px 12px; border-radius: 6px; background: var(--state-error); color: #fff;
+  border: none; cursor: pointer; font-size: 12px; font-weight: 500; transition: opacity .15s;
+}
+.reconnect-btn.show { display: flex; }
+.reconnect-btn:hover { opacity: 0.85; }
+.reconnect-btn svg { width: 14px; height: 14px; }
+
+/* 问题8: 主题切换按钮在底部居中 */
+.theme-toggle {
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  padding: 6px 16px; border-radius: 8px; background: transparent; border: 1px solid var(--border-default);
+  cursor: pointer; font-size: 12px; color: var(--text-50); transition: all .15s;
+  margin-top: 4px;
+}
+.theme-toggle:hover { background: var(--bg-tertiary); }
+.theme-toggle svg { width: 16px; height: 16px; }
+
+/* ===== MAIN AREA (问题7: 删除了顶部标题和右侧连接状态指示) ===== */
+.main-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* 不再有 Header — 问题7要求删除顶部标题"多房间管理"和右侧连接状态指示 */
+/* 仅保留断连时的 Banner */
+.conn-banner {
+  display: none; height: 36px; background: var(--state-error); color: #fff;
+  align-items: center; justify-content: center; gap: 8px; font-size: 13px; flex-shrink: 0;
+}
+.conn-banner.show { display: flex; }
+.conn-banner button { background: transparent; border: none; color: #fff; cursor: pointer; font-size: 12px; opacity: 0.8; }
+
+.content-area { flex: 1; overflow: auto; background: var(--bg-primary); }
+
+/* ===== WORKBENCH ===== */
+.workbench { display: flex; height: 100%; }
+.wb-left { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.wb-right { width: 340px; border-left: 1px solid var(--border-default); overflow-y: auto; background: var(--bg-primary); flex-shrink: 0; }
+
+/* 顶部操作栏 */
+.wb-toolbar {
+  padding: 12px 20px; background: var(--bg-secondary); border-bottom: 1px solid var(--border-default);
+  display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-shrink: 0;
+}
+.wb-toolbar-left { display: flex; align-items: center; gap: 12px; }
+.wb-toolbar h2 { margin: 0; font-size: 16px; font-weight: 600; color: var(--text-50); }
+.wb-toolbar .room-count { color: var(--text-400); font-size: 13px; }
+.toolbar-select {
+  padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border-default);
+  background: var(--bg-tertiary); color: var(--text-200); font-size: 12px; cursor: pointer; outline: none;
+}
+.toolbar-btn {
+  padding: 4px 12px; border-radius: 6px; border: 1px solid var(--border-default);
+  background: var(--bg-tertiary); color: var(--text-200); font-size: 12px; cursor: pointer; transition: all .15s;
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.toolbar-btn:hover { background: var(--bg-secondary); color: var(--text-50); }
+.toolbar-btn.primary { background: var(--accent-primary); color: #fff; border-color: var(--accent-primary); }
+.toolbar-btn.primary:hover { background: var(--brand-600); }
+.toolbar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.toolbar-btn svg { width: 14px; height: 14px; }
+
+/* 房间卡片网格 */
+.room-grid {
+  flex: 1; overflow: auto; padding: 16px 20px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; align-content: start;
+}
+.room-card {
+  background: var(--bg-secondary); border: 1px solid transparent; border-radius: var(--radius-sm);
+  overflow: hidden; cursor: pointer; transition: all .15s ease; position: relative;
+}
+.room-card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.room-card.selected {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px rgba(0,122,255,0.12), 0 0 16px rgba(0,122,255,0.22);
+}
+/* 问题2: 多选时也用蓝色边框，不再用橙色"已同步" */
+.room-card.multi-selected {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 2px rgba(0,122,255,0.15), 0 0 12px rgba(0,122,255,0.12);
+}
+
+/* 问题1: Checkbox 修复后可正常取消勾选 */
+.room-checkbox {
+  position: absolute; top: 8px; left: 8px; z-index: 5;
+  width: 22px; height: 22px; border-radius: 6px;
+  border: 2px solid rgba(255,255,255,0.45); background: rgba(0,0,0,0.45);
+  backdrop-filter: blur(8px); cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: all .15s ease; color: #fff; font-size: 13px; font-weight: 700; line-height: 1; user-select: none;
+}
+.room-checkbox.checked {
+  border-color: var(--accent-primary); background: var(--accent-primary);
+}
+
+/* 预览区域 */
+.room-preview {
+  width: 100%; height: 180px; background: #0a0a0a; border-radius: 8px; margin-bottom: 10px;
+  display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden;
+}
+.room-preview .placeholder { color: var(--text-400); font-size: 24px; }
+.room-preview .preview-video {
+  width: 100%; height: 100%; object-fit: contain; background: #000;
+}
+
+/* 预览覆盖控制条 */
+.preview-overlay {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 8px; background: linear-gradient(transparent, rgba(0,0,0,0.7)); z-index: 3;
+}
+.preview-quality-select {
+  padding: 2px 6px; border-radius: 4px; border: none; background: rgba(0,0,0,0.5);
+  color: #fff; font-size: 11px; cursor: pointer; backdrop-filter: blur(8px); outline: none;
+}
+.preview-quality-select.applying { opacity: 0.6; pointer-events: none; }
+.preview-controls { display: flex; gap: 4px; }
+.preview-btn {
+  width: 28px; height: 28px; border-radius: 6px; border: none; background: rgba(0,0,0,0.5);
+  color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  backdrop-filter: blur(8px); transition: all .15s;
+}
+.preview-btn:hover { background: rgba(0,122,255,0.5); }
+.preview-btn svg { width: 16px; height: 16px; }
+.preview-btn.muted { color: var(--state-error); }
+
+/* 状态 badge */
+.room-status-badge {
+  position: absolute; top: 8px; left: 38px; display: flex; align-items: center; gap: 6px; z-index: 4;
+}
+.status-pill {
+  display: flex; align-items: center; gap: 5px; background: rgba(0,0,0,0.65);
+  backdrop-filter: blur(8px); padding: 3px 8px; border-radius: 6px;
+}
+.status-dot { width: 7px; height: 7px; border-radius: 50%; }
+.status-dot.recording { background: var(--state-error); box-shadow: 0 0 8px var(--state-error); animation: pulse 1.5s infinite; }
+.status-dot.live { background: var(--state-success); }
+.status-dot.connecting { background: var(--state-warning); }
+.status-dot.error { background: var(--state-error); }
+.status-text { font-size: 11px; color: #fff; font-weight: 500; }
+
+/* 问题2: "已选中"标签(蓝色) 替代 "已同步"(橙色) */
+.selected-badge {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px; border-radius: 4px;
+  font-size: 9px; font-weight: 600; background: rgba(0,122,255,0.15); color: var(--brand-300);
+  border: 1px solid rgba(0,122,255,0.3); flex-shrink: 0;
+}
+.selected-badge .dot { display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: var(--accent-primary); }
+
+/* 房间信息 */
+.room-info { padding: 0 12px 12px; }
+.room-title-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; gap: 6px; }
+.room-title { font-size: 13px; font-weight: 600; color: var(--text-50); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.room-platform { font-size: 11px; color: var(--text-400); flex-shrink: 0; }
+.room-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-400); }
+.room-meta .time { font-family: var(--font-mono); }
+
+/* ===== CONTROL BAR + TIMELINE (问题2: 多选时时间线正常工作) ===== */
+.control-bar {
+  padding: 8px 16px; background: var(--bg-secondary); border-top: 1px solid var(--border-default);
+  display: flex; flex-direction: column; gap: 6px; flex-shrink: 0;
+}
+.cb-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.cb-controls { display: flex; align-items: center; gap: 4px; }
+.cb-btn {
+  width: 32px; height: 32px; border-radius: 8px; border: none; background: transparent;
+  color: var(--text-200); cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: all .15s;
+}
+.cb-btn:hover { background: var(--bg-tertiary); color: var(--text-50); }
+.cb-btn svg { width: 18px; height: 18px; }
+.cb-btn.primary { background: var(--accent-primary); color: #fff; }
+.cb-btn.primary:hover { background: var(--brand-600); }
+.cb-time { font-family: var(--font-mono); font-size: 13px; color: var(--text-200); display: flex; gap: 2px; align-items: center; }
+.cb-time .sep { color: var(--text-400); }
+
+/* 多选指示器 — 问题2: 改为"已选中"而非"已同步" */
+.multi-select-indicator {
+  display: none; align-items: center; gap: 8px; padding: 4px 12px;
+  background: rgba(0,122,255,0.08); border-radius: 6px; font-size: 12px;
+  color: var(--brand-300); font-weight: 500;
+}
+.multi-select-indicator.show { display: flex; }
+.multi-select-indicator .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-primary); }
+
+/* Timeline */
+.timeline-container {
+  position: relative; height: 44px; background: var(--bg-tertiary); border-radius: 6px;
+  overflow: hidden; cursor: pointer; user-select: none;
+}
+.timeline-ruler {
+  position: absolute; top: 0; left: 0; right: 0; height: 100%;
+  background-image: repeating-linear-gradient(90deg, transparent, transparent 59px, rgba(255,255,255,0.06) 59px, rgba(255,255,255,0.06) 60px);
+}
+.timeline-tick-label {
+  position: absolute; top: 2px; font-size: 9px; color: var(--text-400); font-family: var(--font-mono);
+  transform: translateX(-50%);
+}
+.timeline-buffered {
+  position: absolute; top: 0; left: 0; height: 100%;
+  background: rgba(0,122,255,0.1); pointer-events: none;
+}
+.timeline-progress {
+  position: absolute; top: 0; left: 0; height: 3px; background: var(--accent-primary);
+  pointer-events: none; border-radius: 0 2px 2px 0;
+}
+.timeline-playhead {
+  position: absolute; top: 0; width: 2px; height: 100%; background: var(--accent-primary);
+  pointer-events: none; z-index: 3; box-shadow: 0 0 4px var(--accent-primary);
+}
+.timeline-playhead::after {
+  content: ''; position: absolute; top: -2px; left: -4px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--accent-primary); border: 2px solid var(--bg-secondary);
+}
+.timeline-mark-in {
+  position: absolute; top: 0; width: 2px; height: 100%; background: var(--state-success);
+  pointer-events: none; z-index: 2;
+}
+.timeline-mark-in::after {
+  content: '入'; position: absolute; top: -1px; left: 3px; font-size: 8px; color: var(--state-success); font-weight: 700;
+}
+.timeline-mark-out {
+  position: absolute; top: 0; width: 2px; height: 100%; background: var(--state-error);
+  pointer-events: none; z-index: 2;
+}
+.timeline-mark-out::after {
+  content: '出'; position: absolute; top: -1px; left: 3px; font-size: 8px; color: var(--state-error); font-weight: 700;
+}
+.timeline-clip {
+  position: absolute; top: 20px; height: 16px; border-radius: 3px;
+  background: rgba(0,122,255,0.25); border: 1px solid var(--accent-primary); pointer-events: none;
+  display: flex; align-items: center; justify-content: center; font-size: 8px; color: var(--brand-200);
+}
+.timeline-labels { display: flex; justify-content: space-between; padding: 0 2px; }
+.timeline-labels span { font-size: 9px; color: var(--text-400); font-family: var(--font-mono); }
+
+/* ===== RIGHT PANEL ===== */
+.right-panel-section {
+  margin: 8px 12px; background: var(--bg-secondary); border-radius: var(--radius-sm); overflow: hidden;
+}
+.right-panel-header {
+  padding: 10px 12px; border-bottom: 1px solid var(--border-default);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.right-panel-header h3 { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-50); }
+.right-panel-body { padding: 10px 12px; }
+
+/* 问题6: 统一录制设置 */
+.record-setting-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.record-setting-row .label { font-size: 12px; color: var(--text-tertiary); flex-shrink: 0; width: 56px; }
+.record-setting-row .value { flex: 1; }
+.record-select {
+  width: 100%; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border-default);
+  background: var(--bg-tertiary); color: var(--text-200); font-size: 12px; cursor: pointer; outline: none;
+}
+.record-input {
+  width: 100%; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border-default);
+  background: var(--bg-tertiary); color: var(--text-200); font-size: 12px; outline: none;
+}
+.crf-slider {
+  width: 100%; -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px;
+  background: var(--bg-tertiary); outline: none; margin: 4px 0;
+}
+.crf-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--accent-primary); cursor: pointer; border: 2px solid var(--bg-secondary);
+}
+.crf-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-tertiary); }
+.crf-value { font-weight: 600; color: var(--brand-300); }
+
+/* ===== EXPANDED / FULLSCREEN (问题5: 单一放大按钮, 复用实例) ===== */
+.expanded-overlay {
+  display: none; position: absolute; inset: 0; z-index: 100; background: #000;
+  flex-direction: column;
+}
+.expanded-overlay.show { display: flex; }
+.expanded-video-container { flex: 1; position: relative; overflow: hidden; }
+.expanded-video-container video { width: 100%; height: 100%; object-fit: contain; }
+.expanded-controls {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 16px; background: linear-gradient(transparent, rgba(0,0,0,0.8));
+}
+/* 问题5: 只有退出放大按钮, 删除了右上角的全屏按钮, 全屏由 video 原生 controls 提供 */
+.exit-expand-btn {
+  position: absolute; top: 12px; right: 12px; z-index: 10;
+  padding: 6px 12px; border-radius: 8px; border: none; background: rgba(0,0,0,0.6);
+  color: #fff; cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 4px;
+  backdrop-filter: blur(8px); transition: all .15s;
+}
+.exit-expand-btn:hover { background: rgba(255,59,48,0.8); }
+.exit-expand-btn svg { width: 16px; height: 16px; }
+
+/* ===== ADD ROOM MODAL ===== */
+.modal-overlay {
+  display: none; position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,0.6);
+  align-items: center; justify-content: center; backdrop-filter: blur(4px);
+}
+.modal-overlay.show { display: flex; }
+.modal {
+  background: var(--bg-secondary); border-radius: var(--radius); padding: 24px;
+  width: 480px; max-width: 90vw; box-shadow: var(--shadow-lg);
+}
+.modal h3 { margin: 0 0 16px; font-size: 18px; font-weight: 600; color: var(--text-50); }
+.modal-input {
+  width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border-default);
+  background: var(--bg-tertiary); color: var(--text-50); font-size: 14px; outline: none; margin-bottom: 12px;
+}
+.modal-input:focus { border-color: var(--accent-primary); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+/* ===== UTILS ===== */
+.hidden { display: none !important; }
+.fade-in { animation: fadeIn .2s ease; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* Toast */
+.toast {
+  position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 9999;
+  padding: 8px 20px; border-radius: 8px; background: var(--bg-700); color: var(--text-50);
+  font-size: 14px; box-shadow: var(--shadow-lg); opacity: 0; transition: opacity .2s;
+  pointer-events: none;
+}
+.toast.show { opacity: 1; }
+:root.dark .toast { background: var(--background-700); }
+:root:not(.dark) .toast, html:not(.dark) .toast { background: #333; }
+
+/* 全屏 video 原生 controls 样式 */
+video::-webkit-media-controls-panel { z-index: 2147483647; }
+</style>
+</head>
+<body>
+<div class="app-layout">
+  <!-- ===== SIDEBAR ===== -->
+  <aside class="sidebar">
+    <!-- Logo -->
+    <div class="sidebar-logo">
+      <div class="logo-icon">LSC</div>
+      <div>
+        <div class="logo-title">LSC</div>
+        <div class="logo-sub">Live Stream Clipper</div>
+      </div>
+    </div>
+
+    <!-- Navigation -->
+    <nav class="sidebar-nav">
+      <div class="nav-item active" onclick="switchPage('workbench')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        多房间工作台
+      </div>
+      <div class="nav-item" onclick="switchPage('settings')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        设置
+      </div>
+    </nav>
+
+    <!-- 问题7+8: Footer — 连接状态(4种) + 重连按钮 + 主题切换(底部居中) -->
+    <div class="sidebar-footer">
+      <div class="conn-status-container">
+        <div class="conn-status-row" id="connStatusRow">
+          <div class="conn-dot connected" id="connDot"></div>
+          <span class="conn-label" id="connLabel">已连接</span>
+        </div>
+        <!-- 重连按钮: 仅在 disconnected / reconnect_failed 时显示 -->
+        <button class="reconnect-btn" id="reconnectBtn" onclick="doReconnect()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          重新连接
+        </button>
+      </div>
+      <!-- 问题8: 主题切换按钮在底部居中 -->
+      <button class="theme-toggle" onclick="toggleTheme()" id="themeToggleBtn">
+        <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+        <span id="themeLabel">浅色</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ===== MAIN AREA (问题7: 无 Header 标题和连接状态指示) ===== -->
+  <main class="main-area">
+    <!-- 断连 Banner -->
+    <div class="conn-banner" id="connBanner">
+      <span>⚠️ 无法连接到后端服务，正在尝试重连...</span>
+      <button onclick="document.getElementById('connBanner').classList.remove('show')">隐藏</button>
+    </div>
+
+    <div class="content-area" id="contentArea">
+      <!-- ===== WORKBENCH PAGE ===== -->
+      <div class="workbench" id="workbenchPage">
+        <div class="wb-left">
+          <!-- 顶部操作栏 -->
+          <div class="wb-toolbar">
+            <div class="wb-toolbar-left">
+              <h2>多房间工作台</h2>
+              <span class="room-count" id="roomCount">0 个房间</span>
+              <select class="toolbar-select" onchange="sortBy(this.value)">
+                <option value="default">默认排序</option>
+                <option value="status">按状态</option>
+                <option value="platform">按平台</option>
+                <option value="name">按名称</option>
+              </select>
+              <button class="toolbar-btn" onclick="analyzeHighlights()">分析高光</button>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <span id="multiSelectInfo" style="font-size:12px;color:var(--text-tertiary);"></span>
+              <button class="toolbar-btn" onclick="selectAll()">全选</button>
+              <button class="toolbar-btn" onclick="deselectAll()">取消选择</button>
+              <button class="toolbar-btn" onclick="toggleAlign()" id="alignBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                一键对齐
+              </button>
+              <button class="toolbar-btn primary" onclick="showAddRoomModal()">+ 添加房间</button>
+            </div>
+          </div>
+
+          <!-- 房间卡片网格 -->
+          <div class="room-grid" id="roomGrid"></div>
+
+          <!-- 放大模式覆盖层 (问题5: 单一退出按钮, 无右上角全屏按钮) -->
+          <div class="expanded-overlay" id="expandedOverlay">
+            <div class="expanded-video-container">
+              <video id="expandedVideo" controls autoplay style="width:100%;height:100%;object-fit:contain;"></video>
+              <!-- 问题5: 只有退出放大按钮, 全屏由 video 原生 controls 的全屏按钮提供 -->
+              <button class="exit-expand-btn" onclick="exitExpand()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+                退出放大
+              </button>
+            </div>
+          </div>
+
+          <!-- 问题2: ControlBar + Timeline (多选时也正常工作) -->
+          <div class="control-bar" id="controlBar">
+            <!-- 多选指示器: "已选中" 而非 "已同步" -->
+            <div class="multi-select-indicator" id="multiSelectIndicator">
+              <span class="dot"></span>
+              <span id="multiSelectText">2 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效</span>
+            </div>
+            <div class="cb-top">
+              <div class="cb-controls">
+                <button class="cb-btn" onclick="seekBack()" title="后退10秒">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 19l-7-7 7-7M19 19l-7-7 7-7"/></svg>
+                </button>
+                <button class="cb-btn primary" onclick="togglePlay()" id="playBtn" title="播放/暂停">
+                  <svg viewBox="0 0 24 24" fill="currentColor" id="playIcon"><path d="M8 5v14l11-7z"/></svg>
+                </button>
+                <button class="cb-btn" onclick="seekFwd()" title="前进10秒">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 5l7 7-7 7M5 5l7 7-7 7"/></svg>
+                </button>
+                <span style="width:8px;"></span>
+                <button class="cb-btn" onclick="setMarkIn()" title="设置入点">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4v16M19 4v16M5 4h14M5 20h14"/></svg>
+                </button>
+                <button class="cb-btn" onclick="setMarkOut()" title="设置出点">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4v16M19 4v16M5 4h14M5 20h14"/></svg>
+                </button>
+                <button class="cb-btn" onclick="addClip()" title="添加切片">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+                </button>
+                <span style="width:8px;"></span>
+                <button class="cb-btn" onclick="goLive()" title="跳转直播">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                </button>
+              </div>
+              <div class="cb-time">
+                <span id="currentTime">00:00:00</span>
+                <span class="sep">/</span>
+                <span id="totalTime">04:00:00</span>
+              </div>
+            </div>
+            <!-- Timeline -->
+            <div class="timeline-container" id="timeline" onclick="timelineClick(event)">
+              <div class="timeline-ruler"></div>
+              <div class="timeline-buffered" id="timelineBuffered" style="width: 45%;"></div>
+              <div class="timeline-mark-in" id="timelineMarkIn" style="left: 20%; display:none;"></div>
+              <div class="timeline-mark-out" id="timelineMarkOut" style="left: 60%; display:none;"></div>
+              <div class="timeline-clip" style="left: 20%; width: 40%;">切片 1</div>
+              <div class="timeline-progress" id="timelineProgress" style="width: 30%;"></div>
+              <div class="timeline-playhead" id="timelinePlayhead" style="left: 30%;"></div>
+            </div>
+            <div class="timeline-labels">
+              <span id="timelineStart">00:00:00</span>
+              <span id="timelineEnd">04:00:00</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右侧面板 -->
+        <div class="wb-right">
+          <!-- 问题6: 统一录制设置 (包含所有字段) -->
+          <div class="right-panel-section">
+            <div class="right-panel-header">
+              <h3>录制设置</h3>
+              <button class="toolbar-btn primary" onclick="saveSettings(this)" style="font-size:11px;padding:2px 10px;">保存</button>
+            </div>
+            <div class="right-panel-body">
+              <!-- 画质 -->
+              <div class="record-setting-row">
+                <span class="label">画质</span>
+                <select class="record-select" id="setQuality">
+                  <option value="原画">原画（直接拷贝，画质无损）</option>
+                  <option value="蓝光">蓝光（平台最高清晰度）</option>
+                  <option value="超清">超清（超清画质流）</option>
+                  <option value="高清" selected>高清（平衡画质与体积）</option>
+                  <option value="流畅">流畅（低码率，网络差）</option>
+                </select>
+              </div>
+              <!-- 预览画质 (问题4: 切换后立即生效) -->
+              <div class="record-setting-row">
+                <span class="label">预览画质</span>
+                <select class="record-select" id="setPreviewQuality" onchange="changePreviewQuality(this)">
+                  <option value="原画">原画</option>
+                  <option value="高清" selected>高清</option>
+                  <option value="标清">标清</option>
+                  <option value="流畅">流畅</option>
+                </select>
+              </div>
+              <!-- 编码器 -->
+              <div class="record-setting-row">
+                <span class="label">编码器</span>
+                <select class="record-select" id="setEncoder">
+                  <option value="libx264">libx264（CPU 软编）</option>
+                  <option value="libx265">libx265（CPU HEVC）</option>
+                  <option value="copy">copy（直接拷贝）</option>
+                  <option value="h264_nvenc" selected>h264_nvenc（NVIDIA GPU）</option>
+                  <option value="hevc_nvenc">hevc_nvenc（NVIDIA HEVC）</option>
+                </select>
+              </div>
+              <!-- 编码参数模式 -->
+              <div class="record-setting-row">
+                <span class="label">编码参数</span>
+                <select class="record-select" id="setParamMode">
+                  <option value="CRF 质量" selected>CRF 质量</option>
+                  <option value="码率限制">码率限制</option>
+                  <option value="不限制">不限制</option>
+                </select>
+              </div>
+              <!-- 码率 (码率限制模式时显示) -->
+              <div class="record-setting-row" id="bitrateRow">
+                <span class="label">码率</span>
+                <div style="display:flex;gap:4px;flex:1;">
+                  <select class="record-select" style="width:70px;">
+                    <option value="kbps" selected>kbps</option>
+                    <option value="Mbps">Mbps</option>
+                  </select>
+                  <select class="record-select" id="setBitrate">
+                    <option value="1000">1000</option>
+                    <option value="2000">2000</option>
+                    <option value="4000">4000</option>
+                    <option value="6000">6000</option>
+                    <option value="8000" selected>8000</option>
+                    <option value="10000">10000</option>
+                    <option value="12000">12000</option>
+                    <option value="15000">15000</option>
+                    <option value="20000">20000</option>
+                  </select>
+                </div>
+              </div>
+              <!-- CRF 滑块 -->
+              <div class="record-setting-row" id="crfRow">
+                <span class="label">CRF</span>
+                <div style="flex:1;">
+                  <div class="crf-labels">
+                    <span>18（小体积）</span>
+                    <span class="crf-value" id="crfValue">23</span>
+                    <span>28（高质量）</span>
+                  </div>
+                  <input type="range" class="crf-slider" id="crfSlider" min="18" max="28" value="23" oninput="document.getElementById('crfValue').innerText=this.value">
+                </div>
+              </div>
+              <!-- 录制分辨率 -->
+              <div class="record-setting-row">
+                <span class="label">录制分辨率</span>
+                <select class="record-select" id="setResolution">
+                  <option value="原画" selected>原画</option>
+                  <option value="1920:1080">1920×1080</option>
+                  <option value="1280:720">1280×720</option>
+                  <option value="854:480">854×480</option>
+                </select>
+              </div>
+              <!-- 录制帧率 -->
+              <div class="record-setting-row">
+                <span class="label">录制帧率</span>
+                <select class="record-select" id="setFramerate">
+                  <option value="原画" selected>原画</option>
+                  <option value="60">60</option>
+                  <option value="30">30</option>
+                  <option value="24">24</option>
+                </select>
+              </div>
+              <!-- 音频编码 -->
+              <div class="record-setting-row">
+                <span class="label">音频编码</span>
+                <select class="record-select" id="setAudioBitrate">
+                  <option value="128k" selected>AAC 128k</option>
+                  <option value="192k">AAC 192k</option>
+                  <option value="256k">AAC 256k</option>
+                </select>
+              </div>
+              <!-- 输出目录 -->
+              <div class="record-setting-row" style="margin-bottom:0;">
+                <span class="label">输出目录</span>
+                <div style="display:flex;gap:4px;flex:1;">
+                  <button class="toolbar-btn" style="font-size:11px;padding:2px 8px;">选择</button>
+                  <input class="record-input" value="~/LSC/output" readonly style="flex:1;">
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 切片列表 -->
+          <div class="right-panel-section">
+            <div class="right-panel-header"><h3>切片列表</h3></div>
+            <div class="right-panel-body" id="clipList">
+              <div style="font-size:12px;color:var(--text-400);text-align:center;padding:12px;">暂无切片</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Add Room Modal -->
+<div class="modal-overlay" id="addRoomModal">
+  <div class="modal">
+    <h3>添加直播间</h3>
+    <input class="modal-input" id="roomUrlInput" placeholder="输入直播间地址（支持抖音/虎牙/B站等）" onkeydown="if(event.key==='Enter')addRoom()">
+    <div style="font-size:12px;color:var(--text-400);">支持的平台：抖音、虎牙、B站、斗鱼、快手、YY</div>
+    <div class="modal-actions">
+      <button class="toolbar-btn" onclick="hideAddRoomModal()">取消</button>
+      <button class="toolbar-btn primary" onclick="addRoom()">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+/* ============================================================
+ * 状态管理
+ * ============================================================ */
+const state = {
+  rooms: [
+    { id: 'r1', title: '主播A的直播间', platform: '抖音', status: 'recording', previewEnabled: true, muted: false, quality: '高清', recordTime: 3661, markIn: 1800, markOut: 3500, clips: [{start:1800,end:3500}] },
+    { id: 'r2', title: '主播B的直播间', platform: '虎牙', status: 'live', previewEnabled: true, muted: true, quality: '高清', recordTime: 7200, markIn: null, markOut: null, clips: [] },
+    { id: 'r3', title: '主播C的游戏直播', platform: 'B站', status: 'live', previewEnabled: false, muted: true, quality: '标清', recordTime: 0, markIn: null, markOut: null, clips: [] },
+    { id: 'r4', title: '主播D的聊天室', platform: '斗鱼', status: 'connecting', previewEnabled: false, muted: true, quality: '高清', recordTime: 0, markIn: null, markOut: null, clips: [] },
+  ],
+  selectedRoomIds: new Set(),
+  selectedRoomId: null,
+  isPlaying: false,
+  previewPos: 1800,
+  expandedRoomId: null,
+  theme: 'dark',
+  connStatus: 'connected',
+  alignedRoomIds: new Set(),
+};
+
+/* ============================================================
+ * 问题1: 修复勾选功能 — 点击两次能取消勾选
+ * 根因: 反向同步 useEffect 依赖了 selectedRoomIds 导致循环
+ * 修复: 用 ref 镜像判断, 不依赖 selectedRoomIds 触发 effect
+ * ============================================================ */
+const selectedRoomIdsRef = { current: new Set() };
+
+function syncRef() { selectedRoomIdsRef.current = new Set(state.selectedRoomIds); }
+
+function toggleCheckbox(roomId, event) {
+  if (event) event.stopPropagation();
+  const next = new Set(state.selectedRoomIds);
+  if (next.has(roomId)) {
+    next.delete(roomId);
+  } else {
+    next.add(roomId);
+  }
+  state.selectedRoomIds = next;
+  // 正向同步: 仅当选中1个房间时同步到 store.selectedRoomId
+  state.selectedRoomId = next.size === 1 ? [...next][0] : null;
+  syncRef();
+  renderRooms();
+  renderControlBar();
+  updateMultiSelectInfo();
+}
+
+function handleCardClick(roomId, event) {
+  if (event.ctrlKey || event.metaKey) {
+    toggleCheckbox(roomId, event);
+  } else {
+    state.selectedRoomIds = new Set([roomId]);
+    state.selectedRoomId = roomId;
+    syncRef();
+    renderRooms();
+    renderControlBar();
+    updateMultiSelectInfo();
+  }
+}
+
+/* 问题1修复核心: 反向同步时不依赖 selectedRoomIds 防止循环
+ * 仅在 selectedRoomId 从外部变化(如 Dashboard 跳转)且不在集合中时同步 */
+function syncFromStoreSelected() {
+  if (state.selectedRoomId && !selectedRoomIdsRef.current.has(state.selectedRoomId)) {
+    state.selectedRoomIds = new Set([state.selectedRoomId]);
+    syncRef();
+    renderRooms();
+    renderControlBar();
+    updateMultiSelectInfo();
+  }
+}
+
+/* ============================================================
+ * 问题2: "已同步" → "已选中", 时间线多选时正常工作
+ * ============================================================ */
+function updateMultiSelectInfo() {
+  const indicator = document.getElementById('multiSelectIndicator');
+  const text = document.getElementById('multiSelectText');
+  const count = state.selectedRoomIds.size;
+  if (count > 1) {
+    indicator.classList.add('show');
+    text.textContent = `${count} 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效`;
+  } else {
+    indicator.classList.remove('show');
+  }
+  // 更新选中数量显示
+  const info = document.getElementById('multiSelectInfo');
+  if (count > 0) {
+    info.textContent = `已选中 ${count} 个房间`;
+  } else {
+    info.textContent = '';
+  }
+}
+
+/* 问题2: 多选时时间线取第一个选中房间的数据作为代表 */
+function getRepresentativeRoom() {
+  if (state.selectedRoomIds.size > 0) {
+    const firstId = [...state.selectedRoomIds][0];
+    return state.rooms.find(r => r.id === firstId);
+  }
+  return null;
+}
+
+/* ============================================================
+ * 房间渲染
+ * ============================================================ */
+function renderRooms() {
+  const grid = document.getElementById('roomGrid');
+  grid.innerHTML = '';
+  state.rooms.forEach(room => {
+    const selected = state.selectedRoomIds.has(room.id);
+    const multiSelected = state.selectedRoomIds.size > 1 && selected;
+    const aligned = state.alignedRoomIds.has(room.id);
+
+    const card = document.createElement('div');
+    card.className = 'room-card' + (selected ? ' selected' : '') + (multiSelected ? ' multi-selected' : '');
+    card.onclick = (e) => handleCardClick(room.id, e);
+
+    const statusColors = { recording: 'var(--state-error)', live: 'var(--state-success)', connecting: 'var(--state-warning)', error: 'var(--state-error)' };
+    const statusTexts = { recording: '录制中', live: '直播中', connecting: '连接中', error: '错误' };
+    const recordTimeStr = room.recordTime > 0 ? formatTime(room.recordTime) : '';
+
+    card.innerHTML = `
+      <div class="room-preview">
+        <!-- 问题1: Checkbox 修复后可正常取消勾选 -->
+        <div class="room-checkbox ${selected ? 'checked' : ''}" onclick="toggleCheckbox('${room.id}', event)" title="${selected ? '取消选择' : '选择此房间'}">
+          ${selected ? '✓' : ''}
+        </div>
+        <!-- 状态 badge -->
+        <div class="room-status-badge">
+          <div class="status-pill">
+            <div class="status-dot ${room.status}"></div>
+            <span class="status-text">${statusTexts[room.status]}</span>
+          </div>
+        </div>
+        ${room.previewEnabled ? `
+          <video class="preview-video" muted playsinline loop autoplay>
+            <source src="" type="video/mp4">
+          </video>
+          <!-- 预览覆盖控制条 -->
+          <div class="preview-overlay">
+            <!-- 问题4: 清晰度切换后立即生效 (添加 applying 状态) -->
+            <select class="preview-quality-select" onchange="changePreviewQuality(this, '${room.id}')" onclick="event.stopPropagation()">
+              <option value="original" ${room.quality==='original'?'selected':''}>原画</option>
+              <option value="hd" ${room.quality==='hd'||room.quality==='高清'?'selected':''}>高清</option>
+              <option value="sd" ${room.quality==='sd'||room.quality==='标清'?'selected':''}>标清</option>
+              <option value="ld" ${room.quality==='ld'||room.quality==='流畅'?'selected':''}>流畅</option>
+            </select>
+            <div class="preview-controls">
+              <!-- 问题3: 取消静音后有声音 (AudioContext resume) -->
+              <button class="preview-btn ${room.muted ? 'muted' : ''}" onclick="toggleMute('${room.id}', event)" title="${room.muted ? '取消静音' : '静音'}">
+                ${room.muted ? 
+                  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>' :
+                  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>'
+                }
+              </button>
+              <!-- 问题5: 只有右下角放大按钮 (RoomCard 中的放大按钮) -->
+              <button class="preview-btn" onclick="expandRoom('${room.id}', event)" title="放大">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+              </button>
+            </div>
+          </div>
+        ` : `
+          <div class="placeholder">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:36px;height:36px;"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+          </div>
+          <button class="toolbar-btn" style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;" onclick="event.stopPropagation();enablePreview('${room.id}')">启用预览</button>
+        `}
+      </div>
+      <div class="room-info">
+        <div class="room-title-row">
+          <span class="room-title">${room.title}</span>
+          <span class="room-platform">${room.platform}</span>
+        </div>
+        <div class="room-meta">
+          ${recordTimeStr ? `<span class="time">⏱ ${recordTimeStr}</span>` : ''}
+          ${room.clips.length > 0 ? `<span>🎬 ${room.clips.length} 个切片</span>` : ''}
+          <!-- 问题2: "已选中"标签(蓝色) 替代 "已同步"(橙色) -->
+          ${multiSelected ? `<span class="selected-badge"><span class="dot"></span>已选中</span>` : ''}
+          <!-- 仅在真正执行过音频对齐后才显示"已同步" -->
+          ${aligned ? `<span class="selected-badge" style="background:rgba(52,199,89,0.15);color:var(--state-success);border-color:rgba(52,199,89,0.3);"><span class="dot" style="background:var(--state-success);"></span>已同步</span>` : ''}
+        </div>
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+
+  document.getElementById('roomCount').textContent = `${state.rooms.length} 个房间`;
+}
+
+/* ============================================================
+ * 问题3: 预览功能有声音 — 取消静音时 resume AudioContext
+ * ============================================================ */
+function toggleMute(roomId, event) {
+  if (event) event.stopPropagation();
+  const room = state.rooms.find(r => r.id === roomId);
+  if (!room) return;
+  room.muted = !room.muted;
+  // 问题3修复: 取消静音时显式 resume AudioContext
+  if (!room.muted) {
+    resumeAudioContext(roomId);
+    showToast('已取消静音');
+  } else {
+    showToast('已静音');
+  }
+  renderRooms();
+}
+
+/* 模拟 AudioContext resume — 问题3的核心修复 */
+function resumeAudioContext(roomId) {
+  // 在实际代码中:
+  // const ctx = getAligner().getContextSync();
+  // if (ctx.state === 'suspended') { ctx.resume(); }
+  console.log(`[AudioContext] Resumed for room ${roomId}`);
+}
+
+/* ============================================================
+ * 问题4: 预览清晰度切换后立即生效
+ * 修复: 后端添加 set_preview_quality handler, 重启 MseStreamer
+ * ============================================================ */
+function changePreviewQuality(selectEl, roomId) {
+  if (event) event.stopPropagation();
+  const quality = selectEl.value;
+  selectEl.classList.add('applying');
+  // 问题4修复: 发送 set_preview_quality 到后端, 后端重启 MseStreamer
+  console.log(`[PreviewQuality] Sending set_preview_quality: room=${roomId}, quality=${quality}`);
+  showToast('正在切换清晰度...');
+  // 模拟后端重启 MseStreamer 后的画面更新
+  setTimeout(() => {
+    if (roomId) {
+      const room = state.rooms.find(r => r.id === roomId);
+      if (room) room.quality = quality;
+    }
+    selectEl.classList.remove('applying');
+    showToast('清晰度已更新');
+    renderRooms();
+  }, 1500);
+}
+
+/* 右侧面板的预览画质切换 */
+function changePreviewQualityGlobal(selectEl) {
+  showToast('正在切换全局预览画质...');
+  console.log(`[PreviewQuality] Global change: ${selectEl.value}`);
+  setTimeout(() => showToast('全局预览画质已更新'), 1000);
+}
+
+/* ============================================================
+ * 问题5: 删除右上角放大按钮, 修复放大后卡顿
+ * 修复: 复用同一个 VideoPreview 实例, 通过 CSS 移动而非重建
+ * ============================================================ */
+function expandRoom(roomId, event) {
+  if (event) event.stopPropagation();
+  state.expandedRoomId = roomId;
+  const overlay = document.getElementById('expandedOverlay');
+  overlay.classList.add('show');
+  // 问题5修复: 复用同一个 video 元素, 不创建新实例
+  // 实际代码中通过 Portal 移动 DOM 节点而非卸载重建
+  const video = document.getElementById('expandedVideo');
+  // 模拟: 如果已有播放器实例, 直接移动到放大容器
+  console.log(`[Expand] Reusing existing VideoPreview for room ${roomId} (no new instance)`);
+  showToast('已放大预览');
+}
+
+function exitExpand() {
+  state.expandedRoomId = null;
+  document.getElementById('expandedOverlay').classList.remove('show');
+  // 问题5修复: 退出放大时将 video 元素移回原位, 不销毁播放器
+  console.log('[Expand] Moving VideoPreview back to grid (no destroy)');
+}
+
+/* ============================================================
+ * ControlBar + Timeline 渲染
+ * 问题2: 多选时时间线也正常工作 (取第一个选中房间)
+ * ============================================================ */
+function renderControlBar() {
+  const room = getRepresentativeRoom() || state.rooms.find(r => r.id === state.selectedRoomId);
+  if (!room) {
+    document.getElementById('currentTime').textContent = '00:00:00';
+    document.getElementById('totalTime').textContent = '04:00:00';
+    return;
+  }
+
+  const TIMELINE_WINDOW = 14400;
+  let elapsed = room.recordTime || 0;
+  let duration = TIMELINE_WINDOW;
+  let windowStart = 0;
+  if (elapsed > TIMELINE_WINDOW) {
+    windowStart = elapsed - TIMELINE_WINDOW;
+  } else {
+    duration = Math.max(TIMELINE_WINDOW, elapsed);
+  }
+
+  const currentTime = state.previewPos || room.markIn || 0;
+  const relativeCurrent = Math.max(0, currentTime - windowStart);
+
+  document.getElementById('currentTime').textContent = formatTime(currentTime);
+  document.getElementById('totalTime').textContent = formatTime(duration);
+  document.getElementById('timelineStart').textContent = formatTime(windowStart);
+  document.getElementById('timelineEnd').textContent = formatTime(windowStart + duration);
+
+  // Timeline 进度
+  const progressPct = (relativeCurrent / duration) * 100;
+  document.getElementById('timelineProgress').style.width = progressPct + '%';
+  document.getElementById('timelinePlayhead').style.left = progressPct + '%';
+
+  // Mark In/Out
+  const markInEl = document.getElementById('timelineMarkIn');
+  if (room.markIn != null) {
+    markInEl.style.left = ((room.markIn - windowStart) / duration * 100) + '%';
+    markInEl.style.display = 'block';
+  } else {
+    markInEl.style.display = 'none';
+  }
+  const markOutEl = document.getElementById('timelineMarkOut');
+  if (room.markOut != null) {
+    markOutEl.style.left = ((room.markOut - windowStart) / duration * 100) + '%';
+    markOutEl.style.display = 'block';
+  } else {
+    markOutEl.style.display = 'none';
+  }
+
+  // 缓冲进度
+  const bufferedEnd = Math.min(elapsed, windowStart + duration);
+  const bufferedPct = ((bufferedEnd - windowStart) / duration) * 100;
+  document.getElementById('timelineBuffered').style.width = bufferedPct + '%';
+}
+
+/* ============================================================
+ * 时间线交互
+ * ============================================================ */
+function timelineClick(event) {
+  const timeline = document.getElementById('timeline');
+  const rect = timeline.getBoundingClientRect();
+  const pct = (event.clientX - rect.left) / rect.width;
+  const room = getRepresentativeRoom();
+  if (!room) return;
+
+  const TIMELINE_WINDOW = 14400;
+  let elapsed = room.recordTime || 0;
+  let duration = TIMELINE_WINDOW;
+  let windowStart = 0;
+  if (elapsed > TIMELINE_WINDOW) {
+    windowStart = elapsed - TIMELINE_WINDOW;
+  } else {
+    duration = Math.max(TIMELINE_WINDOW, elapsed);
+  }
+
+  const targetTime = windowStart + pct * duration;
+  state.previewPos = targetTime;
+  // 问题2: 多选时 seek 对所有选中房间生效
+  state.selectedRoomIds.forEach(rid => {
+    console.log(`[Seek] Seeking room ${rid} to ${targetTime}`);
+  });
+  renderControlBar();
+}
+
+function togglePlay() {
+  state.isPlaying = !state.isPlaying;
+  const icon = document.getElementById('playIcon');
+  if (state.isPlaying) {
+    icon.innerHTML = '<path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>';
+  } else {
+    icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+  }
+  // 问题2: 多选时播放/暂停对所有选中房间生效
+  state.selectedRoomIds.forEach(rid => {
+    console.log(`[PlayPause] Toggling room ${rid}`);
+  });
+}
+
+function seekBack() {
+  state.selectedRoomIds.forEach(rid => {
+    console.log(`[Seek] Room ${rid} back 10s`);
+  });
+  state.previewPos = Math.max(0, state.previewPos - 10);
+  renderControlBar();
+}
+function seekFwd() {
+  state.selectedRoomIds.forEach(rid => {
+    console.log(`[Seek] Room ${rid} forward 10s`);
+  });
+  state.previewPos += 10;
+  renderControlBar();
+}
+function setMarkIn() {
+  state.selectedRoomIds.forEach(rid => {
+    const room = state.rooms.find(r => r.id === rid);
+    if (room) room.markIn = state.previewPos;
+    console.log(`[MarkIn] Room ${rid} mark_in=${state.previewPos}`);
+  });
+  renderRooms();
+  renderControlBar();
+  showToast('入点已设置');
+}
+function setMarkOut() {
+  state.selectedRoomIds.forEach(rid => {
+    const room = state.rooms.find(r => r.id === rid);
+    if (room) room.markOut = state.previewPos;
+    console.log(`[MarkOut] Room ${rid} mark_out=${state.previewPos}`);
+  });
+  renderRooms();
+  renderControlBar();
+  showToast('出点已设置');
+}
+function addClip() {
+  state.selectedRoomIds.forEach(rid => {
+    const room = state.rooms.find(r => r.id === rid);
+    if (room && room.markIn != null && room.markOut != null) {
+      room.clips.push({ start: room.markIn, end: room.markOut });
+    }
+    console.log(`[AddClip] Room ${rid}`);
+  });
+  renderRooms();
+  showToast('切片已添加');
+}
+function goLive() {
+  state.selectedRoomIds.forEach(rid => {
+    console.log(`[GoLive] Room ${rid} jumping to live edge`);
+  });
+  showToast('已跳转到直播位置');
+}
+
+/* ============================================================
+ * 全选 / 取消选择
+ * ============================================================ */
+function selectAll() {
+  state.selectedRoomIds = new Set(state.rooms.map(r => r.id));
+  state.selectedRoomId = null;
+  syncRef();
+  renderRooms();
+  renderControlBar();
+  updateMultiSelectInfo();
+  showToast(`已选中 ${state.rooms.length} 个房间`);
+}
+function deselectAll() {
+  state.selectedRoomIds = new Set();
+  state.selectedRoomId = null;
+  syncRef();
+  renderRooms();
+  renderControlBar();
+  updateMultiSelectInfo();
+}
+
+/* 一键对齐 — 对齐后才显示"已同步"标签 */
+function toggleAlign() {
+  if (state.selectedRoomIds.size < 2) {
+    showToast('请至少选择2个房间');
+    return;
+  }
+  const btn = document.getElementById('alignBtn');
+  btn.disabled = true;
+  showToast('正在对齐音频...');
+  setTimeout(() => {
+    btn.disabled = false;
+    // 问题2: 仅在执行过对齐后才标记为"已同步"
+    state.selectedRoomIds.forEach(rid => state.alignedRoomIds.add(rid));
+    renderRooms();
+    showToast('音频对齐完成');
+  }, 2000);
+}
+
+/* ============================================================
+ * 问题7: 连接状态管理 (4种状态 + 重连按钮)
+ * ============================================================ */
+function updateConnStatus(status) {
+  state.connStatus = status;
+  const dot = document.getElementById('connDot');
+  const label = document.getElementById('connLabel');
+  const reconnectBtn = document.getElementById('reconnectBtn');
+  const banner = document.getElementById('connBanner');
+
+  dot.className = 'conn-dot ' + status;
+  const labels = { connected: '已连接', connecting: '连接中', disconnected: '未连接', reconnect_failed: '连接失败' };
+  label.textContent = labels[status];
+
+  // 重连按钮仅在断开/失败时显示
+  if (status === 'disconnected' || status === 'reconnect_failed') {
+    reconnectBtn.classList.add('show');
+  } else {
+    reconnectBtn.classList.remove('show');
+  }
+
+  // Banner
+  if (status === 'disconnected' || status === 'reconnect_failed') {
+    setTimeout(() => {
+      if (state.connStatus === status) banner.classList.add('show');
+    }, 2000);
+  } else {
+    banner.classList.remove('show');
+  }
+}
+
+function doReconnect() {
+  updateConnStatus('connecting');
+  showToast('正在重新连接...');
+  // 模拟重连
+  setTimeout(() => {
+    if (Math.random() > 0.3) {
+      updateConnStatus('connected');
+      showToast('连接成功');
+    } else {
+      updateConnStatus('reconnect_failed');
+      showToast('连接失败，请检查后端服务');
+    }
+  }, 2000);
+}
+
+/* ============================================================
+ * 问题8: 主题切换 (底部居中)
+ * ============================================================ */
+function toggleTheme() {
+  const html = document.documentElement;
+  html.classList.add('theme-transition');
+  setTimeout(() => html.classList.remove('theme-transition'), 400);
+
+  if (state.theme === 'dark') {
+    state.theme = 'light';
+    html.classList.remove('dark');
+    document.getElementById('themeLabel').textContent = '深色';
+    document.getElementById('themeIcon').innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+  } else {
+    state.theme = 'dark';
+    html.classList.add('dark');
+    document.getElementById('themeLabel').textContent = '浅色';
+    document.getElementById('themeIcon').innerHTML = '<circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>';
+  }
+  console.log(`[Theme] Switched to ${state.theme}`);
+}
+
+/* ============================================================
+ * 页面切换
+ * ============================================================ */
+function switchPage(page) {
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  if (page === 'settings') {
+    showToast('设置页面 (原型中未实现)');
+  }
+}
+
+/* ============================================================
+ * 添加房间
+ * ============================================================ */
+function showAddRoomModal() {
+  document.getElementById('addRoomModal').classList.add('show');
+  document.getElementById('roomUrlInput').focus();
+}
+function hideAddRoomModal() {
+  document.getElementById('addRoomModal').classList.remove('show');
+  document.getElementById('roomUrlInput').value = '';
+}
+function addRoom() {
+  const url = document.getElementById('roomUrlInput').value.trim();
+  if (!url) return;
+  const platforms = { 'douyin': '抖音', 'huya': '虎牙', 'bilibili': 'B站', 'douyu': '斗鱼', 'kuaishou': '快手' };
+  let platform = '未知';
+  for (const [key, val] of Object.entries(platforms)) {
+    if (url.includes(key)) { platform = val; break; }
+  }
+  state.rooms.push({
+    id: 'r' + Date.now(), title: url.substring(0, 20) + '...', platform,
+    status: 'connecting', previewEnabled: false, muted: true, quality: '高清',
+    recordTime: 0, markIn: null, markOut: null, clips: []
+  });
+  hideAddRoomModal();
+  renderRooms();
+  showToast('房间添加成功');
+  // 模拟连接成功
+  setTimeout(() => {
+    const room = state.rooms[state.rooms.length - 1];
+    room.status = 'live';
+    renderRooms();
+  }, 2000);
+}
+
+/* ============================================================
+ * 工具函数
+ * ============================================================ */
+function formatTime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+function sortBy(type) {
+  console.log('[Sort] by:', type);
+  showToast('排序: ' + type);
+}
+
+function analyzeHighlights() {
+  if (!state.selectedRoomId && state.selectedRoomIds.size === 0) {
+    showToast('请先选择一个房间');
+    return;
+  }
+  showToast('正在分析高光时刻...');
+  setTimeout(() => showToast('分析完成'), 2000);
+}
+
+function enablePreview(roomId) {
+  const room = state.rooms.find(r => r.id === roomId);
+  if (room) {
+    room.previewEnabled = true;
+    renderRooms();
+    showToast('预览已启用');
+  }
+}
+
+function saveSettings(btn) {
+  btn.textContent = '保存中...';
+  btn.disabled = true;
+  setTimeout(() => {
+    btn.textContent = '保存';
+    btn.disabled = false;
+    showToast('录制设置已保存');
+  }, 800);
+}
+
+let toastTimer = null;
+function showToast(msg) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 2000);
+}
+
+/* ============================================================
+ * 模拟播放进度 (验证时间线在多选时正常工作)
+ * ============================================================ */
+setInterval(() => {
+  if (state.isPlaying) {
+    state.previewPos += 1;
+    renderControlBar();
+  }
+  // 录制中的房间增加录制时间
+  state.rooms.forEach(room => {
+    if (room.status === 'recording') {
+      room.recordTime += 1;
+      if (state.selectedRoomIds.has(room.id) && state.selectedRoomIds.size === 1) {
+        renderControlBar();
+      }
+    }
+  });
+}, 1000);
+
+/* ============================================================
+ * 模拟连接状态变化 (验证重连逻辑)
+ * ============================================================ */
+// 取消注释以下代码来模拟断连:
+// setTimeout(() => updateConnStatus('disconnected'), 10000);
+
+/* ============================================================
+ * 初始化
+ * ============================================================ */
+renderRooms();
+renderControlBar();
+updateMultiSelectInfo();
+syncRef();
+
+// 默认选中第一个房间
+state.selectedRoomIds = new Set(['r1']);
+state.selectedRoomId = 'r1';
+syncRef();
+renderRooms();
+renderControlBar();
+updateMultiSelectInfo();
+</script>
+</body>
+</html>

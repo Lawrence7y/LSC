@@ -3,6 +3,25 @@ import { resolveWebSocketUrl, type BackendElectronApi, type WebSocketEnv } from 
 
 type MessageHandler = (data: any) => void
 
+/**
+ * WebSocket 客户端：管理单条 WebSocket 连接的生命周期与消息分发。
+ *
+ * 职责：
+ * - 通过 {@link connect} 建立连接，支持传入固定 URL 或从环境变量 / Electron API 动态解析。
+ * - 通过 {@link on} 注册事件处理器，按消息类型分发；同一事件支持多个订阅者。
+ * - 通过 {@link send} 发送消息，断连时自动入队，重连成功后批量 flush。
+ * - 通过 {@link disconnect} 主动关闭连接并抑制自动重连。
+ * - 通过 {@link reconnect} 手动重置重连计数器后重新发起连接。
+ *
+ * 设计要点：
+ * - 幂等连接：多次调用 connect() 仅创建一条物理连接，pending Promise 复用防止并发竞争。
+ * - 消息队列：断连期间消息缓存于 {@link messageQueue}（上限 100 条），重连成功后按序发送。
+ * - 指数退避重连：失败后延迟从 1s 递增至 15s 封顶，最多尝试 20 次后停止并通知 UI。
+ * - 手动关闭标志：disconnect() 设置 manualClose=true，避免 onclose 误触发自动重连。
+ *
+ * @remarks
+ * 实例以单例形式导出（{@link wsClient}），整个应用共享一个 WebSocket 连接。
+ */
 class WebSocketClient {
   private ws: WebSocket | null = null
   private url: string | null
@@ -52,6 +71,22 @@ class WebSocketClient {
     return this.resolvingUrl
   }
 
+  /**
+   * 建立 WebSocket 连接（幂等）。
+   *
+   * 连接流程：
+   * 1. 若已有 OPEN 连接，直接返回。
+   * 2. 若正在 CONNECTING 中，复用同一个 pending Promise，避免并发 connect() 互相 close。
+   * 3. 解析目标 URL（传入 URL 或从 env/Electron API 动态获取）。
+   * 4. 创建 WebSocket，注册 onopen / onmessage / onclose / onerror 回调。
+   *
+   * onopen 时：重置重连计数器，emit('connected')，flush 消息队列。
+   * onmessage 时：JSON 解析为 {@link WSMessage}，按 type 分发到对应 handler。
+   * onclose 时：emit('disconnected')；若非手动关闭，则启动指数退避重连。
+   * onerror 时：reject 当前 Promise，并触发重连。
+   *
+   * @returns 连接建立的 Promise，失败时 reject 底层错误。
+   */
   connect(): Promise<void> {
     // 重置手动关闭标志
     this.manualClose = false
@@ -94,6 +129,21 @@ class WebSocketClient {
         this.ws.onmessage = (event) => {
           try {
             const message: WSMessage = JSON.parse(event.data)
+            if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
+              console.log(`[WebSocket] Received message type=${message.type} (length: ${event.data.length})`)
+            } else {
+              const logData = JSON.parse(JSON.stringify(message.data || {}))
+              if (typeof logData === 'object' && logData !== null) {
+                for (const key of Object.keys(logData)) {
+                  if (typeof logData[key] === 'string' && logData[key].length > 200) {
+                    logData[key] = `<string length=${logData[key].length}>`
+                  } else if (Array.isArray(logData[key]) && logData[key].length > 10) {
+                    logData[key] = `<array length=${logData[key].length}>`
+                  }
+                }
+              }
+              console.log(`[WebSocket] Received message type=${message.type}, data=`, logData)
+            }
             this.emit(message.type, message.data)
           } catch (err) {
             console.error('Failed to parse WebSocket message:', err)
@@ -163,7 +213,33 @@ class WebSocketClient {
     }
   }
 
+  /**
+   * 发送消息。若连接未就绪，消息会进入断连队列等待重连后 flush。
+   *
+   * 消息格式为 {@link WSMessage}：`{ type: string, data: any }`。
+   * 队列上限为 {@link maxQueueSize}（100 条），超出时丢弃最旧消息，保留最新。
+   * 当 {@link ws} 处于 OPEN 状态时直接通过 WebSocket.send() 发出。
+   *
+   * @param type - 消息类型标识，用于 on() 路由分发
+   * @param data - 消息载荷，任意可序列化对象
+   */
   send(type: string, data: any): void {
+    if (type === 'align_preview_audio') {
+      console.log(`[WebSocket] Sending message type=${type} (PCM base64 audio payload)`)
+    } else {
+      const logData = JSON.parse(JSON.stringify(data || {}))
+      if (typeof logData === 'object' && logData !== null) {
+        for (const key of Object.keys(logData)) {
+          if (typeof logData[key] === 'string' && logData[key].length > 200) {
+            logData[key] = `<string length=${logData[key].length}>`
+          } else if (Array.isArray(logData[key]) && logData[key].length > 10) {
+            logData[key] = `<array length=${logData[key].length}>`
+          }
+        }
+      }
+      console.log(`[WebSocket] Sending message type=${type}, data=`, logData)
+    }
+
     const message: WSMessage = { type, data }
     const payload = JSON.stringify(message)
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -178,6 +254,20 @@ class WebSocketClient {
     this.ws.send(payload)
   }
 
+  /**
+   * 注册事件处理器。
+   *
+   * 支持的内部事件：
+   * - `connected`：连接建立成功（data 为 null）
+   * - `disconnected`：连接断开（data 为 null）
+   * - `reconnecting`：进入重连等待（data 为 null）
+   * - `reconnect_failed`：超过最大重连次数（data 为 null）
+   * - 业务消息类型：对应 {@link WSMessage.type}，data 为消息体
+   *
+   * @param event - 事件名称
+   * @param handler - 回调函数，接收消息 data；注册 `connected` 时若已连接会立即同步触发一次
+   * @returns 取消订阅函数，调用后移除该 handler
+   */
   on(event: string, handler: MessageHandler): () => void {
     if (!this.handlers.has(event)) {
       this.handlers.set(event, new Set())
@@ -200,6 +290,15 @@ class WebSocketClient {
     this.handlers.get(event)?.forEach(handler => handler(data))
   }
 
+  /**
+   * 主动断开连接，并抑制后续自动重连。
+   *
+   * 操作：
+   * 1. 设置 manualClose=true，使 onclose 回调跳过 scheduleReconnect。
+   * 2. 清除重连定时器。
+   * 3. 移除 WebSocket 事件监听后 close()，释放底层 TCP 连接。
+   * 4. 清空 pendingConnect，重置连接状态。
+   */
   disconnect(): void {
     this.manualClose = true
     if (this.reconnectTimer) {
@@ -216,8 +315,12 @@ class WebSocketClient {
   }
 
   /**
-   * 手动重连：重置重连计数器后发起连接。
-   * 供 UI 在 reconnect_failed 后手动重试使用。
+   * 手动重连：重置重连计数器后立即调用 connect()。
+   *
+   * 供 UI 在收到 `reconnect_failed` 事件后，用户手动点击"重试"时使用。
+   * 会清除可能存在的退避定时器，将 reconnectAttempts 归零后发起新连接。
+   *
+   * @returns 连接建立的 Promise
    */
   reconnect(): Promise<void> {
     this.reconnectAttempts = 0

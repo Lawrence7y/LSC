@@ -12,9 +12,9 @@
 .lsc-timeline__scroll {
   flex: 1;
   overflow-x: auto;
-  overflow-y: hidden;
+  overflow-y: visible;
   position: relative;
-  padding: 0 12px;
+  padding: 16px 12px 4px;
 }
 
 .lsc-timeline__scroll::-webkit-scrollbar {
@@ -190,13 +190,16 @@
 
 .lsc-timeline__marker-label {
   position: absolute;
-  top: -20px;
+  bottom: -18px;
   left: 50%;
   transform: translateX(-50%);
   font-size: 9px;
   white-space: nowrap;
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
   pointer-events: none;
+  background: var(--bg-secondary, rgba(0,0,0,0.8));
+  padding: 1px 4px;
+  border-radius: 3px;
 }
 
 .lsc-timeline__marker--in .lsc-timeline__marker-label {
@@ -247,4 +250,30 @@
 
 .lsc-timeline__scroll:hover .lsc-timeline__tooltip {
   opacity: 1;
+}
+
+/* 磁吸时标签放大效果 */
+.lsc-timeline__marker--snap {
+  transform: scale(1.35);
+  transition: transform 0.1s ease-out;
+  z-index: 10;
+}
+
+.lsc-timeline__marker--snap .lsc-timeline__marker-label {
+  font-weight: 700;
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.5);
+}
+
+/* 磁吸时播放头脉冲效果 */
+.lsc-timeline__playhead--snap {
+  animation: timelineSnapPulse 0.2s ease-out;
+}
+
+@keyframes timelineSnapPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.8);
+  }
+  100% {
+    box-shadow: 0 0 0 8px rgba(255, 255, 255, 0);
+  }
 }

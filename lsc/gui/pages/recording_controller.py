@@ -449,7 +449,7 @@ class RecordingController:
                 run_kwargs["creationflags"] = creation_flags
             result = subprocess.run(
                 [ffmpeg, "-y", "-loglevel", "error",
-                 "-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=1",
+                 "-f", "lavfi", "-i", "testsrc=duration=1:size=256x256:rate=1",
                  "-c:v", "h264_nvenc", "-frames:v", "1",
                  "-f", "null", "-"],
                 **run_kwargs,
@@ -542,6 +542,22 @@ class RecordingController:
 
         output_args: list[str] = []
         encoder_used = encoder
+
+        # 编码器名称归一化：前端发送 ffmpeg 格式名（h264_nvenc/libx264 等），
+        # 但以下分支检查的是旧格式名（H.264 NVENC/H.264 CPU 等），需要统一映射
+        _encoder_map = {
+            "h264_nvenc": "H.264 NVENC",
+            "hevc_nvenc": "H.265 NVENC",
+            "libx264": "H.264 CPU",
+            "libx265": "H.265 CPU",
+            "copy": "Copy",
+            "H.264 NVENC": "H.264 NVENC",
+            "H.265 NVENC": "H.265 NVENC",
+            "H.264 CPU": "H.264 CPU",
+            "H.265 CPU": "H.265 CPU",
+            "Copy": "Copy",
+        }
+        encoder_used = _encoder_map.get(encoder, encoder)
 
         target_bitrate = self._normalize_bitrate_value(bitrate, bitrate_unit)
         bufsize = ""

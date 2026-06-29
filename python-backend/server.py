@@ -1,14 +1,43 @@
 import asyncio
 import json
+import math
 import traceback
 import websockets
+import logging
 from typing import Dict, Any, Callable
 
+_log = logging.getLogger('lsc.server')
+
+
+class _NumpyJSONEncoder(json.JSONEncoder):
+    """自定义 JSON encoder，处理 numpy 数值类型。"""
+
+    def default(self, obj):
+        try:
+            import numpy as np
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.floating):
+                if math.isnan(obj) or math.isinf(obj):
+                    return None
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except ImportError:
+            pass
+        return super().default(obj)
+
+
+def _json_dumps(obj) -> str:
+    """带 numpy 兼容的 JSON 序列化。"""
+    return json.dumps(obj, cls=_NumpyJSONEncoder)
+
+
 class LSCWebSocketServer:
-    def __init__(self, host: str = 'localhost', port: int = 9876, fallback_ports: list[int] | None = None):
+    def __init__(self, host: str = 'localhost', port: int = 19876, fallback_ports: list[int] | None = None):
         self.host = host
         self.port = port
-        self.fallback_ports = fallback_ports or [9877, 9878, 9879, 9880]
+        self.fallback_ports = fallback_ports or [19877, 19878, 19879, 19880]
         self.clients: set = set()
         self.handlers: Dict[str, Callable] = {}
         self.connect_handlers: list[Callable] = []
@@ -43,13 +72,13 @@ class LSCWebSocketServer:
     async def handle_client(self, websocket):
         """处理客户端连接"""
         self.clients.add(websocket)
-        print(f"Client connected. Total: {len(self.clients)}")
+        _log.info(f"Client connected. Total: {len(self.clients)}")
 
         for handler in self.connect_handlers:
             try:
                 await handler(websocket)
             except Exception as exc:
-                print(f"Connect handler error: {exc}")
+                _log.error(f"Connect handler error: {exc}", exc_info=True)
 
         try:
             async for message in websocket:
@@ -59,26 +88,65 @@ class LSCWebSocketServer:
                     msg_type = data.get('type')
                     msg_data = data.get('data', {})
 
+                    # 限制和截断超大日志字段，避免日志文件暴增
+                    log_data = {}
+                    if isinstance(msg_data, dict):
+                        for k, v in msg_data.items():
+                            if isinstance(v, str) and len(v) > 200:
+                                log_data[k] = f"<str of length {len(v)}>"
+                            elif isinstance(v, list) and len(v) > 10:
+                                log_data[k] = f"<list of length {len(v)}>"
+                            else:
+                                log_data[k] = v
+                    else:
+                        log_data = msg_data
+
+                    # 高频消息降为 debug，避免日志文件被淹没
+                    _HIGH_FREQ_TYPES = frozenset({
+                        'mse_segment', 'mse_init', 'rooms_updated',
+                        'export_progress', 'medium_tick',
+                    })
+                    if msg_type in _HIGH_FREQ_TYPES:
+                        _log.debug(f"Received WS message: type={msg_type}")
+                    else:
+                        _log.info(f"Received WS message: type={msg_type}, data={log_data}")
+
                     # 调用对应的处理器
                     if msg_type in self.handlers:
                         result = await self.handlers[msg_type](msg_data)
                         if result is not None:
-                            await websocket.send(json.dumps({
+                            # 同样截断响应数据
+                            log_res = {}
+                            if isinstance(result, dict):
+                                for k, v in result.items():
+                                    if isinstance(v, str) and len(v) > 200:
+                                        log_res[k] = f"<str of length {len(v)}>"
+                                    elif isinstance(v, list) and len(v) > 10:
+                                        log_res[k] = f"<list of length {len(v)}>"
+                                    else:
+                                        log_res[k] = v
+                            else:
+                                log_res = result
+
+                            if msg_type in _HIGH_FREQ_TYPES:
+                                _log.debug(f"Sending WS response: type={msg_type}_response")
+                            else:
+                                _log.info(f"Sending WS response: type={msg_type}_response, data={log_res}")
+                            await websocket.send(_json_dumps({
                                 'type': f'{msg_type}_response',
                                 'data': result
                             }))
                     else:
-                        print(f"Unknown message type: {msg_type}")
+                        _log.warning(f"Unknown message type: {msg_type}")
 
                 except json.JSONDecodeError:
-                    print(f"Invalid JSON: {message}")
+                    _log.warning(f"Invalid JSON format received (truncated): {message[:500]}")
                 except Exception as e:
                     # 处理器抛异常时打印完整 traceback，并向客户端发送错误响应，避免前端永久等待
-                    print(f"Error handling message: {e}")
-                    print(traceback.format_exc())
+                    _log.error(f"Error handling message: {e}", exc_info=True)
                     if msg_type is not None:
                         try:
-                            await websocket.send(json.dumps({
+                            await websocket.send(_json_dumps({
                                 'type': f'{msg_type}_response',
                                 'data': {'success': False, 'error': str(e)}
                             }))
@@ -90,14 +158,29 @@ class LSCWebSocketServer:
             pass
         finally:
             self.clients.remove(websocket)
-            print(f"Client disconnected. Total: {len(self.clients)}")
+            _log.info(f"Client disconnected. Total: {len(self.clients)}")
     
     async def broadcast(self, message_type: str, data: Any):
         """广播消息给所有客户端"""
         if not self.clients:
             return
+
+        # 对大字段执行截断再打日志，以免产生超大日志文件
+        log_data = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, str) and len(v) > 200:
+                    log_data[k] = f"<str of length {len(v)}>"
+                elif isinstance(v, list) and len(v) > 10:
+                    log_data[k] = f"<list of length {len(v)}>"
+                else:
+                    log_data[k] = v
+        else:
+            log_data = data
+
+        _log.info(f"Broadcasting WS message: type={message_type}, data={log_data}")
             
-        message = json.dumps({
+        message = _json_dumps({
             'type': message_type,
             'data': data
         })
@@ -115,11 +198,11 @@ class LSCWebSocketServer:
         for port in ports_to_try:
             try:
                 if port != self.port:
-                    print(f"Port {self.port} unavailable, trying fallback port {port}...")
+                    _log.warning(f"Port {self.port} unavailable, trying fallback port {port}...")
                 async with websockets.serve(self.handle_client, self.host, port, max_size=16 * 1024 * 1024) as srv:
                     self._server = srv
                     self._bound_port = port
-                    print(f"WebSocket server listening on ws://{self.host}:{port}")
+                    _log.info(f"WebSocket server listening on ws://{self.host}:{port}")
                     await asyncio.Future()  # 永远运行
                     return  # 正常退出时返回
             except OSError as e:
@@ -155,12 +238,27 @@ def main():
     loop = asyncio.new_event_loop()
 
     async def _drain_broadcasts():
-        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。"""
+        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。
+
+        合并连续的 rooms_updated 消息：多房间同时变更状态时，
+        Qt 信号会快速触发多次 _queue_rooms_update，每次都序列化全部房间。
+        合并为只发送最新的一条，减少前端 JSON.parse 负载。
+        """
         while True:
             msg = bridge.get_broadcast(block=False)
             if msg is None:
                 await asyncio.sleep(0.1)
                 continue
+            if msg.get('type') == 'rooms_updated':
+                while True:
+                    next_msg = bridge.get_broadcast(block=False)
+                    if next_msg is None:
+                        break
+                    if next_msg.get('type') != 'rooms_updated':
+                        await server.broadcast(msg.get('type'), msg.get('data', {}))
+                        msg = next_msg
+                        break
+                    msg = next_msg
             await server.broadcast(msg.get('type'), msg.get('data', {}))
 
     def _run_ws():

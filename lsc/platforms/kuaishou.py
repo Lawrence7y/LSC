@@ -109,6 +109,16 @@ class KuaishouAdapter(BasePlatformAdapter):
             )
 
         selected_quality = next(iter(quality_urls), "")
+        category = ""
+        if isinstance(data, dict):
+            liveroom = data.get("liveroom") or {}
+            category = str(liveroom.get("category") or liveroom.get("gameName") or "")
+            if not category:
+                for key in ("category", "gameName", "tag"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val:
+                        category = val
+                        break
         return self._success(
             clean_url,
             stream_url=quality_urls.get(selected_quality, ""),
@@ -119,6 +129,7 @@ class KuaishouAdapter(BasePlatformAdapter):
             selected_quality=selected_quality,
             headers=dict(KUAISHOU_HEADERS),
             raw={},  # discard large page payload on success to save memory
+            category=category,
         )
 
     def _fetch_page(self, url: str) -> str:

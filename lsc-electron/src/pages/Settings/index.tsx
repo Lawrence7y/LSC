@@ -1,6 +1,6 @@
-import { useEffect } from 'react'
-import { Button, message } from 'antd'
-import { FolderOpenOutlined } from '@ant-design/icons'
+import { useEffect, useState } from 'react'
+import { Button, message, Tooltip, Progress } from 'antd'
+import { FolderOpenOutlined, ReloadOutlined, CheckCircleFilled, CloseCircleFilled, DownloadOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { RecordSettings, AppSettings } from '@/types'
@@ -11,12 +11,50 @@ export default function Settings() {
   const setSettings = useAppStore((state) => state.setSettings)
   const appSettings = useAppStore((state) => state.appSettings)
   const setAppSettings = useAppStore((state) => state.setAppSettings)
+  const dependencyStatus = useAppStore((state) => state.dependencyStatus)
+  const [checkingDeps, setCheckingDeps] = useState(false)
+  const [appVersion, setAppVersion] = useState('')
+  const [updateStatus, setUpdateStatus] = useState<{
+    type: string
+    version?: string
+    percent?: number
+    message?: string
+  } | null>(null)
+
+  useEffect(() => {
+    // 获取应用版本号
+    window.electronAPI?.getAppVersion().then((v: string) => setAppVersion(v))
+
+    // 监听更新状态
+    window.electronAPI?.onUpdateStatus((status: any) => {
+      setUpdateStatus(status)
+    })
+
+    return () => {
+      window.electronAPI?.removeUpdateStatusListeners()
+    }
+  }, [])
 
   useEffect(() => {
     if (isConnected) {
       send('get_settings', {})
+      setCheckingDeps(true)
+      send('check_dependencies', {})
     }
   }, [isConnected, send])
+
+  const handleRecheckDeps = () => {
+    if (!isConnected) return
+    setCheckingDeps(true)
+    send('check_dependencies', {})
+    setTimeout(() => setCheckingDeps(false), 5000)
+  }
+
+  // 依赖检测响应可能通过 check_dependencies_response 事件异步到达，
+  // checkingDeps 在收到响应后通过 store 变化自动消除
+  useEffect(() => {
+    if (dependencyStatus) setCheckingDeps(false)
+  }, [dependencyStatus])
 
   // 启动时从主进程同步开机自启/最小化到托盘的真实状态，避免与前端 store 不一致
   useEffect(() => {
@@ -25,11 +63,15 @@ export default function Settings() {
   }, [setAppSettings])
 
   const handleRecordChange = <K extends keyof RecordSettings>(key: K, value: RecordSettings[K]) => {
+    console.log('[Settings] 用户修改录制参数:', key, '->', value);
+
     setSettings({ [key]: value })
   }
 
   // 主题切换：更新 store + 实时切换 documentElement class（持久化由 handleSave 统一处理）
   const handleThemeChange = (value: AppSettings['theme']) => {
+    console.log('[Settings] 用户切换主题:', value);
+
     setAppSettings({ theme: value })
     if (value === 'dark') {
       document.documentElement.classList.add('dark')
@@ -41,22 +83,30 @@ export default function Settings() {
 
   // 开机自启：调用主进程 IPC + 同步 store
   const handleAutoLaunchChange = (v: boolean) => {
+    console.log('[Settings] 用户修改开机自启:', v);
+
     window.app?.setAutoLaunch(v)
     setAppSettings({ autoLaunch: v })
   }
 
   // 最小化到托盘：调用主进程 IPC + 同步 store
   const handleMinimizeToTrayChange = (v: boolean) => {
+    console.log('[Settings] 用户修改最小化到托盘:', v);
+
     window.app?.setMinimizeToTray(v)
     setAppSettings({ minimizeToTray: v })
   }
 
   const handleSave = () => {
+    console.log('[Settings] 用户保存设置');
+
     send('save_settings', { ...settings, appSettings })
     message.success('设置已保存')
   }
 
   const handleBrowse = async () => {
+    console.log('[Settings] 用户点击选择存储路径浏览按钮');
+
     if (window.electronAPI) {
       const dir = await window.electronAPI.selectDirectory()
       if (dir) {
@@ -67,8 +117,29 @@ export default function Settings() {
     }
   }
 
-  const handleCheckUpdate = () => {
-    message.info('当前已是最新版本 v1.0.0')
+  const handleCheckUpdate = async () => {
+    console.log('[Settings] 用户点击检查更新');
+
+    setUpdateStatus(null)
+    const result = await window.electronAPI?.checkForUpdate()
+    if (result && !result.success) {
+      message.error(`检查更新失败: ${result.error}`)
+    }
+  }
+
+  const handleDownloadUpdate = async () => {
+    console.log('[Settings] 用户点击下载更新');
+
+    const result = await window.electronAPI?.downloadUpdate()
+    if (result && !result.success) {
+      message.error(`下载失败: ${result.error}`)
+    }
+  }
+
+  const handleInstallUpdate = () => {
+    console.log('[Settings] 用户点击安装更新并重启');
+
+    window.electronAPI?.installUpdate()
   }
 
   return (
@@ -120,7 +191,11 @@ export default function Settings() {
             <SettingsRow label="语言">
               <select
                 value={appSettings.language}
-                onChange={e => setAppSettings({ language: e.target.value as AppSettings['language'] })}
+                onChange={e => {
+                  const newLang = e.target.value as AppSettings['language']
+                  setAppSettings({ language: newLang })
+                  send('save_settings', { ...settings, appSettings: { ...appSettings, language: newLang } })
+                }}
                 className="settings-select"
               >
                 <option value="zh-CN">简体中文</option>
@@ -138,6 +213,66 @@ export default function Settings() {
               <ToggleSwitch
                 checked={appSettings.minimizeToTray}
                 onChange={handleMinimizeToTrayChange}
+              />
+            </SettingsRow>
+          </div>
+        </div>
+
+        {/* 系统环境 */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            fontSize: 13,
+            fontWeight: 600,
+            color: 'var(--text-300)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.04em',
+            padding: '0 4px',
+            marginBottom: 8,
+          }}>
+            <span>系统环境</span>
+            <Button
+              type="text"
+              size="small"
+              icon={<ReloadOutlined spin={checkingDeps} />}
+              onClick={handleRecheckDeps}
+              disabled={!isConnected || checkingDeps}
+            >
+              重新检测
+            </Button>
+          </div>
+          <div style={{
+            background: 'var(--background-800)',
+            borderRadius: 14,
+            overflow: 'hidden',
+          }}>
+            <SettingsRow label="FFmpeg">
+              <DepStatus
+                ok={dependencyStatus?.ffmpeg.available}
+                version={dependencyStatus?.ffmpeg.version}
+                path={dependencyStatus?.ffmpeg.path}
+              />
+            </SettingsRow>
+            <SettingsRow label="FFprobe">
+              <DepStatus
+                ok={dependencyStatus?.ffprobe.available}
+                version={dependencyStatus?.ffprobe.version}
+                path={dependencyStatus?.ffprobe.path}
+              />
+            </SettingsRow>
+            <SettingsRow label="NVENC 硬件编码">
+              <DepStatus
+                ok={dependencyStatus?.nvenc.available}
+                version={dependencyStatus?.nvenc.available ? 'h264_nvenc 可用' : '不可用'}
+              />
+            </SettingsRow>
+            <SettingsRow label="Python">
+              <DepStatus
+                ok={dependencyStatus?.python.version ? true : undefined}
+                version={dependencyStatus?.python.version}
+                path={dependencyStatus?.python.path}
               />
             </SettingsRow>
           </div>
@@ -172,6 +307,18 @@ export default function Settings() {
                 <option value="流畅">流畅</option>
               </select>
             </SettingsRow>
+            <SettingsRow label="预览画质">
+              <select
+                value={settings.preview_quality}
+                onChange={e => handleRecordChange('preview_quality', e.target.value)}
+                className="settings-select"
+              >
+                <option value="原画">原画（不缩放）</option>
+                <option value="高清">高清 720p</option>
+                <option value="标清">标清 480p</option>
+                <option value="流畅">流畅 360p</option>
+              </select>
+            </SettingsRow>
             <SettingsRow label="默认编码器">
               <select
                 value={settings.encoder}
@@ -185,6 +332,42 @@ export default function Settings() {
                 <option value="hevc_nvenc">hevc_nvenc</option>
               </select>
             </SettingsRow>
+            <SettingsRow label="编码参数">
+              <select
+                value={settings.param_mode}
+                onChange={e => handleRecordChange('param_mode', e.target.value)}
+                className="settings-select"
+              >
+                <option value="CRF 质量">CRF 质量</option>
+                <option value="码率限制">码率限制</option>
+                <option value="不限制">不限制</option>
+              </select>
+            </SettingsRow>
+            {settings.param_mode === '码率限制' && settings.encoder !== 'copy' && (
+              <SettingsRow label="码率">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <select
+                    value={settings.bitrate_unit}
+                    onChange={e => handleRecordChange('bitrate_unit', e.target.value)}
+                    className="settings-select"
+                    style={{ width: 80 }}
+                  >
+                    <option value="kbps">kbps</option>
+                    <option value="Mbps">Mbps</option>
+                  </select>
+                  <select
+                    value={String(settings.bitrate)}
+                    onChange={e => handleRecordChange('bitrate', e.target.value)}
+                    className="settings-select"
+                    style={{ flex: 1 }}
+                  >
+                    {[1000, 2000, 4000, 6000, 8000, 10000, 12000, 15000, 20000].map(b => (
+                      <option key={b} value={String(b)}>{b}</option>
+                    ))}
+                  </select>
+                </div>
+              </SettingsRow>
+            )}
             <SettingsRow label="CRF">
               <input 
                 type="number" 
@@ -310,10 +493,59 @@ export default function Settings() {
             overflow: 'hidden',
           }}>
             <SettingsRow label="版本">
-              <span style={{ fontSize: 13, color: 'var(--text-400)' }}>1.0.0</span>
+              <span style={{ fontSize: 13, color: 'var(--text-400)' }}>v{appVersion || '1.0.0'}</span>
             </SettingsRow>
             <SettingsRow label="">
-              <Button onClick={handleCheckUpdate}>检查更新</Button>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+                {updateStatus?.type === 'checking' && (
+                  <span style={{ fontSize: 12, color: 'var(--text-400)' }}>正在检查更新...</span>
+                )}
+                {updateStatus?.type === 'not-available' && (
+                  <span style={{ fontSize: 12, color: 'var(--state-success)' }}>
+                    ✓ 已是最新版本 v{updateStatus.version}
+                  </span>
+                )}
+                {updateStatus?.type === 'available' && (
+                  <>
+                    <span style={{ fontSize: 12, color: 'var(--brand-400)' }}>
+                      发现新版本 v{updateStatus.version}
+                    </span>
+                    <Button type="primary" size="small" icon={<DownloadOutlined />} onClick={handleDownloadUpdate}>
+                      下载更新
+                    </Button>
+                  </>
+                )}
+                {updateStatus?.type === 'downloading' && (
+                  <div style={{ width: 200 }}>
+                    <div style={{ fontSize: 12, color: 'var(--text-400)', marginBottom: 4 }}>
+                      下载中 {updateStatus.percent}%
+                    </div>
+                    <Progress percent={updateStatus.percent} showInfo={false} size="small" />
+                  </div>
+                )}
+                {updateStatus?.type === 'downloaded' && (
+                  <>
+                    <span style={{ fontSize: 12, color: 'var(--state-success)' }}>
+                      v{updateStatus.version} 已下载完成
+                    </span>
+                    <Button type="primary" size="small" onClick={handleInstallUpdate}>
+                      立即安装并重启
+                    </Button>
+                  </>
+                )}
+                {updateStatus?.type === 'error' && (
+                  <span style={{ fontSize: 12, color: 'var(--state-error)' }}>
+                    {updateStatus.message || '更新失败'}
+                  </span>
+                )}
+                <Button
+                  onClick={handleCheckUpdate}
+                  loading={updateStatus?.type === 'checking'}
+                  disabled={updateStatus?.type === 'downloading'}
+                >
+                  检查更新
+                </Button>
+              </div>
             </SettingsRow>
           </div>
         </div>
@@ -385,6 +617,35 @@ export default function Settings() {
           border-color: var(--brand-500);
         }
       `}</style>
+    </div>
+  )
+}
+
+function DepStatus({ ok, version, path: depPath }: { ok: boolean | undefined; version?: string; path?: string }) {
+  if (ok === undefined) {
+    return <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>检测中...</span>
+  }
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      {ok ? (
+        <CheckCircleFilled style={{ color: '#52c41a', fontSize: 14 }} />
+      ) : (
+        <CloseCircleFilled style={{ color: '#ff4d4f', fontSize: 14 }} />
+      )}
+      {version && (
+        <Tooltip title={depPath || ''}>
+          <span style={{
+            fontSize: 12,
+            color: ok ? 'var(--text-secondary)' : 'var(--state-error)',
+            maxWidth: 200,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}>
+            {version}
+          </span>
+        </Tooltip>
+      )}
     </div>
   )
 }

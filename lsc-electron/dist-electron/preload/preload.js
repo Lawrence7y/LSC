@@ -12,8 +12,17 @@ electron.contextBridge.exposeInMainWorld("electronAPI", {
   // 文件操作
   selectDirectory: () => electron.ipcRenderer.invoke("select-directory"),
   openPath: (path) => electron.ipcRenderer.invoke("open-path", path),
-  // 在资源管理器中高亮定位文件（区别于 openPath 会用默认程序打开文件）
-  showItemInFolder: (path) => electron.ipcRenderer.invoke("show-item-in-folder", path)
+  showItemInFolder: (path) => electron.ipcRenderer.invoke("show-item-in-folder", path),
+  // 自动更新
+  checkForUpdate: () => electron.ipcRenderer.invoke("check-for-update"),
+  downloadUpdate: () => electron.ipcRenderer.invoke("download-update"),
+  installUpdate: () => electron.ipcRenderer.invoke("install-update"),
+  onUpdateStatus: (callback) => {
+    electron.ipcRenderer.on("update-status", (_event, status) => callback(status));
+  },
+  removeUpdateStatusListeners: () => {
+    electron.ipcRenderer.removeAllListeners("update-status");
+  }
 });
 electron.contextBridge.exposeInMainWorld("app", {
   setAutoLaunch: async (enabled) => {

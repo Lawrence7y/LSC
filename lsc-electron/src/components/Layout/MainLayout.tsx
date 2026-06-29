@@ -1,37 +1,34 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
-import { Layout, Menu, Badge, Button } from 'antd'
+import { Layout, Menu, Button } from 'antd'
 import {
-  HomeOutlined,
   DesktopOutlined,
   SettingOutlined,
   BulbOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
 import type { ConnectionStatus } from '@/store/appStore'
 
-const { Sider, Content, Header } = Layout
+const { Sider, Content } = Layout
 
 const connectionDotColors: Record<ConnectionStatus, string> = {
   connected: 'var(--state-success)',
   connecting: 'var(--state-warning)',
   disconnected: 'var(--state-error)',
+  reconnect_failed: 'var(--state-error)',
 }
 
 const connectionLabels: Record<ConnectionStatus, string> = {
   connected: '已连接',
   connecting: '连接中',
   disconnected: '未连接',
+  reconnect_failed: '连接失败',
 }
 
 const menuItems = [
-  {
-    key: '/',
-    icon: <HomeOutlined />,
-    label: '仪表盘',
-  },
   {
     key: '/workbench',
     icon: <DesktopOutlined />,
@@ -47,7 +44,7 @@ const menuItems = [
 export default function MainLayout() {
   const navigate = useNavigate()
   const location = useLocation()
-  const { isConnected, send } = useWebSocket()
+  const { isConnected, send, reconnect } = useWebSocket()
   const connectionStatus = useAppStore((state) => state.connectionStatus)
   const appSettings = useAppStore((state) => state.appSettings)
   const setAppSettings = useAppStore((state) => state.setAppSettings)
@@ -93,14 +90,12 @@ export default function MainLayout() {
   // 全局页面导航快捷键
   useKeyboardShortcuts(
     [
-      { key: '1', ctrl: true, id: 'page:dashboard' },
-      { key: '2', ctrl: true, id: 'page:workbench' },
-      { key: '3', ctrl: true, id: 'page:settings' },
+      { key: '1', ctrl: true, id: 'page:workbench' },
+      { key: '2', ctrl: true, id: 'page:settings' },
     ],
     useCallback(
       (id: string) => {
-        if (id === 'page:dashboard') navigate('/')
-        else if (id === 'page:workbench') navigate('/workbench')
+        if (id === 'page:workbench') navigate('/workbench')
         else if (id === 'page:settings') navigate('/settings')
       },
       [navigate]
@@ -129,7 +124,7 @@ export default function MainLayout() {
           borderBottom: '1px solid var(--border-default)',
         }}>
           <img 
-            src="/assets/logo.png" 
+            src="./assets/logo.png" 
             alt="LSC Logo" 
             style={{
               width: 32,
@@ -171,25 +166,64 @@ export default function MainLayout() {
           }}
         />
 
-        {/* Footer */}
+        {/* Footer — 连接状态(4种) + 重连按钮 + 主题切换(底部居中) */}
         <div style={{
-          padding: '10px 0 14px',
+          padding: '10px 12px 14px',
           borderTop: '1px solid var(--border-default)',
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
-          gap: 6,
+          gap: 8,
         }}>
-          <Badge
-            status={isConnected ? 'success' : 'error'}
-            text={<span style={{ fontSize: 12, color: isConnected ? 'var(--state-success)' : 'var(--state-error)' }}>{isConnected ? '已连接' : '未连接'}</span>}
-          />
+          {/* 连接状态指示器 (4种状态) */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '4px 10px',
+            borderRadius: 6,
+            background: 'var(--bg-tertiary)',
+            border: '1px solid var(--border-default)',
+            width: '100%',
+            justifyContent: 'center',
+          }}>
+            <div style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: connectionDotColors[connectionStatus],
+              boxShadow:
+                connectionStatus === 'connecting'
+                  ? `0 0 0 2px rgba(255, 149, 0, 0.2), 0 0 8px ${connectionDotColors[connectionStatus]}`
+                  : `0 0 8px ${connectionDotColors[connectionStatus]}`,
+              flexShrink: 0,
+            }} />
+            <span style={{
+              fontSize: 12,
+              fontWeight: 500,
+              color: 'var(--text-secondary)',
+            }}>
+              {connectionLabels[connectionStatus]}
+            </span>
+          </div>
+          {/* 重连按钮：仅在断开/失败时显示 */}
+          {(connectionStatus === 'disconnected' || connectionStatus === 'reconnect_failed') && (
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              onClick={reconnect}
+              style={{ fontSize: 12 }}
+            >
+              重新连接
+            </Button>
+          )}
+          {/* 主题切换按钮 — 底部居中 */}
           <Button
             type="text"
             size="small"
             icon={<BulbOutlined />}
             onClick={handleToggleTheme}
-            style={{ color: 'var(--text-50)', fontSize: 12 }}
+            style={{ color: 'var(--text-50)', fontSize: 12, marginTop: 4 }}
           >
             {appSettings.theme === 'dark' ? '浅色' : '深色'}
           </Button>
@@ -226,64 +260,7 @@ export default function MainLayout() {
           </div>
         )}
 
-        {/* Page Header */}
-        <Header style={{
-          height: 64,
-          minHeight: 64,
-          background: 'var(--background-900)',
-          borderBottom: '1px solid var(--border-default)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '0 24px',
-        }}>
-          <h1 style={{
-            fontSize: 17,
-            fontWeight: 600,
-            color: 'var(--text-50)',
-            letterSpacing: '-0.01em',
-            margin: 0,
-          }}>
-            {location.pathname === '/' && '仪表盘'}
-            {location.pathname === '/workbench' && '多房间管理'}
-            {location.pathname === '/settings' && '设置'}
-          </h1>
-
-          {/* Connection Status Indicator */}
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              padding: '4px 10px',
-              borderRadius: 6,
-              background: 'var(--bg-secondary)',
-              border: '1px solid var(--border-default)',
-            }}
-          >
-            <div
-              style={{
-                width: 8,
-                height: 8,
-                borderRadius: '50%',
-                background: connectionDotColors[connectionStatus],
-                boxShadow:
-                  connectionStatus === 'connecting'
-                    ? `0 0 0 2px rgba(255, 149, 0, 0.2), 0 0 8px ${connectionDotColors[connectionStatus]}`
-                    : `0 0 8px ${connectionDotColors[connectionStatus]}`,
-              }}
-            />
-            <span style={{
-              fontSize: 12,
-              fontWeight: 500,
-              color: 'var(--text-secondary)',
-            }}>
-              {connectionLabels[connectionStatus]}
-            </span>
-          </div>
-        </Header>
-
-        {/* Content */}
+        {/* Content — 问题7：删除了顶部标题和右侧连接状态指示器 */}
         <Content style={{
           flex: 1,
           overflow: 'auto',

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, memo } from 'react'
-import { Card, Tag, Space, Button, Tooltip, Modal } from 'antd'
+import { Card, Space, Button, Tooltip, Modal, Select } from 'antd'
 import {
   PlayCircleOutlined,
   DeleteOutlined,
@@ -17,6 +17,14 @@ import { VideoPreview } from '@/components/VideoPreview'
 import { formatTime } from '@/utils/time'
 import { useAppStore } from '@/store/appStore'
 
+// 预览画质选项（值与后端 _PREVIEW_QUALITY_PRESETS 及 Settings 页面一致）
+const PREVIEW_QUALITY_OPTIONS = [
+  { value: '原画', label: '原画' },
+  { value: '高清', label: '高清' },
+  { value: '标清', label: '标清' },
+  { value: '流畅', label: '流畅' },
+]
+
 interface RoomCardProps {
   room: RoomSession
   selected: boolean
@@ -31,8 +39,10 @@ interface RoomCardProps {
   onTogglePreview: (roomId: string, enabled: boolean) => void
   onToggleMute: (roomId: string) => void
   onFullscreen: (roomId: string) => void
-  /** 当前全屏的 roomId（用于 CSS 全屏切换：fixed 浮起 + 占位文字） */
-  fullscreenRoomId?: string | null
+  /** 点击 checkbox 切换多选状态（无需 Ctrl 键） */
+  onToggleMultiSelect?: (roomId: string, e: React.MouseEvent) => void
+  /** 当前放大的 roomId（CSS 放大：VideoPreview 用 position:fixed 浮起，不销毁实例） */
+  expandedRoomId?: string | null
 }
 
 type RoomStatus = 'recording' | 'connected' | 'connecting' | 'failed' | 'idle'
@@ -71,7 +81,8 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
   if (prev.onTogglePreview !== next.onTogglePreview) return false
   if (prev.onToggleMute !== next.onToggleMute) return false
   if (prev.onFullscreen !== next.onFullscreen) return false
-  if (prev.fullscreenRoomId !== next.fullscreenRoomId) return false
+  if (prev.onToggleMultiSelect !== next.onToggleMultiSelect) return false
+  if (prev.expandedRoomId !== next.expandedRoomId) return false
 
   // room 字段级浅比较
   const a = prev.room
@@ -112,11 +123,15 @@ export const RoomCard = memo(function RoomCard({
   onTogglePreview,
   onToggleMute,
   onFullscreen,
-  fullscreenRoomId,
+  onToggleMultiSelect,
+  expandedRoomId,
 }: RoomCardProps) {
   const [tick, setTick] = useState(0)
   const [disconnecting, setDisconnecting] = useState(false)
+  const [previewQuality, setPreviewQuality] = useState('高清')
   const updateRoom = useAppStore((state) => state.updateRoom)
+  // 放大状态：CSS 放大（不销毁 VideoPreview 实例）
+  const isExpanded = expandedRoomId === room.room_id
 
   useEffect(() => {
     if (!room.is_recording) return
@@ -137,6 +152,19 @@ export const RoomCard = memo(function RoomCard({
       }
       .room-card-recording-bar {
         animation: roomCardPulse 1.5s ease-in-out infinite;
+      }
+      .preview-quality-select .ant-select-selector {
+        background: rgba(0,0,0,0.5) !important;
+        backdrop-filter: blur(8px);
+        border-radius: 4px !important;
+        color: #fff !important;
+        font-size: 11px !important;
+        height: 26px !important;
+        min-height: 26px !important;
+        padding: 0 6px !important;
+      }
+      .preview-quality-select .ant-select-arrow {
+        color: rgba(255,255,255,0.7) !important;
       }
     `
     document.head.appendChild(style)
@@ -164,12 +192,12 @@ export const RoomCard = memo(function RoomCard({
       style={{
         background: selected ? 'var(--bg-tertiary)' : 'var(--bg-secondary)',
         border: multiSelected
-          ? '1px solid var(--state-warning)'
+          ? '1px solid var(--accent-primary)'
           : selected
             ? '1px solid var(--accent-primary)'
             : '1px solid transparent',
         boxShadow: multiSelected
-          ? '0 0 0 2px rgba(255, 149, 0, 0.2), 0 0 12px rgba(255, 149, 0, 0.15)'
+          ? '0 0 0 2px rgba(0, 122, 255, 0.15), 0 0 12px rgba(0, 122, 255, 0.12)'
           : selected
           ? '0 0 0 3px rgba(0, 122, 255, 0.12), 0 0 16px rgba(0, 122, 255, 0.22)'
           : 'none',
@@ -181,10 +209,10 @@ export const RoomCard = memo(function RoomCard({
       <div
         style={{
           width: '100%',
-          height: 160,
-          background: 'var(--background-900)',
-          borderRadius: 6,
-          marginBottom: 12,
+          height: 180,
+          background: '#0a0a0a',
+          borderRadius: 8,
+          marginBottom: 10,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
@@ -192,6 +220,49 @@ export const RoomCard = memo(function RoomCard({
           overflow: 'hidden',
         }}
       >
+        {/* 多选 Checkbox */}
+        {onToggleMultiSelect && (
+          <div
+            role="checkbox"
+            aria-checked={multiSelected || selected}
+            onClick={(e) => {
+              e.stopPropagation()
+              onToggleMultiSelect(room.room_id, e)
+            }}
+            title={multiSelected || selected ? '取消选择' : '选择此房间'}
+            style={{
+              position: 'absolute',
+              top: 8,
+              left: 8,
+              zIndex: 5,
+              width: 22,
+              height: 22,
+              borderRadius: 6,
+              border: `2px solid ${
+                multiSelected || selected
+                  ? 'var(--accent-primary)'
+                  : 'rgba(255,255,255,0.45)'
+              }`,
+              background:
+                multiSelected || selected
+                  ? 'var(--accent-primary)'
+                  : 'rgba(0,0,0,0.45)',
+              backdropFilter: 'blur(8px)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              transition: 'all .15s ease',
+              color: '#fff',
+              fontSize: 13,
+              fontWeight: 700,
+              lineHeight: 1,
+              userSelect: 'none',
+            }}
+          >
+            {multiSelected || selected ? '✓' : ''}
+          </div>
+        )}
         {room.last_error ? (
           <div style={{ textAlign: 'center', padding: '0 16px' }}>
             <div
@@ -222,68 +293,49 @@ export const RoomCard = memo(function RoomCard({
           </div>
         ) : !room.is_connected ? (
           <div style={{ textAlign: 'center' }}>
-            <VideoCameraOutlined style={{ fontSize: 32, color: 'var(--text-500)' }} />
-            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>未连接</div>
+            <VideoCameraOutlined style={{ fontSize: 36, color: 'rgba(255,255,255,0.3)' }} />
+            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', marginTop: 6 }}>未连接</div>
           </div>
         ) : room.preview_enabled ? (
           <>
-            {/* VideoPreview 容器：全屏时 position:fixed 浮起覆盖视口，非全屏时填充 120px 预览区 */}
-            <div
-              style={
-                fullscreenRoomId === room.room_id
-                  ? {
-                      position: 'fixed',
-                      inset: 0,
-                      zIndex: 9999,
-                      background: '#000',
-                      borderRadius: 0,
-                    }
-                  : {
-                      position: 'relative',
-                      width: '100%',
-                      height: '100%',
-                    }
-              }
-            >
+            {/* VideoPreview 实例始终保持挂载，放大时通过 CSS position:fixed 浮起，
+                不销毁/重建 MsePlayer，避免缓冲区丢失和卡顿 */}
+            <div style={{ position: 'relative', width: '100%', height: '100%' }}>
               <VideoPreview
                 key={`preview-${room.room_id}`}
                 roomId={room.room_id}
                 active={true}
                 send={send}
-                controls={fullscreenRoomId === room.room_id}
-                style={{ width: '100%', height: '100%' }}
+                controls={isExpanded}
+                style={
+                  isExpanded
+                    ? {
+                        position: 'fixed',
+                        inset: 0,
+                        zIndex: 9999,
+                        width: '100vw',
+                        height: '100vh',
+                        background: '#000',
+                        borderRadius: 0,
+                      }
+                    : { width: '100%', height: '100%' }
+                }
                 muted={room.preview_muted}
               />
-              {/* 全屏时右上角"退出全屏"按钮浮层 */}
-              {fullscreenRoomId === room.room_id && (
+              {/* 放大时的退出按钮 */}
+              {isExpanded && (
                 <Button
                   icon={<CloseOutlined />}
-                  style={{ position: 'absolute', top: 12, right: 12, zIndex: 10 }}
+                  style={{ position: 'fixed', top: 12, right: 12, zIndex: 10000 }}
                   onClick={(e) => {
                     e.stopPropagation()
                     onFullscreen(room.room_id)
                   }}
                 >
-                  退出全屏
+                  退出放大
                 </Button>
               )}
             </div>
-            {/* 全屏时原 120px 预览区显示占位文字（VideoPreview 已 fixed 浮起，原位置空出） */}
-            {fullscreenRoomId === room.room_id && (
-              <div
-                style={{
-                  position: 'absolute',
-                  inset: 0,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  color: 'var(--text-tertiary)',
-                  fontSize: 12,
-                }}
-              >
-                预览已全屏
-              </div>
-            )}
             {room.mse_error && (
               <div
                 style={{
@@ -310,23 +362,83 @@ export const RoomCard = memo(function RoomCard({
                 >
                   {room.mse_error}
                 </span>
+                <button
+                  onClick={() => updateRoom(room.room_id, { mse_error: undefined })}
+                  style={{
+                    marginTop: 4,
+                    padding: '4px 12px',
+                    fontSize: 11,
+                    borderRadius: 4,
+                    border: 'none',
+                    background: 'rgba(255,255,255,0.15)',
+                    color: '#fff',
+                    cursor: 'pointer',
+                  }}
+                >
+                  重试
+                </button>
               </div>
             )}
-            <Button
-              size="small"
-              style={{ position: 'absolute', bottom: 8, right: 8, zIndex: 3 }}
-              onClick={(e) => {
-                e.stopPropagation()
-                updateRoom(room.room_id, { mse_error: undefined })
-                onTogglePreview(room.room_id, false)
+            {/* 底部渐变栏：画质选择 + 预览控制 */}
+            <div
+              style={{
+                position: 'absolute',
+                bottom: 0,
+                left: 0,
+                right: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '6px 8px',
+                background: 'linear-gradient(transparent, rgba(0,0,0,0.7))',
+                zIndex: 3,
               }}
             >
-              停止预览
-            </Button>
+              <Select
+                size="small"
+                value={previewQuality}
+                onChange={(v) => {
+                  setPreviewQuality(v)
+                  send('set_preview_quality', { room_id: room.room_id, quality: v })
+                }}
+                onClick={(e) => e.stopPropagation()}
+                style={{ width: 88 }}
+                popupMatchSelectWidth={false}
+                options={PREVIEW_QUALITY_OPTIONS}
+                variant="borderless"
+                className="preview-quality-select"
+              />
+              <Space size={2}>
+                <Tooltip title={room.preview_muted ? '取消静音' : '静音'}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={room.preview_muted ? <MutedOutlined /> : <SoundOutlined />}
+                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 6 }}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onToggleMute(room.room_id)
+                    }}
+                  />
+                </Tooltip>
+                <Tooltip title="放大">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<FullscreenOutlined />}
+                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 6 }}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onFullscreen(room.room_id)
+                    }}
+                  />
+                </Tooltip>
+              </Space>
+            </div>
           </>
         ) : (
           <div style={{ textAlign: 'center' }}>
-            <PlayCircleOutlined style={{ fontSize: 32, color: 'var(--accent-primary)' }} />
+            <PlayCircleOutlined style={{ fontSize: 36, color: 'var(--accent-primary)' }} />
             <div style={{ marginTop: 6 }}>
               <Button
                 size="small"
@@ -340,39 +452,62 @@ export const RoomCard = memo(function RoomCard({
             </div>
           </div>
         )}
-
-        {/* 状态 badge */}
+      
+        {/* 状态 badge（左上角，偏移到 checkbox 右侧） */}
         <div
           style={{
             position: 'absolute',
             top: 8,
-            left: 8,
+            left: onToggleMultiSelect ? 38 : 8,
             display: 'flex',
             alignItems: 'center',
             gap: 6,
-            background: 'var(--bg-tertiary)',
-            padding: '2px 8px',
-            borderRadius: 4,
           }}
         >
           <div
             style={{
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              background: statusColors[status],
-              boxShadow:
-                status === 'recording'
-                  ? `0 0 8px ${statusColors[status]}`
-                  : 'none',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5,
+              background: 'rgba(0,0,0,0.65)',
+              backdropFilter: 'blur(8px)',
+              padding: '3px 8px',
+              borderRadius: 6,
             }}
-          />
-          <span style={{ fontSize: 11, color: 'var(--text-50)' }}>
-            {statusLabels[status]}
-          </span>
+          >
+            <div
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                background: statusColors[status],
+                boxShadow:
+                  status === 'recording'
+                    ? `0 0 8px ${statusColors[status]}`
+                    : 'none',
+              }}
+            />
+            <span style={{ fontSize: 11, color: '#fff' }}>
+              {statusLabels[status]}
+            </span>
+          </div>
+          {/* 平台标签 */}
+          <div
+            style={{
+              background: 'rgba(0,0,0,0.65)',
+              backdropFilter: 'blur(8px)',
+              padding: '3px 8px',
+              borderRadius: 6,
+              fontSize: 10,
+              color: '#fff',
+              fontWeight: 500,
+            }}
+          >
+            {room.platform_name || '未知平台'}
+          </div>
         </div>
-
-        {/* 房间信息 */}
+      
+        {/* 录制时间（右上角，始终暗色） */}
         {room.is_recording && room.record_started_at && (
           <div
             style={{
@@ -380,29 +515,31 @@ export const RoomCard = memo(function RoomCard({
               top: 8,
               right: 8,
               background: 'rgba(0,0,0,0.7)',
+              backdropFilter: 'blur(8px)',
               padding: '2px 8px',
-              borderRadius: 4,
+              borderRadius: 6,
               fontSize: 11,
-              color: 'var(--text-50)',
+              color: '#fff',
               fontFamily: 'monospace',
             }}
           >
             {formatTime(recordingElapsedSeconds)}
           </div>
         )}
-
-        {/* 录制文件大小（录制中时显示） */}
+      
+        {/* 录制文件大小（右上角时间下方，始终暗色） */}
         {room.is_recording && room.record_size_mb > 0 && (
           <div
             style={{
               position: 'absolute',
               top: 30,
               right: 8,
-              background: 'rgba(0,0,0,0.5)',
+              background: 'rgba(0,0,0,0.55)',
+              backdropFilter: 'blur(8px)',
               padding: '1px 6px',
               borderRadius: 4,
               fontSize: 10,
-              color: 'var(--text-300)',
+              color: 'rgba(255,255,255,0.75)',
               fontFamily: 'monospace',
             }}
           >
@@ -411,19 +548,7 @@ export const RoomCard = memo(function RoomCard({
               : `${room.record_size_mb.toFixed(0)} MB`}
           </div>
         )}
-
-        {/* 平台标签 */}
-        <Tag
-          style={{
-            position: 'absolute',
-            bottom: 8,
-            left: 8,
-            margin: 0,
-          }}
-        >
-          {room.platform_name || '未知平台'}
-        </Tag>
-
+      
         {/* 录制中指示条（脉冲动画提示录制进行中） */}
         {room.is_recording && (
           <div
@@ -440,41 +565,44 @@ export const RoomCard = memo(function RoomCard({
           />
         )}
       </div>
-
+      
       {/* 房间信息 */}
-      <div style={{ marginBottom: 8 }}>
+      <div style={{ marginBottom: 10 }}>
         <div
           style={{
-            fontWeight: 500,
+            fontWeight: 600,
             fontSize: 14,
-            marginBottom: 4,
+            marginBottom: 2,
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
           }}
         >
           <Tooltip title={room.streamer_name || '未知主播'}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
               {room.streamer_name || '未知主播'}
             </span>
           </Tooltip>
-          {/* Multi-select sync badge */}
+          {/* Multi-select badge: "已选中" (blue) — not "已同步" which only applies after audio alignment */}
           {multiSelected && (
             <span style={{
               display: 'inline-flex',
               alignItems: 'center',
               gap: 4,
-              marginLeft: 8,
               padding: '1px 6px',
               borderRadius: 4,
-              fontSize: 10,
+              fontSize: 9,
               fontWeight: 600,
-              background: 'rgba(255, 149, 0, 0.15)',
-              color: 'var(--state-warning)',
-              border: '1px solid rgba(255, 149, 0, 0.3)',
+              background: 'rgba(0, 122, 255, 0.12)',
+              color: 'var(--accent-primary)',
+              border: '1px solid rgba(0, 122, 255, 0.25)',
+              flexShrink: 0,
             }}>
-              <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--state-warning)' }} />
-              已同步
+              <span style={{ display: 'inline-block', width: 5, height: 5, borderRadius: '50%', background: 'var(--accent-primary)' }} />
+              已选中
             </span>
           )}
         </div>
@@ -492,133 +620,108 @@ export const RoomCard = memo(function RoomCard({
           </div>
         </Tooltip>
       </div>
-
-      {/* 操作按钮 */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
-        <Space size={2}>
-          {!room.is_connected ? (
-            <Tooltip title="连接">
-              <Button
-                type="text"
-                size="small"
-                icon={<LinkOutlined />}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onConnect(room.room_id)
-                }}
-                disabled={room.is_connecting}
-                loading={room.is_connecting}
-              />
-            </Tooltip>
-          ) : (
-            <Tooltip title="断开">
-              <Button
-                type="text"
-                size="small"
-                icon={<DisconnectOutlined />}
-                loading={disconnecting}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  if (disconnecting) return
-                  setDisconnecting(true)
-                  try {
-                    onDisconnect(room.room_id)
-                  } finally {
-                    // send 为同步发送消息，1.5s 后重置以提供视觉反馈
-                    setTimeout(() => setDisconnecting(false), 1500)
-                  }
-                }}
-              />
-            </Tooltip>
-          )}
-
-          {room.is_connected && !room.is_recording && (
-            <Tooltip title="开始录制">
-              <Button
-                type="text"
-                size="small"
-                icon={<PlayCircleOutlined />}
-                style={{ color: 'var(--state-success)' }}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onStartRecord(room.room_id)
-                }}
-              />
-            </Tooltip>
-          )}
-
-          {room.is_recording && (
-            <Tooltip title="停止录制">
-              <Button
-                type="text"
-                size="small"
-                icon={<StopOutlined />}
-                danger
-                onClick={(e) => {
-                  e.stopPropagation()
-                  Modal.confirm({
-                    title: '确认停止录制',
-                    content: `确定要停止房间"${room.streamer_name || '未知主播'}"的录制吗？`,
-                    okText: '确认停止',
-                    cancelText: '取消',
-                    okButtonProps: { danger: true },
-                    onOk: () => onStopRecord(room.room_id),
-                  })
-                }}
-              />
-            </Tooltip>
-          )}
-
-          {room.preview_enabled && (
-            <Tooltip title={room.preview_muted ? '取消静音' : '静音'}>
-              <Button
-                type="text"
-                size="small"
-                icon={room.preview_muted ? <MutedOutlined /> : <SoundOutlined />}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onToggleMute(room.room_id)
-                }}
-              />
-            </Tooltip>
-          )}
-
-          {room.preview_enabled && (
-            <Tooltip title="全屏放大">
-              <Button
-                type="text"
-                size="small"
-                icon={<FullscreenOutlined />}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onFullscreen(room.room_id)
-                }}
-              />
-            </Tooltip>
-          )}
-        </Space>
-
-        <Space size={2}>
-          <Tooltip title="删除房间">
-            <Button
-              type="text"
-              size="small"
-              icon={<DeleteOutlined />}
-              danger
-              onClick={(e) => {
-                e.stopPropagation()
-                Modal.confirm({
-                  title: '确认删除',
-                  content: `确定要删除房间"${room.streamer_name || '未知主播'}"吗？此操作不可撤销。`,
-                  okText: '确认删除',
-                  cancelText: '取消',
-                  okButtonProps: { danger: true },
-                  onOk: () => onRemove(room.room_id),
-                })
-              }}
-            />
-          </Tooltip>
-        </Space>
+      
+      {/* 操作按钮：重新设计的布局 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        {/* 主操作按钮（占据主要宽度） */}
+        {!room.is_connected ? (
+          <Button
+            type="primary"
+            size="small"
+            icon={<LinkOutlined />}
+            onClick={(e) => {
+              e.stopPropagation()
+              onConnect(room.room_id)
+            }}
+            disabled={room.is_connecting}
+            loading={room.is_connecting}
+            style={{ flex: 1 }}
+          >
+            连接
+          </Button>
+        ) : room.is_recording ? (
+          <Button
+            size="small"
+            icon={<StopOutlined />}
+            danger
+            onClick={(e) => {
+              e.stopPropagation()
+              Modal.confirm({
+                title: '确认停止录制',
+                content: `确定要停止房间“${room.streamer_name || '未知主播'}”的录制吗？`,
+                okText: '确认停止',
+                cancelText: '取消',
+                okButtonProps: { danger: true },
+                onOk: () => onStopRecord(room.room_id),
+              })
+            }}
+            style={{
+              flex: 1,
+              background: 'rgba(255,59,48,0.12)',
+              borderColor: 'rgba(255,59,48,0.3)',
+              color: 'var(--state-error)',
+            }}
+          >
+            停止录制
+          </Button>
+        ) : (
+          <Button
+            type="primary"
+            size="small"
+            icon={<PlayCircleOutlined />}
+            onClick={(e) => {
+              e.stopPropagation()
+              onStartRecord(room.room_id)
+            }}
+            style={{ flex: 1 }}
+          >
+            开始录制
+          </Button>
+        )}
+      
+        {/* 断开按钮（已连接时显示） */}
+        {room.is_connected && (
+          <Button
+            size="small"
+            icon={<DisconnectOutlined />}
+            loading={disconnecting}
+            onClick={(e) => {
+              e.stopPropagation()
+              if (disconnecting) return
+              setDisconnecting(true)
+              try {
+                onDisconnect(room.room_id)
+              } finally {
+                setTimeout(() => setDisconnecting(false), 1500)
+              }
+            }}
+            style={{ flex: 1 }}
+          >
+            断开
+          </Button>
+        )}
+      
+        {/* 删除按钮（角落） */}
+        <Tooltip title="删除房间">
+          <Button
+            type="text"
+            size="small"
+            icon={<DeleteOutlined />}
+            danger
+            onClick={(e) => {
+              e.stopPropagation()
+              Modal.confirm({
+                title: '确认删除',
+                content: `确定要删除房间“${room.streamer_name || '未知主播'}”吗？此操作不可撤销。`,
+                okText: '确认删除',
+                cancelText: '取消',
+                okButtonProps: { danger: true },
+                onOk: () => onRemove(room.room_id),
+              })
+            }}
+            style={{ width: 36, height: 32, flexShrink: 0 }}
+          />
+        </Tooltip>
       </div>
     </Card>
   )

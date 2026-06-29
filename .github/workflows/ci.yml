@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   pull_request:
     branches: [main, master]
 
@@ -76,3 +77,31 @@ jobs:
           name: coverage-${{ matrix.os }}-py${{ matrix.python-version }}
           path: coverage.xml
         if: always()
+
+  # ===== Electron 发布 =====
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    needs: [lint, test]
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: lsc-electron/package-lock.json
+
+      - name: Install npm dependencies
+        working-directory: lsc-electron
+        run: npm ci
+
+      - name: Build & Publish Electron app
+        working-directory: lsc-electron
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx vite build && npx electron-builder --publish always

@@ -64,14 +64,24 @@ class CaptureResult:
 
 
 def validate_recording(output_path: str, min_size_mb: float = 0.1) -> tuple[bool, str]:
-    """Validate a recorded file's integrity.
+    """验证录制文件的完整性。
+
+    执行三层验证以确保录制文件有效：
+      1. 路径验证：检查路径非空且文件存在
+      2. 大小验证：文件大小需大于 min_size_mb（默认 0.1 MB）
+      3. 格式验证：读取文件头部字节，检查是否为有效的视频格式签名
+         - MP4: 偏移 4 处应为 'ftyp'
+         - FLV: 前 3 字节应为 'FLV'
+         - MKV: 前 4 字节应为 EBML 头（0x1A45DFA3）
 
     Args:
-        output_path: Path to the recorded file.
-        min_size_mb: Minimum file size in MB to be considered valid.
+        output_path: 录制文件路径
+        min_size_mb: 最小文件大小阈值（MB），小于此值视为录制失败
 
     Returns:
-        Tuple of (is_valid, error_message).
+        (is_valid, error_message) 元组
+        - is_valid: 文件是否通过所有验证
+        - error_message: 验证失败时的描述信息，成功时为空字符串
     """
     import os
 
@@ -110,7 +120,23 @@ def validate_recording(output_path: str, min_size_mb: float = 0.1) -> tuple[bool
 
 
 class StreamCapture:
-    """FFmpeg-based live stream capture."""
+    """FFmpeg 直播流录制器。
+
+    封装 FFmpeg 子进程，管理直播流录制的完整生命周期：
+
+    生命周期状态流转：
+        IDLE -> CONNECTING -> RECORDING -> STOPPED
+                                     -> ERROR
+
+    典型使用流程：
+        1. start(url, output_path) — 构造 FFmpeg 命令并启动子进程
+        2. _wait_for_startup_data() — 等待 FFmpeg 产生首帧输出数据（超时 5 秒）
+        3. RECORDING 状态 — 定期调用 check_health() 监控进程和文件增长
+        4. stop() — 三级优雅停止（stdin 'q' -> terminate -> kill）
+
+    共享资源：
+        - 所有实例共享一个 stderr 读取线程池，避免大量并发录制时创建过多线程
+    """
 
     # Shared thread pool for stderr readers across all capture instances.
     # Limiting workers to 2 keeps thread stack usage low even when many
@@ -232,7 +258,20 @@ class StreamCapture:
             return False
 
     def _wait_for_startup_data(self) -> bool:
-        """Wait briefly until FFmpeg proves the input stream is producing data."""
+        """等待 FFmpeg 产生首帧输出数据（启动探测）。
+
+        启动后轮询检查输出文件是否已创建且有内容。如果 FFmpeg 进程在超时前退出，
+        则返回当前文件状态。主要用于检测：
+        - 直播流是否已开播
+        - URL 是否有效
+        - FFmpeg 是否能正常连接并写入数据
+
+        超时时间由 STARTUP_PROBE_TIMEOUT_SEC（默认 5 秒）控制，
+        轮询间隔由 STARTUP_PROBE_INTERVAL_SEC（默认 0.1 秒）控制。
+
+        Returns:
+            True 表示已收到数据，False 表示超时或 FFmpeg 异常退出
+        """
         deadline = time.monotonic() + max(0.0, STARTUP_PROBE_TIMEOUT_SEC)
         while True:
             if self._output_has_started():
@@ -244,7 +283,15 @@ class StreamCapture:
             time.sleep(STARTUP_PROBE_INTERVAL_SEC)
 
     def _startup_failure_message(self) -> str:
-        """Build a user-facing error for a stream that never produced data."""
+        """构建启动失败时的用户友好错误信息。
+
+        根据 FFmpeg 进程退出状态和 stderr 输出生成中文错误描述：
+        - 如果 FFmpeg 已退出：通过 _friendly_ffmpeg_message 解析 exit code 和 stderr
+        - 如果 FFmpeg 仍在运行但超时：返回通用的启动失败提示
+
+        Returns:
+            用户可读的错误描述字符串
+        """
         proc = self._process
         if proc is not None and proc.poll() is not None:
             return _friendly_ffmpeg_message(proc.returncode or -1, self.stderr_tail)
@@ -254,16 +301,30 @@ class StreamCapture:
               codec: str = "copy",
               input_args: list[str] | None = None,
               extra_args: list[str] | None = None) -> bool:
-        """Start capturing a live stream.
+        """启动直播流录制。
+
+        构造 FFmpeg 命令行参数并启动子进程。根据 codec 参数选择不同的编码模式：
+        - "copy": 直接复制视频流，无重新编码（最快，画质无损）
+        - "custom": 编码参数由 extra_args 提供
+        - 其他值: 使用 libx264 + AAC 进行重新编码
+
+        FFmpeg 命令构建逻辑：
+          1. 基础参数：-y（覆盖输出）、-loglevel warning
+          2. HTTP/HTTPS 流自动添加重连参数：-reconnect、-timeout 等
+          3. input_args 在 -i 之前插入（用于自定义 headers 等）
+          4. 根据 codec 添加编码器参数
+          5. 输出格式：MP4 + frag_keyframe（适合流式写入）
+          6. 通过 prepare_launch 构建跨平台启动环境
 
         Args:
-            url: Stream URL (m3u8, flv, etc.)
-            output_path: Output file path
-            codec: Video codec ("copy" for no re-encoding)
-            extra_args: Additional FFmpeg arguments
+            url: 直播流地址（m3u8、flv 等）
+            output_path: 输出文件路径
+            codec: 视频编码模式（"copy" | "custom" | 其他值使用 libx264）
+            input_args: FFmpeg 输入参数列表，在 -i 之前插入
+            extra_args: 额外的 FFmpeg 参数，在编码参数之后添加
 
         Returns:
-            True if capture started successfully
+            True 表示录制成功启动，False 表示启动失败（可查询 last_error）
         """
         with self._lock:
             already_recording = self._status == CaptureStatus.RECORDING
@@ -282,7 +343,11 @@ class StreamCapture:
 
         cmd = [self.ffmpeg, "-y", "-loglevel", "warning"]
 
-        # Stream reconnection parameters (only for HTTP/HTTPS streams)
+        # 流重连参数（仅对 HTTP/HTTPS 直播流生效）
+        # -reconnect 1: 启用自动重连
+        # -reconnect_streamed 1: 对流式传输也启用重连
+        # -reconnect_delay_max 5: 最大重连间隔 5 秒
+        # -timeout 30000000: 网络超时 30 秒（微秒）
         if url.startswith(("http://", "https://")):
             cmd += [
                 "-reconnect", "1",
@@ -291,22 +356,35 @@ class StreamCapture:
                 "-timeout", "30000000",
             ]
 
-        # Input-specific options (e.g. -headers) must come before -i
+        # 输入专属选项（如自定义 headers）必须放在 -i 之前
         if input_args:
             cmd += input_args
 
         cmd += ["-i", url]
+
+        # 编码模式选择
         if codec == "copy":
+            # 直接复制视频流，无重新编码，速度最快且画质无损
             cmd += ["-c", "copy"]
         elif codec == "custom":
-            pass  # Codec args provided via extra_args
+            # 自定义编码，参数由 extra_args 提供
+            pass
         else:
+            # 使用 libx264 编码视频，AAC 编码音频
+            # preset medium: 编码速度与压缩率的平衡
+            # crf 23: 恒定质量因子（18-28 为常用范围，越小质量越高）
             cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
             cmd += ["-c:a", "aac", "-b:a", "128k"]
 
         if extra_args:
             cmd += extra_args
 
+        # 输出格式配置
+        # -f mp4: 强制 MP4 容器格式
+        # -movflags frag_keyframe+empty_moov+faststart:
+        #   frag_keyframe: 每个关键帧生成一个片段（支持流式写入）
+        #   empty_moov: 文件头在结束时写入（支持边录边写）
+        #   faststart: 移动 moov atom 到文件开头（便于网络播放）
         cmd += ["-f", "mp4", "-movflags", "frag_keyframe+empty_moov+faststart", output_path]
 
         _log.info("Starting capture: %s -> %s", url, output_path)
@@ -361,18 +439,20 @@ class StreamCapture:
             return False
 
     def stop(self) -> CaptureResult:
-        """Stop the current capture using three-level degradation.
+        """停止当前录制，采用三级优雅停止策略。
 
-        1. Send 'q' via stdin for graceful FFmpeg shutdown (flushes output)
-        2. wait(timeout=5) — give FFmpeg time to finish
-        3. terminate() + wait(timeout=3) — SIGTERM equivalent
-        4. kill() + final wait(timeout=5) — force SIGKILL as last resort
+        三级停止机制确保 FFmpeg 有充分机会完成文件写入和元数据刷新：
+          1. 通过 stdin 发送 'q' 命令，触发 FFmpeg 优雅退出（写入 moov atom）
+          2. 等待 5 秒，允许 FFmpeg 完成清理
+          3. 发送 SIGTERM（terminate()），再等待 3 秒
+          4. 发送 SIGKILL（kill()），最后等待 5 秒
+          5. 若进程仍不退出，记录孤儿 PID 并标记为 ERROR 状态
 
-        The final wait is also bounded: if FFmpeg still refuses to exit,
-        we log its PID and release resources without blocking the caller.
+        停止后会验证输出文件是否存在，并计算录制时长和文件大小。
 
         Returns:
-            CaptureResult with success status and file info
+            CaptureResult 包含 success、output_path、duration_sec、
+            file_size_mb 等字段。若进程无法退出则 error 字段包含 PID 信息。
         """
         with self._lock:
             if self._status != CaptureStatus.RECORDING or not self._process:
@@ -544,7 +624,21 @@ class StreamCapture:
                 self._release_stderr_executor_once()
 
     def check_health(self) -> str:
-        """Check capture health. Returns status message or empty if OK."""
+        """检查录制健康状态，返回状态描述或空字符串表示正常。
+
+        执行两项检查：
+          1. 进程存活检查：如果 FFmpeg 进程已退出，记录错误信息并清理资源
+          2. 文件增长检查：连续 3 次检查文件大小未变化则判定为卡住（可能直播流中断）
+
+        文件卡住检测逻辑：
+          - 每次调用记录当前文件大小
+          - 如果连续 3 次（即约 3 个检查周期）文件大小无变化且文件非空，
+            则认为直播流可能已卡住，返回警告信息
+          - 文件大小恢复增长时会重置计数器
+
+        Returns:
+            空字符串表示状态正常；非空字符串为错误/警告描述
+        """
         with self._lock:
             if self._status != CaptureStatus.RECORDING:
                 return ""

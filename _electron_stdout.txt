@@ -6,4 +6,4 @@
   exists: true
 }
 [spawnBackend] userData= C:\Users\Administrator\AppData\Roaming\Electron logDir= C:\Users\Administrator\AppData\Roaming\Electron\logs
-[spawnBackend] backend WebSocket URL: ws://localhost:9876
+[spawnBackend] backend WebSocket URL: ws://localhost:9877

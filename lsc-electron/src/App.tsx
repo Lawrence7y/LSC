@@ -1,26 +1,27 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { ConfigProvider, theme, App as AntdApp } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import MainLayout from './components/Layout/MainLayout'
-import Dashboard from './pages/Dashboard'
 import Workbench from './pages/Workbench'
 import Settings from './pages/Settings'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
+import { useTesseractPreload } from '@/hooks/useTesseractPreload'
 
 function AppContent() {
   useWebSocket()
+  useTesseractPreload()
 
   return (
-    <BrowserRouter>
+    <HashRouter>
       <Routes>
         <Route path="/" element={<MainLayout />}>
-          <Route index element={<Dashboard />} />
+          <Route index element={<Navigate to="/workbench" replace />} />
           <Route path="workbench" element={<Workbench />} />
           <Route path="settings" element={<Settings />} />
         </Route>
       </Routes>
-    </BrowserRouter>
+    </HashRouter>
   )
 }
 

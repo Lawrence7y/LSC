@@ -67,6 +67,7 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (!a || !b) return a === b
   return (
     a.room_id === b.room_id &&
+    a.preview_enabled === b.preview_enabled &&
     a.preview_paused === b.preview_paused &&
     a.is_recording === b.is_recording &&
     a.record_started_at === b.record_started_at &&
@@ -105,21 +106,31 @@ export const ControlBar = memo(function ControlBar({
 
   const hasSelection = useMemo(() =>
     room?.mark_in !== null && room?.mark_out !== null && room?.mark_in !== undefined && room?.mark_out !== undefined
+    && room.mark_in < room.mark_out
   , [room?.mark_in, room?.mark_out])
 
-  const isPlaying = room ? !room.preview_paused : false
+  // 播放状态：预览已启用目未暂停时才显示为播放中
+  const isPlaying = room ? (room.preview_enabled && !room.preview_paused) : false
   const isDisabled = !room && (multiSelectCount ?? 0) === 0
 
-  // 时间线总时长：优先使用出点，其次录制已进行时间，兜底 1 小时
-  const { duration, currentTime } = useMemo(() => {
-    let dur = 3600
+  // 时间线总时长：默认4小时窗口，录制超过4小时后自动滚动
+  const TIMELINE_WINDOW = 14400 // 4 小时
+  const { duration, currentTime, windowStart } = useMemo(() => {
+    let dur = TIMELINE_WINDOW
     let cur = 0
+    let elapsed = 0
     if (room?.mark_out !== null && room?.mark_out !== undefined && room.mark_out > 0) {
-      dur = Math.max(dur, room.mark_out)
+      elapsed = room.mark_out
     }
     if (room?.is_recording && room?.record_started_at) {
-      const elapsed = (Date.now() - new Date(room.record_started_at).getTime()) / 1000
-      dur = Math.max(dur, elapsed)
+      elapsed = Math.max(elapsed, (Date.now() - new Date(room.record_started_at).getTime()) / 1000)
+    }
+    // 录制时长超过窗口时，自动滚动窗口跟随播放头
+    let ws = 0
+    if (elapsed > TIMELINE_WINDOW) {
+      ws = elapsed - TIMELINE_WINDOW
+    } else {
+      dur = Math.max(TIMELINE_WINDOW, elapsed)
     }
     // 优先使用 MSE player 实际播放位置，回退到入点
     if (previewPos > 0) {
@@ -127,7 +138,7 @@ export const ControlBar = memo(function ControlBar({
     } else if (room?.mark_in !== null && room?.mark_in !== undefined && room.mark_in > 0) {
       cur = room.mark_in
     }
-    return { duration: dur, currentTime: cur }
+    return { duration: dur, currentTime: cur, windowStart: ws }
   }, [room?.mark_out, room?.is_recording, room?.record_started_at, room?.mark_in, previewPos, tick])
 
   const roomClips = useMemo(() =>
@@ -146,37 +157,38 @@ export const ControlBar = memo(function ControlBar({
       gap: 12,
     }}>
       {/* 时间线 */}
-      {/* Multi-select indicator */}
+      {/* Multi-select indicator — "已选中" (blue) instead of "已同步" (orange) */}
       {multiSelectCount > 0 && (
         <div style={{
           display: 'flex',
           alignItems: 'center',
           gap: 8,
           padding: '4px 12px',
-          background: 'rgba(255, 149, 0, 0.08)',
+          background: 'rgba(0, 122, 255, 0.06)',
           borderRadius: 6,
           fontSize: 12,
-          color: 'var(--state-warning)',
+          color: 'var(--accent-primary)',
           fontWeight: 500,
           marginBottom: -4,
         }}>
-          <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--state-warning)' }} />
-          {multiSelectCount} 个房间同步 — 时间线 / 入出点 / 播放控制全局生效
+          <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-primary)' }} />
+          {multiSelectCount} 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效
         </div>
       )}
       <Timeline
         duration={duration}
-        currentTime={currentTime}
-        markIn={room?.mark_in ?? null}
-        markOut={room?.mark_out ?? null}
-        buffered={currentTime}
-        clips={roomClips}
+        currentTime={Math.max(0, currentTime - windowStart)}
+        markIn={room?.mark_in != null ? Math.max(0, room.mark_in - windowStart) : null}
+        markOut={room?.mark_out != null ? Math.max(0, room.mark_out - windowStart) : null}
+        buffered={Math.max(0, currentTime - windowStart)}
+        clips={roomClips.map(c => ({ start: Math.max(0, c.start - windowStart), end: Math.max(0, c.end - windowStart) }))}
+        windowStart={windowStart}
         onSeek={onSeek}
         onMarkIn={onMarkIn}
         onMarkOut={onMarkOut}
         onMarkerDrag={onMarkerDrag}
         onDeleteMarker={onDeleteMarker}
-        height={60}
+        height={80}
         zoomLevel={zoomLevel}
         onZoomChange={onZoomChange}
       />

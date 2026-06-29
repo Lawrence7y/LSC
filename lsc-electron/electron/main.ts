@@ -4,6 +4,29 @@ import fs from 'fs'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { extractBackendWsUrl } from './backendUrl'
 
+// ===== 全局日志持久化 =====
+export function appLog(level: 'INFO' | 'WARN' | 'ERROR', module: string, msg: string): void {
+  try {
+    const logDir = path.join(app.getPath('userData'), 'logs')
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true })
+    }
+    const logFile = path.join(logDir, 'debug.log')
+    const line = `${new Date().toISOString()} [${level}] [${module}] ${msg}\n`
+    fs.appendFileSync(logFile, line, 'utf-8')
+    if (level === 'ERROR') {
+      console.error(line.trim())
+    } else if (level === 'WARN') {
+      console.warn(line.trim())
+    } else {
+      console.log(line.trim())
+    }
+  } catch (err) {
+    console.error('[appLog] 日志写入失败:', err)
+  }
+}
+
+
 // ===== 模块级状态 =====
 let backendProcess: ChildProcess | null = null
 let mainWindow: BrowserWindow | null = null
@@ -36,22 +59,25 @@ function loadSettings(): AppSettings {
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath, 'utf-8')
       const parsed = JSON.parse(content)
+      appLog('INFO', 'Settings', `读取本地设置成功: ${content.trim()}`)
       return {
         autoLaunch: !!parsed.autoLaunch,
         minimizeToTray: !!parsed.minimizeToTray,
       }
     }
   } catch (err) {
-    console.error('[loadSettings] 读取设置失败:', err)
+    appLog('ERROR', 'Settings', `读取设置失败: ${err}`)
   }
   return { autoLaunch: false, minimizeToTray: false }
 }
 
 function saveSettings(settings: AppSettings): void {
   try {
-    fs.writeFileSync(getSettingsFilePath(), JSON.stringify(settings, null, 2), 'utf-8')
+    const content = JSON.stringify(settings, null, 2)
+    fs.writeFileSync(getSettingsFilePath(), content, 'utf-8')
+    appLog('INFO', 'Settings', `保存设置到本地成功: ${content.trim()}`)
   } catch (err) {
-    console.error('[saveSettings] 写入设置失败:', err)
+    appLog('ERROR', 'Settings', `写入设置失败: ${err}`)
   }
 }
 
@@ -93,7 +119,7 @@ function consumeBackendOutput(data: Buffer): void {
   if (wsUrl && backendWsUrl !== wsUrl) {
     backendWsUrl = wsUrl
     writeLog(`[backend-url-detected] ${wsUrl}\n`)
-    console.log('[spawnBackend] backend WebSocket URL:', wsUrl)
+    appLog('INFO', 'Backend', `检测到后端 WebSocket URL: ${wsUrl}`)
   }
 }
 
@@ -107,7 +133,7 @@ function detectPython(): string | null {
       return cmd
     } catch (err) {
       // 该命令不可用（可能未安装或 Windows 上指向 Microsoft Store 重定向），继续尝试下一个
-      console.error(`[detectPython] ${cmd} 不可用:`, err)
+      appLog('WARN', 'DetectPython', `${cmd} 不可用: ${err}`)
     }
   }
   // 2. 尝试 WorkBuddy 管理的 Python（~/.workbuddy/binaries/python/versions/）
@@ -120,14 +146,14 @@ function detectPython(): string | null {
         for (const ver of versions) {
           const p = path.join(wbPythonDir, ver, process.platform === 'win32' ? 'python.exe' : 'python')
           if (fs.existsSync(p)) {
-            console.log(`[detectPython] 使用 WorkBuddy 管理的 Python: ${p}`)
+            appLog('INFO', 'DetectPython', `使用 WorkBuddy 管理的 Python: ${p}`)
             return p
           }
         }
       }
     }
   } catch (err) {
-    console.error('[detectPython] 检查 WorkBuddy Python 失败:', err)
+    appLog('ERROR', 'DetectPython', `检查 WorkBuddy Python 失败: ${err}`)
   }
   // 3. 尝试打包环境携带的嵌入式 Python（extraResources/python/python.exe）
   try {
@@ -137,7 +163,7 @@ function detectPython(): string | null {
     }
   } catch (err) {
     // resourcesPath 在某些环境可能不可用，忽略
-    console.error('[detectPython] 检查打包内 Python 失败:', err)
+    appLog('ERROR', 'DetectPython', `检查打包内 Python 失败: ${err}`)
   }
   return null
 }
@@ -149,16 +175,16 @@ function spawnBackend(): void {
   backendWsUrl = null
   backendOutputBuffer = ''
 
-  console.log('[spawnBackend]', { backendDir, backendEntry, interpreter, exists: fs.existsSync(backendEntry) })
+  appLog('INFO', 'Backend', `正在启动后端: interpreter=${interpreter}, entry=${backendEntry}, exists=${fs.existsSync(backendEntry)}`)
 
   // 确保日志目录存在
   const logDir = path.join(app.getPath('userData'), 'logs')
-  console.log('[spawnBackend] userData=', app.getPath('userData'), 'logDir=', logDir)
+  appLog('INFO', 'Backend', `日志目录: ${logDir}`)
   try {
     fs.mkdirSync(logDir, { recursive: true })
   } catch (err) {
     // 目录可能已存在，忽略
-    console.error('[spawnBackend] 创建日志目录失败:', err)
+    appLog('ERROR', 'Backend', `创建日志目录失败: ${err}`)
   }
 
   // 创建日志写入流（必须监听 error 事件，否则异步打开失败会变成 uncaught exception）
@@ -168,7 +194,7 @@ function spawnBackend(): void {
       try {
         backendLogStream.end()
       } catch (err) {
-        console.error('[spawnBackend] 关闭旧日志流失败:', err)
+        appLog('ERROR', 'Backend', `关闭旧日志流失败: ${err}`)
       }
     }
     backendLogStream = fs.createWriteStream(getBackendLogPath(), { flags: 'a' })
@@ -177,7 +203,7 @@ function spawnBackend(): void {
       backendLogStream = null
     })
   } catch (err) {
-    console.error('[spawnBackend] 创建日志流失败:', err)
+    appLog('ERROR', 'Backend', `创建日志流失败: ${err}`)
     backendLogStream = null
   }
 
@@ -186,7 +212,7 @@ function spawnBackend(): void {
     const msg = '未检测到可用的 Python 解释器，请安装 Python 并加入 PATH，或将嵌入式 Python 放入 extraResources/python 目录'
     pythonDetectError = msg
     writeLog(`\n[spawn-failed] ${msg}\n`)
-    console.error('[spawnBackend]', msg)
+    appLog('ERROR', 'Backend', msg)
     return
   }
 
@@ -238,7 +264,7 @@ function spawnBackend(): void {
     try {
       backendLogStream?.end()
     } catch (err) {
-      console.error('[backend-exit] 关闭日志流失败:', err)
+      appLog('ERROR', 'Backend', `关闭日志流失败: ${err}`)
     }
     backendLogStream = null
     backendProcess = null
@@ -267,18 +293,20 @@ function killBackend(): void {
       // Windows：taskkill 强杀整棵树（SIGTERM 在 Windows 不可靠）
       try {
         execSync(`taskkill /T /F /PID ${pid}`, { stdio: 'ignore' })
+        appLog('INFO', 'Backend', `成功终止 Windows 后端进程 tree (PID: ${pid})`)
       } catch (err) {
-        console.error('[killBackend] taskkill 失败:', err)
+        appLog('ERROR', 'Backend', `taskkill 失败: ${err}`)
       }
     } else {
       // POSIX：先 SIGTERM，再用 setTimeout 异步轮询进程是否存活
-      // 最多检查 30 次（间隔 100ms，共 3 秒），超时则 SIGKILL
+      // 最多检测 30 次（间隔 100ms，共 3 秒），超时则 SIGKILL
       // 采用 fire-and-forget 模式：before-quit / exit 钩子不需要等待子进程退出完成，
       // 避免同步忙等待阻塞主进程导致 UI 冻结
       try {
         process.kill(pid, 'SIGTERM')
+        appLog('INFO', 'Backend', `发送 SIGTERM 至后端进程 (PID: ${pid})`)
       } catch (err) {
-        console.error('[killBackend] SIGTERM 失败:', err)
+        appLog('ERROR', 'Backend', `SIGTERM 失败: ${err}`)
         return
       }
       const maxAttempts = 30
@@ -286,18 +314,19 @@ function killBackend(): void {
       const checkAlive = (): void => {
         attempts++
         try {
-          process.kill(pid, 0) // 检测进程是否存活
+          process.kill(pid, 0) // 检测进程是否存在
         } catch (err) {
           // 进程已退出
-          console.error('[killBackend] 进程已退出:', err)
+          appLog('INFO', 'Backend', `后端进程 (PID: ${pid}) 已退出`)
           return
         }
         if (attempts >= maxAttempts) {
           // 超时强杀
           try {
             process.kill(pid, 'SIGKILL')
+            appLog('WARN', 'Backend', `超时，强杀进程 (PID: ${pid})`)
           } catch (err) {
-            console.error('[killBackend] SIGKILL 失败:', err)
+            appLog('ERROR', 'Backend', `SIGKILL 失败: ${err}`)
           }
           return
         }
@@ -306,7 +335,7 @@ function killBackend(): void {
       setTimeout(checkAlive, 100)
     }
   } catch (err) {
-    console.error('[killBackend] 终止后端失败:', err)
+    appLog('ERROR', 'Backend', `终止后端失败: ${err}`)
   }
 }
 
@@ -332,7 +361,7 @@ function createTray(): void {
         }
       }
     } catch (err) {
-      console.error('[createTray] 加载图标失败:', p, err)
+      appLog('ERROR', 'Tray', `加载图标失败: ${p} ${err}`)
     }
   }
 
@@ -370,9 +399,9 @@ function createTray(): void {
         mainWindow.focus()
       }
     })
+    appLog('INFO', 'Tray', '托盘菜单创建成功')
   } catch (err) {
-    // 托盘创建失败不崩溃
-    console.error('[createTray] 托盘创建失败:', err)
+    appLog('ERROR', 'Tray', `托盘创建失败: ${err}`)
   }
 }
 
@@ -407,14 +436,22 @@ function _isSafePath(p: string): boolean {
 // 注册窗口相关 IPC（只在 whenReady 中调用一次，避免 macOS activate 二次注册触发
 // "Attempted to register a second handler" 错误）
 function registerWindowIpc(): void {
-  ipcMain.handle('get-app-version', () => app.getVersion())
-  ipcMain.handle('get-backend-ws-url', () => backendWsUrl)
+  ipcMain.handle('get-app-version', () => {
+    appLog('INFO', 'IPC', '获取应用版本')
+    return app.getVersion()
+  })
+  ipcMain.handle('get-backend-ws-url', () => {
+    appLog('INFO', 'IPC', `获取后端 WebSocket URL: ${backendWsUrl}`)
+    return backendWsUrl
+  })
 
   ipcMain.handle('minimize-window', () => {
+    appLog('INFO', 'IPC', '最小化窗口')
     mainWindow?.minimize()
   })
 
   ipcMain.handle('maximize-window', () => {
+    appLog('INFO', 'IPC', '切换最大化/还原')
     if (mainWindow && mainWindow.isMaximized()) {
       mainWindow.unmaximize()
     } else {
@@ -423,46 +460,57 @@ function registerWindowIpc(): void {
   })
 
   ipcMain.handle('close-window', () => {
+    appLog('INFO', 'IPC', '关闭窗口')
     mainWindow?.close()
   })
 
   ipcMain.handle('select-directory', async () => {
+    appLog('INFO', 'IPC', '打开选择文件夹对话框')
     if (!mainWindow) return null
     const result = await dialog.showOpenDialog(mainWindow, {
       properties: ['openDirectory']
     })
+    appLog('INFO', 'IPC', `文件夹选择结果: ${result.filePaths[0] || '已取消'}`)
     return result.canceled ? null : result.filePaths[0]
   })
 
-  ipcMain.handle('open-path', async (_event, openPathStr: string) => {
+  ipcMain.handle('open-path', async (_event, openPathStr) => {
+    appLog('INFO', 'IPC', `请求打开路径: ${openPathStr}`);
     // 路径白名单校验，拒绝可执行文件与越界路径
     if (!_isSafePath(openPathStr)) {
-      writeLog(`[open-path-rejected] ${openPathStr}\n`)
-      return { success: false, error: '不允许打开此类型文件' }
+      writeLog(`[open-path-rejected] ${openPathStr}\n`);
+      appLog('WARN', 'IPC', `打开路径被拒绝 (不安全): ${openPathStr}`);
+      return { success: false, error: '不允许打开此类型文件' };
     }
     // shell.openPath 成功返回空字符串，失败返回错误信息
-    const errMsg = await shell.openPath(openPathStr)
+    const errMsg = await shell.openPath(openPathStr);
     if (errMsg) {
-      writeLog(`[open-path-failed] ${openPathStr} ${errMsg}\n`)
-      return { success: false, error: errMsg }
+      writeLog(`[open-path-failed] ${openPathStr} ${errMsg}\n`);
+      appLog('ERROR', 'IPC', `打开路径失败: ${openPathStr} ${errMsg}`);
+      return { success: false, error: errMsg };
     }
-    return { success: true }
+    appLog('INFO', 'IPC', `成功打开路径: ${openPathStr}`);
+    return { success: true };
   })
 
   // 在资源管理器中高亮定位文件（用于导出产物"打开文件夹"按钮）。
   // 区别于 open-path：openPath 会用默认程序打开 .mp4 文件（启动播放器），
   // showItemInFolder 则在资源管理器中选中并高亮该文件。
-  ipcMain.handle('show-item-in-folder', async (_event, filePath: string) => {
+  ipcMain.handle('show-item-in-folder', async (_event, filePath) => {
+    appLog('INFO', 'IPC', `请求在目录中显示文件: ${filePath}`);
     if (!_isSafePath(filePath)) {
-      writeLog(`[show-item-in-folder-rejected] ${filePath}\n`)
-      return { success: false, error: '不允许打开此路径' }
+      writeLog(`[show-item-in-folder-rejected] ${filePath}\n`);
+      appLog('WARN', 'IPC', `在目录中显示文件被拒绝: ${filePath}`);
+      return { success: false, error: '不允许打开此路径' };
     }
     try {
-      shell.showItemInFolder(filePath)
-      return { success: true }
+      shell.showItemInFolder(filePath);
+      appLog('INFO', 'IPC', `成功在目录中显示文件: ${filePath}`);
+      return { success: true };
     } catch (e) {
-      writeLog(`[show-item-in-folder-failed] ${filePath} ${e}\n`)
-      return { success: false, error: String(e) }
+      writeLog(`[show-item-in-folder-failed] ${filePath} ${e}\n`);
+      appLog('ERROR', 'IPC', `在目录中显示文件失败: ${filePath} ${e}`);
+      return { success: false, error: String(e) };
     }
   })
 }
@@ -478,72 +526,100 @@ function createWindow() {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false, // 禁用后台节流，确保预览/录制计时器在窗口非活跃时仍精确运行
     },
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     show: false,
-  })
+  });
+
+  // 始终注册渲染进程日志转发和生命周期日志
+  mainWindow.webContents.on('console-message', (_event, _level, message) => {
+    appLog('INFO', 'renderer', message);
+  });
+
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    appLog('ERROR', 'createWindow', `LOAD FAILED: code=${errorCode} desc=${errorDescription} url=${validatedURL}`);
+  });
+
+  mainWindow.webContents.on('crashed', () => {
+    appLog('ERROR', 'createWindow', `RENDERER CRASHED`);
+  });
 
   if (process.env.VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
-    mainWindow.webContents.openDevTools()
+    appLog('INFO', 'createWindow', `加载开发服务器: ${process.env.VITE_DEV_SERVER_URL}`);
+    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+    mainWindow.webContents.openDevTools();
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../../dist/index.html'))
+    const indexPath = path.join(__dirname, '../../dist/index.html');
+    appLog('INFO', 'createWindow', `加载生产网页资源: ${indexPath}`);
+    mainWindow.loadFile(indexPath).catch(err => {
+      appLog('ERROR', 'createWindow', `加载 index.html 失败: ${err.message}`);
+    });
   }
 
   mainWindow.once('ready-to-show', () => {
-    mainWindow?.show()
-  })
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      appLog('INFO', 'createWindow', '窗口准备就绪并显示');
+    }
+  });
 
-  // 最小化到托盘：仅当启用且托盘实际存在时才拦截关闭并隐藏窗口，
-  // 否则托盘创建失败时窗口隐藏后将无退出入口
+  // 最小化到托盘
   mainWindow.on('close', (e) => {
     if (settingsCache.minimizeToTray && tray && mainWindow && !mainWindow.isDestroyed()) {
-      e.preventDefault()
-      mainWindow.hide()
+      e.preventDefault();
+      mainWindow.hide();
+      appLog('INFO', 'createWindow', '拦截窗口关闭，最小化到系统托盘');
+    } else {
+      appLog('INFO', 'createWindow', '窗口即将关闭并退出进程');
     }
-  })
+  });
 
-  // 启动后推送持久化设置到前端；若 Python 解释器检测失败则一并通知前端
   mainWindow.webContents.once('did-finish-load', () => {
-    pushSettingsToRenderer()
+    appLog('INFO', 'createWindow', '网页加载完成，推送初始设置');
+    pushSettingsToRenderer();
     if (pythonDetectError) {
-      mainWindow?.webContents.send('backend-error', pythonDetectError)
+      mainWindow?.webContents.send('backend-error', pythonDetectError);
     }
-  })
+  });
 }
 
 // ===== 应用设置 IPC =====
 
 function registerAppSettingsIpc(): void {
-  ipcMain.handle('app:set-auto-launch', (_event, enabled: boolean) => {
-    settingsCache.autoLaunch = !!enabled
+  ipcMain.handle('app:set-auto-launch', (_event, enabled) => {
+    appLog('INFO', 'IPC', `设置开机自启: ${enabled}`);
+    settingsCache.autoLaunch = !!enabled;
     try {
-      app.setLoginItemSettings({ openAtLogin: !!enabled })
+      app.setLoginItemSettings({ openAtLogin: !!enabled });
     } catch (err) {
-      console.error('[set-auto-launch] 设置开机启动失败:', err)
+      appLog('ERROR', 'IPC', `设置开机启动失败: ${err}`);
     }
-    saveSettings(settingsCache)
-    pushSettingsToRenderer()
-    return settingsCache.autoLaunch
-  })
+    saveSettings(settingsCache);
+    pushSettingsToRenderer();
+    return settingsCache.autoLaunch;
+  });
 
   ipcMain.handle('app:get-auto-launch', () => {
-    return settingsCache.autoLaunch
-  })
+    return settingsCache.autoLaunch;
+  });
 
-  ipcMain.handle('app:set-minimize-to-tray', (_event, enabled: boolean) => {
-    settingsCache.minimizeToTray = !!enabled
-    saveSettings(settingsCache)
-    pushSettingsToRenderer()
-    return settingsCache.minimizeToTray
-  })
+  ipcMain.handle('app:set-minimize-to-tray', (_event, enabled) => {
+    appLog('INFO', 'IPC', `设置最小化到托盘: ${enabled}`);
+    settingsCache.minimizeToTray = !!enabled;
+    saveSettings(settingsCache);
+    pushSettingsToRenderer();
+    return settingsCache.minimizeToTray;
+  });
 
   ipcMain.handle('app:get-minimize-to-tray', () => {
-    return settingsCache.minimizeToTray
-  })
+    return settingsCache.minimizeToTray;
+  });
 }
 
 // ===== 生命周期 =====
+
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 
 app.whenReady().then(() => {
   // 启动时读取 app-settings.json 初始化缓存
@@ -552,7 +628,7 @@ app.whenReady().then(() => {
   try {
     app.setLoginItemSettings({ openAtLogin: settingsCache.autoLaunch })
   } catch (err) {
-    console.error('[whenReady] 同步开机启动设置失败:', err)
+    appLog('ERROR', 'App', `同步开机启动设置失败: ${err}`)
   }
 
   // 注册应用设置 IPC（只注册一次）
@@ -572,6 +648,7 @@ app.whenReady().then(() => {
 })
 
 app.on('before-quit', () => {
+  appLog('INFO', 'App', '应用即将退出')
   killBackend()
 })
 

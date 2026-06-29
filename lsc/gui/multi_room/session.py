@@ -1,4 +1,8 @@
-"""Session model for multi-room workbench."""
+"""多房间工作台会话模型。
+
+RoomSession 是多房间工作台中单个直播间连接的完整状态快照，由 manager 统一管理。
+涵盖连接状态、预览控制、录制信息、时间线选区、重连参数及导出内容偏移量等字段。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -10,6 +14,11 @@ from lsc.platforms.registry import get_display_name
 
 @dataclass(slots=True)
 class RoomSession:
+    """单个直播间在工作台中的会话状态。
+
+    聚合了连接、预览、录制、时间线标记、重连配置及内容偏移等所有字段，
+    由 RoomManager 负责生命周期管理和状态更新。
+    """
     room_id: str
     room_url: str
     platform: str = ""
@@ -63,8 +72,19 @@ class RoomSession:
     reconnect_param_mode: str = "CRF 质量"
     reconnect_bitrate: str = ""
     reconnect_bitrate_unit: str = "kbps"
+    # 每房间独立的预览画质（覆盖全局设置），空字符串表示使用全局设置
+    preview_quality: str = ""
+    # 直播分类
+    category: str = ""
+    # 音频互相关计算的内容偏移量（秒）
+    # 正值 = 该房间内容比最慢房间快（导出时需减去此值）
+    # 0 = 基准房间（最慢）
+    # 房间重连/录制重启时重置为 0
+    # 导出时用于将所有房间的音频轨道按此偏移量对齐到基准房间时间线
+    content_offset: float = 0.0
 
     def apply_stream_info(self, info: StreamInfo) -> None:
+        """用异步流探测结果回填房间会话字段，并更新连接状态。"""
         self.platform = info.platform
         self.platform_name = get_display_name(info.platform)
         self.stream_info = info
@@ -73,14 +93,17 @@ class RoomSession:
         self.is_connecting = False
         self.streamer_name = getattr(info, "streamer", "") or ""
         self.stream_title = getattr(info, "title", "") or ""
+        self.category = getattr(info, "category", "") or ""
         self.last_error = ""
 
     def set_error(self, message: str) -> None:
+        """设置错误状态：断开连接并记录错误信息。"""
         self.is_connected = False
         self.is_connecting = False
         self.last_error = message
 
     def status_text(self) -> str:
+        """生成当前房间状态的简短文本描述，供 UI 状态栏展示。"""
         parts: list[str] = []
         if self.is_connecting:
             parts.append("连接中")
@@ -98,6 +121,6 @@ class RoomSession:
 
     @property
     def friendly_error(self) -> str:
-        """返回用户友好的错误描述。"""
+        """返回面向用户的友好错误描述（经 humanize 处理）。"""
         from lsc.utils.error_messages import humanize_error
         return humanize_error(self.last_error)
