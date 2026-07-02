@@ -41,6 +41,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
   removeUpdateStatusListeners: () => {
     ipcRenderer.removeAllListeners('update-status')
   },
+
+  // 系统通知
+  showNotification: (payload: { title: string; body: string; silent?: boolean }) =>
+    ipcRenderer.invoke('show-notification', payload),
+  setProgressBar: (progress: number) =>
+    ipcRenderer.invoke('set-progress-bar', progress),
+  setTrayState: (state: 'idle' | 'recording' | 'error') =>
+    ipcRenderer.invoke('set-tray-state', state),
+  getBackendError: () =>
+    ipcRenderer.invoke('get-backend-error'),
+  onBackendError: (callback: (error: string) => void) => {
+    ipcRenderer.on('backend-error', (_event, error) => callback(error))
+  },
+
+  // 日志查看
+  readLogFile: (opts: { file: string; lines?: number }) =>
+    ipcRenderer.invoke('read-log-file', opts),
+  openLogFolder: () =>
+    ipcRenderer.invoke('open-log-folder'),
 })
 
 contextBridge.exposeInMainWorld('app', {

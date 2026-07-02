@@ -9,6 +9,21 @@ from typing import Dict, Any, Callable
 _log = logging.getLogger('lsc.server')
 
 
+def _truncate_for_log(data: Any, str_limit: int = 200, list_limit: int = 10) -> Any:
+    """截断超大日志字段，避免日志文件暴增。"""
+    if isinstance(data, dict):
+        result = {}
+        for k, v in data.items():
+            if isinstance(v, str) and len(v) > str_limit:
+                result[k] = f"<str of length {len(v)}>"
+            elif isinstance(v, list) and len(v) > list_limit:
+                result[k] = f"<list of length {len(v)}>"
+            else:
+                result[k] = v
+        return result
+    return data
+
+
 class _NumpyJSONEncoder(json.JSONEncoder):
     """自定义 JSON encoder，处理 numpy 数值类型。"""
 
@@ -88,18 +103,7 @@ class LSCWebSocketServer:
                     msg_type = data.get('type')
                     msg_data = data.get('data', {})
 
-                    # 限制和截断超大日志字段，避免日志文件暴增
-                    log_data = {}
-                    if isinstance(msg_data, dict):
-                        for k, v in msg_data.items():
-                            if isinstance(v, str) and len(v) > 200:
-                                log_data[k] = f"<str of length {len(v)}>"
-                            elif isinstance(v, list) and len(v) > 10:
-                                log_data[k] = f"<list of length {len(v)}>"
-                            else:
-                                log_data[k] = v
-                    else:
-                        log_data = msg_data
+                    log_data = _truncate_for_log(msg_data)
 
                     # 高频消息降为 debug，避免日志文件被淹没
                     _HIGH_FREQ_TYPES = frozenset({
@@ -116,17 +120,7 @@ class LSCWebSocketServer:
                         result = await self.handlers[msg_type](msg_data)
                         if result is not None:
                             # 同样截断响应数据
-                            log_res = {}
-                            if isinstance(result, dict):
-                                for k, v in result.items():
-                                    if isinstance(v, str) and len(v) > 200:
-                                        log_res[k] = f"<str of length {len(v)}>"
-                                    elif isinstance(v, list) and len(v) > 10:
-                                        log_res[k] = f"<list of length {len(v)}>"
-                                    else:
-                                        log_res[k] = v
-                            else:
-                                log_res = result
+                            log_res = _truncate_for_log(result)
 
                             if msg_type in _HIGH_FREQ_TYPES:
                                 _log.debug(f"Sending WS response: type={msg_type}_response")
@@ -165,18 +159,7 @@ class LSCWebSocketServer:
         if not self.clients:
             return
 
-        # 对大字段执行截断再打日志，以免产生超大日志文件
-        log_data = {}
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, str) and len(v) > 200:
-                    log_data[k] = f"<str of length {len(v)}>"
-                elif isinstance(v, list) and len(v) > 10:
-                    log_data[k] = f"<list of length {len(v)}>"
-                else:
-                    log_data[k] = v
-        else:
-            log_data = data
+        log_data = _truncate_for_log(data)
 
         _log.info(f"Broadcasting WS message: type={message_type}, data={log_data}")
             

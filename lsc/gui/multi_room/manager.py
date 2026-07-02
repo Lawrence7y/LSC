@@ -318,9 +318,9 @@ class MultiRoomManager(QObject):
     # Emitted on medium-frequency ticks (every 5s) when recording rooms
     # have updated file sizes, so the backend can broadcast rooms_updated.
     medium_tick = Signal()
-    # Emitted on low-frequency ticks (every 30s) when a recording room has
-    # low disk space, so the UI can surface a warning before FFmpeg dies.
-    # (Reserved for future use; currently stop_recording handles this inline.)
+    # Emitted on low-frequency ticks (every 10s) for disk space checks
+    # and other low-frequency monitoring tasks.
+    low_tick = Signal()
     # Emitted when audio cross-correlation alignment completes.
     align_finished = Signal(dict)  # result dict
 
@@ -1424,6 +1424,9 @@ class MultiRoomManager(QObject):
             room.reconnect_param_mode = param_mode
             room.reconnect_bitrate = bitrate or ""
             room.reconnect_bitrate_unit = bitrate_unit
+            room.reconnect_resolution = resolution or ""
+            room.reconnect_framerate = framerate or ""
+            room.reconnect_audio_bitrate = audio_bitrate or ""
             room.reconnect_attempts = 0
             room.reconnect_next_attempt_at = 0.0
         if not ok:
@@ -1446,6 +1449,7 @@ class MultiRoomManager(QObject):
             return False
         ok, _size_mb, output_path = controller.stop_recording()
         room.is_recording = False
+        room.is_reconnecting = False
         room.record_started_at = None
         room.reconnect_attempts = 0
         room.reconnect_next_attempt_at = 0.0
@@ -1634,6 +1638,7 @@ class MultiRoomManager(QObject):
         if not is_recoverable_error(error_msg):
             room.last_error = error_msg
             room.is_recording = False
+            room.is_reconnecting = False
             room.record_started_at = None
             _log.warning("Room %s non-recoverable error: %s", room.room_id, error_msg)
             return
@@ -1641,6 +1646,7 @@ class MultiRoomManager(QObject):
         if room.reconnect_attempts >= _MAX_RECONNECT_ATTEMPTS:
             room.last_error = error_msg
             room.is_recording = False
+            room.is_reconnecting = False
             room.record_started_at = None
             _log.warning("Room %s reconnect exhausted (%d attempts), giving up",
                          room.room_id, room.reconnect_attempts)
@@ -1654,6 +1660,7 @@ class MultiRoomManager(QObject):
 
         if room.reconnect_next_attempt_at <= 0:
             room.reconnect_next_attempt_at = _time.monotonic() + delay
+            room.is_reconnecting = True
             room.last_error = f"{error_msg}，{delay:.0f}秒后尝试恢复..."
             _log.info("Room %s scheduling reconnect attempt %d/%d (delay=%.1fs)",
                       room.room_id, room.reconnect_attempts + 1, _MAX_RECONNECT_ATTEMPTS, delay)
@@ -1704,11 +1711,15 @@ class MultiRoomManager(QObject):
             param_mode=room.reconnect_param_mode,
             bitrate=room.reconnect_bitrate,
             bitrate_unit=room.reconnect_bitrate_unit,
+            resolution=room.reconnect_resolution or None,
+            framerate=room.reconnect_framerate or None,
+            audio_bitrate=room.reconnect_audio_bitrate or None,
         )
         if ok:
             _log.info("Room %s reconnect succeeded", room.room_id)
             room.reconnect_attempts = 0
             room.reconnect_next_attempt_at = 0.0
+            room.is_reconnecting = False
         else:
             _log.warning("Room %s reconnect attempt %d failed: %s",
                          room.room_id, room.reconnect_attempts, room.last_error)
@@ -1721,6 +1732,7 @@ class MultiRoomManager(QObject):
                 _RECONNECT_MAX_DELAY_SEC,
             )
             room.reconnect_next_attempt_at = _time.monotonic() + next_delay
+            room.is_reconnecting = True
 
     def _start_global_timer(self) -> None:
         timer = self._ensure_global_timer()

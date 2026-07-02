@@ -5,12 +5,12 @@ import MainLayout from './components/Layout/MainLayout'
 import Workbench from './pages/Workbench'
 import Settings from './pages/Settings'
 import { useWebSocket } from '@/hooks/useWebSocket'
+import { useNotifications } from '@/hooks/useNotifications'
 import { useAppStore } from '@/store/appStore'
-import { useTesseractPreload } from '@/hooks/useTesseractPreload'
 
 function AppContent() {
   useWebSocket()
-  useTesseractPreload()
+  useNotifications()
 
   return (
     <HashRouter>

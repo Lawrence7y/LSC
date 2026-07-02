@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import { Button, message, Tooltip, Progress } from 'antd'
+import { Button, message, Tooltip } from 'antd'
 import { FolderOpenOutlined, ReloadOutlined, CheckCircleFilled, CloseCircleFilled, DownloadOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
+import LogViewer from '@/components/LogViewer'
 import { RecordSettings, AppSettings } from '@/types'
 
 export default function Settings() {
@@ -15,10 +16,11 @@ export default function Settings() {
   const [checkingDeps, setCheckingDeps] = useState(false)
   const [appVersion, setAppVersion] = useState('')
   const [updateStatus, setUpdateStatus] = useState<{
-    type: string
+    type: 'checking' | 'available' | 'not-available' | 'error'
     version?: string
-    percent?: number
     message?: string
+    releaseUrl?: string
+    releaseNotes?: string
   } | null>(null)
 
   useEffect(() => {
@@ -128,18 +130,14 @@ export default function Settings() {
   }
 
   const handleDownloadUpdate = async () => {
-    console.log('[Settings] 用户点击下载更新');
+    console.log('[Settings] 用户点击前往下载更新');
 
     const result = await window.electronAPI?.downloadUpdate()
     if (result && !result.success) {
-      message.error(`下载失败: ${result.error}`)
+      message.error(`打开下载页失败: ${result.error}`)
+    } else {
+      message.info('已在浏览器中打开 GitHub Release 下载页')
     }
-  }
-
-  const handleInstallUpdate = () => {
-    console.log('[Settings] 用户点击安装更新并重启');
-
-    window.electronAPI?.installUpdate()
   }
 
   return (
@@ -328,8 +326,10 @@ export default function Settings() {
                 <option value="libx264">libx264</option>
                 <option value="libx265">libx265</option>
                 <option value="copy">copy</option>
-                <option value="h264_nvenc">h264_nvenc</option>
-                <option value="hevc_nvenc">hevc_nvenc</option>
+                <option value="h264_nvenc">h264_nvenc (NVIDIA)</option>
+                <option value="hevc_nvenc">hevc_nvenc (NVIDIA)</option>
+                <option value="h264_qsv">h264_qsv (Intel)</option>
+                <option value="h264_amf">h264_amf (AMD)</option>
               </select>
             </SettingsRow>
             <SettingsRow label="编码参数">
@@ -341,6 +341,18 @@ export default function Settings() {
                 <option value="CRF 质量">CRF 质量</option>
                 <option value="码率限制">码率限制</option>
                 <option value="不限制">不限制</option>
+              </select>
+            </SettingsRow>
+            <SettingsRow label="编码预设">
+              <select
+                value={settings.preset || 'medium'}
+                onChange={e => handleRecordChange('preset', e.target.value)}
+                className="settings-select"
+              >
+                <option value="ultrafast">ultrafast（最快）</option>
+                <option value="fast">fast（快速）</option>
+                <option value="medium">medium（均衡）</option>
+                <option value="slow">slow（慢速）</option>
               </select>
             </SettingsRow>
             {settings.param_mode === '码率限制' && settings.encoder !== 'copy' && (
@@ -507,29 +519,28 @@ export default function Settings() {
                 )}
                 {updateStatus?.type === 'available' && (
                   <>
-                    <span style={{ fontSize: 12, color: 'var(--brand-400)' }}>
-                      发现新版本 v{updateStatus.version}
+                    <span style={{ fontSize: 12, color: 'var(--brand-400)', fontWeight: 500 }}>
+                      🎉 发现新版本 v{updateStatus.version}
                     </span>
-                    <Button type="primary" size="small" icon={<DownloadOutlined />} onClick={handleDownloadUpdate}>
-                      下载更新
-                    </Button>
-                  </>
-                )}
-                {updateStatus?.type === 'downloading' && (
-                  <div style={{ width: 200 }}>
-                    <div style={{ fontSize: 12, color: 'var(--text-400)', marginBottom: 4 }}>
-                      下载中 {updateStatus.percent}%
-                    </div>
-                    <Progress percent={updateStatus.percent} showInfo={false} size="small" />
-                  </div>
-                )}
-                {updateStatus?.type === 'downloaded' && (
-                  <>
-                    <span style={{ fontSize: 12, color: 'var(--state-success)' }}>
-                      v{updateStatus.version} 已下载完成
-                    </span>
-                    <Button type="primary" size="small" onClick={handleInstallUpdate}>
-                      立即安装并重启
+                    {updateStatus.message && (
+                      <span style={{
+                        fontSize: 11,
+                        color: 'var(--text-400)',
+                        maxWidth: 220,
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        lineHeight: 1.5,
+                      }}>
+                        {String(updateStatus.message).slice(0, 120)}{String(updateStatus.message).length > 120 ? '...' : ''}
+                      </span>
+                    )}
+                    <Button
+                      type="primary"
+                      size="small"
+                      icon={<DownloadOutlined />}
+                      onClick={handleDownloadUpdate}
+                    >
+                      前往下载
                     </Button>
                   </>
                 )}
@@ -541,7 +552,6 @@ export default function Settings() {
                 <Button
                   onClick={handleCheckUpdate}
                   loading={updateStatus?.type === 'checking'}
-                  disabled={updateStatus?.type === 'downloading'}
                 >
                   检查更新
                 </Button>
@@ -550,6 +560,26 @@ export default function Settings() {
           </div>
         </div>
       </div>
+
+        {/* 日志 */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{
+            fontSize: 13,
+            fontWeight: 600,
+            color: 'var(--text-300)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.04em',
+            padding: '0 4px',
+            marginBottom: 8,
+          }}>日志</div>
+          <div style={{
+            background: 'var(--background-800)',
+            borderRadius: 14,
+            padding: 16,
+          }}>
+            <LogViewer />
+          </div>
+        </div>
 
       <style>{`
         .settings-select {

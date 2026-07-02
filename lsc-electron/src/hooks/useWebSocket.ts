@@ -126,6 +126,7 @@ function _attachSharedWebSocketHandlers(): () => void {
   const unsubConnected = wsClient.on('connected', () => {
     useAppStore.getState().setConnectionStatus('connected')
     wsClient.send('get_disk_usage', {})
+    wsClient.send('get_system_stats', {})
     wsClient.send('get_settings', {})
     // S1: WS 重连后自动恢复所有预览。重连成功后，对 store 中 preview_enabled=true
     // 的房间重新发送 enable_preview(mse)，确保后端 MseStreamer 重建（旧进程可能已随
@@ -157,6 +158,16 @@ function _attachSharedWebSocketHandlers(): () => void {
         }
       }
       useAppStore.getState().setRooms(data.rooms)
+      // 根据录制状态切换托盘图标
+      const anyRecording = data.rooms.some((r: any) => r.is_recording)
+      const anyError = data.rooms.some((r: any) => r.last_error && !r.is_recording)
+      if (anyError) {
+        window.electronAPI?.setTrayState?.('error')
+      } else if (anyRecording) {
+        window.electronAPI?.setTrayState?.('recording')
+      } else {
+        window.electronAPI?.setTrayState?.('idle')
+      }
     }
   }
   const unsubRoomsUpdated = wsClient.on('rooms_updated', handleRooms)
@@ -172,6 +183,24 @@ function _attachSharedWebSocketHandlers(): () => void {
   const unsubClipCompleted = wsClient.on('clip_completed', (data: any) => {
     if (data && typeof data.start === 'number' && typeof data.end === 'number') {
       useAppStore.getState().addRecentClip(data as ClipSegment)
+    }
+    window.electronAPI?.setProgressBar?.(-1)
+    useAppStore.getState().setExportProgress(null)
+  })
+
+  const unsubClipFailed = wsClient.on('clip_failed', () => {
+    window.electronAPI?.setProgressBar?.(-1)
+    useAppStore.getState().setExportProgress(null)
+  })
+
+  const unsubExportProgress = wsClient.on('export_progress', (data: any) => {
+    if (data?.percent !== undefined) {
+      const progress = Math.max(0, Math.min(1, data.percent / 100))
+      window.electronAPI?.setProgressBar?.(progress)
+      useAppStore.getState().setExportProgress({
+        job_id: data.job_id || '',
+        percent: data.percent,
+      })
     }
   })
 
@@ -220,6 +249,21 @@ function _attachSharedWebSocketHandlers(): () => void {
   }
   const unsubDiskUsage = wsClient.on('disk_usage', handleDiskUsage)
   const unsubDiskUsageResponse = wsClient.on('get_disk_usage_response', handleDiskUsage)
+
+  const handleSystemStats = (data: any) => {
+    if (data && typeof data.cpu_percent === 'number') {
+      useAppStore.getState().setSystemStats({
+        cpu_percent: data.cpu_percent,
+        memory_percent: data.memory_percent,
+        memory_total_gb: data.memory_total_gb,
+        memory_used_gb: data.memory_used_gb,
+        disk_percent: data.disk_percent,
+        disk_total_gb: data.disk_total_gb,
+        disk_free_gb: data.disk_free_gb,
+      })
+    }
+  }
+  const unsubSystemStats = wsClient.on('system_stats', handleSystemStats)
 
   const unsubDepStatus = wsClient.on('check_dependencies_response', (data: any) => {
     if (data && data.dependencies) {
@@ -315,6 +359,8 @@ function _attachSharedWebSocketHandlers(): () => void {
     unsubRoomsLoaded()
     unsubRoomUpdated()
     unsubClipCompleted()
+    unsubClipFailed()
+    unsubExportProgress()
     unsubSettingsLoaded()
     unsubSettingsResponse()
     unsubConnectionStatus()
@@ -322,6 +368,7 @@ function _attachSharedWebSocketHandlers(): () => void {
     unsubReconnectFailed()
     unsubDiskUsage()
     unsubDiskUsageResponse()
+    unsubSystemStats()
     unsubDepStatus()
     unsubMseInit()
     unsubMseSegment()

@@ -12,5 +12,8 @@ websockets>=12.0
 # Audio cross-correlation alignment (numpy-based FFT)
 numpy>=1.24,<3
 
+# System resource monitoring (CPU, memory, disk)
+psutil>=5.9,<7
+
 # Test dependencies (uncomment if running the test suite)
 # pytest>=7.4,<9

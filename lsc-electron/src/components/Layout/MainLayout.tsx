@@ -11,6 +11,7 @@ import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
 import type { ConnectionStatus } from '@/store/appStore'
+import SystemMonitor from './SystemMonitor'
 
 const { Sider, Content } = Layout
 
@@ -206,6 +207,7 @@ export default function MainLayout() {
               {connectionLabels[connectionStatus]}
             </span>
           </div>
+          <SystemMonitor />
           {/* 重连按钮：仅在断开/失败时显示 */}
           {(connectionStatus === 'disconnected' || connectionStatus === 'reconnect_failed') && (
             <Button

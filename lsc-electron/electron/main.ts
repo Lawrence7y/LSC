@@ -1,10 +1,34 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, Notification } from 'electron'
 import path from 'path'
 import fs from 'fs'
+import https from 'https'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { extractBackendWsUrl } from './backendUrl'
 
 // ===== 全局日志持久化 =====
+const _MAX_LOG_SIZE = 2 * 1024 * 1024 // 2MB
+const _MAX_LOG_BACKUPS = 5
+
+function _rotateLogFile(logFile: string): void {
+  try {
+    if (!fs.existsSync(logFile)) return
+    const stats = fs.statSync(logFile)
+    if (stats.size < _MAX_LOG_SIZE) return
+    for (let i = _MAX_LOG_BACKUPS; i >= 1; i--) {
+      const oldPath = `${logFile}.${i}`
+      const newPath = `${logFile}.${i + 1}`
+      if (i === _MAX_LOG_BACKUPS) {
+        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath)
+      } else {
+        if (fs.existsSync(oldPath)) fs.renameSync(oldPath, newPath)
+      }
+    }
+    fs.renameSync(logFile, `${logFile}.1`)
+  } catch {
+    // 轮转失败不应影响日志写入
+  }
+}
+
 export function appLog(level: 'INFO' | 'WARN' | 'ERROR', module: string, msg: string): void {
   try {
     const logDir = path.join(app.getPath('userData'), 'logs')
@@ -14,6 +38,9 @@ export function appLog(level: 'INFO' | 'WARN' | 'ERROR', module: string, msg: st
     const logFile = path.join(logDir, 'debug.log')
     const line = `${new Date().toISOString()} [${level}] [${module}] ${msg}\n`
     fs.appendFileSync(logFile, line, 'utf-8')
+    if (Math.random() < 0.01) {
+      _rotateLogFile(logFile)
+    }
     if (level === 'ERROR') {
       console.error(line.trim())
     } else if (level === 'WARN') {
@@ -98,7 +125,7 @@ function getBackendDir(): string {
 }
 
 function getBackendLogPath(): string {
-  return path.join(app.getPath('userData'), 'logs', 'backend.log')
+  return path.join(app.getPath('userData'), 'logs', 'backend-stdout.log')
 }
 
 function writeLog(line: string): void {
@@ -230,6 +257,7 @@ function spawnBackend(): void {
     SYSTEMROOT: process.env.SYSTEMROOT,
     PATHEXT: process.env.PATHEXT,
     PYTHONUNBUFFERED: '1',
+    LSC_LOG_DIR: path.join(app.getPath('userData'), 'logs'),
   }
   // PYTHONPATH 如有则透传
   if (process.env.PYTHONPATH) {
@@ -513,6 +541,256 @@ function registerWindowIpc(): void {
       return { success: false, error: String(e) };
     }
   })
+
+  // ===== 版本更新检测 =====
+  // 检测仓库：https://github.com/Lawrence7y/LSC
+  // API：https://api.github.com/repos/Lawrence7y/LSC/releases/latest
+
+  /**
+   * 向 GitHub API 发起 HTTPS GET 请求，返回响应体 JSON。
+   * timeout=10s，失败时抛出含中文的错误信息方便前端展示。
+   */
+  function fetchGitHubLatestRelease(): Promise<{
+    tag_name: string
+    name: string
+    html_url: string
+    body: string
+    assets: Array<{ name: string; browser_download_url: string; size: number }>
+  }> {
+    return new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.github.com',
+        path: '/repos/Lawrence7y/LSC/releases/latest',
+        method: 'GET',
+        headers: {
+          'User-Agent': `LSC-App/${app.getVersion()}`,
+          'Accept': 'application/vnd.github+json',
+        },
+        timeout: 10000,
+      }
+      const req = https.request(options, (res) => {
+        let body = ''
+        res.setEncoding('utf-8')
+        res.on('data', (chunk) => { body += chunk })
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            try {
+              resolve(JSON.parse(body))
+            } catch (e) {
+              reject(new Error('GitHub API 返回数据解析失败'))
+            }
+          } else if (res.statusCode === 403 || res.statusCode === 429) {
+            reject(new Error('GitHub API 请求过于频繁，请稍后重试'))
+          } else if (res.statusCode === 404) {
+            reject(new Error('未找到发布版本（仓库可能尚未发布 Release）'))
+          } else {
+            reject(new Error(`GitHub API 返回异常状态码: ${res.statusCode}`))
+          }
+        })
+      })
+      req.on('timeout', () => {
+        req.destroy()
+        reject(new Error('检查更新超时（可能是网络问题或 GitHub 访问受限），请稍后重试'))
+      })
+      req.on('error', (err) => {
+        if ((err as NodeJS.ErrnoException).code === 'ENOTFOUND') {
+          reject(new Error('无法连接到 GitHub，请检查网络连接'))
+        } else {
+          reject(new Error(`网络请求失败: ${err.message}`))
+        }
+      })
+      req.end()
+    })
+  }
+
+  /**
+   * 比较两个 semver 版本字符串（去除开头 v）。
+   * 返回 1 = remote > local（有新版本），0 = 相同，-1 = remote < local。
+   */
+  function compareVersions(local: string, remote: string): number {
+    const normalize = (v: string) => v.replace(/^v/, '').split('.').map(Number)
+    const [la, lb, lc] = normalize(local)
+    const [ra, rb, rc] = normalize(remote)
+    if (ra !== la) return ra > la ? 1 : -1
+    if (rb !== lb) return rb > lb ? 1 : -1
+    if (rc !== lc) return rc > lc ? 1 : -1
+    return 0
+  }
+
+  // 缓存最近一次检查结果，避免短时间内频繁请求 GitHub API
+  let _lastUpdateCheck: { time: number; result: object } | null = null
+  const _UPDATE_CACHE_MS = 5 * 60 * 1000  // 5 分钟缓存
+
+  ipcMain.handle('check-for-update', async () => {
+    appLog('INFO', 'Update', '用户触发检查更新')
+
+    // 通知前端：正在检查
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-status', { type: 'checking' })
+    }
+
+    // 命中缓存时直接返回
+    if (_lastUpdateCheck && Date.now() - _lastUpdateCheck.time < _UPDATE_CACHE_MS) {
+      appLog('INFO', 'Update', '使用缓存的更新检查结果')
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-status', _lastUpdateCheck.result)
+      }
+      return { success: true }
+    }
+
+    try {
+      const release = await fetchGitHubLatestRelease()
+      const remoteVersion = release.tag_name.replace(/^v/, '')
+      const localVersion = app.getVersion()
+      const cmp = compareVersions(localVersion, remoteVersion)
+
+      let statusPayload: object
+      if (cmp > 0) {
+        // 有新版本
+        statusPayload = {
+          type: 'available',
+          version: remoteVersion,
+          releaseUrl: release.html_url,
+          releaseNotes: release.body || '',
+          assets: release.assets,
+        }
+        appLog('INFO', 'Update', `发现新版本: v${remoteVersion}（当前 v${localVersion}）`)
+      } else {
+        // 已是最新
+        statusPayload = {
+          type: 'not-available',
+          version: localVersion,
+        }
+        appLog('INFO', 'Update', `已是最新版本 v${localVersion}`)
+      }
+
+      _lastUpdateCheck = { time: Date.now(), result: statusPayload }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-status', statusPayload)
+      }
+      return { success: true }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      appLog('ERROR', 'Update', `检查更新失败: ${msg}`)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-status', { type: 'error', message: msg })
+      }
+      return { success: false, error: msg }
+    }
+  })
+
+  // 打开 GitHub Release 页面（浏览器下载）
+  ipcMain.handle('download-update', async () => {
+    appLog('INFO', 'Update', '用户点击下载更新，跳转到 GitHub Release 页面')
+    // 使用缓存的 releaseUrl，否则直接跳转仓库 releases 页
+    const releaseUrl =
+      (_lastUpdateCheck?.result as Record<string, string> | undefined)?.releaseUrl ||
+      'https://github.com/Lawrence7y/LSC/releases/latest'
+    try {
+      await shell.openExternal(releaseUrl)
+      return { success: true }
+    } catch (err) {
+      appLog('ERROR', 'Update', `打开 Release 页面失败: ${err}`)
+      return { success: false, error: String(err) }
+    }
+  })
+
+  // 安装更新（保留接口兼容性，提示用户手动安装）
+  ipcMain.handle('install-update', () => {
+    appLog('INFO', 'Update', 'install-update called（手动下载模式，跳转 GitHub）')
+    shell.openExternal('https://github.com/Lawrence7y/LSC/releases/latest').catch(() => {})
+  })
+
+  // 系统通知
+  ipcMain.handle('show-notification', (_event, payload: {
+    title: string
+    body: string
+    silent?: boolean
+  }) => {
+    if (!Notification.isSupported()) return
+    // 窗口聚焦时跳过系统通知（antd message 已处理）
+    if (mainWindow?.isFocused()) return
+    const notif = new Notification({
+      title: payload.title,
+      body: payload.body,
+      icon: path.join(__dirname, '../../assets/icon.ico'),
+      silent: payload.silent ?? false,
+    })
+    notif.on('click', () => {
+      mainWindow?.show()
+      mainWindow?.focus()
+    })
+    notif.show()
+    // 任务栏闪烁
+    if (mainWindow && !mainWindow.isFocused()) {
+      mainWindow.flashFrame(true)
+      mainWindow.once('focus', () => mainWindow.flashFrame(false))
+    }
+  })
+
+  // 任务栏进度条
+  ipcMain.handle('set-progress-bar', (_event, progress: number) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setProgressBar(progress)
+    }
+  })
+
+  // 托盘动态状态：通过 tooltip 文字区分状态（图标暂不切换，缺少多状态图标资源）
+  const _trayTooltips: Record<string, string> = {
+    idle: 'LSC 直播切片系统',
+    recording: 'LSC 直播切片系统 — 录制中',
+    error: 'LSC 直播切片系统 — 有错误',
+  }
+  ipcMain.handle('set-tray-state', (_event, state: 'idle' | 'recording' | 'error') => {
+    if (!tray) return
+    try {
+      tray.setToolTip(_trayTooltips[state] || _trayTooltips.idle)
+    } catch {
+      // ignore
+    }
+  })
+
+  // backend-error 前端监听桥接
+  ipcMain.handle('get-backend-error', () => {
+    return pythonDetectError
+  })
+
+  // 读取日志文件内容（尾部 N 行）
+  ipcMain.handle('read-log-file', (_event, opts: { file: string; lines?: number }) => {
+    const logDir = path.join(app.getPath('userData'), 'logs')
+    const allowedFiles = ['debug.log', 'backend.log', 'backend-stdout.log']
+    const fileName = opts.file || 'debug.log'
+    if (!allowedFiles.includes(fileName)) {
+      return { success: false, error: '不支持的日志文件', content: '' }
+    }
+    const logPath = path.join(logDir, fileName)
+    try {
+      if (!fs.existsSync(logPath)) {
+        return { success: true, content: '(日志文件不存在或为空)', path: logPath, size: 0 }
+      }
+      const stats = fs.statSync(logPath)
+      const content = fs.readFileSync(logPath, 'utf-8')
+      const allLines = content.split('\n').filter(Boolean)
+      const tailLines = opts.lines && opts.lines > 0 ? allLines.slice(-opts.lines) : allLines.slice(-500)
+      return { success: true, content: tailLines.join('\n'), path: logPath, size: stats.size }
+    } catch (err) {
+      return { success: false, error: String(err), content: '' }
+    }
+  })
+
+  // 在资源管理器中打开日志目录
+  ipcMain.handle('open-log-folder', () => {
+    const logDir = path.join(app.getPath('userData'), 'logs')
+    try {
+      if (!fs.existsSync(logDir)) {
+        fs.mkdirSync(logDir, { recursive: true })
+      }
+      shell.openPath(logDir)
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
 }
 
 function createWindow() {
@@ -533,8 +811,15 @@ function createWindow() {
   });
 
   // 始终注册渲染进程日志转发和生命周期日志
-  mainWindow.webContents.on('console-message', (_event, _level, message) => {
-    appLog('INFO', 'renderer', message);
+  mainWindow.webContents.on('console-message', (_event, level, message) => {
+    const levelMap: Record<number, 'INFO' | 'WARN' | 'ERROR'> = {
+      0: 'INFO',
+      1: 'INFO',
+      2: 'WARN',
+      3: 'ERROR',
+    }
+    const logLevel = levelMap[level] || 'INFO'
+    appLog(logLevel, 'renderer', message);
   });
 
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
@@ -629,6 +914,10 @@ app.whenReady().then(() => {
     app.setLoginItemSettings({ openAtLogin: settingsCache.autoLaunch })
   } catch (err) {
     appLog('ERROR', 'App', `同步开机启动设置失败: ${err}`)
+  }
+
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.lsc.app')
   }
 
   // 注册应用设置 IPC（只注册一次）

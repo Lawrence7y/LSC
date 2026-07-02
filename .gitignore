@@ -75,7 +75,24 @@ venv/
 node_modules/
 lsc-electron/release/
 lsc-electron/dist/
+lsc-electron/dist-electron/
 lsc-electron/out/
+lsc-electron/tsconfig.node.tsbuildinfo
+
+# Runtime data (user-specific)
+data/rooms.json
+python-backend/recording_history.json
+python-backend/settings.json
+python-backend/logs/
+logs/
+.runtime/
+
+# AI tool configs
+.opencode/
+.claude/
+.mimocode/
+.trae/
+.workbuddy/
 
 # Unrelated prototype/scratch files
 bun-socket-v2.ts

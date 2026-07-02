@@ -1,9 +1,0 @@
-
-[spawnBackend] {
-  backendDir: 'D:\\Project\\直播切片多人\\python-backend',
-  backendEntry: 'D:\\Project\\直播切片多人\\python-backend\\main.py',
-  interpreter: 'python',
-  exists: true
-}
-[spawnBackend] userData= C:\Users\Administrator\AppData\Roaming\Electron logDir= C:\Users\Administrator\AppData\Roaming\Electron\logs
-[spawnBackend] backend WebSocket URL: ws://localhost:9877

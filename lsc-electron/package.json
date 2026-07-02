@@ -1,6 +1,6 @@
 {
   "name": "lsc-electron",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "description": "LSC 直播切片系统 - Electron 版本",
   "author": "Lawrence7y",
   "repository": {
@@ -24,7 +24,6 @@
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
-    "tesseract.js": "^7.0.0",
     "zustand": "^4.4.7"
   },
   "devDependencies": {

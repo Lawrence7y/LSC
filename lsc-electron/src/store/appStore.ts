@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { RoomSession, ClipSegment, RecordSettings, AppSettings, DependencyStatus } from '@/types'
+import { RoomSession, ClipSegment, RecordSettings, AppSettings, DependencyStatus, SystemStats } from '@/types'
 
 export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'reconnect_failed'
 
@@ -18,6 +18,8 @@ interface AppState {
   appSettings: AppSettings
   connectionStatus: ConnectionStatus
   diskUsage: DiskUsage | null
+  systemStats: SystemStats | null
+  exportProgress: { job_id: string; percent: number } | null
   dependencyStatus: DependencyStatus | null
 }
 
@@ -35,6 +37,8 @@ interface AppActions {
   setAppSettings: (s: Partial<AppSettings>) => void
   setConnectionStatus: (status: ConnectionStatus) => void
   setDiskUsage: (diskUsage: DiskUsage | null) => void
+  setSystemStats: (stats: SystemStats | null) => void
+  setExportProgress: (progress: { job_id: string; percent: number } | null) => void
   setDependencyStatus: (status: DependencyStatus | null) => void
 }
 
@@ -51,6 +55,7 @@ const defaultSettings: RecordSettings = {
   audio_codec: 'AAC 128k',
   audio_bitrate: '128k',
   preview_quality: '高清',
+  preset: 'medium',
 }
 
 const defaultAppSettings: AppSettings = {
@@ -69,6 +74,8 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   appSettings: defaultAppSettings,
   connectionStatus: 'disconnected',
   diskUsage: null,
+  systemStats: null,
+  exportProgress: null,
   dependencyStatus: null,
 
   setRooms: (rooms) => set({ rooms }),
@@ -125,6 +132,10 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   setConnectionStatus: (connectionStatus) => set({ connectionStatus }),
 
   setDiskUsage: (diskUsage) => set({ diskUsage }),
+
+  setSystemStats: (systemStats) => set({ systemStats }),
+
+  setExportProgress: (exportProgress) => set({ exportProgress }),
 
   setDependencyStatus: (dependencyStatus) => set({ dependencyStatus }),
 }))

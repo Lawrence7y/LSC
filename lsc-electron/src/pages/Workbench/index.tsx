@@ -247,10 +247,6 @@ export default function Workbench() {
         message.error(`导出失败：${data.error}`)
       }
     }))
-    // 导出进度上报（目前无 UI 展示，保留监听）
-    unsubs.push(on('export_progress', () => {
-      // 进度更新可通过 toast 或 ClipList 中的进度指示器展示
-    }))
     // export_clip 提交响应：失败时立即提示
     unsubs.push(on('export_clip_response', (data: { success?: boolean; error?: string; job_id?: string }) => {
       if (data?.job_id && data?.success === false) {

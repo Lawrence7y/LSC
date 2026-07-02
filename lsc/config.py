@@ -47,9 +47,10 @@ class ExportProfile:
         if self.fps < 0:
             self.fps = 0.0
 
-        # 分辨率格式验证
+        # 分辨率格式验证（兼容 "1920x1080" 和 "1920:1080" 两种分隔符）
         if self.resolution:
-            parts = self.resolution.split("x", 1)
+            normalized = self.resolution.replace(":", "x")
+            parts = normalized.split("x", 1)
             if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
                 _log.warning("Invalid resolution format: %s, clearing", self.resolution)
                 self.resolution = ""
@@ -58,6 +59,8 @@ class ExportProfile:
                 if w <= 0 or h <= 0 or w > 7680 or h > 4320:
                     _log.warning("Resolution out of range: %s, clearing", self.resolution)
                     self.resolution = ""
+                else:
+                    self.resolution = normalized
 
     # ── 硬件编码预设 ──
     # 常用硬件编码器快速选择

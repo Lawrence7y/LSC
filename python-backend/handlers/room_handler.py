@@ -28,6 +28,7 @@ if _LSC_ROOT not in sys.path:
 from lsc.config import ExportProfile
 from lsc.gui.multi_room.manager import MultiRoomManager
 from lsc.utils.error_messages import humanize_error
+from lsc.core.services.resource_monitor import collect_system_stats
 
 from persistence import load_rooms, save_rooms
 
@@ -281,7 +282,7 @@ def load_settings():
     return {
         'output_dir': os.path.join(os.path.expanduser('~'), 'LSC', 'output'),
         'theme': 'dark',
-        'encoder': 'H.264 NVENC',
+        'encoder': 'h264_nvenc',
         'quality': '原画',
         'param_mode': 'CRF 质量',
         'crf': 23,
@@ -289,7 +290,6 @@ def load_settings():
         'bitrate_unit': 'kbps',
         'resolution': '原画',
         'framerate': '原画',
-        'audio_codec': 'AAC 128k',
         'audio_bitrate': '128k',
         'preview_quality': '高清',
     }
@@ -384,6 +384,7 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
         'is_connecting': room.is_connecting,
         'is_connected': room.is_connected,
         'is_recording': room.is_recording,
+        'is_reconnecting': getattr(room, 'is_reconnecting', False),
         'record_output_path': room.record_output_path,
         'record_started_at': started_at,
         'record_size_mb': room.record_size_mb,
@@ -478,6 +479,18 @@ def register_room_handlers(server, bridge):
     manager.batch_record_finished.connect(_queue_rooms_update)
     # 每 5 秒中频 tick 时广播 rooms_updated，让前端刷新录制文件大小
     manager.medium_tick.connect(_queue_rooms_update)
+
+    def _broadcast_system_stats():
+        """广播系统资源快照到前端。"""
+        try:
+            settings = load_settings()
+            output_dir = _expand_user_path(settings.get('output_dir', ''))
+            stats = collect_system_stats(output_dir)
+            bridge.queue_broadcast({'type': 'system_stats', 'data': stats})
+        except Exception as exc:
+            _log.debug("System stats broadcast failed: %s", exc)
+
+    manager.low_tick.connect(lambda: _broadcast_system_stats())
 
     @server.on_connect
     async def handle_connect(websocket):
@@ -1046,6 +1059,15 @@ def register_room_handlers(server, bridge):
         _log.debug("获取磁盘使用情况")
         return get_disk_usage_info()
 
+    @server.on('get_system_stats')
+    async def handle_get_system_stats(data):
+        """获取系统资源快照。"""
+        _log.debug("获取系统资源快照")
+        settings = load_settings()
+        output_dir = _expand_user_path(settings.get('output_dir', ''))
+        stats = collect_system_stats(output_dir)
+        return {'type': 'system_stats', 'data': stats}
+
     @server.on('get_settings')
     async def handle_get_settings(data):
         """获取应用设置。"""
@@ -1274,7 +1296,7 @@ def register_room_handlers(server, bridge):
         """导出视频切片。
 
         使用 MSE currentTime 作为时间基准，减去 preview_latency 补偿预览延迟，
-        再减去 content_offset 补偿多房间内容延迟（由音频互相关或 OCR 计算得出）。
+        再减去 content_offset 补偿多房间内容延迟（由音频互相关计算得出）。
         不使用墙钟时间差，避免 seek 标记时墙钟差与内容时长不一致导致导出时长错误。
         """
         room_id = data.get('room_id')
@@ -1371,9 +1393,16 @@ def register_room_handlers(server, bridge):
             bitrate = str(settings.get('bitrate', 8000))
             video_bitrate = f"{bitrate}k" if not bitrate.endswith(('k', 'M')) else bitrate
 
+            # 分辨率格式归一化：将 "1920:1080" 转为 "1920x1080"
+            if resolution and ":" in resolution:
+                resolution = resolution.replace(":", "x")
+
+            # 从设置中读取编码预设（默认 medium）
+            preset = settings.get('preset', 'medium')
             profile = ExportProfile(
                 codec=codec_map.get(encoder, 'libx264'),
                 crf=crf_val,
+                preset=preset,
                 rate_mode=rate_mode_map.get(param_mode, 'crf'),
                 video_bitrate=video_bitrate,
                 audio_bitrate=audio_br,

@@ -64,6 +64,7 @@ class RoomSession:
     analysis_in_progress: bool = False
     export_in_progress: bool = False
     # 自动重连状态
+    is_reconnecting: bool = False
     reconnect_next_attempt_at: float = 0.0
     reconnect_attempts: int = 0
     reconnect_output_dir: str = ""
@@ -72,6 +73,9 @@ class RoomSession:
     reconnect_param_mode: str = "CRF 质量"
     reconnect_bitrate: str = ""
     reconnect_bitrate_unit: str = "kbps"
+    reconnect_resolution: str = ""
+    reconnect_framerate: str = ""
+    reconnect_audio_bitrate: str = ""
     # 每房间独立的预览画质（覆盖全局设置），空字符串表示使用全局设置
     preview_quality: str = ""
     # 直播分类
@@ -105,7 +109,9 @@ class RoomSession:
     def status_text(self) -> str:
         """生成当前房间状态的简短文本描述，供 UI 状态栏展示。"""
         parts: list[str] = []
-        if self.is_connecting:
+        if self.is_reconnecting:
+            parts.append(f"重连中({self.reconnect_attempts})")
+        elif self.is_connecting:
             parts.append("连接中")
         elif self.is_recording:
             parts.append("录制中")

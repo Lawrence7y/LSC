@@ -9,6 +9,7 @@ export interface RoomSession {
   is_connecting: boolean
   is_connected: boolean
   is_recording: boolean
+  is_reconnecting?: boolean
   record_output_path: string
   record_started_at: string | null
   record_size_mb: number
@@ -77,6 +78,7 @@ export interface RecordSettings {
   audio_codec: string
   audio_bitrate: string
   preview_quality: string
+  preset?: string
 }
 
 // 导出预设
@@ -124,6 +126,13 @@ export interface ElectronAPI {
   installUpdate: () => void
   onUpdateStatus: (callback: (status: any) => void) => void
   removeUpdateStatusListeners: () => void
+  showNotification?: (payload: { title: string; body: string; silent?: boolean }) => Promise<void>
+  setProgressBar?: (progress: number) => Promise<void>
+  setTrayState?: (state: 'idle' | 'recording' | 'error') => Promise<void>
+  getBackendError?: () => Promise<string | null>
+  onBackendError?: (callback: (error: string) => void) => void
+  readLogFile?: (opts: { file: string; lines?: number }) => Promise<{ success: boolean; content: string; path?: string; error?: string; size?: number }>
+  openLogFolder?: () => Promise<{ success: boolean; error?: string }>
 }
 
 // 依赖检测状态
@@ -138,6 +147,16 @@ export interface DependencyStatus {
   ffprobe: DependencyItem
   nvenc: { available: boolean }
   python: { version: string; path: string }
+}
+
+export interface SystemStats {
+  cpu_percent: number
+  memory_percent: number
+  memory_total_gb: number
+  memory_used_gb: number
+  disk_percent: number
+  disk_total_gb: number
+  disk_free_gb: number
 }
 
 // 通用应用设置（主题/语言/开机自启/最小化到托盘）
