@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多房间管理 v2 — LSC</title>
+    <style id="theme-vars">
+/*
+ * Pinguo design tokens
+ * Brand: Pinguo
+ * Domain: Consumer imaging product
+ * Style: Restrained, elegant, Apple-inspired
+ * Theme mode: light-dark
+ * Source language: zh
+ * Output language: en
+ *
+ * Color architecture (two layers):
+ *   1. Primitive palette - six categories. brand / background / text / icon
+ *      are each a 10-step scale (50 lightest to 900 darkest). state-success and
+ *      state-error are functional colors anchored on Apple system colors.
+ *      Anchors follow Apple Human Interface Guidelines system colors
+ *      (System Blue #007AFF, System Green #34C759, System Red #FF3B30,
+ *      system grays / label / background colors).
+ *   2. Semantic tokens - :root (light) and .dark map roles onto primitives.
+ *      Components and UI kits must only consume the semantic tokens below.
+ */
+
+/* @group-priority: brand, background, text, icon, state-success, state-error */
+
+:root {
+  /* ===== PRIMITIVE PALETTE ===== */
+
+  /* brand */
+  --brand-50: #e8f2ff;
+  --brand-100: #cfe5ff;
+  --brand-200: #9fcbff;
+  --brand-300: #66abff;
+  --brand-400: #2e8dff;
+  --brand-500: #007aff; /* @primary */
+  --brand-600: #0064d6;
+  --brand-700: #004fad;
+  --brand-800: #003b82;
+  --brand-900: #00275a;
+
+  /* background */
+  --background-50: #ffffff;
+  --background-100: #f7f7fa;
+  --background-200: #f2f2f7;
+  --background-300: #e5e5ea;
+  --background-400: #d1d1d6;
+  --background-500: #aeaeb2;
+  --background-600: #8e8e93;
+  --background-700: #3a3a3c;
+  --background-800: #1c1c1e;
+  --background-900: #000000;
+
+  /* text */
+  --text-50: #f5f5f7;
+  --text-100: #e3e3e8;
+  --text-200: #c7c7cc;
+  --text-300: #aeaeb2;
+  --text-400: #8e8e93;
+  --text-500: #6e6e73;
+  --text-600: #48484a;
+  --text-700: #3c3c43;
+  --text-800: #1d1d1f;
+  --text-900: #000000;
+
+  /* icon */
+  --icon-50: #f5f5f7;
+  --icon-100: #e5e5ea;
+  --icon-200: #d1d1d6;
+  --icon-300: #c7c7cc;
+  --icon-400: #aeaeb2;
+  --icon-500: #8e8e93;
+  --icon-600: #6e6e73;
+  --icon-700: #48484a;
+  --icon-800: #2c2c2e;
+  --icon-900: #1d1d1f;
+
+  /* state-success */
+  --state-success: #34c759; /* @primary */
+  --state-success-dark: #30d158;
+  --state-success-surface: #e9f9ee;
+  --state-success-foreground: #ffffff;
+
+  /* state-error */
+  --state-error: #ff3b30; /* @primary */
+  --state-error-dark: #ff453a;
+  --state-error-surface: #ffecea;
+  --state-error-foreground: #ffffff;
+
+  /* ===== SEMANTIC ROLES ===== */
+
+  /* semantic */
+  --background: var(--background-50);
+  --foreground: var(--text-800);
+  --card: var(--background-50);
+  --card-foreground: var(--text-800);
+  --popover: var(--background-50);
+  --popover-foreground: var(--text-900);
+
+  --primary: var(--brand-500);
+  --primary-foreground: var(--background-50);
+  --secondary: var(--background-200);
+  --secondary-foreground: var(--text-800);
+  --muted: var(--background-200);
+  --muted-foreground: var(--text-400);
+  --accent: var(--background-100);
+  --accent-foreground: var(--text-800);
+  --destructive: var(--state-error);
+  --destructive-foreground: var(--state-error-foreground);
+  --success: var(--state-success);
+  --success-foreground: var(--state-success-foreground);
+  --border: var(--background-300);
+  --input: var(--background-400);
+  --ring: var(--brand-500);
+
+  --icon: var(--icon-900);
+  --icon-muted: var(--icon-500);
+
+  /* chart */
+  --chart-1: var(--state-success);
+  --chart-2: var(--brand-500);
+  --chart-3: #ff9500;
+  --chart-4: #5856d6;
+  --chart-5: #af52de;
+
+  /* sidebar */
+  --sidebar: var(--background-200);
+  --sidebar-foreground: var(--text-800);
+  --sidebar-primary: var(--brand-500);
+  --sidebar-primary-foreground: var(--background-50);
+  --sidebar-accent: var(--background-300);
+  --sidebar-accent-foreground: var(--text-800);
+  --sidebar-border: var(--background-300);
+  --sidebar-ring: var(--brand-500);
+
+  /* TYPOGRAPHY */
+  --font-sans: DM Sans, ui-sans-serif, sans-serif, system-ui;
+  --font-serif: DM Sans, ui-sans-serif, sans-serif, system-ui;
+  --font-mono: JetBrains Mono, monospace;
+  --tracking-normal: 0em;
+
+  /* RADIUS */
+  --radius: 1.2rem;
+
+  /* SHADOWS */
+  --shadow-2xs: 0 1px 2px -1px rgba(0, 0, 0, 0.04);
+  --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05), 0 1px 3px -1px rgba(0, 0, 0, 0.05);
+  --shadow: 0 2px 4px -1px rgba(0, 0, 0, 0.06), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.06), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 8px 24px -8px rgba(0, 0, 0, 0.08), 0 4px 8px -4px rgba(0, 0, 0, 0.05);
+  --shadow-xl: 0 16px 40px -10px rgba(0, 0, 0, 0.10), 0 8px 16px -8px rgba(0, 0, 0, 0.06);
+  --shadow-2xl: 0 24px 64px -12px rgba(0, 0, 0, 0.12);
+
+  /* SPACING */
+  --spacing: 0.24rem;
+}
+
+/* ===== SEMANTIC ROLES - dark ===== */
+.dark {
+  --background: var(--background-900);
+  --foreground: var(--text-50);
+  --card: var(--background-800);
+  --card-foreground: var(--text-50);
+  --popover: var(--background-700);
+  --popover-foreground: var(--text-50);
+
+  --primary: var(--brand-400);
+  --primary-foreground: var(--background-900);
+  --secondary: var(--background-800);
+  --secondary-foreground: var(--text-50);
+  --muted: var(--background-800);
+  --muted-foreground: var(--text-400);
+  --accent: var(--background-700);
+  --accent-foreground: var(--text-50);
+  --destructive: var(--state-error-dark);
+  --destructive-foreground: var(--state-error-foreground);
+  --success: var(--state-success-dark);
+  --success-foreground: var(--state-success-foreground);
+  --border: var(--background-700);
+  --input: var(--background-700);
+  --ring: var(--brand-400);
+
+  --icon: var(--icon-50);
+  --icon-muted: var(--icon-500);
+
+  --chart-1: var(--state-success-dark);
+  --chart-2: var(--brand-400);
+  --chart-3: #ff9f0a;
+  --chart-4: #5e5ce6;
+  --chart-5: #bf5af2;
+
+  --sidebar: var(--background-800);
+  --sidebar-foreground: var(--text-50);
+  --sidebar-primary: var(--brand-400);
+  --sidebar-primary-foreground: var(--background-900);
+  --sidebar-accent: var(--background-700);
+  --sidebar-accent-foreground: var(--text-50);
+  --sidebar-border: var(--background-700);
+  --sidebar-ring: var(--brand-400);
+
+  --shadow-2xs: 0 1px 2px -1px rgba(0, 0, 0, 0.30);
+  --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.36), 0 1px 3px -1px rgba(0, 0, 0, 0.36);
+  --shadow: 0 2px 4px -1px rgba(0, 0, 0, 0.40), 0 1px 2px -1px rgba(0, 0, 0, 0.36);
+  --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.44), 0 2px 4px -2px rgba(0, 0, 0, 0.36);
+  --shadow-lg: 0 8px 24px -8px rgba(0, 0, 0, 0.50), 0 4px 8px -4px rgba(0, 0, 0, 0.40);
+  --shadow-xl: 0 16px 40px -10px rgba(0, 0, 0, 0.55), 0 8px 16px -8px rgba(0, 0, 0, 0.44);
+  --shadow-2xl: 0 24px 64px -12px rgba(0, 0, 0, 0.60);
+}
+
+    </style>
+    <style id="component-vars">
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:calc(var(--spacing)*1.5);height:40px;padding:0 20px;border:none;border-radius:calc(var(--radius)*2);background:transparent;color:var(--foreground);font:600 14px/1 var(--font-sans);letter-spacing:var(--tracking-normal);white-space:nowrap;box-shadow:var(--shadow-sm);cursor:pointer;transition:background-color .18s ease,color .18s ease,opacity .18s ease,filter .18s ease}
+.btn:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.btn:disabled{opacity:.42;cursor:not-allowed}
+.btn-primary{background:var(--primary);color:var(--primary-foreground)}
+.btn-primary:hover{filter:brightness(.96)}
+.btn-secondary{height:48px;padding:0 24px;background:var(--secondary);color:var(--secondary-foreground)}
+.btn-secondary:hover{background:var(--muted)}
+.btn-text{height:48px;padding:0 4px;box-shadow:none}
+.btn-text:hover{color:var(--primary)}
+.btn-lg{height:56px;padding:0 28px;font-size:16px}
+.card{width:188px;min-height:148px;padding:calc(var(--spacing)*5);display:flex;flex-direction:column;justify-content:space-between;background:var(--card);color:var(--card-foreground);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow-md);transition:transform .18s ease,box-shadow .18s ease}
+.card:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.card.disabled,.card.disabled:hover{opacity:.5;transform:none;box-shadow:var(--shadow-md)}
+.eyebrow,.meta{color:var(--muted-foreground);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.title{margin:6px 0 8px;font-size:18px;line-height:1.15}
+.body-copy{margin:0;color:var(--muted-foreground);font-size:13px}
+.cta{display:inline-flex;align-items:center;justify-content:center;width:max-content;margin-top:12px;padding:calc(var(--spacing)*2) calc(var(--spacing)*3.5);border-radius:999px;background:var(--primary);color:var(--primary-foreground);font-size:12px;font-weight:700;text-decoration:none}
+.media{aspect-ratio:4/3;border-radius:calc(var(--radius) - 4px);background:linear-gradient(135deg,var(--secondary),var(--accent));border:1px solid var(--border)}
+.media-card{min-height:212px;padding:calc(var(--spacing)*4)}
+.media-card .title{font-size:16px;margin:10px 0 6px}
+.price{font-size:12px;color:var(--muted-foreground)}
+.t{display:grid;grid-template-columns:96px repeat(3,1fr);overflow:hidden;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--card-foreground);box-shadow:var(--shadow-sm)}
+.q{grid-template-columns:82px repeat(4,1fr)}
+.c{padding:10px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
+.t>.c:nth-child(4n),.q>.c:nth-child(5n){border-right:0}
+.t>.c:nth-last-child(-n+4),.q>.c:nth-last-child(-n+5){border-bottom:0}
+.m{background:var(--background);color:var(--muted-foreground);font:700 10px/1 var(--font-mono);letter-spacing:.12em;text-transform:uppercase}
+.h{background:var(--background);font-weight:700}
+.k{display:block;font-size:14px;line-height:1.1}
+.s{display:block;margin-top:4px;color:var(--chart-2);font-size:11px;font-weight:700}
+.b .k{color:var(--chart-2)}
+.v{font-weight:600}
+.n{color:var(--muted-foreground);font-size:12px}
+.x{opacity:.45}
+.surface{display:flex;gap:calc(var(--spacing)*2);padding:calc(var(--spacing)*3);border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow-sm)}
+.field{display:flex;align-items:center;gap:calc(var(--spacing)*2);min-width:240px;height:44px;padding:0 calc(var(--spacing)*3);border:1px solid var(--input);border-radius:var(--radius);background:var(--background);color:var(--foreground);box-shadow:var(--shadow-xs)}
+.field.small{height:40px}
+.field:focus-within{border-color:var(--ring);box-shadow:0 0 0 1px var(--ring)}
+.field.disabled{opacity:.55}
+.icon,.clear{padding:0;border:0;background:transparent;color:var(--icon-muted);font:inherit}
+.icon{font-size:13px}
+.control{flex:1;border:0;outline:0;background:transparent;color:inherit;font:inherit}
+.control::placeholder{color:var(--muted-foreground)}
+.webbar,.mobile{border:1px solid var(--border);box-shadow:var(--shadow-sm)}
+.webbar{display:flex;align-items:center;gap:calc(var(--spacing)*2);min-width:320px;height:44px;padding:0 calc(var(--spacing)*3);border-radius:var(--radius);background:var(--sidebar)}
+.brand{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
+.link,.tab{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;color:inherit;text-decoration:none;white-space:nowrap;transition:background-color .18s ease,color .18s ease,opacity .18s ease}
+.link{height:32px;padding:0 calc(var(--spacing)*2.5)}
+.link:hover,.tab:hover{background:var(--secondary)}
+.link:focus-visible,.tab:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.mobile{padding:calc(var(--spacing)*2);border-radius:calc(var(--radius)*1.1);background:var(--card)}
+.screen{display:flex;align-items:flex-end;justify-content:center;width:188px;height:164px;padding:calc(var(--spacing)*3);border-radius:calc(var(--radius)*.9);background:linear-gradient(180deg,var(--background),var(--secondary))}
+.tabbar{display:flex;gap:calc(var(--spacing)*1.5);padding:calc(var(--spacing)*1.5);border:1px solid var(--border);border-radius:999px;background:var(--card);box-shadow:var(--shadow-md)}
+.tab{flex-direction:column;gap:2px;min-width:56px;height:56px;padding:0 calc(var(--spacing)*1.5);font-size:11px;text-align:center}
+.dot{width:18px;height:18px;border-radius:999px;background:var(--secondary);box-shadow:inset 0 0 0 1px var(--border)}
+.tab:hover .dot{background:var(--primary)}
+.grid{display:grid;gap:8px;flex:1}
+.grid-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.eyebrow{color:var(--muted-foreground);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+.price{font-variant-numeric:tabular-nums}
+.muted{color:var(--muted-foreground)}
+.is-disabled{opacity:.55}
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.3.1/dist/index.global.js"></script>
+    <script src="https://unpkg.com/lucide@1.8.0/dist/umd/lucide.min.js"></script>
+    <style type="text/tailwindcss">
+  @theme inline {
+    --color-foreground: var(--card-foreground);
+  }
+  @layer base {
+    body { background: var(--background-900); color: var(--text-50); }
+    td, th { @apply break-words; word-break: break-all; word-break: auto-phrase; }
+    th { @apply whitespace-nowrap; }
+  }
+    </style>
+</head>
+<body>
+
+<div class="app-shell">
+  <!-- ===== Sidebar ===== -->
+  <aside class="app-sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-icon">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/></svg>
+      </div>
+      <div>
+        <div class="logo-text">LSC</div>
+        <div class="logo-subtext">Live Stream Clipper</div>
+      </div>
+    </div>
+    <nav class="sidebar-nav">
+      <a class="nav-item" data-dom-id="nav-dashboard" data-nav-key="dashboard" href="dashboard.html">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <span>仪表盘</span>
+      </a>
+      <a class="nav-item active" data-nav-key="multi-room" href="multi-room-v2.html">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>
+        <span>多房间管理</span>
+      </a>
+      <a class="nav-item" data-dom-id="nav-settings" data-nav-key="settings" href="settings.html">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        <span>设置</span>
+      </a>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="theme-toggle" data-action="toggle-theme">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/></svg>
+        <span>切换主题</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ===== Main Content Area ===== -->
+  <main class="app-main">
+    <header class="page-header">
+      <h1 class="page-header-title">多房间管理</h1>
+      <div class="header-actions">
+        <div class="view-toggle">
+          <button class="view-toggle-btn active" data-view="grid" title="一排两个">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>
+          </button>
+          <button class="view-toggle-btn" data-view="list" title="一排一个">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
+          </button>
+        </div>
+        <button class="btn-add-room" data-dom-id="add-room">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+          添加房间
+        </button>
+      </div>
+    </header>
+
+    <div class="page-content">
+      <div class="content-layout">
+
+        <!-- ===== LEFT: Room Cards Grid ===== -->
+        <div class="content-main">
+
+          <div class="room-grid" id="roomGrid">
+
+            <!-- Room Card 1 -->
+            <div class="room-card" style="--stagger: 0;">
+              <div class="room-card-header">
+                <div class="room-card-info">
+                  <span class="room-card-name">斗鱼直播间A</span>
+                  <span class="room-card-url"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg> douyu.com/room/123456</span>
+                </div>
+                <span class="status-badge recording">录制中</span>
+              </div>
+              <div class="video-preview">
+                <div class="play-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div>
+              </div>
+              <div class="room-timeline">
+                <div class="timeline-label">斗鱼直播间A</div>
+                <div class="timeline-container">
+                  <div class="timeline-ruler"><span>00:00</span><span>00:30</span><span>01:00</span><span>01:30</span><span>02:00</span><span>02:30</span><span>03:00</span></div>
+                  <div class="timeline-track">
+                    <div class="clip-segment recorded" style="left:0%;width:22%;"><span class="clip-label">00:45</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment highlight" style="left:23%;width:8%;"><span class="clip-label">00:16</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment recorded" style="left:32%;width:30%;"><span class="clip-label">01:02</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment highlight" style="left:63%;width:6%;"><span class="clip-label">00:12</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment recorded" style="left:70%;width:18%;"><span class="clip-label">00:36</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="playhead" style="left:65%;"></div>
+                  </div>
+                </div>
+              </div>
+
+            <div class="room-card" style="--stagger: 1;">
+              <div class="room-card-header">
+                <div class="room-card-info">
+                  <span class="room-card-name">虎牙直播间B</span>
+                  <span class="room-card-url"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg> huya.com/room/789012</span>
+                </div>
+                <span class="status-badge idle">空闲</span>
+              </div>
+              <div class="video-preview">
+                <div class="play-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div>
+              </div>
+              <div class="room-timeline">
+                <div class="timeline-label">虎牙直播间B</div>
+                <div class="timeline-container">
+                  <div class="timeline-ruler"><span>00:00</span><span>00:30</span><span>01:00</span><span>01:30</span><span>02:00</span><span>02:30</span><span>03:00</span></div>
+                  <div class="timeline-track">
+                    <div class="clip-segment recorded" style="left:0%;width:35%;"><span class="clip-label">01:10</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment highlight" style="left:37%;width:10%;"><span class="clip-label">00:20</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment recorded" style="left:48%;width:25%;"><span class="clip-label">00:50</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="playhead" style="left:75%;"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Room Card 3 -->
+            <div class="room-card" style="--stagger: 2;">
+              <div class="room-card-header">
+                <div class="room-card-info">
+                  <span class="room-card-name">B站直播间C</span>
+                  <span class="room-card-url"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg> live.bilibili.com/345678</span>
+                </div>
+                <span class="status-badge recording">录制中</span>
+              </div>
+              <div class="video-preview">
+                <div class="play-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div>
+              </div>
+              <div class="room-timeline">
+                <div class="timeline-label">B站直播间C</div>
+                <div class="timeline-container">
+                  <div class="timeline-ruler"><span>00:00</span><span>00:30</span><span>01:00</span><span>01:30</span><span>02:00</span><span>02:30</span><span>03:00</span></div>
+                  <div class="timeline-track">
+                    <div class="clip-segment recorded" style="left:0%;width:28%;"><span class="clip-label">00:56</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment highlight" style="left:30%;width:12%;"><span class="clip-label">00:24</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment recorded" style="left:44%;width:20%;"><span class="clip-label">00:40</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment recorded" style="left:66%;width:15%;"><span class="clip-label">00:30</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="playhead" style="left:82%;"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Room Card 4 -->
+            <div class="room-card" style="--stagger: 3;">
+              <div class="room-card-header">
+                <div class="room-card-info">
+                  <span class="room-card-name">快手直播间D</span>
+                  <span class="room-card-url"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg> live.kuaishou.com/567890</span>
+                </div>
+                <span class="status-badge idle">空闲</span>
+              </div>
+              <div class="video-preview">
+                <div class="play-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div>
+              </div>
+              <div class="room-timeline">
+                <div class="timeline-label">快手直播间D</div>
+                <div class="timeline-container">
+                  <div class="timeline-ruler"><span>00:00</span><span>00:30</span><span>01:00</span><span>01:30</span><span>02:00</span><span>02:30</span><span>03:00</span></div>
+                  <div class="timeline-track">
+                    <div class="clip-segment recorded" style="left:0%;width:40%;"><span class="clip-label">01:20</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment highlight" style="left:42%;width:15%;"><span class="clip-label">00:30</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="clip-segment recorded" style="left:58%;width:30%;"><span class="clip-label">01:00</span><div class="clip-actions"><button class="clip-action-btn merge" title="连接"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20 21 3"/><path d="M21 16v5h-5"/><path d="M15 15 6 6"/><path d="M4 4v5h5"/></svg></button><button class="clip-action-btn mute" title="静音"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button><button class="clip-action-btn select" title="选择"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg></button><button class="clip-action-btn delete" title="删除"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg></button></div></div>
+                    <div class="playhead" style="left:90%;"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Global Timeline Section (independent) -->
+          <div class="global-timeline-section">
+            <div class="global-timeline-header">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="2" x2="22" y1="12" y2="12"/><polyline points="12 2 22 12 12 22"/></svg>
+              <span>全局时间线</span>
+              <span class="global-time-display">00:00:00 / 06:32:15</span>
+            </div>
+            <div class="global-timeline-body">
+              <div class="timeline-ruler"><span>00:00</span><span>01:00</span><span>02:00</span><span>03:00</span><span>04:00</span><span>05:00</span><span>06:00</span></div>
+              <div class="global-timeline-track">
+                <div class="clip-segment recorded" style="left:0%;width:15%;"><span class="clip-label">斗鱼A 00:54</span></div>
+                <div class="clip-segment highlight" style="left:16%;width:5%;"><span class="clip-label">虎牙B 00:18</span></div>
+                <div class="clip-segment recorded" style="left:22%;width:20%;"><span class="clip-label">斗鱼A 01:12</span></div>
+                <div class="clip-segment highlight" style="left:43%;width:4%;"><span class="clip-label">B站C 00:09</span></div>
+                <div class="clip-segment recorded" style="left:48%;width:12%;"><span class="clip-label">虎牙B 00:43</span></div>
+                <div class="clip-segment recorded" style="left:62%;width:18%;"><span class="clip-label">快手D 01:05</span></div>
+                <div class="clip-segment highlight" style="left:81%;width:6%;"><span class="clip-label">B站C 00:13</span></div>
+                <div class="clip-segment recorded" style="left:88%;width:10%;"><span class="clip-label">快手D 00:36</span></div>
+                <div class="playhead-scrubber" style="left:65%;" data-current="04:12:33" data-total="06:32:15">
+                  <div class="scrubber-line"></div>
+                  <div class="scrubber-handle">
+                    <div class="scrubber-dot"></div>
+                    <div class="scrubber-tooltip">04:12:33 / 06:32:15</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Recent Clips Section -->
+          <div class="recent-clips-section">
+            <div class="section-header">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+              <span>最近切片</span>
+            </div>
+            <div class="clips-scroll-row">
+              <div class="clip-card"><div class="clip-thumbnail" style="background:linear-gradient(135deg,var(--brand-700),var(--brand-500));"><div class="clip-thumb-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div><span class="clip-duration-badge">00:45</span></div><div class="clip-card-info"><span class="clip-card-title">斗鱼直播间A</span><span class="clip-card-time">14:32:10</span></div><button class="clip-export-btn"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>导出</button></div>
+              <div class="clip-card"><div class="clip-thumbnail" style="background:linear-gradient(135deg,var(--state-success),#28a745);"><div class="clip-thumb-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div><span class="clip-duration-badge">01:12</span></div><div class="clip-card-info"><span class="clip-card-title">虎牙直播间B</span><span class="clip-card-time">14:15:22</span></div><button class="clip-export-btn"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>导出</button></div>
+              <div class="clip-card"><div class="clip-thumbnail" style="background:linear-gradient(135deg,#5856d6,#af52de);"><div class="clip-thumb-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div><span class="clip-duration-badge">00:28</span></div><div class="clip-card-info"><span class="clip-card-title">B站直播间C</span><span class="clip-card-time">13:48:05</span></div><button class="clip-export-btn"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>导出</button></div>
+              <div class="clip-card"><div class="clip-thumbnail" style="background:linear-gradient(135deg,#ff9500,#ff3b30);"><div class="clip-thumb-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div><span class="clip-duration-badge">02:05</span></div><div class="clip-card-info"><span class="clip-card-title">快手直播间D</span><span class="clip-card-time">13:22:18</span></div><button class="clip-export-btn"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>导出</button></div>
+              <div class="clip-card"><div class="clip-thumbnail" style="background:linear-gradient(135deg,var(--brand-600),var(--brand-400));"><div class="clip-thumb-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div><span class="clip-duration-badge">00:55</span></div><div class="clip-card-info"><span class="clip-card-title">斗鱼直播间A</span><span class="clip-card-time">12:58:40</span></div><button class="clip-export-btn"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>导出</button></div>
+              <div class="clip-card"><div class="clip-thumbnail" style="background:linear-gradient(135deg,#30d158,#34c759);"><div class="clip-thumb-overlay"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg></div><span class="clip-duration-badge">01:38</span></div><div class="clip-card-info"><span class="clip-card-title">虎牙直播间B</span><span class="clip-card-time">12:30:15</span></div><button class="clip-export-btn"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>导出</button></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ===== RIGHT: Settings Panel ===== -->
+        <aside class="settings-panel">
+          <div class="settings-title">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+            录制设置
+          </div>
+          <div class="setting-group"><label class="setting-label">视频质量</label><div class="setting-select"><select><option>1080p</option><option>720p</option><option>480p</option></select><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></div></div>
+          <div class="setting-group"><label class="setting-label">录制格式</label><div class="setting-select"><select><option>MP4</option><option>MKV</option><option>FLV</option></select><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></div></div>
+          <div class="setting-group"><label class="setting-label">自动切片</label><div class="toggle-switch active" data-action="toggle-auto-clip"><div class="toggle-knob"></div></div></div>
+          <div class="setting-group"><label class="setting-label">切片间隔</label><div class="setting-input-row"><input type="number" class="setting-input" value="5" min="1" max="120"><span class="setting-unit">分钟</span></div></div>
+          <div class="setting-group"><label class="setting-label">存储路径</label><div class="setting-path-row"><span class="setting-path-display">D:\Recordings\LSC</span><button class="setting-browse-btn"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg></button></div></div>
+          <div class="settings-divider"></div>
+          <div class="setting-group"><label class="setting-label">采样率</label><div class="setting-select"><select><option>48000 Hz</option><option>44100 Hz</option><option>22050 Hz</option></select><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></div></div>
+          <div class="setting-group"><label class="setting-label">声道</label><div class="setting-select"><select><option>立体声</option><option>单声道</option></select><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></div></div>
+          <div class="settings-divider"></div>
+          <div class="setting-group"><label class="setting-label">编码预设</label><div class="setting-select"><select><option>H.264</option><option>H.265</option><option>AV1</option></select><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></div></div>
+        </aside>
+
+      </div>
+    </div>
+  </main>
+</div>
+
+<style>
+  /* ===== Reset & Base ===== */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Pro Display', 'PingFang SC', system-ui, -apple-system, sans-serif;
+    font-size: 13px; color: var(--text-50); background: var(--background-900);
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+    animation: pageLoad 0.4s cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  @keyframes pageLoad { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* ===== App Shell ===== */
+  .app-shell { display: flex; width: 100%; height: 100vh; background: var(--background-900); font-family: 'SF Pro Display', 'PingFang SC', system-ui, sans-serif; font-size: 13px; color: var(--text-50); overflow: hidden; }
+
+  /* ===== Sidebar ===== */
+  .app-sidebar { width: 200px; min-width: 200px; height: 100vh; background: var(--background-800); border-right: 1px solid var(--border-default); display: flex; flex-direction: column; justify-content: space-between; user-select: none; -webkit-app-region: drag; }
+  .sidebar-logo { display: flex; align-items: center; gap: 10px; padding: 20px 16px 24px 16px; border-bottom: 1px solid var(--border-default); }
+  .sidebar-logo .logo-icon { width: 32px; height: 32px; border-radius: 8px; background: var(--brand-500); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .sidebar-logo .logo-icon svg { width: 18px; height: 18px; color: var(--background-50); }
+  .sidebar-logo .logo-text { font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--text-50); line-height: 1; }
+  .sidebar-logo .logo-subtext { font-size: 10px; font-weight: 400; color: var(--text-400); margin-top: 2px; }
+  .sidebar-nav { display: flex; flex-direction: column; padding: 12px 0; gap: 2px; flex: 1; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 8px 16px; margin: 0 8px; border-radius: 6px; cursor: pointer; transition: background 0.15s ease, color 0.15s ease; color: var(--text-300); text-decoration: none; font-size: 13px; font-weight: 400; border-left: 3px solid transparent; -webkit-app-region: no-drag; }
+  .nav-item:hover { background: rgba(255, 255, 255, 0.06); color: var(--text-50); }
+  .nav-item svg { width: 18px; height: 18px; flex-shrink: 0; opacity: 0.7; transition: opacity 0.15s ease; }
+  .nav-item:hover svg { opacity: 1; }
+  .nav-item.active { background: rgba(0, 122, 255, 0.12); color: var(--background-50); border-left: 3px solid var(--brand-500); font-weight: 500; }
+  .nav-item.active svg { opacity: 1; color: var(--brand-500); }
+  .sidebar-footer { padding: 12px 0 16px 0; border-top: 1px solid var(--border-default); }
+  .theme-toggle { display: flex; align-items: center; gap: 10px; padding: 8px 16px; margin: 0 8px; border-radius: 6px; cursor: pointer; transition: background 0.15s ease, color 0.15s ease; color: var(--text-400); font-size: 13px; -webkit-app-region: no-drag; }
+  .theme-toggle:hover { background: rgba(255, 255, 255, 0.06); color: var(--text-50); }
+  .theme-toggle svg { width: 18px; height: 18px; flex-shrink: 0; opacity: 0.7; transition: opacity 0.15s ease; }
+  .theme-toggle:hover svg { opacity: 1; }
+
+  /* ===== Main ===== */
+  .app-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--background-900); }
+  .page-header { height: 64px; min-height: 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; border-bottom: 1px solid var(--border-default); background: var(--background-900); -webkit-app-region: drag; }
+  .page-header-title { font-size: 17px; font-weight: 600; color: var(--text-50); letter-spacing: -0.01em; }
+  .header-actions { display: flex; align-items: center; gap: 10px; -webkit-app-region: no-drag; }
+
+  /* ===== View Toggle ===== */
+  .view-toggle { display: flex; gap: 2px; background: rgba(255, 255, 255, 0.06); border-radius: 8px; padding: 2px; }
+  .view-toggle-btn { width: 32px; height: 28px; border: none; border-radius: 6px; background: transparent; color: var(--text-400); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.15s ease, color 0.15s ease; }
+  .view-toggle-btn:hover { color: var(--text-50); }
+  .view-toggle-btn.active { background: var(--brand-500); color: var(--background-50); }
+  .view-toggle-btn svg { width: 16px; height: 16px; }
+
+  /* ===== Add Room ===== */
+  .btn-add-room { display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px; background: var(--brand-500); color: var(--background-50); font-size: 13px; font-weight: 500; border: none; border-radius: 9999px; cursor: pointer; transition: background 0.15s ease, transform 0.1s ease; }
+  .btn-add-room:hover { background: var(--brand-400); }
+  .btn-add-room:active { transform: scale(0.97); }
+  .btn-add-room svg { width: 16px; height: 16px; }
+
+  /* ===== Content ===== */
+  .page-content { flex: 1; overflow-y: auto; padding: 24px; }
+  .content-layout { display: flex; gap: 0; height: calc(100vh - 64px - 48px); min-height: 0; }
+  .content-main { flex: 1; overflow-y: auto; padding-right: 16px; }
+
+  /* ===== Room Grid ===== */
+  .room-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; transition: grid-template-columns 0.3s cubic-bezier(0.32, 0.72, 0, 1); }
+  .room-grid.list-view { grid-template-columns: 1fr; }
+
+  /* ===== Room Card ===== */
+  .room-card { background: var(--background-800); border: 1px solid var(--border-default); border-radius: 14px; padding: 16px; transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease; animation: cardEntrance 0.4s cubic-bezier(0.32, 0.72, 0, 1) both; animation-delay: calc(var(--stagger, 0) * 0.08s); }
+  .room-card:hover { border-color: rgba(255, 255, 255, 0.15); box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3); transform: scale(1.01); }
+  @keyframes cardEntrance { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+  .room-card-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; }
+  .room-card-info { display: flex; flex-direction: column; gap: 3px; }
+  .room-card-name { font-size: 15px; font-weight: 600; color: var(--text-50); letter-spacing: -0.01em; }
+  .room-card-url { font-size: 12px; color: var(--text-400); display: flex; align-items: center; gap: 4px; }
+  .room-card-url svg { width: 12px; height: 12px; opacity: 0.5; }
+
+  /* ===== Status Badge ===== */
+  .status-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 9999px; font-size: 11px; font-weight: 500; }
+  .status-badge.recording { background: rgba(52, 199, 89, 0.15); color: var(--state-success); }
+  .status-badge.recording::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--state-success); animation: pulseDot 1.5s ease-in-out infinite; }
+  .status-badge.idle { background: rgba(142, 142, 147, 0.15); color: var(--background-600); }
+  @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* ===== Video Preview ===== */
+  .video-preview { width: 100%; height: 200px; background: var(--background-700); border-radius: 10px; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; margin-bottom: 12px; }
+  .video-preview::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(0,122,255,0.05), rgba(88,86,214,0.05)); }
+  .play-overlay { width: 48px; height: 48px; border-radius: 50%; background: rgba(0, 0, 0, 0.5); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; transition: background 0.15s ease, transform 0.15s ease; position: relative; z-index: 1; }
+  .video-preview:hover .play-overlay { background: rgba(0, 0, 0, 0.7); transform: scale(1.05); }
+  .play-overlay svg { width: 22px; height: 22px; color: var(--background-50); margin-left: 2px; }
+
+  /* ===== Timeline ===== */
+  .room-timeline { margin-bottom: 10px; }
+  .timeline-label { font-size: 11px; font-weight: 500; color: var(--text-400); margin-bottom: 4px; letter-spacing: 0.02em; }
+  .timeline-container { background: var(--background-700); border-radius: 8px; overflow: hidden; }
+  .timeline-ruler { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px 2px 8px; height: 18px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .timeline-ruler span { font-family: 'SF Mono', 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-400); letter-spacing: 0.01em; }
+  .timeline-track { position: relative; height: 40px; padding: 4px 8px; display: flex; align-items: center; }
+
+  /* ===== Clip Segments ===== */
+  .clip-segment { position: absolute; height: 28px; border-radius: 3px; display: flex; align-items: center; justify-content: center; transition: box-shadow 0.2s ease; cursor: pointer; }
+  .clip-segment:hover { box-shadow: 0 0 8px rgba(255, 255, 255, 0.15); }
+  .clip-segment.recorded { background: var(--state-success); }
+  .clip-segment.highlight { background: var(--brand-500); }
+  .clip-label { font-family: 'SF Mono', 'JetBrains Mono', monospace; font-size: 10px; color: var(--background-50); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; pointer-events: none; }
+
+  /* ===== Clip Actions ===== */
+  .clip-actions { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s ease; }
+  .clip-segment:hover .clip-actions { opacity: 1; }
+  .clip-segment:hover .clip-label { opacity: 0; }
+  .clip-action-btn { width: 20px; height: 20px; border-radius: 4px; border: none; background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(4px); color: var(--background-50); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.15s ease; }
+  .clip-action-btn:hover { background: rgba(0, 0, 0, 0.8); }
+  .clip-action-btn svg { width: 12px; height: 12px; }
+  .clip-action-btn.merge:hover { background: var(--brand-500); }
+  .clip-action-btn.mute:hover { background: var(--background-600); }
+  .clip-action-btn.select:hover { background: var(--state-success); }
+  .clip-action-btn.delete:hover { background: var(--state-error); }
+
+  /* ===== Playhead ===== */
+  /* Per-room playhead (simple line + triangle) */
+  .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--background-50); border-radius: 1px; box-shadow: 0 0 4px rgba(255, 255, 255, 0.5); z-index: 10; pointer-events: none; }
+  .playhead::before { content: ''; position: absolute; top: -1px; left: 50%; transform: translateX(-50%); width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid var(--background-50); }
+
+  /* Professional player scrubber (global timeline) */
+  .playhead-scrubber { position: absolute; top: 0; bottom: 0; z-index: 20; display: flex; flex-direction: column; align-items: center; cursor: pointer; }
+  .scrubber-line { width: 2px; flex: 1; background: var(--background-50); border-radius: 1px; box-shadow: 0 0 6px rgba(255, 255, 255, 0.4); }
+  .scrubber-handle { position: relative; width: 14px; height: 14px; border-radius: 50%; background: var(--background-50); border: 2px solid var(--brand-500); box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.3), 0 2px 8px rgba(0, 0, 0, 0.4); transition: transform 0.15s cubic-bezier(0.32, 0.72, 0, 1), box-shadow 0.15s ease; flex-shrink: 0; }
+  .playhead-scrubber:hover .scrubber-handle { transform: scale(1.3); box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.4), 0 2px 12px rgba(0, 0, 0, 0.5); }
+  .scrubber-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--brand-500); position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+  .scrubber-tooltip { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); background: rgba(0, 0, 0, 0.85); backdrop-filter: blur(8px); color: var(--background-50); font-family: 'SF Mono', 'JetBrains Mono', monospace; font-size: 11px; font-weight: 500; padding: 4px 10px; border-radius: 6px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s ease, transform 0.2s ease; transform: translateX(-50%) translateY(4px); border: 1px solid rgba(255, 255, 255, 0.12); }
+  .scrubber-tooltip::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 5px solid rgba(0, 0, 0, 0.85); }
+  .playhead-scrubber:hover .scrubber-tooltip { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ===== Global Timeline Section (Independent) ===== */
+  .global-timeline-section { background: var(--background-800); border: 1px solid var(--border-default); border-radius: 14px; padding: 16px; margin-top: 16px; animation: pageLoad 0.4s cubic-bezier(0.32, 0.72, 0, 1) 0.25s both; }
+  .global-timeline-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .global-timeline-header svg { width: 16px; height: 16px; color: var(--brand-500); }
+  .global-timeline-header span:first-of-type { font-size: 14px; font-weight: 600; color: var(--text-50); }
+  .global-time-display { margin-left: auto; font-family: 'SF Mono', 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-300); background: var(--background-700); padding: 3px 10px; border-radius: 6px; border: 1px solid var(--border-default); }
+  .global-timeline-body { background: var(--background-700); border-radius: 10px; overflow: hidden; }
+  .global-timeline-track { position: relative; height: 48px; padding: 6px 10px; display: flex; align-items: center; }
+  .global-timeline-track .clip-segment { height: 36px; }
+  .global-timeline-track .clip-label { font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 6px; }
+
+  /* ===== Recent Clips ===== */
+  .recent-clips-section { margin-top: 24px; animation: pageLoad 0.4s cubic-bezier(0.32, 0.72, 0, 1) 0.3s both; }
+  .section-header { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-50); margin-bottom: 12px; }
+  .section-header svg { width: 16px; height: 16px; color: var(--brand-400); }
+  .clips-scroll-row { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+  .clips-scroll-row::-webkit-scrollbar { height: 4px; }
+  .clips-scroll-row::-webkit-scrollbar-track { background: transparent; }
+  .clips-scroll-row::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+  .clip-card { flex-shrink: 0; width: 176px; background: var(--background-800); border: 1px solid var(--border-default); border-radius: 10px; padding: 8px; transition: border-color 0.2s ease, transform 0.2s ease; }
+  .clip-card:hover { border-color: rgba(255, 255, 255, 0.15); transform: translateY(-2px); }
+  .clip-thumbnail { width: 160px; height: 90px; border-radius: 8px; position: relative; overflow: hidden; margin-bottom: 8px; }
+  .clip-thumb-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.25); opacity: 0; transition: opacity 0.15s ease; }
+  .clip-thumbnail:hover .clip-thumb-overlay { opacity: 1; }
+  .clip-thumb-overlay svg { width: 20px; height: 20px; color: var(--background-50); }
+  .clip-duration-badge { position: absolute; bottom: 4px; right: 4px; background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(4px); padding: 2px 6px; border-radius: 4px; font-family: 'SF Mono', 'JetBrains Mono', monospace; font-size: 10px; color: var(--background-50); font-weight: 500; }
+  .clip-card-info { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+  .clip-card-title { font-size: 12px; font-weight: 500; color: var(--text-50); }
+  .clip-card-time { font-family: 'SF Mono', 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-400); }
+  .clip-export-btn { width: 100%; padding: 5px 0; background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; color: var(--text-300); font-size: 11px; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 4px; cursor: pointer; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
+  .clip-export-btn:hover { background: rgba(255, 255, 255, 0.1); color: var(--text-50); border-color: rgba(255, 255, 255, 0.2); }
+  .clip-export-btn svg { width: 12px; height: 12px; }
+
+  /* ===== Settings Panel ===== */
+  .settings-panel { width: 320px; min-width: 320px; height: calc(100vh - 64px - 48px); background: var(--background-800); border-left: 1px solid var(--border-default); padding: 16px; overflow-y: auto; animation: settingsSlideIn 0.4s cubic-bezier(0.32, 0.72, 0, 1) both; }
+  @keyframes settingsSlideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+  .settings-title { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; color: var(--text-50); margin-bottom: 20px; letter-spacing: -0.01em; }
+  .settings-title svg { width: 16px; height: 16px; color: var(--brand-400); }
+  .setting-group { margin-bottom: 16px; }
+  .setting-label { display: block; font-size: 12px; font-weight: 500; color: var(--text-400); margin-bottom: 6px; }
+  .setting-select { position: relative; display: flex; align-items: center; }
+  .setting-select select { width: 100%; height: 36px; padding: 0 32px 0 12px; background: var(--background-700); color: var(--text-50); border: 1px solid var(--border-default); border-radius: 8px; font-size: 13px; font-family: inherit; appearance: none; cursor: pointer; transition: border-color 0.15s ease; outline: none; }
+  .setting-select select:hover { border-color: rgba(255,255,255,0.2); }
+  .setting-select select:focus { border-color: var(--brand-500); }
+  .setting-select svg { position: absolute; right: 10px; width: 12px; height: 12px; color: var(--text-400); pointer-events: none; }
+
+  /* ===== Toggle Switch ===== */
+  .toggle-switch { width: 44px; height: 26px; border-radius: 13px; background: var(--background-700); border: 1px solid var(--border-default); position: relative; cursor: pointer; transition: background 0.25s cubic-bezier(0.32, 0.72, 0, 1), border-color 0.25s cubic-bezier(0.32, 0.72, 0, 1); }
+  .toggle-switch.active { background: var(--brand-500); border-color: var(--brand-500); }
+  .toggle-knob { width: 22px; height: 22px; border-radius: 50%; background: var(--background-50); position: absolute; top: 1px; left: 1px; transition: transform 0.25s cubic-bezier(0.32, 0.72, 0, 1); box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+  .toggle-switch.active .toggle-knob { transform: translateX(18px); }
+
+  /* ===== Setting Input ===== */
+  .setting-input-row { display: flex; align-items: center; gap: 8px; }
+  .setting-input { width: 80px; height: 36px; padding: 0 12px; background: var(--background-700); color: var(--text-50); border: 1px solid var(--border-default); border-radius: 8px; font-size: 13px; font-family: inherit; outline: none; transition: border-color 0.15s ease; }
+  .setting-input:hover { border-color: rgba(255,255,255,0.2); }
+  .setting-input:focus { border-color: var(--brand-500); }
+  .setting-unit { font-size: 12px; color: var(--text-400); }
+
+  /* ===== Setting Path ===== */
+  .setting-path-row { display: flex; align-items: center; gap: 8px; }
+  .setting-path-display { flex: 1; font-size: 12px; color: var(--text-300); padding: 8px 12px; background: var(--background-700); border: 1px solid var(--border-default); border-radius: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .setting-browse-btn { width: 36px; height: 36px; border: 1px solid var(--border-default); border-radius: 8px; background: var(--background-700); color: var(--text-400); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; flex-shrink: 0; }
+  .setting-browse-btn:hover { background: rgba(255,255,255,0.08); color: var(--text-50); border-color: rgba(255,255,255,0.2); }
+
+  /* ===== Settings Divider ===== */
+  .settings-divider { height: 1px; background: var(--border-default); margin: 16px 0; }
+
+  /* ===== Scrollbar ===== */
+  .content-main::-webkit-scrollbar, .settings-panel::-webkit-scrollbar, .page-content::-webkit-scrollbar { width: 6px; }
+  .content-main::-webkit-scrollbar-track, .settings-panel::-webkit-scrollbar-track, .page-content::-webkit-scrollbar-track { background: transparent; }
+  .content-main::-webkit-scrollbar-thumb, .settings-panel::-webkit-scrollbar-thumb, .page-content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+  .content-main::-webkit-scrollbar-thumb:hover, .settings-panel::-webkit-scrollbar-thumb:hover, .page-content::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+  /* ===== View Toggle JS ===== */
+  .view-toggle-btn[data-view="grid"] { background: var(--brand-500); color: var(--background-50); }
+  .view-toggle-btn[data-view="list"] { background: transparent; color: var(--text-400); }
+</style>
+
+<script>
+  // View toggle interaction
+  document.querySelectorAll('.view-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+      document.querySelectorAll('.view-toggle-btn').forEach(b => {
+        b.classList.remove('active');
+        b.style.background = 'transparent';
+        b.style.color = 'var(--text-400)';
+      });
+      this.classList.add('active');
+      this.style.background = 'var(--brand-500)';
+      this.style.color = 'var(--background-50)';
+      const grid = document.getElementById('roomGrid');
+      if (this.dataset.view === 'list') {
+        grid.classList.add('list-view');
+      } else {
+        grid.classList.remove('list-view');
+      }
+    });
+  });
+
+  // Toggle switch interaction
+  document.querySelectorAll('.toggle-switch').forEach(toggle => {
+    toggle.addEventListener('click', function() {
+      this.classList.toggle('active');
+    });
+  });
+</script>
+
+</body>
+</html>

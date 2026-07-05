@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "saved_at": "2026-07-05T23:15:57",
+  "rooms": [
+    {
+      "url": "https://example.com/a.m3u8"
+    },
+    {
+      "url": "not-a-supported-live-url"
+    }
+  ]
+}

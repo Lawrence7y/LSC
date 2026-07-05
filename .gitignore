@@ -1,0 +1,130 @@
+# Build directories
+build/
+*/build/
+*/*/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Qt build artifacts
+*.moc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+*.qm
+*.autosave
+
+# Compiled objects
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Windows specific
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# macOS specific
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Large binary files and dependencies (keep only source)
+deps/
+mlt-source/build/
+shotcut-source/build/
+dlfcn-win32/build/
+
+# User-specific files
+*.user
+*.suo
+
+# Test output
+tests/output/
+test_*.mp4
+
+# Generated files
+*_autogen/
+autogen/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Node / Electron
+node_modules/
+lsc-electron/release/
+lsc-electron/dist/
+lsc-electron/dist-electron/
+lsc-electron/out/
+lsc-electron/tsconfig.node.tsbuildinfo
+
+# Runtime data (user-specific)
+data/rooms.json
+python-backend/recording_history.json
+python-backend/settings.json
+python-backend/logs/
+logs/
+.runtime/
+
+# AI tool configs
+.opencode/
+.claude/
+.mimocode/
+.trae/
+.workbuddy/
+
+# Unrelated prototype/scratch files
+bun-socket-v2.ts
+figma-plugin-code.ts
+figma-test.js
+lsc_showcase.html
+
+# Debug/scratch scripts (root-level throwaway helpers)
+_debug_*.py
+_font_test*.py
+_screenshot_audit.py
+capture_app.py
+click_window.py
+concurrency_stress_test.py
+e2e_platform_test.py
+test_douyin_flow.py
+ui_main_test.py
+ui_render_test.py
+ui_responsiveness_test.py
+verify_fixes.py
+
+# Screenshots & visual audit artifacts (root-level)
+*.png
+!docs/**/*.png
+verify_output/
+docs/_test_shots/
+
+# Test/runtime artifacts
+.coverage
+nul
+
+# Misc scratch
+socket.ts
+ws-relay.js
+ws-server.js

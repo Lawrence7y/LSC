@@ -1,0 +1,174 @@
+{
+  "project": {
+    "name": "直播切片工具 UI 设计",
+    "path": "d:\\Project\\直播切片多人\\lsc-ui-design",
+    "operation": "create",
+    "deviceType": "desktop",
+    "language": "zh-CN",
+    "dashboardMode": false,
+    "replicationMode": null,
+    "sourceUrl": null,
+    "visualSpecExcerpt": null,
+    "styleDefinitionBrief": "直播切片工具桌面端UI设计，苹果风格，深色为主，蓝色强调，紧凑信息密度，专业工具感",
+    "designRead": "desktop tool UI / content creators / professional restrained / information-dense / avoid playful or decorative",
+    "designDials": {
+      "layoutVariance": 2,
+      "motionIntensity": 1,
+      "visualDensity": 4
+    },
+    "styleContinuityAnchors": {
+      "colorSystem": {
+        "primaryColorRole": "Apple Blue #007AFF for primary actions and active states",
+        "brandHuePolicy": "single brand blue hue; state colors for success/warning/error only",
+        "stateColors": "success #34c759, warning #ff9500, error #ff3b30"
+      },
+      "shapeSystem": "radius 14px for cards, 10px for buttons/inputs, 8px for small controls, pill for chips",
+      "typographySystem": "SF Pro Display / PingFang SC, 13px body, 600 weight headings",
+      "spacingSystem": "compact: 16px card padding, 20px page margins, 12px section gaps",
+      "componentLanguage": "border-defined cards, subtle elevation, capsule buttons, clean inputs",
+      "surfaceAndDepth": "border-first, shadow alpha <= 0.05 for static, deeper for overlays only",
+      "imageryAndIconography": "stroke icons, no decorative images",
+      "interactionTone": "restrained hover, smooth transitions"
+    },
+    "specsConstraints": null,
+    "sharedProjectShellContract": {
+      "navigationShell": "left sidebar 200px with icon+label nav items, active state with blue left border and blue tint background, app logo at top",
+      "primaryColorSystem": "Apple Blue #007AFF, no secondary brand hue",
+      "typographySystem": "SF Pro Display, PingFang SC, 13px body, 15px section titles, 20px page titles, weight 500-600",
+      "radiusScale": "14px cards, 10px buttons/inputs, 8px small controls, 15px chips",
+      "surfaceDepthModel": "1px border default, no shadow on static cards, subtle shadow on hover",
+      "ctaStyle": "pill-shaped primary buttons with blue fill, rounded secondary buttons with border",
+      "alignmentRules": "left-aligned content, 20px page margins, 16px card padding, 12px element gaps"
+    },
+    "generationTree": {
+      "root": {
+        "nodeId": "gen-project-shell",
+        "kind": "project-shell",
+        "pageIds": ["page-dashboard", "page-multi-room", "page-settings"],
+        "output": "partials/project-shell.html",
+        "sharedRegions": ["sidebar", "pageFrame"],
+        "privateRegions": [],
+        "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+        "status": "planned",
+        "children": [
+          {
+            "nodeId": "gen-page-dashboard",
+            "kind": "page-leaf",
+            "pageIds": ["page-dashboard"],
+            "output": "pages/dashboard.html",
+            "sharedRegions": [],
+            "privateRegions": ["dashboard content"],
+            "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+            "status": "planned",
+            "children": []
+          },
+          {
+            "nodeId": "gen-page-multi-room",
+            "kind": "page-leaf",
+            "pageIds": ["page-multi-room"],
+            "output": "pages/multi-room.html",
+            "sharedRegions": [],
+            "privateRegions": ["multi-room content"],
+            "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+            "status": "planned",
+            "children": []
+          },
+          {
+            "nodeId": "gen-page-settings",
+            "kind": "page-leaf",
+            "pageIds": ["page-settings"],
+            "output": "pages/settings.html",
+            "sharedRegions": [],
+            "privateRegions": ["settings content"],
+            "mutableSlots": ["activeNavItem", "pageTitle", "pageContent"],
+            "status": "planned",
+            "children": []
+          }
+        ]
+      }
+    }
+  },
+  "designSource": {
+    "operatingMode": "library-bound",
+    "libraryIdentity": {
+      "name": "苹果",
+      "id": "dl_builtin_apple",
+      "version": null,
+      "scope": "built-in-global",
+      "path": "c:\\Users\\Administrator\\.trae-cn\\design_libraries\\dl_builtin_apple",
+      "versionSource": "metadata.json"
+    },
+    "brandPrefix": "",
+    "cssPath": "c:\\Users\\Administrator\\.trae-cn\\design_libraries\\dl_builtin_apple\\colors_and_type.css",
+    "iconAssets": ["arrow-down", "arrow-left", "arrow-right", "arrow-up", "box", "check", "chevron-down", "chevron-left", "chevron-right", "chevron-up", "chevrons-down-up", "chevrons-up-down", "circle-alert", "circle-check", "circle-minus", "circle-pause", "circle-play", "circle-plus", "circle-question-mark", "external-link", "file", "folder-open", "folder", "funnel", "grip", "heart", "house", "mail", "map-pin", "message-circle-more", "mouse-pointer-click", "pen-line", "send-horizontal", "star", "tag", "thumbs-down", "thumbs-up", "trash-2", "triangle-alert", "user"]
+  },
+  "pages": [
+    {
+      "nodeId": "page-dashboard",
+      "title": "仪表盘",
+      "htmlSrc": "pages/dashboard.html",
+      "pageIndex": 1,
+      "pageType": "information-dense",
+      "visualNorthStar": "Clean dashboard with stat cards, action cards, and session history in Apple dark theme",
+      "compositionPattern": null,
+      "continuityAnchors": {
+        "colorSystem": "Apple Blue #007AFF, dark bg #000000/#1c1c1e, text #f5f5f7/#aeaeb2",
+        "shapeSystem": "14px card radius, 10px button radius",
+        "typographySystem": "SF Pro Display / PingFang SC, 13px body",
+        "componentLanguage": "border-defined cards, capsule buttons, clean stat displays"
+      },
+      "componentPlan": null,
+      "imagePlan": [],
+      "chartsRequired": false,
+      "miniProgramStyle": false
+    },
+    {
+      "nodeId": "page-multi-room",
+      "title": "多房间管理",
+      "htmlSrc": "pages/multi-room.html",
+      "pageIndex": 2,
+      "pageType": "information-dense",
+      "visualNorthStar": "Multi-room management with room cards grid, detail panel, timeline, and recording controls",
+      "compositionPattern": null,
+      "continuityAnchors": {
+        "colorSystem": "Apple Blue #007AFF, dark bg #000000/#1c1c1e, text #f5f5f7/#aeaeb2",
+        "shapeSystem": "14px card radius, 10px button radius",
+        "typographySystem": "SF Pro Display / PingFang SC, 13px body",
+        "componentLanguage": "border-defined room cards, overlay controls, timeline clips"
+      },
+      "componentPlan": null,
+      "imagePlan": [],
+      "chartsRequired": false,
+      "miniProgramStyle": false
+    },
+    {
+      "nodeId": "page-settings",
+      "title": "设置",
+      "htmlSrc": "pages/settings.html",
+      "pageIndex": 3,
+      "pageType": "task-driven",
+      "visualNorthStar": "Settings page with grouped sections, toggle switches, dropdowns, and input fields",
+      "compositionPattern": null,
+      "continuityAnchors": {
+        "colorSystem": "Apple Blue #007AFF, dark bg #000000/#1c1c1e, text #f5f5f7/#aeaeb2",
+        "shapeSystem": "14px card radius, 10px input radius",
+        "typographySystem": "SF Pro Display / PingFang SC, 13px body",
+        "componentLanguage": "grouped setting rows, toggle switches, clean form fields"
+      },
+      "componentPlan": null,
+      "imagePlan": [],
+      "chartsRequired": false,
+      "miniProgramStyle": false
+    }
+  ],
+  "assets": [],
+  "wiringPlan": [
+    {"from": "page-dashboard", "to": "page-multi-room", "domId": "nav-multi-room", "label": "Sidebar nav to multi-room"},
+    {"from": "page-dashboard", "to": "page-settings", "domId": "nav-settings", "label": "Sidebar nav to settings"},
+    {"from": "page-multi-room", "to": "page-dashboard", "domId": "nav-dashboard", "label": "Sidebar nav to dashboard"},
+    {"from": "page-multi-room", "to": "page-settings", "domId": "nav-settings", "label": "Sidebar nav to settings"},
+    {"from": "page-settings", "to": "page-dashboard", "domId": "nav-dashboard", "label": "Sidebar nav to dashboard"},
+    {"from": "page-settings", "to": "page-multi-room", "domId": "nav-multi-room", "label": "Sidebar nav to multi-room"}
+  ],
+  "hiddenInteractionPlan": []
+}

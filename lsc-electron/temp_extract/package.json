@@ -1,0 +1,15 @@
+{
+  "name": "lsc-electron",
+  "version": "1.0.0",
+  "description": "LSC 直播切片系统 - Electron 版本",
+  "main": "dist-electron/main/main.js",
+  "dependencies": {
+    "@ant-design/icons": "^5.2.6",
+    "antd": "^5.12.0",
+    "dayjs": "^1.11.10",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.20.0",
+    "zustand": "^4.4.7"
+  }
+}

@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSC UI 改造设计稿 v3</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  :root {
+    --bg-primary: #0a0a0a;
+    --bg-secondary: #141414;
+    --bg-tertiary: #1e1e1e;
+    --bg-elevated: #282828;
+    --bg-hover: #323232;
+    --text-primary: #f0f0f0;
+    --text-secondary: #a0a0a0;
+    --text-tertiary: #707070;
+    --text-muted: #505050;
+    --border-subtle: rgba(255,255,255,0.06);
+    --border-default: rgba(255,255,255,0.1);
+    --border-strong: rgba(255,255,255,0.18);
+    --accent-primary: #f5a623;
+    --accent-primary-dim: rgba(245,166,35,0.12);
+    --accent-primary-glow: rgba(245,166,35,0.25);
+    --accent-success: #34c759;
+    --accent-success-dim: rgba(52,199,89,0.12);
+    --accent-warning: #ff9f0a;
+    --accent-warning-dim: rgba(255,159,10,0.12);
+    --accent-error: #ff453a;
+    --accent-error-dim: rgba(255,69,58,0.12);
+    --accent-info: #5ac8fa;
+    --accent-info-dim: rgba(90,200,250,0.12);
+    --accent-secondary: #af52de;
+    --accent-secondary-dim: rgba(175,82,222,0.12);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+    --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+    --shadow-lg: 0 8px 24px rgba(0,0,0,0.5);
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'Inter', -apple-system, 'SF Pro Display', 'Microsoft YaHei UI', sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, .mono { font-family: 'JetBrains Mono', 'Consolas', monospace; }
+
+  /* ── 设计稿导航 ── */
+  .design-nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    background: rgba(10,10,10,0.92); backdrop-filter: blur(20px) saturate(1.8);
+    border-bottom: 1px solid var(--border-default);
+    padding: 0 24px; height: 48px; display: flex; gap: 4px; align-items: center;
+  }
+  .design-nav .logo {
+    font-weight: 700; font-size: 14px; color: var(--accent-primary);
+    margin-right: 20px; letter-spacing: -0.5px;
+  }
+  .design-nav a {
+    color: var(--text-tertiary); text-decoration: none; font-size: 12px;
+    padding: 6px 12px; border-radius: var(--radius-sm); transition: all 0.15s;
+    font-weight: 500;
+  }
+  .design-nav a:hover { color: var(--text-secondary); background: var(--bg-tertiary); }
+  .design-nav a.active { color: var(--text-primary); background: var(--bg-elevated); }
+  .design-nav .spacer { flex: 1; }
+  .design-nav .version {
+    font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace;
+  }
+
+  .section {
+    margin-top: 72px; padding: 32px 24px; max-width: 1200px;
+    margin-left: auto; margin-right: auto;
+  }
+  .section-header { margin-bottom: 24px; }
+  .section-title {
+    font-size: 20px; font-weight: 700; letter-spacing: -0.5px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .section-desc { color: var(--text-secondary); font-size: 13px; margin-top: 6px; max-width: 700px; }
+  .change-tag {
+    display: inline-flex; padding: 2px 8px; border-radius: 4px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .tag-new { background: var(--accent-success-dim); color: var(--accent-success); }
+  .tag-changed { background: var(--accent-warning-dim); color: var(--accent-warning); }
+  .tag-removed { background: var(--accent-error-dim); color: var(--accent-error); }
+
+  .annotation {
+    background: var(--bg-tertiary); border-left: 3px solid var(--accent-primary);
+    border-radius: 0 var(--radius-md) var(--radius-md) 0;
+    padding: 12px 16px; margin: 16px 0;
+    font-size: 12px; color: var(--text-secondary); line-height: 1.7;
+  }
+  .annotation strong { color: var(--text-primary); font-weight: 600; }
+  .annotation code {
+    background: var(--bg-elevated); padding: 1px 5px; border-radius: 3px;
+    font-size: 11px; color: var(--accent-primary);
+  }
+
+  /* ── 通用组件 ── */
+  .btn {
+    padding: 7px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-default);
+    background: var(--bg-elevated); color: var(--text-primary); cursor: pointer;
+    font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 5px;
+    transition: all 0.15s; font-family: inherit;
+  }
+  .btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+  .btn:active { transform: scale(0.97); }
+  .btn-primary { background: var(--accent-primary); border-color: var(--accent-primary); color: #000; font-weight: 600; }
+  .btn-primary:hover { filter: brightness(1.1); background: var(--accent-primary); }
+  .btn-ghost { background: transparent; border-color: transparent; color: var(--text-secondary); }
+  .btn-ghost:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+  .btn-success { background: var(--accent-success); border-color: var(--accent-success); color: #fff; }
+  .btn-danger { background: var(--accent-error); border-color: var(--accent-error); color: #fff; }
+  .btn-sm { padding: 4px 10px; font-size: 11px; }
+  .btn-icon { width: 30px; height: 30px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-sm); }
+
+  .card {
+    background: var(--bg-secondary); border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg); padding: 16px;
+  }
+  .card-title {
+    font-size: 12px; font-weight: 600; color: var(--text-secondary);
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;
+  }
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
+  }
+  .badge-success { background: var(--accent-success-dim); color: var(--accent-success); }
+  .badge-warning { background: var(--accent-warning-dim); color: var(--accent-warning); }
+  .badge-error { background: var(--accent-error-dim); color: var(--accent-error); }
+  .badge-info { background: var(--accent-info-dim); color: var(--accent-info); }
+  .status-dot {
+    width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0;
+  }
+  .status-dot-success { background: var(--accent-success); box-shadow: 0 0 8px var(--accent-success); }
+  .status-dot-warning { background: var(--accent-warning); box-shadow: 0 0 8px var(--accent-warning); }
+  .status-dot-error { background: var(--accent-error); box-shadow: 0 0 8px var(--accent-error); }
+  .status-dot-idle { background: var(--text-muted); }
+  .label { font-size: 11px; color: var(--text-tertiary); margin-bottom: 5px; font-weight: 500; }
+  .text-input {
+    flex: 1; padding: 8px 12px; background: var(--bg-tertiary);
+    border: 1px solid var(--border-default); border-radius: var(--radius-sm);
+    color: var(--text-primary); font-size: 12px; outline: none;
+    transition: border-color 0.15s; font-family: inherit;
+  }
+  .text-input:focus { border-color: var(--accent-primary); box-shadow: 0 0 0 2px var(--accent-primary-dim); }
+  .text-input::placeholder { color: var(--text-muted); }
+  .divider { width: 1px; height: 20px; background: var(--border-default); margin: 0 6px; flex-shrink: 0; }
+  .setting-row { margin-bottom: 16px; }
+  .setting-row:last-child { margin-bottom: 0; }
+
+  /* ── Chip 选择器 ── */
+  .chip-group { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    padding: 5px 12px; border-radius: var(--radius-sm); font-size: 12px;
+    background: var(--bg-tertiary); border: 1px solid var(--border-default);
+    color: var(--text-secondary); cursor: pointer; transition: all 0.15s;
+    font-weight: 500; font-family: inherit;
+  }
+  .chip:hover { border-color: var(--border-strong); color: var(--text-primary); background: var(--bg-elevated); }
+  .chip.active {
+    background: var(--accent-primary-dim); border-color: var(--accent-primary);
+    color: var(--accent-primary); font-weight: 600;
+  }
+
+  /* ── 悬浮提示 ── */
+  .chip-tip { position: relative; display: inline-block; }
+  .chip-tip .tip {
+    display: none; position: absolute; bottom: calc(100% + 8px); left: 50%;
+    transform: translateX(-50%); background: #1a1a1a; color: var(--text-secondary);
+    border: 1px solid var(--border-default); border-radius: var(--radius-md);
+    padding: 10px 14px; font-size: 11px; line-height: 1.6; z-index: 50;
+    pointer-events: none; min-width: 180px; max-width: 280px;
+    white-space: normal; box-shadow: var(--shadow-lg);
+  }
+  .chip-tip .tip::after {
+    content: ''; position: absolute; top: 100%; left: 50%;
+    transform: translateX(-50%); border: 5px solid transparent;
+    border-top-color: var(--border-default);
+  }
+  .chip-tip:hover .tip { display: block; }
+
+  .info-tip { position: relative; display: inline-flex; cursor: help; }
+  .info-tip .tip-icon {
+    width: 14px; height: 14px; border-radius: 50%; display: inline-flex;
+    align-items: center; justify-content: center; font-size: 9px;
+    background: var(--bg-elevated); color: var(--text-muted); margin-left: 5px;
+    transition: all 0.15s; font-style: normal; font-weight: 700;
+  }
+  .info-tip:hover .tip-icon { background: var(--accent-primary-dim); color: var(--accent-primary); }
+  .info-tip .tip {
+    display: none; position: absolute; bottom: calc(100% + 8px); left: 50%;
+    transform: translateX(-50%); background: #1a1a1a; color: var(--text-secondary);
+    border: 1px solid var(--border-default); border-radius: var(--radius-md);
+    padding: 10px 14px; font-size: 11px; line-height: 1.6; z-index: 50;
+    pointer-events: none; max-width: 300px; white-space: normal;
+    box-shadow: var(--shadow-lg);
+  }
+  .info-tip .tip::after {
+    content: ''; position: absolute; top: 100%; left: 50%;
+    transform: translateX(-50%); border: 5px solid transparent;
+    border-top-color: var(--border-default);
+  }
+  .info-tip:hover .tip { display: block; }
+
+  /* ── 滑块 ── */
+  .slider-row { display: flex; align-items: center; gap: 12px; }
+  .slider-row input[type="range"] {
+    flex: 1; height: 4px; -webkit-appearance: none; appearance: none;
+    background: var(--bg-elevated); border-radius: 2px; outline: none;
+  }
+  .slider-row input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent-primary); cursor: pointer;
+    box-shadow: 0 0 6px var(--accent-primary-glow);
+  }
+  .slider-value {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500;
+    background: var(--bg-tertiary); padding: 4px 10px; border-radius: var(--radius-sm);
+    min-width: 40px; text-align: center; border: 1px solid var(--border-subtle);
+  }
+
+  /* ════════════════════════════════════════════
+     播放器
+     ════════════════════════════════════════════ */
+  .player-wrapper {
+    background: #0d0d0d; border-radius: var(--radius-lg); overflow: hidden;
+    border: 1px solid var(--border-subtle); min-height: 200px;
+    display: flex; flex-direction: column;
+  }
+  .player-viewport {
+    flex: 1; background: #000; position: relative;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .player-viewport .placeholder {
+    color: var(--text-muted); font-size: 13px; display: flex;
+    flex-direction: column; align-items: center; gap: 8px;
+  }
+  .player-viewport .placeholder .icon { font-size: 32px; opacity: 0.3; }
+
+  /* ── 进度条 ── */
+  .seekbar-area {
+    position: relative; height: 18px; cursor: pointer;
+    display: flex; align-items: flex-end; padding: 0 12px;
+  }
+  .seekbar-track {
+    width: 100%; height: 3px; background: #333; border-radius: 2px;
+    position: relative; transition: height 0.12s ease;
+  }
+  .seekbar-area:hover .seekbar-track { height: 5px; }
+  .seekbar-buffered {
+    position: absolute; top: 0; left: 0; height: 100%;
+    background: rgba(255,255,255,0.08); border-radius: 2px;
+  }
+  .seekbar-progress {
+    position: absolute; top: 0; left: 0; height: 100%;
+    background: var(--accent-primary); border-radius: 2px;
+  }
+  .seekbar-playhead {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--accent-primary); z-index: 5;
+    opacity: 0; transition: opacity 0.12s;
+    box-shadow: 0 0 8px var(--accent-primary-glow);
+  }
+  .seekbar-area:hover .seekbar-playhead { opacity: 1; }
+  .seekbar-hover-label {
+    position: absolute; top: -4px; transform: translateX(-50%);
+    background: #222; border: 1px solid #444; border-radius: 4px;
+    padding: 3px 10px; font-size: 11px; color: #fff;
+    font-family: 'JetBrains Mono', monospace; pointer-events: none;
+    display: none; z-index: 10; white-space: nowrap;
+  }
+  .seekbar-area:hover .seekbar-hover-label { display: block; }
+  .seekbar-marker {
+    position: absolute; top: 0; width: 2px; height: 100%; z-index: 3;
+  }
+  .seekbar-marker-in { background: var(--accent-success); }
+  .seekbar-marker-out { background: var(--accent-error); }
+  .seekbar-selection {
+    position: absolute; top: 0; height: 100%;
+    background: rgba(245,166,35,0.12); z-index: 2;
+  }
+  .seekbar-clip {
+    position: absolute; top: 0; height: 100%; border-radius: 2px; z-index: 1;
+  }
+
+  /* ── 控制栏 ── */
+  .player-controls {
+    display: flex; align-items: center; gap: 2px; padding: 6px 12px;
+    background: #111; border-top: 1px solid var(--border-subtle);
+  }
+  .ctrl-btn {
+    width: 30px; height: 30px; display: flex; align-items: center;
+    justify-content: center; background: none; border: none;
+    color: #888; cursor: pointer; border-radius: var(--radius-sm);
+    font-size: 13px; transition: all 0.1s;
+  }
+  .ctrl-btn:hover { background: rgba(255,255,255,0.08); color: #ccc; }
+  .ctrl-btn.active { color: var(--accent-primary); }
+  .ctrl-btn svg { width: 14px; height: 14px; fill: currentColor; }
+  .ctrl-spacer { flex: 1; }
+  .timecode {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+    color: #999; padding: 0 10px; white-space: nowrap;
+  }
+  .codec-tag {
+    display: inline-block; padding: 2px 7px; border-radius: 3px;
+    font-size: 10px; font-family: 'JetBrains Mono', monospace;
+    background: #1a1a1a; color: #666; border: 1px solid #333;
+    margin-left: 4px; font-weight: 500;
+  }
+  .codec-tag.highlight { color: var(--accent-primary); border-color: rgba(245,166,35,0.2); }
+  .volume-area { display: flex; align-items: center; gap: 6px; }
+  .volume-slider {
+    width: 70px; height: 3px; -webkit-appearance: none; appearance: none;
+    background: #333; border-radius: 2px; outline: none; cursor: pointer;
+  }
+  .volume-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 10px; height: 10px; border-radius: 50%;
+    background: #888; cursor: pointer; transition: background 0.15s;
+  }
+  .volume-slider::-webkit-slider-thumb:hover { background: #fff; }
+
+  /* ════════════════════════════════════════════
+     工作台
+     ════════════════════════════════════════════ */
+  .workbench { display: flex; gap: 0; }
+  .workbench-left {
+    flex: 1; display: flex; flex-direction: column; gap: 10px;
+    padding: 16px; min-width: 0;
+  }
+  .workbench-right {
+    width: 300px; flex-shrink: 0; display: flex; flex-direction: column; gap: 10px;
+    padding: 16px 16px 16px 0; border-left: 1px solid var(--border-subtle);
+  }
+  .room-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 10px; align-content: start;
+  }
+
+  /* ── 房间卡片 ── */
+  .room-card {
+    background: var(--bg-secondary); border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-lg); overflow: hidden; cursor: default;
+    transition: all 0.15s;
+  }
+  .room-card:hover { border-color: var(--border-default); }
+  .room-card.selected { border-color: var(--accent-primary); box-shadow: 0 0 0 1px var(--accent-primary), 0 0 20px var(--accent-primary-dim); }
+
+  .room-card-header {
+    display: flex; align-items: center; gap: 8px; padding: 10px 12px 6px;
+  }
+  .room-card-title {
+    font-size: 13px; font-weight: 600; flex: 1; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary);
+  }
+  .room-card-actions { display: flex; gap: 3px; }
+
+  .room-card-preview {
+    height: 130px; background: #0a0a0a; position: relative;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-muted); font-size: 12px; margin: 0 10px;
+    border-radius: var(--radius-md); overflow: hidden;
+  }
+  .preview-placeholder {
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    color: var(--text-muted);
+  }
+  .preview-placeholder .icon { font-size: 24px; opacity: 0.3; }
+  .preview-overlay {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.3); opacity: 0; transition: opacity 0.15s;
+  }
+  .room-card:hover .preview-overlay { opacity: 1; }
+  .preview-overlay .play-btn {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: rgba(0,0,0,0.6); border: 2px solid rgba(255,255,255,0.25);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: all 0.15s; font-size: 14px; color: #fff;
+  }
+  .preview-overlay .play-btn:hover {
+    background: rgba(245,166,35,0.3); border-color: var(--accent-primary);
+    transform: scale(1.1);
+  }
+
+  .mini-seekbar {
+    height: 20px; padding: 0 12px; position: relative;
+    background: rgba(0,0,0,0.15); cursor: pointer;
+    display: flex; align-items: center;
+  }
+  .mini-seekbar-track {
+    width: 100%; height: 2px; background: #2a2a2a; border-radius: 1px;
+    position: relative;
+  }
+  .mini-seekbar-progress {
+    height: 100%; background: var(--accent-primary); border-radius: 1px;
+  }
+  .mini-seekbar-dot {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent-primary); border: 1.5px solid #fff;
+    opacity: 0; transition: opacity 0.12s;
+  }
+  .mini-seekbar:hover .mini-seekbar-dot { opacity: 1; }
+
+  .room-card-footer {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px 10px; gap: 8px;
+  }
+  .room-card-meta {
+    font-size: 11px; color: var(--text-tertiary);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .room-card-btns { display: flex; gap: 4px; }
+
+  /* ── 切片列表 ── */
+  .clip-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: var(--radius-sm);
+    background: var(--bg-tertiary); margin-bottom: 6px;
+    transition: background 0.15s;
+  }
+  .clip-item:hover { background: var(--bg-elevated); }
+  .clip-thumb {
+    width: 64px; height: 36px; border-radius: 4px; overflow: hidden;
+    background: #111; flex-shrink: 0; position: relative; cursor: pointer;
+  }
+  .clip-thumb img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  .clip-thumb .thumb-placeholder {
+    width: 100%; height: 100%; display: flex; align-items: center;
+    justify-content: center; color: var(--text-muted); font-size: 10px;
+    background: linear-gradient(135deg, #1a1a1a 0%, #222 100%);
+  }
+  .clip-thumb .thumb-play {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: rgba(0,0,0,0.4); opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .clip-thumb:hover .thumb-play { opacity: 1; }
+  .clip-thumb .thumb-play::after {
+    content: ''; width: 0; height: 0;
+    border-left: 6px solid #fff; border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+  }
+  .clip-index { font-size: 11px; font-weight: 600; color: var(--accent-primary); min-width: 22px; text-align: center; }
+  .clip-time { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-secondary); flex: 1; }
+  .clip-duration { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-tertiary); }
+  .clip-delete {
+    width: 20px; height: 20px; border-radius: 4px; background: transparent;
+    border: none; color: var(--text-muted); cursor: pointer;
+    display: flex; align-items: center; justify-content: center; font-size: 14px;
+    transition: all 0.15s;
+  }
+  .clip-delete:hover { background: var(--accent-error-dim); color: var(--accent-error); }
+
+  /* ── 弹窗预览 ── */
+  .clip-preview-overlay {
+    display: none; position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
+    align-items: center; justify-content: center;
+  }
+  .clip-preview-overlay.show { display: flex; }
+  .clip-preview-modal {
+    background: #111; border-radius: var(--radius-lg); overflow: hidden;
+    border: 1px solid var(--border-default); box-shadow: var(--shadow-lg);
+    width: 640px; max-width: 90vw;
+  }
+  .clip-preview-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; border-bottom: 1px solid var(--border-subtle);
+  }
+  .clip-preview-header .title {
+    font-size: 13px; font-weight: 600; color: var(--text-primary);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .clip-preview-header .title .tag {
+    font-size: 10px; padding: 2px 6px; border-radius: 3px;
+    background: var(--accent-primary-dim); color: var(--accent-primary);
+    font-weight: 500;
+  }
+  .clip-preview-close {
+    width: 28px; height: 28px; border-radius: var(--radius-sm);
+    background: transparent; border: none; color: var(--text-tertiary);
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    font-size: 16px; transition: all 0.15s;
+  }
+  .clip-preview-close:hover { background: var(--bg-elevated); color: var(--text-primary); }
+  .clip-preview-viewport {
+    height: 360px; background: #000; display: flex;
+    align-items: center; justify-content: center;
+    color: var(--text-muted); font-size: 13px;
+  }
+  .clip-preview-controls {
+    display: flex; align-items: center; gap: 6px; padding: 8px 14px;
+    background: #111; border-top: 1px solid var(--border-subtle);
+  }
+
+  /* ── 详情 ── */
+  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .detail-item .detail-label { font-size: 10px; color: var(--text-muted); margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .detail-item .detail-value { font-size: 12px; color: var(--text-primary); font-weight: 500; }
+
+  /* ── 仪表盘 ── */
+  .dashboard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .dashboard-grid .card { min-height: 220px; }
+  .room-status-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 0; border-bottom: 1px solid var(--border-subtle);
+  }
+  .room-status-item:last-child { border-bottom: none; }
+  .room-status-item .room-name { flex: 1; font-size: 13px; font-weight: 500; }
+  .room-status-item .room-platform {
+    font-size: 10px; color: var(--text-tertiary);
+    background: var(--bg-tertiary); padding: 2px 7px; border-radius: 3px;
+    font-weight: 500; text-transform: uppercase; letter-spacing: 0.3px;
+  }
+  .room-status-item .room-duration {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-secondary);
+  }
+  .history-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 0; border-bottom: 1px solid var(--border-subtle);
+    cursor: pointer; transition: all 0.15s; border-radius: var(--radius-sm);
+  }
+  .history-item:hover { background: var(--accent-primary-dim); margin: 0 -12px; padding: 10px 12px; }
+  .history-item:last-child { border-bottom: none; }
+  .history-icon {
+    width: 32px; height: 32px; border-radius: var(--radius-sm);
+    background: var(--bg-tertiary); display: flex;
+    align-items: center; justify-content: center; font-size: 14px;
+    flex-shrink: 0;
+  }
+  .history-info { flex: 1; }
+  .history-info .history-title { font-size: 13px; font-weight: 500; }
+  .history-info .history-meta { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+  .history-time { font-size: 11px; color: var(--text-muted); text-align: right; flex-shrink: 0; }
+  .storage-bar { display: flex; align-items: center; gap: 12px; padding: 8px 0; }
+  .storage-bar .bar { flex: 1; height: 4px; background: var(--bg-elevated); border-radius: 2px; overflow: hidden; }
+  .storage-bar .bar-fill { height: 100%; background: var(--accent-secondary); border-radius: 2px; }
+  .storage-bar .storage-text { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-tertiary); }
+
+  /* ── 事件悬浮演示 ── */
+  .event-demo { display: flex; gap: 14px; margin-top: 16px; }
+  .event-demo .card { flex: 1; padding: 16px; }
+  .event-demo .demo-area {
+    background: #0a0a0a; border-radius: var(--radius-md); padding: 14px;
+    text-align: center; position: relative; height: 56px;
+    display: flex; align-items: flex-end; justify-content: center;
+  }
+  .event-demo .demo-label {
+    background: #1e1e1e; border: 1px solid #3a3a3a; border-radius: var(--radius-sm);
+    padding: 6px 12px; font-size: 11px; color: var(--text-primary);
+    white-space: nowrap; box-shadow: var(--shadow-md);
+  }
+  .event-demo .demo-label .type { font-weight: 600; margin-bottom: 2px; }
+  .event-demo .demo-label .detail { color: var(--text-tertiary); font-size: 10px; }
+</style>
+</head>
+<body>
+
+<nav class="design-nav">
+  <span class="logo">LSC</span>
+  <a href="#player" class="active">播放器</a>
+  <a href="#workbench">工作台</a>
+  <a href="#dashboard">仪表盘</a>
+  <a href="#settings">录制设置</a>
+  <div class="spacer"></div>
+  <span class="version">design v3</span>
+</nav>
+
+<!-- ════════════════════════════════════════════════
+     1. 播放器
+     ════════════════════════════════════════════════ -->
+<div id="player" class="section">
+  <div class="section-header">
+    <h2 class="section-title">播放器 / 时间线 <span class="change-tag tag-changed">大改</span></h2>
+    <p class="section-desc">mpv 风格：细进度条 + 圆形播放头 + 悬浮时间/事件提示 + 入出点标记 + 切片段色块</p>
+  </div>
+
+  <div class="player-wrapper" style="max-width:860px;">
+    <!-- 视口 -->
+    <div class="player-viewport">
+      <div class="placeholder">
+        <div class="icon">📺</div>
+        <span>视频预览区域</span>
+      </div>
+    </div>
+
+    <!-- 进度条 -->
+    <div class="seekbar-area">
+      <div class="seekbar-track">
+        <div class="seekbar-buffered" style="width:82%;"></div>
+        <div class="seekbar-progress" style="width:55%;"></div>
+        <div class="seekbar-selection" style="left:30%; width:15%;"></div>
+        <div class="seekbar-clip" style="left:10%; width:8%; background:rgba(52,199,89,0.2);"></div>
+        <div class="seekbar-clip" style="left:60%; width:12%; background:rgba(175,82,222,0.2);"></div>
+        <div class="seekbar-marker seekbar-marker-in" style="left:30%;"></div>
+        <div class="seekbar-marker seekbar-marker-out" style="left:45%;"></div>
+        <div class="seekbar-playhead" style="left:55%;"></div>
+      </div>
+      <div class="seekbar-hover-label" style="left:55%;">00:08:15</div>
+    </div>
+
+    <!-- 控制栏 -->
+    <div class="player-controls">
+      <button class="ctrl-btn" title="播放/暂停 (Space)">▶</button>
+      <button class="ctrl-btn" title="停止">⏹</button>
+      <button class="ctrl-btn" title="后退 5s (←)">⏪</button>
+      <button class="ctrl-btn" title="前进 5s (→)">⏩</button>
+      <div class="divider"></div>
+      <span class="timecode">00:08:15 / 00:15:00</span>
+      <div class="divider"></div>
+      <span class="codec-tag highlight">H/W</span>
+      <span class="codec-tag">AVC1</span>
+      <span class="codec-tag">AAC</span>
+      <span class="codec-tag">2.0</span>
+      <div class="ctrl-spacer"></div>
+      <button class="ctrl-btn" style="color:var(--accent-success);font-size:11px;font-weight:700;" title="入点 (I)">I</button>
+      <button class="ctrl-btn" style="color:var(--accent-error);font-size:11px;font-weight:700;" title="出点 (O)">O</button>
+      <button class="ctrl-btn" title="清除选区 (X)" style="font-size:11px;">✕</button>
+      <button class="ctrl-btn active" title="添加到切片列表" style="font-size:15px;">+</button>
+      <div class="divider"></div>
+      <button class="ctrl-btn" title="导出选区">⬇</button>
+      <button class="ctrl-btn" title="全屏">⛶</button>
+      <div class="divider"></div>
+      <div class="volume-area">
+        <button class="ctrl-btn" title="静音">🔊</button>
+        <input type="range" class="volume-slider" min="0" max="100" value="80">
+      </div>
+    </div>
+  </div>
+
+  <!-- 悬浮事件效果 -->
+  <div class="event-demo">
+    <div class="card">
+      <div class="label">悬浮在入点标记上</div>
+      <div class="demo-area">
+        <div class="demo-label">
+          <div class="type" style="color:var(--accent-success);">入点标记</div>
+          <div class="detail">00:04:30 — 精彩操作开始</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">悬浮在切片段上</div>
+      <div class="demo-area">
+        <div class="demo-label">
+          <div class="type" style="color:var(--accent-primary);">切片 #1</div>
+          <div class="detail">00:04:30 → 00:06:12 (1:42)</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">悬浮在空白位置</div>
+      <div class="demo-area">
+        <div class="demo-label">00:08:15</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="annotation">
+    <strong>交互要点：</strong>
+    进度条默认 3px，悬浮变 5px + 播放头出现。
+    悬浮时显示时间提示，靠近标记点/切片段时额外显示事件信息。
+    入点=绿色竖线，出点=红色竖线，选区=金色半透明。
+    控制栏分组：播放 | 时间码+编码 | 入出点+导出 | 音量。
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     2. 工作台
+     ════════════════════════════════════════════════ -->
+<div id="workbench" class="section">
+  <div class="section-header">
+    <h2 class="section-title">多房间工作台 <span class="change-tag tag-changed">优化</span></h2>
+    <p class="section-desc">左侧：房间卡片 + 底部播放器。右侧：添加房间 + 录制设置（hover 提示）+ 录制信息 + 切片列表</p>
+  </div>
+
+  <div class="workbench">
+    <div class="workbench-left">
+      <div class="room-grid">
+        <!-- 卡片1：录制中 -->
+        <div class="room-card selected">
+          <div class="room-card-header">
+            <span class="badge badge-warning">● 录制中</span>
+            <span class="room-card-title">某主播的精彩操作直播</span>
+            <div class="room-card-actions">
+              <button class="btn btn-ghost btn-sm btn-icon" title="全屏">⛶</button>
+            </div>
+          </div>
+          <div class="room-card-preview">
+            <div class="preview-overlay"><div class="play-btn">▶</div></div>
+          </div>
+          <div class="mini-seekbar">
+            <div class="mini-seekbar-track"><div class="mini-seekbar-progress" style="width:55%;"></div></div>
+            <div class="mini-seekbar-dot" style="left:55%;"></div>
+          </div>
+          <div class="room-card-footer">
+            <div class="room-card-meta">
+              <span class="status-dot status-dot-warning"></span>
+              <span>抖音</span>
+              <span class="mono" style="font-size:10px;">00:32:28</span>
+              <span>1.2 GB</span>
+            </div>
+            <div class="room-card-btns">
+              <button class="btn btn-sm btn-ghost">连接</button>
+              <button class="btn btn-sm btn-ghost">预览</button>
+              <button class="btn btn-sm btn-danger">停止</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 卡片2：已连接 -->
+        <div class="room-card">
+          <div class="room-card-header">
+            <span class="badge badge-success">● 已连接</span>
+            <span class="room-card-title">另一个主播的直播间</span>
+            <div class="room-card-actions">
+              <button class="btn btn-ghost btn-sm btn-icon">⛶</button>
+            </div>
+          </div>
+          <div class="room-card-preview">
+            <div class="preview-placeholder">
+              <div class="icon">📺</div>
+              <span style="font-size:11px;">点击预览查看</span>
+            </div>
+          </div>
+          <div class="mini-seekbar">
+            <div class="mini-seekbar-track"><div class="mini-seekbar-progress" style="width:0%;"></div></div>
+          </div>
+          <div class="room-card-footer">
+            <div class="room-card-meta">
+              <span class="status-dot status-dot-success"></span>
+              <span>B站</span>
+              <span>未录制</span>
+            </div>
+            <div class="room-card-btns">
+              <button class="btn btn-sm btn-ghost">连接</button>
+              <button class="btn btn-sm btn-ghost">预览</button>
+              <button class="btn btn-sm btn-success">录制</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 卡片3：错误 -->
+        <div class="room-card">
+          <div class="room-card-header">
+            <span class="badge badge-error">● 连接失败</span>
+            <span class="room-card-title">虎牙直播间</span>
+            <div class="room-card-actions">
+              <button class="btn btn-ghost btn-sm btn-icon">⛶</button>
+            </div>
+          </div>
+          <div class="room-card-preview" style="color:var(--accent-error); font-size:11px;">
+            连接失败：直播流鉴权失败 (403)
+          </div>
+          <div class="mini-seekbar">
+            <div class="mini-seekbar-track"><div class="mini-seekbar-progress" style="width:0%;"></div></div>
+          </div>
+          <div class="room-card-footer">
+            <div class="room-card-meta">
+              <span class="status-dot status-dot-error"></span>
+              <span>虎牙</span>
+            </div>
+            <div class="room-card-btns">
+              <button class="btn btn-sm btn-ghost">连接</button>
+              <button class="btn btn-sm btn-ghost">预览</button>
+              <button class="btn btn-sm btn-ghost">重试</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 底部播放器 -->
+      <div class="player-wrapper">
+        <div class="seekbar-area">
+          <div class="seekbar-track">
+            <div class="seekbar-buffered" style="width:82%;"></div>
+            <div class="seekbar-progress" style="width:55%;"></div>
+            <div class="seekbar-selection" style="left:30%; width:15%;"></div>
+            <div class="seekbar-clip" style="left:10%; width:8%; background:rgba(52,199,89,0.2);"></div>
+            <div class="seekbar-marker seekbar-marker-in" style="left:30%;"></div>
+            <div class="seekbar-marker seekbar-marker-out" style="left:45%;"></div>
+            <div class="seekbar-playhead" style="left:55%;"></div>
+          </div>
+          <div class="seekbar-hover-label" style="left:55%;">00:08:15</div>
+        </div>
+        <div class="player-controls">
+          <button class="ctrl-btn">▶</button>
+          <button class="ctrl-btn">⏹</button>
+          <button class="ctrl-btn">⏪</button>
+          <button class="ctrl-btn">⏩</button>
+          <div class="divider"></div>
+          <span class="timecode">00:08:15 / 00:15:00</span>
+          <div class="divider"></div>
+          <span class="codec-tag highlight">H/W</span>
+          <span class="codec-tag">AVC1</span>
+          <span class="codec-tag">AAC</span>
+          <div class="ctrl-spacer"></div>
+          <button class="ctrl-btn" style="color:var(--accent-success);font-size:11px;font-weight:700;">I</button>
+          <button class="ctrl-btn" style="color:var(--accent-error);font-size:11px;font-weight:700;">O</button>
+          <button class="ctrl-btn" style="font-size:11px;">✕</button>
+          <button class="ctrl-btn active" style="font-size:15px;">+</button>
+          <div class="divider"></div>
+          <button class="ctrl-btn">⬇</button>
+          <button class="ctrl-btn">⛶</button>
+          <div class="divider"></div>
+          <div class="volume-area">
+            <button class="ctrl-btn">🔊</button>
+            <input type="range" class="volume-slider" min="0" max="100" value="80">
+          </div>
+        </div>
+      </div>
+
+      <!-- 切片列表（播放器下方） -->
+        <div class="card">
+        <div class="card-title">切片列表 <span style="font-size:10px;color:var(--text-muted);font-weight:400;text-transform:none;letter-spacing:0;">3 个片段</span></div>
+        <div class="clip-item" style="cursor:pointer;" onclick="document.getElementById('clipPreview').classList.add('show')">
+          <div class="clip-thumb"><div class="thumb-placeholder">🎬</div><div class="thumb-play"></div></div>
+          <span class="clip-index">#1</span>
+          <span class="clip-time">00:04:30 → 00:06:12</span>
+          <span class="clip-duration">1:42</span>
+          <button class="clip-delete" onclick="event.stopPropagation();">×</button>
+        </div>
+        <div class="clip-item" style="cursor:pointer;" onclick="document.getElementById('clipPreview').classList.add('show')">
+          <div class="clip-thumb"><div class="thumb-placeholder">🎬</div><div class="thumb-play"></div></div>
+          <span class="clip-index">#2</span>
+          <span class="clip-time">00:08:45 → 00:11:20</span>
+          <span class="clip-duration">2:35</span>
+          <button class="clip-delete" onclick="event.stopPropagation();">×</button>
+        </div>
+        <div class="clip-item" style="cursor:pointer;" onclick="document.getElementById('clipPreview').classList.add('show')">
+          <div class="clip-thumb"><div class="thumb-placeholder">🎬</div><div class="thumb-play"></div></div>
+          <span class="clip-index">#3</span>
+          <span class="clip-time">00:12:10 → 00:14:50</span>
+          <span class="clip-duration">2:40</span>
+          <button class="clip-delete" onclick="event.stopPropagation();">×</button>
+        </div>
+        <button class="btn btn-success btn-sm" style="width:100%;margin-top:8px;">导出全部切片</button>
+      </div>
+    </div>
+
+    <!-- 右侧面板 -->
+    <div class="workbench-right">
+      <div class="card">
+        <div class="card-title">添加直播间</div>
+        <div class="label">直播间链接</div>
+        <div style="display:flex; gap:8px;">
+          <input class="text-input" placeholder="粘贴直播间链接...">
+          <button class="btn btn-primary btn-sm">+ 添加</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">录制设置</div>
+        <div class="setting-row">
+          <div class="label" style="display:flex;align-items:center;">
+            画质预设
+            <span class="info-tip">
+              <span class="tip-icon">?</span>
+              <span class="tip">原画：不重编码，直接拷贝流，画质无损<br>高清：重编码为高清，平衡画质与体积<br>流畅：低码率，适合网络差时使用</span>
+            </span>
+          </div>
+          <div class="chip-group">
+            <span class="chip-tip"><span class="chip active">原画</span><span class="tip">不重编码，直接拷贝直播流。画质无损，文件较大。</span></span>
+            <span class="chip-tip"><span class="chip">高清</span><span class="tip">重编码为高清分辨率。平衡画质与体积。</span></span>
+            <span class="chip-tip"><span class="chip">流畅</span><span class="tip">低码率编码。适合网络条件差时使用。</span></span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="label" style="display:flex;align-items:center;">
+            编码器
+            <span class="info-tip">
+              <span class="tip-icon">?</span>
+              <span class="tip">NVENC：NVIDIA GPU 硬编码，CPU 占用低<br>CPU：软编码，兼容性好<br>Copy：直接拷贝流，不重编码</span>
+            </span>
+          </div>
+          <div class="chip-group">
+            <span class="chip-tip"><span class="chip">H.264 NVENC</span><span class="tip">NVIDIA GPU 硬编码。需要 NVIDIA 显卡，CPU 占用低。</span></span>
+            <span class="chip-tip"><span class="chip">H.264 CPU</span><span class="tip">CPU 软编码。兼容性好，但 CPU 占用高。</span></span>
+            <span class="chip-tip"><span class="chip active">Copy</span><span class="tip">直接拷贝流，不重编码。速度最快。</span></span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="label" style="display:flex;align-items:center;">
+            CRF 质量
+            <span class="info-tip">
+              <span class="tip-icon">?</span>
+              <span class="tip">值越小质量越高、文件越大<br>18=高质量, 23=默认, 28=小体积</span>
+            </span>
+          </div>
+          <div class="slider-row">
+            <input type="range" min="0" max="51" value="23">
+            <span class="slider-value">23</span>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="label">输出目录</div>
+          <div style="display:flex; gap:8px;">
+            <input class="text-input" value="C:\Users\Admin\LSC\output" style="font-size:11px;">
+            <button class="btn btn-sm btn-ghost">选择</button>
+          </div>
+        </div>
+        <button class="btn btn-primary" style="width:100%;margin-top:10px;">开始录制</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title">录制信息</div>
+        <div class="detail-grid">
+          <div class="detail-item"><div class="detail-label">分辨率</div><div class="detail-value">1920×1080</div></div>
+          <div class="detail-item"><div class="detail-label">帧率</div><div class="detail-value">30 fps</div></div>
+          <div class="detail-item"><div class="detail-label">编码</div><div class="detail-value">H.264 NVENC</div></div>
+          <div class="detail-item"><div class="detail-label">文件大小</div><div class="detail-value">1.2 GB</div></div>
+          <div class="detail-item" style="grid-column:1/-1;">
+            <div class="detail-label">输出路径</div>
+            <div class="detail-value" style="font-size:10px;word-break:break-all;color:var(--text-tertiary);">C:\Users\Admin\LSC\output\douyin主播_a1b2c3\recording.mp4</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     3. 仪表盘
+     ════════════════════════════════════════════════ -->
+<div id="dashboard" class="section">
+  <div class="section-header">
+    <h2 class="section-title">仪表盘 <span class="change-tag tag-changed">精简</span></h2>
+    <p class="section-desc">房间状态概览 + 最近录制历史（点击跳转工作台）+ 存储统计</p>
+  </div>
+
+  <div class="dashboard-grid">
+    <div class="card">
+      <div class="card-title">房间状态</div>
+      <div class="room-status-item">
+        <span class="status-dot status-dot-warning"></span>
+        <span class="room-name">某主播的精彩操作直播</span>
+        <span class="room-platform">抖音</span>
+        <span class="badge badge-warning">录制中</span>
+        <span class="room-duration mono">00:32:28</span>
+      </div>
+      <div class="room-status-item">
+        <span class="status-dot status-dot-success"></span>
+        <span class="room-name">另一个主播的直播间</span>
+        <span class="room-platform">B站</span>
+        <span class="badge badge-success">已连接</span>
+        <span class="room-duration">--</span>
+      </div>
+      <div class="room-status-item">
+        <span class="status-dot status-dot-error"></span>
+        <span class="room-name">虎牙直播间</span>
+        <span class="room-platform">虎牙</span>
+        <span class="badge badge-error">失败</span>
+        <span class="room-duration">--</span>
+      </div>
+      <div class="room-status-item">
+        <span class="status-dot status-dot-idle"></span>
+        <span class="room-name">快手主播间</span>
+        <span class="room-platform">快手</span>
+        <span class="badge" style="background:var(--bg-tertiary);color:var(--text-muted);">未连接</span>
+        <span class="room-duration">--</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">最近录制</div>
+      <div class="history-item">
+        <div class="history-icon">🎬</div>
+        <div class="history-info">
+          <div class="history-title">某主播的精彩操作</div>
+          <div class="history-meta">抖音 · 00:45:32 · 2.1 GB</div>
+        </div>
+        <div class="history-time">今天 14:30</div>
+      </div>
+      <div class="history-item">
+        <div class="history-icon">🎬</div>
+        <div class="history-info">
+          <div class="history-title">B站主播游戏直播</div>
+          <div class="history-meta">B站 · 01:20:15 · 3.8 GB</div>
+        </div>
+        <div class="history-time">今天 10:15</div>
+      </div>
+      <div class="history-item">
+        <div class="history-icon">🎬</div>
+        <div class="history-info">
+          <div class="history-title">虎牙主播日常</div>
+          <div class="history-meta">虎牙 · 00:30:08 · 1.4 GB</div>
+        </div>
+        <div class="history-time">昨天 22:00</div>
+      </div>
+      <div class="history-item">
+        <div class="history-icon">🎬</div>
+        <div class="history-info">
+          <div class="history-title">快手带货直播</div>
+          <div class="history-meta">快手 · 02:10:45 · 5.2 GB</div>
+        </div>
+        <div class="history-time">昨天 18:30</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px;max-width:480px;">
+    <div class="card-title">存储使用</div>
+    <div class="storage-bar">
+      <span class="storage-text">12.5 GB</span>
+      <div class="bar"><div class="bar-fill" style="width:25%;"></div></div>
+      <span class="storage-text">50 GB</span>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════
+     4. 录制设置
+     ════════════════════════════════════════════════ -->
+<div id="settings" class="section">
+  <div class="section-header">
+    <h2 class="section-title">录制设置 <span class="change-tag tag-changed">悬浮提示</span></h2>
+    <p class="section-desc">无解释文字。每个选项有 ? 图标和悬浮提示，鼠标放上去显示说明，移开消失。</p>
+  </div>
+
+  <div style="max-width:340px;">
+    <div class="card">
+      <div class="card-title">录制设置</div>
+      <div class="setting-row">
+        <div class="label" style="display:flex;align-items:center;">
+          画质预设
+          <span class="info-tip"><span class="tip-icon">?</span><span class="tip">原画：不重编码，直接拷贝流<br>高清：重编码为高清<br>流畅：低码率</span></span>
+        </div>
+        <div class="chip-group">
+          <span class="chip-tip"><span class="chip active">原画</span><span class="tip">不重编码，直接拷贝直播流。画质无损，文件较大。</span></span>
+          <span class="chip-tip"><span class="chip">高清</span><span class="tip">重编码为高清分辨率。平衡画质与体积。</span></span>
+          <span class="chip-tip"><span class="chip">流畅</span><span class="tip">低码率编码。适合网络条件差时使用。</span></span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="label" style="display:flex;align-items:center;">
+          编码器
+          <span class="info-tip"><span class="tip-icon">?</span><span class="tip">NVENC：NVIDIA GPU 硬编码<br>CPU：软编码<br>Copy：直接拷贝</span></span>
+        </div>
+        <div class="chip-group">
+          <span class="chip-tip"><span class="chip">H.264 NVENC</span><span class="tip">NVIDIA GPU 硬编码。需要 NVIDIA 显卡，CPU 占用低。</span></span>
+          <span class="chip-tip"><span class="chip">H.264 CPU</span><span class="tip">CPU 软编码。兼容性好，但 CPU 占用高。</span></span>
+          <span class="chip-tip"><span class="chip active">Copy</span><span class="tip">直接拷贝流，不重编码。速度最快。</span></span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="label" style="display:flex;align-items:center;">
+          CRF 质量
+          <span class="info-tip"><span class="tip-icon">?</span><span class="tip">值越小质量越高、文件越大<br>18=高质量, 23=默认, 28=小体积</span></span>
+        </div>
+        <div class="slider-row">
+          <input type="range" min="0" max="51" value="23">
+          <span class="slider-value">23</span>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="label">输出目录</div>
+        <div style="display:flex;gap:8px;">
+          <input class="text-input" value="C:\Users\Admin\LSC\output" style="font-size:11px;">
+          <button class="btn btn-sm btn-ghost">选择</button>
+        </div>
+      </div>
+      <button class="btn btn-primary" style="width:100%;margin-top:10px;">开始录制</button>
+    </div>
+  </div>
+</div>
+
+<div style="height:80px;"></div>
+
+<!-- 弹窗预览 -->
+<div class="clip-preview-overlay" id="clipPreview" onclick="this.classList.remove('show')">
+  <div class="clip-preview-modal" onclick="event.stopPropagation()">
+    <div class="clip-preview-header">
+      <div class="title">
+        <span>切片预览</span>
+        <span class="tag">#1</span>
+        <span style="font-size:11px;color:var(--text-tertiary);font-family:'JetBrains Mono',monospace;">00:04:30 → 00:06:12 (1:42)</span>
+      </div>
+      <button class="clip-preview-close" onclick="document.getElementById('clipPreview').classList.remove('show')">✕</button>
+    </div>
+    <div class="clip-preview-viewport">
+      <div style="display:flex;flex-direction:column;align-items:center;gap:8px;">
+        <div style="font-size:32px;opacity:0.3;">🎬</div>
+        <span>切片视频预览区域</span>
+        <span style="font-size:11px;color:var(--text-muted);">mpv 独立窗口播放该片段</span>
+      </div>
+    </div>
+    <div class="clip-preview-controls">
+      <button class="ctrl-btn">▶</button>
+      <button class="ctrl-btn">⏹</button>
+      <div class="divider"></div>
+      <span class="timecode">00:04:30 / 00:01:42</span>
+      <div class="ctrl-spacer"></div>
+      <button class="ctrl-btn" title="导出此切片">⬇</button>
+      <button class="ctrl-btn" title="在时间线中定位">📍</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

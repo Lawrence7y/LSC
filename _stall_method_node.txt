@@ -1,0 +1,51 @@
+  private _startStallDetection(): void {
+    this._stopStallDetection()
+    this._stallCheckTimer = setInterval(() => {
+      if (this._state !== 'playing') return
+      const ct = this._video?.currentTime ?? 0
+      if (Math.abs(ct - this._lastStallPosition) > 0.1) {
+        // currentTime 在变化，播放正常
+        this._lastStallPosition = ct
+        this._lastStallTime = 0
+        return
+      }
+      // currentTime 停滞
+      if (this._lastStallTime === 0) {
+        this._lastStallTime = Date.now()
+        return
+      }
+      const stallDuration = Date.now() - this._lastStallTime
+      if (stallDuration < 1500) return // 容忍 1.5 秒内的停滞
+
+      // 超过 1.5 秒卡顿，尝试恢复
+      this._log(`Stall detected (${(stallDuration / 1000).toFixed(1)}s), attempting recovery`)
+      this._lastStallTime = 0
+
+      const video = this._video
+      if (!video || video.buffered.length === 0) {
+        // 缓冲区为空，等待新数据到达，不盲目 seek
+        this._log('Stall recovery: buffer empty, waiting for data')
+        return
+      }
+
+      const bufEnd = video.buffered.end(video.buffered.length - 1)
+      const bufStart = video.buffered.start(0)
+
+      // 检查 currentTime 是否在缓冲区范围内
+      if (ct < bufStart || ct > bufEnd - 0.3) {
+        // currentTime 落在缓冲区外，seek 到缓冲区末尾
+        const target = Math.max(bufStart, bufEnd - 0.3)
+        this._log(`Stall recovery: seek ${ct.toFixed(2)} -> ${target.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
+        try {
+          video.currentTime = target
+        } catch {}
+        this._liveEdgeAligned = false
+        this._tryPlay(0)
+      } else {
+        // currentTime 在缓冲区内但卡住了，尝试重新 play
+        this._log(`Stall recovery: re-trigger play() at ${ct.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
+        this._tryPlay(0)
+      }
+    }, 500)
+  }
+
