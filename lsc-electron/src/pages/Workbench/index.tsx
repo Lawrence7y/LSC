@@ -102,6 +102,7 @@ export default function Workbench() {
   // 同步导出模式标记（response 监听器据此预创建 clips 关联 job_id）
   const isSyncExportModeRef = useRef(false)
   const syncMainRoomRef = useRef<string | null>(null)
+  const syncTargetRoomIdsRef = useRef<string[]>([])
   const [loopPreview, setLoopPreview] = useState(false)
   const [timelineZoom, setTimelineZoom] = useState(1)
   const [allMuted, setAllMuted] = useState(false)
@@ -1182,6 +1183,7 @@ export default function Workbench() {
       const jobPrefix = `hlexport-${Date.now()}`
       isSyncExportModeRef.current = true
       syncMainRoomRef.current = continuousMainRoom
+      syncTargetRoomIdsRef.current = [...targetRoomIds]
       setContinuousSubmitting(true)
       const analysisMode = isValorantRoundCutting ? 'valorant_round' : 'scene'
       console.log('[Workbench] 用户操作: 多房间同步分析导出, main:', continuousMainRoom,
@@ -1218,7 +1220,7 @@ export default function Workbench() {
         if (isSyncExportModeRef.current && data.job_ids && Array.isArray(data.job_ids)) {
           const curRooms = useAppStore.getState().rooms
           const mainRoom = curRooms.find(r => r.room_id === syncMainRoomRef.current)
-          const targetIds = [...selectedRoomIdsRef.current]
+          const targetIds = syncTargetRoomIdsRef.current
           const newClips: ClipSegment[] = []
           data.highlights.forEach((h: Highlight, i: number) => {
             targetIds.forEach(rid => {
@@ -1249,6 +1251,7 @@ export default function Workbench() {
         message.error(data?.error || '同步分析导出失败')
       }
       isSyncExportModeRef.current = false
+      syncTargetRoomIdsRef.current = []
     }))
     unsubs.push(on('start_continuous_analysis_response', (data: any) => {
       if (data?.success) {

@@ -228,3 +228,14 @@ def test_workbench_continuous_analysis_uses_explicit_game_modes() -> None:
     assert '<Radio.Button value="valorant_round">无畏契约回合切割</Radio.Button>' in source
     assert '<Radio.Button value="generic">通用直播</Radio.Button>' in source
     assert "setAnalysisGameType('valorant')" not in source
+
+
+def test_workbench_sync_export_freezes_target_rooms_until_response() -> None:
+    source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+
+    assert "const syncTargetRoomIdsRef = useRef<string[]>([])" in source
+    request_body = source.split("send('start_analysis_export'", 1)[0]
+    assert "syncTargetRoomIdsRef.current = [...targetRoomIds]" in request_body
+    response_body = source.split("on('start_analysis_export_response'", 1)[1].split("on('start_continuous_analysis_response'", 1)[0]
+    assert "const targetIds = syncTargetRoomIdsRef.current" in response_body
+    assert "selectedRoomIdsRef.current" not in response_body
