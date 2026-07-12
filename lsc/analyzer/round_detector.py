@@ -816,7 +816,7 @@ def _format_output(
         if ocr_info:
             # OCR 起点已经是战斗开始（buy phase 已裁），仅加 pre_combat_pad
             combat_end_sec = float(seg_end)
-            tail_reason = "ocr_phase"
+            tail_reason = ocr_info.get("tail_by", "ocr_phase")
 
             # 如果 OCR 有明确的结束时间戳（胜负结算文字），用它精确裁尾
             if ocr_end_ts is not None and ocr_end_ts > float(seg_start):
@@ -1126,134 +1126,6 @@ def _dedupe_marker_times(times: list[float], min_gap: float) -> list[float]:
             deduped.append(ts)
     return deduped
 
-
-def _build_round_segments_from_phase_markers_legacy(
-    markers: list[dict[str, Any]],
-    duration: float,
-    cfg: ValorantRoundConfig,
-) -> list[dict[str, Any]]:
-    """用 OCR 回合状态标记构建完整回合片段。
-
-    starts 来自"购买阶段 0:00"（屏障落下/回合开始临界点）；ends 来自胜负/拆包
-    等结算文本。若某个 end 漏检，则用下一回合 start 向前回推准备阶段和过渡时间。
-
-    OCR 推断间隔用 8s（死亡回放 ~3s + 结算/MVP ~5s），比音频路径的
-    round_inactive_gap(15s) 更紧，避免多裁战斗内容。
-    """
-    # OCR 路径专用：从下回合购买阶段开始向前回推的间隔
-    # 实际战斗结束 -> 下回合购买阶段开始的过渡 = 死亡回放(~3s) + 结算/MVP(~5s) ≈ 8s
-    if duration <= 0:
-        return []
-
-    starts = _dedupe_marker_times(
-        [
-            float(m.get("timestamp", 0.0))
-            for m in markers
-            if m.get("type") == "round_start"
-        ],
-        min_gap=cfg.min_round_gap,
-    )
-    ends = _dedupe_marker_times(
-        [
-            float(m.get("timestamp", 0.0))
-            for m in markers
-            if m.get("type") == "round_end"
-        ],
-        min_gap=cfg.min_round_gap * 0.5,
-    )
-
-    if not starts:
-        return []
-
-    # 不再硬编码 [0.0] 作为首段起点：录像可能从回合中途开始，
-    # 从 0.0 构造的首段不是真正的回合开始。
-    segment_starts = [s for s in starts if s > 0 and s < duration]
-    results: list[dict[str, Any]] = []
-
-    for idx, buy_marker in enumerate(segment_starts):
-        # ponytail: 2s OCR sampling; densify around the barrier only when needed.
-        start = min(duration, round(buy_marker + cfg.phase_sample_interval, 3))
-        next_start = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else None
-
-        explicit_candidates = [
-            e for e in ends
-            if start + cfg.min_combat_duration <= e
-            and (next_start is None or e < next_start)
-            and e <= duration
-        ]
-        ocr_end_ts: float | None = explicit_candidates[0] if explicit_candidates else None
-        if ocr_end_ts is not None:
-            end = ocr_end_ts
-            end_by = "ocr_result"
-            tail_reason = "ocr_phase"
-        elif next_start is not None:
-            end = next_start
-            end_by = "next_buy"
-            tail_reason = "ocr_phase"
-        else:
-            end = duration
-            end_by = "open_tail"
-            tail_reason = "open_tail"
-        if False:
-            """
-            if explicit_candidates:
-                explicit_end = explicit_candidates[0]
-                ocr_end_ts = explicit_end
-                # 有下一回合开始点时，仍保守删除进入下一回合前的几秒过渡画面。
-                if explicit_end <= inferred_end + 1.0:
-                    end = explicit_end
-                else:
-                    end = inferred_end
-            else:
-                end = inferred_end
-
-            """
-
-        # OCR boundaries are authoritative; audio/chime checks remain fallback-only.
-        explicit_candidates = [
-            e for e in ends
-            if start + cfg.min_combat_duration <= e
-            and (next_start is None or e < next_start)
-            and e <= duration
-        ]
-        if explicit_candidates:
-            ocr_end_ts = explicit_candidates[0]
-            end = ocr_end_ts
-            end_by = "ocr_result"
-            tail_reason = "ocr_phase"
-        elif next_start is not None:
-            end = next_start
-            end_by = "next_buy"
-            tail_reason = "ocr_phase"
-        else:
-            end = duration
-            end_by = "open_tail"
-            tail_reason = "open_tail"
-
-        start = max(0.0, round(start, 3))
-        end = min(duration, round(end, 3))
-        if end - start < cfg.min_combat_duration:
-            continue
-
-        results.append({
-            "start": start,
-            "end": end,
-            "score": 0.8,
-            "reason": f"回合 {len(results) + 1}: OCR 状态边界",
-            "phase": "combat",
-            "round_index": len(results) + 1,
-            "tail_by": tail_reason,
-            "start_by": "ocr_buy_exit",
-            "end_by": end_by,
-            "ocr_confirmed": end_by in {"ocr_result", "next_buy"},
-            "ocr_start": start,
-            "ocr_end": ocr_end_ts,
-            "speech_score": 0.0,
-            "visual_score": 0.0,
-            "transcript": "",
-        })
-
-    return results
 
 
 def _refine_rounds_with_ocr(

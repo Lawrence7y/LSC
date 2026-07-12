@@ -728,16 +728,19 @@ class TestOcrOutputBoundaryRegression:
             "end": 180.0,
             "start_by": "ocr_buy_exit",
             "end_by": "open_tail",
+            "tail_by": "open_tail",
             "ocr_confirmed": False,
             "ocr_end": None,
         }]
         result = _format_output(
             [(100, 180)], np.ones(220, dtype=np.float32), 1.0, 220.0, cfg,
+            chime_timestamps=[150.0],
             phase_rounds=phase,
         )
         assert result[0]["start"] == 100.0
         assert result[0]["end_by"] == "open_tail"
         assert result[0]["ocr_confirmed"] is False
+        assert result[0]["tail_by"] == "open_tail"
 
     def test_phase_rounds_skip_onset_fallback(self):
         fake_onset = types.ModuleType("lsc.analyzer.onset_detector")
