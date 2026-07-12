@@ -123,6 +123,19 @@ def test_open_tail_round_is_retained_as_pending_for_status() -> None:
     assert not room_handler._is_auto_exportable_valorant_round(retained[0])
 
 
+def test_new_rounds_releases_pending_round_when_ocr_confirms_end() -> None:
+    previous = [{
+        "start": 100.0, "end": 180.0, "phase": "pending",
+        "start_by": "ocr_buy_exit", "end_by": "open_tail",
+    }]
+    current = [{
+        "start": 100.0, "end": 195.0, "phase": "combat",
+        "start_by": "ocr_buy_exit", "end_by": "ocr_result",
+    }]
+
+    assert room_handler._new_rounds(previous, current) == current
+
+
 def test_continuous_valorant_budget_uses_first_full_scan_then_trailing_window() -> None:
     """专用模式首次全量，之后固定回看窗口；压力仍会禁用 OCR。"""
     first_range, first_ocr, _, first_full = room_handler._continuous_valorant_scan_budget(
