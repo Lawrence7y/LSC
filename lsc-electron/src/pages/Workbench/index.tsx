@@ -1,22 +1,69 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert } from 'antd'
-import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined } from '@ant-design/icons'
+import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch } from 'antd'
+import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
 import { RoomCard } from './components/RoomCard'
 import { ControlBar } from './components/ControlBar'
 import { ClipList, type ExportProgressInfo } from './components/ClipList'
-import { RecordSettings } from './components/RecordSettings'
-import { ClipSegment } from '@/types'
+import { ClipSegment, ContinuousAnalysisStatus } from '@/types'
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
 import { formatTime } from '@/utils/time'
-import { getAligner } from '@/utils/previewAudioAligner'
+import { getAligner, type PreviewAudioCaptureDiagnostics } from '@/utils/previewAudioAligner'
+import { AnalysisProgress } from '@/components/AnalysisProgress'
+/** 分析模式 */
+type AnalysisMode = 'valorant_round' | 'generic'
+
+/** 高光段数据（支持 AI 分析扩展字段） */
+interface Highlight {
+  start: number
+  end: number
+  score: number
+  reason?: string
+  speech_score?: number
+  visual_score?: number
+  transcript?: string
+}
+
+type CaptureFailure = {
+  roomId: string
+  reason: string
+  diagnostics?: PreviewAudioCaptureDiagnostics | null
+}
+
+function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
+  if (failures.length === 0) return '原因未知'
+  const labels: Record<string, string> = {
+    no_video: '无预览播放器',
+    worklet_not_loaded: '音频 Worklet 未加载',
+    capture_stream_unavailable: '浏览器不支持音频捕获',
+    no_audio_track: '无音轨',
+    buffer_empty: 'buffer 空',
+    silent: '静音或音量过低',
+    timeout: '捕获超时',
+    capture_exception: '捕获异常',
+  }
+  return failures
+    .map(failure => {
+      const label = labels[failure.reason] ?? failure.reason
+      const sampleCount = failure.diagnostics?.sample_count
+      const rms = failure.diagnostics?.rms
+      const suffix = sampleCount !== undefined
+        ? ` samples=${sampleCount}${typeof rms === 'number' ? ` rms=${rms.toFixed(5)}` : ''}`
+        : ''
+      return `${failure.roomId}:${label}${suffix}`
+    })
+    .join('；')
+}
+
 export default function Workbench() {
   const { isConnected, send, on } = useWebSocket()
   const rooms = useAppStore((state) => state.rooms)
   const selectedRoomId = useAppStore((state) => state.selectedRoomId)
   const connectionStatus = useAppStore((state) => state.connectionStatus)
+  const settings = useAppStore((state) => state.settings)
+  const appSettings = useAppStore((state) => state.appSettings)
   // L11: WebSocket 断连提示防抖——仅在断开超过 2 秒后才显示 banner，
   // 避免后端启动慢时反复 connect/disconnect 导致 banner 闪烁
   const [showDisconnectAlert, setShowDisconnectAlert] = useState(false)
@@ -29,16 +76,32 @@ export default function Workbench() {
     return undefined
   }, [connectionStatus])
   const clips = useAppStore((state) => state.clips)
+  const continuousAnalysisStatus = useAppStore((state) => state.continuousAnalysisStatus)
   const setSelectedRoomId = useAppStore((state) => state.setSelectedRoomId)
   const addClip = useAppStore((state) => state.addClip)
   const setClips = useAppStore((state) => state.setClips)
+  const setContinuousAnalysisStatus = useAppStore((state) => state.setContinuousAnalysisStatus)
   const [loading, setLoading] = useState(false)
   const [url, setUrl] = useState('')
   const [previewClip, setPreviewClip] = useState<ClipSegment | null>(null)
-  const [exportPresetId, setExportPresetId] = useState(getDefaultPreset().id)
-  const [analyzing, setAnalyzing] = useState(false)
-  const [analysisResults, setAnalysisResults] = useState<{start: number; end: number; score: number}[]>([])
-  const [showAnalysisModal, setShowAnalysisModal] = useState(false)
+  const [exportPresetId, setExportPresetId] = useState(appSettings.default_export_preset || getDefaultPreset().id)
+  // 分析导出 Modal 状态（持续分析 + 同步分析导出合并）
+  const [continuousModalOpen, setContinuousModalOpen] = useState(false)
+  const [continuousMainRoom, setContinuousMainRoom] = useState<string | null>(null)
+
+  const [continuousPresetId, setContinuousPresetId] = useState(appSettings.default_export_preset || getDefaultPreset().id)
+  const [analysisIsContinuous, setAnalysisIsContinuous] = useState(false)
+  const [continuousSubmitting, setContinuousSubmitting] = useState(false)
+  // 运行中的持续分析状态
+  const [continuousAnalyzing, setContinuousAnalyzing] = useState(false)
+  const [continuousRoomId, setContinuousRoomId] = useState<string | null>(null)
+  const [continuousTargetRoomIds, setContinuousTargetRoomIds] = useState<string[]>([])
+  const [analysisGameType, setAnalysisGameType] = useState<AnalysisMode>('generic')
+  const isValorantRoundCutting = analysisGameType === 'valorant_round'
+  const continuousActiveRoomRef = useRef<string | null>(null)
+  // 同步导出模式标记（response 监听器据此预创建 clips 关联 job_id）
+  const isSyncExportModeRef = useRef(false)
+  const syncMainRoomRef = useRef<string | null>(null)
   const [loopPreview, setLoopPreview] = useState(false)
   const [timelineZoom, setTimelineZoom] = useState(1)
   const [allMuted, setAllMuted] = useState(false)
@@ -88,18 +151,21 @@ export default function Workbench() {
 
   // Escape 键退出放大（capture 阶段拦截，避免触发其他快捷键如 mark_in/out）
   useEffect(() => {
-    if (expandedRoomId === null) return
+    if (expandedRoomId === null && fullscreenRoomId === null) return
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
         e.stopPropagation()
-        setExpandedRoomId(null)
-        setFullscreenRoomId(null)
+        if (fullscreenRoomId !== null) {
+          setFullscreenRoomId(null)
+        } else {
+          setExpandedRoomId(null)
+        }
       }
     }
     window.addEventListener('keydown', handleKeyDown, true)
     return () => window.removeEventListener('keydown', handleKeyDown, true)
-  }, [expandedRoomId])
+  }, [expandedRoomId, fullscreenRoomId])
 
   // 程序切到后台后再切回前台时，恢复所有 MSE player 的播放
   useEffect(() => {
@@ -134,16 +200,44 @@ export default function Workbench() {
     }
   }, [selectedRoomId])
 
-  // 获取房间列表
+  // 获取房间列表 + 查询当前是否有正在运行的持续分析任务
   useEffect(() => {
     if (isConnected) {
       send('get_rooms', {})
+      send('get_continuous_analysis_status', {})
     }
   }, [isConnected, send])
+
+  // 轮询补偿：每 10s 查询持续分析状态，防止后端广播遗漏导致 UI 冻结
+  useEffect(() => {
+    if (!isConnected || !continuousAnalyzing) return
+    const timer = setInterval(() => {
+      send('get_continuous_analysis_status', {})
+    }, 10000)
+    return () => clearInterval(timer)
+  }, [isConnected, continuousAnalyzing, send])
 
   // 监听后端事件（仅用于界面反馈，状态由 useWebSocket 统一写入 store）
   useEffect(() => {
     const unsubs: (() => void)[] = []
+    const applyContinuousStatus = (data: ContinuousAnalysisStatus) => {
+      setContinuousAnalysisStatus(data)
+      if (data?.running && data?.room_id) {
+        setContinuousAnalyzing(true)
+        setContinuousRoomId(data.room_id)
+        continuousActiveRoomRef.current = data.room_id
+        if (Array.isArray(data.target_room_ids)) {
+          setContinuousTargetRoomIds(data.target_room_ids)
+        }
+      } else {
+        setContinuousAnalyzing(false)
+        setContinuousRoomId(null)
+        continuousActiveRoomRef.current = null
+        setContinuousTargetRoomIds([])
+      }
+    }
+    unsubs.push(on('continuous_analysis_status', applyContinuousStatus))
+    unsubs.push(on('get_continuous_analysis_status_response', applyContinuousStatus))
     unsubs.push(on('room_connect_finished', (data: { room_id: string; success: boolean; error: string }) => {
       if (!data.success) {
         message.error(`连接失败：${data.error || '未知错误'}`)
@@ -259,10 +353,12 @@ export default function Workbench() {
       }
     }))
     // 导出失败/取消：后端通过 clip_failed 通知
-    unsubs.push(on('clip_failed', (data: { job_id?: string; error?: string }) => {
+    unsubs.push(on('clip_failed', (data: { room_id?: string; job_id?: string; error?: string }) => {
       const isCancelled = data.error === '导出已取消'
       if (!isCancelled && data.error) {
         message.error(`导出失败：${data.error}`)
+      } else if (!isCancelled && !data.error) {
+        message.error('导出失败：未知错误（后端未返回原因，请查看日志）')
       }
       if (data?.job_id) {
         const jid = data.job_id
@@ -380,11 +476,37 @@ export default function Workbench() {
     send('enable_preview', { room_id: roomId, enabled, mode: 'mse' })
   }, [send])
 
-  // 放大预览（单级：点击放大到左侧面板，再次点击退出；全屏由 video 原生 controls 提供）
+  // 放大预览（两级：第一次进入左侧区域放大，第二次进入真正全屏）
   const handleFullscreen = useCallback((roomId: string) => {
-    setExpandedRoomId(prev => prev === roomId ? null : roomId)
+    if (fullscreenRoomId === roomId) {
+      setFullscreenRoomId(null)
+      setExpandedRoomId(roomId)
+      return
+    }
+    if (expandedRoomId === roomId) {
+      setFullscreenRoomId(roomId)
+      return
+    }
+    setExpandedRoomId(roomId)
     setFullscreenRoomId(null)
-  }, [])
+  }, [expandedRoomId, fullscreenRoomId])
+
+  const handleCollapse = useCallback((roomId: string) => {
+    if (fullscreenRoomId === roomId) {
+      setFullscreenRoomId(null)
+      return
+    }
+    if (expandedRoomId === roomId) {
+      setExpandedRoomId(null)
+    }
+  }, [expandedRoomId, fullscreenRoomId])
+
+  const handleExitFullscreen = useCallback((roomId: string) => {
+    if (fullscreenRoomId === roomId) {
+      setFullscreenRoomId(null)
+      setExpandedRoomId(roomId)
+    }
+  }, [fullscreenRoomId])
 
   // 删除房间
   const handleRemove = useCallback((roomId: string) => {
@@ -553,24 +675,28 @@ export default function Workbench() {
     send('toggle_play_pause', { room_id: roomId })
   }, [send])
 
-  // 时间线跳转（多选时同步 seek 所有选中房间）
+  // 时间线跳转（多选时按 content_offset 调整每房间 seek 位置）
   const handleTimelineSeek = useCallback((time: number) => {
     console.log('[Workbench] 用户操作: 时间线跳转, time:', time.toFixed(2), '房间数:', selectedRoomIds.size)
-    selectedRoomIds.forEach(rid => mseSeek(rid, time))
-  }, [selectedRoomIds, mseSeek])
+    selectedRoomIds.forEach(rid => {
+      const room = rooms.find(r => r.room_id === rid)
+      const offset = room?.content_offset ?? 0
+      mseSeek(rid, time - offset)
+    })
+  }, [selectedRoomIds, mseSeek, rooms])
 
   // 设置入点
   const handleMarkIn = useCallback((roomId: string) => {
     const time = getPreviewCurrentTime(roomId)
     console.log('[Workbench] 用户操作: 设置入点, roomId:', roomId, 'time:', time.toFixed(2))
-    send('set_mark_in', { room_id: roomId, time })
+    send('set_mark_in', { room_id: roomId, time, live: true })
   }, [send, getPreviewCurrentTime])
 
   // 设置出点
   const handleMarkOut = useCallback((roomId: string) => {
     const time = getPreviewCurrentTime(roomId)
     console.log('[Workbench] 用户操作: 设置出点, roomId:', roomId, 'time:', time.toFixed(2))
-    send('set_mark_out', { room_id: roomId, time })
+    send('set_mark_out', { room_id: roomId, time, live: true })
   }, [send, getPreviewCurrentTime])
 
   // 添加到切片列表
@@ -640,23 +766,41 @@ export default function Workbench() {
 
   const handleGoLive = useCallback(() => {
     console.log('[Workbench] 用户操作: 跳转到直播最新位置, 房间数:', selectedRoomIds.size)
+    if (selectedRoomIds.size === 0) {
+      console.warn('[Workbench] 直播按钮诊断: 未选中房间')
+      return
+    }
+    const registry = (window as any).__msePlayers
     selectedRoomIds.forEach(rid => {
-      const registry = (window as any).__msePlayers
       const entry = registry?.[rid]
       const player = entry?.player
-      if (player && typeof player.resumePlayback === 'function') {
-        // 使用 MSE player 的 resumePlayback() 方法：
-        // 1. 自动 seek 到缓冲区末尾
+      const video = player?.videoElement as HTMLVideoElement | undefined
+      const bufferedLength = video?.buffered?.length ?? 0
+      const bufferedStart = bufferedLength > 0 ? video!.buffered.start(0) : null
+      const bufferedEnd = bufferedLength > 0 ? video!.buffered.end(bufferedLength - 1) : null
+      console.log('[Workbench] 直播按钮诊断', {
+        roomId: rid,
+        hasPlayer: !!player,
+        hasVideo: !!video,
+        readyState: video?.readyState ?? null,
+        currentTime: video?.currentTime ?? null,
+        bufferedStart,
+        bufferedEnd,
+      })
+      if (player && typeof player.goLive === 'function') {
+        // 使用 MSE player 的 goLive() 方法：
+        // 1. 强制 seek 到缓冲区末尾
         // 2. 重置 live-edge 对齐标志，允许后续自动校准
         // 3. 触发 _tryPlay() 延迟重试机制
-        player.resumePlayback()
+        player.goLive()
       } else {
         // 备用逻辑：player 不可用时直接操作 video 元素
-        const video = entry?.player?.videoElement as HTMLVideoElement | undefined
         if (video && video.buffered.length > 0) {
           const bufEnd = video.buffered.end(video.buffered.length - 1)
           video.currentTime = Math.max(0, bufEnd - 0.5)
           video.play().catch(() => {})
+        } else {
+          console.warn('[Workbench] 直播按钮诊断: MSE player 不可用或 buffer 为空', { roomId: rid })
         }
       }
     })
@@ -675,11 +819,17 @@ export default function Workbench() {
       const scores = (data.scores || {}) as Record<string, number>
       const referenceRoomId = data.reference_room_id as string
       const registry = (window as any).__msePlayers
+      const alignmentTrustThreshold = 0.3
       let alignedCount = 0
       let mutedCount = 0
       aligningRoomIdsRef.current.forEach(rid => {
         const offset = offsets[rid]
         if (offset === undefined) return
+        const score = scores[rid] ?? 0
+        if (score < alignmentTrustThreshold) {
+          send('set_content_offset', { room_id: rid, offset: 0 })
+          return
+        }
 
         // 回传 content_offset 到后端（用于导出时补偿）
         send('set_content_offset', { room_id: rid, offset })
@@ -698,7 +848,8 @@ export default function Workbench() {
       // 自动静音非参考房间（快的房间），消除多路音频叠加的回声/空灵感
       aligningRoomIdsRef.current.forEach(rid => {
         const offset = offsets[rid]
-        if (offset !== undefined && offset > 0.05 && rid !== referenceRoomId) {
+        const score = scores[rid] ?? 0
+        if (offset !== undefined && score >= alignmentTrustThreshold && offset > 0.05 && rid !== referenceRoomId) {
           send('set_preview_muted', { room_id: rid, muted: true })
           mutedCount++
         }
@@ -752,17 +903,68 @@ export default function Workbench() {
     aligningRoomIdsRef.current = new Set(selectedRoomIds)
     try {
       const aligner = getAligner()
+      const previewAlignDuration = 8.0
+      const captureFailures: CaptureFailure[] = []
       const capturePromises = [...selectedRoomIds].map(async rid => {
-        const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
-        if (!video) return null
-        const pcm = await aligner.captureAudio(rid, video, 3.0)
-        if (!pcm) return null
-        return { room_id: rid, sample_rate: 16000, pcm_base64: aligner.base64Encode(pcm) }
+        const entry = registry?.[rid]
+        const video = entry?.player?.videoElement as HTMLVideoElement | undefined
+        if (!video) {
+          captureFailures.push({ roomId: rid, reason: 'no_video' })
+          return null
+        }
+        const pcm = await aligner.captureAudio(rid, video, previewAlignDuration)
+        const captureDiagnostics = aligner.getLastCaptureDiagnostics(rid)
+        if (!pcm) {
+          captureFailures.push({
+            roomId: rid,
+            reason: captureDiagnostics?.reason ?? 'unknown',
+            diagnostics: captureDiagnostics,
+          })
+          return null
+        }
+        const buffered = video.buffered
+        return {
+          room_id: rid,
+          sample_rate: 16000,
+          pcm_base64: aligner.base64Encode(pcm),
+          diagnostics: {
+            current_time: video.currentTime,
+            buffer_start: buffered.length ? buffered.start(0) : null,
+            buffer_end: buffered.length ? buffered.end(buffered.length - 1) : null,
+            ingest_mode: entry?.ingestMode || 'unknown',
+            ready_state: captureDiagnostics?.ready_state ?? video.readyState,
+            has_audio_track: captureDiagnostics?.has_audio_track ?? true,
+            rms: captureDiagnostics?.rms ?? null,
+            sample_count: captureDiagnostics?.sample_count ?? pcm.length,
+            capture_reason: captureDiagnostics?.reason ?? 'ok',
+          },
+        }
       })
-      const results = (await Promise.all(capturePromises)).filter((r): r is { room_id: string; sample_rate: number; pcm_base64: string } => r !== null)
+      const results = (await Promise.all(capturePromises)).filter((r): r is {
+        room_id: string
+        sample_rate: number
+        pcm_base64: string
+        diagnostics: {
+          current_time: number
+          buffer_start: number | null
+          buffer_end: number | null
+          ingest_mode: string
+          ready_state: number
+          has_audio_track: boolean
+          rms: number | null
+          sample_count: number
+          capture_reason: string
+        }
+      } => r !== null)
       if (results.length < 2) {
         setAligning(false)
-        message.warning('音频捕获不足，已使用缓冲区对齐')
+        const failureSummary = formatCaptureFailureSummary(captureFailures)
+        console.warn('[Workbench] 音频捕获不足诊断', {
+          selectedRooms: [...selectedRoomIds],
+          capturedRooms: results.map(r => r.room_id),
+          captureFailures,
+        })
+        message.warning(`音频捕获不足（${failureSummary}），已使用缓冲区对齐`)
         return
       }
       send('align_preview_audio', { rooms: results })
@@ -773,16 +975,19 @@ export default function Workbench() {
     }
   }, [selectedRoomIds, send])
 
-  const handleMarkerDrag = useCallback((type: 'in' | 'out', time: number) => {
-    console.log('[Workbench] 用户操作: 标记拖拽, type:', type, 'time:', time.toFixed(2))
+  const handleMarkerDragEnd = useCallback((type: 'in' | 'out', time: number) => {
+    console.log('[Workbench] 用户操作: 标记拖拽结束, type:', type, 'time:', time.toFixed(2))
     selectedRoomIds.forEach(rid => {
       if (type === 'in') {
-        send('set_mark_in', { room_id: rid, time })
+        send('set_mark_in', { room_id: rid, time, live: false })
       } else {
-        send('set_mark_out', { room_id: rid, time })
+        send('set_mark_out', { room_id: rid, time, live: false })
       }
     })
-  }, [selectedRoomIds, send])
+    if (selectedRoomIds.size > 0) {
+      mseSeek([...selectedRoomIds][0], time)
+    }
+  }, [selectedRoomIds, send, mseSeek])
 
   const handleDeleteMarker = useCallback((type: 'in' | 'out') => {
     console.log('[Workbench] 用户操作: 删除标记, type:', type)
@@ -838,6 +1043,7 @@ export default function Workbench() {
       label: previewClip.label,
       preset_id: exportPresetId,
       job_id: jobId,
+      source: previewClip.is_ai_highlight ? 'ai_highlight' : 'manual',
     })
     // 将 job_id 写入对应 clip，使 ClipList 能关联导出进度
     const store = useAppStore.getState()
@@ -906,49 +1112,254 @@ export default function Workbench() {
       if (loopTimerRef.current) clearInterval(loopTimerRef.current)
     }
   }, [])
-  const handleStartAnalysis = () => {
-    if (!selectedRoomId) {
-      message.warning('请先选中一个已录制的房间')
+  // 同步分析导出启用条件：多选≥2 + 所有选中房间 align_group_id 一致非空 + 有录制文件
+  const selectedRoomList = rooms.filter(r => selectedRoomIds.has(r.room_id))
+  const currentTargetIds = selectedRoomIds.size > 0
+    ? [...selectedRoomIds]
+    : (selectedRoomId ? [selectedRoomId] : [])
+  const currentTargetRoomList = rooms.filter(r => currentTargetIds.includes(r.room_id))
+  const continuousTargetRooms = rooms.filter(r => continuousTargetRoomIds.includes(r.room_id))
+  const targetHasRecordings = currentTargetRoomList.every(r => r.record_output_path)
+  const targetAlignGroupReady = currentTargetRoomList.length <= 1 || (() => {
+    const groups = new Set(currentTargetRoomList.map(r => r.align_group_id || ''))
+    return groups.size === 1 && !groups.has('')
+  })()
+  const analysisEnabled = currentTargetRoomList.length >= 1
+    && targetHasRecordings
+    && targetAlignGroupReady
+  const analysisTooltip = currentTargetRoomList.length < 1
+    ? '请先选择房间'
+    : !targetHasRecordings
+      ? '选中房间缺少录制文件'
+      : !targetAlignGroupReady
+        ? '多房间分析需要先一键对齐，且对齐组一致'
+        : '分析主直播间高光，按对齐偏移映射导出'
+
+  // 分析导出确认（持续分析 / 同步分析导出 合并）
+  const handleConfirmAnalysisExport = () => {
+    if (!continuousMainRoom) {
+      message.warning('请选择主直播间')
       return
     }
-    const room = rooms.find(r => r.room_id === selectedRoomId)
-    if (!room?.is_recording && !room?.record_output_path) {
-      message.warning('该房间没有录制文件可分析')
+    const targetRoomIds = analysisIsContinuous ? continuousTargetRoomIds : [...selectedRoomIds]
+    const targetRooms = rooms.filter(r => targetRoomIds.includes(r.room_id))
+    if (targetRooms.length === 0) {
+      message.warning('请先选择房间')
       return
     }
-    console.log('[Workbench] 用户操作: 启动场景分析, roomId:', selectedRoomId)
-    setAnalyzing(true)
-    send('start_analysis', { room_id: selectedRoomId, threshold: 0.3 })
+    if (!targetRooms.every(r => r.record_output_path)) {
+      message.error('选中房间缺少录制文件')
+      return
+    }
+    if (!targetRoomIds.includes(continuousMainRoom)) {
+      message.error('主直播间必须在目标房间中')
+      return
+    }
+    if (targetRooms.length > 1) {
+      const groupSet = new Set(targetRooms.map(r => r.align_group_id || ''))
+      if (groupSet.size !== 1 || groupSet.has('')) {
+        message.error('多房间分析需要先一键对齐，且对齐组一致')
+        return
+      }
+    }
+
+    if (analysisIsContinuous) {
+      send('start_continuous_analysis', {
+        main_room_id: continuousMainRoom,
+        target_room_ids: targetRoomIds,
+        mode: isValorantRoundCutting ? 'valorant_round' : 'scene',
+        interval: 120,
+        threshold: 0.3,
+        game: isValorantRoundCutting ? 'valorant' : 'generic',
+      })
+      setContinuousModalOpen(false)
+      message.info('持续分析启动请求已发送')
+    } else {
+      if (targetRoomIds.length < 2) {
+        message.warning('请至少选中 2 个房间（或开启持续分析）')
+        return
+      }
+      const jobPrefix = `hlexport-${Date.now()}`
+      isSyncExportModeRef.current = true
+      syncMainRoomRef.current = continuousMainRoom
+      setContinuousSubmitting(true)
+      const analysisMode = isValorantRoundCutting ? 'valorant_round' : 'scene'
+      console.log('[Workbench] 用户操作: 多房间同步分析导出, main:', continuousMainRoom,
+        'targets:', targetRoomIds, 'mode:', analysisMode)
+      send('start_analysis_export', {
+        main_room_id: continuousMainRoom,
+        target_room_ids: targetRoomIds,
+        mode: analysisMode,
+        threshold: 0.3,
+        whisper_model: 'auto',
+        weights: { audio: 0.45, visual: 0.35, scene: 0.20 },
+        absolute_threshold: settings.analysis_settings?.absolute_threshold ?? 0.15,
+        preset_id: continuousPresetId,
+        job_prefix: jobPrefix,
+        game: isValorantRoundCutting ? 'valorant' : 'generic',
+      })
+      setContinuousModalOpen(false)
+      setContinuousSubmitting(false)
+    }
   }
 
-  // 监听分析结果
+  // 监听分析结果与进度
   useEffect(() => {
-    const unsub = on('start_analysis_response', (data: any) => {
-      setAnalyzing(false)
-      if (data?.success && data?.highlights) {
-        setAnalysisResults(data.highlights)
-        setShowAnalysisModal(true)
-      } else {
-        message.error(data?.error || '分析失败')
+    const unsubs: (() => void)[] = []
+    // 同步分析导出响应：后端已自动提交导出，前端预创建 clips 关联 job_id
+    unsubs.push(on('start_analysis_export_response', (data: any) => {
+      if (data?.install_guide) {
+        message.warning('AI 分析依赖未安装，请运行: pip install -r requirements-ai.txt')
+        isSyncExportModeRef.current = false
+        return
       }
-    })
-    return () => unsub()
+      if (data?.success && data?.highlights) {
+        // 预创建 clips，让 ClipList 显示导出进度（用 store 最新 rooms/ref 避免闭包旧值）
+        if (isSyncExportModeRef.current && data.job_ids && Array.isArray(data.job_ids)) {
+          const curRooms = useAppStore.getState().rooms
+          const mainRoom = curRooms.find(r => r.room_id === syncMainRoomRef.current)
+          const targetIds = [...selectedRoomIdsRef.current]
+          const newClips: ClipSegment[] = []
+          data.highlights.forEach((h: Highlight, i: number) => {
+            targetIds.forEach(rid => {
+              const room = curRooms.find(r => r.room_id === rid)
+              const delta = (mainRoom?.content_offset || 0) - (room?.content_offset || 0)
+              const mappedStart = Math.max(0, h.start + delta)
+              const mappedEnd = Math.max(0, h.end + delta)
+              // job_id 格式：{job_prefix}-{i}-{rid}
+              const jid = data.job_ids.find((id: string) => id.endsWith(`-${i}-${rid}`))
+              if (jid) {
+                newClips.push({
+                  start: mappedStart,
+                  end: mappedEnd,
+                  label: `${room?.streamer_name || rid}_高光${i + 1}`,
+                  room_id: rid,
+                  room_name: room?.streamer_name,
+                  job_id: jid,
+                  exported: false,
+                })
+              }
+            })
+          })
+          const store = useAppStore.getState()
+          store.setClips([...store.clips, ...newClips])
+          message.success(`已提交 ${data.job_ids.length} 个导出任务（${targetIds.length} 房间 × ${data.highlights.length} 高光）`)
+        }
+      } else {
+        message.error(data?.error || '同步分析导出失败')
+      }
+      isSyncExportModeRef.current = false
+    }))
+    unsubs.push(on('start_continuous_analysis_response', (data: any) => {
+      if (data?.success) {
+        const roomId = data.main_room_id || continuousMainRoom
+        const targetRoomIds = Array.isArray(data.target_room_ids) ? data.target_room_ids : continuousTargetRoomIds
+        setContinuousAnalyzing(true)
+        setContinuousRoomId(roomId)
+        continuousActiveRoomRef.current = roomId
+        if (Array.isArray(data.target_room_ids)) {
+          setContinuousTargetRoomIds(data.target_room_ids)
+        }
+        setContinuousAnalysisStatus({
+          running: true,
+          room_id: roomId,
+          target_room_ids: targetRoomIds,
+          mode: data.mode || 'scene',
+          analyzed_duration: 0,
+          total_highlights: 0,
+          phase: 'running',
+          updated_at: Date.now(),
+        })
+        message.success('持续分析已启动（快速回合检测），边录边分析新内容')
+      } else {
+        setContinuousAnalyzing(false)
+        setContinuousRoomId(null)
+        continuousActiveRoomRef.current = null
+        setContinuousAnalysisStatus({
+          running: false,
+          room_id: null,
+          phase: 'error',
+          error: data?.error || '持续分析启动失败',
+          updated_at: Date.now(),
+        })
+        message.error(data?.error || '持续分析启动失败')
+      }
+    }))
+    unsubs.push(on('stop_continuous_analysis_response', (data: any) => {
+      if (data?.success) {
+        setContinuousAnalyzing(false)
+        setContinuousRoomId(null)
+        continuousActiveRoomRef.current = null
+        message.success('持续分析已停止')
+      } else {
+        message.error(data?.error || '持续分析停止失败')
+      }
+    }))
+    // 录制结束后持续分析收尾完成通知
+    unsubs.push(on('continuous_analysis_complete', (data: any) => {
+      message.success(`录制结束分析完成：共 ${data?.total_highlights || 0} 个回合`)
+      setContinuousAnalyzing(false)
+      setContinuousRoomId(null)
+      continuousActiveRoomRef.current = null
+      setContinuousAnalysisStatus({
+        running: false,
+        room_id: data?.room_id ?? null,
+        total_highlights: data?.total_highlights ?? 0,
+        phase: 'completed',
+        updated_at: Date.now(),
+      })
+    }))
+    // 刷新房间状态响应
+    unsubs.push(on('refresh_room_status', (data: any) => {
+      if (data?.success) {
+        message.success(`已刷新 ${data?.refreshed || 0} 个房间状态`)
+      }
+    }))
+    // 持续分析高光更新：仅显示通知，不添加切片到列表
+    // 切片由 clip_queued 统一添加（使用映射后时间做 clip_id，避免多房间时 clip_id 不一致导致重复）
+    unsubs.push(on('continuous_highlights', (data: any) => {
+      const newCount = data?.new_count || 0
+      if (newCount > 0) {
+        const total = data?.total || 0
+        message.success(`持续分析: 新增 ${newCount} 个回合 (累计 ${total})`)
+      }
+    }))
+    return () => unsubs.forEach(u => u())
   }, [on])
 
-  // 将分析结果导入切片列表
-  const handleImportAnalysis = () => {
-    const room = rooms.find(r => r.room_id === selectedRoomId)
-    const newClips = analysisResults.map((h, i) => ({
-      start: h.start,
-      end: h.end,
-      label: `${room?.streamer_name || '房间'} - 高光 ${i + 1}`,
-      room_id: selectedRoomId!,
+  // ── 流式高光推送：仅显示通知，不添加切片到列表 ──
+  // 切片由 clip_queued 统一添加（使用映射后时间做 clip_id，避免多房间时 clip_id 不一致导致重复）
+  useEffect(() => {
+    const unsubs: Array<() => void> = []
+    unsubs.push(on('highlight_stream', (data: any) => {
+      if (!data?.highlight || !data?.room_id) return
+      // 只用于实时进度通知，不添加切片到列表
+      // 切片在导出入队时由 clip_queued 事件统一添加
     }))
-    console.log('[Workbench] 用户操作: 导入分析结果, 片段数:', newClips.length)
-    setClips([...clips, ...newClips])
-    setShowAnalysisModal(false)
-    message.success(`已导入 ${newClips.length} 个高光片段`)
-  }
+    return () => unsubs.forEach(u => u())
+  }, [on])
+
+  // ── 后端自动导出入队通知：切片添加到列表 ──
+  useEffect(() => {
+    const unsubs: Array<() => void> = []
+    unsubs.push(on('clip_queued', (data: any) => {
+      if (!data?.clip_id || !data?.room_id) return
+      const st = useAppStore.getState()
+      if (st.clips.some(c => c.clip_id === data.clip_id)) return
+      st.addClip({
+        start: data.start,
+        end: data.end,
+        label: data.label || '高光',
+        room_id: data.room_id,
+        room_name: data.room_name,
+        clip_id: data.clip_id,
+        job_id: data.job_id,
+        is_ai_highlight: true,
+      })
+      message.success(`已添加切片: ${data.label}`)
+    }))
+    return () => unsubs.forEach(u => u())
+  }, [on])
 
   // ── 导出文件操作 ──
   const handleOpenExportFolder = (outputPath: string) => {
@@ -1094,99 +1505,132 @@ export default function Workbench() {
         background: 'var(--bg-secondary)',
         borderBottom: '1px solid var(--border-default)',
         display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
+        flexDirection: 'column',
+        gap: 12,
       }}>
-        <Space>
-          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>多房间工作台</h2>
-          <span style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>
-            {rooms.length} 个房间
-          </span>
-          <Select
-            size="small"
-            value={sortBy}
-            onChange={setSortBy}
-            style={{ width: 110, marginLeft: 8, fontSize: 12 }}
-            options={[
-              { value: 'default', label: '默认排序' },
-              { value: 'status', label: '按状态' },
-              { value: 'platform', label: '按平台' },
-              { value: 'name', label: '按名称' },
-            ]}
-          />
-          <Button
-            type="default"
-            size="small"
-            onClick={handleStartAnalysis}
-            loading={analyzing}
-            disabled={!selectedRoomId || !rooms.find(r => r.room_id === selectedRoomId)?.record_output_path}
-          >
-            {analyzing ? '分析中...' : '分析高光'}
-          </Button>
-        </Space>
-        <Space>
-          <Button
-            size="small"
-            onClick={() => {
-              if (rooms.length > 0) {
-                setSelectedRoomIds(new Set(rooms.map(r => r.room_id)))
-                message.info(`已选中 ${rooms.length} 个房间`)
-              }
-            }}
-            disabled={rooms.length === 0}
-          >
-            全选
-          </Button>
-          <Button
-            size="small"
-            icon={<SyncOutlined />}
-            onClick={handleAlignLive}
-            loading={aligning}
-            disabled={aligning || selectedRoomIds.size === 0}
-          >
-            {aligning ? '对齐中' : '一键对齐'}
-          </Button>
-          <Button
-            size="small"
-            type={allMuted ? 'primary' : 'default'}
-            icon={allMuted ? <MutedOutlined /> : <SoundOutlined />}
-            onClick={() => {
-              const newMuted = !allMuted
-              setAllMuted(newMuted)
-              rooms.forEach(r => {
-                if (r.preview_enabled) {
-                  send('set_preview_muted', { room_id: r.room_id, muted: newMuted })
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+          <Space>
+            <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>多房间工作台</h2>
+            <span style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>
+              {rooms.length} 个房间
+            </span>
+            <Select
+              size="small"
+              value={sortBy}
+              onChange={setSortBy}
+              style={{ width: 110, marginLeft: 8, fontSize: 12 }}
+              options={[
+                { value: 'default', label: '默认排序' },
+                { value: 'status', label: '按状态' },
+                { value: 'platform', label: '按平台' },
+                { value: 'name', label: '按名称' },
+              ]}
+            />
+            <Button
+              size="small"
+              type={continuousAnalyzing ? 'primary' : 'default'}
+              disabled={!continuousAnalyzing && !analysisEnabled}
+              title={continuousAnalyzing ? '停止持续分析' : analysisTooltip}
+              onClick={() => {
+                if (continuousAnalyzing) {
+                  const activeRoomId = continuousActiveRoomRef.current || continuousRoomId || undefined
+                  send('stop_continuous_analysis', { main_room_id: activeRoomId })
+                  setContinuousModalOpen(false)
+                  message.info('持续分析停止请求已发送')
+                } else {
+                  const targetRoomIds = currentTargetIds
+                  if (targetRoomIds.length === 0) return
+                  setContinuousTargetRoomIds(targetRoomIds)
+                  setContinuousMainRoom(targetRoomIds[0])
+                  setContinuousPresetId(getDefaultPreset().id)
+                  setAnalysisIsContinuous(false)
+                  setContinuousModalOpen(true)
                 }
-              })
-            }}
-            disabled={rooms.length === 0}
-          >
-            {allMuted ? '取消静音' : '静音'}
-          </Button>
-          <Tooltip title={batchRecordTooltip}>
-            <span>
-              <Button
-                type="primary"
-                icon={<VideoCameraOutlined />}
-                onClick={handleBatchRecord}
-                disabled={batchRecordDisabled}
-              >
-                批量录制
-              </Button>
-            </span>
-          </Tooltip>
-          <Tooltip title={batchStopTooltip}>
-            <span>
-              <Button
-                danger
-                onClick={handleBatchStop}
-                disabled={batchStopDisabled}
-              >
-                批量停止
-              </Button>
-            </span>
-          </Tooltip>
-        </Space>
+              }}
+            >
+              {continuousAnalyzing ? '停止持续分析' : '分析导出'}
+            </Button>
+          </Space>
+          <Space wrap>
+            <Button
+              size="small"
+              onClick={() => {
+                if (rooms.length > 0) {
+                  setSelectedRoomIds(new Set(rooms.map(r => r.room_id)))
+                  message.info(`已选中 ${rooms.length} 个房间`)
+                }
+              }}
+              disabled={rooms.length === 0}
+            >
+              全选
+            </Button>
+            <Button
+              size="small"
+              icon={<SyncOutlined />}
+              onClick={handleAlignLive}
+              loading={aligning}
+              disabled={aligning || selectedRoomIds.size === 0}
+            >
+              {aligning ? '对齐中' : '一键对齐'}
+            </Button>
+
+            <Button
+              size="small"
+              icon={<ReloadOutlined />}
+              onClick={() => {
+                send('refresh_room_status', {})
+                message.info('正在刷新房间状态...')
+              }}
+              title="刷新房间状态（清除错误标记，不影响录制/预览/分析）"
+            >
+              刷新
+            </Button>
+
+            <Button
+              size="small"
+              type={allMuted ? 'primary' : 'default'}
+              icon={allMuted ? <MutedOutlined /> : <SoundOutlined />}
+              onClick={() => {
+                const newMuted = !allMuted
+                setAllMuted(newMuted)
+                rooms.forEach(r => {
+                  if (r.preview_enabled) {
+                    send('set_preview_muted', { room_id: r.room_id, muted: newMuted })
+                  }
+                })
+              }}
+              disabled={rooms.length === 0}
+            >
+              {allMuted ? '取消静音' : '静音'}
+            </Button>
+            <Tooltip title={batchRecordTooltip}>
+              <span>
+                <Button
+                  type="primary"
+                  icon={<VideoCameraOutlined />}
+                  onClick={handleBatchRecord}
+                  disabled={batchRecordDisabled}
+                >
+                  批量录制
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip title={batchStopTooltip}>
+              <span>
+                <Button
+                  danger
+                  onClick={handleBatchStop}
+                  disabled={batchStopDisabled}
+                >
+                  批量停止
+                </Button>
+              </span>
+            </Tooltip>
+          </Space>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <AnalysisProgress status={continuousAnalysisStatus} compact />
+        </div>
       </div>
 
       {/* 主内容区 */}
@@ -1203,27 +1647,33 @@ export default function Workbench() {
               />
             ) : (
               <Row gutter={[16, 16]}>
-                {sortedRooms.map(room => (
-                  <Col key={room.room_id} xs={24} sm={12} lg={12} xl={8}>
-                    <RoomCard
-                      room={room}
-                      send={send}
-                      selected={selectedRoomIds.has(room.room_id)}
-                      multiSelected={selectedRoomIds.size > 1 && selectedRoomIds.has(room.room_id)}
-                      onSelect={handleSelect}
-                      onConnect={handleConnect}
-                      onDisconnect={handleDisconnect}
-                      onStartRecord={handleStartRecord}
-                      onStopRecord={handleStopRecord}
-                      onRemove={handleRemove}
-                      onTogglePreview={handleTogglePreview}
-                      onToggleMute={handleToggleMute}
-                      onFullscreen={handleFullscreen}
-                      onToggleMultiSelect={handleToggleMultiSelect}
-                      expandedRoomId={expandedRoomId}
-                    />
-                  </Col>
-                ))}
+                {sortedRooms.map(room => {
+                  const isExpanded = expandedRoomId === room.room_id && !fullscreenRoomId
+                  return (
+                    <Col key={room.room_id} xs={24} sm={isExpanded ? 24 : 12} lg={isExpanded ? 24 : 12} xl={isExpanded ? 24 : 8}>
+                      <RoomCard
+                        room={room}
+                        send={send}
+                        selected={selectedRoomIds.has(room.room_id)}
+                        multiSelected={selectedRoomIds.size > 1 && selectedRoomIds.has(room.room_id)}
+                        onSelect={handleSelect}
+                        onConnect={handleConnect}
+                        onDisconnect={handleDisconnect}
+                        onStartRecord={handleStartRecord}
+                        onStopRecord={handleStopRecord}
+                        onRemove={handleRemove}
+                        onTogglePreview={handleTogglePreview}
+                        onToggleMute={handleToggleMute}
+                        onFullscreen={handleFullscreen}
+                        onToggleMultiSelect={handleToggleMultiSelect}
+                        expandedRoomId={expandedRoomId}
+                        fullscreenRoomId={fullscreenRoomId}
+                        onCollapse={handleCollapse}
+                        onExitFullscreen={handleExitFullscreen}
+                      />
+                    </Col>
+                  )
+                })}
               </Row>
             )}
           </div>
@@ -1246,7 +1696,7 @@ export default function Workbench() {
             onGoLive={handleGoLive}
             zoomLevel={timelineZoom}
             onZoomChange={setTimelineZoom}
-            onMarkerDrag={handleMarkerDrag}
+            onMarkerDragEnd={handleMarkerDragEnd}
             onDeleteMarker={handleDeleteMarker}
           />
         </div>
@@ -1287,8 +1737,16 @@ export default function Workbench() {
             </Space.Compact>
           </Card>
 
-          {/* 录制设置 */}
-          <RecordSettings />
+          {/* 快捷入口：打开设置页面调整录制参数 */}
+          <Button
+            size="small"
+            icon={<SettingOutlined />}
+            onClick={() => useAppStore.getState().setSettingsDrawerOpen(true)}
+            style={{ margin: '8px 16px', width: 'fit-content' }}
+            title="录制设置（在设置页面中调整）"
+          >
+            录制设置
+          </Button>
 
           {/* 切片列表 */}
           <ClipList
@@ -1338,57 +1796,91 @@ export default function Workbench() {
         )}
       </Modal>
 
-      {/* 分析高光结果 Modal */}
+      {/* 分析导出 Modal（持续分析 + 同步分析导出合并） */}
       <Modal
-        title="高光分析结果"
-        open={showAnalysisModal}
-        onCancel={() => setShowAnalysisModal(false)}
+        title={analysisIsContinuous ? '持续分析设置' : '多房间同步分析导出'}
+        open={continuousModalOpen}
+        onCancel={() => setContinuousModalOpen(false)}
+        width={520}
         footer={[
-          <Button key="cancel" onClick={() => setShowAnalysisModal(false)}>关闭</Button>,
-          <Button key="import" type="primary" onClick={handleImportAnalysis} disabled={analysisResults.length === 0}>
-            导入到切片列表 ({analysisResults.length} 个)
+          <Button key="cancel" onClick={() => setContinuousModalOpen(false)}>取消</Button>,
+          <Button
+            key="confirm"
+            type="primary"
+            loading={continuousSubmitting}
+            disabled={!continuousMainRoom}
+            onClick={handleConfirmAnalysisExport}
+          >
+            {analysisIsContinuous ? '开始持续分析' : '开始分析与导出'}
           </Button>,
         ]}
-        width={480}
       >
-        {analysisResults.length === 0 ? (
-          <div style={{ textAlign: 'center', padding: 24, color: 'var(--text-tertiary)' }}>
-            未检测到高光片段，可能需要调整检测阈值或该视频场景变化较少。
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{
+            padding: '8px 12px', borderRadius: 6,
+            background: 'var(--bg-tertiary)', fontSize: 12, color: 'var(--text-secondary)',
+          }}>
+            {analysisIsContinuous
+              ? '边录边分析主直播间高光，自动同步导入所有目标房间的切片列表。'
+              : `分析主直播间高光，按 content_offset 映射到所有选中房间导出。选中 ${selectedRoomList.length} 个房间。`}
           </div>
-        ) : (
-          <div style={{ maxHeight: 400, overflow: 'auto' }}>
-            {analysisResults.map((h, i) => (
-              <div
-                key={i}
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  padding: '8px 12px',
-                  borderRadius: 6,
-                  background: i % 2 === 0 ? 'var(--bg-tertiary)' : 'transparent',
-                  marginBottom: 4,
-                }}
-              >
-                <span style={{ fontSize: 13, fontWeight: 500 }}>
-                  高光 {i + 1}
-                </span>
-                <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                  {formatTime(h.start)} → {formatTime(h.end)}
-                </span>
-                <span style={{
-                  fontSize: 11,
-                  padding: '1px 6px',
-                  borderRadius: 4,
-                  background: h.score > 0.7 ? 'rgba(52,199,89,0.15)' : 'rgba(142,142,147,0.15)',
-                  color: h.score > 0.7 ? '#34c759' : 'var(--text-tertiary)',
-                }}>
-                  {formatTime(h.end - h.start)}
-                </span>
-              </div>
-            ))}
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>主直播间（用于高光分析）</div>
+            <Radio.Group
+              value={continuousMainRoom}
+              onChange={(e) => setContinuousMainRoom(e.target.value)}
+              style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+            >
+              {(analysisIsContinuous ? continuousTargetRooms : selectedRoomList).map(r => (
+                <Radio key={r.room_id} value={r.room_id}>
+                  {r.streamer_name || r.room_id}
+                  {!r.record_output_path && <span style={{ color: 'var(--state-error)', marginLeft: 8 }}>（无录制文件）</span>}
+                </Radio>
+              ))}
+            </Radio.Group>
           </div>
-        )}
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>直播类型</div>
+            <Radio.Group
+              value={analysisGameType}
+              onChange={(e) => setAnalysisGameType(e.target.value)}
+              optionType="button"
+              buttonStyle="solid"
+            >
+              <Radio.Button value="valorant_round">无畏契约回合切割</Radio.Button>
+              <Radio.Button value="generic">通用直播</Radio.Button>
+            </Radio.Group>
+          </div>
+
+          {!analysisIsContinuous && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <strong>导出预设：</strong>
+              <Select
+                value={continuousPresetId}
+                onChange={setContinuousPresetId}
+                style={{ flex: 1, fontSize: 13 }}
+                options={EXPORT_PRESETS.map(p => ({ value: p.id, label: `${p.name} — ${p.description}` }))}
+              />
+            </div>
+          )}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '8px 12px', borderRadius: 6,
+            background: 'var(--bg-tertiary)',
+          }}>
+            <strong>持续分析</strong>
+            <Switch
+              checked={analysisIsContinuous}
+              onChange={(checked) => {
+                setAnalysisIsContinuous(checked)
+              }}
+              disabled={continuousAnalyzing}
+            />
+            <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+              {analysisIsContinuous ? '开启后边录边分析，自动导入高光到切片列表' : '关闭则为单次分析并导出所有选中房间'}
+            </span>
+          </div>
+        </div>
       </Modal>
     </div>
   )
