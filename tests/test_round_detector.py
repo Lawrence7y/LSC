@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from unittest.mock import patch
 
 import numpy as np
@@ -21,6 +23,7 @@ from lsc.analyzer.round_detector import (
     ValorantRoundConfig,
     _build_round_segments_from_phase_markers,
     _find_combat_segments,
+    _format_output,
     _split_by_round_end_chimes,
     _trim_buy_phases,
     _validate_rounds,
@@ -698,3 +701,69 @@ class TestOcrRoundBoundaryMetadata:
         )
         assert rounds[0]["end_by"] == "open_tail"
         assert rounds[0]["ocr_confirmed"] is False
+
+
+class TestOcrOutputBoundaryRegression:
+    def test_ocr_output_uses_phase_start_without_prepad(self):
+        cfg = ValorantRoundConfig(pre_combat_pad=10.0)
+        phase = [{
+            "start": 100.0,
+            "end": 160.0,
+            "start_by": "ocr_buy_exit",
+            "end_by": "ocr_result",
+            "ocr_confirmed": True,
+            "ocr_end": 160.0,
+        }]
+        result = _format_output(
+            [(100, 160)], np.ones(200, dtype=np.float32), 1.0, 200.0, cfg,
+            phase_rounds=phase,
+        )
+        assert result[0]["start"] == 100.0
+        assert result[0]["start_by"] == "ocr_buy_exit"
+
+    def test_open_tail_keeps_ocr_metadata_without_audio_fallback(self):
+        cfg = ValorantRoundConfig(pre_combat_pad=10.0)
+        phase = [{
+            "start": 100.0,
+            "end": 180.0,
+            "start_by": "ocr_buy_exit",
+            "end_by": "open_tail",
+            "ocr_confirmed": False,
+            "ocr_end": None,
+        }]
+        result = _format_output(
+            [(100, 180)], np.ones(220, dtype=np.float32), 1.0, 220.0, cfg,
+            phase_rounds=phase,
+        )
+        assert result[0]["start"] == 100.0
+        assert result[0]["end_by"] == "open_tail"
+        assert result[0]["ocr_confirmed"] is False
+
+    def test_phase_rounds_skip_onset_fallback(self):
+        fake_onset = types.ModuleType("lsc.analyzer.onset_detector")
+        fake_onset.compute_spectral_flux = lambda samples, rate: (np.ones(2), 1)
+        fake_onset.detect_onset_events = lambda flux, rate: [{"timestamp": 0.0}]
+        fake_onset.aggregate_onsets_to_combat_segments = lambda events, duration: [
+            {"start": 0, "end": 20}
+        ]
+        markers = [
+            {"timestamp": 100.0, "type": "round_start"},
+            {"timestamp": 150.0, "type": "round_end"},
+        ]
+        fake_rms = np.ones(300, dtype=np.float32)
+        with (
+            patch.dict(sys.modules, {"lsc.analyzer.onset_detector": fake_onset}),
+            patch("lsc.analyzer.round_detector._get_duration", return_value=300.0),
+            patch("lsc.analyzer.round_detector._detect_round_phase_markers", return_value=markers),
+            patch("lsc.analyzer.round_detector._extract_audio_pcm",
+                  return_value=(np.zeros(300 * 16, dtype=np.float32), 16000)),
+            patch("lsc.analyzer.round_detector._compute_rms_envelope", return_value=fake_rms),
+            patch("lsc.analyzer.round_detector._detect_chimes_from_samples", return_value=[]),
+            patch("os.path.isfile", return_value=True),
+        ):
+            result = detect_valorant_rounds(
+                "fake.mp4", config=ValorantRoundConfig(), refine_with_ocr=True,
+                duration=300.0,
+            )
+        assert result[0]["start"] == 102.0
+        assert result[0]["start_by"] == "ocr_buy_exit"

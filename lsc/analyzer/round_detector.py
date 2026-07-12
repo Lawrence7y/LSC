@@ -247,7 +247,7 @@ def detect_valorant_rounds(
     rms_total_coverage = sum(e - s for s, e in combat_segments) if combat_segments else 0
     rms_too_few = len(combat_segments) <= 2
     rms_too_broad = rms_total_coverage > analysis_duration * 0.8
-    if ((rms_too_few or rms_too_broad) and analysis_duration > 120
+    if ((rms_too_few or rms_too_broad) and not phase_rounds and analysis_duration > 120
             and samples is not None and framerate > 0):
         _log.info("RMS 分段失效（%d 段），切换到 onset 频谱通量检测 (duration=%.0fs)",
                   len(combat_segments), analysis_duration)
@@ -809,9 +809,11 @@ def _format_output(
 
         combat_duration = seg_end - seg_start
         start_sec = max(0.0, float(seg_start) - cfg.pre_combat_pad)
+        if ocr_info:
+            start_sec = max(0.0, float(ocr_info.get("start", seg_start)))
 
         # OCR 确认的回合：直接使用 OCR 边界，跳过音频裁切
-        if ocr_confirmed:
+        if ocr_info:
             # OCR 起点已经是战斗开始（buy phase 已裁），仅加 pre_combat_pad
             combat_end_sec = float(seg_end)
             tail_reason = "ocr_phase"
