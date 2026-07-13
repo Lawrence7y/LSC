@@ -794,6 +794,10 @@ export default function Workbench() {
     const currentRooms = useAppStore.getState().rooms
     const currentClips = useAppStore.getState().clips
     const room = currentRooms.find(r => r.room_id === roomId)
+    if (!room?.record_output_path) {
+      message.warning('请先开始录制后再添加切片')
+      return
+    }
     if (room && room.mark_in !== null && room.mark_out !== null) {
       console.log('[Workbench] 用户操作: 添加切片, roomId:', roomId, 'mark_in:', room.mark_in, 'mark_out:', room.mark_out)
       const newClip: ClipSegment = {

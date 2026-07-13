@@ -72,7 +72,8 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
     a.is_recording === b.is_recording &&
     a.record_started_at === b.record_started_at &&
     a.mark_in === b.mark_in &&
-    a.mark_out === b.mark_out
+    a.mark_out === b.mark_out &&
+    a.record_output_path === b.record_output_path
   )
 }
 
@@ -108,6 +109,9 @@ export const ControlBar = memo(function ControlBar({
     room?.mark_in !== null && room?.mark_out !== null && room?.mark_in !== undefined && room?.mark_out !== undefined
     && room.mark_in < room.mark_out
   , [room?.mark_in, room?.mark_out])
+
+  const hasRecordingFile = !!room?.record_output_path
+  const canAddClip = hasSelection && hasRecordingFile
 
   // 播放状态：预览已启用目未暂停时才显示为播放中
   const isPlaying = room ? (room.preview_enabled && !room.preview_paused) : false
@@ -288,12 +292,12 @@ export const ControlBar = memo(function ControlBar({
               </Button>
             </Tooltip>
           )}
-          <Tooltip title="添加到切片列表">
+          <Tooltip title={!hasRecordingFile ? '请先开始录制后再添加切片' : '添加到切片列表'}>
             <Button 
               type="text" size="small"
               icon={<ScissorOutlined />}
               onClick={onAddClip}
-              disabled={!room || !hasSelection}
+              disabled={!room || !canAddClip}
             >
               添加切片
             </Button>
