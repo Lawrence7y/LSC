@@ -176,8 +176,10 @@ def _compute_preview_quality_params(data: dict | None = None) -> dict[str, Any]:
     preset = _get_preview_quality_preset(preview_quality)
     from lsc.core.services.mse_streamer import _check_nvenc
     use_nvenc = _check_nvenc()
-    width = preset['width']
-    height = preset['height']
+    preset_width = preset['width']
+    preset_height = preset['height']
+    width = preset_width
+    height = preset_height
     target_fps = 0  # 0 表示保持原画帧率
     active_mse_count = _preview_stream_registry().active_count()
 
@@ -187,24 +189,38 @@ def _compute_preview_quality_params(data: dict | None = None) -> dict[str, Any]:
 
     # 默认不限制（使用 preset 原始分辨率）
     max_w, max_h = 0, 0
+    degraded = False
+    reason = ''
+
+    incoming_count = active_mse_count + 1
 
     if pressure_level == 'critical' or active_mse_count >= 4:
         max_w, max_h, target_fps = 640, 360, 15
+        reason = '系统资源紧张' if pressure_level == 'critical' else f'多路预览（{incoming_count}路）'
     elif pressure_level == 'pressure' or active_mse_count >= 3:
         max_w, max_h, target_fps = 854, 480, 20
+        reason = '系统资源压力较高' if pressure_level == 'pressure' else f'多路预览（{incoming_count}路）'
     elif active_mse_count >= 8:
         max_w, max_h, target_fps = 640, 360, 15
+        reason = f'多路预览（{incoming_count}路）'
     elif active_mse_count >= 6:
         max_w, max_h = 854, 480
+        reason = f'多路预览（{incoming_count}路）'
 
     # 仅在设置了限制时才降分辨率
     if max_w > 0 and max_h > 0:
         if width == 0 or height == 0:
             width, height = max_w, max_h
+            degraded = True
         elif width > max_w or height > max_h:
             ratio = min(max_w / width, max_h / height)
             width = int(width * ratio)
             height = int(height * ratio)
+            degraded = True
+        if target_fps > 0:
+            degraded = True
+        if degraded and not reason:
+            reason = f'多路预览（{incoming_count}路）'
 
     video_bitrate = preset['nvenc_bitrate'] if use_nvenc else preset['x264_bitrate']
     crf_value = preset['x264_crf']
@@ -217,7 +233,42 @@ def _compute_preview_quality_params(data: dict | None = None) -> dict[str, Any]:
         'fps': target_fps,
         'pressure_level': pressure_level,
         'pressure_reject': pressure_level == 'critical',
+        'degraded': degraded,
+        'reason': reason,
+        'requested_width': preset_width,
+        'requested_height': preset_height,
     }
+
+
+def _preview_quality_response_fields(params: dict[str, Any]) -> dict[str, Any]:
+    """Extract preview quality metadata for enable_preview responses."""
+    fields: dict[str, Any] = {
+        'width': int(params.get('width') or 0),
+        'height': int(params.get('height') or 0),
+        'fps': int(params.get('fps') or 0),
+        'degraded': bool(params.get('degraded')),
+    }
+    reason = str(params.get('reason') or '').strip()
+    if reason:
+        fields['reason'] = reason
+    return fields
+
+
+def _mse_preview_success_response(
+    room_id: str,
+    data: dict | None,
+    *,
+    note: str,
+) -> dict[str, Any]:
+    """Build enable_preview success payload with actual preview quality metadata."""
+    preview_params = _compute_preview_quality_params(data)
+    response: dict[str, Any] = {
+        'success': True,
+        'room_id': room_id,
+        'note': note,
+    }
+    response.update(_preview_quality_response_fields(preview_params))
+    return response
 
 
 def _configure_shared_preview_quality(shared_ingest, data: dict | None = None) -> None:
@@ -250,6 +301,8 @@ _ai_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ai')
 _recording_semaphore = asyncio.Semaphore(2)
 # 正在提交录制启动的 room_id 集合，防止同一房间重复提交
 _recording_starting: set[str] = set()
+# 等待录制并发槽位的 room_id 队列（Semaphore 已满时）
+_recording_wait_queue: list[str] = []
 
 
 def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
@@ -277,6 +330,7 @@ def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
         _mse_starting.clear()
     _mse_reconnect_state.clear()
     _recording_starting.clear()
+    _recording_wait_queue.clear()
     _analysis_jobs.clear()
     export_jobs.clear()
 
@@ -1582,6 +1636,10 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
         'is_connected': room.is_connected,
         'is_recording': room.is_recording,
         'is_recording_starting': room_id in _recording_starting,
+        'is_recording_queued': room_id in _recording_wait_queue,
+        'recording_queue_position': (
+            _recording_wait_queue.index(room_id) + 1 if room_id in _recording_wait_queue else 0
+        ),
         'is_reconnecting': getattr(room, 'is_reconnecting', False),
         'record_output_path': room.record_output_path or "",
         'record_started_at': started_at,
@@ -1657,6 +1715,66 @@ class _RoomsThrottle:
     @property
     def has_pending(self) -> bool:
         return self._pending
+
+
+def _resolve_export_range(
+    start_sec,
+    end_sec,
+    *,
+    source='',
+    content_offset=0.0,
+    snap_in=None,
+    snap_out=None,
+    snap_rec=None,
+    use_room_marks=False,
+    room_mark_in=None,
+    room_mark_out=None,
+    room_rec_start=None,
+):
+    """解析导出入/出点与精度。
+
+    优先级：
+    1. source == 'ai_highlight' → 直接用 start/end（忽略快照）
+    2. 完整墙钟快照 (snap_in/out/rec) → exact
+    3. use_room_marks + 房间当前墙钟 → exact
+    4. 否则 start/end - content_offset → approximate
+    """
+    content_offset = float(content_offset or 0.0)
+    start_sec = float(start_sec)
+    end_sec = float(end_sec)
+
+    if source == 'ai_highlight':
+        return max(0.0, start_sec), max(0.0, end_sec), 'exact'
+
+    if snap_in is not None and snap_out is not None and snap_rec is not None:
+        return (
+            max(0.0, float(snap_in) - float(snap_rec) - content_offset),
+            max(0.0, float(snap_out) - float(snap_rec) - content_offset),
+            'exact',
+        )
+
+    if use_room_marks:
+        if (
+            room_mark_in is not None
+            and room_mark_out is not None
+            and room_rec_start is not None
+        ):
+            return (
+                max(0.0, float(room_mark_in) - float(room_rec_start) - content_offset),
+                max(0.0, float(room_mark_out) - float(room_rec_start) - content_offset),
+                'exact',
+            )
+        return (
+            max(0.0, start_sec - content_offset),
+            max(0.0, end_sec - content_offset),
+            'approximate',
+        )
+
+    return (
+        max(0.0, start_sec - content_offset),
+        max(0.0, end_sec - content_offset),
+        'approximate',
+    )
 
 
 def register_room_handlers(server, bridge):
@@ -2228,17 +2346,35 @@ def register_room_handlers(server, bridge):
         error_msg: str | None = None
         try:
             # 并发限流：最多 2 路同时启动录制（Semaphore 在 asyncio 上下文 await，不占 executor 线程）
+            if _recording_semaphore.locked():
+                if room_id not in _recording_wait_queue:
+                    _recording_wait_queue.append(room_id)
+                position = _recording_wait_queue.index(room_id) + 1
+                bridge.queue_broadcast({
+                    'type': 'recording_queue',
+                    'data': {'room_id': room_id, 'position': position, 'waiting': True},
+                })
+                _broadcast_rooms(force=True)
+
             _rec_log.info("[录制] acquiring semaphore for room %s", room_id)
-            async with _recording_semaphore:
+            await _recording_semaphore.acquire()
+            try:
+                if room_id in _recording_wait_queue:
+                    _recording_wait_queue.remove(room_id)
+                _broadcast_rooms(force=True)
                 _rec_log.info("[录制] semaphore acquired, submitting to executor for room %s", room_id)
                 success = await asyncio.get_running_loop().run_in_executor(_recording_executor, _start)
-            _rec_log.info("[录制] executor returned success=%s for room %s", success, room_id)
+                _rec_log.info("[录制] executor returned success=%s for room %s", success, room_id)
+            finally:
+                _recording_semaphore.release()
         except Exception as exc:
             _rec_log.error("[录制] exception for room %s: %s", room_id, exc, exc_info=True)
             error_msg = humanize_error(str(exc))
             success = False
         finally:
             _recording_starting.discard(room_id)
+            if room_id in _recording_wait_queue:
+                _recording_wait_queue.remove(room_id)
 
         room = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(manager.get_room, room_id))
         if room and room.is_recording:
@@ -2966,7 +3102,9 @@ def register_room_handlers(server, bridge):
                         _log.error("设置 preview_enabled 失败: room_id=%s, error=%s", room_id, exc)
                     existing.replay_init()
                     _broadcast_rooms()
-                    return {'success': True, 'room_id': room_id, 'note': 'already streaming, init replayed'}
+                    return _mse_preview_success_response(
+                        room_id, data, note='already streaming, init replayed',
+                    )
             try:
                 shared_enabled = bool(getattr(load_config(), 'shared_ingest_enabled', False))
             except Exception as exc:
@@ -3049,7 +3187,9 @@ def register_room_handlers(server, bridge):
                         )
                         _mse_reconnect_state.pop(room_id, None)
                         _broadcast_rooms()
-                        return {'success': True, 'room_id': room_id, 'note': 'shared ingest preview attached'}
+                        return _mse_preview_success_response(
+                            room_id, data, note='shared ingest preview attached',
+                        )
                     except Exception as exc:
                         _log.warning(
                             "shared ingest preview attach failed: room_id=%s, error=%s",
@@ -3131,7 +3271,9 @@ def register_room_handlers(server, bridge):
                         )
                         _mse_reconnect_state.pop(room_id, None)
                         _broadcast_rooms()
-                        return {'success': True, 'room_id': room_id, 'note': 'shared ingest preview-only started'}
+                        return _mse_preview_success_response(
+                            room_id, data, note='shared ingest preview-only started',
+                        )
                     except Exception as exc:
                         _log.warning(
                             "shared ingest preview-only failed: room_id=%s, error=%s",
@@ -3213,9 +3355,6 @@ def register_room_handlers(server, bridge):
                 # 读取预览画质预设（优先消息传入的 preview_quality，回退到全局设置）
                 settings = load_settings()
                 preview_quality = data.get('preview_quality') or settings.get('preview_quality', '高清')
-                preset = _get_preview_quality_preset(preview_quality)
-                width = preset['width']
-                height = preset['height']
 
                 # 根据用户选择的预览画质，从 quality_urls 中挑选对应画质的流地址
                 quality_urls = snapshot.get('quality_urls') or {}
@@ -3231,33 +3370,16 @@ def register_room_handlers(server, bridge):
                 platform = snapshot.get('platform', '')
                 probe_timeout = 8.0 if platform in ('bilibili', 'bilibili_bangumi') else 3.0
 
-                # 动态降分辨率：活跃 MSE ≥6 路时强制限制分辨率 ≤ 854x480
-                # S7: ≥8 路时进一步降级到 640x360，防止内存/CPU 过载
-                active_mse_count = _preview_stream_registry().active_count()
-                if active_mse_count >= 8:
-                    max_w, max_h = 640, 360
-                    if width == 0 or height == 0:
-                        width, height = max_w, max_h
-                    elif width > max_w or height > max_h:
-                        ratio = min(max_w / width, max_h / height)
-                        width = int(width * ratio)
-                        height = int(height * ratio)
-                elif active_mse_count >= 6:
-                    max_w, max_h = 854, 480
-                    if width == 0 or height == 0:
-                        width, height = max_w, max_h
-                    elif width > max_w or height > max_h:
-                        ratio = min(max_w / width, max_h / height)
-                        width = int(width * ratio)
-                        height = int(height * ratio)
+                preview_params = _compute_preview_quality_params(data)
+                width = preview_params['width']
+                height = preview_params['height']
+                target_fps = preview_params.get('fps', 0)
 
                 # 提取流 headers（B站/虎牙/斗鱼 CDN 强制检查 Referer）
                 preview_headers = snapshot.get('headers') or {}
-                # 确定编码码率/CRF
-                from lsc.core.services.mse_streamer import _check_nvenc
-                use_nvenc = _check_nvenc()
-                video_bitrate = preset['nvenc_bitrate'] if use_nvenc else preset['x264_bitrate']
-                crf_value = preset['x264_crf']
+                use_nvenc = preview_params['use_nvenc']
+                video_bitrate = preview_params['video_bitrate']
+                crf_value = preview_params['crf_value']
 
                 loop = asyncio.get_running_loop()
 
@@ -3531,6 +3653,7 @@ def register_room_handlers(server, bridge):
                             headers=preview_headers or None,
                             video_bitrate=video_bitrate,
                             crf_value=crf_value,
+                            fps=target_fps,
                             on_init_segment=lambda seg: asyncio.run_coroutine_threadsafe(
                                 srv.broadcast('mse_init', {
                                     'room_id': room_id,
@@ -3615,7 +3738,7 @@ def register_room_handlers(server, bridge):
 
                 _mse_reconnect_state.pop(room_id, None)
                 _broadcast_rooms()
-                return {'success': True, 'note': 'mse streaming started'}
+                return _mse_preview_success_response(room_id, data, note='mse streaming started')
             finally:
                 with _mse_starting_lock:
                     _mse_starting.discard(room_id)
@@ -4299,8 +4422,8 @@ def register_room_handlers(server, bridge):
         保证全局同时最多 _EXPORT_MAX_CONCURRENT 个 FFmpeg 导出进程。
 
         时间映射优先级（§2.1）：
-        1. 请求携带 mark_in/out_wallclock + recording_*_mono 快照 → 精确映射
-        2. source == 'ai_highlight' → 直接使用传入 start/end
+        1. source == 'ai_highlight' → 直接使用传入 start/end（忽略快照）
+        2. 请求携带 mark_in/out_wallclock + recording_*_mono 快照 → 精确映射
         3. use_room_marks=True → 使用房间当前 mark_*_wallclock（仅「导当前选区」）
         4. 否则 → start/end + content_offset，precision=approximate
         """
@@ -4316,7 +4439,6 @@ def register_room_handlers(server, bridge):
             return {'error': '房间不存在'}
 
         room_name = getattr(room, 'streamer_name', '') or room_id
-        precision = 'exact'
         content_offset = float(getattr(room, 'content_offset', 0.0) or 0.0)
 
         # 请求快照字段（列表导出时由前端 handleAddClip 快照写入）
@@ -4341,40 +4463,59 @@ def register_room_handlers(server, bridge):
             except (TypeError, ValueError):
                 snap_rec = None
 
-        if snap_in is not None and snap_out is not None and snap_rec is not None:
-            export_start = max(0.0, snap_in - snap_rec - content_offset)
-            export_end = max(0.0, snap_out - snap_rec - content_offset)
-            precision = 'exact'
-        elif source == 'ai_highlight':
-            export_start = max(0.0, start_sec)
-            export_end = max(0.0, end_sec)
-            precision = 'exact'
-        elif use_room_marks:
-            mark_in_wc = getattr(room, 'mark_in_wallclock', None)
-            mark_out_wc = getattr(room, 'mark_out_wallclock', None)
-            rec_start = getattr(room, 'recording_media_start_mono', None) or getattr(room, 'recording_start_mono', None)
-            if mark_in_wc is not None and mark_out_wc is not None and rec_start is not None:
-                export_start = max(0.0, mark_in_wc - rec_start - content_offset)
-                export_end = max(0.0, mark_out_wc - rec_start - content_offset)
-                precision = 'exact'
-            else:
-                export_start = max(0.0, start_sec - content_offset)
-                export_end = max(0.0, end_sec - content_offset)
-                precision = 'approximate'
+        room_mark_in = getattr(room, 'mark_in_wallclock', None)
+        room_mark_out = getattr(room, 'mark_out_wallclock', None)
+        room_rec_start = (
+            getattr(room, 'recording_media_start_mono', None)
+            or getattr(room, 'recording_start_mono', None)
+        )
+
+        export_start, export_end, precision = _resolve_export_range(
+            start_sec,
+            end_sec,
+            source=source,
+            content_offset=content_offset,
+            snap_in=snap_in,
+            snap_out=snap_out,
+            snap_rec=snap_rec,
+            use_room_marks=use_room_marks,
+            room_mark_in=room_mark_in,
+            room_mark_out=room_mark_out,
+            room_rec_start=room_rec_start,
+        )
+
+        if precision == 'approximate':
+            if use_room_marks:
                 _log.warning(
                     "导出降级：use_room_marks 但墙钟不可用，使用 start/end "
                     "(room=%s, start=%.2f, end=%.2f)",
                     room_id, export_start, export_end,
                 )
-        else:
-            export_start = max(0.0, start_sec - content_offset)
-            export_end = max(0.0, end_sec - content_offset)
-            precision = 'approximate'
-            _log.warning(
-                "导出降级：无墙钟快照，使用 start/end "
-                "(room=%s, start=%.2f, end=%.2f)",
-                room_id, export_start, export_end,
-            )
+            else:
+                missing = []
+                if snap_in is None:
+                    missing.append('mark_in_wallclock')
+                if snap_out is None:
+                    missing.append('mark_out_wallclock')
+                if snap_rec is None:
+                    missing.append('recording_*_mono')
+                any_present = (
+                    snap_in is not None
+                    or snap_out is not None
+                    or snap_rec is not None
+                )
+                if any_present:
+                    _log.warning(
+                        "导出降级：部分墙钟快照缺失，降级 missing=%s "
+                        "(room=%s, start=%.2f, end=%.2f)",
+                        missing, room_id, export_start, export_end,
+                    )
+                else:
+                    _log.warning(
+                        "导出降级：无墙钟快照，使用 start/end "
+                        "(room=%s, start=%.2f, end=%.2f)",
+                        room_id, export_start, export_end,
+                    )
 
         if export_start >= export_end:
             return {'error': '导出时间范围无效（入点>=出点）'}

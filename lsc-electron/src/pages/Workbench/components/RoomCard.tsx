@@ -113,6 +113,8 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
     a.is_connecting === b.is_connecting &&
     a.is_recording === b.is_recording &&
     a.is_recording_starting === b.is_recording_starting &&
+    a.is_recording_queued === b.is_recording_queued &&
+    a.recording_queue_position === b.recording_queue_position &&
     a.preview_enabled === b.preview_enabled &&
     a.preview_paused === b.preview_paused &&
     a.preview_muted === b.preview_muted &&
@@ -714,7 +716,11 @@ export const RoomCard = memo(function RoomCard({
             }}
             style={{ flex: 1 }}
           >
-            {room.is_recording_starting ? '启动中' : '开始录制'}
+            {room.is_recording_queued
+              ? `排队中${room.recording_queue_position ? ` #${room.recording_queue_position}` : ''}`
+              : room.is_recording_starting
+                ? '启动中'
+                : '开始录制'}
           </Button>
         )}
       

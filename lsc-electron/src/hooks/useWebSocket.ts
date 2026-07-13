@@ -130,9 +130,12 @@ function _attachSharedWebSocketHandlers(): () => void {
 
   const unsubConnected = wsClient.on('connected', () => {
     useAppStore.getState().setConnectionStatus('connected')
-    wsClient.send('get_disk_usage', {})
-    wsClient.send('get_system_stats', {})
-    wsClient.send('get_settings', {})
+    // 后端 on_connect 已主动推送 settings_loaded，无需重复请求
+    // 延迟非关键请求，不阻塞首屏渲染
+    setTimeout(() => {
+      wsClient.send('get_disk_usage', {})
+      wsClient.send('get_system_stats', {})
+    }, 500)
     // S1: WS 重连后自动恢复所有预览。重连成功后，对 store 中 preview_enabled=true
     // 的房间重新发送 enable_preview(mse)，确保后端 MseStreamer 重建（旧进程可能已随
     // 断连终止）。使用 setTimeout 避免阻塞 get_settings 的处理。
@@ -276,6 +279,20 @@ function _attachSharedWebSocketHandlers(): () => void {
     }
   })
 
+  const unsubRecordingQueue = wsClient.on('recording_queue', (data: {
+    room_id?: string
+    position?: number
+    waiting?: boolean
+  }) => {
+    if (data?.room_id) {
+      useAppStore.getState().updateRoom(data.room_id, {
+        is_recording_starting: true,
+        is_recording_queued: !!data.waiting,
+        recording_queue_position: data.position ?? 0,
+      })
+    }
+  })
+
   const unsubMseInit = wsClient.on('mse_init', (data: { room_id: string; data: string }) => {
     if (data?.room_id && data?.data) {
       _feedMseSegment(data.room_id, data.data, 'init')
@@ -320,7 +337,23 @@ function _attachSharedWebSocketHandlers(): () => void {
     }
   })
 
-  const unsubEnablePreviewResp = wsClient.on('enable_preview_response', (data: { success?: boolean; error?: string; room_id?: string }) => {
+  const unsubEnablePreviewResp = wsClient.on('enable_preview_response', (data: {
+    success?: boolean
+    error?: string
+    room_id?: string
+    degraded?: boolean
+    width?: number
+    height?: number
+    fps?: number
+    reason?: string
+  }) => {
+    if (data?.success && data.degraded && data.width && data.height) {
+      useAppStore.getState().setPreviewDegradationBanner({
+        width: data.width,
+        height: data.height,
+        reason: data.reason,
+      })
+    }
     if (data && !data.success && data.error) {
       console.warn('enable_preview failed:', data.error)
       if (data.room_id) {
@@ -409,6 +442,7 @@ function _attachSharedWebSocketHandlers(): () => void {
     unsubDiskUsageResponse()
     unsubSystemStats()
     unsubDepStatus()
+    unsubRecordingQueue()
     unsubMseInit()
     unsubMseSegment()
     unsubMseError()
@@ -432,7 +466,27 @@ export function useWebSocket() {
       _sharedHandlersCleanup = _attachSharedWebSocketHandlers()
     }
 
+    // 监听 Electron 主进程的清理全部房间事件（应用退出时触发）
+    const cleanupOnExit = window.electronAPI?.onCleanupAllRooms?.(() => {
+      console.log('[useWebSocket] 收到清理全部房间通知，正在停止所有录制/预览/分析...')
+      const state = useAppStore.getState()
+      // 停止所有录制
+      state.rooms.forEach(r => {
+        if (r.is_recording) {
+          wsClient.send('stop_recording', { room_id: r.room_id })
+        }
+        if (r.preview_enabled) {
+          wsClient.send('enable_preview', { room_id: r.room_id, enabled: false, mode: 'mse' })
+        }
+      })
+      // 停止持续分析
+      if (state.continuousAnalysisStatus?.running && state.continuousAnalysisStatus.room_id) {
+        wsClient.send('stop_continuous_analysis', { main_room_id: state.continuousAnalysisStatus.room_id })
+      }
+    })
+
     return () => {
+      cleanupOnExit?.() // 移除 IPC 监听器
       _sharedHandlersRefCount = Math.max(0, _sharedHandlersRefCount - 1)
       if (_sharedHandlersRefCount === 0) {
         _sharedHandlersCleanup?.()

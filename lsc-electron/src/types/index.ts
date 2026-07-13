@@ -11,6 +11,10 @@ export interface RoomSession {
   is_recording: boolean
   /** 录制启动中（刷新流地址 / 启动 FFmpeg），用于按钮即时 loading */
   is_recording_starting?: boolean
+  /** 等待录制并发槽位（Semaphore 排队中） */
+  is_recording_queued?: boolean
+  /** 录制排队序号（1 起），0 表示未排队 */
+  recording_queue_position?: number
   is_reconnecting?: boolean
   record_output_path: string
   record_started_at: string | null
