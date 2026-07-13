@@ -1329,11 +1329,13 @@ export default function Workbench() {
     && targetHasRecordings
     && targetAlignGroupReady
   const analysisTooltip = currentTargetRoomList.length < 1
-    ? '请先选择房间'
+    ? '请先选择要分析的房间'
     : !targetHasRecordings
-      ? '选中房间缺少录制文件'
+      ? '选中房间需先有录制文件，请先开始录制'
       : !targetAlignGroupReady
-        ? '多房间分析需要先一键对齐，且对齐组一致'
+        ? currentTargetRoomList.length > 1
+          ? '多房间分析需先点击「一键对齐」，且各房间对齐组一致'
+          : '请先点击一键对齐'
         : '分析主直播间高光，按对齐偏移映射导出'
 
   // 分析导出确认（持续分析 / 同步分析导出 合并）
@@ -1828,30 +1830,45 @@ export default function Workbench() {
                 { value: 'name', label: '按名称' },
               ]}
             />
-            <Button
-              size="small"
-              type={continuousAnalyzing ? 'primary' : 'default'}
-              disabled={!continuousAnalyzing && !analysisEnabled}
-              title={continuousAnalyzing ? '停止持续分析' : analysisTooltip}
-              onClick={() => {
-                if (continuousAnalyzing) {
-                  const activeRoomId = continuousActiveRoomRef.current || continuousRoomId || undefined
-                  send('stop_continuous_analysis', { main_room_id: activeRoomId })
-                  setContinuousModalOpen(false)
-                  message.info('持续分析停止请求已发送')
-                } else {
-                  const targetRoomIds = currentTargetIds
-                  if (targetRoomIds.length === 0) return
-                  setContinuousTargetRoomIds(targetRoomIds)
-                  setContinuousMainRoom(targetRoomIds[0])
-                  setContinuousPresetId(getDefaultPreset().id)
-                  setAnalysisIsContinuous(false)
-                  setContinuousModalOpen(true)
-                }
-              }}
-            >
-              {continuousAnalyzing ? '停止持续分析' : '分析导出'}
-            </Button>
+            <Tooltip title={continuousAnalyzing ? '停止持续分析' : analysisTooltip}>
+              <span>
+                <Button
+                  size="small"
+                  type={continuousAnalyzing ? 'primary' : 'default'}
+                  disabled={!continuousAnalyzing && !analysisEnabled}
+                  onClick={() => {
+                    if (!continuousAnalyzing && !analysisEnabled) {
+                      if (currentTargetRoomList.length < 1) return
+                      if (!targetHasRecordings) {
+                        message.warning('请先开始录制')
+                        return
+                      }
+                      if (!targetAlignGroupReady) {
+                        message.info('请先点击一键对齐')
+                        return
+                      }
+                      return
+                    }
+                    if (continuousAnalyzing) {
+                      const activeRoomId = continuousActiveRoomRef.current || continuousRoomId || undefined
+                      send('stop_continuous_analysis', { main_room_id: activeRoomId })
+                      setContinuousModalOpen(false)
+                      message.info('持续分析停止请求已发送')
+                    } else {
+                      const targetRoomIds = currentTargetIds
+                      if (targetRoomIds.length === 0) return
+                      setContinuousTargetRoomIds(targetRoomIds)
+                      setContinuousMainRoom(targetRoomIds[0])
+                      setContinuousPresetId(getDefaultPreset().id)
+                      setAnalysisIsContinuous(false)
+                      setContinuousModalOpen(true)
+                    }
+                  }}
+                >
+                  {continuousAnalyzing ? '停止持续分析' : '分析导出'}
+                </Button>
+              </span>
+            </Tooltip>
           </Space>
           <Space wrap>
             <Button
