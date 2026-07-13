@@ -327,13 +327,28 @@ function _attachSharedWebSocketHandlers(): () => void {
     }
   })
 
-  const unsubMseReconnected = wsClient.on('mse_reconnected', (data: { room_id: string }) => {
+  const unsubMseReconnected = wsClient.on('mse_reconnected', (data: {
+    room_id: string
+    degraded?: boolean
+    width?: number
+    height?: number
+    fps?: number
+    reason?: string
+  }) => {
     if (data?.room_id) {
       console.log(`MSE reconnected for ${data.room_id}`)
       useAppStore.getState().updateRoom(data.room_id, {
         mse_reconnecting: undefined,
         mse_error: undefined,
       })
+      if (data.degraded && data.width && data.height) {
+        useAppStore.getState().setPreviewDegradationBanner({
+          width: data.width,
+          height: data.height,
+          fps: data.fps,
+          reason: data.reason,
+        })
+      }
     }
   })
 

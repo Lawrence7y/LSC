@@ -77,6 +77,8 @@ export interface ClipSegment {
   recording_media_start_mono?: number | null
   /** exact = 入队时有完整墙钟；approximate = 仅有 start/end（如拖拽标记） */
   mark_precision?: 'exact' | 'approximate'
+  /** 入队时快照的 content_offset，导出时优先于房间当前值 */
+  content_offset?: number
 }
 
 // 流信息
@@ -104,6 +106,8 @@ export interface RecordSettings {
   audio_bitrate: string
   preview_quality: string
   preset?: string
+  /** 共享进样：单 FFmpeg 同时输出录制与预览 */
+  shared_ingest_enabled?: boolean
   analysis_settings?: {
     absolute_threshold: number
   }

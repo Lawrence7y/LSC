@@ -817,6 +817,7 @@ export default function Workbench() {
         mark_out_wallclock: room.mark_out_wallclock ?? null,
         recording_start_mono: room.recording_start_mono ?? null,
         recording_media_start_mono: room.recording_media_start_mono ?? null,
+        content_offset: room.content_offset ?? 0,
         mark_precision:
           room.mark_in_wallclock != null &&
           room.mark_out_wallclock != null &&
@@ -1042,7 +1043,7 @@ export default function Workbench() {
 
     // 少于 2 个房间时不需要音频对齐
     if (selectedRoomIds.size < 2) {
-      message.success(`已对齐 ${selectedRoomIds.size} 个直播间`)
+      message.info('已同步预览进度（单房间无需音频对齐）')
       return
     }
     message.loading({ content: '对齐中...', key: 'align', duration: 0 })
@@ -1192,6 +1193,7 @@ export default function Workbench() {
         mark_out_wallclock: clip.mark_out_wallclock,
         recording_start_mono: clip.recording_start_mono,
         recording_media_start_mono: clip.recording_media_start_mono,
+        content_offset: clip.content_offset,
         use_room_marks: false,
       })
       queued += 1
@@ -1250,6 +1252,7 @@ export default function Workbench() {
       mark_out_wallclock: previewClip.mark_out_wallclock,
       recording_start_mono: previewClip.recording_start_mono,
       recording_media_start_mono: previewClip.recording_media_start_mono,
+      content_offset: previewClip.content_offset,
       use_room_marks: false,
     })
     // 将 job_id 写入对应 clip，使 ClipList 能关联导出进度
