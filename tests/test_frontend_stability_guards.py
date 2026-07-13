@@ -362,5 +362,22 @@ def test_add_clip_snapshots_wallclock_fields() -> None:
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     body = workbench.split("const handleAddClip = useCallback", 1)[1].split("}, [addClip])", 1)[0]
     assert "mark_in_wallclock" in body
+    assert "mark_out_wallclock" in body
     assert "recording_start_mono" in body
+    assert "recording_media_start_mono" in body
+    # mark_precision 必须与后端 exact 门控对齐：双墙钟 + rec mono
+    assert "mark_precision" in body
+    assert "recording_media_start_mono ?? room.recording_start_mono" in body
+
+    export_many = workbench.split("const handleExportMany = ", 1)[1].split(
+        "const handleOpenExportFile", 1
+    )[0]
+    assert "mark_in_wallclock" in export_many
+    assert "use_room_marks: false" in export_many
+
+    confirm_export = workbench.split("const handleConfirmExport = ", 1)[1].split(
+        "const store = useAppStore.getState()", 1
+    )[0]
+    assert "mark_in_wallclock" in confirm_export
+    assert "use_room_marks: false" in confirm_export
 

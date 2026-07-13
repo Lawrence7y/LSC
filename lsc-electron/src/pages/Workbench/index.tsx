@@ -753,7 +753,9 @@ export default function Workbench() {
         recording_start_mono: room.recording_start_mono ?? null,
         recording_media_start_mono: room.recording_media_start_mono ?? null,
         mark_precision:
-          room.mark_in_wallclock != null && room.mark_out_wallclock != null
+          room.mark_in_wallclock != null &&
+          room.mark_out_wallclock != null &&
+          (room.recording_media_start_mono ?? room.recording_start_mono) != null
             ? 'exact'
             : 'approximate',
       }

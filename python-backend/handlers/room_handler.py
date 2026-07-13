@@ -4265,6 +4265,7 @@ def register_room_handlers(server, bridge):
         content_offset = float(getattr(room, 'content_offset', 0.0) or 0.0)
 
         # 请求快照字段（列表导出时由前端 handleAddClip 快照写入）
+        # NOTE: content_offset is NOT snapshotted; still read from live room state.
         snap_in = mark_in_wallclock
         snap_out = mark_out_wallclock
         snap_rec = recording_media_start_mono if recording_media_start_mono is not None else recording_start_mono
