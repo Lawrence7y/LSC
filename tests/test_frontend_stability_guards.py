@@ -381,3 +381,35 @@ def test_add_clip_snapshots_wallclock_fields() -> None:
     assert "mark_in_wallclock" in confirm_export
     assert "use_room_marks: false" in confirm_export
 
+
+def test_scrub_mark_surfaces_approximate_precision() -> None:
+    """拖拽标记须 live:false，并在 UI/导出路径标明近似，避免假精确。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    clip_list = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(
+        encoding="utf-8"
+    )
+
+    assert "live: false" in workbench
+    assert "approximate" in workbench or "近似" in workbench
+    assert "近似" in workbench or "近似" in clip_list
+
+    scrub = workbench.split("const handleMarkerDragEnd = useCallback", 1)[1].split(
+        "const handleDeleteMarker", 1
+    )[0]
+    assert "live: false" in scrub
+    assert "近似" in scrub
+
+    export_many = workbench.split("const handleExportMany = ", 1)[1].split(
+        "const handleOpenExportFile", 1
+    )[0]
+    confirm_export = workbench.split("const handleConfirmExport = ", 1)[1].split(
+        "const handleCancelExportModal", 1
+    )[0]
+    assert "mark_precision" in export_many or "approximate" in export_many
+    assert "message.warning" in export_many and "近似" in export_many
+    assert "mark_precision" in confirm_export or "approximate" in confirm_export
+    assert "message.warning" in confirm_export and "近似" in confirm_export
+
+    assert "mark_precision" in clip_list
+    assert "近似" in clip_list
+

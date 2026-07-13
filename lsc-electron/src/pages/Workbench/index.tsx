@@ -1056,6 +1056,8 @@ export default function Workbench() {
     if (selectedRoomIds.size > 0) {
       mseSeek([...selectedRoomIds][0], time)
     }
+    // 拖拽不写墙钟：近似定位，避免假精确；精确导出请用 I/O
+    message.info('近似定位：拖拽标记可能偏差数秒，精确导出请用 I / O 键', 3)
   }, [selectedRoomIds, send, mseSeek])
 
   const handleDeleteMarker = useCallback((type: 'in' | 'out') => {
@@ -1087,6 +1089,15 @@ export default function Workbench() {
     if (targets.length === 1) {
       handleExportClip(targets[0])
       return
+    }
+    const hasApproximate = targets.some(
+      (c) =>
+        c.mark_precision === 'approximate' ||
+        (c.mark_precision !== 'exact' &&
+          (c.mark_in_wallclock == null || c.mark_out_wallclock == null)),
+    )
+    if (hasApproximate) {
+      message.warning('含近似定位切片，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
     }
     const store = useAppStore.getState()
     let queued = 0
@@ -1139,6 +1150,13 @@ export default function Workbench() {
     if (!room.record_output_path) {
       message.error('该房间没有录制文件，请先开始录制再导出切片')
       return
+    }
+    const isApproximate =
+      previewClip.mark_precision === 'approximate' ||
+      (previewClip.mark_precision !== 'exact' &&
+        (previewClip.mark_in_wallclock == null || previewClip.mark_out_wallclock == null))
+    if (isApproximate) {
+      message.warning('该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
     }
     const jobId = `export-${Date.now()}`
 

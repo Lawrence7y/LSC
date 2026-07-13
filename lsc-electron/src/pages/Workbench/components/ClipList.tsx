@@ -140,6 +140,13 @@ export function ClipList({ clips, onDelete, onExport, onOpenFile, onOpenFolder, 
                     <Tag style={{ margin: 0 }}>
                       {formatDuration(clip.end - clip.start)}
                     </Tag>
+                    {(clip.mark_precision === 'approximate' ||
+                      (clip.mark_precision !== 'exact' &&
+                        (clip.mark_in_wallclock == null || clip.mark_out_wallclock == null))) && (
+                      <Tag color="orange" style={{ margin: 0 }} title="拖拽标记无墙钟，导出可能偏差数秒；精确请用 I/O 键">
+                        近似
+                      </Tag>
+                    )}
                     {isExporting && (
                       <Tag color="blue" style={{ margin: 0 }}>
                         导出中 {prog.percent.toFixed(0)}%
