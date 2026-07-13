@@ -128,3 +128,6 @@ nul
 socket.ts
 ws-relay.js
 ws-server.js
+
+# Brainstorm visual companion sessions
+.superpowers/
