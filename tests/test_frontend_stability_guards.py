@@ -399,16 +399,20 @@ def test_scrub_mark_surfaces_approximate_precision() -> None:
     assert "live: false" in scrub
     assert "近似" in scrub
 
+    assert "function isApproximateClip" in workbench
+
     export_many = workbench.split("const handleExportMany = ", 1)[1].split(
         "const handleOpenExportFile", 1
     )[0]
     confirm_export = workbench.split("const handleConfirmExport = ", 1)[1].split(
         "const handleCancelExportModal", 1
     )[0]
-    assert "mark_precision" in export_many or "approximate" in export_many
+    assert "isApproximateClip" in export_many
     assert "message.warning" in export_many and "近似" in export_many
-    assert "mark_precision" in confirm_export or "approximate" in confirm_export
+    assert "已提交" in export_many
+    assert "isApproximateClip" in confirm_export
     assert "message.warning" in confirm_export and "近似" in confirm_export
+    assert "导出任务已提交" in confirm_export
 
     assert "mark_precision" in clip_list
     assert "近似" in clip_list

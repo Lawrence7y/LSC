@@ -33,6 +33,14 @@ type CaptureFailure = {
   diagnostics?: PreviewAudioCaptureDiagnostics | null
 }
 
+function isApproximateClip(c: ClipSegment): boolean {
+  return (
+    c.mark_precision === 'approximate' ||
+    (c.mark_precision !== 'exact' &&
+      (c.mark_in_wallclock == null || c.mark_out_wallclock == null))
+  )
+}
+
 function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
   if (failures.length === 0) return '原因未知'
   const labels: Record<string, string> = {
@@ -1090,15 +1098,7 @@ export default function Workbench() {
       handleExportClip(targets[0])
       return
     }
-    const hasApproximate = targets.some(
-      (c) =>
-        c.mark_precision === 'approximate' ||
-        (c.mark_precision !== 'exact' &&
-          (c.mark_in_wallclock == null || c.mark_out_wallclock == null)),
-    )
-    if (hasApproximate) {
-      message.warning('含近似定位切片，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
-    }
+    const hasApproximate = targets.some(isApproximateClip)
     const store = useAppStore.getState()
     let queued = 0
     targets.forEach((clip, i) => {
@@ -1126,8 +1126,17 @@ export default function Workbench() {
           : c
       ))
     })
-    if (queued > 0) message.success(`已提交 ${queued} 个导出任务`)
-    else message.warning('没有可导出的切片（缺少录制文件）')
+    if (queued > 0) {
+      if (hasApproximate) {
+        message.warning(
+          `含近似定位切片，导出时间可能偏差数秒；精确导出请用 I / O 键标记。已提交 ${queued} 个导出任务`,
+        )
+      } else {
+        message.success(`已提交 ${queued} 个导出任务`)
+      }
+    } else {
+      message.warning('没有可导出的切片（缺少录制文件）')
+    }
   }
 
   // 打开导出的文件
@@ -1151,13 +1160,7 @@ export default function Workbench() {
       message.error('该房间没有录制文件，请先开始录制再导出切片')
       return
     }
-    const isApproximate =
-      previewClip.mark_precision === 'approximate' ||
-      (previewClip.mark_precision !== 'exact' &&
-        (previewClip.mark_in_wallclock == null || previewClip.mark_out_wallclock == null))
-    if (isApproximate) {
-      message.warning('该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
-    }
+    const isApproximate = isApproximateClip(previewClip)
     const jobId = `export-${Date.now()}`
 
     send('export_clip', {
@@ -1182,7 +1185,13 @@ export default function Workbench() {
         : c
     ))
     setPreviewClip(null)
-    message.info('导出任务已提交')
+    if (isApproximate) {
+      message.warning(
+        '该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记。导出任务已提交',
+      )
+    } else {
+      message.info('导出任务已提交')
+    }
   }
 
   const handleCancelExportModal = () => {
