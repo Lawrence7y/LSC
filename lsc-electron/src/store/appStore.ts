@@ -36,6 +36,7 @@ interface AppState {
   exportProgress: { job_id: string; percent: number } | null
   dependencyStatus: DependencyStatus | null
   timelineContext: TimelineContext | null
+  timelineInvalidated: boolean
   continuousAnalysisStatus: ContinuousAnalysisStatus | null
   settingsDrawerOpen: boolean
   previewDegradationBanner: PreviewDegradationBanner | null
@@ -59,6 +60,7 @@ interface AppActions {
   setExportProgress: (progress: { job_id: string; percent: number } | null) => void
   setDependencyStatus: (status: DependencyStatus | null) => void
   setTimelineContext: (ctx: TimelineContext | null) => void
+  setTimelineInvalidated: (invalidated: boolean) => void
   setContinuousAnalysisStatus: (status: ContinuousAnalysisStatus | null) => void
   setSettingsDrawerOpen: (open: boolean) => void
   setPreviewDegradationBanner: (info: PreviewDegradationInfo | null) => void
@@ -105,6 +107,7 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   exportProgress: null,
   dependencyStatus: null,
   timelineContext: null,
+  timelineInvalidated: false,
   continuousAnalysisStatus: null,
   settingsDrawerOpen: false,
   previewDegradationBanner: null,
@@ -198,6 +201,7 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   setDependencyStatus: (dependencyStatus) => set({ dependencyStatus }),
 
   setTimelineContext: (timelineContext) => set({ timelineContext }),
+  setTimelineInvalidated: (timelineInvalidated) => set({ timelineInvalidated }),
   setContinuousAnalysisStatus: (continuousAnalysisStatus) => set({ continuousAnalysisStatus }),
   setSettingsDrawerOpen: (open) => set({ settingsDrawerOpen: open }),
   setPreviewDegradationBanner: (previewDegradationBanner) => set({ previewDegradationBanner }),

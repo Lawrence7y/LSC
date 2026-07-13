@@ -22,6 +22,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -40,7 +41,10 @@ from persistence import (
 from lsc.config import ExportProfile, load_config
 from lsc.core.services.ingest_registry import PreviewStreamRegistry, get_shared_ingest_registry
 from lsc.core.services.resource_monitor import collect_system_stats, get_resource_pressure
-from lsc.core.services.timeline_service import get_timeline_service
+from lsc.core.services.timeline_service import (
+    build_room_snapshots_from_align,
+    get_timeline_service,
+)
 from lsc.gui.multi_room.manager import MultiRoomManager
 from lsc.platforms.registry import select_quality
 from lsc.utils.error_messages import humanize_error
@@ -283,6 +287,16 @@ _mse_reconnect_state: dict[str, dict[str, Any]] = {}
 _MSE_MAX_RECONNECT = 3
 _MSE_RECONNECT_BASE_DELAY = 2.0
 _MSE_RECONNECT_MAX_DELAY = 30.0
+
+
+def _invalidate_room_timeline(room_id: str, reason: str = "") -> None:
+    """若房间绑定了活动 TimelineContext，则使其失效（不删除 ClipSnapshot）。"""
+    svc = get_timeline_service()
+    ctx = svc.get_active_timeline_for_room(room_id)
+    if ctx is None:
+        return
+    svc.invalidate_timeline(ctx.timeline_id, reason or f"room_lifecycle:{room_id}")
+
 
 # 专用线程池：录制操作（HTTP 刷新 + FFmpeg 启动）可阻塞 30s+，独立线程池避免饿死快操作
 _recording_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix='rec')
@@ -1658,6 +1672,29 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
     }
 
 
+def _timeline_to_dict(ctx) -> dict[str, Any]:
+    """将 TimelineContext 序列化为与 get_timeline 同构的 dict。"""
+    return {
+        'timeline_id': ctx.timeline_id,
+        'reference_room_id': ctx.reference_room_id,
+        'preview_ready': ctx.preview_ready,
+        'clip_ready': ctx.clip_ready,
+        'created_at': ctx.created_at,
+        'room_snapshots': {
+            rid: {
+                'room_id': s.room_id,
+                'preview_epoch_id': s.preview_epoch_id,
+                'recording_id': s.recording_id,
+                'preview_to_common_delta': s.preview_to_common_delta,
+                'recording_to_common_delta': s.recording_to_common_delta,
+                'align_confidence': s.align_confidence,
+                'media_start_mono': s.media_start_mono,
+            }
+            for rid, s in ctx.room_snapshots.items()
+        },
+    }
+
+
 def _rooms_list(manager: MultiRoomManager):
     """将 manager 中的所有房间序列化为字典列表。"""
     return [_room_to_dict(r) for r in manager.list_rooms()]
@@ -2203,6 +2240,9 @@ def register_room_handlers(server, bridge):
             await asyncio.get_running_loop().run_in_executor(_bridge_executor, _stop_streamer)
             _stop_idle_shared_ingest(room_id, reason="room disconnected")
 
+        # 房间断开时使绑定的 TimelineContext 失效（ClipSnapshot 保留）
+        _invalidate_room_timeline(room_id, reason=f"room_disconnected:{room_id}")
+
         bridge.submit(manager.disconnect_room, room_id)
         _broadcast_rooms(force=True)
         _log.info("断开连接指令已提交: room_id=%s", room_id)
@@ -2447,6 +2487,9 @@ def register_room_handlers(server, bridge):
                     _log.debug("停止 streamer 失败 (remove): %s", exc)
             await asyncio.get_running_loop().run_in_executor(_bridge_executor, _stop_streamer)
             _stop_idle_shared_ingest(room_id, reason="room removed")
+
+        # 房间移除时使绑定的 TimelineContext 失效（ClipSnapshot 保留）
+        _invalidate_room_timeline(room_id, reason=f"room_removed:{room_id}")
 
         bridge.submit(manager.remove_room, room_id)
         _broadcast_rooms()
@@ -2914,30 +2957,82 @@ def register_room_handlers(server, bridge):
 
             import time as _align_time
             group_id = f"align_{int(_align_time.time())}"
+            reference_room_id = result.reference_room_id
 
-            def _apply_alignment():
+            def _apply_alignment_and_create_timeline():
+                timeline_svc = get_timeline_service()
+                # 重新对齐前先失效旧 timeline
+                seen_tids: set[str] = set()
+                for rid in trusted:
+                    old = timeline_svc.get_active_timeline_for_room(rid)
+                    if old is not None and old.timeline_id not in seen_tids:
+                        seen_tids.add(old.timeline_id)
+                        timeline_svc.invalidate_timeline(
+                            old.timeline_id, f"realign:{group_id}",
+                        )
+
+                room_meta: dict[str, dict] = {}
                 for rid, offset in offsets.items():
                     room = manager.get_room(rid)
                     if room is None:
                         continue
                     score = float(scores.get(rid, 0.0) or 0.0)
                     if score < _ALIGN_TRUST_THRESHOLD:
-                        # 低置信：强制 0，并清除旧 align_group_id，避免分析门槛被绕过
                         room.content_offset = 0.0
                         room.align_group_id = ''
                         continue
                     room.content_offset = float(offset)
                     room.align_group_id = group_id
-                return True
+                    media_start = (
+                        getattr(room, 'recording_media_start_mono', None)
+                        or getattr(room, 'recording_start_mono', None)
+                        or 0.0
+                    )
+                    room_meta[rid] = {
+                        'preview_epoch_id': getattr(room, 'preview_epoch_id', '') or '',
+                        'recording_id': getattr(room, 'recording_id', '') or '',
+                        'media_start_mono': float(media_start or 0.0),
+                    }
 
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_apply_alignment)
+                snapshots = build_room_snapshots_from_align(
+                    reference_room_id,
+                    offsets=trusted,
+                    scores=scores,
+                    room_meta=room_meta,
+                    confidence_threshold=_ALIGN_TRUST_THRESHOLD,
                 )
-            except Exception as exc:
-                _align_log.warning("写入对齐组失败: %s", exc)
+                if len(snapshots) < 2:
+                    _align_log.warning(
+                        "对齐快照不足 2 路，跳过 create_timeline: %s",
+                        list(snapshots.keys()),
+                    )
+                    return None
+                return timeline_svc.create_timeline(
+                    reference_room_id,
+                    snapshots,
+                    required_room_ids=list(trusted.keys()),
+                )
 
-            return {
+            timeline_payload = None
+            try:
+                ctx = await asyncio.get_running_loop().run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_apply_alignment_and_create_timeline)
+                )
+                if ctx is not None:
+                    timeline_payload = _timeline_to_dict(ctx)
+                    bridge.queue_broadcast({
+                        'type': 'timeline_ready',
+                        'timeline': timeline_payload,
+                    })
+                else:
+                    _align_log.warning(
+                        "create_timeline 未创建（offset 已保留）: reference=%s trusted=%s",
+                        reference_room_id, list(trusted.keys()),
+                    )
+            except Exception as exc:
+                _align_log.warning("写入对齐组/创建 TimelineContext 失败: %s", exc)
+
+            response = {
                 'success': True,
                 'offsets': result.offsets,
                 'reference_room_id': result.reference_room_id,
@@ -2945,6 +3040,9 @@ def register_room_handlers(server, bridge):
                 'scores': result.correlation_scores,
                 'align_group_id': group_id,
             }
+            if timeline_payload is not None:
+                response['timeline'] = timeline_payload
+            return response
         except Exception as exc:
             _align_log.error("预览音频对齐失败: %s", exc, exc_info=True)
             return {'success': False, 'error': str(exc)}
@@ -3210,7 +3308,10 @@ def register_room_handlers(server, bridge):
                         def _set_shared_preview_on():
                             room = mgr.get_room(room_id)
                             if room is not None:
+                                new_epoch = uuid4().hex
                                 room.preview_enabled = True
+                                room.preview_epoch_id = new_epoch
+                                get_timeline_service().on_preview_epoch_change(room_id, new_epoch)
                             return True
 
                         await asyncio.get_running_loop().run_in_executor(
@@ -3294,7 +3395,10 @@ def register_room_handlers(server, bridge):
                         def _set_shared_preview_on():
                             room = mgr.get_room(room_id)
                             if room is not None:
+                                new_epoch = uuid4().hex
                                 room.preview_enabled = True
+                                room.preview_epoch_id = new_epoch
+                                get_timeline_service().on_preview_epoch_change(room_id, new_epoch)
                             return True
 
                         await asyncio.get_running_loop().run_in_executor(
@@ -3469,6 +3573,11 @@ def register_room_handlers(server, bridge):
                                 room = mgr.get_room(room_id)
                                 if room is not None:
                                     room.preview_enabled = False
+                                # 预览彻底清除时使 timeline 失效（ClipSnapshot 保留）
+                                _invalidate_room_timeline(
+                                    room_id,
+                                    reason=f"mse_reconnect_exhausted:{room_id}",
+                                )
 
                             try:
                                 await loop.run_in_executor(
@@ -3639,6 +3748,23 @@ def register_room_handlers(server, bridge):
                         if success:
                             _mse_reconnect_state.pop(room_id, None)
                             _log.info("MSE reconnect succeeded for room %s", room_id)
+
+                            def _rotate_epoch_on_reconnect():
+                                room = mgr.get_room(room_id)
+                                if room is None:
+                                    return False
+                                new_epoch = uuid4().hex
+                                room.preview_epoch_id = new_epoch
+                                get_timeline_service().on_preview_epoch_change(room_id, new_epoch)
+                                return True
+
+                            try:
+                                await loop.run_in_executor(
+                                    _bridge_executor, lambda: bridge.call(_rotate_epoch_on_reconnect)
+                                )
+                            except Exception as exc:
+                                _log.debug("MSE reconnect epoch rotate failed: %s", exc)
+
                             await srv.broadcast('mse_reconnected', {
                                 'room_id': room_id,
                                 **_preview_quality_response_fields(preview_params),
@@ -3734,7 +3860,10 @@ def register_room_handlers(server, bridge):
                 def _set_preview_enabled():
                     room = mgr.get_room(room_id)
                     if room is not None:
+                        new_epoch = uuid4().hex
                         room.preview_enabled = True
+                        room.preview_epoch_id = new_epoch
+                        get_timeline_service().on_preview_epoch_change(room_id, new_epoch)
                     return True
 
                 try:
@@ -5322,6 +5451,18 @@ def register_room_handlers(server, bridge):
     # ── TimelineContext 集成 ──
     _timeline_svc = get_timeline_service()
 
+    def _on_timeline_invalidated(timeline_id: str, reason: str) -> None:
+        try:
+            bridge.queue_broadcast({
+                'type': 'timeline_invalidated',
+                'timeline_id': timeline_id,
+                'reason': reason,
+            })
+        except Exception as exc:
+            _log.debug("broadcast timeline_invalidated 失败: %s", exc)
+
+    _timeline_svc.add_invalidate_listener(_on_timeline_invalidated)
+
     # ── create_clip_snapshot handler ──
     @server.on('create_clip_snapshot')
     async def handle_create_clip_snapshot(data):
@@ -5345,18 +5486,24 @@ def register_room_handlers(server, bridge):
         if ctx is None:
             return {'success': False, 'error': 'timeline not found or expired'}
 
+        shared_group_id = f"group_{timeline_id[:8]}_{uuid4().hex[:8]}"
+        created_clip_ids: list[str] = []
         clips = []
         for room_id in target_room_ids:
             snap = _timeline_svc.create_clip_snapshot(
                 timeline_id, room_id, common_start, common_end,
                 source=source, source_highlight_id=source_highlight_id,
+                clip_group_id=shared_group_id,
             )
             if snap is None:
+                for cid in created_clip_ids:
+                    _timeline_svc.delete_clip_snapshot(cid)
                 return {
                     'success': False,
                     'error': 'RANGE_UNAVAILABLE',
                     'failed_room': room_id,
                 }
+            created_clip_ids.append(snap.clip_id)
             clips.append({
                 'clip_id': snap.clip_id,
                 'clip_group_id': snap.clip_group_id,
@@ -5441,7 +5588,8 @@ def register_room_handlers(server, bridge):
             snap.room_id, export_start, export_end,
             label=data.get('label', 'clip'),
             preset_id=data.get('preset_id', ''),
-            source='ai_highlight', job_id=jid,
+            source=snap.source or data.get('source', 'manual'),
+            job_id=jid,
         )
 
         if result.get('error'):
@@ -5461,23 +5609,7 @@ def register_room_handlers(server, bridge):
             return {'error': 'no active timeline'}
         return {
             'success': True,
-            'timeline': {
-                'timeline_id': ctx.timeline_id,
-                'reference_room_id': ctx.reference_room_id,
-                'preview_ready': ctx.preview_ready,
-                'clip_ready': ctx.clip_ready,
-                'created_at': ctx.created_at,
-                'room_snapshots': {
-                    rid: {
-                        'preview_epoch_id': s.preview_epoch_id,
-                        'recording_id': s.recording_id,
-                        'preview_to_common_delta': s.preview_to_common_delta,
-                        'recording_to_common_delta': s.recording_to_common_delta,
-                        'align_confidence': s.align_confidence,
-                    }
-                    for rid, s in ctx.room_snapshots.items()
-                },
-            },
+            'timeline': _timeline_to_dict(ctx),
         }
 
     # 已保存的房间列表会在新客户端连接时由 on_connect 推送

@@ -33,10 +33,27 @@ class PCMRecorder extends AudioWorkletProcessor {
 registerProcessor('pcm-recorder', PCMRecorder);
 `;
 
+export interface PreviewAudioCaptureDiagnostics {
+  reason: string
+  ready_state?: number
+  has_audio_track?: boolean
+  rms?: number | null
+  sample_count?: number
+}
+
 class PreviewAudioAligner {
   private ctx: AudioContext | null = null
   private workletLoaded = false
   private workletPromise: Promise<boolean> | null = null
+  private lastCaptureDiagnostics: Record<string, PreviewAudioCaptureDiagnostics> = {}
+
+  getLastCaptureDiagnostics(roomId: string): PreviewAudioCaptureDiagnostics | undefined {
+    return this.lastCaptureDiagnostics[roomId]
+  }
+
+  private setCaptureDiagnostics(roomId: string, diag: PreviewAudioCaptureDiagnostics): void {
+    this.lastCaptureDiagnostics[roomId] = diag
+  }
 
   private async getContext(): Promise<AudioContext> {
     if (!this.ctx) {
@@ -96,6 +113,7 @@ class PreviewAudioAligner {
       const ok = await this.loadWorklet(ctx)
       if (!ok) {
         console.error(`[PreviewAudioAligner] Worklet not loaded for room ${roomId}`)
+        this.setCaptureDiagnostics(roomId, { reason: 'worklet_not_loaded', ready_state: video.readyState })
         return null
       }
 
@@ -117,11 +135,13 @@ class PreviewAudioAligner {
         const stream: MediaStream | undefined = v.captureStream?.() ?? v.mozCaptureStream?.()
         if (!stream) {
           console.error(`[PreviewAudioAligner] captureStream() not available for room ${roomId}`)
+          this.setCaptureDiagnostics(roomId, { reason: 'capture_stream_unavailable', ready_state: video.readyState })
           return null
         }
         const audioTracks = stream.getAudioTracks()
         if (audioTracks.length === 0) {
           console.warn(`[PreviewAudioAligner] No audio tracks for room ${roomId}`)
+          this.setCaptureDiagnostics(roomId, { reason: 'no_audio_track', ready_state: video.readyState, has_audio_track: false })
           return null
         }
         const audioStream = new MediaStream(audioTracks)
@@ -160,6 +180,7 @@ class PreviewAudioAligner {
           settled = true
           cleanup()
           console.warn(`[PreviewAudioAligner] Capture timeout for room ${roomId} (${duration + 4}s)`)
+          this.setCaptureDiagnostics(roomId, { reason: 'capture_timeout', ready_state: video.readyState })
           resolve(null)
         }, (duration + 4) * 1000)
 
@@ -172,6 +193,7 @@ class PreviewAudioAligner {
           const samples = e.data.samples as Float32Array
           if (!samples || samples.length === 0) {
             console.warn(`[PreviewAudioAligner] Empty samples for room ${roomId}`)
+            this.setCaptureDiagnostics(roomId, { reason: 'buffer_empty', ready_state: video.readyState })
             resolve(null)
             return
           }
@@ -182,11 +204,24 @@ class PreviewAudioAligner {
           const rms = Math.sqrt(sumSq / samples.length)
           if (rms < 1e-6) {
             console.warn(`[PreviewAudioAligner] Room ${roomId} audio is silent (RMS=${rms.toFixed(8)}), discarding`)
+            this.setCaptureDiagnostics(roomId, {
+              reason: 'silent_audio',
+              ready_state: video.readyState,
+              rms,
+              sample_count: samples.length,
+            })
             resolve(null)
             return
           }
 
           const downsampled = this.downsample(samples, sampleRate, 16000)
+          this.setCaptureDiagnostics(roomId, {
+            reason: 'ok',
+            ready_state: video.readyState,
+            has_audio_track: true,
+            rms,
+            sample_count: downsampled.length,
+          })
           console.log(`[PreviewAudioAligner] Capture OK: room=${roomId}, samples=${samples.length} → ${downsampled.length} (16kHz), RMS=${rms.toFixed(4)}`)
           resolve(downsampled)
         }

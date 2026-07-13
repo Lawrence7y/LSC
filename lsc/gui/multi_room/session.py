@@ -51,6 +51,7 @@ class RoomSession:
     mark_out_wallclock: float | None = None
     # 录制开始的 monotonic 时间戳，由 manager 在录制启动时回填
     recording_start_mono: float | None = None
+    recording_media_start_mono: float | None = None
     # 预览延迟（秒），即从录制开始到首个 MSE segment 到达的延迟，默认 2.0 秒
     preview_latency: float = 2.0
     # 录制文件大小（MB），由 manager 每 tick 回填
@@ -87,10 +88,25 @@ class RoomSession:
     # 房间重连/录制重启时重置为 0
     # 导出时用于将所有房间的音频轨道按此偏移量对齐到基准房间时间线
     content_offset: float = 0.0
+    # 对齐组 ID：一次 audio_align 的所有参与房间共享同一 id（空串=未对齐）
+    # 多房间同步导出时校验：target_room_ids 的 align_group_id 必须一致且非空
+    # 房间重连/录制重启时与 content_offset 一起重置
+    align_group_id: str = ""
     # 重连取消事件：用户断开/删除房间时 set()，通知后台重连线程退出
     _cancel_reconnect: Event = field(default_factory=Event)
     # 后台重连线程引用，用于在断开/删除时取消
     _reconnect_thread: object | None = None
+    # 首帧写入校正标记：recording_start_mono 首帧校正完成后置 True，避免重复校正
+    # 录制启动时重置为 False（支持重连场景重新校正）
+    _first_frame_corrected: bool = False
+    # 预览 epoch ID：每次预览启动/重建时生成新 UUID，用于检测预览流版本变化
+    preview_epoch_id: str = ""
+    # 录制 ID：每次录制启动/重连时生成新 UUID，用于绑定 ClipSnapshot 到特定录制文件
+    recording_id: str = ""
+    # 缓存的流地址：连接/刷新时保存，避免录制/预览启动时重复刷新
+    stream_url_cached: str = ""
+    # 缓存解析时间戳（unix time），用于判断缓存是否过期（5分钟有效期）
+    stream_parsed_at: float = 0.0
 
     def apply_stream_info(self, info: StreamInfo) -> None:
         """用异步流探测结果回填房间会话字段，并更新连接状态。"""
@@ -98,6 +114,9 @@ class RoomSession:
         self.platform_name = get_display_name(info.platform)
         self.stream_info = info
         self.selected_quality = info.selected_quality
+        if info.stream_url:
+            self.stream_url_cached = info.stream_url
+            self.stream_parsed_at = __import__('time').time()
         self.is_connected = bool(info.is_live and info.stream_url)
         self.is_connecting = False
         self.streamer_name = getattr(info, "streamer", "") or ""

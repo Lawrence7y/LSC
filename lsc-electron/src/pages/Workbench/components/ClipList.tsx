@@ -13,6 +13,7 @@ interface ClipListProps {
   clips: ClipSegment[]
   onDelete: (index: number) => void
   onExport: (clip: ClipSegment, index: number) => void
+  onExportMany?: (clips: ClipSegment[]) => void
   onOpenFile?: (path: string) => void
   onOpenFolder?: (path: string) => void
   onCancelExport?: (jobId: string) => void
@@ -26,7 +27,7 @@ function formatDuration(seconds: number): string {
   return `${s}秒`
 }
 
-export function ClipList({ clips, onDelete, onExport, onOpenFile, onOpenFolder, onCancelExport, exportProgress }: ClipListProps) {
+export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress }: ClipListProps) {
   return (
     <Card
       size="small"
@@ -47,9 +48,16 @@ export function ClipList({ clips, onDelete, onExport, onOpenFile, onOpenFolder, 
         }
       }}
       extra={
-        <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-          {clips.length} 个切片
-        </span>
+        <Space size={8}>
+          {clips.length > 1 && onExportMany && (
+            <Button type="link" size="small" onClick={() => onExportMany(clips)}>
+              导出全部
+            </Button>
+          )}
+          <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+            {clips.length} 个切片
+          </span>
+        </Space>
       }
     >
       {clips.length === 0 ? (
@@ -142,6 +150,7 @@ export function ClipList({ clips, onDelete, onExport, onOpenFile, onOpenFolder, 
                     </Tag>
                     {(clip.mark_precision === 'approximate' ||
                       (clip.mark_precision !== 'exact' &&
+                        !clip.clip_snapshot_id &&
                         (clip.mark_in_wallclock == null || clip.mark_out_wallclock == null))) && (
                       <Tag color="orange" style={{ margin: 0 }} title="拖拽标记无墙钟，导出可能偏差数秒；精确请用 I/O 键">
                         近似

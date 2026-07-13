@@ -1,4 +1,5 @@
 import { useRef, useState, useCallback, useMemo, useEffect } from 'react'
+import type { TimelineHighlightBand } from '@/types'
 import './Timeline.css'
 
 export interface TimelineClip {
@@ -19,6 +20,9 @@ interface TimelineProps {
   onDeleteMarker?: (type: 'in' | 'out') => void
   buffered?: number
   clips?: TimelineClip[]
+  highlights?: TimelineHighlightBand[]
+  waveformPeaks?: number[]
+  onHighlightClick?: (highlight: TimelineHighlightBand) => void
   height?: number
   zoomLevel?: number
   onZoomChange?: (zoom: number) => void
@@ -78,10 +82,15 @@ function findSnapTarget(
   markOut: number | null,
   currentTime: number,
   tickInterval: number,
+  highlights: TimelineHighlightBand[] = [],
 ): number {
   const targets: SnapTarget[] = []
   if (markIn !== null) targets.push({ time: markIn, priority: 100 })
   if (markOut !== null) targets.push({ time: markOut, priority: 100 })
+  for (const h of highlights) {
+    targets.push({ time: h.start, priority: 90 })
+    targets.push({ time: h.end, priority: 90 })
+  }
   targets.push({ time: currentTime, priority: 80 })
   for (let t = 0; t <= duration; t += tickInterval) {
     targets.push({ time: t, priority: 50 })
@@ -107,6 +116,9 @@ export function Timeline({
   onDeleteMarker,
   buffered = 0,
   clips = [],
+  highlights = [],
+  waveformPeaks = [],
+  onHighlightClick,
   height = 60,
   zoomLevel = 1,
   onZoomChange,
@@ -157,8 +169,8 @@ export function Timeline({
   }, [effectiveDuration])
 
   const snapTime = useCallback((rawTime: number) => {
-    return findSnapTarget(rawTime, effectiveDuration, markIn, markOut, currentTime, tickInterval)
-  }, [effectiveDuration, markIn, markOut, currentTime, tickInterval])
+    return findSnapTarget(rawTime, effectiveDuration, markIn, markOut, currentTime, tickInterval, highlights)
+  }, [effectiveDuration, markIn, markOut, currentTime, tickInterval, highlights])
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (draggingMarker) return
@@ -267,6 +279,20 @@ export function Timeline({
 
   const innerWidth = `${zoom * 100}%`
 
+  const waveformPoints = useMemo(() => {
+    if (!waveformPeaks.length) return ''
+    const h = 36
+    const mid = h / 2
+    const n = waveformPeaks.length
+    return waveformPeaks
+      .map((p, i) => {
+        const x = (i / Math.max(n - 1, 1)) * 400
+        const y = mid - p * (mid - 2)
+        return `${x},${y}`
+      })
+      .join(' ')
+  }, [waveformPeaks])
+
   return (
     <div
       className="lsc-timeline"
@@ -307,8 +333,31 @@ export function Timeline({
           </div>
 
           <div className="lsc-timeline__track" ref={trackRef}>
+            {waveformPoints && (
+              <svg className="lsc-timeline__waveform" viewBox="0 0 400 36" preserveAspectRatio="none">
+                <polyline fill="none" stroke="rgba(48, 209, 88, 0.45)" strokeWidth="1.5" points={waveformPoints} />
+              </svg>
+            )}
             <div className="lsc-timeline__buffered" style={{ width: `${bufferedPct}%` }} />
             <div className="lsc-timeline__progress" style={{ width: `${progressPct}%` }} />
+
+            {highlights.map((h) => {
+              const left = clamp((h.start / effectiveDuration) * 100, 0, 100)
+              const width = clamp(((h.end - h.start) / effectiveDuration) * 100, 0, 100 - left)
+              const title = [h.reason || h.label || 'AI 高光', h.score != null ? `score ${h.score.toFixed(2)}` : ''].filter(Boolean).join(' · ')
+              return (
+                <div
+                  key={h.id}
+                  className="lsc-timeline__highlight"
+                  style={{ left: `${left}%`, width: `${width}%` }}
+                  title={title}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onHighlightClick?.(h)
+                  }}
+                />
+              )
+            })}
 
             {selection && (
               <div

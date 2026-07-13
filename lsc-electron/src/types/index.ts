@@ -75,10 +75,17 @@ export interface ClipSegment {
   mark_out_wallclock?: number | null
   recording_start_mono?: number | null
   recording_media_start_mono?: number | null
-  /** exact = 入队时有完整墙钟；approximate = 仅有 start/end（如拖拽标记） */
+  /** exact = 入队时有完整墙钟或 ClipSnapshot；approximate = 仅有 start/end（如拖拽标记） */
   mark_precision?: 'exact' | 'approximate'
   /** 入队时快照的 content_offset，导出时优先于房间当前值 */
   content_offset?: number
+  /** 公共时间轴坐标（TimelineContext 模式） */
+  common_start?: number
+  common_end?: number
+  timeline_id?: string
+  clip_snapshot_id?: string
+  highlight_reason?: string
+  highlight_score?: number
 }
 
 // 流信息
@@ -204,11 +211,31 @@ export interface AppSettings {
   default_export_preset: string
 }
 
+export interface RoomTimeSnapshot {
+  preview_epoch_id: string
+  recording_id: string
+  preview_to_common_delta: number
+  recording_to_common_delta: number
+  align_confidence: number
+  media_start_mono?: number
+}
+
 export interface TimelineContext {
   timeline_id: string
-  main_room_id?: string
-  target_room_ids?: string[]
-  [key: string]: unknown
+  reference_room_id: string
+  preview_ready: boolean
+  clip_ready: boolean
+  created_at: number
+  room_snapshots: Record<string, RoomTimeSnapshot>
+}
+
+export interface TimelineHighlightBand {
+  id: string
+  start: number
+  end: number
+  score?: number
+  reason?: string
+  label?: string
 }
 
 export interface ContinuousAnalysisStatus {

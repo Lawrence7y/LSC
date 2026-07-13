@@ -12,22 +12,18 @@
 .lsc-timeline__scroll {
   flex: 1;
   overflow-x: auto;
-  overflow-y: visible;
+  overflow-y: hidden;
   position: relative;
   padding: 16px 12px 4px;
+  /* 隐藏时间线滚动条；缩放后仍可用触控板/Shift+滚轮平移 */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 .lsc-timeline__scroll::-webkit-scrollbar {
-  width: 3px;
-  height: 3px;
-}
-.lsc-timeline__scroll::-webkit-scrollbar-track {
-  background: transparent;
-}
-.lsc-timeline__scroll::-webkit-scrollbar-thumb {
-  background: var(--text-400, #8e8e93);
-  border-radius: 2px;
-  opacity: 0.35;
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 .lsc-timeline__inner {
@@ -91,9 +87,10 @@
 
 .lsc-timeline__track {
   width: 100%;
-  height: 3px;
+  min-height: 36px;
+  height: 36px;
   background: var(--background-700);
-  border-radius: 2px;
+  border-radius: 4px;
   position: relative;
   transition: height 0.12s ease;
   overflow: visible;
@@ -101,15 +98,44 @@
 }
 
 .lsc-timeline__scroll:hover .lsc-timeline__track {
-  height: 5px;
+  min-height: 40px;
+  height: 40px;
+}
+
+.lsc-timeline__waveform {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 4px;
+  height: 28px;
+  width: 100%;
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+.lsc-timeline__highlight {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(255, 159, 10, 0.28);
+  border-left: 2px solid rgba(255, 159, 10, 0.85);
+  border-right: 2px solid rgba(255, 159, 10, 0.85);
+  pointer-events: auto;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.lsc-timeline__highlight:hover {
+  background: rgba(255, 159, 10, 0.4);
 }
 
 .lsc-timeline__buffered,
 .lsc-timeline__progress {
   position: absolute;
-  top: 0;
+  top: 50%;
+  transform: translateY(-50%);
   left: 0;
-  height: 100%;
+  height: 3px;
   border-radius: 2px;
   pointer-events: none;
 }

@@ -1,18 +1,22 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch } from 'antd'
-import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined, SettingOutlined } from '@ant-design/icons'
+import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
 import { RoomCard } from './components/RoomCard'
-import { ControlBar } from './components/ControlBar'
+import { ControlBar, type TimelineViewModel } from './components/ControlBar'
 import { ClipList, type ExportProgressInfo } from './components/ClipList'
 import { RefreshButton } from './components/RefreshButton'
-import { ClipSegment, ContinuousAnalysisStatus } from '@/types'
+import { ClipSegment, ContinuousAnalysisStatus, TimelineHighlightBand } from '@/types'
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
 import { formatTime } from '@/utils/time'
 import { getAligner, type PreviewAudioCaptureDiagnostics } from '@/utils/previewAudioAligner'
+import { commonToPreview, getAlignStatus, pickReferenceRoomId, previewToCommon } from '@/utils/timelineCoords'
+import { sendRequest } from '@/utils/wsRequest'
+import { WaveformPeakBuffer } from '@/utils/waveformPeaks'
 import { AnalysisProgress } from '@/components/AnalysisProgress'
+import './Workbench.css'
 /** 分析模式 */
 type AnalysisMode = 'valorant_round' | 'generic'
 
@@ -34,11 +38,16 @@ type CaptureFailure = {
 }
 
 function isApproximateClip(c: ClipSegment): boolean {
+  if (c.clip_snapshot_id || c.mark_precision === 'exact') return false
   return (
     c.mark_precision === 'approximate' ||
     (c.mark_precision !== 'exact' &&
       (c.mark_in_wallclock == null || c.mark_out_wallclock == null))
   )
+}
+
+function clipSnapshotJobId(clipId: string): string {
+  return `clip-${clipId.slice(0, 8)}`
 }
 
 /** 会停止录制的危险操作统一二次确认 */
@@ -117,6 +126,10 @@ export default function Workbench() {
   const addClip = useAppStore((state) => state.addClip)
   const setClips = useAppStore((state) => state.setClips)
   const setContinuousAnalysisStatus = useAppStore((state) => state.setContinuousAnalysisStatus)
+  const timelineContext = useAppStore((state) => state.timelineContext)
+  const timelineInvalidated = useAppStore((state) => state.timelineInvalidated)
+  const setTimelineContext = useAppStore((state) => state.setTimelineContext)
+  const setTimelineInvalidated = useAppStore((state) => state.setTimelineInvalidated)
   const [loading, setLoading] = useState(false)
   const [url, setUrl] = useState('')
   const [previewClip, setPreviewClip] = useState<ClipSegment | null>(null)
@@ -141,6 +154,10 @@ export default function Workbench() {
   const syncTargetRoomIdsRef = useRef<string[]>([])
   const [loopPreview, setLoopPreview] = useState(false)
   const [timelineZoom, setTimelineZoom] = useState(1)
+  const [commonMarkIn, setCommonMarkIn] = useState<number | null>(null)
+  const [commonMarkOut, setCommonMarkOut] = useState<number | null>(null)
+  const [waveformPeaks, setWaveformPeaks] = useState<number[]>([])
+  const waveformBufferRef = useRef<WaveformPeakBuffer | null>(null)
   const [allMuted, setAllMuted] = useState(false)
   const [sortBy, setSortBy] = useState<string>('default')
   const [aligning, setAligning] = useState(false)
@@ -187,6 +204,174 @@ export default function Workbench() {
     }, 200)  // S4: 从 500ms 提升到 200ms，时间线播放头更平滑
     return () => clearInterval(id)
   }, [])
+
+  const TIMELINE_WINDOW = 14400
+  const [timelineTick, setTimelineTick] = useState(0)
+  useEffect(() => {
+    const recording = rooms.some(r => selectedRoomIds.has(r.room_id) && r.is_recording)
+    if (!recording) return
+    const id = setInterval(() => setTimelineTick(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [rooms, selectedRoomIds])
+
+  const alignStatus = getAlignStatus(timelineContext, timelineInvalidated)
+  const commonMode = alignStatus === 'ready' && !!timelineContext
+
+  const referenceRoomId = useMemo(
+    () => pickReferenceRoomId(timelineContext, selectedRoomIds, selectedRoomId),
+    [timelineContext, selectedRoomIds, selectedRoomId],
+  )
+
+  useEffect(() => {
+    const unsubReady = on('timeline_ready', (data: { timeline?: typeof timelineContext }) => {
+      if (data?.timeline) {
+        setTimelineContext(data.timeline)
+        setTimelineInvalidated(false)
+        setCommonMarkIn(null)
+        setCommonMarkOut(null)
+      }
+    })
+    const unsubInvalid = on('timeline_invalidated', () => {
+      setTimelineContext(null)
+      setTimelineInvalidated(true)
+      setCommonMarkIn(null)
+      setCommonMarkOut(null)
+      message.warning('公共轴已失效，请重新对齐')
+    })
+    return () => {
+      unsubReady()
+      unsubInvalid()
+    }
+  }, [on, setTimelineContext, setTimelineInvalidated])
+
+  useEffect(() => {
+    if (!timelineContext?.timeline_id || !referenceRoomId) return
+    const room = rooms.find(r => r.room_id === referenceRoomId)
+    if (room?.mark_in != null) {
+      setCommonMarkIn(previewToCommon(timelineContext, referenceRoomId, room.mark_in))
+    }
+    if (room?.mark_out != null) {
+      setCommonMarkOut(previewToCommon(timelineContext, referenceRoomId, room.mark_out))
+    }
+  }, [timelineContext?.timeline_id, referenceRoomId, rooms])
+
+  const timelineHighlights = useMemo((): TimelineHighlightBand[] => {
+    const out: TimelineHighlightBand[] = []
+    for (const c of clips) {
+      if (!c.is_ai_highlight) continue
+      let start = c.common_start ?? c.start
+      let end = c.common_end ?? c.end
+      if (commonMode && timelineContext && c.room_id && c.common_start == null) {
+        try {
+          start = previewToCommon(timelineContext, c.room_id, c.start)
+          end = previewToCommon(timelineContext, c.room_id, c.end)
+        } catch {
+          continue
+        }
+      }
+      out.push({
+        id: c.clip_id || `${c.room_id}-${start}`,
+        start,
+        end,
+        reason: c.highlight_reason,
+        score: c.highlight_score,
+        label: c.label,
+      })
+    }
+    return out
+  }, [clips, commonMode, timelineContext])
+
+  const timelineView = useMemo((): TimelineViewModel | null => {
+    if (!commonMode || !timelineContext || !referenceRoomId) return null
+    const refRoom = rooms.find(r => r.room_id === referenceRoomId)
+    const previewT = previewPositions[referenceRoomId] ?? 0
+    const curCommon = previewToCommon(timelineContext, referenceRoomId, previewT)
+    let elapsed = Math.max(commonMarkOut ?? 0, curCommon)
+    if (refRoom?.is_recording && refRoom.record_started_at) {
+      elapsed = Math.max(elapsed, (Date.now() - new Date(refRoom.record_started_at).getTime()) / 1000)
+    }
+    let ws = 0
+    let dur = TIMELINE_WINDOW
+    if (elapsed > TIMELINE_WINDOW) {
+      ws = elapsed - TIMELINE_WINDOW
+    } else {
+      dur = Math.max(TIMELINE_WINDOW, elapsed)
+    }
+    const markIn = commonMarkIn ?? (refRoom?.mark_in != null
+      ? previewToCommon(timelineContext, referenceRoomId, refRoom.mark_in)
+      : null)
+    const markOut = commonMarkOut ?? (refRoom?.mark_out != null
+      ? previewToCommon(timelineContext, referenceRoomId, refRoom.mark_out)
+      : null)
+    const clipBlocks = clips
+      .filter(c => !c.is_ai_highlight && c.end > c.start)
+      .map(c => {
+        let start = c.common_start ?? c.start
+        let end = c.common_end ?? c.end
+        if (c.room_id && c.common_start == null) {
+          try {
+            start = previewToCommon(timelineContext, c.room_id, c.start)
+            end = previewToCommon(timelineContext, c.room_id, c.end)
+          } catch {
+            return null
+          }
+        }
+        return { start, end }
+      })
+      .filter((c): c is { start: number; end: number } => c != null)
+    return {
+      duration: dur,
+      currentTime: curCommon,
+      windowStart: ws,
+      markIn,
+      markOut,
+      clips: clipBlocks,
+      highlights: timelineHighlights,
+      waveformPeaks,
+    }
+  }, [
+    commonMode, timelineContext, referenceRoomId, rooms, previewPositions,
+    commonMarkIn, commonMarkOut, clips, timelineHighlights, waveformPeaks, timelineTick,
+  ])
+
+  useEffect(() => {
+    if (!commonMode || !referenceRoomId || !timelineContext) {
+      waveformBufferRef.current?.detach()
+      waveformBufferRef.current = null
+      setWaveformPeaks([])
+      return
+    }
+    const buf = new WaveformPeakBuffer()
+    if (!buf.attachFromRegistry(referenceRoomId)) {
+      return
+    }
+    waveformBufferRef.current = buf
+    const ctx = timelineContext
+    buf.start(() => {
+      const t = lastPreviewPositionsRef.current[referenceRoomId] ?? 0
+      try {
+        return previewToCommon(ctx, referenceRoomId, t)
+      } catch {
+        return 0
+      }
+    })
+    const id = setInterval(() => {
+      const previewT = lastPreviewPositionsRef.current[referenceRoomId] ?? 0
+      let elapsed = Math.max(commonMarkOut ?? 0, previewToCommon(ctx, referenceRoomId, previewT))
+      const refRoom = rooms.find(r => r.room_id === referenceRoomId)
+      if (refRoom?.is_recording && refRoom.record_started_at) {
+        elapsed = Math.max(elapsed, (Date.now() - new Date(refRoom.record_started_at).getTime()) / 1000)
+      }
+      const ws = elapsed > TIMELINE_WINDOW ? elapsed - TIMELINE_WINDOW : 0
+      const dur = elapsed > TIMELINE_WINDOW ? TIMELINE_WINDOW : Math.max(TIMELINE_WINDOW, elapsed)
+      setWaveformPeaks(buf.sample(ws, ws + dur, 120))
+    }, 500)
+    return () => {
+      clearInterval(id)
+      buf.detach()
+      waveformBufferRef.current = null
+    }
+  }, [commonMode, referenceRoomId, timelineContext?.timeline_id, rooms, commonMarkOut])
 
   // Escape 键退出放大（capture 阶段拦截，避免触发其他快捷键如 mark_in/out）
   useEffect(() => {
@@ -776,26 +961,18 @@ export default function Workbench() {
   // 时间线跳转（多选时按 content_offset 调整每房间 seek 位置）
   const handleTimelineSeek = useCallback((time: number) => {
     console.log('[Workbench] 用户操作: 时间线跳转, time:', time.toFixed(2), '房间数:', selectedRoomIds.size)
+    const ctx = useAppStore.getState().timelineContext
+    const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
     selectedRoomIds.forEach(rid => {
+      if (status === 'ready' && ctx?.room_snapshots[rid]) {
+        mseSeek(rid, Math.max(0, commonToPreview(ctx, rid, time)))
+        return
+      }
       const room = rooms.find(r => r.room_id === rid)
       const offset = room?.content_offset ?? 0
-      mseSeek(rid, time - offset)
+      mseSeek(rid, Math.max(0, time - offset))
     })
   }, [selectedRoomIds, mseSeek, rooms])
-
-  // 设置入点
-  const handleMarkIn = useCallback((roomId: string) => {
-    const time = getPreviewCurrentTime(roomId)
-    console.log('[Workbench] 用户操作: 设置入点, roomId:', roomId, 'time:', time.toFixed(2))
-    send('set_mark_in', { room_id: roomId, time, live: true })
-  }, [send, getPreviewCurrentTime])
-
-  // 设置出点
-  const handleMarkOut = useCallback((roomId: string) => {
-    const time = getPreviewCurrentTime(roomId)
-    console.log('[Workbench] 用户操作: 设置出点, roomId:', roomId, 'time:', time.toFixed(2))
-    send('set_mark_out', { room_id: roomId, time, live: true })
-  }, [send, getPreviewCurrentTime])
 
   // 添加到切片列表
   const handleAddClip = useCallback((roomId: string) => {
@@ -857,25 +1034,101 @@ export default function Workbench() {
 
   const handleControlMarkIn = useCallback(() => {
     console.log('[Workbench] 用户操作: 控制栏设置入点, 房间数:', selectedRoomIds.size)
+    const ctx = useAppStore.getState().timelineContext
+    const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
+    if (status === 'ready' && ctx) {
+      const refId = pickReferenceRoomId(ctx, selectedRoomIds, selectedRoomId)
+      if (!refId) return
+      const commonT = previewToCommon(ctx, refId, getPreviewCurrentTime(refId))
+      setCommonMarkIn(commonT)
+      selectedRoomIds.forEach(rid => {
+        if (!ctx.room_snapshots[rid]) return
+        const local = commonToPreview(ctx, rid, commonT)
+        send('set_mark_in', { room_id: rid, time: local, live: true })
+      })
+      return
+    }
     selectedRoomIds.forEach(rid => {
       const time = getPreviewCurrentTime(rid)
-      send('set_mark_in', { room_id: rid, time })
+      send('set_mark_in', { room_id: rid, time, live: true })
     })
-  }, [selectedRoomIds, send, getPreviewCurrentTime])
+  }, [selectedRoomIds, send, getPreviewCurrentTime, selectedRoomId])
 
   const handleControlMarkOut = useCallback(() => {
     console.log('[Workbench] 用户操作: 控制栏设置出点, 房间数:', selectedRoomIds.size)
+    const ctx = useAppStore.getState().timelineContext
+    const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
+    if (status === 'ready' && ctx) {
+      const refId = pickReferenceRoomId(ctx, selectedRoomIds, selectedRoomId)
+      if (!refId) return
+      const commonT = previewToCommon(ctx, refId, getPreviewCurrentTime(refId))
+      setCommonMarkOut(commonT)
+      selectedRoomIds.forEach(rid => {
+        if (!ctx.room_snapshots[rid]) return
+        const local = commonToPreview(ctx, rid, commonT)
+        send('set_mark_out', { room_id: rid, time: local, live: true })
+      })
+      return
+    }
     selectedRoomIds.forEach(rid => {
       const time = getPreviewCurrentTime(rid)
-      send('set_mark_out', { room_id: rid, time })
+      send('set_mark_out', { room_id: rid, time, live: true })
     })
-  }, [selectedRoomIds, send, getPreviewCurrentTime])
+  }, [selectedRoomIds, send, getPreviewCurrentTime, selectedRoomId])
 
-  const handleControlAddClip = useCallback(() => {
+  const handleControlAddClip = useCallback(async () => {
     if (selectedRoomIds.size === 0) return
+    const ctx = useAppStore.getState().timelineContext
+    const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
+    if (status === 'ready' && ctx && commonMarkIn != null && commonMarkOut != null && commonMarkIn < commonMarkOut) {
+      const targetIds = [...selectedRoomIds].filter(rid => {
+        const room = useAppStore.getState().rooms.find(r => r.room_id === rid)
+        return !!room?.record_output_path && !!ctx.room_snapshots[rid]
+      })
+      if (targetIds.length === 0) {
+        message.warning('请先开始录制后再添加切片')
+        return
+      }
+      try {
+        const res = await sendRequest({ send, on }, 'create_clip_snapshot', {
+          timeline_id: ctx.timeline_id,
+          common_start: commonMarkIn,
+          common_end: commonMarkOut,
+          target_room_ids: targetIds,
+          source: 'manual',
+        }) as { success?: boolean; clips?: Array<{ clip_id: string; room_id: string; common_start: number; common_end: number }>; error?: string; failed_room?: string }
+        if (!res?.success || !res.clips?.length) {
+          message.error(res?.error === 'RANGE_UNAVAILABLE'
+            ? `时间范围不可用: ${res.failed_room ?? ''}`
+            : (res?.error || '创建切片失败'))
+          return
+        }
+        const store = useAppStore.getState()
+        res.clips.forEach((c, i) => {
+          const room = store.rooms.find(r => r.room_id === c.room_id)
+          addClip({
+            start: c.common_start,
+            end: c.common_end,
+            common_start: c.common_start,
+            common_end: c.common_end,
+            label: `${room?.streamer_name ?? c.room_id} - 片段 ${store.clips.length + i + 1}`,
+            room_id: c.room_id,
+            clip_id: c.clip_id,
+            clip_snapshot_id: c.clip_id,
+            timeline_id: ctx.timeline_id,
+            mark_precision: 'exact',
+          })
+        })
+        message.success(`已添加 ${res.clips.length} 个切片（公共轴精确）`)
+      } catch (err) {
+        console.error('[Workbench] create_clip_snapshot 失败:', err)
+        message.error('创建切片失败')
+      }
+      return
+    }
     console.log('[Workbench] 用户操作: 控制栏添加切片, 房间数:', selectedRoomIds.size)
     selectedRoomIds.forEach(rid => handleAddClip(rid))
-  }, [selectedRoomIds, handleAddClip])
+  }, [selectedRoomIds, handleAddClip, addClip, commonMarkIn, commonMarkOut, send, on])
 
   const handleGoLive = useCallback(() => {
     console.log('[Workbench] 用户操作: 跳转到直播最新位置, 房间数:', selectedRoomIds.size)
@@ -928,6 +1181,12 @@ export default function Workbench() {
         console.warn('[Workbench] 音频对齐失败:', data?.error)
         message.warning('未精确对齐：已仅做预览缓冲区对齐，导出可能不同步')
         return
+      }
+      if (data.timeline) {
+        setTimelineContext(data.timeline)
+        setTimelineInvalidated(false)
+        setCommonMarkIn(null)
+        setCommonMarkOut(null)
       }
       const offsets = data.offsets as Record<string, number>
       const scores = (data.scores || {}) as Record<string, number>
@@ -995,7 +1254,7 @@ export default function Workbench() {
       }
     })
     return () => unsub()
-  }, [on, send])
+  }, [on, send, setTimelineContext, setTimelineInvalidated])
 
   const handleAlignLive = useCallback(async () => {
     if (selectedRoomIds.size === 0) return
@@ -1130,6 +1389,22 @@ export default function Workbench() {
 
   const handleMarkerDragEnd = useCallback((type: 'in' | 'out', time: number) => {
     console.log('[Workbench] 用户操作: 标记拖拽结束, type:', type, 'time:', time.toFixed(2))
+    const ctx = useAppStore.getState().timelineContext
+    const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
+    if (status === 'ready' && ctx) {
+      if (type === 'in') setCommonMarkIn(time)
+      else setCommonMarkOut(time)
+      selectedRoomIds.forEach(rid => {
+        if (!ctx.room_snapshots[rid]) return
+        const local = commonToPreview(ctx, rid, time)
+        send(type === 'in' ? 'set_mark_in' : 'set_mark_out', { room_id: rid, time: local, live: false })
+      })
+      if (selectedRoomIds.size > 0) {
+        const refId = pickReferenceRoomId(ctx, selectedRoomIds, selectedRoomId)
+        if (refId) mseSeek(refId, Math.max(0, commonToPreview(ctx, refId, time)))
+      }
+      return
+    }
     selectedRoomIds.forEach(rid => {
       if (type === 'in') {
         send('set_mark_in', { room_id: rid, time, live: false })
@@ -1140,12 +1415,13 @@ export default function Workbench() {
     if (selectedRoomIds.size > 0) {
       mseSeek([...selectedRoomIds][0], time)
     }
-    // 拖拽不写墙钟：近似定位，避免假精确；精确导出请用 I/O
     message.info('近似定位：拖拽标记可能偏差数秒，精确导出请用 I / O 键', 3)
-  }, [selectedRoomIds, send, mseSeek])
+  }, [selectedRoomIds, send, mseSeek, selectedRoomId])
 
   const handleDeleteMarker = useCallback((type: 'in' | 'out') => {
     console.log('[Workbench] 用户操作: 删除标记, type:', type)
+    if (type === 'in') setCommonMarkIn(null)
+    else setCommonMarkOut(null)
     selectedRoomIds.forEach(rid => {
       if (type === 'in') {
         send('set_mark_in', { room_id: rid, time: null })
@@ -1181,25 +1457,36 @@ export default function Workbench() {
       const room = store.rooms.find(r => r.room_id === clip.room_id)
       if (!room?.record_output_path) return
       const jobId = `export-${Date.now()}-${i}`
-      send('export_clip', {
-        room_id: clip.room_id,
-        start: clip.start,
-        end: clip.end,
-        label: clip.label,
-        preset_id: exportPresetId || useAppStore.getState().appSettings?.default_export_preset || '',
-        job_id: jobId,
-        source: clip.is_ai_highlight ? 'ai_highlight' : 'manual',
-        mark_in_wallclock: clip.mark_in_wallclock,
-        mark_out_wallclock: clip.mark_out_wallclock,
-        recording_start_mono: clip.recording_start_mono,
-        recording_media_start_mono: clip.recording_media_start_mono,
-        content_offset: clip.content_offset,
-        use_room_marks: false,
-      })
+      const preset = exportPresetId || useAppStore.getState().appSettings?.default_export_preset || ''
+      const snapshotJobId = clip.clip_snapshot_id ? clipSnapshotJobId(clip.clip_snapshot_id) : jobId
+      if (clip.clip_snapshot_id) {
+        send('export_clip_by_id', {
+          clip_id: clip.clip_snapshot_id,
+          label: clip.label,
+          preset_id: preset,
+          source: clip.is_ai_highlight ? 'ai_highlight' : 'manual',
+        })
+      } else {
+        send('export_clip', {
+          room_id: clip.room_id,
+          start: clip.start,
+          end: clip.end,
+          label: clip.label,
+          preset_id: preset,
+          job_id: jobId,
+          source: clip.is_ai_highlight ? 'ai_highlight' : 'manual',
+          mark_in_wallclock: clip.mark_in_wallclock,
+          mark_out_wallclock: clip.mark_out_wallclock,
+          recording_start_mono: clip.recording_start_mono,
+          recording_media_start_mono: clip.recording_media_start_mono,
+          content_offset: clip.content_offset,
+          use_room_marks: false,
+        })
+      }
       queued += 1
       store.setClips(useAppStore.getState().clips.map(c =>
         c.clip_id === clip.clip_id || (c.start === clip.start && c.end === clip.end && c.room_id === clip.room_id)
-          ? { ...c, job_id: jobId, exported: false, export_status: 'queued' as const, export_error: undefined }
+          ? { ...c, job_id: snapshotJobId, exported: false, export_status: 'queued' as const, export_error: undefined }
           : c
       ))
     })
@@ -1238,23 +1525,34 @@ export default function Workbench() {
       return
     }
     const isApproximate = isApproximateClip(previewClip)
-    const jobId = `export-${Date.now()}`
+    const jobId = previewClip.clip_snapshot_id
+      ? clipSnapshotJobId(previewClip.clip_snapshot_id)
+      : `export-${Date.now()}`
 
-    send('export_clip', {
-      room_id: previewClip.room_id,
-      start: previewClip.start,
-      end: previewClip.end,
-      label: previewClip.label,
-      preset_id: exportPresetId,
-      job_id: jobId,
-      source: previewClip.is_ai_highlight ? 'ai_highlight' : 'manual',
-      mark_in_wallclock: previewClip.mark_in_wallclock,
-      mark_out_wallclock: previewClip.mark_out_wallclock,
-      recording_start_mono: previewClip.recording_start_mono,
-      recording_media_start_mono: previewClip.recording_media_start_mono,
-      content_offset: previewClip.content_offset,
-      use_room_marks: false,
-    })
+    if (previewClip.clip_snapshot_id) {
+      send('export_clip_by_id', {
+        clip_id: previewClip.clip_snapshot_id,
+        label: previewClip.label,
+        preset_id: exportPresetId,
+        source: previewClip.is_ai_highlight ? 'ai_highlight' : 'manual',
+      })
+    } else {
+      send('export_clip', {
+        room_id: previewClip.room_id,
+        start: previewClip.start,
+        end: previewClip.end,
+        label: previewClip.label,
+        preset_id: exportPresetId,
+        job_id: jobId,
+        source: previewClip.is_ai_highlight ? 'ai_highlight' : 'manual',
+        mark_in_wallclock: previewClip.mark_in_wallclock,
+        mark_out_wallclock: previewClip.mark_out_wallclock,
+        recording_start_mono: previewClip.recording_start_mono,
+        recording_media_start_mono: previewClip.recording_media_start_mono,
+        content_offset: previewClip.content_offset,
+        use_room_marks: false,
+      })
+    }
     // 将 job_id 写入对应 clip，使 ClipList 能关联导出进度
     const store = useAppStore.getState()
     store.setClips(store.clips.map(c =>
@@ -1574,16 +1872,35 @@ export default function Workbench() {
       if (!data?.clip_id || !data?.room_id) return
       const st = useAppStore.getState()
       if (st.clips.some(c => c.clip_id === data.clip_id)) return
+      const ctx = st.timelineContext
+      const commonReady = getAlignStatus(ctx, st.timelineInvalidated) === 'ready' && !!ctx
+      let commonStart: number | undefined
+      let commonEnd: number | undefined
+      if (commonReady && ctx) {
+        try {
+          commonStart = previewToCommon(ctx, data.room_id, data.start)
+          commonEnd = previewToCommon(ctx, data.room_id, data.end)
+        } catch {
+          /* keep preview-local coords */
+        }
+      }
       st.addClip({
         start: data.start,
         end: data.end,
+        common_start: commonStart,
+        common_end: commonEnd,
         label: data.label || '高光',
         room_id: data.room_id,
         room_name: data.room_name,
         clip_id: data.clip_id,
+        clip_snapshot_id: data.clip_snapshot_id,
+        timeline_id: data.timeline_id,
         job_id: data.job_id,
         export_status: data.export_deferred ? 'pending' : 'queued',
         is_ai_highlight: true,
+        highlight_reason: data.highlight_reason ?? data.reason,
+        highlight_score: data.score,
+        mark_precision: data.clip_snapshot_id ? 'exact' : undefined,
       })
       message.success(data.export_deferred ? `已添加切片(待导出): ${data.label}` : `已添加切片: ${data.label}`)
     }))
@@ -1655,10 +1972,10 @@ export default function Workbench() {
           selectedRoomIds.forEach(rid => mseTogglePlayPause(rid))
           break
         case 'mark:in':
-          selectedRoomIds.forEach(rid => handleMarkIn(rid))
+          handleControlMarkIn()
           break
         case 'mark:out':
-          selectedRoomIds.forEach(rid => handleMarkOut(rid))
+          handleControlMarkOut()
           break
         case 'record:toggle': {
           // Iterate each selected room individually to avoid mixed-state issues
@@ -1717,7 +2034,7 @@ export default function Workbench() {
           break
       }
     },
-    [selectedRoomIds, selectedRoomId, send, rooms, clips]
+    [selectedRoomIds, selectedRoomId, send, rooms, clips, handleControlMarkIn, handleControlMarkOut, mseTogglePlayPause, handleStartRecord, handleStopRecord, handleToggleMute, handleFullscreen, handleBatchRecord, handleBatchStop, handleExportClip]
   )
 
   useKeyboardShortcuts(
@@ -1982,7 +2299,10 @@ export default function Workbench() {
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
 
           {/* 房间卡片网格 — 放大通过 CSS position:fixed 在 RoomCard 内部实现，不销毁实例 */}
-          <div style={{ flex: 1, overflow: 'auto', padding: '16px 24px' }}>
+          <div
+            className="workbench-room-scroll"
+            style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '16px 24px' }}
+          >
             {rooms.length === 0 ? (
               <Empty
                 description="暂无房间，请添加直播间地址"
@@ -2028,6 +2348,8 @@ export default function Workbench() {
             loopPreview={loopPreview}
             clips={clips}
             previewPos={previewPositions[selectedRoom?.room_id ?? ''] ?? 0}
+            alignStatus={alignStatus}
+            timelineView={timelineView}
             onSeek={handleTimelineSeek}
             onPlayPause={handleControlPlayPause}
             onSeekBack={handleControlSeekBack}
@@ -2039,8 +2361,13 @@ export default function Workbench() {
             onGoLive={handleGoLive}
             zoomLevel={timelineZoom}
             onZoomChange={setTimelineZoom}
-            onMarkerDragEnd={handleMarkerDragEnd}
+            onMarkerDrag={handleMarkerDragEnd}
             onDeleteMarker={handleDeleteMarker}
+            onHighlightClick={(h) => {
+              setCommonMarkIn(h.start)
+              setCommonMarkOut(h.end)
+              handleTimelineSeek(h.start)
+            }}
           />
         </div>
 

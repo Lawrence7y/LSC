@@ -1,0 +1,22 @@
+/* 房间区域右侧滚动条 */
+.workbench-room-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-400, #8e8e93) transparent;
+}
+
+.workbench-room-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.workbench-room-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.workbench-room-scroll::-webkit-scrollbar-thumb {
+  background: rgba(142, 142, 147, 0.45);
+  border-radius: 4px;
+}
+
+.workbench-room-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(142, 142, 147, 0.7);
+}

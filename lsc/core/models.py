@@ -114,6 +114,94 @@ class Clip:
     # 符号约定: 正数表示当前房间的音频内容相对于参考音频"延后"，
     # 导出时会调整 clip 的时间戳以对齐多房间内容。
     # 典型场景: 多房间同步剪辑时，通过 cross-correlation 计算得到
+    score_breakdown: dict = field(default_factory=dict)  # 各维度评分明细，如 {"speech": 0.9, "visual": 0.7, "scene": 0.5}
+    highlight_reason: str = ""  # 高光原因描述（如 "语音情绪激动 + 画面剧烈变化"）
+    transcript: str = ""  # 该片段对应的语音转录文本
+
+
+@dataclass(slots=True)
+class RoomTimeSnapshot:
+    """单个房间在 TimelineContext 提交时的时间快照。
+
+    记录房间在某一时刻的时间轴参数，用于双向时间转换。
+    common = preview_local + preview_to_common_delta
+    common = recording_local + recording_to_common_delta
+    """
+    room_id: str
+    preview_epoch_id: str = ""
+    recording_id: str = ""
+    preview_to_common_delta: float = 0.0
+    recording_to_common_delta: float = 0.0
+    align_confidence: float = 0.0
+    media_start_mono: float = 0.0
+
+
+@dataclass(slots=True)
+class TimelineContext:
+    """公共时间模型 — 所有播放头、seek、mark、loop 和切片的时间基准。
+
+    通过双向转换将不同房间的时间轴统一到同一 common 时间轴上：
+    - common = preview_local + preview_to_common_delta
+    - common = recording_local + recording_to_common_delta
+
+    纯内存对象，不跨重启持久化。
+    """
+    timeline_id: str
+    reference_room_id: str
+    preview_ready: bool = False
+    clip_ready: bool = False
+    created_at: float = 0.0
+    room_snapshots: dict[str, RoomTimeSnapshot] = field(default_factory=dict)
+
+    def common_to_preview(self, room_id: str, common_time: float) -> float:
+        """从公共时间转换到预览时间。"""
+        snap = self.room_snapshots.get(room_id)
+        if snap is None:
+            raise KeyError(f"Room {room_id} not in timeline {self.timeline_id}")
+        return common_time - snap.preview_to_common_delta
+
+    def preview_to_common(self, room_id: str, preview_time: float) -> float:
+        """从预览时间转换到公共时间。"""
+        snap = self.room_snapshots.get(room_id)
+        if snap is None:
+            raise KeyError(f"Room {room_id} not in timeline {self.timeline_id}")
+        return preview_time + snap.preview_to_common_delta
+
+    def common_to_recording(self, room_id: str, common_time: float) -> float:
+        """从公共时间转换到录制文件时间。"""
+        snap = self.room_snapshots.get(room_id)
+        if snap is None:
+            raise KeyError(f"Room {room_id} not in timeline {self.timeline_id}")
+        return common_time - snap.recording_to_common_delta
+
+    def recording_to_common(self, room_id: str, recording_time: float) -> float:
+        """从录制文件时间转换到公共时间。"""
+        snap = self.room_snapshots.get(room_id)
+        if snap is None:
+            raise KeyError(f"Room {room_id} not in timeline {self.timeline_id}")
+        return recording_time + snap.recording_to_common_delta
+
+
+@dataclass(slots=True, frozen=True)
+class ClipSnapshot:
+    """不可变的切片快照 — 后端冻结的录制文件坐标。
+
+    start/end 是录制文件中的物理位置，一经创建不可修改。
+    通过 recording_id 绑定到特定录制文件版本。
+    """
+    clip_id: str
+    clip_group_id: str
+    timeline_id: str
+    recording_id: str
+    common_start: float
+    common_end: float
+    room_id: str
+    source: str = ""
+    source_highlight_id: str = ""
+    output_path: str = ""
+    thumbnail_path: str = ""
+    exported: bool = False
+    error: str = ""
 
 
 @dataclass(slots=True)

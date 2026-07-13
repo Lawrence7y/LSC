@@ -13,9 +13,21 @@ import {
   ZoomOutOutlined,
   CompressOutlined,
 } from '@ant-design/icons'
-import { RoomSession, ClipSegment } from '@/types'
+import { RoomSession, ClipSegment, TimelineHighlightBand } from '@/types'
+import type { TimelineAlignStatus } from '@/utils/timelineCoords'
 import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
+
+export interface TimelineViewModel {
+  duration: number
+  currentTime: number
+  windowStart: number
+  markIn: number | null
+  markOut: number | null
+  clips: { start: number; end: number; color?: string }[]
+  highlights?: TimelineHighlightBand[]
+  waveformPeaks?: number[]
+}
 
 interface ControlBarProps {
   room: RoomSession | undefined
@@ -23,6 +35,8 @@ interface ControlBarProps {
   loopPreview?: boolean
   clips?: ClipSegment[]
   previewPos?: number
+  alignStatus?: TimelineAlignStatus
+  timelineView?: TimelineViewModel | null
   onSeek: (time: number) => void
   onPlayPause: () => void
   onSeekBack: () => void
@@ -36,6 +50,7 @@ interface ControlBarProps {
   onZoomChange?: (zoom: number) => void
   onMarkerDrag?: (type: 'in' | 'out', time: number) => void
   onDeleteMarker?: (type: 'in' | 'out') => void
+  onHighlightClick?: (highlight: TimelineHighlightBand) => void
 }
 
 /**
@@ -60,6 +75,9 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (prev.onGoLive !== next.onGoLive) return false
   if (prev.onMarkerDrag !== next.onMarkerDrag) return false
   if (prev.onDeleteMarker !== next.onDeleteMarker) return false
+  if (prev.alignStatus !== next.alignStatus) return false
+  if (prev.timelineView !== next.timelineView) return false
+  if (prev.onHighlightClick !== next.onHighlightClick) return false
 
   const a = prev.room
   const b = next.room
@@ -96,6 +114,9 @@ export const ControlBar = memo(function ControlBar({
   onZoomChange,
   onMarkerDrag,
   onDeleteMarker,
+  alignStatus = 'local',
+  timelineView = null,
+  onHighlightClick,
 }: ControlBarProps) {
   // 录制中时每秒刷新一次时间显示，非录制时不触发
   const [tick, setTick] = useState(0)
@@ -105,10 +126,13 @@ export const ControlBar = memo(function ControlBar({
     return () => clearInterval(id)
   }, [room?.is_recording])
 
-  const hasSelection = useMemo(() =>
-    room?.mark_in !== null && room?.mark_out !== null && room?.mark_in !== undefined && room?.mark_out !== undefined
-    && room.mark_in < room.mark_out
-  , [room?.mark_in, room?.mark_out])
+  const hasSelection = useMemo(() => {
+    if (timelineView) {
+      return timelineView.markIn != null && timelineView.markOut != null && timelineView.markIn < timelineView.markOut
+    }
+    return room?.mark_in !== null && room?.mark_out !== null && room?.mark_in !== undefined && room?.mark_out !== undefined
+      && room.mark_in < room.mark_out
+  }, [timelineView, room?.mark_in, room?.mark_out])
 
   const hasRecordingFile = !!room?.record_output_path
   const canAddClip = hasSelection && hasRecordingFile
@@ -117,9 +141,8 @@ export const ControlBar = memo(function ControlBar({
   const isPlaying = room ? (room.preview_enabled && !room.preview_paused) : false
   const isDisabled = !room && (multiSelectCount ?? 0) === 0
 
-  // 时间线总时长：默认4小时窗口，录制超过4小时后自动滚动
   const TIMELINE_WINDOW = 14400 // 4 小时
-  const { duration, currentTime, windowStart } = useMemo(() => {
+  const localTimeline = useMemo(() => {
     let dur = TIMELINE_WINDOW
     let cur = 0
     let elapsed = 0
@@ -129,14 +152,12 @@ export const ControlBar = memo(function ControlBar({
     if (room?.is_recording && room?.record_started_at) {
       elapsed = Math.max(elapsed, (Date.now() - new Date(room.record_started_at).getTime()) / 1000)
     }
-    // 录制时长超过窗口时，自动滚动窗口跟随播放头
     let ws = 0
     if (elapsed > TIMELINE_WINDOW) {
       ws = elapsed - TIMELINE_WINDOW
     } else {
       dur = Math.max(TIMELINE_WINDOW, elapsed)
     }
-    // 优先使用 MSE player 实际播放位置，回退到入点
     if (previewPos > 0) {
       cur = previewPos
     } else if (room?.mark_in !== null && room?.mark_in !== undefined && room.mark_in > 0) {
@@ -145,11 +166,45 @@ export const ControlBar = memo(function ControlBar({
     return { duration: dur, currentTime: cur, windowStart: ws }
   }, [room?.mark_out, room?.is_recording, room?.record_started_at, room?.mark_in, previewPos, tick])
 
-  const roomClips = useMemo(() =>
-    clips
+  const { duration, currentTime, windowStart } = timelineView ?? localTimeline
+
+  const displayMarkIn = timelineView
+    ? (timelineView.markIn != null ? Math.max(0, timelineView.markIn - windowStart) : null)
+    : (room?.mark_in != null ? Math.max(0, room.mark_in - windowStart) : null)
+  const displayMarkOut = timelineView
+    ? (timelineView.markOut != null ? Math.max(0, timelineView.markOut - windowStart) : null)
+    : (room?.mark_out != null ? Math.max(0, room.mark_out - windowStart) : null)
+  const displayCurrent = timelineView
+    ? Math.max(0, timelineView.currentTime - windowStart)
+    : Math.max(0, currentTime - windowStart)
+
+  const roomClips = useMemo(() => {
+    if (timelineView) {
+      return timelineView.clips.map(c => ({
+        start: Math.max(0, c.start - windowStart),
+        end: Math.max(0, c.end - windowStart),
+        color: c.color,
+      }))
+    }
+    return clips
       .filter(c => c.room_id === room?.room_id && c.end > c.start)
-      .map(c => ({ start: c.start, end: c.end }))
-  , [clips, room?.room_id])
+      .map(c => ({ start: Math.max(0, c.start - windowStart), end: Math.max(0, c.end - windowStart) }))
+  }, [timelineView, clips, room?.room_id, windowStart])
+
+  const timelineHighlights = useMemo(() => {
+    if (!timelineView?.highlights) return []
+    return timelineView.highlights.map(h => ({
+      ...h,
+      start: Math.max(0, h.start - windowStart),
+      end: Math.max(0, h.end - windowStart),
+    }))
+  }, [timelineView?.highlights, windowStart])
+
+  const alignBadge = alignStatus === 'ready'
+    ? { text: '公共轴已就绪', color: 'var(--state-success-dark, #30d158)', bg: 'rgba(48, 209, 88, 0.12)' }
+    : alignStatus === 'invalidated'
+      ? { text: '公共轴已失效 · 请重新对齐', color: 'var(--state-warning-dark, #ff9f0a)', bg: 'rgba(255, 159, 10, 0.12)' }
+      : { text: '未对齐 · 本地时间', color: 'var(--text-tertiary)', bg: 'rgba(142, 142, 147, 0.12)' }
 
   return (
     <div style={{
@@ -159,33 +214,57 @@ export const ControlBar = memo(function ControlBar({
       display: 'flex',
       flexDirection: 'column',
       gap: 12,
+      flexShrink: 0,
     }}>
-      {/* 时间线 */}
-      {/* Multi-select indicator — "已选中" (blue) instead of "已同步" (orange) */}
-      {multiSelectCount > 0 && (
+      {/* 对齐状态 + 多选提示 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: -4 }}>
         <div style={{
-          display: 'flex',
+          display: 'inline-flex',
           alignItems: 'center',
-          gap: 8,
-          padding: '4px 12px',
-          background: 'rgba(0, 122, 255, 0.06)',
+          gap: 6,
+          padding: '4px 10px',
+          background: alignBadge.bg,
           borderRadius: 6,
           fontSize: 12,
-          color: 'var(--accent-primary)',
+          color: alignBadge.color,
           fontWeight: 500,
-          marginBottom: -4,
         }}>
-          <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-primary)' }} />
-          {multiSelectCount} 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效
+          <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: alignBadge.color }} />
+          {alignBadge.text}
         </div>
-      )}
+        {multiSelectCount > 0 && (
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '4px 12px',
+            background: 'rgba(0, 122, 255, 0.06)',
+            borderRadius: 6,
+            fontSize: 12,
+            color: 'var(--accent-primary)',
+            fontWeight: 500,
+          }}>
+            <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-primary)' }} />
+            {multiSelectCount} 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效
+          </div>
+        )}
+      </div>
       <Timeline
         duration={duration}
-        currentTime={Math.max(0, currentTime - windowStart)}
-        markIn={room?.mark_in != null ? Math.max(0, room.mark_in - windowStart) : null}
-        markOut={room?.mark_out != null ? Math.max(0, room.mark_out - windowStart) : null}
-        buffered={Math.max(0, currentTime - windowStart)}
-        clips={roomClips.map(c => ({ start: Math.max(0, c.start - windowStart), end: Math.max(0, c.end - windowStart) }))}
+        currentTime={displayCurrent}
+        markIn={displayMarkIn}
+        markOut={displayMarkOut}
+        buffered={displayCurrent}
+        clips={roomClips}
+        highlights={timelineHighlights}
+        waveformPeaks={timelineView?.waveformPeaks}
+        onHighlightClick={onHighlightClick
+          ? (h) => onHighlightClick({
+            ...h,
+            start: h.start + windowStart,
+            end: h.end + windowStart,
+          })
+          : undefined}
         windowStart={windowStart}
         onSeek={onSeek}
         onMarkIn={onMarkIn}
@@ -265,7 +344,7 @@ export const ControlBar = memo(function ControlBar({
             fontSize: 14,
             color: 'var(--text-primary)',
           }}>
-            {formatTime(currentTime)}
+            {formatTime(timelineView ? timelineView.currentTime : currentTime)}
           </span>
           <span style={{ color: 'var(--text-tertiary)' }}>/</span>
           <span style={{
