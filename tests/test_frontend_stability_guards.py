@@ -382,6 +382,18 @@ def test_add_clip_snapshots_wallclock_fields() -> None:
     assert "use_room_marks: false" in confirm_export
 
 
+def test_destructive_stop_recording_paths_require_confirm() -> None:
+    """凡会停止录制的路径（断开/R 键/长按刷新）必须二次确认。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    disconnect = workbench.split("const handleDisconnect = useCallback", 1)[1].split("}, [send])", 1)[0]
+    assert "Modal.confirm" in disconnect
+    # R 键停止录制不得直接 handleStopRecord 而无确认
+    toggle = workbench.split("case 'record:toggle'", 1)[1].split("case '", 1)[0]
+    assert "Modal.confirm" in toggle or "confirmStopRecording" in toggle
+    longpress = workbench.split("const handleRefreshLongPress", 1)[1].split("}, [", 1)[0]
+    assert "Modal.confirm" in longpress
+
+
 def test_scrub_mark_surfaces_approximate_precision() -> None:
     """拖拽标记须 live:false，并在 UI/导出路径标明近似，避免假精确。"""
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")

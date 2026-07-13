@@ -41,6 +41,18 @@ function isApproximateClip(c: ClipSegment): boolean {
   )
 }
 
+/** 会停止录制的危险操作统一二次确认 */
+function confirmStopRecording(title: string, content: string, onOk: () => void) {
+  Modal.confirm({
+    title,
+    content,
+    okText: '确认',
+    okButtonProps: { danger: true },
+    cancelText: '取消',
+    onOk,
+  })
+}
+
 function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
   if (failures.length === 0) return '原因未知'
   const labels: Record<string, string> = {
@@ -463,23 +475,38 @@ export default function Workbench() {
     send('connect_room', { room_id: roomId })
   }, [send])
 
-  // 断开房间：先停止录制/预览/分析，再断开连接
+  // 断开房间：先停止录制/预览/分析，再断开连接（录制中须二次确认）
   const handleDisconnect = useCallback((roomId: string) => {
     console.log('[Workbench] 用户操作: 断开房间连接, roomId:', roomId);
+    const doDisconnect = () => {
+      const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
+      if (room?.is_recording) {
+        send('stop_recording', { room_id: roomId })
+      }
+      if (room?.preview_enabled) {
+        send('enable_preview', { room_id: roomId, enabled: false, mode: 'mse' })
+      }
+      // 如果该房间正在被持续分析，停止它
+      const continuousStatus = useAppStore.getState().continuousAnalysisStatus
+      if (continuousStatus?.running && continuousStatus.room_id === roomId) {
+        send('stop_continuous_analysis', { main_room_id: roomId })
+      }
+      // 最后断开连接
+      send('disconnect_room', { room_id: roomId })
+    }
     const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
     if (room?.is_recording) {
-      send('stop_recording', { room_id: roomId })
+      Modal.confirm({
+        title: '确认断开',
+        content: `断开将停止录制「${room.streamer_name || '未知主播'}」`,
+        okText: '确认',
+        okButtonProps: { danger: true },
+        cancelText: '取消',
+        onOk: doDisconnect,
+      })
+      return
     }
-    if (room?.preview_enabled) {
-      send('enable_preview', { room_id: roomId, enabled: false, mode: 'mse' })
-    }
-    // 如果该房间正在被持续分析，停止它
-    const continuousStatus = useAppStore.getState().continuousAnalysisStatus
-    if (continuousStatus?.running && continuousStatus.room_id === roomId) {
-      send('stop_continuous_analysis', { main_room_id: roomId })
-    }
-    // 最后断开连接
-    send('disconnect_room', { room_id: roomId })
+    doDisconnect()
   }, [send])
 
   // 切换静音（乐观写 store，与 VideoPreview 一致，避免 stale rooms_updated 打回图标）
@@ -1574,15 +1601,32 @@ export default function Workbench() {
           break
         case 'record:toggle': {
           // Iterate each selected room individually to avoid mixed-state issues
+          const toStop: string[] = []
+          const toStart: string[] = []
           selectedRoomIds.forEach(rid => {
             const r = rooms.find(r2 => r2.room_id === rid)
             if (!r) return
             if (r.is_recording) {
-              handleStopRecord(rid)
+              toStop.push(rid)
             } else if (r.is_connected) {
-              handleStartRecord(rid)
+              toStart.push(rid)
             }
           })
+          toStart.forEach(rid => handleStartRecord(rid))
+          if (toStop.length === 1) {
+            const r = rooms.find(r2 => r2.room_id === toStop[0])
+            confirmStopRecording(
+              '确认停止录制',
+              `将停止录制「${r?.streamer_name || '未知主播'}」`,
+              () => handleStopRecord(toStop[0]),
+            )
+          } else if (toStop.length > 1) {
+            confirmStopRecording(
+              '确认停止录制',
+              `将停止 ${toStop.length} 个房间的录制`,
+              () => toStop.forEach(rid => handleStopRecord(rid)),
+            )
+          }
           break
         }
         case 'mute:toggle':
@@ -1662,29 +1706,38 @@ export default function Workbench() {
   }, [send])
 
   const handleRefreshLongPress = useCallback(() => {
-    const currentRooms = useAppStore.getState().rooms
-    message.info('长按刷新全部：正在停止所有录制、预览和分析...')
-    currentRooms.forEach(r => {
-      if (r.is_recording) send('stop_recording', { room_id: r.room_id })
-      if (r.preview_enabled) send('enable_preview', { room_id: r.room_id, enabled: false, mode: 'mse' })
-    })
-    const currentAnalysisStatus = useAppStore.getState().continuousAnalysisStatus
-    if (currentAnalysisStatus?.running && currentAnalysisStatus.room_id) {
-      send('stop_continuous_analysis', { main_room_id: currentAnalysisStatus.room_id })
-    }
-    // 1.5 秒后重启连接和预览
-    setTimeout(() => {
-      send('refresh_room_status', {})
-      const freshRooms = useAppStore.getState().rooms
-      freshRooms.forEach(r => {
-        if (r.is_connected) {
-          setTimeout(() => {
-            send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
-          }, 500)
+    Modal.confirm({
+      title: '确认刷新全部',
+      content: '将停止全部房间的录制、预览与分析，然后重启预览',
+      okText: '确认',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        const currentRooms = useAppStore.getState().rooms
+        message.info('长按刷新全部：正在停止所有录制、预览和分析...')
+        currentRooms.forEach(r => {
+          if (r.is_recording) send('stop_recording', { room_id: r.room_id })
+          if (r.preview_enabled) send('enable_preview', { room_id: r.room_id, enabled: false, mode: 'mse' })
+        })
+        const currentAnalysisStatus = useAppStore.getState().continuousAnalysisStatus
+        if (currentAnalysisStatus?.running && currentAnalysisStatus.room_id) {
+          send('stop_continuous_analysis', { main_room_id: currentAnalysisStatus.room_id })
         }
-      })
-      message.success('刷新全部完成：所有房间已重启')
-    }, 1500)
+        // 1.5 秒后重启连接和预览
+        setTimeout(() => {
+          send('refresh_room_status', {})
+          const freshRooms = useAppStore.getState().rooms
+          freshRooms.forEach(r => {
+            if (r.is_connected) {
+              setTimeout(() => {
+                send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
+              }, 500)
+            }
+          })
+          message.success('刷新全部完成：所有房间已重启')
+        }, 1500)
+      },
+    })
   }, [send])
 
   return (
