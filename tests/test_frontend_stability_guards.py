@@ -228,6 +228,8 @@ def test_workbench_continuous_analysis_uses_explicit_game_modes() -> None:
     assert '<Radio.Button value="valorant_round">无畏契约回合切割</Radio.Button>' in source
     assert '<Radio.Button value="generic">通用直播</Radio.Button>' in source
     assert "setAnalysisGameType('valorant')" not in source
+    assert "interval: 20" in source
+    assert "interval: 120" not in source
 
 
 def test_workbench_sync_export_freezes_target_rooms_until_response() -> None:
@@ -239,3 +241,126 @@ def test_workbench_sync_export_freezes_target_rooms_until_response() -> None:
     response_body = source.split("on('start_analysis_export_response'", 1)[1].split("on('start_continuous_analysis_response'", 1)[0]
     assert "const targetIds = syncTargetRoomIdsRef.current" in response_body
     assert "selectedRoomIdsRef.current" not in response_body
+
+
+def test_continuous_analysis_types_expose_round_progress_and_export_status() -> None:
+    source = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
+
+    assert "recorded_duration?: number" in source
+    assert "confirmed_rounds?: number" in source
+    assert "pending_rounds?: number" in source
+    assert "analysis_stage?:" in source
+    assert "export_status?: 'queued' | 'exporting' | 'completed' | 'failed' | 'pending'" in source
+    assert "export_error?: string" in source
+
+
+def test_analysis_progress_renders_recorded_duration_round_counts_and_export_summary() -> None:
+    source = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
+
+    assert "recorded_duration" in source
+    assert "confirmed_rounds" in source
+    assert "pending_rounds" in source
+    assert "analysis_stage" in source
+    assert "export_status" in source
+
+
+def test_workbench_updates_clip_export_status_for_queue_progress_completion_and_failure() -> None:
+    source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+
+    assert "export_status: 'queued'" in source
+    assert "export_status: 'exporting'" in source
+    assert "export_status: 'completed'" in source
+    assert "export_status: 'failed'" in source
+    assert "export_error" in source
+
+
+def test_clip_list_blocks_duplicate_export_and_allows_failed_retry() -> None:
+    source = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(encoding="utf-8")
+
+    assert "clip.export_status === 'queued'" in source
+    assert "clip.export_status === 'exporting'" in source
+    assert "clip.export_status === 'failed'" in source
+    assert "export_error" in source
+    assert "一键导出" in source
+    assert "选择导出" in source
+    assert "Checkbox" in source
+
+
+def test_analysis_progress_receives_real_export_summary_counts() -> None:
+    progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+
+    assert "exportSummary" in progress
+    assert "ExportSummary" in progress
+    assert "queued" in progress and "exporting" in progress and "completed" in progress and "failed" in progress
+    assert "useMemo" in workbench
+    assert "exportSummary" in workbench
+    assert "queued" in workbench and "exporting" in workbench and "completed" in workbench and "failed" in workbench
+
+
+def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording() -> None:
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
+
+    assert "const previous = useAppStore.getState().continuousAnalysisStatus" in workbench
+    assert "{ ...previous, ...data }" in workbench
+    assert "等待新录制" in progress
+    assert "等待录制" in progress
+
+
+def test_workbench_optimistically_updates_connect_record_and_mute() -> None:
+    """房间连接/录制/静音点击必须乐观更新 store，避免等 rooms_updated 才有反馈。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    room_card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    types = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
+
+    assert "is_recording_starting" in types
+    connect_body = workbench.split("const handleConnect = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
+    assert "is_connecting: true" in connect_body
+    mute_body = workbench.split("const handleToggleMute = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
+    assert "preview_muted: newMuted" in mute_body
+    record_body = workbench.split("const handleStartRecord = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
+    assert "is_recording_starting: true" in record_body
+    assert "loading={!!room.is_recording_starting}" in room_card
+    assert "启动中" in room_card
+
+
+def test_room_handler_mute_awaits_before_broadcast_and_exposes_recording_starting() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    mute_body = source.split("async def handle_set_preview_muted(data):", 1)[1].split("@server.on(", 1)[0]
+    assert "bridge.call(manager.set_preview_muted" in mute_body
+    assert "bridge.submit(manager.set_preview_muted" not in mute_body
+    assert "_broadcast_rooms(force=True)" in mute_body
+    assert "'is_recording_starting': room_id in _recording_starting" in source
+    start_body = source.split("async def handle_start_recording(data):", 1)[1].split("@server.on('stop_recording')", 1)[0]
+    assert "_recording_starting.add(room_id)" in start_body
+    assert "_broadcast_rooms(force=True)" in start_body
+
+
+def test_workbench_does_not_auto_disconnect_on_missing_is_live() -> None:
+    """后端 rooms_updated 不带 is_live 时，前端不得把已连接房间自动断开。
+
+    回归：启动后首次连接成功再点录制/预览，会因 !r.is_live（undefined）误发
+    disconnect_room，房间弹回未连接；disconnectedRef 又让第二次连接看似正常。
+    """
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    room_to_dict = (
+        (ROOT / "python-backend/handlers/room_handler.py")
+        .read_text(encoding="utf-8")
+        .split("def _room_to_dict(", 1)[1]
+        .split("\ndef ", 1)[0]
+    )
+
+    assert "disconnectedRef" not in workbench
+    assert "if (!r.is_live && (r.is_connected || r.is_recording || r.preview_enabled))" not in workbench
+    # 当前后端未序列化 is_live；若以后补上并做自动断连，须用 === false 而非 !is_live
+    assert "'is_live'" not in room_to_dict
+
+
+def test_add_clip_snapshots_wallclock_fields() -> None:
+    """切片入队时必须快照墙钟字段，避免导出时被房间当前 mark 覆盖。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    body = workbench.split("const handleAddClip = useCallback", 1)[1].split("}, [addClip])", 1)[0]
+    assert "mark_in_wallclock" in body
+    assert "recording_start_mono" in body
+

@@ -9,6 +9,8 @@ export interface RoomSession {
   is_connecting: boolean
   is_connected: boolean
   is_recording: boolean
+  /** 录制启动中（刷新流地址 / 启动 FFmpeg），用于按钮即时 loading */
+  is_recording_starting?: boolean
   is_reconnecting?: boolean
   record_output_path: string
   record_started_at: string | null
@@ -23,6 +25,7 @@ export interface RoomSession {
   mark_in_wallclock?: number | null
   mark_out_wallclock?: number | null
   recording_start_mono?: number | null
+  recording_media_start_mono?: number | null
   preview_latency?: number
   /** 音频互相关偏移量（秒），表示该房间内容相对于最慢参考房间的时间差。
    *
@@ -39,8 +42,13 @@ export interface RoomSession {
   mse_error?: string
   // MSE 预览自动重连状态（后端流断开后自动重试时设置）
   mse_reconnecting?: { attempt: number; maxAttempts: number }
+  // 直播是否在线（false 表示断联）
+  is_live?: boolean
+  // 当前预览画质
+  preview_quality?: string
   // 直播分区分类
   category?: string
+  align_group_id?: string
 }
 
 // 切片相关
@@ -49,11 +57,22 @@ export interface ClipSegment {
   end: number
   label: string
   thumbnail_path?: string
-  room_id?: string
+  room_id?: string | null
   room_name?: string
   exported?: boolean
+  export_status?: 'queued' | 'exporting' | 'completed' | 'failed' | 'pending'
+  export_error?: string
   outputPath?: string
   job_id?: string
+  clip_id?: string
+  is_ai_highlight?: boolean
+  /** 入队时快照的墙钟入点（time.monotonic），导出时优先于房间当前 mark */
+  mark_in_wallclock?: number | null
+  mark_out_wallclock?: number | null
+  recording_start_mono?: number | null
+  recording_media_start_mono?: number | null
+  /** exact = 入队时有完整墙钟；approximate = 仅有 start/end（如拖拽标记） */
+  mark_precision?: 'exact' | 'approximate'
 }
 
 // 流信息
@@ -81,6 +100,9 @@ export interface RecordSettings {
   audio_bitrate: string
   preview_quality: string
   preset?: string
+  analysis_settings?: {
+    absolute_threshold: number
+  }
 }
 
 // 导出预设
@@ -133,8 +155,12 @@ export interface ElectronAPI {
   setTrayState?: (state: 'idle' | 'recording' | 'error') => Promise<void>
   getBackendError?: () => Promise<string | null>
   onBackendError?: (callback: (error: string) => void) => void
+  removeBackendErrorListeners?: () => void
   readLogFile?: (opts: { file: string; lines?: number }) => Promise<{ success: boolean; content: string; path?: string; error?: string; size?: number }>
   openLogFolder?: () => Promise<{ success: boolean; error?: string }>
+
+  // 退出清理：主进程通知渲染进程清理所有房间
+  onCleanupAllRooms?: (callback: () => void) => () => void
 }
 
 // 依赖检测状态
@@ -167,6 +193,39 @@ export interface AppSettings {
   language: 'zh-CN' | 'zh-TW' | 'en'
   autoLaunch: boolean
   minimizeToTray: boolean
+  default_export_preset: string
+}
+
+export interface TimelineContext {
+  timeline_id: string
+  main_room_id?: string
+  target_room_ids?: string[]
+  [key: string]: unknown
+}
+
+export interface ContinuousAnalysisStatus {
+  running: boolean
+  room_id?: string | null
+  target_room_ids?: string[]
+  mode?: string
+  analyzed_duration?: number
+  recorded_duration?: number
+  confirmed_rounds?: number
+  pending_rounds?: number
+  analysis_stage?: string
+  total_highlights?: number
+  phase?: 'idle' | 'running' | 'finalizing' | 'completed' | 'error'
+  updated_at?: number
+  scan_mode?: 'full' | 'incremental'
+  scan_phase?: 'full' | 'incremental'
+  scan_reason?: string
+  scan_range?: [number, number]
+  scan_timeout?: number
+  full_rescan?: boolean
+  refine_with_ocr?: boolean
+  effective_interval?: number
+  progress?: number
+  error?: string
 }
 
 // 主进程暴露的应用 API（与 electron/preload.ts 保持一致）
