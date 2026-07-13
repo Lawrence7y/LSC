@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { RoomSession, ClipSegment, RecordSettings, AppSettings, DependencyStatus, SystemStats } from '@/types'
+import { RoomSession, ClipSegment, RecordSettings, AppSettings, DependencyStatus, SystemStats, TimelineContext, ContinuousAnalysisStatus } from '@/types'
 
 export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'reconnect_failed'
 
@@ -7,6 +7,18 @@ export interface DiskUsage {
   total: number
   used: number
   free: number
+}
+
+export interface PreviewDegradationInfo {
+  width: number
+  height: number
+  reason?: string
+}
+
+export interface PreviewDegradationBanner {
+  width: number
+  height: number
+  reason?: string
 }
 
 interface AppState {
@@ -21,6 +33,10 @@ interface AppState {
   systemStats: SystemStats | null
   exportProgress: { job_id: string; percent: number } | null
   dependencyStatus: DependencyStatus | null
+  timelineContext: TimelineContext | null
+  continuousAnalysisStatus: ContinuousAnalysisStatus | null
+  settingsDrawerOpen: boolean
+  previewDegradationBanner: PreviewDegradationBanner | null
 }
 
 interface AppActions {
@@ -40,6 +56,11 @@ interface AppActions {
   setSystemStats: (stats: SystemStats | null) => void
   setExportProgress: (progress: { job_id: string; percent: number } | null) => void
   setDependencyStatus: (status: DependencyStatus | null) => void
+  setTimelineContext: (ctx: TimelineContext | null) => void
+  setContinuousAnalysisStatus: (status: ContinuousAnalysisStatus | null) => void
+  setSettingsDrawerOpen: (open: boolean) => void
+  setPreviewDegradationBanner: (info: PreviewDegradationInfo | null) => void
+  dismissPreviewDegradationBanner: () => void
 }
 
 const defaultSettings: RecordSettings = {
@@ -56,6 +77,9 @@ const defaultSettings: RecordSettings = {
   audio_bitrate: '128k',
   preview_quality: '高清',
   preset: 'medium',
+  analysis_settings: {
+    absolute_threshold: 0.15,
+  },
 }
 
 const defaultAppSettings: AppSettings = {
@@ -63,6 +87,7 @@ const defaultAppSettings: AppSettings = {
   language: 'zh-CN',
   autoLaunch: false,
   minimizeToTray: false,
+  default_export_preset: 'douyin_vertical',
 }
 
 export const useAppStore = create<AppState & AppActions>((set) => ({
@@ -77,8 +102,15 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   systemStats: null,
   exportProgress: null,
   dependencyStatus: null,
+  timelineContext: null,
+  continuousAnalysisStatus: null,
+  settingsDrawerOpen: false,
+  previewDegradationBanner: null,
 
-  setRooms: (rooms) => set({ rooms }),
+  setRooms: (rooms) => set((state) => {
+    if (state.rooms === rooms) return state
+    return { rooms }
+  }),
 
   addRoom: (room) =>
     set((state) => ({
@@ -107,10 +139,12 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   setClips: (clips) => set({ clips }),
 
   addClip: (clip) =>
-    set((state) => ({
+    set((state) => {
+      // clip_id 去重：已存在则跳过
+      if (clip.clip_id && state.clips.some(c => c.clip_id === clip.clip_id)) return state
       // 上限 200 条，超出移除最旧
-      clips: [...state.clips, clip].slice(-200),
-    })),
+      return { clips: [...state.clips, clip].slice(-200) }
+    }),
 
   setRecentClips: (recentClips) => set({ recentClips }),
 
@@ -129,13 +163,41 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
       appSettings: { ...state.appSettings, ...s },
     })),
 
-  setConnectionStatus: (connectionStatus) => set({ connectionStatus }),
+  setConnectionStatus: (connectionStatus) => set((state) => state.connectionStatus === connectionStatus ? state : { connectionStatus }),
 
-  setDiskUsage: (diskUsage) => set({ diskUsage }),
+  setDiskUsage: (diskUsage) =>
+    set((state) => {
+      const prev = state.diskUsage
+      if (prev?.total === diskUsage?.total && prev?.used === diskUsage?.used && prev?.free === diskUsage?.free) {
+        return state
+      }
+      return { diskUsage }
+    }),
 
-  setSystemStats: (systemStats) => set({ systemStats }),
+  setSystemStats: (systemStats) =>
+    set((state) => {
+      const prev = state.systemStats
+      if (
+        prev?.cpu_percent === systemStats?.cpu_percent &&
+        prev?.memory_percent === systemStats?.memory_percent &&
+        prev?.memory_total_gb === systemStats?.memory_total_gb &&
+        prev?.memory_used_gb === systemStats?.memory_used_gb &&
+        prev?.disk_percent === systemStats?.disk_percent &&
+        prev?.disk_total_gb === systemStats?.disk_total_gb &&
+        prev?.disk_free_gb === systemStats?.disk_free_gb
+      ) {
+        return state
+      }
+      return { systemStats }
+    }),
 
   setExportProgress: (exportProgress) => set({ exportProgress }),
 
   setDependencyStatus: (dependencyStatus) => set({ dependencyStatus }),
+
+  setTimelineContext: (timelineContext) => set({ timelineContext }),
+  setContinuousAnalysisStatus: (continuousAnalysisStatus) => set({ continuousAnalysisStatus }),
+  setSettingsDrawerOpen: (open) => set({ settingsDrawerOpen: open }),
+  setPreviewDegradationBanner: (previewDegradationBanner) => set({ previewDegradationBanner }),
+  dismissPreviewDegradationBanner: () => set({ previewDegradationBanner: null }),
 }))

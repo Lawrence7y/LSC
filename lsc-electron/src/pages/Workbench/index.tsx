@@ -53,6 +53,12 @@ function confirmStopRecording(title: string, content: string, onOk: () => void) 
   })
 }
 
+function formatPreviewDegradationLabel(width: number, height: number): string {
+  if (height === 360 || height === 480 || height === 720) return `${height}p`
+  if (width > 0 && height > 0) return `${width}×${height}`
+  return '较低画质'
+}
+
 function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
   if (failures.length === 0) return '原因未知'
   const labels: Record<string, string> = {
@@ -98,6 +104,8 @@ export default function Workbench() {
   }, [connectionStatus])
   const clips = useAppStore((state) => state.clips)
   const continuousAnalysisStatus = useAppStore((state) => state.continuousAnalysisStatus)
+  const previewDegradationBanner = useAppStore((state) => state.previewDegradationBanner)
+  const dismissPreviewDegradationBanner = useAppStore((state) => state.dismissPreviewDegradationBanner)
   const setSelectedRoomId = useAppStore((state) => state.setSelectedRoomId)
   const addClip = useAppStore((state) => state.addClip)
   const setClips = useAppStore((state) => state.setClips)
@@ -1777,6 +1785,20 @@ export default function Workbench() {
           message="WebSocket 连接断开，正在重连..."
           banner
           showIcon
+        />
+      )}
+      {previewDegradationBanner && (
+        <Alert
+          type="info"
+          banner
+          showIcon
+          closable
+          onClose={dismissPreviewDegradationBanner}
+          message={`多路预览已降为 ${formatPreviewDegradationLabel(
+            previewDegradationBanner.width,
+            previewDegradationBanner.height,
+          )} 以保流畅`}
+          description={previewDegradationBanner.reason}
         />
       )}
       {/* 顶部操作栏 */}
