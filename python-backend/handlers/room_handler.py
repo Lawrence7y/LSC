@@ -2688,7 +2688,7 @@ def register_room_handlers(server, bridge):
 
             result = align_audio_map(audio_map, sample_rate, method='preview_audio')
             if not result.success:
-                return {'success': False, 'error': result.error}
+                return {'success': False, 'error': result.error, 'precision': 'buffer_only'}
 
             _align_log.info(
                 "预览音频对齐完成: reference=%s, offsets=%s, scores=%s",
@@ -2697,17 +2697,46 @@ def register_room_handlers(server, bridge):
                 {k: f"{v:.3f}" for k, v in result.correlation_scores.items()},
             )
 
-            # 写入 content_offset 和 align_group_id 到所有参与房间
+            # 仅对置信度 ≥ 0.3 的房间写入 offset/group；可信不足 2 路则不建组
+            _ALIGN_TRUST_THRESHOLD = 0.3
+            offsets = result.offsets
+            scores = result.correlation_scores
+            trusted = {
+                rid: float(offset)
+                for rid, offset in offsets.items()
+                if float(scores.get(rid, 0.0) or 0.0) >= _ALIGN_TRUST_THRESHOLD
+            }
+            if len(trusted) < 2:
+                _align_log.warning(
+                    "可信对齐房间不足 %d/2，不写入 align_group_id: trusted=%s",
+                    len(trusted),
+                    list(trusted.keys()),
+                )
+                return {
+                    'success': False,
+                    'error': '可信对齐不足，无法建立对齐组',
+                    'offsets': result.offsets,
+                    'reference_room_id': result.reference_room_id,
+                    'method': result.method,
+                    'scores': result.correlation_scores,
+                    'precision': 'buffer_only',
+                }
+
             import time as _align_time
             group_id = f"align_{int(_align_time.time())}"
-            offsets = result.offsets
 
             def _apply_alignment():
                 for rid, offset in offsets.items():
                     room = manager.get_room(rid)
-                    if room is not None:
-                        room.content_offset = float(offset)
-                        room.align_group_id = group_id
+                    if room is None:
+                        continue
+                    score = float(scores.get(rid, 0.0) or 0.0)
+                    if score < _ALIGN_TRUST_THRESHOLD:
+                        # 低置信：强制 0，不写入 align_group_id
+                        room.content_offset = 0.0
+                        continue
+                    room.content_offset = float(offset)
+                    room.align_group_id = group_id
                 return True
 
             try:

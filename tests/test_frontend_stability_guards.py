@@ -144,9 +144,15 @@ def test_shared_preview_keeps_mse_event_names() -> None:
     assert "request_mse_init" in source
 
 
+def _workbench_align_live_body(source: str) -> str:
+    return source.split("const handleAlignLive = useCallback(async () => {", 1)[1].split(
+        "  }, [selectedRoomIds, send", 1
+    )[0]
+
+
 def test_workbench_align_live_uses_longer_preview_audio_window() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    align_body = source.split("const handleAlignLive = useCallback(async () => {", 1)[1].split("  }, [selectedRoomIds, send])", 1)[0]
+    align_body = _workbench_align_live_body(source)
 
     assert "const previewAlignDuration = 8.0" in align_body
     assert "captureAudio(rid, video, previewAlignDuration)" in align_body
@@ -154,7 +160,7 @@ def test_workbench_align_live_uses_longer_preview_audio_window() -> None:
 
 def test_workbench_alignment_request_includes_preview_diagnostics() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    align_body = source.split("const handleAlignLive = useCallback(async () => {", 1)[1].split("  }, [selectedRoomIds, send])", 1)[0]
+    align_body = _workbench_align_live_body(source)
 
     assert "diagnostics:" in align_body
     assert "current_time" in align_body
@@ -165,7 +171,7 @@ def test_workbench_alignment_request_includes_preview_diagnostics() -> None:
 
 def test_workbench_alignment_request_includes_audio_capture_diagnostics() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    align_body = source.split("const handleAlignLive = useCallback(async () => {", 1)[1].split("  }, [selectedRoomIds, send])", 1)[0]
+    align_body = _workbench_align_live_body(source)
 
     assert "ready_state" in align_body
     assert "has_audio_track" in align_body
@@ -176,11 +182,37 @@ def test_workbench_alignment_request_includes_audio_capture_diagnostics() -> Non
 
 def test_workbench_alignment_shortage_message_includes_failure_summary() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    align_body = source.split("const handleAlignLive = useCallback(async () => {", 1)[1].split("  }, [selectedRoomIds, send])", 1)[0]
+    align_body = _workbench_align_live_body(source)
 
     assert "captureFailures" in align_body
     assert "formatCaptureFailureSummary" in align_body
-    assert "音频捕获不足" in align_body
+    assert "未精确对齐" in align_body
+    assert "message.success" not in align_body.split("results.length < 2", 1)[1].split("send('align_preview_audio'", 1)[0]
+
+
+def test_alignment_buffer_fallback_is_not_success() -> None:
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "未精确对齐" in workbench
+
+    # 捕获失败 / 后端失败路径：warning「未精确对齐」，禁止 message.success 宣称精确对齐
+    align_body = _workbench_align_live_body(workbench)
+    shortage = align_body.split("results.length < 2", 1)[1].split("send('align_preview_audio'", 1)[0]
+    assert "message.warning" in shortage
+    assert "未精确对齐" in shortage
+    assert "message.success" not in shortage
+
+    catch_path = align_body.split("} catch (err) {", 1)[1]
+    assert "未精确对齐" in catch_path
+    assert "message.success" not in catch_path
+
+    response_fail = workbench.split("on('align_preview_audio_response'", 1)[1].split(
+        "const offsets = data.offsets", 1
+    )[0]
+    assert "未精确对齐" in response_fail
+    assert "message.success" not in response_fail
+
+    # 自动静音 toast 须说明可手动取消
+    assert "可手动取消静音" in workbench
 
 
 def test_preview_audio_aligner_records_capture_failure_reasons() -> None:
@@ -206,15 +238,35 @@ def test_backend_alignment_handler_reads_preview_diagnostics() -> None:
     assert "pcm_base64" not in handler_body.split("diagnostics", 1)[1].split("_align_log.info", 1)[0]
 
 
+def test_low_confidence_align_does_not_write_group_for_failed_rooms() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    handler_body = source.split("@server.on('align_preview_audio')", 1)[1].split("@server.on('export_clip')", 1)[0]
+
+    assert "align_group_id" in handler_body
+    # 仅可信 offset（≥0.3）写入 group；可信不足 2 路时不写 group
+    assert "0.3" in handler_body
+    assert "trusted" in handler_body
+    assert "buffer_only" in handler_body
+    apply_body = handler_body.split("def _apply_alignment", 1)[1].split("try:", 1)[0]
+    assert "align_group_id" in apply_body
+    # 低置信房间不得写入 align_group_id（分支内跳过或清零 offset）
+    assert "content_offset = 0" in apply_body or "content_offset = 0.0" in apply_body
+
+
 def test_workbench_alignment_response_does_not_count_low_confidence_zero_offsets() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    response_body = source.split("on('align_preview_audio_response'", 1)[1].split("const scoreValues", 1)[0]
+    response_body = source.split("on('align_preview_audio_response'", 1)[1]
 
     assert "const alignmentTrustThreshold = 0.3" in response_body
     assert "score < alignmentTrustThreshold" in response_body
     assert "send('set_content_offset', { room_id: rid, offset: 0 })" in response_body
-    low_confidence_branch = response_body.split("score < alignmentTrustThreshold", 1)[1].split("if (offset < 0.05)", 1)[0]
+    low_confidence_branch = response_body.split("score < alignmentTrustThreshold", 1)[1].split(
+        "if (offset < 0.05)", 1
+    )[0]
     assert "return" in low_confidence_branch
+    # 部分成功用 warning，不得对低置信房间宣称全面精确成功
+    assert "置信度不足" in response_body
+    assert "可手动取消静音" in response_body
 
 
 def test_workbench_continuous_analysis_uses_explicit_game_modes() -> None:

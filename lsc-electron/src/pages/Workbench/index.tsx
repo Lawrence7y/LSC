@@ -895,7 +895,7 @@ export default function Workbench() {
       message.destroy('align')
       if (!data?.success || !data?.offsets) {
         console.warn('[Workbench] 音频对齐失败:', data?.error)
-        message.warning('音频对齐失败，已使用缓冲区对齐')
+        message.warning('未精确对齐：已仅做预览缓冲区对齐，导出可能不同步')
         return
       }
       const offsets = data.offsets as Record<string, number>
@@ -904,16 +904,20 @@ export default function Workbench() {
       const registry = (window as any).__msePlayers
       const alignmentTrustThreshold = 0.3
       let alignedCount = 0
+      let lowConfidenceCount = 0
       let mutedCount = 0
+      const trustedScores: number[] = []
       aligningRoomIdsRef.current.forEach(rid => {
         const offset = offsets[rid]
         if (offset === undefined) return
         const score = scores[rid] ?? 0
         if (score < alignmentTrustThreshold) {
+          lowConfidenceCount++
           send('set_content_offset', { room_id: rid, offset: 0 })
           return
         }
 
+        trustedScores.push(score)
         // 回传 content_offset 到后端（用于导出时补偿）
         send('set_content_offset', { room_id: rid, offset })
 
@@ -938,13 +942,26 @@ export default function Workbench() {
         }
       })
 
-      const scoreValues = Object.values(scores) as number[]
-      const avgScore = scoreValues.length > 0
-        ? scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length
+      const avgScore = trustedScores.length > 0
+        ? trustedScores.reduce((a, b) => a + b, 0) / trustedScores.length
         : 0
-      console.log('[Workbench] 音频对齐完成: aligned=' + alignedCount + ', avgScore=' + avgScore.toFixed(3))
-      const muteMsg = mutedCount > 0 ? `，已静音 ${mutedCount} 个快房间消除回声` : ''
-      message.success(`已精确对齐 ${alignedCount} 个直播间（置信度 ${Math.round(avgScore * 100)}%）${muteMsg}`)
+      console.log(
+        '[Workbench] 音频对齐完成: aligned=' + alignedCount
+        + ', lowConfidence=' + lowConfidenceCount
+        + ', avgScore=' + avgScore.toFixed(3),
+      )
+      const muteMsg = mutedCount > 0
+        ? `，已静音 ${mutedCount} 个快房间（可手动取消静音）`
+        : ''
+      if (lowConfidenceCount > 0) {
+        message.warning(
+          `精确对齐 ${alignedCount} 路，${lowConfidenceCount} 路置信度不足已跳过${muteMsg}`,
+        )
+      } else {
+        message.success(
+          `已精确对齐 ${alignedCount} 个直播间（置信度 ${Math.round(avgScore * 100)}%）${muteMsg}`,
+        )
+      }
     })
     return () => unsub()
   }, [on, send])
@@ -1066,8 +1083,9 @@ export default function Workbench() {
           selectedRooms: [...selectedRoomIds],
           capturedRooms: results.map(r => r.room_id),
           captureFailures,
+          failureSummary,
         })
-        message.warning(`音频捕获不足（${failureSummary}），已使用缓冲区对齐`)
+        message.warning('未精确对齐：已仅做预览缓冲区对齐，导出可能不同步')
         return
       }
       send('align_preview_audio', { rooms: results })
@@ -1075,7 +1093,7 @@ export default function Workbench() {
       setAligning(false)
       message.destroy('align')
       console.error('[Workbench] 音频对齐异常:', err)
-      message.warning('音频对齐失败，已使用缓冲区对齐')
+      message.warning('未精确对齐：已仅做预览缓冲区对齐，导出可能不同步')
     }
   }, [selectedRoomIds, send, rooms])
 
