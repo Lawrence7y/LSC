@@ -133,6 +133,9 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 | `audio_codec` | `"AAC 128k"` | 音频参数配置。 |
 | `audio_bitrate`| `"128k"` | 导出音频码率：`"96k"`、`"128k"`、`"256k"` 等。 |
 | `preview_quality`| `"高清"` | MSE 预览的转码分辨率参考预设。 |
+| `shared_ingest_enabled` | `False` | 是否启用共享进样模式（单 FFmpeg 进程同时输出录制和预览）。`True` 开启，`False` 使用独立双进程。 |
+| `shared_ingest_preview_crf` | `23` | 共享进样模式下预览流的 CRF 值（0-51），越低画质越高。默认 23。 |
+| `shared_ingest_preview_preset`| `"veryfast"` | 共享进样模式下预览流的编码预设。可选 `ultrafast`/`superfast`/`veryfast`/`faster`/`fast`/`medium` 等。 |
 
 ---
 
@@ -301,10 +304,14 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
     *   如果连续读取未检测到分片边界且累积超过 **512KB** (`_MAX_SEGMENT_BYTES`)，则强制切分，防止缓冲区溢出。
 4.  **前端消费机制**：前端通过 `mediaSourcePlayer.ts` 接收 WebSocket 消息。首帧写入 `SourceBuffer.appendBuffer(initSegment)`，后续高频追加 `mediaSegment`，当缓冲区超出时间阈值时，自动执行清理以保证预览低延迟。
 
-### 7.3 ⚠️ 关键设计约束：预览流与录制流完全独立
+### 7.3 预览流与录制流架构模式
 
-> [!IMPORTANT]
-> **预览和录制是两条完全独立的 FFmpeg 进程和独立的直播流连接，互不干扰，不共享任何管道或状态。** 这是系统最核心的设计约束之一，必须严格维护。
+系统支持两种预览/录制架构模式，通过 `LscConfig.shared_ingest_enabled` 配置开关控制：
+
+#### 7.3.1 独立双进程模式（默认，`shared_ingest_enabled=False`）
+
+> [!NOTE]
+> 默认模式下，预览和录制是两条完全独立的 FFmpeg 进程和独立的直播流连接，互不干扰。
 
 ```
 直播 CDN
@@ -317,11 +324,36 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 
 *   **录制进程**：由 `MultiRoomManager.start_recording()` 启动，输出到本地磁盘文件（MP4/FLV/MKV），使用 `-c copy` 直拷或选定硬件/软件编码器。
 *   **预览进程**：由 `_handle_mse_preview()` → `MseStreamer.start()` 启动，**独立**从直播 CDN 拉流，转码为 fMP4 并通过 stdout 管道推送到 WebSocket，**完全不涉及录制文件**。
+
+#### 7.3.2 共享进程模式（`shared_ingest_enabled=True`）
+
+> [!WARNING]
+> 开启后，预览和录制共享同一个 FFmpeg 进程。录制故障会同时导致预览中断，预览转码负载可能影响录制稳定性。预览画质由 `shared_ingest_preview_crf` 控制，与录制画质（`-c copy`）不同。
+
+```
+直播 CDN
+    │
+    └── 单个 FFmpeg 进程 (SharedRoomIngest)
+         │
+         ├── 输出1: -c copy → 录制文件（磁盘）
+         │
+         └── 输出2: libx264 -crf {shared_ingest_preview_crf} → pipe:1 → SharedPreviewHandle → WebSocket → MSE播放器
+```
+
+*   **核心实现**：`lsc/core/services/shared_ingest.py` — `SharedRoomIngest` 类，单进程双输出 FFmpeg 命令。
+*   **录制输出**：`-c copy` 直拷到磁盘文件，保证录制画质无损。
+*   **预览输出**：`libx264` 软件编码，参数由 `shared_ingest_preview_crf`（默认 23）和 `shared_ingest_preview_preset`（默认 `veryfast`）控制。
+*   **进程生命周期**：`start_recording_and_preview()` 启动双输出；`stop_recording_sink()` 停止录制后自动重启为纯预览模式；`start_preview_only()` 启动纯预览进程。
+*   **错误检测**：`_read_preview_stdout_loop` 通过 `_planned_stop` 标志区分计划内关闭和意外退出，确保预览独享模式下进程死亡也能正确触发 `mse_error` 广播。
+*   **重连优化**：`_attempt_recording_reconnect` 对共享进程走快速路径（直接终止旧进程 + 创建新进程），避免 `stop_recording_sink` → preview-only → dual-output 的双重重启链。
+
+#### 7.3.3 通用约束（两种模式均适用）
+
 *   **独立启动时机**：用户点击"开始录制"触发 `start_recording`；用户点击"预览"触发 `enable_preview {mode: "mse"}`。两者完全解耦，可以只录不看、只看不录、或同时进行。
 *   **并发上限**：
     *   预览最多 **4路**（`MAX_CONCURRENT_PREVIEWS`），≥6 路时动态降分辨率 ≤ 854×480，≥8 路时限制 ≤ 640×360。
     *   录制最多 **12路**（`MAX_CONCURRENT_RECORDINGS`），启动并发用 `asyncio.Semaphore(2)` 限制，防止多路 HTTP 刷新同时阻塞。
-*   **init 段竞态修复**：`mse_init` 消息可能早于 `rooms_updated` 到达前端（前端 VideoPreview 组件尚未挂载）。`MseStreamer` 内部缓存最近一次 init 段（`_last_init_segment`），前端挂载后主动发送 `request_mse_init`，后端通过 `replay_init()` 补发，解决竞态。
+*   **init 段竞态修复**：`mse_init` 消息可能早于 `rooms_updated` 到达前端（前端 VideoPreview 组件尚未挂载）。`SharedRoomIngest` 内部缓存最近一次 init 段（`last_init_segment`），前端挂载后主动发送 `request_mse_init`，后端通过 `replay_init()` 补发，解决竞态。
 *   **MSE 启动流程时序**：
     1.  前端发送 `enable_preview {mode: "mse"}`
     2.  后端 `_handle_mse_preview` 调用 `mgr.refresh_stream_url()` 刷新流地址（B站等平台耗时可达 10s+，在 `_recording_executor` 线程池执行，不阻塞 Qt 主线程）
@@ -719,7 +751,7 @@ Electron 应用使用 `electron-builder` 进行打包：
 | **全屏预览** | `f` | `fullscreen` |
 | **一键批量启动录制** | `Ctrl + r` | `batch:record` |
 | **一键批量停止录制** | `Ctrl + Shift + r` | `batch:stop` |
-| **多房间卡片全选** | `Ctrl + a` | `select:all` |
+| **多房间卡片全选** | `Ctrl + Shift + A` | `select:all` |
 | **触发当前导出** | `Ctrl + e` | `export:clip` |
 | **刷新页面** | `F5` | `page:reload` |
 
