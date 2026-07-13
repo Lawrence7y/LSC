@@ -53,10 +53,17 @@ function confirmStopRecording(title: string, content: string, onOk: () => void) 
   })
 }
 
-function formatPreviewDegradationLabel(width: number, height: number): string {
-  if (height === 360 || height === 480 || height === 720) return `${height}p`
-  if (width > 0 && height > 0) return `${width}×${height}`
-  return '较低画质'
+function formatPreviewDegradationLabel(width: number, height: number, fps?: number): string {
+  let label: string
+  if (height === 360 || height === 480 || height === 720) {
+    label = `${height}p`
+  } else if (width > 0 && height > 0) {
+    label = `${width}×${height}`
+  } else {
+    label = '较低画质'
+  }
+  if (fps && fps > 0) label += `@${fps}fps`
+  return label
 }
 
 function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
@@ -139,6 +146,7 @@ export default function Workbench() {
   const [aligning, setAligning] = useState(false)
   const [exportProgressMap, setExportProgressMap] = useState<Record<string, ExportProgressInfo>>({})
   const aligningRoomIdsRef = useRef<Set<string>>(new Set())
+  const alignButtonRef = useRef<HTMLButtonElement | null>(null)
   const loopTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   // 长按刷新：由 RefreshButton 组件内部管理粒子动效
   const [fullscreenRoomId, setFullscreenRoomId] = useState<string | null>(null)
@@ -1332,15 +1340,23 @@ export default function Workbench() {
   const analysisEnabled = currentTargetRoomList.length >= 1
     && targetHasRecordings
     && targetAlignGroupReady
+  const analysisNeedsAlign = currentTargetRoomList.length >= 1
+    && targetHasRecordings
+    && !targetAlignGroupReady
   const analysisTooltip = currentTargetRoomList.length < 1
     ? '请先选择要分析的房间'
     : !targetHasRecordings
       ? '选中房间需先有录制文件，请先开始录制'
       : !targetAlignGroupReady
         ? currentTargetRoomList.length > 1
-          ? '多房间分析需先点击「一键对齐」，且各房间对齐组一致'
+          ? '多房间分析需先点击「一键对齐」，且各房间对齐组一致（仅缓冲区对齐不可用于分析）'
           : '请先点击一键对齐'
         : '分析主直播间高光，按对齐偏移映射导出'
+
+  const scrollToAlignButton = useCallback(() => {
+    alignButtonRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    message.info('请点击上方「一键对齐」完成多房间同步')
+  }, [])
 
   // 分析导出确认（持续分析 / 同步分析导出 合并）
   const handleConfirmAnalysisExport = () => {
@@ -1803,6 +1819,7 @@ export default function Workbench() {
           message={`多路预览已降为 ${formatPreviewDegradationLabel(
             previewDegradationBanner.width,
             previewDegradationBanner.height,
+            previewDegradationBanner.fps,
           )} 以保流畅`}
           description={previewDegradationBanner.reason}
         />
@@ -1848,7 +1865,7 @@ export default function Workbench() {
                         return
                       }
                       if (!targetAlignGroupReady) {
-                        message.info('请先点击一键对齐')
+                        scrollToAlignButton()
                         return
                       }
                       return
@@ -1873,6 +1890,11 @@ export default function Workbench() {
                 </Button>
               </span>
             </Tooltip>
+            {analysisNeedsAlign && (
+              <Button type="link" size="small" onClick={scrollToAlignButton} style={{ padding: '0 4px' }}>
+                去对齐
+              </Button>
+            )}
           </Space>
           <Space wrap>
             <Button
@@ -1888,6 +1910,7 @@ export default function Workbench() {
               全选
             </Button>
             <Button
+              ref={alignButtonRef}
               size="small"
               icon={<SyncOutlined spin={aligning} />}
               onClick={handleAlignLive}

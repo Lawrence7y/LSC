@@ -351,6 +351,7 @@ function _attachSharedWebSocketHandlers(): () => void {
       useAppStore.getState().setPreviewDegradationBanner({
         width: data.width,
         height: data.height,
+        fps: data.fps,
         reason: data.reason,
       })
     }

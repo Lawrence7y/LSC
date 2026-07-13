@@ -55,7 +55,9 @@ def test_workbench_shows_preview_degradation_banner() -> None:
 
   assert "previewDegradationBanner" in workbench or "preview_degradation" in workbench.lower()
   assert "degraded" in websocket
+  assert "fps" in websocket
   assert "以保流畅" in workbench
+  assert "@${fps}fps" in workbench or "fps" in workbench.split("formatPreviewDegradationLabel", 1)[1][:400]
 
 
 def test_claude_select_all_shortcut_is_ctrl_shift_a() -> None:
@@ -72,3 +74,5 @@ def test_analysis_tooltip_explains_prerequisites() -> None:
   assert "请先选择" in tooltip_block
   assert "录制" in tooltip_block
   assert "一键对齐" in tooltip_block
+  assert "去对齐" in workbench
+  assert "scrollToAlignButton" in workbench

@@ -12,12 +12,14 @@ export interface DiskUsage {
 export interface PreviewDegradationInfo {
   width: number
   height: number
+  fps?: number
   reason?: string
 }
 
 export interface PreviewDegradationBanner {
   width: number
   height: number
+  fps?: number
   reason?: string
 }
 
