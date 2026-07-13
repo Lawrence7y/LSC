@@ -496,3 +496,54 @@ def test_scrub_mark_surfaces_approximate_precision() -> None:
     assert "mark_precision" in clip_list
     assert "近似" in clip_list
 
+
+def test_preview_starting_state_shows_pull_stream_message() -> None:
+    """预览已启用但尚未出画时，应显示拉流/转码等待文案。"""
+    video_preview = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    assert "正在拉流/转码" in video_preview
+
+
+def test_douyin_cookie_error_shows_settings_guidance() -> None:
+    """抖音 Cookie/验证页类错误应在房间卡片引导去设置。"""
+    room_card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    assert "去设置" in room_card
+    assert "Cookie" in room_card or "抖音" in room_card
+    assert "setSettingsDrawerOpen" in room_card or "settingsDrawerOpen" in room_card
+
+
+def test_recording_queue_broadcast_before_semaphore() -> None:
+    """多路开录进入 semaphore 前应广播 recording_queue 含 position/waiting。"""
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    start_body = source.split("async def handle_start_recording(data):", 1)[1].split("@server.on('stop_recording')", 1)[0]
+    assert "recording_queue" in start_body
+    assert "position" in start_body
+    assert "waiting" in start_body
+    assert "_recording_semaphore" in start_body
+
+
+def test_room_card_distinguishes_recording_queue_states() -> None:
+    """录制启动中应区分排队中与启动 FFmpeg。"""
+    room_card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    types = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
+    assert "排队中" in room_card
+    assert "启动中" in room_card
+    assert "recording_queue_position" in types or "is_recording_queued" in types
+
+
+def test_shared_ingest_risk_warning_in_settings() -> None:
+    """设置页共享进样开关旁须有风险说明，且不改后端默认。"""
+    settings = (ROOT / "lsc-electron/src/pages/Settings/index.tsx").read_text(encoding="utf-8")
+    assert "shared_ingest_enabled" in settings
+    assert "录制中断会导致预览中断" in settings or "预览与录制共用同一进程" in settings
+
+
+def test_add_clip_requires_recording_file() -> None:
+    """未录制（无 record_output_path）时不得添加切片。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    control_bar = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
+    body = workbench.split("const handleAddClip = useCallback", 1)[1].split("}, [addClip])", 1)[0]
+    assert "record_output_path" in body
+    assert "请先开始录制后再添加切片" in workbench
+    assert "record_output_path" in control_bar
+    assert "请先开始录制" in control_bar
+

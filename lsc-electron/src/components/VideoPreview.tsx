@@ -90,12 +90,15 @@ export function VideoPreview({
 
   // S6: 重试 loading 状态，防止用户连续点击
   const [retrying, setRetrying] = useState(false)
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const handleRetry = useCallback(() => {
     if (retrying) return
     setRetrying(true)
     stopAndNotify()
-    // 3 秒后自动恢复按钮（允许用户再次尝试）
-    setTimeout(() => setRetrying(false), 3000)
+    retryTimerRef.current = setTimeout(() => {
+      retryTimerRef.current = null
+      setRetrying(false)
+    }, 3000)
   }, [retrying, stopAndNotify])
 
   // Feed init segment to player
@@ -186,6 +189,16 @@ export function VideoPreview({
             gain.connect(ctx.destination)
             audioSourceRef.current = source
             gainNodeRef.current = gain
+            const registry = (window as any).__msePlayers || {}
+            registry[roomId] = {
+              ...(registry[roomId] || {}),
+              feedInit,
+              feedMedia,
+              player: playerRef.current,
+              audioSource: audioSourceRef.current,
+              gainNode: gainNodeRef.current,
+            }
+            ;(window as any).__msePlayers = registry
             console.log(`[VideoPreview] Web Audio routing created on sourceopen for ${roomId}`)
           } catch (e) {
             console.warn(`[VideoPreview] Failed to create Web Audio routing for ${roomId}:`, e)
@@ -232,6 +245,10 @@ export function VideoPreview({
       autoRetriedRef.current = false
       setState('idle')
       setError(null)
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
     }
   }, [active, roomId])
 
@@ -310,6 +327,7 @@ export function VideoPreview({
     if (!active || !videoRef.current) return
     const video = videoRef.current
     const handleVolumeChange = () => {
+      if ((video as any).__lscSuppressMuteSync) return
       if (video.muted !== mutedRef.current) {
         // 设置本地覆盖，立即反映到 UI
         localMutedOverrideRef.current = video.muted
@@ -324,9 +342,14 @@ export function VideoPreview({
     return () => video.removeEventListener('volumechange', handleVolumeChange)
   }, [active, roomId])
 
-  const showLoading = state === 'loading'
   const showError = state === 'error' || error
   const showIdle = state === 'idle'
+  // 预览已启用但尚未出画（拉流/转码中）
+  const showStarting =
+    active &&
+    !mseReconnecting &&
+    !showError &&
+    state !== 'playing'
 
   return (
     <div
@@ -361,8 +384,8 @@ export function VideoPreview({
         }}
       />
 
-      {/* Loading overlay */}
-      {showLoading && (
+      {/* 预览启动中：已 enable 但尚无首帧 / 未 playing */}
+      {showStarting && (
         <div
           style={{
             position: 'absolute',
@@ -373,10 +396,11 @@ export function VideoPreview({
             background: 'rgba(0, 0, 0, 0.6)',
             flexDirection: 'column',
             gap: 8,
+            zIndex: 2,
           }}
         >
           <LoadingOutlined style={{ fontSize: 24, color: 'var(--brand-500)' }} />
-          <span style={{ fontSize: 12, color: 'var(--text-300)' }}>加载中...</span>
+          <span style={{ fontSize: 12, color: 'var(--text-300)' }}>正在拉流/转码…</span>
         </div>
       )}
 
@@ -460,31 +484,7 @@ export function VideoPreview({
         </div>
       )}
 
-      {/* MSE status badge */}
-      {active && state !== 'idle' && (
-        <div
-          style={{
-            position: 'absolute',
-            top: 8,
-            right: 8,
-            padding: '2px 8px',
-            borderRadius: 4,
-            fontSize: 10,
-            fontWeight: 600,
-            background:
-              mseReconnecting
-                ? 'rgba(255, 149, 0, 0.8)'
-                : state === 'playing'
-                  ? 'rgba(52, 199, 89, 0.8)'
-                  : state === 'loading'
-                    ? 'rgba(255, 149, 0, 0.8)'
-                    : 'rgba(255, 59, 48, 0.8)',
-            color: '#fff',
-          }}
-        >
-          {mseReconnecting ? '重连中' : state === 'playing' ? 'MSE' : state === 'loading' ? '连接中' : '错误'}
-        </div>
-      )}
+
     </div>
   )
 }

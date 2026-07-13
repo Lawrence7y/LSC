@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, memo } from 'react'
+import { useState, useEffect, useMemo, memo, useRef } from 'react'
 import { Card, Space, Button, Tooltip, Modal, Select } from 'antd'
 import {
   PlayCircleOutlined,
@@ -17,13 +17,26 @@ import { VideoPreview } from '@/components/VideoPreview'
 import { formatTime } from '@/utils/time'
 import { useAppStore } from '@/store/appStore'
 
-// 预览画质选项（值与后端 _PREVIEW_QUALITY_PRESETS 及 Settings 页面一致）
-const PREVIEW_QUALITY_OPTIONS = [
-  { value: '原画', label: '原画' },
-  { value: '高清', label: '高清' },
-  { value: '标清', label: '标清' },
-  { value: '流畅', label: '流畅' },
-]
+function openDouyinCookieSettings(e: React.MouseEvent) {
+  e.stopPropagation()
+  useAppStore.getState().setSettingsDrawerOpen(true)
+}
+
+/** 抖音缺 Cookie / 验证页类错误，引导用户去设置页配置 Cookie */
+function isDouyinCookieError(room: RoomSession): boolean {
+  const text = `${room.last_error || ''} ${room.mse_error || ''}`.toLowerCase()
+  if (!text.trim()) return false
+  const isDouyin = room.platform === 'douyin' || (room.platform_name || '').includes('抖音')
+  if (!isDouyin) return false
+  return (
+    text.includes('cookie') ||
+    text.includes('验证中间页') ||
+    text.includes('验证码') ||
+    text.includes('抖音 cookie') ||
+    text.includes('设置 → 抖音') ||
+    text.includes('设置页')
+  )
+}
 
 interface RoomCardProps {
   room: RoomSession
@@ -41,8 +54,14 @@ interface RoomCardProps {
   onFullscreen: (roomId: string) => void
   /** 点击 checkbox 切换多选状态（无需 Ctrl 键） */
   onToggleMultiSelect?: (roomId: string, e: React.MouseEvent) => void
-  /** 当前放大的 roomId（CSS 放大：VideoPreview 用 position:fixed 浮起，不销毁实例） */
+  /** 当前区域放大的 roomId */
   expandedRoomId?: string | null
+  /** 当前全屏的 roomId */
+  fullscreenRoomId?: string | null
+  /** 退出区域放大 */
+  onCollapse?: (roomId: string) => void
+  /** 退出全屏后回到区域放大 */
+  onExitFullscreen?: (roomId: string) => void
 }
 
 type RoomStatus = 'recording' | 'connected' | 'connecting' | 'failed' | 'idle'
@@ -93,6 +112,7 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
     a.is_connected === b.is_connected &&
     a.is_connecting === b.is_connecting &&
     a.is_recording === b.is_recording &&
+    a.is_recording_starting === b.is_recording_starting &&
     a.preview_enabled === b.preview_enabled &&
     a.preview_paused === b.preview_paused &&
     a.preview_muted === b.preview_muted &&
@@ -125,19 +145,37 @@ export const RoomCard = memo(function RoomCard({
   onFullscreen,
   onToggleMultiSelect,
   expandedRoomId,
+  fullscreenRoomId,
+  onCollapse,
+  onExitFullscreen,
 }: RoomCardProps) {
   const [tick, setTick] = useState(0)
   const [disconnecting, setDisconnecting] = useState(false)
-  const [previewQuality, setPreviewQuality] = useState('高清')
-  const updateRoom = useAppStore((state) => state.updateRoom)
-  // 放大状态：CSS 放大（不销毁 VideoPreview 实例）
+  const [localMuted, setLocalMuted] = useState(room.preview_muted)
+  const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 放大状态：区域放大 / 真全屏
   const isExpanded = expandedRoomId === room.room_id
+  const isFullscreen = fullscreenRoomId === room.room_id
+  const isAnyExpanded = isExpanded || isFullscreen
 
   useEffect(() => {
     if (!room.is_recording) return
     const id = setInterval(() => setTick((t) => t + 1), 1000)
     return () => clearInterval(id)
   }, [room.is_recording])
+
+  // 同步后端广播的实际静音状态（覆盖乐观更新）
+  useEffect(() => {
+    setLocalMuted(room.preview_muted)
+  }, [room.preview_muted])
+
+  useEffect(() => {
+    return () => {
+      if (disconnectTimerRef.current) {
+        clearTimeout(disconnectTimerRef.current)
+      }
+    }
+  }, [])
 
   // 注入录制指示条脉冲动画 CSS（全局共享，仅注入一次）
   useEffect(() => {
@@ -152,19 +190,6 @@ export const RoomCard = memo(function RoomCard({
       }
       .room-card-recording-bar {
         animation: roomCardPulse 1.5s ease-in-out infinite;
-      }
-      .preview-quality-select .ant-select-selector {
-        background: rgba(0,0,0,0.5) !important;
-        backdrop-filter: blur(8px);
-        border-radius: 4px !important;
-        color: #fff !important;
-        font-size: 11px !important;
-        height: 26px !important;
-        min-height: 26px !important;
-        padding: 0 6px !important;
-      }
-      .preview-quality-select .ant-select-arrow {
-        color: rgba(255,255,255,0.7) !important;
       }
     `
     document.head.appendChild(style)
@@ -209,7 +234,9 @@ export const RoomCard = memo(function RoomCard({
       <div
         style={{
           width: '100%',
-          height: 180,
+          height: isAnyExpanded ? 'auto' : 180,
+          aspectRatio: isAnyExpanded ? '16 / 9' : undefined,
+          minHeight: isAnyExpanded ? 420 : undefined,
           background: '#0a0a0a',
           borderRadius: 8,
           marginBottom: 10,
@@ -273,7 +300,7 @@ export const RoomCard = memo(function RoomCard({
                 marginBottom: 4,
               }}
             >
-              连接失败
+              {isDouyinCookieError(room) ? '需要抖音 Cookie' : '连接失败'}
             </div>
             <Tooltip title={room.last_error}>
               <div
@@ -285,11 +312,17 @@ export const RoomCard = memo(function RoomCard({
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
+                  marginBottom: isDouyinCookieError(room) ? 8 : 0,
                 }}
               >
                 {room.last_error}
               </div>
             </Tooltip>
+            {isDouyinCookieError(room) && (
+              <Button size="small" type="primary" onClick={openDouyinCookieSettings}>
+                去设置 Cookie
+              </Button>
+            )}
           </div>
         ) : !room.is_connected ? (
           <div style={{ textAlign: 'center' }}>
@@ -298,17 +331,17 @@ export const RoomCard = memo(function RoomCard({
           </div>
         ) : room.preview_enabled ? (
           <>
-            {/* VideoPreview 实例始终保持挂载，放大时通过 CSS position:fixed 浮起，
-                不销毁/重建 MsePlayer，避免缓冲区丢失和卡顿 */}
+            {/* VideoPreview 实例始终保持挂载，区域放大时铺满卡片，
+                全屏时通过 CSS position:fixed 覆盖视口，不销毁/重建 MsePlayer */}
             <div style={{ position: 'relative', width: '100%', height: '100%' }}>
               <VideoPreview
                 key={`preview-${room.room_id}`}
                 roomId={room.room_id}
                 active={true}
                 send={send}
-                controls={isExpanded}
+                controls={isExpanded || isFullscreen}
                 style={
-                  isExpanded
+                  isFullscreen
                     ? {
                         position: 'fixed',
                         inset: 0,
@@ -318,68 +351,50 @@ export const RoomCard = memo(function RoomCard({
                         background: '#000',
                         borderRadius: 0,
                       }
-                    : { width: '100%', height: '100%' }
+                    : isExpanded
+                      ? {
+                          position: 'absolute',
+                          inset: 0,
+                          zIndex: 8,
+                          width: '100%',
+                          height: '100%',
+                          background: '#000',
+                        }
+                      : { width: '100%', height: '100%' }
                 }
-                muted={room.preview_muted}
+                muted={localMuted}
               />
               {/* 放大时的退出按钮 */}
-              {isExpanded && (
+              {(isExpanded || isFullscreen) && (
                 <Button
                   icon={<CloseOutlined />}
-                  style={{ position: 'fixed', top: 12, right: 12, zIndex: 10000 }}
+                  size="small"
+                  style={{
+                    position: 'absolute',
+                    top: 12,
+                    right: 12,
+                    zIndex: 10000,
+                    background: 'rgba(0, 0, 0, 0.65)',
+                    backdropFilter: 'blur(8px)',
+                    color: '#fff',
+                    border: '1px solid rgba(255,255,255,0.15)',
+                    borderRadius: 6,
+                    boxShadow: '0 2px 12px rgba(0, 0, 0, 0.3)',
+                  }}
                   onClick={(e) => {
                     e.stopPropagation()
-                    onFullscreen(room.room_id)
+                    if (isFullscreen) {
+                      onExitFullscreen?.(room.room_id)
+                      return
+                    }
+                    onCollapse?.(room.room_id)
                   }}
                 >
-                  退出放大
+                  {isFullscreen ? '退出全屏' : '缩小'}
                 </Button>
               )}
             </div>
-            {room.mse_error && (
-              <div
-                style={{
-                  position: 'absolute',
-                  inset: 0,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  background: 'rgba(0, 0, 0, 0.75)',
-                  flexDirection: 'column',
-                  gap: 8,
-                  padding: 16,
-                  zIndex: 2,
-                }}
-              >
-                <span style={{ fontSize: 20 }}>⚠️</span>
-                <span
-                  style={{
-                    fontSize: 12,
-                    color: 'var(--state-error)',
-                    textAlign: 'center',
-                    wordBreak: 'break-all',
-                  }}
-                >
-                  {room.mse_error}
-                </span>
-                <button
-                  onClick={() => updateRoom(room.room_id, { mse_error: undefined })}
-                  style={{
-                    marginTop: 4,
-                    padding: '4px 12px',
-                    fontSize: 11,
-                    borderRadius: 4,
-                    border: 'none',
-                    background: 'rgba(255,255,255,0.15)',
-                    color: '#fff',
-                    cursor: 'pointer',
-                  }}
-                >
-                  重试
-                </button>
-              </div>
-            )}
-            {/* 底部渐变栏：画质选择 + 预览控制 */}
+                        {/* 底部渐变栏：预览控制 */}
             <div
               style={{
                 position: 'absolute',
@@ -394,34 +409,40 @@ export const RoomCard = memo(function RoomCard({
                 zIndex: 3,
               }}
             >
+              {/* 预览画质选择 */}
               <Select
                 size="small"
-                value={previewQuality}
-                onChange={(v) => {
-                  setPreviewQuality(v)
-                  send('set_preview_quality', { room_id: room.room_id, quality: v })
+                value={room.preview_quality || '高清'}
+                onChange={(val) => {
+                  // 只发 set_preview_quality，后端负责保存 + 重启预览（避免前端 disable/enable 竞态）
+                  send('set_preview_quality', { room_id: room.room_id, quality: val })
                 }}
                 onClick={(e) => e.stopPropagation()}
-                style={{ width: 88 }}
-                popupMatchSelectWidth={false}
-                options={PREVIEW_QUALITY_OPTIONS}
-                variant="borderless"
-                className="preview-quality-select"
+                getPopupContainer={() => document.body}
+                style={{ width: 88, fontSize: 11 }}
+                options={[
+                  { value: '原画', label: '原画' },
+                  { value: '高清', label: '高清 720p' },
+                  { value: '标清', label: '标清 480p' },
+                  { value: '流畅', label: '流畅 360p' },
+                ]}
               />
-              <Space size={2}>
-                <Tooltip title={room.preview_muted ? '取消静音' : '静音'}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Tooltip title={localMuted ? '取消静音' : '静音'}>
                   <Button
                     type="text"
                     size="small"
-                    icon={room.preview_muted ? <MutedOutlined /> : <SoundOutlined />}
+                    icon={localMuted ? <MutedOutlined /> : <SoundOutlined />}
                     style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 6 }}
                     onClick={(e) => {
                       e.stopPropagation()
+                      // 本地图标即时翻转；store/后端由 onToggleMute 乐观更新
+                      setLocalMuted(!localMuted)
                       onToggleMute(room.room_id)
                     }}
                   />
                 </Tooltip>
-                <Tooltip title="放大">
+                <Tooltip title={isFullscreen ? '退出全屏' : '放大'}>
                   <Button
                     type="text"
                     size="small"
@@ -433,8 +454,37 @@ export const RoomCard = memo(function RoomCard({
                     }}
                   />
                 </Tooltip>
-              </Space>
+              </div>
             </div>
+            {/* 竖向音量滑块（放大/全屏时） */}
+            {(isExpanded || isFullscreen) && (
+              <div style={{
+                position: 'absolute', right: 12, top: '50%',
+                transform: 'translateY(-50%)', zIndex: 10001,
+                display: 'flex', flexDirection: 'column',
+                alignItems: 'center', gap: 4,
+                background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)',
+                padding: '8px 4px', borderRadius: 8, pointerEvents: 'auto',
+              }}>
+                <SoundOutlined style={{ color: '#fff', fontSize: 11 }} />
+                <input type="range" min="0" max="1" step="0.05" defaultValue="1"
+                  onChange={(e) => {
+                    e.stopPropagation()
+                    const vol = parseFloat(e.target.value)
+                    const registry = (window as any).__msePlayers
+                    const video = registry?.[room.room_id]?.player?.videoElement
+                    if (video) { video.volume = vol; video.muted = vol === 0 }
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    writingMode: 'vertical-lr', direction: 'rtl',
+                    width: 4, height: 100, cursor: 'pointer', accentColor: '#007aff',
+                    WebkitAppearance: 'slider-vertical' as any,
+                  }}
+                />
+                <MutedOutlined style={{ color: '#fff', fontSize: 11, opacity: 0.5 }} />
+              </div>
+            )}
           </>
         ) : (
           <div style={{ textAlign: 'center' }}>
@@ -491,20 +541,7 @@ export const RoomCard = memo(function RoomCard({
               {statusLabels[status]}
             </span>
           </div>
-          {/* 平台标签 */}
-          <div
-            style={{
-              background: 'rgba(0,0,0,0.65)',
-              backdropFilter: 'blur(8px)',
-              padding: '3px 8px',
-              borderRadius: 6,
-              fontSize: 10,
-              color: '#fff',
-              fontWeight: 500,
-            }}
-          >
-            {room.platform_name || '未知平台'}
-          </div>
+
         </div>
       
         {/* 录制时间（右上角，始终暗色） */}
@@ -648,7 +685,7 @@ export const RoomCard = memo(function RoomCard({
               e.stopPropagation()
               Modal.confirm({
                 title: '确认停止录制',
-                content: `确定要停止房间“${room.streamer_name || '未知主播'}”的录制吗？`,
+                content: `将停止录制「${room.streamer_name || '未知主播'}」`,
                 okText: '确认停止',
                 cancelText: '取消',
                 okButtonProps: { danger: true },
@@ -669,13 +706,15 @@ export const RoomCard = memo(function RoomCard({
             type="primary"
             size="small"
             icon={<PlayCircleOutlined />}
+            loading={!!room.is_recording_starting}
+            disabled={!!room.is_recording_starting}
             onClick={(e) => {
               e.stopPropagation()
               onStartRecord(room.room_id)
             }}
             style={{ flex: 1 }}
           >
-            开始录制
+            {room.is_recording_starting ? '启动中' : '开始录制'}
           </Button>
         )}
       
@@ -692,7 +731,10 @@ export const RoomCard = memo(function RoomCard({
               try {
                 onDisconnect(room.room_id)
               } finally {
-                setTimeout(() => setDisconnecting(false), 1500)
+                disconnectTimerRef.current = setTimeout(() => {
+                  disconnectTimerRef.current = null
+                  setDisconnecting(false)
+                }, 1500)
               }
             }}
             style={{ flex: 1 }}
