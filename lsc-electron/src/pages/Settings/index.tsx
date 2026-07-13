@@ -317,6 +317,17 @@ export default function Settings() {
                 <option value="流畅">流畅 360p</option>
               </select>
             </SettingsRow>
+            <SettingsRow label="共享进样">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end', maxWidth: 360 }}>
+                <ToggleSwitch
+                  checked={!!settings.shared_ingest_enabled}
+                  onChange={(v) => handleRecordChange('shared_ingest_enabled', v)}
+                />
+                <div style={{ fontSize: 11, color: 'var(--state-warning)', lineHeight: 1.5, textAlign: 'right' }}>
+                  开启后预览与录制共用同一进程：录制中断会导致预览中断，预览转码可能影响录制稳定性。
+                </div>
+              </div>
+            </SettingsRow>
             <SettingsRow label="默认编码器">
               <select
                 value={settings.encoder}
