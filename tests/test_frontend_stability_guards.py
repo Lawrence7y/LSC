@@ -360,6 +360,21 @@ def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording(
     assert "等待录制" in progress
 
 
+def test_connect_room_response_uses_accepted_not_fake_success() -> None:
+    """connect_room_response 不得 toast「连接成功」；仅 accepted=false 时回滚 is_connecting。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    connect_resp = workbench.split("on('connect_room_response'", 1)[1].split("unsubs.push", 1)[0]
+    finished = workbench.split("on('room_connect_finished'", 1)[1].split("unsubs.push", 1)[0]
+
+    assert "accepted" in connect_resp
+    assert "is_connecting: false" in connect_resp
+    # 异步受理成功不得在 response 上 toast 连接成功
+    assert "连接成功" not in connect_resp
+    # 失败 toast 由 room_connect_finished 负责（success 可选）
+    assert "连接失败" in finished
+    assert "message.error" in finished
+
+
 def test_workbench_optimistically_updates_connect_record_and_mute() -> None:
     """房间连接/录制/静音点击必须乐观更新 store，避免等 rooms_updated 才有反馈。"""
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")

@@ -277,11 +277,21 @@ export default function Workbench() {
         message.error(`录制启动失败：${data.error || '未知错误'}`)
       }
     }))
-    // 连接异常时回滚乐观 is_connecting（已在连接中返回 success=false 无 error 时不回滚）
-    unsubs.push(on('connect_room_response', (data: { success?: boolean; error?: string; room_id?: string }) => {
-      if (data?.room_id && data.success === false && data.error) {
+    // 仅 accepted=false / success=false+error 时回滚乐观 is_connecting；
+    // async 受理成功不得 toast「连接成功」，真正结果等 room_connect_finished
+    unsubs.push(on('connect_room_response', (data: {
+      success?: boolean
+      accepted?: boolean
+      async?: boolean
+      error?: string
+      room_id?: string
+    }) => {
+      const rejected = data?.accepted === false || (data?.success === false && !!data?.error)
+      if (data?.room_id && rejected) {
         useAppStore.getState().updateRoom(data.room_id, { is_connecting: false })
-        message.error(`连接失败：${data.error}`)
+        if (data.error) {
+          message.error(`连接失败：${data.error}`)
+        }
       }
     }))
     // 单房间录制响应（后端返回 start_recording_response，不是 recording_started）

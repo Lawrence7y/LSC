@@ -2026,10 +2026,16 @@ def register_room_handlers(server, bridge):
 
     @server.on('connect_room')
     async def handle_connect_room(data):
-        """连接指定房间的直播间。"""
+        """连接指定房间的直播间。
+
+        async_mode 下本响应仅表示「是否受理」后台连接任务，真正结果由
+        ``room_connect_finished`` 广播。契约：
+        - 受理成功: ``{success: True, accepted: True, async: True, room_id}``
+        - 已在连接 / 启动失败: ``{success: False, accepted: False, error, room_id}``
+        """
         room_id = data.get('room_id')
         if not room_id:
-            return {'error': 'room_id is required'}
+            return {'success': False, 'accepted': False, 'error': 'room_id is required'}
         _log.info("连接房间: room_id=%s", room_id)
 
         def _connect():
@@ -2037,13 +2043,33 @@ def register_room_handlers(server, bridge):
             return manager.connect_room(room_id, async_mode=True, quality_preset=settings.get('quality', '原画'))
 
         try:
-            success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_connect))
+            accepted = await asyncio.get_running_loop().run_in_executor(
+                _bridge_executor, lambda: bridge.call(_connect)
+            )
         except Exception as exc:
             _log.error("连接房间异常: room_id=%s, error=%s", room_id, exc)
-            return {'success': False, 'error': humanize_error(str(exc)), 'room_id': room_id}
+            return {
+                'success': False,
+                'accepted': False,
+                'error': humanize_error(str(exc)),
+                'room_id': room_id,
+            }
         _broadcast_rooms(force=True)
-        _log.info("连接房间完成: room_id=%s, success=%s", room_id, success)
-        return {'success': bool(success), 'room_id': room_id}
+        if not accepted:
+            _log.info("连接房间未受理: room_id=%s (已在连接中或房间不存在)", room_id)
+            return {
+                'success': False,
+                'accepted': False,
+                'error': '房间不存在或已在连接中',
+                'room_id': room_id,
+            }
+        _log.info("连接房间已受理(异步): room_id=%s", room_id)
+        return {
+            'success': True,
+            'accepted': True,
+            'room_id': room_id,
+            'async': True,
+        }
 
     @server.on('disconnect_room')
     async def handle_disconnect_room(data):
