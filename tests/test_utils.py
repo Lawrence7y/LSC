@@ -158,7 +158,57 @@ class TestErrorStats:
 
     def test_record_many_trims_timestamps(self):
         stats = ErrorStats()
-        # Record more than 100 errors — older timestamps should be trimmed
+        # Record more than 100 errors - older timestamps should be trimmed
         for _ in range(110):
             stats.record_error("overflow", "test")
         assert stats.get_error_count("overflow") == 110
+
+    def test_get_frequent_errors_does_not_deadlock(self):
+        """get_frequent_errors calls get_error_rate while holding the lock.
+
+        A non-reentrant Lock deadlocks here; RLock allows re-entry.
+        Regression test for the recursive-lock deadlock.
+        """
+        stats = ErrorStats()
+        stats.record_error("E1", "msg")
+        stats.record_error("E2", "msg2")
+        # If the lock is non-reentrant this hangs forever; the test timeout
+        # (pytest-timeout or CI) catches it, but assert correctness too.
+        frequent = stats.get_frequent_errors(threshold=0.0)
+        assert isinstance(frequent, list)
+        codes = {entry[0] for entry in frequent}
+        assert {"E1", "E2"}.issubset(codes)
+
+    def test_get_summary_does_not_deadlock(self):
+        """get_summary calls get_frequent_errors while holding the lock."""
+        stats = ErrorStats()
+        stats.record_error("E1", "msg")
+        summary = stats.get_summary()
+        assert summary["total_errors"] == 1
+        assert isinstance(summary["frequent_errors"], list)
+
+    def test_frequent_errors_threadsafe_under_concurrency(self):
+        """Multiple threads calling get_summary must not deadlock."""
+        import threading
+
+        stats = ErrorStats()
+        for i in range(50):
+            stats.record_error(f"E{i}", "msg")
+
+        errors: list[BaseException] = []
+
+        def worker():
+            try:
+                for _ in range(20):
+                    stats.get_summary()
+                    stats.get_frequent_errors(threshold=0.0)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not errors, f"concurrent access raised: {errors}"
+        assert all(not t.is_alive() for t in threads), "threads deadlocked"

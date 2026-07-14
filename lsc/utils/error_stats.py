@@ -4,14 +4,17 @@ from __future__ import annotations
 import time as _time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import RLock
 from typing import Any
 
 
 @dataclass
 class ErrorStats:
     """Track error occurrences and patterns."""
-    _lock: Lock = field(default_factory=Lock, repr=False)
+    # RLock (reentrant) is required because get_frequent_errors() and
+    # get_summary() call other locked methods (get_error_rate / get_frequent_errors)
+    # while already holding the lock. A plain Lock deadlocks on re-entry.
+    _lock: RLock = field(default_factory=RLock, repr=False)
     _error_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     _error_timestamps: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
     _last_error: str = ""

@@ -160,16 +160,31 @@ class LSCWebSocketServer:
                     except Exception:
                         pass
 
+        # Process messages sequentially per connection to guarantee in-order
+        # handler execution. Previously each message spawned an independent
+        # asyncio.create_task, so a later message (e.g. export_clip) could
+        # complete before an earlier one (e.g. set_mark_in) whose state it
+        # depends on. Handlers are non-blocking (long work is queued), so
+        # serialization does not stall the connection.
         try:
             async for message in websocket:
-                task = asyncio.create_task(dispatch(message))
-                pending.add(task)
-                task.add_done_callback(pending.discard)
+                await dispatch(message)
         except ConnectionClosed:
             pass
         finally:
+            # `pending` is kept for backward compatibility but is no longer
+            # populated under sequential processing. If any stray tasks exist
+            # (e.g. from connect handlers), bound the wait so a slow/stuck
+            # task cannot block disconnect cleanup indefinitely.
             if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=3.0,
+                    )
+                except asyncio.TimeoutError:
+                    for t in pending:
+                        t.cancel()
             self.clients.discard(websocket)
             _log.info(f"Client disconnected. Total: {len(self.clients)}")
 
