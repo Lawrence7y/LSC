@@ -1,7 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
 let _updateStatusCallback: ((status: any) => void) | null = null
+let _updateStatusWrapper: ((_event: any, status: any) => void) | null = null
 let _backendErrorCallback: ((error: string) => void) | null = null
+let _backendErrorWrapper: ((_event: any, error: any) => void) | null = null
+let _appSettingsWrapper: ((_event: any, settings: any) => void) | null = null
 
 export interface AppAPI {
   setAutoLaunch(enabled: boolean): Promise<void>
@@ -39,15 +42,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
   onUpdateStatus: (callback: (status: any) => void) => {
-    if (_updateStatusCallback) {
-      ipcRenderer.removeListener('update-status', _updateStatusCallback)
+    if (_updateStatusWrapper) {
+      ipcRenderer.removeListener('update-status', _updateStatusWrapper)
     }
+    _updateStatusWrapper = (_event: any, status: any) => callback(status)
     _updateStatusCallback = callback
-    ipcRenderer.on('update-status', (_event, status) => callback(status))
+    ipcRenderer.on('update-status', _updateStatusWrapper)
   },
   removeUpdateStatusListeners: () => {
-    if (_updateStatusCallback) {
-      ipcRenderer.removeListener('update-status', _updateStatusCallback)
+    if (_updateStatusWrapper) {
+      ipcRenderer.removeListener('update-status', _updateStatusWrapper)
+      _updateStatusWrapper = null
       _updateStatusCallback = null
     }
   },
@@ -62,15 +67,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackendError: () =>
     ipcRenderer.invoke('get-backend-error'),
   onBackendError: (callback: (error: string) => void) => {
-    if (_backendErrorCallback) {
-      ipcRenderer.removeListener('backend-error', _backendErrorCallback)
+    if (_backendErrorWrapper) {
+      ipcRenderer.removeListener('backend-error', _backendErrorWrapper)
     }
+    _backendErrorWrapper = (_event: any, error: any) => callback(error)
     _backendErrorCallback = callback
-    ipcRenderer.on('backend-error', (_event, error) => callback(error))
+    ipcRenderer.on('backend-error', _backendErrorWrapper)
   },
   removeBackendErrorListeners: () => {
-    if (_backendErrorCallback) {
-      ipcRenderer.removeListener('backend-error', _backendErrorCallback)
+    if (_backendErrorWrapper) {
+      ipcRenderer.removeListener('backend-error', _backendErrorWrapper)
+      _backendErrorWrapper = null
       _backendErrorCallback = null
     }
   },
@@ -98,9 +105,17 @@ contextBridge.exposeInMainWorld('app', {
     await ipcRenderer.invoke('app:set-minimize-to-tray', enabled)
   },
   getMinimizeToTray: () => ipcRenderer.invoke('app:get-minimize-to-tray'),
+  removeAppSettingsChangeListeners: () => {
+    if (_appSettingsWrapper) {
+      ipcRenderer.removeListener('app:settings-changed', _appSettingsWrapper)
+      _appSettingsWrapper = null
+    }
+  },
   onAppSettingsChange: (callback: (settings: { autoLaunch: boolean; minimizeToTray: boolean }) => void) => {
-    ipcRenderer.on('app:settings-changed', (_event, settings) => {
-      callback(settings)
-    })
+    if (_appSettingsWrapper) {
+      ipcRenderer.removeListener('app:settings-changed', _appSettingsWrapper)
+    }
+    _appSettingsWrapper = (_event: any, settings: any) => callback(settings)
+    ipcRenderer.on('app:settings-changed', _appSettingsWrapper)
   },
 })
