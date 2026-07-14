@@ -2126,6 +2126,18 @@ def _resolve_export_range(
     )
 
 
+
+def _purge_stale_analysis_jobs() -> None:
+    """#99: periodic TTL-based purge of completed analysis jobs."""
+    now = time.time()
+    stale = [rid for rid, job in list(_analysis_jobs.items())
+             if job.get('completed_at') and now - job['completed_at'] > _ANALYSIS_JOB_TTL]
+    for rid in stale:
+        _analysis_jobs.pop(rid, None)
+    if stale:
+        _log.debug("purged %d stale analysis jobs", len(stale))
+
+
 def register_room_handlers(server, bridge):
     manager: MultiRoomManager = bridge.manager
 
@@ -4978,7 +4990,7 @@ def register_room_handlers(server, bridge):
         global _export_queue, _EXPORT_WORKERS, _export_semaphore, _export_semaphore_limit
         async with _export_queue_lock:
             if _export_queue is None:
-                _export_queue = asyncio.Queue()
+                _export_queue = asyncio.Queue(maxsize=100)  # #100 cap
             # 热更新：按已记录的配置上限比较，避免读取 Semaphore._waiters
             #（空闲时 _waiters 可为 None，调用 __len__ 会抛 NoneType 错误）
             desired = _get_export_max_concurrent()
@@ -4997,6 +5009,7 @@ def register_room_handlers(server, bridge):
                     )
             # 清理已结束的 worker，补充到常驻池大小
             _EXPORT_WORKERS[:] = [t for t in _EXPORT_WORKERS if not t.done()]
+            _purge_stale_analysis_jobs()
             while len(_EXPORT_WORKERS) < _MAX_EXPORT_WORKERS:
                 _EXPORT_WORKERS.append(asyncio.create_task(_export_queue_worker()))
             if len(_EXPORT_WORKERS) == _MAX_EXPORT_WORKERS:

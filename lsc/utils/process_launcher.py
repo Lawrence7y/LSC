@@ -56,6 +56,10 @@ _ENV_WHITELIST = frozenset({
     "HOME", "SYSTEMROOT", "PATHEXT", "PYTHONUNBUFFERED", "PYTHONPATH",
     "LSC_LOG_DIR", "LSC_BUNDLED_FFMPEG_DIR", "LSC_LOG_LEVEL",
     "LSC_BILIBILI_COOKIES",
+    # #49: preserve CUDA-related env vars for multi-GPU NVENC selection
+    "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER",
+    "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
+    "CUDA_PATH", "CUDA_BIN_PATH",
 })
 
 
@@ -74,9 +78,13 @@ def build_clean_env(ffmpeg_path: str) -> dict[str, str]:
         clean_path = []
         for d in path_dirs:
             if d and os.path.isdir(d):
+                try:
+                    entries = os.listdir(d)
+                except OSError:
+                    entries = []
                 has_avcodec = any(
                     f.startswith("avcodec-") and f.endswith(".dll")
-                    for f in os.listdir(d)
+                    for f in entries
                     if os.path.isfile(os.path.join(d, f))
                 )
                 if has_avcodec and os.path.normcase(d) != os.path.normcase(ffmpeg_dir):

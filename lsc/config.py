@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import shutil
 from dataclasses import dataclass, field
 
@@ -251,6 +252,7 @@ def _find_executable(name: str) -> str:
 
 
 _config_instance: LscConfig | None = None
+_config_lock = threading.Lock()  # #109
 
 
 def _load_config_overrides() -> dict:
@@ -332,7 +334,25 @@ def load_config(force_reload: bool = False) -> LscConfig:
     """
     global _config_instance
     if force_reload or _config_instance is None:
-        _config_instance = LscConfig(**_load_config_overrides())
+        from dataclasses import fields
+        overrides = _load_config_overrides()
+        validated = {}
+        field_map = {f.name: f.type for f in fields(LscConfig)}
+        for key, val in overrides.items():
+            expected = field_map.get(key)
+            if expected is None:
+                continue
+            if expected is int and isinstance(val, str):
+                if val.isdigit():
+                    validated[key] = int(val)
+                else:
+                    _log.warning("config type mismatch: %s=%r expected %s, skipped", key, val, expected.__name__)
+                continue
+            if not isinstance(val, expected):
+                _log.warning("config type mismatch: %s=%r expected %s, skipped", key, val, expected.__name__)
+                continue
+            validated[key] = val
+        _config_instance = LscConfig(**validated)
         _log.info("LSC config loaded (singleton created)")
     return _config_instance
 

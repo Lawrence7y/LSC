@@ -17,7 +17,7 @@ def atomic_write_json(file_path: str, data: Any) -> None:
 
 
 def clip_id(room_id: str, start: float, end: float) -> str:
-    return f"{room_id}_{int(round(start * 10))}_{int(round(end * 10))}"
+    return f"{room_id}_{int(round(start * 1000))}_{int(round(end * 1000))}"  # #51 ms precision
 
 
 def expand_user_path(path: str) -> str:

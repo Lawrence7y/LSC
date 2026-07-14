@@ -74,6 +74,10 @@ def save_rooms(
         payload = {"rooms": rooms}
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+            f.flush()
+            os.fsync(f.fileno())
         tmp_path.replace(file_path)
         _log.info("已保存 %d 个房间到 %s", len(rooms), file_path.name)
         return True
@@ -129,6 +133,8 @@ def save_analysis_results(
         tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         tmp_path.replace(file_path)
         _log.info("分析结果已保存: %s (%d 段高光, 耗时=%.1fs)", file_path.name, len(highlights), analysis_time_sec)
         return True
@@ -173,7 +179,7 @@ def is_analysis_stale(video_path: str, stored: dict[str, Any]) -> bool:
         return True
     try:
         current_mtime = os.path.getmtime(video_path)
-        stale = abs(current_mtime - stored_mtime) > 1.0
+        stale = abs(current_mtime - stored_mtime) > 0.5
         if stale:
             _log.info("分析结果已过期: mtime 变化 %.1fs", abs(current_mtime - stored_mtime))
         return stale

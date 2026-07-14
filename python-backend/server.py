@@ -99,11 +99,15 @@ class LSCWebSocketServer:
             origin = websocket.request_headers.get('origin', '')
         if not origin:
             _log.warning("Rejected WebSocket connection: missing Origin header")
-            await websocket.close(code=1008, reason='Origin required')
+            close_fn = getattr(websocket, 'close', None)
+            if callable(close_fn):
+                await close_fn(code=1008, reason='Origin required')
             return
         if origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
             _log.warning("Rejected WebSocket connection from origin: %s", origin)
-            await websocket.close(code=1008, reason='Origin not allowed')
+            close_fn = getattr(websocket, 'close', None)
+            if callable(close_fn):
+                await close_fn(code=1008, reason='Origin not allowed')
             return
 
         self.clients.add(websocket)

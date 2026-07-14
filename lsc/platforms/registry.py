@@ -120,7 +120,11 @@ class _ParseCache:
                     continue
                 raw = vals[0]
                 try:
-                    ts = int(raw, 16) if all(c in '0123456789abcdefABCDEF' for c in raw) and len(raw) >= 6 else int(raw)
+                    # #38: pure-digit strings (Bilibili expires) are decimal, not hex
+                    ts = int(raw, 10) if raw.isdigit() else (
+                        int(raw, 16) if all(c in '0123456789abcdefABCDEF' for c in raw) and len(raw) >= 6
+                        else int(raw)
+                    )
                 except (ValueError, OverflowError):
                     continue
                 if now > ts - 60:

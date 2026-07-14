@@ -186,12 +186,27 @@ def load_cookies_from_file(cookie_file: str) -> dict[str, str]:
             content = f.read()
 
         # 尝试JSON格式
-        if content.strip().startswith("{"):
+        stripped = content.strip()
+        if stripped.startswith("{"):
             data = json.loads(content)
             if isinstance(data, dict):
                 return _sanitize_cookie_map(
                     {str(k): str(v) for k, v in data.items() if v is not None}
                 )
+            return {}
+        # #37: JSON array format (browser extension export)
+        if stripped.startswith("["):
+            arr = json.loads(content)
+            if isinstance(arr, list):
+                result = {}
+                for entry in arr:
+                    if isinstance(entry, dict):
+                        name = entry.get("name")
+                        value = entry.get("value")
+                        if name and value is not None:
+                            result[str(name)] = str(value)
+                _log.info("loaded %d cookies from JSON array", len(result))
+                return _sanitize_cookie_map(result)
             return {}
 
         # 尝试Netscape格式

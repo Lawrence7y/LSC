@@ -73,8 +73,6 @@ _RECOVERABLE_PATTERNS: list[re.Pattern] = [
     re.compile(r"Error number -138", re.I),
     re.compile(r"Invalid data found", re.I),
     re.compile(r"未增长|stalled|not growing", re.I),
-    re.compile(r"403|Forbidden", re.I),
-    re.compile(r"404|Not Found", re.I),
     re.compile(r"流.*过期|链接已过期|鉴权失败", re.I),
 ]
 
@@ -83,6 +81,8 @@ _NON_RECOVERABLE_PATTERNS: list[re.Pattern] = [
     re.compile(r"Permission denied|EACCES|WinError 5|拒绝访问", re.I),
     re.compile(r"No space left|ENOSPC|disk full|磁盘空间不足|磁盘已满", re.I),
     re.compile(r"Encoder.*not found|cannot find encoder", re.I),
+    re.compile(r"403|Forbidden", re.I),
+    re.compile(r"404|Not Found", re.I),
 ]
 
 
