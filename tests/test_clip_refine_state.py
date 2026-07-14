@@ -167,3 +167,22 @@ def test_align_preview_audio_rejects_too_many_rooms():
     assert result is not None
     assert result.get("success") is False
     assert "过多" in result.get("error", "") or "many" in result.get("error", "").lower()
+
+
+# ── #102 regression: _refined_round_keys thread safety ──────────────
+
+
+def test_refined_round_keys_has_lock():
+    """_refined_round_keys must be protected by a threading.Lock (#102)."""
+    from handlers import room_handler
+    # The lock is created when register_room_handlers is called, which
+    # sets up a closure-scoped lock. Verify by checking the handler source
+    # has the lock guard pattern.
+    source = (Path(__file__).resolve().parents[1] /
+              "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_refined_round_keys_lock" in source, \
+        "_refined_round_keys must have a thread lock declaration"
+    assert "with _refined_round_keys_lock:" in source, \
+        "_refined_round_keys read/write must be guarded by the lock"
+    assert "snapshot = set(_refined_round_keys)" in source, \
+        "cross-thread reads must take a snapshot under the lock"

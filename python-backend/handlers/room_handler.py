@@ -67,7 +67,8 @@ def _load_recording_history() -> list[dict[str, Any]]:
         with open(RECORDING_HISTORY_FILE, encoding='utf-8') as f:
             data = json.load(f)
         if isinstance(data, list):
-            return data
+            # 裁剪至上限，防止历史文件已膨胀（#18）
+            return data[-_MAX_RECORDING_HISTORY:]
     except Exception as exc:
         _log.warning("加载录制历史失败，使用空列表: %s", exc)
     return []
@@ -90,6 +91,11 @@ def _save_recording_history(history: list[dict[str, Any]]) -> None:
 
 
 recording_history: list[dict[str, Any]] = _load_recording_history()
+# 录制历史上限：防止 24x7 长期运行时 JSON 无限膨胀（#18）
+_MAX_RECORDING_HISTORY = 500
+# 保护 recording_history 的锁：start_handler（asyncio 线程）与 stop_handler
+# （Qt 线程 via bridge.call）并发读写，无锁可丢记录或损坏列表（#17）
+_recording_history_lock = threading.Lock()
 
 # ── 切片命名工具（与前端 clipNaming.ts 保持同步）──
 
@@ -2133,12 +2139,20 @@ def register_room_handlers(server, bridge):
         if force:
             _rooms_throttle._pending = False
             _rooms_throttle._last_send_time = time.monotonic()
+            # 取消待发的 _flush task，防止 force 发送后 _flush 再发一遍（#103）
+            if _rooms_throttle_task is not None and not _rooms_throttle_task.done():
+                _rooms_throttle_task.cancel()
+                _rooms_throttle_task = None
             bridge.queue_broadcast({
                 'type': 'rooms_updated',
                 'data': {'rooms': _rooms_list(manager)},
             })
             return
         if _rooms_throttle.should_send_immediate():
+            # 取消待发的 _flush task，防止立即发送后 _flush 再发一遍（#103）
+            if _rooms_throttle_task is not None and not _rooms_throttle_task.done():
+                _rooms_throttle_task.cancel()
+                _rooms_throttle_task = None
             bridge.queue_broadcast({
                 'type': 'rooms_updated',
                 'data': {'rooms': _rooms_list(manager)},
@@ -2147,7 +2161,10 @@ def register_room_handlers(server, bridge):
         if _rooms_throttle_task is not None and not _rooms_throttle_task.done():
             return
         async def _flush():
-            await asyncio.sleep(_RoomsThrottle._MERGE_WINDOW_SEC)
+            try:
+                await asyncio.sleep(_RoomsThrottle._MERGE_WINDOW_SEC)
+            except asyncio.CancelledError:
+                return
             if _rooms_throttle.has_pending:
                 _rooms_throttle._pending = False
                 _rooms_throttle._last_send_time = time.monotonic()
@@ -2786,13 +2803,17 @@ def register_room_handlers(server, bridge):
             _bridge_executor, lambda: bridge.call(_get_room_and_error)
         )
         if room and room.is_recording:
-            recording_history.append({
-                'title': room.streamer_name or '未知主播',
-                'platform': room.platform_name,
-                'start_time': datetime.now().isoformat(),
-                'room_id': room_id,
-            })
-            _save_recording_history(recording_history)
+            with _recording_history_lock:
+                recording_history.append({
+                    'title': room.streamer_name or '未知主播',
+                    'platform': room.platform_name,
+                    'start_time': datetime.now().isoformat(),
+                    'room_id': room_id,
+                })
+                # 裁剪至上限，防止 24x7 长期运行时无限膨胀（#18）
+                if len(recording_history) > _MAX_RECORDING_HISTORY:
+                    del recording_history[:len(recording_history) - _MAX_RECORDING_HISTORY]
+                _save_recording_history(recording_history)
             if success:
                 await _reattach_shared_preview_after_recording_start(room_id, room)
 
@@ -2826,15 +2847,16 @@ def register_room_handlers(server, bridge):
             return {'success': False, 'error': humanize_error(str(exc))}
         _log.info("停止录制完成: room_id=%s, success=%s", room_id, success)
 
-        for record in reversed(recording_history):
-            if record.get('room_id') == room_id and 'end_time' not in record:
-                record['end_time'] = datetime.now().isoformat()
-                start = datetime.fromisoformat(record['start_time'])
-                end = datetime.fromisoformat(record['end_time'])
-                duration = (end - start).total_seconds()
-                record['duration'] = f"{int(duration // 3600):02d}:{int((duration % 3600) // 60):02d}:{int(duration % 60):02d}"
-                break
-        _save_recording_history(recording_history)
+        with _recording_history_lock:
+            for record in reversed(recording_history):
+                if record.get('room_id') == room_id and 'end_time' not in record:
+                    record['end_time'] = datetime.now().isoformat()
+                    start = datetime.fromisoformat(record['start_time'])
+                    end = datetime.fromisoformat(record['end_time'])
+                    duration = (end - start).total_seconds()
+                    record['duration'] = f"{int(duration // 3600):02d}:{int((duration % 3600) // 60):02d}:{int(duration % 60):02d}"
+                    break
+            _save_recording_history(recording_history)
 
         _broadcast_rooms()
         return {'success': bool(success)}
@@ -4568,6 +4590,9 @@ def register_room_handlers(server, bridge):
     _listed_clip_ids: set[str] = set()  # 已向切片列表广播过的 room:round_key
     _listed_clip_bounds: dict[str, tuple[float, float, str]] = {}  # listed_key -> (start, end, status)
     _refined_round_keys: set[str] = set()  # 精修中或已确认的 round_key（OCR 不得改边界）
+    # 保护 _refined_round_keys 的锁：asyncio handler 与分析 executor 线程
+    # 均会并发读写（#102），无锁可导致重复导出或 OCR 误改冻结边界
+    _refined_round_keys_lock = threading.Lock()
 
     async def _auto_export_highlights(main_room, target_rooms, highlights, job_prefix, preset_id='',
                                       defer_export: bool = True,
@@ -4627,6 +4652,10 @@ def register_room_handlers(server, bridge):
                 end_r = round(export_end, 1)
 
                 if list_only:
+                    # Take a snapshot under the lock to avoid concurrent
+                    # mutation during the membership check (#102)
+                    with _refined_round_keys_lock:
+                        refined_snapshot = set(_refined_round_keys)
                     action = _should_broadcast_clip_list_update(
                         listed_key,
                         round_key,
@@ -4635,7 +4664,7 @@ def register_room_handlers(server, bridge):
                         confirm_status,
                         listed_ids=_listed_clip_ids,
                         exported_ids=_exported_clip_ids,
-                        refined_keys=_refined_round_keys,
+                        refined_keys=refined_snapshot,
                         listed_bounds=_listed_clip_bounds,
                     )
                     if action == "skip":
@@ -4948,9 +4977,18 @@ def register_room_handlers(server, bridge):
             #（空闲时 _waiters 可为 None，调用 __len__ 会抛 NoneType 错误）
             desired = _get_export_max_concurrent()
             if _export_semaphore_limit != desired:
-                _export_semaphore = asyncio.Semaphore(desired)
-                _export_semaphore_limit = desired
-                _log.info("导出并发上限已更新: %d", desired)
+                # 仅在队列为空（无在途任务）时替换 semaphore，避免在途 worker
+                # 持有旧 semaphore 的 permit 而新 worker 用新 semaphore，导致
+                # 短暂超并发或旧 semaphore 的 permit 永久丢失（#16）
+                if _export_queue.empty():
+                    _export_semaphore = asyncio.Semaphore(desired)
+                    _export_semaphore_limit = desired
+                    _log.info("导出并发上限已更新: %d", desired)
+                else:
+                    _log.warning(
+                        "导出并发上限变更(%d->%d)延迟生效：队列非空，待队列清空后下次 _ensure_export_queue 再替换",
+                        _export_semaphore_limit, desired,
+                    )
             # 清理已结束的 worker，补充到常驻池大小
             _EXPORT_WORKERS[:] = [t for t in _EXPORT_WORKERS if not t.done()]
             while len(_EXPORT_WORKERS) < _MAX_EXPORT_WORKERS:
@@ -5590,10 +5628,14 @@ def register_room_handlers(server, bridge):
                                     for rid in target_room_ids
                                 )
                             ]
+                            # Snapshot under lock to avoid concurrent mutation
+                            # during the comprehension (#102)
+                            with _refined_round_keys_lock:
+                                refined_snapshot = set(_refined_round_keys)
                             ocr_confirmed_hl = [
                                 h for h in pending_hl
                                 if _is_auto_exportable_valorant_round(h)
-                                and _valorant_round_key(h) not in _refined_round_keys
+                                and _valorant_round_key(h) not in refined_snapshot
                             ]
                             ocr_keys = {_valorant_round_key(h) for h in ocr_confirmed_hl}
                             pending_only_hl = [
@@ -6174,7 +6216,8 @@ def register_room_handlers(server, bridge):
             _log.warning("begin_refine_clip: 缺少 round_key")
             return {'success': False, 'error': 'missing round_key'}
         # 冻结：OCR 不得再改该 round_key 的边界
-        _refined_round_keys.add(round_key)
+        with _refined_round_keys_lock:
+            _refined_round_keys.add(round_key)
         _clip_refine_state[round_key] = {
             'status': 'refining',
             'room_id': room_id,
@@ -6206,7 +6249,8 @@ def register_room_handlers(server, bridge):
             _log.warning("confirm_highlight_clip: 缺少 round_key")
             return {'success': False, 'error': 'missing round_key'}
         # 主房确认
-        _refined_round_keys.add(round_key)
+        with _refined_round_keys_lock:
+            _refined_round_keys.add(round_key)
         _clip_refine_state[round_key] = {
             'status': 'user_confirmed',
             'room_id': room_id,
@@ -6271,7 +6315,8 @@ def register_room_handlers(server, bridge):
         if saved and not room_id:
             room_id = saved.get('room_id', '')
         # 未确认的精修取消后允许 OCR 再升格
-        _refined_round_keys.discard(round_key)
+        with _refined_round_keys_lock:
+            _refined_round_keys.discard(round_key)
         broadcast_data: dict = {
             'room_id': room_id,
             'round_key': round_key,

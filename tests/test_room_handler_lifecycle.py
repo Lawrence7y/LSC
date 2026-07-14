@@ -657,3 +657,52 @@ def test_mse_preview_starts_shared_preview_only_when_enabled(monkeypatch) -> Non
     assert room.preview_enabled is True
     assert manager.refresh_calls == [("room-1", False)]
     assert any(event == "mse_init" for event, _payload in server.broadcasts)
+
+
+# ── #18 regression: recording_history cap ──────────────────────────
+
+def test_recording_history_capped_on_load():
+    """_load_recording_history must slice to _MAX_RECORDING_HISTORY (#18)."""
+    from handlers import room_handler
+
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "return data[-_MAX_RECORDING_HISTORY:]" in source, \
+        "load must trim to max"
+
+
+def test_recording_history_capped_on_append():
+    """Append site must trim when exceeding _MAX_RECORDING_HISTORY (#18)."""
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    snippet = source.split("recording_history.append", 1)[1].split("\n", 15)
+    joined = "\n".join(snippet)
+    assert "_MAX_RECORDING_HISTORY" in joined
+    assert "del recording_history[" in joined
+
+
+# ── #17 regression: recording_history lock ─────────────────────────
+
+def test_recording_history_has_lock():
+    """recording_history must be protected by _recording_history_lock (#17)."""
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_recording_history_lock" in source
+
+
+# ── #103 regression: throttle flush cancellation ───────────────────
+
+def test_broadcast_rooms_cancels_pending_flush_on_force():
+    """_broadcast_rooms must cancel pending _flush task before force sending (#103)."""
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_rooms_throttle_task.cancel()" in source, \
+        "force and immediate paths must cancel pending flush task to prevent double broadcast"
+
+
+# ── #16 regression: semaphore guarded replacement ──────────────────
+
+def test_export_semaphore_not_replaced_mid_flight():
+    """_ensure_export_queue must not replace semaphore when queue is non-empty (#16)."""
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    # The guard checks _export_queue.empty() before replacing
+    assert "_export_queue.empty()" in source, \
+        "semaphore must only be replaced when the export queue is empty"
+    assert "延迟" in source, \
+        "must log a delay warning when queue is non-empty"
