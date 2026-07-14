@@ -204,7 +204,7 @@ class LSCWebSocketBackend:
 
     async def _broadcast_coroutine(self):
         """协程版广播循环：从 bridge 队列取消息并发送。"""
-        from server import drain_merge_broadcasts
+        from server import drain_merge_broadcasts, _json_dumps
         while not self._shutdown:
             try:
                 merged = drain_merge_broadcasts(self.bridge)
@@ -212,7 +212,12 @@ class LSCWebSocketBackend:
                     await asyncio.sleep(0.1)
                     continue
                 for msg in merged:
-                    data = json.dumps(msg)
+                    # Use the numpy-aware serializer (consistent with
+                    # server.py dispatch/broadcast). Plain json.dumps
+                    # raises TypeError on numpy int64/float64 values
+                    # produced by the audio-analysis code; the broad
+                    # except below silently dropped those broadcasts.
+                    data = _json_dumps(msg)
                     clients = list(self.server.clients)
                     if not clients:
                         continue

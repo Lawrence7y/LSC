@@ -161,15 +161,20 @@ class TestWebSocketOriginValidation:
 
     def _check_origin(self, origin: str) -> bool:
         """Simulate origin check from handle_client. Returns True if allowed."""
-        if origin and origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
+        # Missing/empty Origin is rejected (#14): legitimate Electron
+        # renderers and browsers always send an Origin header.
+        if not origin:
+            return False
+        if origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
             return False  # rejected
         return True
 
     def test_null_origin_allowed(self):
         assert self._check_origin('null') is True
 
-    def test_empty_origin_allowed(self):
-        assert self._check_origin('') is True
+    def test_empty_origin_rejected(self):
+        """Empty/missing Origin must be rejected (#14)."""
+        assert self._check_origin('') is False
 
     def test_localhost_allowed(self):
         assert self._check_origin('http://localhost:3000') is True
@@ -337,3 +342,80 @@ class TestMessageOrdering:
 
         # Client must have been removed from the server's client set
         assert ws not in srv.clients
+
+
+class TestOriginRejectionInHandleClient:
+    """Integration tests for origin rejection via handle_client (#14)."""
+
+    def test_missing_origin_rejected(self):
+        """handle_client must close the connection when Origin is missing (#14)."""
+        srv = LSCWebSocketServer()
+        ws = _MockWebSocket([], origin='')  # no Origin header
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(srv.handle_client(ws))
+        finally:
+            loop.close()
+
+        # Connection must have been closed and client NOT added
+        assert ws._closed is True
+        assert ws not in srv.clients
+
+    def test_null_origin_accepted(self):
+        """Electron file:// sends Origin 'null' and must be accepted."""
+        srv = LSCWebSocketServer()
+
+        @srv.on('ping')
+        async def handle_ping(data):
+            return {'success': True}
+
+        ws = _MockWebSocket([json.dumps({'type': 'ping', 'data': {}})], origin='null')
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(srv.handle_client(ws))
+        finally:
+            loop.close()
+
+        assert ws in srv.clients or ws not in srv.clients  # disconnected after msgs
+        # Should have received a response
+        assert len(ws.sent) > 0
+
+
+class TestBroadcastNumpySerialization:
+    """Verify the broadcast coroutine uses the numpy-aware serializer (#23)."""
+
+    def test_main_broadcast_uses_numpy_serializer(self):
+        """main.py _broadcast_coroutine must use _json_dumps, not plain json.dumps.
+
+        This is a source-level guard: plain json.dumps raises TypeError on
+        numpy int64/float64 values from audio analysis, and the broad except
+        silently dropped the broadcast.
+        """
+        import inspect
+        from main import LSCWebSocketBackend
+
+        source = inspect.getsource(LSCWebSocketBackend._broadcast_coroutine)
+        assert '_json_dumps' in source, "_broadcast_coroutine must use _json_dumps"
+        assert 'json.dumps(msg)' not in source, \
+            "_broadcast_coroutine must not use plain json.dumps(msg)"
+
+    def test_numpy_values_serialize_for_broadcast(self):
+        """Broadcast messages with numpy values must serialize without error."""
+        try:
+            import numpy as np
+        except ImportError:
+            pytest.skip("numpy not installed")
+
+        msg = {'type': 'analysis_result', 'data': {
+            'score': np.float64(0.95),
+            'count': np.int64(42),
+            'values': np.array([1.0, 2.0, 3.0]),
+        }}
+        # _json_dumps is what both server.broadcast and _broadcast_coroutine use
+        serialized = _json_dumps(msg)
+        decoded = json.loads(serialized)
+        assert decoded['data']['score'] == 0.95
+        assert decoded['data']['count'] == 42
+        assert decoded['data']['values'] == [1.0, 2.0, 3.0]

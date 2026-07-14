@@ -91,11 +91,17 @@ class LSCWebSocketServer:
 
     async def handle_client(self, websocket):
         """处理客户端连接"""
-        # S-4: Origin 校验 — 仅允许 Electron (file://) 和本地开发服务器
+        # S-4: Origin 校验 - 仅允许 Electron (file://) 和本地开发服务器
+        # 缺失/空 Origin 一律拒绝：合法的 Electron 渲染进程和浏览器都会
+        # 发送 Origin 头，缺失通常意味着非浏览器客户端或 CSRF 尝试。
         origin = ''
         if hasattr(websocket, 'request_headers'):
             origin = websocket.request_headers.get('origin', '')
-        if origin and origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
+        if not origin:
+            _log.warning("Rejected WebSocket connection: missing Origin header")
+            await websocket.close(code=1008, reason='Origin required')
+            return
+        if origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
             _log.warning("Rejected WebSocket connection from origin: %s", origin)
             await websocket.close(code=1008, reason='Origin not allowed')
             return
@@ -225,7 +231,14 @@ class LSCWebSocketServer:
             try:
                 if port != self.port:
                     _log.warning(f"Port {self.port} unavailable, trying fallback port {port}...")
-                async with websockets.serve(self.handle_client, self.host, port, max_size=16 * 1024 * 1024) as srv:
+                async with websockets.serve(
+                    self.handle_client, self.host, port,
+                    max_size=16 * 1024 * 1024,
+                    # Detect silent TCP drops (network partition, killed
+                    # client). Without keepalive pings, a half-open socket
+                    # stays in self.clients indefinitely (#98).
+                    ping_interval=20, ping_timeout=20,
+                ) as srv:
                     self._server = srv
                     self._bound_port = port
                     _log.info(f"WebSocket server listening on ws://{self.host}:{port}")
