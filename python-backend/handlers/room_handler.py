@@ -90,9 +90,11 @@ def _save_recording_history(history: list[dict[str, Any]]) -> None:
         _log.error("保存录制历史失败: %s", exc)
 
 
-recording_history: list[dict[str, Any]] = _load_recording_history()
 # 录制历史上限：防止 24x7 长期运行时 JSON 无限膨胀（#18）
+# 必须在 _load_recording_history() 之前定义，因为该函数在模块加载时即调用
 _MAX_RECORDING_HISTORY = 500
+
+recording_history: list[dict[str, Any]] = _load_recording_history()
 # 保护 recording_history 的锁：start_handler（asyncio 线程）与 stop_handler
 # （Qt 线程 via bridge.call）并发读写，无锁可丢记录或损坏列表（#17）
 _recording_history_lock = threading.Lock()
@@ -352,6 +354,9 @@ _recording_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix='rec'
 _bridge_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix='bridge')
 # AI 分析专用线程池：CPU/GPU 密集型，独立线程池避免与录制/导出竞争
 _ai_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ai')
+# FFprobe 探针专用线程池：-probesize 50M + -analyzeduration 10M 可阻塞 15s+，
+# 独立线程池避免阻塞 bridge 快操作（disconnect/mute/seek）和录制操作（#20）
+_probe_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='probe')
 
 # 录制并发限流：最多同时启动 2 路录制，避免 6 路同时 HTTP 刷新 + FFmpeg 启动耗尽线程和 CPU
 _recording_semaphore = asyncio.Semaphore(2)
@@ -411,6 +416,7 @@ def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
         ("recording", _recording_executor),
         ("bridge", _bridge_executor),
         ("ai", _ai_executor),
+        ("probe", _probe_executor),
     ):
         shutdown = getattr(executor, "shutdown", None)
         if callable(shutdown):
@@ -5425,7 +5431,7 @@ def register_room_handlers(server, bridge):
                 if not state or state.get('cancelled'):
                     break
                 video_path, current_dur = await loop.run_in_executor(
-                    _bridge_executor, _get_recording_file_info,
+                    _probe_executor, _get_recording_file_info,
                 )
                 room_obj = manager.get_room(room_id)
                 is_still_recording = bool(room_obj and getattr(room_obj, 'is_recording', False))

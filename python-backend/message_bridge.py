@@ -36,12 +36,16 @@ class QtManagerBridge(QObject):
 
     # 内部信号：用于在 Qt 线程中执行外部提交的函数
     _execute = Signal(object)
+    # 最大待执行请求数，防止 timed-out 但仍在 Qt 线程执行的长任务堆积（#21）
+    _MAX_PENDING_REQUESTS = 8
 
     def __init__(self, manager: Any):
         """初始化桥接器，绑定 manager 信号到广播方法。"""
         super().__init__()
         self._manager = manager
         self._execute.connect(self._on_execute)
+        self._pending_count = 0
+        self._pending_lock = threading.Lock()
 
         # 连接 manager 信号 -> 广播到 WebSocket 客户端
         # 注意：MultiRoomManager 只有 room_connect_finished / batch_record_progress /
@@ -56,6 +60,8 @@ class QtManagerBridge(QObject):
     def _on_execute(self, req: _CallRequest):
         """在 Qt 主线程执行请求函数并设置结果/异常。"""
         if req.cancelled:
+            with self._pending_lock:
+                self._pending_count -= 1
             return
         try:
             req.result = req.fn(*req.args, **req.kwargs)
@@ -65,6 +71,8 @@ class QtManagerBridge(QObject):
             req.traceback = traceback.format_exc()
             _log.error("executed %s raised %s", getattr(req.fn, '__name__', '?'), exc, exc_info=True)
         finally:
+            with self._pending_lock:
+                self._pending_count -= 1
             req.event.set()
 
     def _on_connect_finished(self, room_id: str, success: bool, error: str):
@@ -100,11 +108,28 @@ class QtManagerBridge(QObject):
             _log.debug("call on main thread, executing directly")
             return fn(*args, **kwargs)
 
+        # #21 待执行上限保护：防止 timed-out 长任务堆积阻塞 Qt 线程
+        with self._pending_lock:
+            if self._pending_count >= self._MAX_PENDING_REQUESTS:
+                _log.error(
+                    "bridge.call rejected: pending=%d >= max=%d, fn=%s, timeout=%.1fs",
+                    self._pending_count, self._MAX_PENDING_REQUESTS,
+                    getattr(fn, '__name__', '?'), timeout,
+                )
+                raise TimeoutError(
+                    f'Qt manager too busy ({self._pending_count} pending, '
+                    f'max {self._MAX_PENDING_REQUESTS})'
+                )
+            self._pending_count += 1
+
         req = _CallRequest(fn, args, kwargs)
         self._execute.emit(req)
         if not req.event.wait(timeout=timeout):
             req.cancelled = True
-            _log.error("call timed out after %.1fs: %s", timeout, getattr(fn, '__name__', '?'))
+            _log.warning(
+                "bridge.call timed out after %.1fs but Qt thread still executing: %s, pending=%d",
+                timeout, getattr(fn, '__name__', '?'), self._pending_count,
+            )
             raise TimeoutError('Qt manager call timed out')
         if req.exception is not None:
             # 显式打印完整 traceback，便于调试（__traceback__ 技术上保留但日志不可见）
@@ -124,6 +149,7 @@ class QtManagerBridge(QObject):
 
         req = _CallRequest(fn, args, kwargs)
         self._execute.emit(req)
+        _log.debug("submit fire-and-forget: %s", getattr(fn, '__name__', '?'))
 
     def get_broadcast(self, block: bool = False, timeout: float | None = None) -> dict[str, Any] | None:
         """从广播队列获取一条待发送的消息。"""
