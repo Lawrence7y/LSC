@@ -1,3 +1,4 @@
+import threading
 """多房间工作台会话模型。
 
 RoomSession 是多房间工作台中单个直播间连接的完整状态快照，由 manager 统一管理。
@@ -87,11 +88,15 @@ class RoomSession:
     # 0 = 基准房间（最慢）
     # 房间重连/录制重启时重置为 0
     # 导出时用于将所有房间的音频轨道按此偏移量对齐到基准房间时间线
+    # #28: per-room thread lock for concurrent batch recording writes
+    _room_lock: threading.Lock = field(default_factory=threading.Lock)
     content_offset: float = 0.0
     # 对齐组 ID：一次 audio_align 的所有参与房间共享同一 id（空串=未对齐）
     # 多房间同步导出时校验：target_room_ids 的 align_group_id 必须一致且非空
     # 房间重连/录制重启时与 content_offset 一起重置
     align_group_id: str = ""
+    # #7: set by disconnect_room, checked by _on_connect_finished
+    disconnect_requested: bool = False
     # 重连取消事件：用户断开/删除房间时 set()，通知后台重连线程退出
     _cancel_reconnect: Event = field(default_factory=Event)
     # 后台重连线程引用，用于在断开/删除时取消

@@ -494,6 +494,13 @@ class MultiRoomManager(QObject):
             _log.warning("Room limit reached (%d), cannot add more", MAX_ROOMS)
             return None
 
+        # #27: duplicate URL detection
+        url_stripped = url.strip().rstrip("/").lower()
+        for existing in list(self._rooms.values()):
+            existing_url = getattr(existing, "room_url", "").strip().rstrip("/").lower()
+            if existing_url == url_stripped:
+                _log.warning("duplicate URL rejected: %s", url)
+                return None
         room_id = uuid4().hex
         controller = self._create_controller()
 
@@ -646,6 +653,11 @@ class MultiRoomManager(QObject):
             entry["include_in_cut"] = room.include_in_cut
         if room.preview_muted is not True:
             entry["preview_muted"] = room.preview_muted
+        # #29: persist alignment state across restarts
+        if room.align_group_id:
+            entry["align_group_id"] = room.align_group_id
+        if room.content_offset:
+            entry["content_offset"] = room.content_offset
         return entry
 
     def save_rooms(self) -> int:
@@ -805,6 +817,10 @@ class MultiRoomManager(QObject):
         return True
 
     def _on_connect_finished(self, room_id: str, success: bool, error: str,
+        room = self.get_room(room_id)
+        if room is None or room.disconnect_requested:
+            return
+        self._connect_workers.pop(room_id, None)
                              info: StreamInfo | None) -> None:
         self._connect_workers.pop(room_id, None)
         room = self.get_room(room_id)
@@ -2074,7 +2090,7 @@ class MultiRoomManager(QObject):
                 except Exception as exc:
                     _log.warning("Reconnect stop failed (exhausted) room=%s: %s", room.room_id, exc)
             if room.preview_enabled:
-                self.stop_preview(room_id)
+                self.stop_preview(room.room_id)
                 _log.info("Room %s preview stopped after reconnect exhausted", room.room_id)
             return
 
