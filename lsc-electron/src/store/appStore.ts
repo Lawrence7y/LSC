@@ -3,12 +3,6 @@ import { RoomSession, ClipSegment, RecordSettings, AppSettings, DependencyStatus
 
 export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'reconnect_failed'
 
-export interface DiskUsage {
-  total: number
-  used: number
-  free: number
-}
-
 export interface PreviewDegradationInfo {
   width: number
   height: number
@@ -27,13 +21,10 @@ interface AppState {
   rooms: RoomSession[]
   selectedRoomId: string | null
   clips: ClipSegment[]
-  recentClips: ClipSegment[]
   settings: RecordSettings
   appSettings: AppSettings
   connectionStatus: ConnectionStatus
-  diskUsage: DiskUsage | null
   systemStats: SystemStats | null
-  exportProgress: { job_id: string; percent: number } | null
   dependencyStatus: DependencyStatus | null
   timelineContext: TimelineContext | null
   timelineInvalidated: boolean
@@ -50,14 +41,10 @@ interface AppActions {
   setSelectedRoomId: (roomId: string | null) => void
   setClips: (clips: ClipSegment[]) => void
   addClip: (clip: ClipSegment) => void
-  setRecentClips: (clips: ClipSegment[]) => void
-  addRecentClip: (clip: ClipSegment) => void
   setSettings: (settings: Partial<RecordSettings>) => void
   setAppSettings: (s: Partial<AppSettings>) => void
   setConnectionStatus: (status: ConnectionStatus) => void
-  setDiskUsage: (diskUsage: DiskUsage | null) => void
   setSystemStats: (stats: SystemStats | null) => void
-  setExportProgress: (progress: { job_id: string; percent: number } | null) => void
   setDependencyStatus: (status: DependencyStatus | null) => void
   setTimelineContext: (ctx: TimelineContext | null) => void
   setTimelineInvalidated: (invalidated: boolean) => void
@@ -81,9 +68,8 @@ const defaultSettings: RecordSettings = {
   audio_bitrate: '128k',
   preview_quality: '高清',
   preset: 'medium',
-  analysis_settings: {
-    absolute_threshold: 0.15,
-  },
+  ocr_accel: 'dml',
+  export_max_concurrent: 2,
 }
 
 const defaultAppSettings: AppSettings = {
@@ -98,13 +84,10 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   rooms: [],
   selectedRoomId: null,
   clips: [],
-  recentClips: [],
   settings: defaultSettings,
   appSettings: defaultAppSettings,
   connectionStatus: 'disconnected',
-  diskUsage: null,
   systemStats: null,
-  exportProgress: null,
   dependencyStatus: null,
   timelineContext: null,
   timelineInvalidated: false,
@@ -151,13 +134,6 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
       return { clips: [...state.clips, clip].slice(-200) }
     }),
 
-  setRecentClips: (recentClips) => set({ recentClips }),
-
-  addRecentClip: (clip) =>
-    set((state) => ({
-      recentClips: [clip, ...state.recentClips].slice(0, 20),
-    })),
-
   setSettings: (settings) =>
     set((state) => ({
       settings: { ...state.settings, ...settings },
@@ -169,15 +145,6 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
     })),
 
   setConnectionStatus: (connectionStatus) => set((state) => state.connectionStatus === connectionStatus ? state : { connectionStatus }),
-
-  setDiskUsage: (diskUsage) =>
-    set((state) => {
-      const prev = state.diskUsage
-      if (prev?.total === diskUsage?.total && prev?.used === diskUsage?.used && prev?.free === diskUsage?.free) {
-        return state
-      }
-      return { diskUsage }
-    }),
 
   setSystemStats: (systemStats) =>
     set((state) => {
@@ -195,8 +162,6 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
       }
       return { systemStats }
     }),
-
-  setExportProgress: (exportProgress) => set({ exportProgress }),
 
   setDependencyStatus: (dependencyStatus) => set({ dependencyStatus }),
 

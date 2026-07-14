@@ -28,9 +28,10 @@ from lsc.core.models import (
     RoomInfo,
     StreamQuality,
 )
+from lsc.core.services.ingest_registry import get_shared_ingest_registry
 from lsc.platforms.base import StreamInfo
 from lsc.platforms.registry import parse_stream
-from lsc.recorder.capture import StreamCapture, validate_recording
+from lsc.recorder.capture import CaptureResult, StreamCapture, validate_recording
 
 _log = get_logger(__name__)
 
@@ -76,8 +77,10 @@ class RecordingService:
     def __init__(self, config: LscConfig | None = None) -> None:
         self._config = config or load_config()
         self._sessions: dict[str, _SessionHandle] = {}
+        self._shared_ingests = get_shared_ingest_registry()
         self._lock = Lock()
         self._on_status_changed: StatusCallback | None = None
+        _log.debug("RecordingService initialized (encoder=%s)", self._config.profile.export.codec)
 
     def set_status_callback(self, callback: StatusCallback | None) -> None:
         """设置状态变更回调。
@@ -86,6 +89,7 @@ class RecordingService:
         调用线程可能是后台线程，UI 层需要自行调度到主线程。
         """
         self._on_status_changed = callback
+        _log.debug("status callback %s", "registered" if callback else "cleared")
 
     # ── 流解析 ─────────────────────────────────────────────
 
@@ -210,6 +214,30 @@ class RecordingService:
             max_reconnect_attempts=config.max_reconnect_attempts,
         )
 
+        if self._config.shared_ingest_enabled:
+            try:
+                shared_capture = self._start_shared_ingest_recording(room, output_path)
+            except Exception as exc:
+                _log.warning(
+                    "shared ingest recording unavailable, falling back to StreamCapture: %s",
+                    exc,
+                )
+            else:
+                handle = _SessionHandle(
+                    session=session,
+                    capture=shared_capture,
+                    config=config,
+                    room_headers=dict(room.headers),
+                )
+                with self._lock:
+                    self._sessions[session_id] = handle
+                session.status = RecordingStatus.RECORDING
+                from datetime import datetime
+
+                session.start_time = datetime.now()
+                self._notify_status(session)
+                return self._copy_session(session)
+
         capture = StreamCapture(self._config)
 
         # 构建 FFmpeg 参数
@@ -244,8 +272,8 @@ class RecordingService:
                     self._sessions.pop(session_id, None)
                 try:
                     capture.force_cleanup()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("操作异常（已忽略）: %s", exc)
                 self._notify_status(session)
                 return self._copy_session(session)
 
@@ -264,8 +292,8 @@ class RecordingService:
                 self._sessions.pop(session_id, None)
             try:
                 capture.force_cleanup()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("操作异常（已忽略）: %s", exc)
             self._notify_status(session)
             raise
 
@@ -314,6 +342,8 @@ class RecordingService:
                 session.last_error = result.error or "停止录制失败"
 
             self._notify_status(session)
+            if isinstance(capture, _SharedCaptureAdapter) and (capture.ingest.is_stopped or capture.ingest.preview_subscribers <= 0):
+                self._shared_ingests.stop_room(capture.room_id, reason="recording stopped")
         except Exception as exc:
             session.status = RecordingStatus.ERROR
             session.last_error = f"停止录制失败: {exc}"
@@ -353,14 +383,14 @@ class RecordingService:
         if handle.session.status == RecordingStatus.RECORDING:
             try:
                 self.stop_recording(session_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("操作异常（已忽略）: %s", exc)
 
         # 清理资源
         try:
             handle.capture.force_cleanup()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("操作异常（已忽略）: %s", exc)
 
         with self._lock:
             self._sessions.pop(session_id, None)
@@ -518,8 +548,8 @@ class RecordingService:
             if progress_callback is not None:
                 try:
                     progress_callback(i, total, url)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("操作异常（已忽略）: %s", exc)
 
         return results
 
@@ -571,8 +601,8 @@ class RecordingService:
             if progress_callback is not None:
                 try:
                     progress_callback(i, total, session_id or room.room_url, success)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("操作异常（已忽略）: %s", exc)
 
         return started
 
@@ -646,6 +676,32 @@ class RecordingService:
             except Exception as exc:
                 _log.warning("Status callback raised: %s", exc)
 
+    def _start_shared_ingest_recording(self, room: RoomInfo, output_path: str) -> _SharedCaptureAdapter:
+        room_id = self._shared_ingest_room_key(room)
+        ingest = self._shared_ingests.get_or_create(
+            room_id,
+            url=room.stream_url,
+            headers=dict(room.headers),
+        )
+        try:
+            result = ingest.start_recording_and_preview(output_path)
+            if result.use_legacy_fallback:
+                raise RuntimeError(result.error or "shared ingest requested legacy fallback")
+            if result.ok:
+                return _SharedCaptureAdapter(ingest=ingest, room_id=room_id, output_path=output_path)
+            raise RuntimeError(result.error or "shared ingest recording start failed")
+        except Exception:
+            self._shared_ingests.stop_room(room_id, reason="shared recording fallback")
+            raise
+
+    @staticmethod
+    def _shared_ingest_room_key(room: RoomInfo) -> str:
+        raw = getattr(room, "raw", {}) or {}
+        runtime_id = raw.get("room_id") or raw.get("id")
+        if runtime_id:
+            return str(runtime_id)
+        return room.room_url or room.stream_url
+
     @staticmethod
     def _headers_to_input_args(headers: dict[str, str]) -> list[str]:
         """将 HTTP 头转换为 FFmpeg 输入参数。"""
@@ -711,6 +767,52 @@ class RecordingService:
                 f"需要 {required_gb:.1f} GB（{concurrent_streams} 路并发录制）"
             )
         return ""
+
+
+class _SharedCaptureAdapter:
+    """Adapter that lets shared ingest satisfy RecordingService's capture shape."""
+
+    __slots__ = ("ingest", "room_id", "output_path", "last_error", "_started_mono")
+
+    def __init__(self, *, ingest, room_id: str, output_path: str) -> None:
+        self.ingest = ingest
+        self.room_id = room_id
+        self.output_path = output_path
+        self.last_error = ""
+        self._started_mono = time.monotonic()
+
+    @property
+    def duration(self) -> float:
+        if self._started_mono <= 0:
+            return 0.0
+        return max(0.0, time.monotonic() - self._started_mono)
+
+    def stop(self) -> CaptureResult:
+        duration = self.duration
+        self.ingest.stop_recording_sink(reason="recording stopped")
+        size_mb = 0.0
+        if self.output_path and os.path.isfile(self.output_path):
+            try:
+                size_mb = os.path.getsize(self.output_path) / (1024 * 1024)
+            except OSError:
+                size_mb = 0.0
+        return CaptureResult(
+            success=True,
+            output_path=self.output_path,
+            duration_sec=duration,
+            file_size_mb=size_mb,
+        )
+
+    def check_health(self) -> str:
+        upstream_error = getattr(self.ingest, "upstream_error", "")
+        if upstream_error:
+            return upstream_error
+        if getattr(self.ingest, "is_stopped", False):
+            return "shared ingest stopped"
+        return ""
+
+    def force_cleanup(self) -> None:
+        self.ingest.stop(reason="recording cleanup")
 
 
 class _SessionHandle:

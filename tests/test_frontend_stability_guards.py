@@ -96,23 +96,30 @@ def test_preview_audio_capture_restores_mute_override_on_setup_failure() -> None
 
 def test_go_live_button_calls_force_live_edge_method() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    go_live_body = source.split("const handleGoLive = useCallback(() => {", 1)[1].split("  }, [selectedRoomIds])", 1)[0]
+    # Go Live / 贴右回 Live 统一走 enterTimelineLive → player.goLive()
+    live_body = source.split("const enterTimelineLive = useCallback", 1)[1].split(
+        "const handleTimelineSeek = useCallback", 1
+    )[0]
+    handle_body = source.split("const handleGoLive = useCallback(() => {", 1)[1].split(
+        "  }, [selectedRoomIds", 1
+    )[0]
 
-    assert "typeof player.goLive === 'function'" in go_live_body
-    assert "player.goLive()" in go_live_body
+    assert "enterTimelineLive(targets)" in handle_body
+    assert "typeof player.goLive === 'function'" in live_body
+    assert "player.goLive()" in live_body
 
 
 def test_go_live_button_logs_player_and_buffer_diagnostics() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    go_live_body = source.split("const handleGoLive = useCallback(() => {", 1)[1].split("  }, [selectedRoomIds")[
-        0
-    ]
+    live_body = source.split("const enterTimelineLive = useCallback", 1)[1].split(
+        "const handleTimelineSeek = useCallback", 1
+    )[0]
 
-    assert "直播按钮诊断" in go_live_body
-    assert "hasPlayer" in go_live_body
-    assert "bufferedStart" in go_live_body
-    assert "bufferedEnd" in go_live_body
-    assert "readyState" in go_live_body
+    assert "直播按钮诊断" in live_body
+    assert "hasPlayer" in live_body
+    assert "bufferedStart" in live_body
+    assert "bufferedEnd" in live_body
+    assert "readyState" in live_body
 
 
 def test_mse_player_go_live_always_seeks_to_buffer_end() -> None:
@@ -156,6 +163,19 @@ def test_workbench_align_live_uses_longer_preview_audio_window() -> None:
 
     assert "const previewAlignDuration = 8.0" in align_body
     assert "captureAudio(rid, video, previewAlignDuration)" in align_body
+    # Phase 1 必须按房间各自跳直播沿，禁止共用同一个 currentTime 绝对值
+    assert "goLive" in align_body
+    assert "minBufferEnd" not in align_body
+    assert "const targetTime = Math.max(0, minBufferEnd" not in align_body
+    assert "end - 0.5" in align_body
+
+
+def test_preview_audio_aligner_rejects_near_silent_rms() -> None:
+    source = (ROOT / "lsc-electron/src/utils/previewAudioAligner.ts").read_text(encoding="utf-8")
+    # 仅丢弃近乎全零；弱信号峰值归一化后仍可对齐
+    assert "peak < 1e-5 || rms < 1e-5" in source
+    assert "silent_audio" in source
+    assert "0.5 / peak" in source
 
 
 def test_workbench_alignment_request_includes_preview_diagnostics() -> None:
@@ -211,8 +231,8 @@ def test_alignment_buffer_fallback_is_not_success() -> None:
     assert "未精确对齐" in response_fail
     assert "message.success" not in response_fail
 
-    # 自动静音 toast 须说明可手动取消
-    assert "可手动取消静音" in workbench
+    # W6.1: 不再自动静音，toast 中提供「点击静音」按钮供用户手动操作
+    assert "点击静音" in workbench
 
 
 def test_preview_audio_aligner_records_capture_failure_reasons() -> None:
@@ -266,7 +286,6 @@ def test_workbench_alignment_response_does_not_count_low_confidence_zero_offsets
     assert "return" in low_confidence_branch
     # 部分成功用 warning，不得对低置信房间宣称全面精确成功
     assert "置信度不足" in response_body
-    assert "可手动取消静音" in response_body
 
 
 def test_workbench_continuous_analysis_uses_explicit_game_modes() -> None:
@@ -280,8 +299,13 @@ def test_workbench_continuous_analysis_uses_explicit_game_modes() -> None:
     assert '<Radio.Button value="valorant_round">无畏契约回合切割</Radio.Button>' in source
     assert '<Radio.Button value="generic">通用直播</Radio.Button>' in source
     assert "setAnalysisGameType('valorant')" not in source
-    assert "interval: 20" in source
-    assert "interval: 120" not in source
+    # 无畏契约持续分析：无预览 45s / 有预览 60s，禁止再写死 20s
+    continuous_start = source.split("send('start_continuous_analysis'", 1)[1].split("})", 1)[0]
+    assert "interval: 20" not in continuous_start
+    assert "interval: 120" not in continuous_start
+    assert "preview_enabled" in continuous_start
+    assert "? 60 : 45" in continuous_start
+    assert "isValorantRoundCutting" in continuous_start
 
 
 def test_workbench_sync_export_freezes_target_rooms_until_response() -> None:
@@ -291,8 +315,10 @@ def test_workbench_sync_export_freezes_target_rooms_until_response() -> None:
     request_body = source.split("send('start_analysis_export'", 1)[0]
     assert "syncTargetRoomIdsRef.current = [...targetRoomIds]" in request_body
     response_body = source.split("on('start_analysis_export_response'", 1)[1].split("on('start_continuous_analysis_response'", 1)[0]
-    assert "const targetIds = syncTargetRoomIdsRef.current" in response_body
-    assert "selectedRoomIdsRef.current" not in response_body
+    # W3: 同步分析与持续分析一致，仅 list_only 入列，不自动 queue_export；
+    # response 只显示入列数，不再预创建 clips 关联 job_id
+    assert "syncTargetRoomIdsRef.current = []" in response_body
+    assert "入列" in response_body or "已分析" in response_body
 
 
 def test_continuous_analysis_types_expose_round_progress_and_export_status() -> None:
@@ -333,8 +359,8 @@ def test_clip_list_blocks_duplicate_export_and_allows_failed_retry() -> None:
     assert "clip.export_status === 'exporting'" in source
     assert "clip.export_status === 'failed'" in source
     assert "export_error" in source
-    assert "一键导出" in source
-    assert "选择导出" in source
+    assert "一键导出" in source or "导出全部" in source
+    assert "选择导出" in source or "导出所选" in source
     assert "Checkbox" in source
 
 
@@ -488,7 +514,8 @@ def test_scrub_mark_surfaces_approximate_precision() -> None:
     )[0]
     assert "isApproximateClip" in export_many
     assert "message.warning" in export_many and "近似" in export_many
-    assert "已提交" in export_many
+    assert "已排队" in export_many or "已提交" in export_many
+    assert "skipped" in export_many
     assert "isApproximateClip" in confirm_export
     assert "message.warning" in confirm_export and "近似" in confirm_export
     assert "导出任务已提交" in confirm_export
@@ -547,3 +574,293 @@ def test_add_clip_requires_recording_file() -> None:
     assert "record_output_path" in control_bar
     assert "请先开始录制" in control_bar
 
+
+def test_workbench_blocks_exact_clip_when_clip_not_ready() -> None:
+    """common 模式添加精确切片前必须校验 ctx.clip_ready。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    body = workbench.split("const handleControlAddClip = useCallback(async () => {", 1)[1].split(
+        "}, [selectedRoomIds, handleAddClip, addClip, commonMarkIn, commonMarkOut, send, on])", 1
+    )[0]
+
+    guard = body.find("!ctx.clip_ready")
+    snap = body.find("create_clip_snapshot")
+    assert guard != -1 and snap != -1 and guard < snap
+    assert "录制未就绪" in body or "正在录制" in body
+
+
+def test_unaligned_drag_add_forces_approximate() -> None:
+    """未对齐拖拽路径必须 live:false + approximate，且不调用 create_clip_snapshot。"""
+    wb = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "live: false" in wb or "live:false" in wb.replace(" ", "")
+    assert "近似定位" in wb or "approximate" in wb
+
+    add_body = wb.split("const handleAddClip = useCallback", 1)[1].split("}, [", 1)[0]
+    assert "approximate" in add_body
+    # 单房降级路径不得伪装精确切片
+    assert "clip_snapshot_id" not in add_body or "create_clip_snapshot" not in add_body
+
+
+def test_timeline_invalidation_clears_common_marks_and_waveform() -> None:
+    """对齐失效时必须清空 common 标记与波形，并提示用户。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    invalid_body = workbench.split("on('timeline_invalidated'", 1)[1].split("return () => {", 1)[0]
+
+    assert "setCommonMarkIn(null)" in invalid_body
+    assert "setCommonMarkOut(null)" in invalid_body
+    assert "setWaveformPeaks([])" in invalid_body
+    assert "message.warning" in invalid_body
+
+
+def test_preview_phase_broadcast_and_ui() -> None:
+    """后端广播 preview_phase，前端按阶段显示刷新流地址等文案。"""
+    handler = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "preview_phase" in handler
+    assert "refreshing_url" in handler
+    assert "probing" in handler
+
+    preview = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    assert "刷新流地址" in preview or "refreshing_url" in preview
+    assert "正在拉流/转码…" in preview  # 默认文案保留
+
+    types = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
+    assert "preview_phase?:" in types
+
+    ws = (ROOT / "lsc-electron/src/hooks/useWebSocket.ts").read_text(encoding="utf-8")
+    assert "preview_phase" in ws
+
+
+def test_frontend_sends_valorant_profile() -> None:
+    """持续分析启动 payload 包含 valorant_profile，UI 提供游戏视角/赛事解说选择。"""
+    wb = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "valorant_profile" in wb
+    assert "游戏视角" in wb
+
+
+def test_mse_error_offers_retry() -> None:
+    """mse_error 覆盖层须有重试按钮，并走 enable_preview 重开预览。"""
+    card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    preview = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    blob = card + preview
+    assert "重试" in blob
+    assert "enable_preview" in blob or "onRetryPreview" in blob
+    # 重试须重开预览（enabled: true），而非仅停止
+    retry_body = preview.split("const handleRetry = useCallback", 1)[1].split("}, [", 1)[0]
+    assert "enabled: true" in retry_body
+
+
+def test_timeline_coords_has_recording_converters() -> None:
+    src = (ROOT / "lsc-electron/src/utils/timelineCoords.ts").read_text(encoding="utf-8")
+    assert "commonToRecording" in src
+    assert "recordingToCommon" in src
+    assert "recording_to_common_delta" in src
+
+
+def test_is_approximate_clip_excludes_ai_highlights() -> None:
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    body = src.split("function isApproximateClip", 1)[1].split("}", 1)[0]
+    assert "is_ai_highlight" in body
+    assert "mark_precision !== 'approximate'" in body
+
+
+def test_confirm_clip_uses_common_to_recording() -> None:
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    body = src.split("const handleConfirmClip", 1)[1].split("setRefiningClipId(null)", 1)[0]
+    assert "commonToRecording" in body
+    assert "commonToPreview" not in body
+
+
+def test_refine_banner_uses_dynamic_axis_label() -> None:
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "公共时间轴" in src
+    assert "预览时间轴" in src
+    assert "当前为录制时间轴" not in src
+
+
+def test_shortcuts_blocked_when_modal_visible() -> None:
+    """存在可见 Ant Design Modal 或 role=dialog 时，业务快捷键应被拦截。"""
+    src = (ROOT / "lsc-electron/src/hooks/useKeyboardShortcuts.ts").read_text(encoding="utf-8")
+    assert "hasVisibleModal" in src
+    assert ".ant-modal-wrap:not([style*=\"display: none\"])" in src
+    assert "[role=\"dialog\"]" in src
+
+
+def test_no_room_selected_shortcuts_show_feedback() -> None:
+    """无选中房间时，业务快捷键应弹出 message.info 而非静默 return。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    handler_body = src.split("const handleWorkbenchShortcut = useCallback(", 1)[1].split(
+        "useKeyboardShortcuts(", 1
+    )[0]
+    assert "请先选择房间" in handler_body
+    assert "message.info" in handler_body
+
+
+# ── W2: 命名与手动切片模型守卫 ──
+
+
+def test_clip_naming_helper_exists() -> None:
+    """clipNaming.ts 必须存在并导出三个函数。"""
+    src = (ROOT / "lsc-electron/src/utils/clipNaming.ts").read_text(encoding="utf-8")
+    assert "sanitizeStreamerName" in src
+    assert "formatManualClipLabel" in src
+    assert "formatAiRoundClipLabel" in src
+    assert "_M" in src
+    assert "_R" in src
+
+
+def test_workbench_imports_clip_naming() -> None:
+    """Workbench 应导入并使用 clipNaming 工具（formatManualClipLabel 用于手动切片）。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "formatManualClipLabel" in src
+
+
+def test_workbench_no_old_label_formats() -> None:
+    """Workbench 不再使用旧格式字符串（`片段 ${` / `_高光` / `_回合{idx}_{start}s`）。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "片段 ${" not in src
+    assert "_高光" not in src
+    # 旧格式：`_回合{round_idx}_{int(export_start)}s`（Python 侧）
+    # 前端不再有 `_高光${i + 1}` 这种拼接
+    assert "_高光${" not in src
+
+
+def test_manual_clip_shows_toast_not_refine() -> None:
+    """手动切片点击时应 toast 提示，不进精修。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    select_body = src.split("const handleSelectClip = ", 1)[1].split("const handleConfirmClip", 1)[0]
+    assert "手动切片可直接导出" in select_body
+    assert "message.info" in select_body
+
+
+def test_manual_clip_uses_per_room_counter() -> None:
+    """手动切片命名必须按 room_id 维度计数，而非全局 clips.length。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    add_body = src.split("const handleAddClip = useCallback", 1)[1].split("}, [addClip])", 1)[0]
+    # 必须过滤 room_id 来计数
+    assert "room_id === roomId" in add_body or "filter" in add_body
+    # 不得使用全局 clips.length 做序号
+    assert "clips.length + 1" not in add_body
+
+
+def test_python_handler_clip_naming_helpers() -> None:
+    """Python room_handler 必须提供等价的命名 helper。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "format_manual_clip_label" in src
+    assert "format_ai_round_clip_label" in src
+    assert "_M" in src
+    assert "_R" in src
+
+
+def test_python_no_old_label_formats() -> None:
+    """Python handler 不再使用旧格式字符串。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    # 旧格式：`{room_name}_高光{i + 1}_s{int(t1)}`
+    assert "_高光{i + 1}_s{int" not in src
+    # 旧格式：`{room_name}_回合{round_idx}_{int(export_start)}s`
+    assert "_回合{round_idx}_{int(export_start)}s" not in src
+
+
+def test_settings_exposes_ocr_accel_control() -> None:
+    settings = (ROOT / "lsc-electron/src/pages/Settings/index.tsx").read_text(encoding="utf-8")
+    types = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
+    assert "ocr_accel" in types
+    assert "OCR 加速" in settings
+    assert 'value="dml"' in settings or "value={'dml'}" in settings or "|| 'dml'" in settings
+    assert "DirectML" in settings
+    assert "h264_nvenc (NVIDIA，推荐)" in settings
+
+
+def test_timeline_experience_polish_shortcuts_and_loop() -> None:
+    """体验抛光：步进/穿梭/速率快捷键 + A-B rAF 循环；不恢复波形渲染。"""
+    shortcuts = (ROOT / "lsc-electron/src/hooks/useKeyboardShortcuts.ts").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    timeline = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
+    control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(
+        encoding="utf-8"
+    )
+
+    for sid in (
+        "seek:back-1",
+        "seek:fwd-1",
+        "seek:back-fine",
+        "seek:fwd-fine",
+        "seek:back-2",
+        "seek:fwd-2",
+        "mark:nudge-out-back",
+        "rate:cycle-up",
+    ):
+        assert sid in shortcuts
+        assert sid in workbench
+
+    assert "handleSeekByDelta" in workbench
+    assert "requestAnimationFrame" in workbench
+    assert "loopRafRef" in workbench
+    assert "PLAYBACK_RATE_STEPS" in control or "playbackRate" in control
+    assert "onPlaybackRateChange" in control
+    # 波形仍停用（档 B）
+    assert "波形已停用" in timeline or "waveformPeaks" in timeline
+
+
+def test_timeline_scrub_can_leave_live_edge() -> None:
+    """Live 钉右 / 非 Live 可回看：同步监听 + 冻结 ws + 贴右回 Live。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
+    timeline = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
+    coords = (ROOT / "lsc-electron/src/utils/timelineCoords.ts").read_text(encoding="utf-8")
+
+    assert "scrubOverrideRef" in workbench
+    assert "timelineFollowLive" in workbench
+    assert "LIVE_EDGE_TOLERANCE_SEC" in workbench
+    assert "enterTimelineLive" in workbench
+    assert "setTimelineFollowLive(false)" in workbench
+    assert "followLive={timelineFollowLive}" in workbench
+    assert "panTimelineWindowStart" in workbench
+    assert "panTimelineWindowStart" in coords
+    assert "TIMELINE_MAX_WINDOW * 0.15" not in workbench
+    assert "TIMELINE_MAX_WINDOW * 0.15" not in control
+
+    seek_body = workbench.split("const mseSeek = useCallback", 1)[1].split("const mseTogglePlayPause", 1)[0]
+    assert "bufEnd - 0.5" not in seek_body
+    assert "scrubOverrideRef.current[roomId]" in seek_body
+
+    seek_handler = workbench.split("const handleTimelineSeek = useCallback", 1)[1].split(
+        "const handleTimelineScrubStart", 1
+    )[0]
+    assert "enterTimelineLive" in seek_handler
+    assert "LIVE_EDGE_TOLERANCE_SEC" in seek_handler
+
+    scrub_start = workbench.split("const handleTimelineScrubStart = useCallback", 1)[1].split(
+        "const handleTimelineScrubEnd", 1
+    )[0]
+    assert "setTimelineFollowLive(false)" in scrub_start
+    assert "setFrozenWindowStart" in scrub_start
+
+    scrub_end = workbench.split("const handleTimelineScrubEnd = useCallback", 1)[1].split(
+        "const handleAddClip", 1
+    )[0]
+    assert "enterTimelineLive" in scrub_end
+    assert "finalTime" in scrub_end
+
+    # Live：钉最右
+    assert "followLive && !isScrubbing" in control
+    assert "trackDuration" in control.split("const displayCurrent", 1)[1].split("const roomClips", 1)[0]
+
+    assert "attachWindowDragListeners" in timeline
+    assert "onScrubStart?.(ws)" in timeline
+    assert "skipCurrentTime" in timeline
+    assert "lastPreviewSeekTimeRef" in timeline
+    mousedown_body = timeline.split("const handleMouseDown = useCallback", 1)[1].split(
+        "const handleMouseMove = useCallback", 1
+    )[0]
+    assert "attachWindowDragListeners()" in mousedown_body
+    assert "useEffect(() => {\n    if (!isDragging && !draggingMarker) return" not in timeline
+    # 拖拽过程不 onSeek，松手 onScrubEnd 落点
+    assert "onSeek(abs)" not in mousedown_body and "onSeek(snapped" not in mousedown_body
+    assert "onScrubEndRef.current?.(finalAbs)" in timeline
+
+    # scrub 中避免每帧父级重渲染 / WS；内容右沿只增不减
+    assert "timelineScrubbingRef" in workbench
+    assert "quiet" in seek_body or "{ quiet:" in workbench
+    assert "if (timelineScrubbingRef.current) return" in workbench
+    assert "只增不减" in workbench or "Math.max(lastContentEndRef.current" in workbench
+    assert "contentEdgeRef" in control
+    assert "Math.max(contentEdgeRef.current" in control

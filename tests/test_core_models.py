@@ -134,7 +134,7 @@ class TestClip:
 class TestExportOptions:
     def test_default_options(self):
         opts = ExportOptions()
-        assert opts.codec == "libx264"
+        assert opts.codec == "h264_nvenc"
         assert opts.crf == 23
         assert opts.preset == "medium"
         assert opts.audio_bitrate == "128k"

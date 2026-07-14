@@ -221,9 +221,9 @@ def test_douyin_adapter_wraps_existing_parser(monkeypatch):
 
     class FakeDouyinModule:
         @staticmethod
-        def fetch_page(url):
+        def fetch_page(url, cookies=None):
             assert url == "https://live.douyin.com/123456"
-            return "<html>fake</html>"
+            return "<html>fake</html>", None
 
         @staticmethod
         def extract_ssr_data(html):
@@ -240,6 +240,7 @@ def test_douyin_adapter_wraps_existing_parser(monkeypatch):
 
     adapter = DouyinAdapter()
     monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+    monkeypatch.setattr(adapter, "_get_douyin_cookies", lambda: {"ttwid": "x"})
 
     info = adapter.parse("https://live.douyin.com/123456")
 
@@ -262,9 +263,9 @@ def test_douyin_adapter_returns_parse_failed_when_fetch_page_is_empty(monkeypatc
 
     class FakeDouyinModule:
         @staticmethod
-        def fetch_page(url):
+        def fetch_page(url, cookies=None):
             assert url == "https://live.douyin.com/123456"
-            return ""
+            return None, "HTTP 403"
 
         @staticmethod
         def extract_ssr_data(html):
@@ -272,12 +273,14 @@ def test_douyin_adapter_returns_parse_failed_when_fetch_page_is_empty(monkeypatc
 
     adapter = DouyinAdapter()
     monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+    monkeypatch.setattr(adapter, "_get_douyin_cookies", lambda: {"ttwid": "x"})
 
     info = adapter.parse("https://live.douyin.com/123456")
 
     assert info.platform == "douyin"
     assert info.is_live is False
     assert info.error_code == ERROR_PARSE_FAILED
+    assert "HTTP 403" in info.error
     assert info.headers["Referer"] == "https://live.douyin.com/"
 
 
@@ -287,9 +290,9 @@ def test_douyin_adapter_returns_offline_when_not_live_or_missing_stream(monkeypa
 
     class FakeDouyinModule:
         @staticmethod
-        def fetch_page(url):
+        def fetch_page(url, cookies=None):
             assert url == "https://live.douyin.com/123456"
-            return "<html>fake</html>"
+            return "<html>fake</html>", None
 
         @staticmethod
         def extract_ssr_data(html):
@@ -303,6 +306,7 @@ def test_douyin_adapter_returns_offline_when_not_live_or_missing_stream(monkeypa
 
     adapter = DouyinAdapter()
     monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+    monkeypatch.setattr(adapter, "_get_douyin_cookies", lambda: {"ttwid": "x"})
 
     info = adapter.parse("https://live.douyin.com/123456")
 
@@ -310,6 +314,50 @@ def test_douyin_adapter_returns_offline_when_not_live_or_missing_stream(monkeypa
     assert info.is_live is False
     assert info.error_code == ERROR_OFFLINE
     assert info.raw["isLive"] is False
+
+
+def test_douyin_adapter_requires_cookies_instead_of_claiming_offline(monkeypatch):
+    from lsc.platforms.base import ERROR_RESTRICTED
+    from lsc.platforms.douyin import DouyinAdapter
+
+    adapter = DouyinAdapter()
+    monkeypatch.setattr(adapter, "_get_douyin_cookies", lambda: {})
+    monkeypatch.setattr(
+        adapter,
+        "_load_script_module",
+        lambda: (_ for _ in ()).throw(AssertionError("should not fetch without cookies")),
+    )
+
+    info = adapter.parse("https://live.douyin.com/123456")
+    assert info.error_code == ERROR_RESTRICTED
+    assert "Cookie" in info.error
+
+
+def test_douyin_adapter_detects_verify_page(monkeypatch):
+    from lsc.platforms.base import ERROR_RESTRICTED
+    from lsc.platforms.douyin import DouyinAdapter
+
+    class FakeDouyinModule:
+        @staticmethod
+        def fetch_page(url, cookies=None):
+            return (
+                "<html><head><title>验证码中间页</title>"
+                "<script src='https://lf-cdn-tos.bytescm.com/obj/static/sec_sdk_build/3.5.2/captcha.js'></script>"
+                "</head><body></body></html>",
+                None,
+            )
+
+        @staticmethod
+        def extract_ssr_data(html):
+            raise AssertionError("should not parse captcha html")
+
+    adapter = DouyinAdapter()
+    monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+    monkeypatch.setattr(adapter, "_get_douyin_cookies", lambda: {"ttwid": "stale"})
+
+    info = adapter.parse("https://live.douyin.com/123456")
+    assert info.error_code == ERROR_RESTRICTED
+    assert "验证" in info.error or "Cookie" in info.error
 
 
 def test_douyin_adapter_does_not_claim_non_live_douyin_pages():

@@ -13,6 +13,7 @@ from .base import (
     DEFAULT_USER_AGENT,
     ERROR_OFFLINE,
     ERROR_PARSE_FAILED,
+    ERROR_RESTRICTED,
     BasePlatformAdapter,
     StreamInfo,
     fetch_json,
@@ -20,6 +21,33 @@ from .base import (
 )
 
 _log = logging.getLogger(__name__)
+
+_COOKIE_HELP = (
+    "请在浏览器登录抖音后，用 Cookie 插件导出 JSON，"
+    "到本应用「设置 → 抖音 Cookie」粘贴保存，"
+    "或写入 ~/.lsc/cookies/douyin.json。"
+)
+
+
+def _is_douyin_verify_page(html: str) -> bool:
+    """抖音反爬验证页（无登录 Cookie 时常见），不含直播 SSR 数据。"""
+    if not html:
+        return False
+    sample = html[:8000]
+    lowered = sample.lower()
+    if "验证码中间页" in sample or "验证中间页" in sample:
+        return True
+    if "sec_sdk_build" in lowered and "captcha" in lowered:
+        return True
+    title_match = re.search(r"<title[^>]*>([^<]*)</title>", sample, re.IGNORECASE)
+    if title_match and "验证" in title_match.group(1):
+        return True
+    return "captcha-verify" in lowered
+
+
+def _cookie_required_error(*, reason: str = "") -> str:
+    prefix = reason.strip() or "抖音反爬已拦截请求（返回验证页而非直播数据）"
+    return f"{prefix}。Chrome 新版 Cookie 无法自动读取，{_COOKIE_HELP}"
 
 DOUYIN_HEADERS = {
     "Referer": "https://live.douyin.com/",
@@ -56,13 +84,11 @@ class DouyinAdapter(BasePlatformAdapter):
             return True
 
         # 关注直播URL: www.douyin.com/follow/live/xxx
-        if host in self._USER_HOSTS and bool(_FOLLOW_LIVE_RE.fullmatch(path)):
-            return True
-
-        return False
+        return host in self._USER_HOSTS and bool(_FOLLOW_LIVE_RE.fullmatch(path))
 
     def parse(self, url: str) -> StreamInfo:
         clean_url = (url or "").strip()
+        _log.info("Douyin: parsing %s", clean_url[:80])
         parsed = urlparse(clean_url)
         host = parsed.netloc.lower()
         path = parsed.path.rstrip("/")
@@ -162,10 +188,31 @@ class DouyinAdapter(BasePlatformAdapter):
     def _parse_live_room(self, url: str) -> StreamInfo:
         """解析直播间URL。"""
         try:
+            # 获取抖音登录态 Cookie，绕过反爬验证页面（验证中间页/CAPTCHA）
+            cookies = self._get_douyin_cookies()
+            if not cookies:
+                _log.warning("Douyin parse aborted: no usable cookies url=%s", url[:80])
+                return self._failed(
+                    url,
+                    _cookie_required_error(reason="未检测到有效的抖音登录 Cookie"),
+                    ERROR_RESTRICTED,
+                )
             module = self._load_script_module()
-            html = module.fetch_page(url)
+            html, fetch_err = module.fetch_page(url, cookies=cookies)
             if not html:
-                return self._failed(url, "无法获取抖音直播间页面。", ERROR_PARSE_FAILED)
+                if fetch_err:
+                    msg = f"无法获取抖音直播间页面：{fetch_err}。请检查网络连接或稍后重试。"
+                else:
+                    msg = "无法获取抖音直播间页面。请检查网络连接或稍后重试。"
+                _log.warning("Douyin fetch failed url=%s err=%s", url[:80], fetch_err)
+                return self._failed(url, msg, ERROR_PARSE_FAILED)
+            if _is_douyin_verify_page(html):
+                _log.warning("Douyin verify/captcha page url=%s cookies=%d", url[:80], len(cookies))
+                return self._failed(
+                    url,
+                    _cookie_required_error(reason="抖音返回了验证中间页，当前 Cookie 无效或已过期"),
+                    ERROR_RESTRICTED,
+                )
             data = module.extract_ssr_data(html) or {}
         except Exception as exc:
             return self._failed(url, f"抖音直播间解析失败: {exc}", ERROR_PARSE_FAILED)
@@ -178,6 +225,7 @@ class DouyinAdapter(BasePlatformAdapter):
                 if is_live_flag and not stream_url:
                     error_msg = "抖音直播间流地址已过期，请重新连接获取新地址。"
                 else:
+                    # 有 Cookie 且非验证页时，才判定为真正未开播
                     error_msg = "抖音直播间未开播。"
             return self._failed(
                 url,
@@ -258,6 +306,19 @@ class DouyinAdapter(BasePlatformAdapter):
             raw={},  # discard extracted SSR payload on success to save memory
             category=category,
         )
+
+    def _get_douyin_cookies(self) -> dict[str, str]:
+        """获取抖音登录态 Cookie，用于绕过反爬验证页面。
+
+        抖音会在请求无登录态时返回"验证中间页"（含 CAPTCHA JS），
+        导致 SSR 数据解析失败、房间显示为"未开播"。
+        """
+        try:
+            from .cookie_helper import get_douyin_cookies
+            return get_douyin_cookies()
+        except Exception as exc:
+            _log.debug("获取抖音Cookie失败: %s", exc)
+            return {}
 
     def _failed(self, url: str, error: str, code: str, raw: dict | None = None) -> StreamInfo:
         """Failed result always carries Douyin request headers."""

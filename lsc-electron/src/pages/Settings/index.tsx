@@ -1,19 +1,21 @@
-import { useEffect, useState } from 'react'
-import { Button, message, Tooltip } from 'antd'
+import { useEffect, useState, useRef } from 'react'
+import { Button, message, Tooltip, Slider, Input } from 'antd'
 import { FolderOpenOutlined, ReloadOutlined, CheckCircleFilled, CloseCircleFilled, DownloadOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import LogViewer from '@/components/LogViewer'
 import { RecordSettings, AppSettings } from '@/types'
+import { EXPORT_PRESETS } from '@/services/exportPresets'
 
 export default function Settings() {
-  const { isConnected, send } = useWebSocket()
+  const { isConnected, send, on } = useWebSocket()
   const settings = useAppStore((state) => state.settings)
   const setSettings = useAppStore((state) => state.setSettings)
   const appSettings = useAppStore((state) => state.appSettings)
   const setAppSettings = useAppStore((state) => state.setAppSettings)
   const dependencyStatus = useAppStore((state) => state.dependencyStatus)
   const [checkingDeps, setCheckingDeps] = useState(false)
+  const depCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [appVersion, setAppVersion] = useState('')
   const [updateStatus, setUpdateStatus] = useState<{
     type: 'checking' | 'available' | 'not-available' | 'error'
@@ -22,10 +24,17 @@ export default function Settings() {
     releaseUrl?: string
     releaseNotes?: string
   } | null>(null)
+  const [douyinCookieText, setDouyinCookieText] = useState('')
+  const [douyinCookieStatus, setDouyinCookieStatus] = useState<{
+    configured?: boolean
+    count?: number
+    keys?: string[]
+  } | null>(null)
+  const [savingDouyinCookie, setSavingDouyinCookie] = useState(false)
 
   useEffect(() => {
     // 获取应用版本号
-    window.electronAPI?.getAppVersion().then((v: string) => setAppVersion(v))
+    window.electronAPI?.getAppVersion().then((v: string) => setAppVersion(v)).catch((e: unknown) => console.error('[Settings] getAppVersion failed:', e))
 
     // 监听更新状态
     window.electronAPI?.onUpdateStatus((status: any) => {
@@ -42,14 +51,61 @@ export default function Settings() {
       send('get_settings', {})
       setCheckingDeps(true)
       send('check_dependencies', {})
+      send('get_douyin_cookie_status', {})
     }
   }, [isConnected, send])
+
+  useEffect(() => {
+    const unsubs = [
+      on('get_douyin_cookie_status_response', (data: {
+        success?: boolean
+        configured?: boolean
+        count?: number
+        keys?: string[]
+        error?: string
+      }) => {
+        if (data?.success === false && data.error) {
+          message.error(`读取抖音 Cookie 状态失败：${data.error}`)
+          return
+        }
+        setDouyinCookieStatus({
+          configured: !!data?.configured,
+          count: data?.count || 0,
+          keys: data?.keys || [],
+        })
+      }),
+      on('save_douyin_cookies_response', (data: {
+        success?: boolean
+        configured?: boolean
+        count?: number
+        keys?: string[]
+        error?: string
+      }) => {
+        setSavingDouyinCookie(false)
+        if (!data?.success) {
+          message.error(data?.error || '保存抖音 Cookie 失败')
+          return
+        }
+        setDouyinCookieStatus({
+          configured: !!data.configured,
+          count: data.count || 0,
+          keys: data.keys || [],
+        })
+        setDouyinCookieText('')
+        message.success(`抖音 Cookie 已保存（${data.count || 0} 项），请重新连接直播间`)
+      }),
+    ]
+    return () => unsubs.forEach((u) => u())
+  }, [on])
 
   const handleRecheckDeps = () => {
     if (!isConnected) return
     setCheckingDeps(true)
     send('check_dependencies', {})
-    setTimeout(() => setCheckingDeps(false), 5000)
+    depCheckTimerRef.current = setTimeout(() => {
+      depCheckTimerRef.current = null
+      setCheckingDeps(false)
+    }, 5000)
   }
 
   // 依赖检测响应可能通过 check_dependencies_response 事件异步到达，
@@ -60,8 +116,8 @@ export default function Settings() {
 
   // 启动时从主进程同步开机自启/最小化到托盘的真实状态，避免与前端 store 不一致
   useEffect(() => {
-    window.app?.getAutoLaunch().then((v) => setAppSettings({ autoLaunch: v }))
-    window.app?.getMinimizeToTray().then((v) => setAppSettings({ minimizeToTray: v }))
+    window.app?.getAutoLaunch().then((v) => setAppSettings({ autoLaunch: v })).catch((e: unknown) => console.error('[Settings] getAutoLaunch failed:', e))
+    window.app?.getMinimizeToTray().then((v) => setAppSettings({ minimizeToTray: v })).catch((e: unknown) => console.error('[Settings] getMinimizeToTray failed:', e))
   }, [setAppSettings])
 
   const handleRecordChange = <K extends keyof RecordSettings>(key: K, value: RecordSettings[K]) => {
@@ -140,23 +196,22 @@ export default function Settings() {
     }
   }
 
+  const handleSaveDouyinCookies = () => {
+    if (!douyinCookieText.trim()) {
+      message.warning('请先粘贴 Cookie 内容')
+      return
+    }
+    setSavingDouyinCookie(true)
+    send('save_douyin_cookies', { cookies: douyinCookieText })
+  }
+
   return (
-    <div style={{ padding: 24 }}>
-      <div style={{ 
-        display: 'flex', 
-        justifyContent: 'space-between', 
-        alignItems: 'center',
-        marginBottom: 24,
-      }}>
-        <h1 style={{ fontSize: 17, fontWeight: 600, color: 'var(--text-50)', margin: 0 }}>
-          设置
-        </h1>
-        <Button type="primary" onClick={handleSave}>保存设置</Button>
-      </div>
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
 
       <div style={{
         display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))',
+        gridTemplateColumns: '1fr',
         gap: 24,
         width: '100%',
       }}>
@@ -184,21 +239,6 @@ export default function Settings() {
               >
                 <option value="dark">深色</option>
                 <option value="light">浅色</option>
-              </select>
-            </SettingsRow>
-            <SettingsRow label="语言">
-              <select
-                value={appSettings.language}
-                onChange={e => {
-                  const newLang = e.target.value as AppSettings['language']
-                  setAppSettings({ language: newLang })
-                  send('save_settings', { ...settings, appSettings: { ...appSettings, language: newLang } })
-                }}
-                className="settings-select"
-              >
-                <option value="zh-CN">简体中文</option>
-                <option value="zh-TW">繁體中文</option>
-                <option value="en">English</option>
               </select>
             </SettingsRow>
             <SettingsRow label="开机自启">
@@ -317,14 +357,40 @@ export default function Settings() {
                 <option value="流畅">流畅 360p</option>
               </select>
             </SettingsRow>
-            <SettingsRow label="共享进样">
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end', maxWidth: 360 }}>
-                <ToggleSwitch
-                  checked={!!settings.shared_ingest_enabled}
-                  onChange={(v) => handleRecordChange('shared_ingest_enabled', v)}
-                />
+             <SettingsRow label="共享进样">
+               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end', maxWidth: 360 }}>
+                 <ToggleSwitch
+                   checked={!!settings.shared_ingest_enabled}
+                   onChange={(v) => {
+                     handleRecordChange('shared_ingest_enabled', v)
+                     send('save_settings', { ...settings, shared_ingest_enabled: v, appSettings })
+                     message.success(v ? '已开启共享进样（新预览/录制生效）' : '已关闭共享进样（新预览/录制生效）', 2)
+                   }}
+                 />
                 <div style={{ fontSize: 11, color: 'var(--state-warning)', lineHeight: 1.5, textAlign: 'right' }}>
                   开启后预览与录制共用同一进程：录制中断会导致预览中断，预览转码可能影响录制稳定性。
+                </div>
+              </div>
+            </SettingsRow>
+            <SettingsRow label="OCR 加速">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end', maxWidth: 360 }}>
+                <select
+                  value={settings.ocr_accel || 'dml'}
+                  onChange={(e) => {
+                    const v = e.target.value as 'auto' | 'dml' | 'cuda' | 'cpu'
+                    handleRecordChange('ocr_accel', v)
+                    send('save_settings', { ...settings, ocr_accel: v, appSettings })
+                    message.success('OCR 加速已保存（下次识别生效）', 2)
+                  }}
+                  className="settings-select"
+                >
+                  <option value="dml">DirectML（Windows GPU，推荐）</option>
+                  <option value="auto">自动</option>
+                  <option value="cuda">CUDA（NVIDIA）</option>
+                  <option value="cpu">仅 CPU</option>
+                </select>
+                <div style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.5, textAlign: 'right' }}>
+                  持续分析 OCR 推理加速；自动会探测并选最快后端，弱核显可能回退 CPU。
                 </div>
               </div>
             </SettingsRow>
@@ -334,13 +400,13 @@ export default function Settings() {
                 onChange={e => handleRecordChange('encoder', e.target.value)}
                 className="settings-select"
               >
-                <option value="libx264">libx264</option>
-                <option value="libx265">libx265</option>
-                <option value="copy">copy</option>
-                <option value="h264_nvenc">h264_nvenc (NVIDIA)</option>
+                <option value="h264_nvenc">h264_nvenc (NVIDIA，推荐)</option>
                 <option value="hevc_nvenc">hevc_nvenc (NVIDIA)</option>
                 <option value="h264_qsv">h264_qsv (Intel)</option>
                 <option value="h264_amf">h264_amf (AMD)</option>
+                <option value="copy">copy（直拷，最省）</option>
+                <option value="libx264">libx264（CPU）</option>
+                <option value="libx265">libx265（CPU）</option>
               </select>
             </SettingsRow>
             <SettingsRow label="编码参数">
@@ -350,7 +416,7 @@ export default function Settings() {
                 className="settings-select"
               >
                 <option value="CRF 质量">CRF 质量</option>
-                <option value="码率限制">码率限制</option>
+                 <option value="自定义码率">自定义码率</option>
                 <option value="不限制">不限制</option>
               </select>
             </SettingsRow>
@@ -366,7 +432,7 @@ export default function Settings() {
                 <option value="slow">slow（慢速）</option>
               </select>
             </SettingsRow>
-            {settings.param_mode === '码率限制' && settings.encoder !== 'copy' && (
+             {settings.param_mode === '自定义码率' && settings.encoder !== 'copy' && (
               <SettingsRow label="码率">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                   <select
@@ -391,16 +457,26 @@ export default function Settings() {
                 </div>
               </SettingsRow>
             )}
-            <SettingsRow label="CRF">
-              <input 
-                type="number" 
-                value={settings.crf}
-                onChange={e => handleRecordChange('crf', parseInt(e.target.value))}
-                min={0}
-                max={51}
-                className="settings-number"
-              />
-            </SettingsRow>
+            {settings.param_mode === 'CRF 质量' && settings.encoder !== 'copy' && (
+              <SettingsRow label="CRF">
+                <div style={{ width: '100%', padding: '0 4px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-tertiary)' }}>
+                    <span>18（高质量，大体积）</span>
+                    <span style={{ fontWeight: 600, color: 'var(--brand-400)' }}>CRF {settings.crf}</span>
+                    <span>28（低质量，小体积）</span>
+                  </div>
+                  <Slider
+                    min={18}
+                    max={28}
+                    value={settings.crf}
+                    onChange={(v) => handleRecordChange('crf', v)}
+                    marks={{ 18: '', 23: '23', 28: '' }}
+                    tooltip={{ open: false }}
+                    style={{ width: '100%', margin: '4px 0' }}
+                  />
+                </div>
+              </SettingsRow>
+            )}
             <SettingsRow label="录制分辨率">
               <select
                 value={settings.resolution}
@@ -446,7 +522,8 @@ export default function Settings() {
                   padding: '6px 12px',
                   fontSize: 12,
                   fontFamily: 'var(--font-mono)',
-                  maxWidth: 200,
+                  flex: 1,
+                  minWidth: 0,
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
@@ -458,6 +535,36 @@ export default function Settings() {
                   浏览
                 </button>
               </div>
+            </SettingsRow>
+             <SettingsRow label="并发导出数">
+               <select
+                 value={settings.export_max_concurrent ?? 2}
+                 onChange={e => {
+                   const v = Number(e.target.value)
+                   handleRecordChange('export_max_concurrent', v)
+                   send('save_settings', { ...settings, export_max_concurrent: v, appSettings })
+                   message.success(v === 1 ? '已设为单路导出（降低 CPU 负载）' : '已设为双路并发导出', 2)
+                 }}
+                 className="settings-select"
+               >
+                 <option value="2">2 路（默认）</option>
+                 <option value="1">1 路（低负载）</option>
+               </select>
+             </SettingsRow>
+             <SettingsRow label="默认导出预设">
+              <select
+                value={appSettings.default_export_preset || 'douyin_vertical'}
+                onChange={e => {
+                  const newPresetId = e.target.value
+                  setAppSettings({ default_export_preset: newPresetId })
+                  send('save_settings', { ...settings, appSettings: { ...appSettings, default_export_preset: newPresetId } })
+                }}
+                className="settings-select"
+              >
+                {EXPORT_PRESETS.map(p => (
+                  <option key={p.id} value={p.id}>{p.name} — {p.description}</option>
+                ))}
+              </select>
             </SettingsRow>
           </div>
         </div>
@@ -478,29 +585,94 @@ export default function Settings() {
             borderRadius: 14,
             overflow: 'hidden',
           }}>
-            <SettingsRow label="开始/停止录制">
-              <KeyBadge keys={['Ctrl', 'Shift', 'R']} />
+            <SettingsRow label="页面：工作台">
+              <KeyBadge keys={['Ctrl', '1']} />
             </SettingsRow>
-            <SettingsRow label="手动切片">
-              <KeyBadge keys={['Ctrl', 'Shift', 'C']} />
+            <SettingsRow label="页面：设置">
+              <KeyBadge keys={['Ctrl', '2']} />
             </SettingsRow>
-            <SettingsRow label="截图">
-              <KeyBadge keys={['Ctrl', 'Shift', 'S']} />
-            </SettingsRow>
-            <SettingsRow label="设置入点">
-              <KeyBadge keys={['I']} />
-            </SettingsRow>
-            <SettingsRow label="设置出点">
-              <KeyBadge keys={['O']} />
+            <SettingsRow label="刷新页面">
+              <KeyBadge keys={['F5']} />
             </SettingsRow>
             <SettingsRow label="播放/暂停">
               <KeyBadge keys={['Space']} />
             </SettingsRow>
+            <SettingsRow label="标记入点">
+              <KeyBadge keys={['I']} />
+            </SettingsRow>
+            <SettingsRow label="标记出点">
+              <KeyBadge keys={['O']} />
+            </SettingsRow>
+            <SettingsRow label="切换录制">
+              <KeyBadge keys={['R']} />
+            </SettingsRow>
+            <SettingsRow label="静音/取消静音">
+              <KeyBadge keys={['M']} />
+            </SettingsRow>
+            <SettingsRow label="全屏预览">
+              <KeyBadge keys={['F']} />
+            </SettingsRow>
+            <SettingsRow label="批量开始录制">
+              <KeyBadge keys={['Ctrl', 'R']} />
+            </SettingsRow>
+            <SettingsRow label="批量停止录制">
+              <KeyBadge keys={['Ctrl', 'Shift', 'R']} />
+            </SettingsRow>
+            <SettingsRow label="全选房间">
+              <KeyBadge keys={['Ctrl', 'Shift', 'A']} />
+            </SettingsRow>
+            <SettingsRow label="导出切片">
+              <KeyBadge keys={['Ctrl', 'E']} />
+            </SettingsRow>
+          </div>
+        </div>
+
+        {/* 抖音 Cookie */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{
+            fontSize: 13,
+            fontWeight: 600,
+            color: 'var(--text-300)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.04em',
+            padding: '0 4px',
+            marginBottom: 8,
+          }}>抖音 Cookie</div>
+          <div style={{
+            background: 'var(--background-800)',
+            borderRadius: 14,
+            overflow: 'hidden',
+            padding: 16,
+          }}>
+            <div style={{ fontSize: 12, color: 'var(--text-400)', lineHeight: 1.6, marginBottom: 10 }}>
+              Chrome 新版无法自动读取 Cookie。请在浏览器登录抖音后，用 Cookie-Editor 等插件导出 JSON，粘贴到下方并保存，否则直播间会一直连不上（显示验证页/未开播）。
+            </div>
+            <div style={{ fontSize: 12, marginBottom: 10, color: douyinCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
+              {douyinCookieStatus?.configured
+                ? `已配置 ${douyinCookieStatus.count || 0} 项（${(douyinCookieStatus.keys || []).slice(0, 6).join(', ') || '已保存'}）`
+                : '尚未配置有效 Cookie'}
+            </div>
+            <Input.TextArea
+              value={douyinCookieText}
+              onChange={(e) => setDouyinCookieText(e.target.value)}
+              placeholder='支持 JSON 对象/数组，或 ttwid=...; sessionid=... 格式'
+              autoSize={{ minRows: 4, maxRows: 10 }}
+              style={{ marginBottom: 10 }}
+            />
+            <Button
+              type="primary"
+              size="small"
+              loading={savingDouyinCookie}
+              onClick={handleSaveDouyinCookies}
+              disabled={!isConnected}
+            >
+              保存抖音 Cookie
+            </Button>
           </div>
         </div>
 
         {/* 关于 */}
-        <div>
+        <div style={{ marginBottom: 20 }}>
           <div style={{
             fontSize: 13,
             fontWeight: 600,
@@ -570,7 +742,6 @@ export default function Settings() {
             </SettingsRow>
           </div>
         </div>
-      </div>
 
         {/* 日志 */}
         <div style={{ marginBottom: 20 }}>
@@ -591,6 +762,7 @@ export default function Settings() {
             <LogViewer />
           </div>
         </div>
+      </div>
 
       <style>{`
         .settings-select {
@@ -658,6 +830,18 @@ export default function Settings() {
           border-color: var(--brand-500);
         }
       `}</style>
+      </div>
+      {/* 固定底栏 — 保存按钮始终可见 */}
+      <div style={{
+        padding: '12px 16px',
+        borderTop: '1px solid var(--border-default)',
+        background: 'var(--background-800)',
+        display: 'flex',
+        justifyContent: 'flex-end',
+        flexShrink: 0,
+      }}>
+        <Button type="primary" onClick={handleSave}>保存设置</Button>
+      </div>
     </div>
   )
 }
@@ -700,6 +884,8 @@ function SettingsRow({ label, children }: { label: string; children: React.React
       padding: '12px 16px',
       borderBottom: '1px solid var(--border-default)',
       minHeight: 44,
+      flexWrap: 'wrap',
+      gap: 8,
     }}>
       <span style={{ fontSize: 13, fontWeight: 400, color: 'var(--text-50)', whiteSpace: 'nowrap' }}>
         {label}

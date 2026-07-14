@@ -5,6 +5,7 @@
 2. 买枪期剔除——回合起始的低能量买枪/准备期被裁掉，片段从战斗实际开始处起算。
 3. 回合尾冗余裁剪——战斗结束（回合结束钟声）后仅保留短余韵。
 4. 不固定时长——手枪局(~30s)/长枪局(~60-80s)/加时(~80-100s)都能正确分段。
+5. 全回合模式（full_round）——保留买枪期和结尾垃圾时间的完整回合、不削头去尾。
 
 策略：不依赖真实视频/FFmpeg，通过 patch `_extract_rms_envelope` 直接注入合成的
 1s 窗口 RMS 波形，patch `_detect_round_end_chimes` 注入回合结束钟声时间戳，纯 numpy
@@ -181,7 +182,8 @@ class TestRoundCompleteness:
         extract.assert_called_once_with("fake.mp4", "ffmpeg", time_range=(100.0, 220.0))
         assert len(res) == 1
         assert 119.0 <= res[0]["start"] <= 121.0
-        assert 163.0 <= res[0]["end"] <= 165.0
+        # local chime=60 → global 160；+tail_pad
+        assert 160.0 <= res[0]["end"] <= 160.0 + ValorantRoundConfig().tail_pad + 1.0
 
     def test_long_round_not_split_at_midpoint(self):
         """加时长回合(~95s)不被 max_combat_duration 中点强切成两段。
@@ -574,9 +576,9 @@ class TestOcrConfirmedBoundaryPriority:
         # OCR 确认的回合 tail_by 应为 ocr_phase，不是 chime
         assert res[0]["tail_by"] == "ocr_phase", \
             f"OCR 确认的回合不应被钟声覆盖: {res[0]['tail_by']}"
-        # end 应基于 OCR end(150) + tail_pad(4) = 154，而非钟声(148)+4=152
-        assert res[0]["end"] == 154.0, \
-            f"OCR end 应 150+4=154, 实际 {res[0]['end']}"
+        # end 应基于 OCR end(150) + tail_pad，而非钟声覆盖
+        assert res[0]["end"] == round(150.0 + cfg.tail_pad, 3), \
+            f"OCR end 应 150+tail_pad={150.0 + cfg.tail_pad}, 实际 {res[0]['end']}"
 
     def test_audio_only_rounds_still_use_chime(self):
         """无 OCR 时（refine_with_ocr=False）仍用钟声裁尾。"""
@@ -742,6 +744,33 @@ class TestOcrOutputBoundaryRegression:
         assert result[0]["ocr_confirmed"] is False
         assert result[0]["tail_by"] == "open_tail"
 
+    def test_ocr_metadata_survives_clamped_segment_end_mismatch(self):
+        """持续分析中 RMS 长度可能短于 OCR end，精确 (start,end) 匹配会丢元数据。
+
+        一旦丢失，full_round 路径会写出 start_by/end_by=full_round，
+        导致 _is_auto_exportable_valorant_round 永远为 False，切片列表为空。
+        """
+        cfg = ValorantRoundConfig(full_round=True, pre_combat_pad=2.0, tail_pad=0.0)
+        # OCR 权威边界 end=153；战斗段被夹断到 len(smoothed)=152
+        phase = [{
+            "start": 40.0,
+            "end": 153.0,
+            "start_by": "ocr_buy_exit",
+            "end_by": "next_buy",
+            "tail_by": "ocr_phase",
+            "ocr_confirmed": True,
+            "ocr_end": None,
+        }]
+        result = _format_output(
+            [(40, 152)], np.ones(152, dtype=np.float32), 1.0, 153.0, cfg,
+            phase_rounds=phase,
+        )
+        assert len(result) == 1
+        assert result[0]["start_by"] == "ocr_buy_exit"
+        assert result[0]["end_by"] == "next_buy"
+        assert result[0]["ocr_confirmed"] is True
+        assert result[0]["start_by"] != "full_round"
+
     def test_phase_rounds_skip_onset_fallback(self):
         fake_onset = types.ModuleType("lsc.analyzer.onset_detector")
         fake_onset.compute_spectral_flux = lambda samples, rate: (np.ones(2), 1)
@@ -770,3 +799,106 @@ class TestOcrOutputBoundaryRegression:
             )
         assert result[0]["start"] == 102.0
         assert result[0]["start_by"] == "ocr_buy_exit"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 9. 全回合模式：保留买枪期 + 结尾垃圾时间
+# ──────────────────────────────────────────────────────────────────────
+class TestFullRoundMode:
+    def test_full_round_audio_uses_modest_pad_not_buy_phase_max(self):
+        """无 OCR 的 full_round 不得用 ±55s buy_phase_max 糊边界；用适度前 pad + 钟声/post_combat 收尾。"""
+        cfg_full = ValorantRoundConfig(full_round=True)
+        # 回合: buy 10-35, combat 35-65, post-combat 65-85
+        rms = _build_rms(rounds=[(10, 35, 65)], total_sec=120)
+        rms[65:85] = 0.5  # 结尾残留能量（结算画面）
+
+        full_res = _run_detect(rms, chimes=[65.0], config=cfg_full)
+
+        assert len(full_res) == 1
+        # 适度前 pad：起点应接近 combat_start，绝不能回退到 buy_phase_max(55)
+        assert full_res[0]["start"] >= 20.0, \
+            f"无 OCR full_round 起点不应扩展整个买枪期, 实际 {full_res[0]['start']}"
+        assert full_res[0]["start"] <= 35.0
+        # 终点应按钟声/post_combat，不得 +buy_phase_max
+        assert full_res[0]["end"] <= 65.0 + 20.0, \
+            f"无 OCR full_round 终点不应 +buy_phase_max, 实际 {full_res[0]['end']}"
+        assert full_res[0]["phase"] == "full_round"
+        assert full_res[0]["start_by"] == "full_round"
+        assert full_res[0]["end_by"] == "full_round"
+
+    def test_full_round_no_overlap(self):
+        """相邻全回合不应有重叠（prev_end / next_start 约束）。"""
+        cfg = ValorantRoundConfig(full_round=True)
+        # 两回合: R1 buy 10-30, combat 30-65; R2 buy 85-105, combat 105-140
+        rms = _build_rms(rounds=[(10, 30, 65), (85, 105, 140)], total_sec=200)
+        rms[65:85] = 0.3
+        rms[140:160] = 0.3
+
+        res = _run_detect(rms, chimes=[65.0, 140.0], config=cfg)
+
+        assert len(res) == 2
+        r1_end = res[0]["end"]
+        r2_start = res[1]["start"]
+        assert r1_end <= r2_start + 1.0, \
+            f"R1 end ({r1_end:.1f}s) 不应重叠 R2 start ({r2_start:.1f}s)"
+
+    def test_full_round_first_round_capped_at_zero(self):
+        """首回合向前扩展不应低于 0。"""
+        cfg = ValorantRoundConfig(full_round=True)
+        rms = _build_rms(rounds=[(5, 8, 40)], total_sec=100)
+
+        res = _run_detect(rms, chimes=[40.0], config=cfg)
+
+        assert len(res) == 1
+        assert res[0]["start"] >= 0.0
+        # 适度前 pad 仍可能贴到 0，但绝不能依赖 buy_phase_max=55
+        assert res[0]["start"] <= 8.0
+
+    def test_full_round_ocr_path_unchanged(self):
+        """全回合模式 + OCR 路径应仍使用 OCR 边界，不受 full_round 影响。"""
+        cfg = ValorantRoundConfig(full_round=True)
+        markers = [
+            {"timestamp": 100.0, "type": "round_start"},
+            {"timestamp": 150.0, "type": "round_end"},
+        ]
+        fake_rms = np.ones(200, dtype=np.float32)
+        fake_rms[105:150] = 2000.0
+
+        with (
+            patch("lsc.analyzer.round_detector._get_duration", return_value=200.0),
+            patch("lsc.analyzer.round_detector._detect_round_phase_markers",
+                  return_value=markers),
+            patch("lsc.analyzer.round_detector._extract_audio_pcm",
+                  return_value=(np.zeros(200 * 8, dtype=np.float32), 8000)),
+            patch("lsc.analyzer.round_detector._compute_rms_envelope",
+                  return_value=fake_rms),
+            patch("lsc.analyzer.round_detector._detect_chimes_from_samples",
+                  return_value=[]),
+            patch("os.path.isfile", return_value=True),
+        ):
+            res = detect_valorant_rounds(
+                "fake.mp4", config=cfg, refine_with_ocr=True, duration=200.0,
+            )
+
+        assert len(res) >= 1
+        # OCR path should still produce OCR-defined start boundaries
+        assert res[0]["start_by"] in ("ocr_buy_exit", "full_round"), \
+            f"OCR 路径应保留 OCR 边界标记或 full_round, 实际 {res[0].get('start_by')}"
+
+
+def test_format_output_accepts_float_second_indices_from_onset() -> None:
+    """Onset 段是 float 秒；_format_output 不得因 float 切片崩溃。"""
+    from lsc.analyzer.round_detector import ValorantRoundConfig, _format_output
+
+    smoothed = np.ones(120, dtype=np.float32) * 2.0
+    cfg = ValorantRoundConfig(full_round=True)
+    # 模拟 onset 返回的 float 秒坐标（旧代码会触发 slice indices must be integers）
+    result = _format_output(
+        [(12.3, 78.9), (90.1, 115.4)],
+        smoothed,
+        threshold=1.0,
+        duration=120.0,
+        cfg=cfg,
+    )
+    assert len(result) == 2
+    assert result[0]["end"] > result[0]["start"]

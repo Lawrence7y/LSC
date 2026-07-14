@@ -16,7 +16,7 @@ export default defineConfig({
             minify: false,
             outDir: 'dist-electron/main',
             rollupOptions: {
-              external: ['electron', 'electron-updater', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
+              external: ['electron', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
             },
           },
         },
@@ -30,7 +30,7 @@ export default defineConfig({
             minify: false,
             outDir: 'dist-electron/preload',
             rollupOptions: {
-              external: ['electron', 'electron-updater', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
+              external: ['electron', 'path', 'fs', 'child_process', 'os', 'crypto', 'stream', 'util', 'url', 'events'],
             },
           },
         },
@@ -43,7 +43,10 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    // 5173 落在本机 Windows 排除端口 5150-5249，会导致 EACCES
+    host: '127.0.0.1',
+    port: 5250,
+    strictPort: true,
   },
   build: {
     outDir: 'dist',

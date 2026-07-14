@@ -14,13 +14,14 @@
     "preview": "vite preview",
     "electron": "vite --config vite.config.ts",
     "electron:build": "tsc --noEmit && vite build && electron-builder",
-    "release": "vite build && electron-builder --publish always"
+    "release": "vite build && electron-builder --publish always",
+    "prep-bundle": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1",
+    "build:full": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1 && tsc --noEmit && vite build && electron-builder"
   },
   "dependencies": {
     "@ant-design/icons": "^5.2.6",
     "antd": "^5.12.0",
     "dayjs": "^1.11.10",
-    "electron-updater": "^6.8.9",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
@@ -61,6 +62,27 @@
       {
         "from": "../scripts",
         "to": "scripts"
+      },
+      {
+        "from": ".bundle/python",
+        "to": "python",
+        "filter": [
+          "**/*",
+          "!__pycache__/**",
+          "!**/__pycache__/**",
+          "!*.pyc",
+          "!Scripts/**",
+          "!pip/**",
+          "!setuptools/**",
+          "!pkg_resources/**"
+        ]
+      },
+      {
+        "from": ".bundle/ffmpeg",
+        "to": "ffmpeg",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "publish": {

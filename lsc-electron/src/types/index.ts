@@ -46,6 +46,8 @@ export interface RoomSession {
   mse_error?: string
   // MSE 预览自动重连状态（后端流断开后自动重试时设置）
   mse_reconnecting?: { attempt: number; maxAttempts: number }
+  // 预览启动阶段进度（refreshing_url=刷新流地址/probing=探测转码/streaming=拉流中/error/idle）
+  preview_phase?: 'idle' | 'refreshing_url' | 'probing' | 'streaming' | 'error'
   // 直播是否在线（false 表示断联）
   is_live?: boolean
   // 当前预览画质
@@ -54,6 +56,9 @@ export interface RoomSession {
   category?: string
   align_group_id?: string
 }
+
+// 切片确认状态（与导出状态正交：确认管可信度，export 管导出队列）
+export type ClipConfirmStatus = 'pending' | 'refining' | 'user_confirmed' | 'ocr_confirmed'
 
 // 切片相关
 export interface ClipSegment {
@@ -70,6 +75,12 @@ export interface ClipSegment {
   job_id?: string
   clip_id?: string
   is_ai_highlight?: boolean
+  /** 切片来源：'manual' = 手动添加, 'ai_highlight' = AI 高光 */
+  source?: 'manual' | 'ai_highlight'
+  /** AI 检出的确认状态（pending/refining/user_confirmed/ocr_confirmed） */
+  confirm_status?: ClipConfirmStatus
+  /** 稳定回合键（与持续分析 _valorant_round_key 一致），用于多房同步 */
+  round_key?: string
   /** 入队时快照的墙钟入点（time.monotonic），导出时优先于房间当前 mark */
   mark_in_wallclock?: number | null
   mark_out_wallclock?: number | null
@@ -115,9 +126,10 @@ export interface RecordSettings {
   preset?: string
   /** 共享进样：单 FFmpeg 同时输出录制与预览 */
   shared_ingest_enabled?: boolean
-  analysis_settings?: {
-    absolute_threshold: number
-  }
+  /** 持续分析 OCR 推理加速：auto / dml / cuda / cpu */
+  ocr_accel?: 'auto' | 'dml' | 'cuda' | 'cpu'
+  /** 最大并发导出数（1 或 2，默认 2） */
+  export_max_concurrent?: number
 }
 
 // 导出预设
@@ -133,12 +145,49 @@ export interface ExportPreset {
   audio_bitrate: string
 }
 
-// WebSocket 消息
-export interface WSMessage {
-  type: string
-  data: any
-  id?: string
+// WebSocket 消息 payload 类型映射（服务端 → 前端广播 + 响应）
+export interface WSPayloadMap {
+  // 生命周期
+  connected: undefined
+  disconnected: undefined
+  reconnecting: undefined
+  reconnect_failed: undefined
+  // 广播
+  rooms_updated: { rooms: RoomSession[] }
+  rooms_loaded: { rooms: RoomSession[] }
+  room_updated: { room_id: string; [key: string]: unknown }
+  mse_init: { room_id: string; data: string }
+  mse_segment: { room_id: string; data: string }
+  mse_error: { room_id: string; error: string }
+  mse_reconnecting: { room_id: string; attempt: number; max_attempts: number }
+  mse_reconnected: { room_id: string; degraded?: boolean; width?: number; height?: number; fps?: number; reason?: string }
+  clip_completed: { job_id: string; output_path: string; room_name?: string; thumbnail_path?: string; clip_id?: string }
+  clip_failed: { error: string; room_name?: string; job_id?: string; clip_id?: string }
+  export_progress: { job_id: string; percent: number; room_name?: string }
+  room_connect_finished: { room_id: string; success: boolean; error: string }
+  recording_started: { room_id: string; success: boolean; error: string }
+  recording_stopped: { room_id: string; reason: string; message: string }
+  recording_queue: { room_id?: string; position?: number; waiting?: boolean }
+  system_stats: { cpu_percent: number; memory: { total: number; used: number; percent: number }; disks: unknown[] }
+  preview_phase: { room_id: string; phase: string }
+  clip_confirm_status: { room_id: string; round_key: string; confirm_status: string; start?: number; end?: number; label?: string }
+  timeline_ready: { timeline: unknown }
+  timeline_invalidated: { timeline_id: string; reason: string }
+  continuous_analysis_status: { room_id: string; stage: string; progress: number; detail?: string; recorded_duration: number; analyzed_duration: number; analysis_stage: string }
+  clip_queued: { clip_id: string; room_id: string; round_key?: string; start: number; end: number; duration: number; score: number; label?: string; deferred?: boolean }
+  analysis_progress: { room_id: string; stage: string; progress: number; detail?: string }
+  highlight_stream: { room_id: string; highlights: unknown[] }
+  continuous_highlights: { room_id: string; highlights: unknown[] }
+  settings_loaded: Record<string, unknown>
+  get_settings_response: Record<string, unknown>
+  enable_preview_response: { success?: boolean; note?: string }
+  request_mse_init_response: { success?: boolean; note?: string; room_id?: string }
+  check_dependencies_response: { python: unknown; ffmpeg: unknown; ffprobe: unknown }
+  clip_export_started: { job_id: string; room_name?: string }
+  continuous_analysis_complete: { room_id: string; total_rounds: number; confirmed_rounds: number; exported_rounds: number; failed_rounds: number }
 }
+
+export type WSMessageType = keyof WSPayloadMap
 
 // API 响应
 export interface ApiResponse<T = any> {
@@ -261,6 +310,17 @@ export interface ContinuousAnalysisStatus {
   effective_interval?: number
   progress?: number
   error?: string
+  // 无畏契约相位调度字段
+  valorant_profile?: 'pov' | 'broadcast'
+  round_phase?: 'unknown' | 'buy' | 'pre_combat' | 'combat' | 'post_combat' | 'intermission'
+  round_phase_detail?: string
+  pending_round?: boolean
+  predicted_wake_at?: number | null
+  predicted_phase?: string | null
+  prediction_detail?: string
+  scan_elapsed_sec?: number
+  worker_job_label?: string
+  scan_running?: boolean
 }
 
 // 主进程暴露的应用 API（与 electron/preload.ts 保持一致）

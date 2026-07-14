@@ -86,15 +86,25 @@ class FrameCaptureWorker:
         return args
 
     def _spawn_process(self) -> subprocess.Popen:
+        from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
+
         args = self._build_args()
+        ffmpeg_bin = args[0]
+        env, creation_flags, cwd = prepare_launch(ffmpeg_bin)
         _log.info("FrameCapture spawning FFmpeg for stream (fps=%d, %dx%d, q=%d)",
                   self._fps, self._width, self._height, self._quality)
-        return subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-        )
+        popen_kwargs: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "env": env,
+            "cwd": cwd,
+        }
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+        proc = subprocess.Popen(args, **popen_kwargs)
+        set_stream_nonblocking(proc.stdout)
+        return proc
 
     # ── 读线程 ────────────────────────────────────────────────
 

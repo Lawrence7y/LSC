@@ -1,6 +1,10 @@
 """Adapter for Xiaohongshu (小红书/RED) live room URLs."""
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -31,6 +35,7 @@ class XiaohongshuAdapter(BasePlatformAdapter):
     display_name = "小红书"
 
     def can_handle(self, url: str) -> bool:
+        _log.debug("Xiaohongshu: checking %s", url[:60])
         parsed = urlparse((url or "").strip())
         host = parsed.netloc.lower()
         if host not in {"www.xiaohongshu.com", "xhslink.com"}:
@@ -38,6 +43,7 @@ class XiaohongshuAdapter(BasePlatformAdapter):
         return bool(_LIVE_PATH_RE.match(parsed.path)) or bool(_USER_PATH_RE.match(parsed.path))
 
     def parse(self, url: str) -> StreamInfo:
+        _log.info("Xiaohongshu: parsing %s", url[:80])
         clean_url = (url or "").strip()
         parsed = urlparse(clean_url)
 

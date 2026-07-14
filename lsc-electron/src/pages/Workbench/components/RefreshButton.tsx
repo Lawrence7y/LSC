@@ -424,7 +424,7 @@ export const RefreshButton = memo(function RefreshButton({
           style={{
             position: 'absolute',
             inset: 0,
-            background: 'linear-gradient(135deg, #007aff, #4da3ff)',
+            background: 'linear-gradient(135deg, #31B3AE, #4DC4BF)',
             opacity: fillProgress / 100,
             borderRadius: 'inherit',
             pointerEvents: 'none',

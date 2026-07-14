@@ -111,8 +111,8 @@ class Clip:
     mark_in_wallclock: float = 0.0  # 入点墙钟时间戳（time.monotonic），用于精确对齐录制文件位置
     mark_out_wallclock: float = 0.0  # 出点墙钟时间戳（time.monotonic），用于精确对齐录制文件位置
     content_offset: float = 0.0  # 音频互相关偏移量（秒），导出时用于补偿不同房间的内容延迟
-    # 符号约定: 正数表示当前房间的音频内容相对于参考音频"延后"，
-    # 导出时会调整 clip 的时间戳以对齐多房间内容。
+    # 符号约定: 正值表示该房间内容比基准房间快（内容超前/领先），
+    # 负值表示比基准房间慢（内容滞后）；导出时通过墙钟映射公式补偿。
     # 典型场景: 多房间同步剪辑时，通过 cross-correlation 计算得到
     score_breakdown: dict = field(default_factory=dict)  # 各维度评分明细，如 {"speech": 0.9, "visual": 0.7, "scene": 0.5}
     highlight_reason: str = ""  # 高光原因描述（如 "语音情绪激动 + 画面剧烈变化"）
@@ -212,7 +212,7 @@ class ExportOptions:
     使用 dataclass 而非直接传 dict，便于类型检查和重构。
     """
 
-    codec: str = "libx264"  # 视频编码器（默认 H.264）
+    codec: str = "h264_nvenc"  # 视频编码器（默认优先 NVENC）
     crf: int = 23  # 恒定质量因子（18-28 为常用范围，越小质量越高）
     preset: str = "medium"  # 编码预设（影响编码速度与压缩率）
     audio_bitrate: str = "128k"  # 音频码率
@@ -220,7 +220,7 @@ class ExportOptions:
     video_bitrate: str = "8000k"  # 视频码率（bitrate 模式或 unrestricted 时使用）
     resolution: str = ""  # 输出分辨率（如 "1920x1080"），空字符串表示不缩放
     fps: float = 0.0  # 输出帧率（0 表示保持原帧率）
-    vertical_crop: bool = False  # 是否裁切为 9:16 竖屏格式（适用于短视频平台）
+    vertical_crop: bool = False  # 抖音竖屏：原画等比放入 9:16 画布并上下补边（不裁剪）
     generate_thumbnail: bool = True  # 是否生成视频缩略图
 
 

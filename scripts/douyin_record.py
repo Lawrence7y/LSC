@@ -14,14 +14,19 @@ logging.basicConfig(
 )
 
 # Unified HTTP defaults (mirrors lsc.platforms.base to avoid importing lsc here).
-_HTTP_TIMEOUT = 12
-_HTTP_RETRIES = 2
+_HTTP_TIMEOUT = 20
+_HTTP_RETRIES = 3
 
 
-def fetch_page(url: str) -> str | None:
-    """Fetch the Douyin live page HTML with unified timeout and retry."""
+def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | None, str | None]:
+    """Fetch the Douyin live page HTML with unified timeout and retry.
+
+    Returns
+    -------
+    (html, None) on success; (None, reason) on failure.
+    """
     import time
-    from urllib.error import URLError
+    from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
 
     headers = {
@@ -31,19 +36,49 @@ def fetch_page(url: str) -> str | None:
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://live.douyin.com/",
     }
+    if cookies:
+        # Cookie 头必须 latin-1 可编码；过滤解密失败产生的 \ufffd 等脏值
+        safe_pairs = []
+        for k, v in cookies.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                continue
+            if "\ufffd" in k or "\ufffd" in v:
+                continue
+            try:
+                k.encode("latin-1")
+                v.encode("latin-1")
+            except UnicodeEncodeError:
+                continue
+            safe_pairs.append(f"{k}={v}")
+        if safe_pairs:
+            headers["Cookie"] = "; ".join(safe_pairs)
+
     last_exc: Exception | None = None
+    reason: str | None = None
     for attempt in range(_HTTP_RETRIES + 1):
         try:
             request = Request(url, headers=headers)
             with urlopen(request, timeout=_HTTP_TIMEOUT) as response:
-                return response.read().decode("utf-8", errors="replace")
-        except (URLError, Exception) as exc:
+                return response.read().decode("utf-8", errors="replace"), None
+        except HTTPError as exc:
             last_exc = exc
+            reason = f"HTTP {exc.code}"
             if attempt < _HTTP_RETRIES:
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
+        except URLError as exc:
+            last_exc = exc
+            reason = f"网络错误: {exc.reason}"
+            if attempt < _HTTP_RETRIES:
+                time.sleep(1.0 * (attempt + 1))
+        except Exception as exc:
+            last_exc = exc
+            reason = f"连接异常: {exc}"
+            if attempt < _HTTP_RETRIES:
+                time.sleep(1.0 * (attempt + 1))
     log.warning("fetch_page failed url=%s err=%s", url, last_exc)
-    return None
+    return None, reason
 
 
 def extract_ssr_data(html: str) -> dict[str, object]:
@@ -176,6 +211,7 @@ def extract_ssr_data(html: str) -> dict[str, object]:
     # 2. Sequentially parse JSON objects from full_payload using raw_decode
     decoder = json.JSONDecoder()
     pos = 0
+    doc = None  # 初始化为 None，防止所有 JSON 解析失败时后续访问 doc 触发 UnboundLocalError
     chunk_pattern = re.compile(r'([a-zA-Z0-9_$]+):(?:([HLIMSJTH])([a-f0-9]+)?,)?')
 
     while pos < len(full_payload):

@@ -1,5 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+let _updateStatusCallback: ((status: any) => void) | null = null
+let _backendErrorCallback: ((error: string) => void) | null = null
+
 export interface AppAPI {
   setAutoLaunch(enabled: boolean): Promise<void>
   getAutoLaunch(): Promise<boolean>
@@ -36,10 +39,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
   onUpdateStatus: (callback: (status: any) => void) => {
+    if (_updateStatusCallback) {
+      ipcRenderer.removeListener('update-status', _updateStatusCallback)
+    }
+    _updateStatusCallback = callback
     ipcRenderer.on('update-status', (_event, status) => callback(status))
   },
   removeUpdateStatusListeners: () => {
-    ipcRenderer.removeAllListeners('update-status')
+    if (_updateStatusCallback) {
+      ipcRenderer.removeListener('update-status', _updateStatusCallback)
+      _updateStatusCallback = null
+    }
   },
 
   // 系统通知
@@ -52,7 +62,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackendError: () =>
     ipcRenderer.invoke('get-backend-error'),
   onBackendError: (callback: (error: string) => void) => {
+    if (_backendErrorCallback) {
+      ipcRenderer.removeListener('backend-error', _backendErrorCallback)
+    }
+    _backendErrorCallback = callback
     ipcRenderer.on('backend-error', (_event, error) => callback(error))
+  },
+  removeBackendErrorListeners: () => {
+    if (_backendErrorCallback) {
+      ipcRenderer.removeListener('backend-error', _backendErrorCallback)
+      _backendErrorCallback = null
+    }
   },
 
   // 日志查看
@@ -60,6 +80,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('read-log-file', opts),
   openLogFolder: () =>
     ipcRenderer.invoke('open-log-folder'),
+
+  // 退出清理：主进程通知渲染进程清理所有房间
+  onCleanupAllRooms: (callback: () => void) => {
+    const handler = () => callback()
+    ipcRenderer.on('cleanup-all-rooms', handler)
+    return () => ipcRenderer.removeListener('cleanup-all-rooms', handler)
+  },
 })
 
 contextBridge.exposeInMainWorld('app', {

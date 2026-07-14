@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 from urllib.parse import urlparse
+
+_log = logging.getLogger(__name__)
 
 from .base import (
     DEFAULT_USER_AGENT,
@@ -28,11 +31,13 @@ class DouyuAdapter(BasePlatformAdapter):
     display_name = "斗鱼"
 
     def can_handle(self, url: str) -> bool:
+        _log.debug("Douyu: checking %s", url[:60])
         parsed = urlparse((url or "").strip())
         host = parsed.netloc.lower()
         return host in {"www.douyu.com", "douyu.com"} and bool(_ROOM_PATH_RE.fullmatch(parsed.path))
 
     def parse(self, url: str) -> StreamInfo:
+        _log.info("Douyu: parsing %s", url[:80])
         clean_url = (url or "").strip()
         match = _ROOM_PATH_RE.fullmatch(urlparse(clean_url).path)
         if not match:
@@ -77,6 +82,7 @@ class DouyuAdapter(BasePlatformAdapter):
         )
 
     def _extract_stream_url(self, html: str, room_id: str) -> str:
+        _log.debug("Douyu: extracting stream for room %s", room_id)
         """Extract stream URL from Douyu page. Tries multiple methods."""
         # Method 1: Look for hls_url in page data
         hls_match = re.search(r'"hls_url"\s*:\s*"(https?://[^"]*\.m3u8[^"]*)"', html)
@@ -103,8 +109,8 @@ class DouyuAdapter(BasePlatformAdapter):
             hls = data.get("data", {}).get("hls_url", "")
             if hls:
                 return hls
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("操作异常（已忽略）: %s", exc)
 
         return ""
 

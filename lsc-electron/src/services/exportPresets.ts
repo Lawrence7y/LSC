@@ -10,7 +10,7 @@ export const EXPORT_PRESETS: ExportPreset[] = [
   {
     id: 'douyin_vertical',
     name: '抖音竖屏',
-    description: '1080x1920 竖屏, 30fps, H.264, CRF 23',
+    description: '1080x1920 竖屏（原画居中+上下黑边）, 30fps, H.264, CRF 23',
     resolution: '1080:1920',
     framerate: '30',
     codec: 'h264_nvenc',

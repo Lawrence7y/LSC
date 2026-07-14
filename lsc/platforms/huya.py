@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 from urllib.parse import urlparse
+
+_log = logging.getLogger(__name__)
 
 from .base import (
     DEFAULT_USER_AGENT,
@@ -34,6 +37,7 @@ class HuyaAdapter(BasePlatformAdapter):
         return host in {"www.huya.com", "huya.com"} and bool(_ROOM_PATH_RE.fullmatch(parsed.path))
 
     def parse(self, url: str) -> StreamInfo:
+        _log.info("Huya: parsing %s", url[:80])
         clean_url = (url or "").strip()
         try:
             html = self._fetch_page(clean_url)
@@ -86,8 +90,8 @@ class HuyaAdapter(BasePlatformAdapter):
                             title = title or parts[1].strip()
                     else:
                         title = title or page_title
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("操作异常（已忽略）: %s", exc)
         # 覆盖回 room_info/profile_info 以便后续使用
         if title:
             room_info["sIntroduction"] = title

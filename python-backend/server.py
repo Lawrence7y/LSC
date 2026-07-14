@@ -3,9 +3,10 @@ import json
 import logging
 import math
 from collections.abc import Callable
-from typing import Any, Dict
+from typing import Any
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 _log = logging.getLogger('lsc.server')
 
@@ -22,6 +23,8 @@ def _truncate_for_log(data: Any, str_limit: int = 200, list_limit: int = 10) -> 
             else:
                 result[k] = v
         return result
+    if isinstance(data, str) and len(data) > str_limit:
+        return f"<str of length {len(data)}>"
     return data
 
 
@@ -55,7 +58,7 @@ class LSCWebSocketServer:
         self.port = port
         self.fallback_ports = fallback_ports or [19877, 19878, 19879, 19880]
         self.clients: set = set()
-        self.handlers: Dict[str, Callable] = {}
+        self.handlers: dict[str, Callable] = {}
         self.connect_handlers: list[Callable] = []
         self._server = None
         self._bound_port: int | None = None
@@ -69,6 +72,7 @@ class LSCWebSocketServer:
         """注册消息处理器，支持装饰器用法：@server.on('type')"""
         def decorator(fn: Callable) -> Callable:
             self.handlers[message_type] = fn
+            _log.debug("registered handler: %s -> %s", message_type, getattr(fn, '__name__', '?'))
             return fn
 
         if handler is None:
@@ -87,76 +91,94 @@ class LSCWebSocketServer:
 
     async def handle_client(self, websocket):
         """处理客户端连接"""
+        # S-4: Origin 校验 — 仅允许 Electron (file://) 和本地开发服务器
+        origin = ''
+        if hasattr(websocket, 'request_headers'):
+            origin = websocket.request_headers.get('origin', '')
+        if origin and origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
+            _log.warning("Rejected WebSocket connection from origin: %s", origin)
+            await websocket.close(code=1008, reason='Origin not allowed')
+            return
+
         self.clients.add(websocket)
         _log.info(f"Client connected. Total: {len(self.clients)}")
 
         for handler in self.connect_handlers:
             try:
                 await handler(websocket)
+            except websockets.ConnectionClosed:
+                _log.info("Client disconnected during connect handler")
+                return
             except Exception as exc:
                 _log.error(f"Connect handler error: {exc}", exc_info=True)
 
+        pending: set[asyncio.Task] = set()
+
+        async def dispatch(message: str):
+            msg_type = None
+            request_id = None
+            try:
+                data = json.loads(message)
+                msg_type = data.get('type')
+                msg_data = data.get('data', {})
+                log_data = _truncate_for_log(msg_data)
+                high_freq_types = frozenset({
+                    'mse_segment', 'mse_init', 'rooms_updated',
+                    'export_progress', 'medium_tick',
+                })
+                if msg_type in high_freq_types:
+                    _log.debug("Received WS message: type=%s", msg_type)
+                else:
+                    _log.info("Received WS message: type=%s, data=%s", msg_type, log_data)
+
+                handler = self.handlers.get(msg_type)
+                if handler is None:
+                    _log.warning("Unknown message type: %s", msg_type)
+                    return
+                request_id = msg_data.pop('request_id', None) if isinstance(msg_data, dict) else None
+                result = await handler(msg_data)
+                if result is None:
+                    return
+                if request_id is not None and isinstance(result, dict):
+                    result['request_id'] = request_id
+                if msg_type not in high_freq_types:
+                    _log.info("Sending WS response: type=%s_response, data=%s", msg_type, _truncate_for_log(result))
+                await websocket.send(_json_dumps({'type': f'{msg_type}_response', 'data': result}))
+            except json.JSONDecodeError:
+                _log.warning("Invalid JSON format received (truncated): %s", message[:500])
+            except Exception as exc:
+                _log.error("Error handling message: %s", exc, exc_info=True)
+                if msg_type is not None:
+                    try:
+                        error_data: dict[str, Any] = {'success': False, 'error': str(exc)}
+                        if request_id is not None:
+                            error_data['request_id'] = request_id
+                        await websocket.send(_json_dumps({
+                            'type': f'{msg_type}_response',
+                            'data': error_data,
+                        }))
+                    except Exception:
+                        pass
+
         try:
             async for message in websocket:
-                msg_type = None
-                try:
-                    data = json.loads(message)
-                    msg_type = data.get('type')
-                    msg_data = data.get('data', {})
-
-                    log_data = _truncate_for_log(msg_data)
-
-                    # 高频消息降为 debug，避免日志文件被淹没
-                    _HIGH_FREQ_TYPES = frozenset({
-                        'mse_segment', 'mse_init', 'rooms_updated',
-                        'export_progress', 'medium_tick',
-                    })
-                    if msg_type in _HIGH_FREQ_TYPES:
-                        _log.debug(f"Received WS message: type={msg_type}")
-                    else:
-                        _log.info(f"Received WS message: type={msg_type}, data={log_data}")
-
-                    # 调用对应的处理器
-                    if msg_type in self.handlers:
-                        result = await self.handlers[msg_type](msg_data)
-                        if result is not None:
-                            # 同样截断响应数据
-                            log_res = _truncate_for_log(result)
-
-                            if msg_type in _HIGH_FREQ_TYPES:
-                                _log.debug(f"Sending WS response: type={msg_type}_response")
-                            else:
-                                _log.info(f"Sending WS response: type={msg_type}_response, data={log_res}")
-                            await websocket.send(_json_dumps({
-                                'type': f'{msg_type}_response',
-                                'data': result
-                            }))
-                    else:
-                        _log.warning(f"Unknown message type: {msg_type}")
-
-                except json.JSONDecodeError:
-                    _log.warning(f"Invalid JSON format received (truncated): {message[:500]}")
-                except Exception as e:
-                    # 处理器抛异常时打印完整 traceback，并向客户端发送错误响应，避免前端永久等待
-                    _log.error(f"Error handling message: {e}", exc_info=True)
-                    if msg_type is not None:
-                        try:
-                            await websocket.send(_json_dumps({
-                                'type': f'{msg_type}_response',
-                                'data': {'success': False, 'error': str(e)}
-                            }))
-                        except Exception:
-                            # 客户端可能已断连，忽略发送失败
-                            pass
-
-        except websockets.exceptions.ConnectionClosed:
+                task = asyncio.create_task(dispatch(message))
+                pending.add(task)
+                task.add_done_callback(pending.discard)
+        except ConnectionClosed:
             pass
         finally:
-            self.clients.remove(websocket)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self.clients.discard(websocket)
             _log.info(f"Client disconnected. Total: {len(self.clients)}")
 
     async def broadcast(self, message_type: str, data: Any):
-        """广播消息给所有客户端"""
+        """广播消息给所有客户端。
+
+        高频消息（mse_segment/mse_init/rooms_updated/export_progress）不记录 INFO，
+        避免日志文件被淹没。确保 INFO 中 MSE 分片记录为 0。
+        """
         if not self.clients:
             return
 
@@ -170,8 +192,14 @@ class LSCWebSocketServer:
             return_exceptions=True,
         )
 
-        log_data = _truncate_for_log(data)
-        _log.info(f"Broadcasted WS message: type={message_type}, data={log_data}")
+        # 高频消息不记录 INFO，确保 INFO 中 MSE 记录为 0
+        _HIGH_FREQ_BROADCASTS = frozenset({
+            'mse_segment', 'mse_init', 'rooms_updated',
+            'export_progress', 'medium_tick',
+        })
+        if message_type not in _HIGH_FREQ_BROADCASTS:
+            log_data = _truncate_for_log(data)
+            _log.debug(f"Broadcasted WS message: type={message_type}, data={log_data}")
 
     async def start(self):
         """启动服务器，支持端口回退（主端口被占用时尝试备用端口）。"""
@@ -200,6 +228,28 @@ class LSCWebSocketServer:
 server = LSCWebSocketServer()
 
 
+def drain_merge_broadcasts(bridge):
+    """从 bridge 队列消费所有待发消息，按 type 做 last-value coalesce。
+
+    同 type 的消息只保留最后一条（覆盖式合并），减少前端 JSON 序列化与
+    React 重渲染负载。返回保序的消息列表，供 _broadcast_coroutine 发送。
+    """
+    messages: list[dict[str, Any]] = []
+    while True:
+        msg = bridge.get_broadcast(block=False)
+        if msg is None:
+            break
+        messages.append(msg)
+    coalesced: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for msg in messages:
+        msg_type = msg.get('type', '')
+        if msg_type not in coalesced:
+            order.append(msg_type)
+        coalesced[msg_type] = msg
+    return [coalesced[t] for t in order]
+
+
 def main():
     """独立入口：参考 main.py 的两线程模型启动后端。
 
@@ -223,33 +273,25 @@ def main():
     loop = asyncio.new_event_loop()
 
     async def _drain_broadcasts():
-        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。
-
-        合并连续的 rooms_updated 消息：多房间同时变更状态时，
-        Qt 信号会快速触发多次 _queue_rooms_update，每次都序列化全部房间。
-        合并为只发送最新的一条，减少前端 JSON.parse 负载。
-        """
+        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。"""
         while True:
-            msg = bridge.get_broadcast(block=False)
-            if msg is None:
+            merged = drain_merge_broadcasts(bridge)
+            if not merged:
                 await asyncio.sleep(0.1)
                 continue
-            if msg.get('type') == 'rooms_updated':
-                while True:
-                    next_msg = bridge.get_broadcast(block=False)
-                    if next_msg is None:
-                        break
-                    if next_msg.get('type') != 'rooms_updated':
-                        await server.broadcast(msg.get('type'), msg.get('data', {}))
-                        msg = next_msg
-                        break
-                    msg = next_msg
-            await server.broadcast(msg.get('type'), msg.get('data', {}))
+            for msg in merged:
+                await server.broadcast(msg.get('type'), msg.get('data', {}))
+
+    async def _start_export_queue():
+        """启动全局导出队列 worker。"""
+        from handlers.room_handler import _ensure_export_queue
+        await _ensure_export_queue()
 
     def _run_ws():
         asyncio.set_event_loop(loop)
         register_room_handlers(server, bridge)
         loop.create_task(_drain_broadcasts())
+        loop.create_task(_start_export_queue())
         try:
             loop.run_until_complete(server.start())
         except asyncio.CancelledError:

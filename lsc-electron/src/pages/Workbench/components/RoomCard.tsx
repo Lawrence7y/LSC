@@ -456,37 +456,20 @@ export const RoomCard = memo(function RoomCard({
                     }}
                   />
                 </Tooltip>
+                <Tooltip title="取消预览">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<StopOutlined />}
+                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 6 }}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onTogglePreview(room.room_id, false)
+                    }}
+                  />
+                </Tooltip>
               </div>
             </div>
-            {/* 竖向音量滑块（放大/全屏时） */}
-            {(isExpanded || isFullscreen) && (
-              <div style={{
-                position: 'absolute', right: 12, top: '50%',
-                transform: 'translateY(-50%)', zIndex: 10001,
-                display: 'flex', flexDirection: 'column',
-                alignItems: 'center', gap: 4,
-                background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)',
-                padding: '8px 4px', borderRadius: 8, pointerEvents: 'auto',
-              }}>
-                <SoundOutlined style={{ color: '#fff', fontSize: 11 }} />
-                <input type="range" min="0" max="1" step="0.05" defaultValue="1"
-                  onChange={(e) => {
-                    e.stopPropagation()
-                    const vol = parseFloat(e.target.value)
-                    const registry = (window as any).__msePlayers
-                    const video = registry?.[room.room_id]?.player?.videoElement
-                    if (video) { video.volume = vol; video.muted = vol === 0 }
-                  }}
-                  onClick={(e) => e.stopPropagation()}
-                  style={{
-                    writingMode: 'vertical-lr', direction: 'rtl',
-                    width: 4, height: 100, cursor: 'pointer', accentColor: '#007aff',
-                    WebkitAppearance: 'slider-vertical' as any,
-                  }}
-                />
-                <MutedOutlined style={{ color: '#fff', fontSize: 11, opacity: 0.5 }} />
-              </div>
-            )}
           </>
         ) : (
           <div style={{ textAlign: 'center' }}>

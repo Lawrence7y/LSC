@@ -44,6 +44,13 @@ export function VideoPreview({
   const mseReconnecting = useAppStore(
     (s) => s.rooms.find((r) => r.room_id === roomId)?.mse_reconnecting
   )
+  // 预览启动阶段（refreshing_url/probing/streaming/error/idle）
+  const previewPhase = useAppStore(
+    (s) => s.rooms.find((r) => r.room_id === roomId)?.preview_phase
+  )
+  const platform = useAppStore(
+    (s) => s.rooms.find((r) => r.room_id === roomId)?.platform
+  )
   // 超时检测：加载后 30 秒未收到任何帧则报错。
   // B站等平台首次预览需要 refresh_stream_url（重新解析直播页面），耗时可达 10+ 秒。
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -77,29 +84,24 @@ export function VideoPreview({
     setError(null)
   }, [])
 
-  // Clean up locally AND tell the backend to stop previewing.
-  // Used by user-initiated stop scenarios (e.g. the "重试" button).
-  const stopAndNotify = useCallback(() => {
-    cleanupPlayer()
-    sendRef.current('enable_preview', {
-      room_id: roomId,
-      enabled: false,
-      mode: 'mse',
-    })
-  }, [roomId, cleanupPlayer])
-
   // S6: 重试 loading 状态，防止用户连续点击
   const [retrying, setRetrying] = useState(false)
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 重试预览：清理本地播放器并重新请求后端拉流（与开预览同一路径 enable_preview）
   const handleRetry = useCallback(() => {
     if (retrying) return
     setRetrying(true)
-    stopAndNotify()
+    cleanupPlayer()
+    sendRef.current('enable_preview', {
+      room_id: roomId,
+      enabled: true,
+      mode: 'mse',
+    })
     retryTimerRef.current = setTimeout(() => {
       retryTimerRef.current = null
       setRetrying(false)
     }, 3000)
-  }, [retrying, stopAndNotify])
+  }, [retrying, cleanupPlayer, roomId])
 
   // Feed init segment to player
   const feedInit = useCallback((data: ArrayBuffer) => {
@@ -351,6 +353,16 @@ export function VideoPreview({
     !showError &&
     state !== 'playing'
 
+  // 阶段进度文案：B站等平台首次刷新流地址耗时较长，单独提示
+  const phaseText =
+    previewPhase === 'refreshing_url' ? '正在刷新流地址…' :
+    previewPhase === 'probing' ? '正在探测/转码…' :
+    '正在拉流/转码…'
+  const phaseHint =
+    previewPhase === 'refreshing_url' && platform && /bilibili/i.test(platform)
+      ? '首次刷新通常需要 10–30 秒'
+      : null
+
   return (
     <div
       style={{
@@ -400,7 +412,10 @@ export function VideoPreview({
           }}
         >
           <LoadingOutlined style={{ fontSize: 24, color: 'var(--brand-500)' }} />
-          <span style={{ fontSize: 12, color: 'var(--text-300)' }}>正在拉流/转码…</span>
+          <span style={{ fontSize: 12, color: 'var(--text-300)' }}>{phaseText}</span>
+          {phaseHint && (
+            <span style={{ fontSize: 11, color: 'var(--text-400)' }}>{phaseHint}</span>
+          )}
         </div>
       )}
 

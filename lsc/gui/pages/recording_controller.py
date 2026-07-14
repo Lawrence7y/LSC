@@ -10,7 +10,6 @@ import logging
 import os
 import subprocess
 import time as _time
-from argparse import Namespace
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -23,7 +22,6 @@ except ImportError:
     def get_logger(name: str):
         return logging.getLogger(name)
 
-from lsc.exporter.clip import ClipExporter
 from lsc.platforms.registry import parse_stream, select_quality
 from lsc.recorder.capture import validate_recording
 
@@ -146,8 +144,8 @@ class ExportWorker(QThread):
             if proc.poll() is None:  # 仍在运行
                 proc.kill()
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("操作异常（已忽略）: %s", exc)
         return False
 
 
@@ -231,6 +229,7 @@ class RecordingController:
         self._exporter = None
         self._export_thread: ExportWorker | None = None
         self._export_workers: dict[str, ExportWorker] = {}  # export_id -> worker
+        self._last_export_error: str = ""
         self._analysis_thread: AnalysisWorker | None = None
         self._batch_export_thread: BatchExportWorker | None = None
         self._url_parser: UrlParserWorker | None = None
@@ -414,7 +413,8 @@ class RecordingController:
         force_refresh = getattr(self, "_force_next_parse_refresh", False)
         self._force_next_parse_refresh = False
         if force_refresh:
-            parse_fn = lambda u: self.parse_stream_url(u, force_refresh=True)
+            def parse_fn(u):
+                return self.parse_stream_url(u, force_refresh=True)
         else:
             parse_fn = self.parse_stream_url
         self._url_parser = UrlParserWorker(url, parse_fn)
@@ -680,9 +680,8 @@ class RecordingController:
         else:
             self.is_recording = False
 
-        if self._capture and not self._capture.is_alive() and self.video_path:
-            if os.path.isfile(self.video_path):
-                return _validated(True, self.video_path)
+        if self._capture and not self._capture.is_alive() and self.video_path and os.path.isfile(self.video_path):
+            return _validated(True, self.video_path)
 
         return False, size_mb, output_path
 
@@ -773,7 +772,14 @@ class RecordingController:
             export_id（非空字符串）表示已启动；空字符串表示启动失败。
             export_id 可传给 :meth:`cancel_export` 取消该任务。
         """
-        if not self._exporter or not self.video_path or not os.path.isfile(self.video_path):
+        if not self._exporter:
+            self._last_export_error = self.exporter_init_error or "导出器未初始化"
+            return ""
+        if not self.video_path:
+            self._last_export_error = "没有录制文件，请先开始录制"
+            return ""
+        if not os.path.isfile(self.video_path):
+            self._last_export_error = f"录制文件不存在: {self.video_path}"
             return ""
 
         self._export_thread = ExportWorker(
@@ -781,6 +787,7 @@ class RecordingController:
             start_sec, end_sec, output_dir, name,
             profile=profile,
         )
+        self._last_export_error = ""
         export_id = uuid4().hex
         # 完成后从映射中移除，避免字典无限增长
         def _on_finished(*args):
@@ -857,11 +864,8 @@ class RecordingController:
             (self._batch_export_thread, "batch_export"),
             (self._url_parser, "url_parser"),
         ):
-            if worker and worker.isRunning():
-                if not worker.wait(5000):
-                    _log.warning("%s worker did not stop in time, terminating", name)
-                    worker.terminate()
-                    worker.wait(1000)
+            if worker and worker.isRunning() and not worker.wait(10000):
+                _log.warning("%s worker did not stop in 10s, leaving as daemon", name)
 
         if self._capture:
             if self._capture.is_recording:

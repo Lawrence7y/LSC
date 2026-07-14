@@ -11,6 +11,7 @@ from lsc.editor.audio_aligner import (
     AUDIO_DURATION,
     SAMPLE_RATE,
     _parabolic_interpolation,
+    align_audio_map,
     align_rooms,
     compute_offset,
     extract_audio_pcm,
@@ -43,6 +44,24 @@ def _shifted_window(long_signal: np.ndarray, delay_sec: float,
     if available > 0:
         window[:available] = long_signal[start:start + available]
     return window
+
+
+def _shared_event_signal(duration: float, sample_rate: int = SAMPLE_RATE, seed: int = 42) -> np.ndarray:
+    """生成稀疏公共音频事件，模拟游戏音效/现场声。"""
+    rng = np.random.RandomState(seed)
+    n_samples = int(duration * sample_rate)
+    signal = np.zeros(n_samples, dtype=np.float32)
+    for t in np.arange(0.5, duration - 0.5, 0.8):
+        pos = int((t + rng.uniform(-0.08, 0.08)) * sample_rate)
+        length = int(0.08 * sample_rate)
+        if pos + length >= n_samples:
+            continue
+        env = np.hanning(length).astype(np.float32)
+        tone = np.sin(
+            2 * np.pi * rng.uniform(300, 1200) * np.arange(length) / sample_rate
+        ).astype(np.float32)
+        signal[pos:pos + length] += env * tone
+    return signal
 
 
 class TestComputeOffset:
@@ -113,6 +132,30 @@ class TestComputeOffset:
         offset1, _ = compute_offset(ref, delayed, SAMPLE_RATE)
         offset2, _ = compute_offset(ref, delayed_loud, SAMPLE_RATE)
         assert abs(offset1 - offset2) < 0.01
+
+    def test_shared_events_survive_independent_commentary_noise(self):
+        """公共音效被不同主播声音污染时，应回退到瞬态包络对齐。"""
+        duration = 8.0
+        long_signal = _shared_event_signal(duration + 2.0, seed=5)
+        ref = _shifted_window(long_signal, 0.0, duration)
+        delayed = _shifted_window(long_signal, 1.2, duration)
+        ref = ref + 0.5 * _noise_signal(duration, seed=10)
+        delayed = delayed + 0.5 * _noise_signal(duration, seed=11)
+
+        offset, score = compute_offset(ref, delayed, SAMPLE_RATE)
+
+        assert abs(offset - (-1.2)) < 0.05
+        assert score >= 0.3
+
+    def test_unrelated_noisy_streams_do_not_get_high_fallback_score(self):
+        """完全不相关的主播音频不应被包络 fallback 误判为高置信。"""
+        duration = 8.0
+        ref = _noise_signal(duration, seed=101)
+        other = _noise_signal(duration, seed=202)
+
+        _, score = compute_offset(ref, other, SAMPLE_RATE)
+
+        assert score < 0.3
 
 
 class TestParabolicInterpolation:
@@ -260,8 +303,81 @@ class TestAlignRooms:
         assert result.method == "stream"
 
 
+class TestPairwiseAudioMapAlignment:
+    """三路及以上音频使用两两全对齐。"""
+
+    @patch("lsc.editor.audio_aligner.compute_offset")
+    def test_three_rooms_compute_all_three_pairs(self, mock_compute):
+        """3 个房间应计算 A-B、A-C、B-C 三条边，而不是只对参考房间。"""
+        mock_compute.side_effect = [
+            (1.0, 0.90),  # a -> b
+            (2.0, 0.80),  # a -> c
+            (1.0, 0.95),  # b -> c
+        ]
+        audio_map = {
+            "a": _noise_signal(2.0, seed=1),
+            "b": _noise_signal(2.0, seed=2),
+            "c": _noise_signal(2.0, seed=3),
+        }
+
+        result = align_audio_map(audio_map, SAMPLE_RATE, method="preview_audio")
+
+        assert mock_compute.call_count == 3
+        assert result.success is True
+        assert result.offsets["a"] == pytest.approx(0.0)
+        assert result.offsets["b"] == pytest.approx(1.0)
+        assert result.offsets["c"] == pytest.approx(2.0)
+        assert result.correlation_scores["b"] >= 0.9
+
+    def test_dirty_first_room_does_not_poison_pairwise_alignment(self):
+        """第一路音频很脏时，B-C 高置信边仍能对齐 B/C。"""
+        duration = 8.0
+        long_signal = _shared_event_signal(duration + 2.0, seed=8)
+        audio_map = {
+            "dirty": _noise_signal(duration, seed=100),
+            "slow": _shifted_window(long_signal, 1.2, duration) + 0.35 * _noise_signal(duration, seed=10),
+            "fast": _shifted_window(long_signal, 0.0, duration) + 0.35 * _noise_signal(duration, seed=11),
+        }
+
+        result = align_audio_map(audio_map, SAMPLE_RATE, method="preview_audio")
+
+        assert result.success is True
+        assert result.offsets["slow"] == pytest.approx(0.0, abs=0.05)
+        assert result.offsets["fast"] == pytest.approx(1.2, abs=0.05)
+        assert result.correlation_scores["dirty"] == 0.0
+        assert result.correlation_scores["slow"] >= 0.3
+        assert result.correlation_scores["fast"] >= 0.3
+
+    @patch("lsc.editor.audio_aligner.compute_offset")
+    def test_consistent_low_score_edges_bridge_third_room(self, mock_compute):
+        """三路两两 offset 自洽时，低分桥接边也应把第三路纳入全局对齐。"""
+        mock_compute.side_effect = [
+            (-1.1957, 0.150),  # fast -> mid
+            (-2.1764, 1.000),  # fast -> slow
+            (-0.9807, 0.115),  # mid -> slow
+        ]
+        audio_map = {
+            "fast": _noise_signal(2.0, seed=1),
+            "mid": _noise_signal(2.0, seed=2),
+            "slow": _noise_signal(2.0, seed=3),
+        }
+
+        result = align_audio_map(audio_map, SAMPLE_RATE, method="preview_audio")
+
+        assert result.success is True
+        assert result.offsets["slow"] == pytest.approx(0.0, abs=0.01)
+        assert result.offsets["mid"] == pytest.approx(0.9807, abs=0.02)
+        assert result.offsets["fast"] == pytest.approx(2.1764, abs=0.02)
+        assert result.correlation_scores["mid"] >= 0.3
+
+
 class TestPreviewAudioAlignment:
     """测试预览音频对齐（base64 PCM → 互相关）的核心逻辑。"""
+
+    def test_shared_ingest_does_not_change_content_offset_sign(self) -> None:
+        offsets = {"slow": 0.0, "fast": 2.0}
+
+        assert offsets["fast"] > offsets["slow"]
 
     def test_base64_roundtrip_preserves_samples(self) -> None:
         """base64 编解码后 PCM 样本应完全一致。"""

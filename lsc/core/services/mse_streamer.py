@@ -14,65 +14,63 @@ MSE (Media Source Extensions) 流式传输服务 — 用于 Electron 预览。
 
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import subprocess
 import threading
 import time
-from typing import Callable
+from collections.abc import Callable
 
+from lsc import get_logger
 from lsc.config import load_config
-from lsc.utils.process_launcher import prepare_launch
+from lsc.core.services.fmp4_segments import Fmp4SegmentParser
+from lsc.platforms.base import headers_to_ffmpeg_input_args
+from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
 
-_log = logging.getLogger(__name__)
-
-# MP4 box type markers
-_FTYP_MARKER = b'ftyp'
-_MOOV_MARKER = b'moov'
-_MOOF_MARKER = b'moof'
-_MDAT_MARKER = b'mdat'
+_log = get_logger(__name__)
 
 # Max segment size before forcing a split (512KB)
 _MAX_SEGMENT_BYTES = 512 * 1024
 
 # NVENC availability cache (checked once per process lifetime)
 _nvenc_available: bool | None = None
+_nvenc_lock = threading.Lock()
 
 
 def _check_nvenc() -> bool:
     """Quick test: can FFmpeg use h264_nvenc on this system?"""
     global _nvenc_available
-    if _nvenc_available is not None:
-        return _nvenc_available
-    try:
-        cfg = load_config()
-        ffmpeg = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
-        if not ffmpeg or not os.path.isfile(ffmpeg):
+    with _nvenc_lock:
+        if _nvenc_available is not None:
+            return _nvenc_available
+        try:
+            cfg = load_config()
+            ffmpeg = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+            if not ffmpeg or not os.path.isfile(ffmpeg):
+                _nvenc_available = False
+                return False
+            env, creation_flags, cwd = prepare_launch(ffmpeg)
+            run_kwargs: dict = {
+                "capture_output": True,
+                "text": True,
+                "timeout": 10,
+                "env": env,
+            }
+            if cwd:
+                run_kwargs["cwd"] = cwd
+            if creation_flags:
+                run_kwargs["creationflags"] = creation_flags
+            result = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "testsrc=duration=1:size=256x256:rate=1",
+                 "-c:v", "h264_nvenc", "-frames:v", "1",
+                 "-f", "null", "-"],
+                **run_kwargs,
+            )
+            _nvenc_available = result.returncode == 0
+        except Exception:
             _nvenc_available = False
-            return False
-        env, creation_flags, cwd = prepare_launch(ffmpeg)
-        run_kwargs: dict = {
-            "capture_output": True,
-            "text": True,
-            "timeout": 10,
-            "env": env,
-        }
-        if cwd:
-            run_kwargs["cwd"] = cwd
-        if creation_flags:
-            run_kwargs["creationflags"] = creation_flags
-        result = subprocess.run(
-            [ffmpeg, "-y", "-loglevel", "error",
-             "-f", "lavfi", "-i", "testsrc=duration=1:size=256x256:rate=1",
-             "-c:v", "h264_nvenc", "-frames:v", "1",
-             "-f", "null", "-"],
-            **run_kwargs,
-        )
-        _nvenc_available = result.returncode == 0
-    except Exception:
-        _nvenc_available = False
-    return _nvenc_available
+        return _nvenc_available
 
 
 class MseStreamer:
@@ -119,13 +117,15 @@ class MseStreamer:
         self._headers = headers
         self._video_bitrate = video_bitrate
         self._crf_value = crf_value
-        self._ffmpeg_path = shutil.which("ffmpeg") or "ffmpeg"
+        cfg = load_config()
+        self._ffmpeg_path = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
         self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._watchdog_thread: threading.Thread | None = None
         self._running = False
         self._init_sent = False
+        self._segment_parser = Fmp4SegmentParser(max_buffer_bytes=_MAX_SEGMENT_BYTES)
         # 缓存最近一次 init 段，支持前端错过 init 后通过 replay_init() 补发
         self._last_init_segment: bytes | None = None
         # 缓存 FFmpeg 最近 stderr 输出，异常退出时上报具体原因
@@ -166,6 +166,8 @@ class MseStreamer:
             return False
 
         # Build scale filter if resolution specified
+        # 直播 URL 上不要强制 -hwaccel cuda / scale_cuda：CDN/HLS 硬解失败率高，
+        # 会导致 MSE init 永远不就绪。预览仍用 NVENC 编码降 CPU。
         vf_parts: list[str] = []
         if self._width > 0 and self._height > 0:
             vf_parts.append(f"scale={self._width}:{self._height}:force_original_aspect_ratio=decrease")
@@ -196,8 +198,7 @@ class MseStreamer:
 
         # 插入 HTTP headers（B站/虎牙/斗鱼 CDN 强制检查 Referer，缺少会 403）
         if self._headers:
-            header_str = "\r\n".join(f"{k}: {v}" for k, v in self._headers.items()) + "\r\n"
-            cmd += ["-headers", header_str]
+            cmd += headers_to_ffmpeg_input_args(self._headers)
 
         cmd += [
             "-i", self._url,
@@ -283,6 +284,8 @@ class MseStreamer:
             if cwd:
                 popen_kwargs["cwd"] = cwd
             self._process = subprocess.Popen(cmd, **popen_kwargs)
+            set_stream_nonblocking(self._process.stdout)
+            set_stream_nonblocking(self._process.stderr)
         except Exception as exc:
             _log.error("Failed to start FFmpeg: %s", exc)
             if self._on_error:
@@ -291,6 +294,7 @@ class MseStreamer:
 
         self._running = True
         self._init_sent = False
+        self._segment_parser = Fmp4SegmentParser(max_buffer_bytes=_MAX_SEGMENT_BYTES)
         self._last_stderr = ""
         self._thread = threading.Thread(target=self._read_segments, daemon=True)
         self._thread.start()
@@ -357,13 +361,13 @@ class MseStreamer:
                 try:
                     if proc.stdout:
                         proc.stdout.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("MSE stdout pipe close failed: %s", exc)
                 try:
                     if proc.stderr:
                         proc.stderr.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("MSE stderr pipe close failed: %s", exc)
                 self._process = None
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2)
@@ -390,9 +394,7 @@ class MseStreamer:
             return
 
         # Buffer for incomplete reads
-        buf = bytearray()
         # Track seen box types to detect init segment boundaries
-        seen_ftyp = False
         # 上次收到数据的时间戳（用 list 包装以便 watchdog 闭包修改）
         # Python GIL 保证 float 赋值原子性，list[0] 读写同样安全
         last_data_time = [time.monotonic()]
@@ -414,8 +416,15 @@ class MseStreamer:
                     # 强杀 FFmpeg → stdout 管道关闭 → 阻塞 read() 返回空 → 主线程退出
                     try:
                         proc.kill()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.warning("MSE watchdog kill failed: %s", exc)
+                    # D-4: 显式关闭 stdout 管道，确保即使 kill 信号未及时生效，
+                    # 阻塞的 read() 也能立即返回，避免读取线程永久挂起
+                    try:
+                        if proc.stdout:
+                            proc.stdout.close()
+                    except Exception as exc:
+                        _log.warning("MSE watchdog stdout close failed: %s", exc)
                     return
                 time.sleep(1.0)
 
@@ -437,8 +446,8 @@ class MseStreamer:
                         if proc.stderr:
                             try:
                                 stderr_output = proc.stderr.read(4096)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                _log.debug("操作异常（已忽略）: %s", exc)
                         if self._running and not self._error_reported and self._on_error:
                             self._error_reported = True
                             err_msg = (
@@ -452,61 +461,14 @@ class MseStreamer:
                     break
 
                 last_data_time[0] = time.monotonic()
-                buf.extend(chunk)
-
-                # Process complete segments from buffer
-                while self._running and len(buf) > 8:
-                    # Look for ftyp (init segment marker) or moof (media segment marker)
-                    ftyp_idx = buf.find(_FTYP_MARKER)
-                    moof_idx = buf.find(_MOOF_MARKER)
-
-                    if not seen_ftyp and ftyp_idx != -1:
-                        # Found ftyp - extract init segment
-                        init_start = max(0, ftyp_idx - 4)  # Include box size
-                        moov_idx = buf.find(_MOOV_MARKER, ftyp_idx + 4)
-
-                        if moov_idx != -1:
-                            if moov_idx >= 4:
-                                moov_size = int.from_bytes(buf[moov_idx - 4:moov_idx], "big")
-                                init_end = moov_idx - 4 + moov_size
-
-                                if init_end <= len(buf):
-                                    init_data = bytes(buf[init_start:init_end])
-                                    self._last_init_segment = init_data
-                                    self._on_init(init_data)
-                                    self._init_sent = True
-                                    seen_ftyp = True
-                                    buf = buf[init_end:]
-                                    _log.info("Init segment sent (%d bytes)", len(init_data))
-                                    continue
-
-                    if seen_ftyp and moof_idx != -1 and moof_idx >= 4:
-                        seg_start = moof_idx - 4
-                        mdat_idx = buf.find(_MDAT_MARKER, moof_idx + 4)
-
-                        if mdat_idx != -1 and mdat_idx > 4:
-                            mdat_size = int.from_bytes(buf[mdat_idx - 4:mdat_idx], "big")
-                            seg_end = mdat_idx - 4 + mdat_size
-
-                            if seg_end <= len(buf):
-                                seg_data = bytes(buf[seg_start:seg_end])
-                                self._on_segment(seg_data)
-                                buf = buf[seg_end:]
-                                continue
-
-                    # If buffer is too large without a valid segment, trim
-                    if len(buf) > _MAX_SEGMENT_BYTES * 2:
-                        next_ftyp = buf.find(_FTYP_MARKER, 4)
-                        next_moof = buf.find(_MOOF_MARKER, 4)
-                        trim_to = min(
-                            next_ftyp if next_ftyp != -1 else len(buf),
-                            next_moof if next_moof != -1 else len(buf),
-                        )
-                        if trim_to > 4 and trim_to < len(buf):
-                            buf = buf[trim_to:]
-                        break
-
-                    break  # No complete segment yet, wait for more data
+                for segment in self._segment_parser.feed(chunk):
+                    if segment.kind == "init":
+                        self._last_init_segment = segment.data
+                        self._on_init(segment.data)
+                        self._init_sent = True
+                        _log.info("Init segment sent (%d bytes)", len(segment.data))
+                    elif segment.kind == "media":
+                        self._on_segment(segment.data)
 
         except Exception as exc:
             _log.error("Segment reader error: %s", exc)

@@ -38,24 +38,28 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
 
 ### 1.2 关键目录结构与职责说明
 
-*   `lsc/`：核心 Python 包，提供业务逻辑与底层驱动。
-    *   `core/models.py`：纯 dataclass 领域模型，定义 DTO 契约。
-    *   `core/services/`：录制服务、导出服务、MSE 视频流分片转码服务。
-    *   `platforms/`：平台解析适配器层，负责从直播地址抓取原始视频流和元数据。
-    *   `recorder/`：FFmpeg 录制控制与文件有效性验证。
-    *   `exporter/`：FFmpeg 切片剪辑与直拷/转码导出。
-    *   `editor/audio_aligner.py`：基于音频信号互相关的对齐补偿模块。
-    *   `gui/multi_room/manager.py`：多房间管理的核心编排层（运行在 Qt 主线程）。
 *   `python-backend/`：桥接服务，协调工作线程与 Qt 主线程。
     *   `main.py`：后端入口，管理进程初始化及双线程启动。
     *   `server.py`：基于 asyncio 的 WebSocket 服务器，处理来自前端的 JSON 指令。
     *   `message_bridge.py`：利用 Qt 信号槽实现线程安全的跨线程调用及广播分发。
     *   `persistence.py`：本地房间配置的持久化存储。
+    *   `handlers/room_handler.py`：房间/录制/对齐/导出队列/持续分析等主 handler。
+    *   `handlers/timeline_handlers.py`：`create_clip_snapshot` / `export_clip_by_id` 等时间线精确切片。
+*   `lsc/`：核心 Python 包，提供业务逻辑与底层驱动。
+    *   `analyzer/`：高光 / 回合检测、相位调度（Valorant）、OCR/onset 等分析管线。
+    *   `core/models.py`：纯 dataclass 领域模型，定义 DTO 契约。
+    *   `core/services/`：录制服务、导出服务、MSE 视频流分片转码服务、共享进样。
+    *   `platforms/`：平台解析适配器层，负责从直播地址抓取原始视频流和元数据。
+    *   `recorder/`：FFmpeg 录制控制与文件有效性验证。
+    *   `exporter/`：FFmpeg 切片剪辑与直拷/转码导出。
+    *   `editor/audio_aligner.py`：基于音频信号互相关的对齐补偿模块。
+    *   `gui/multi_room/manager.py`：多房间管理的核心编排层（运行在 Qt 主线程）。
 *   `lsc-electron/`：前端桌面包。
     *   `electron/main.ts`：Electron 主进程，控制窗口、系统托盘、自动启动、Python 进程检测与生命周期保护。
     *   `src/store/appStore.ts`：基于 Zustand 的全局前端状态管理。
     *   `src/services/mediaSourcePlayer.ts`：MSE 播放器核心，解析 fMP4 分片并送入 SourceBuffer 播放。
     *   `src/pages/Workbench/`：核心工作台界面，承载多房间同步预览、时间线、切片控制。
+    *   `src/utils/timelineCoords.ts`：preview / common / recording 三轴换算（见 §8.7）。
 
 ---
 
@@ -136,6 +140,8 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 | `shared_ingest_enabled` | `False` | 是否启用共享进样模式（单 FFmpeg 进程同时输出录制和预览）。`True` 开启，`False` 使用独立双进程。 |
 | `shared_ingest_preview_crf` | `23` | 共享进样模式下预览流的 CRF 值（0-51），越低画质越高。默认 23。 |
 | `shared_ingest_preview_preset`| `"veryfast"` | 共享进样模式下预览流的编码预设。可选 `ultrafast`/`superfast`/`veryfast`/`faster`/`fast`/`medium` 等。 |
+| `export_max_concurrent` | `2` | 全局导出 FFmpeg 并发上限，合法值仅 `1` 或 `2`。由 `room_handler._export_semaphore` 限流。 |
+| `ocr_accel` | `"dml"` | `"auto"` / `"dml"` / `"cuda"` / `"cpu"`。持续分析 OCR 加速；默认 DirectML（Windows GPU），auto 会探针选最快并缓存。 |
 
 ---
 
@@ -200,10 +206,14 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
     *   **FLV**：前 3 字节应为 `FLV` 字符。
     *   **MKV**：前 4 字节应为 EBML 头签名 `0x1A45DFA3`。
 
-### 5.2 视频导出与切片 (`ExportService`)
+### 5.2 视频导出与切片 (`ExportService` + 全局导出队列)
 
-视频导出通过 `ClipExporter` 调用 FFmpeg 进行精确裁剪。
-*   **并发控制**：`ExportService` 通过 `ThreadPoolExecutor` 维护导出任务队列，**最大并发数严格限制为 2** (`_DEFAULT_MAX_CONCURRENT`)，以防多路转码输出压垮 CPU 或显卡硬件编码芯片。
+视频导出通过 `ClipExporter` 调用 FFmpeg 进行精确裁剪。业务入口统一为 `python-backend/handlers/room_handler.py` 的 `queue_export()`（手动 / AI / `export_clip_by_id` 均入同一队列）。
+
+*   **并发控制**：
+    *   核心 `ExportService` 线程池历史默认上限为 2（`_DEFAULT_MAX_CONCURRENT`）。
+    *   WebSocket 路径另有**全局 asyncio 导出队列**：常驻 worker 池（`_MAX_EXPORT_WORKERS = 4`）+ `_export_semaphore` 限流，实际并发跟随 `settings.export_max_concurrent`（仅允许 1 或 2）。
+*   **⚠️ Semaphore 热更新禁区**：`_ensure_export_queue` 调整并发上限时，**禁止**读取 `asyncio.Semaphore._waiters` 或调用 `_waiters.__len__()`。Python 3.10+ 在无等待者时 `_waiters` 为 `None`，会导致每次导出入队报 `'NoneType' object has no attribute '__len__'`。必须用模块级 `_export_semaphore_limit` 记录已配置上限，与 `desired` 比较后再替换 Semaphore。
 *   **竖屏裁剪算法**：当选择“竖屏裁剪 (9:16)”时，FFmpeg 滤镜参数会动态转换为：
     `crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920`
     该公式提取画面中心区域并缩放到标准的 1080x1920。
@@ -449,7 +459,7 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 ### 8.3 导出阶段（FFmpeg 精确裁切）
 
-`manager.start_export()` 将任务提交到 `ExportService` 的线程池（**最大并发数严格限制为 2**），调用 `ClipExporter` 执行 FFmpeg 精确裁切：
+`queue_export` → `_process_export_job` → `manager.start_export()` → `ClipExporter` 执行 FFmpeg 精确裁切（全局并发见 §5.2）：
 
 ```
 [录制文件 (.mp4/.flv)] ──FFmpeg -ss {start} -to {end}──> [导出文件]
@@ -458,8 +468,17 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 *   进度回调通过 `asyncio.run_coroutine_threadsafe` 异步广播 `export_progress` WebSocket 消息，前端实时更新进度条。
 *   导出完成后广播 `clip_completed`，包含 `output_path`、`thumbnail_path`（若启用缩略图）、`job_id` 等字段，前端据此完成队列状态更新。
 *   用户可随时发送 `cancel_export {job_id}` 中止进行中的导出任务，后端通过 `manager.cancel_export(clip_id)` 强杀对应的 FFmpeg 进程。
+*   **前端提交响应**：必须同时监听 `export_clip_response` 与 `export_clip_by_id_response`。`success === false`（含仅有 `error`、无 `job_id`）时 toast 提示，并用乐观入队时记录的 `job_id` 回滚 `export_status`，避免切片永久卡在「排队中」导致导出按钮灰掉。
 
-### 8.4 多房间批量切片与对齐
+### 8.4 AI 高光切片精修与「确认并导出」
+
+持续分析 / 同步分析检出的 AI 回合默认 `confirm_status='pending'`、`export_deferred=true`，**不自动 FFmpeg 导出**，只经 `clip_queued` 入切片列表。
+
+*   **导出门禁**：`confirm_status` 为 `pending` / `refining` 时不可直接导出；须 `user_confirmed` 或 `ocr_confirmed`（或无 `confirm_status` 的手动切片）。
+*   **交互**：用户可点选切片进入精修（拖时间线调入出点 →「确认」），或直接点「确认并导出」（`handleConfirmClip` 后立即打开导出预览弹窗）。
+*   **涉及文件**：`ClipList.tsx`（`canExportClip` / `onConfirmAndExport`）、`Workbench/index.tsx`（`handleConfirmClip`、`handleConfirmAndExport`）、后端 `confirm_highlight_clip`。
+
+### 8.5 多房间批量切片与对齐
 
 当用户同时对多个房间标记相同事件（如同一精彩片段的多视角），系统通过以下方式实现对齐批量导出：
 
@@ -467,10 +486,30 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 2.  后端 `handle_align_preview_audio` 调用 `audio_aligner.py` 的 `compute_offset` 计算各房间相对于"进度最慢"基准房间的 `content_offset`，返回给前端。
 3.  前端将 `content_offset` 通过 `set_content_offset` 消息回传后端，存入 `room.content_offset` 字段。
 4.  导出时，每个房间使用各自的 `content_offset` 调整导出入/出点（通过墙钟映射公式 + FFmpeg `-ss` 参数），使导出的多路视频在画面内容层面完全对齐。
-5.  所有房间并行提交导出任务，受 `_DEFAULT_MAX_CONCURRENT = 2` 限制自动排队。
+5.  所有房间并行提交导出任务，受全局导出 semaphore（§5.2）限制自动排队。
 
 > [!NOTE]
 > 对齐算法的音频输入**始终来自预览流**（前端 `<video>`），而非录制文件。`audio_aligner.py` 中的 `align_rooms` 函数（支持从录制文件提取音频）从未被业务代码调用。这与"预览流和录制流完全独立"的核心约束一致。
+
+### 8.6 持续分析（多房间同步）
+
+*   **只分析主房录制文件**；副房通过 `_map_highlight_to_room`（`recording_start_mono` + `content_offset` 差值）映射后 `clip_queued`。
+*   **分析导出 Modal**：打开时冻结 `continuousTargetRoomIds = currentTargetIds`（含单房 `selectedRoomId` 回退）。主房 Radio 与确认启动时的 `target_room_ids` **必须同源**（一律用 `continuousTargetRooms` / `continuousTargetRoomIds`），禁止在 `selectedRoomList` 与冻结列表间切换导致「只能选一间 / 只分析一间」。
+*   若打开 Modal 时已多选 ≥2 房，但确认时 `target_room_ids.length < 2`，须拦截并提示保持多选。
+*   映射校验失败回退仅主房时，广播 `continuous_highlights` 须带 `mapping_fallback: true` + `error`，前端 toast「副房间映射失败」。
+
+### 8.7 时间线坐标系契约（进度条 / windowStart）
+
+前端存在三套时间轴，**禁止混用**撑开可视窗口：
+
+| 坐标系 | 典型来源 | 用途 |
+| :--- | :--- | :--- |
+| `preview_local` | MSE `currentTime` / `previewPositions` | 单房预览播放头 |
+| `common` | `previewToCommon` / `commonMark*` | 对齐后公共轴 |
+| `recording_local` | 录制文件秒、`record_started_at` 墙钟差、`recorded_duration` | 导出映射 / 分析进度 |
+
+*   `ControlBar` / `timelineView` 计算 `windowStart`、`displayCurrent`、进度条位置时，`elapsed` **只**允许使用与播放头同一轴的时间（common 或 preview）。
+*   **禁止**用 `record_started_at` 墙钟差或 `recorded_duration` 直接参与 `windowStart`（会导致录制已久、预览较晚时播放头被钳到 0%）。
 
 ---
 
@@ -725,12 +764,18 @@ Electron 应用使用 `electron-builder` 进行打包：
 #### 前端通知策略
 
 *   窗口聚焦时跳过非关键通知（如"录制已开始"）。
-*   **关键错误事件**（`clip_failed`、`recording_started` 失败、`room_connect_finished` 失败、`reconnect_failed`）始终通知，即使窗口聚焦。
+*   **关键错误事件**（`clip_failed`、`recording_started` 失败、`room_connect_finished` 失败、`reconnect_failed`、导出提交失败的 `export_clip*_response`）始终通知，即使窗口聚焦。
 *   MSE segment watchdog：前端检测到预览流超过 10s 无数据时自动触发 WebSocket 重连。
+*   持续分析 `continuous_highlights.mapping_fallback === true` 时须 toast 提示副房映射失败。
 
 ---
 
 ## 12. 交互设计与辅助特性
+
+### 12.0 工作台预览交互约束
+
+*   **放大 / 全屏预览**：可启用原生 `<video controls>` 与底部渐变栏静音按钮；**不要**再叠加自定义右侧竖向音量滑块（已从 `RoomCard.tsx` 移除）。
+*   多房间卡片静音仍用底部工具栏 / 全局静音（快捷键 `m`）。
 
 ### 12.1 全局快捷键约束表 (`useKeyboardShortcuts.ts`)
 

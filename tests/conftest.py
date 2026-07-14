@@ -7,7 +7,13 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from lsc.config import LscConfig
+# Add python-backend directory to path so tests can import from it
+import sys
+_python_backend = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
+if _python_backend not in sys.path:
+    sys.path.insert(0, _python_backend)
+
+from lsc.config import LscConfig  # noqa: E402
 
 
 

@@ -2,8 +2,8 @@ import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { ConfigProvider, theme, App as AntdApp } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import MainLayout from './components/Layout/MainLayout'
+import ErrorBoundary from './components/ErrorBoundary'
 import Workbench from './pages/Workbench'
-import Settings from './pages/Settings'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useNotifications } from '@/hooks/useNotifications'
 import { useAppStore } from '@/store/appStore'
@@ -13,15 +13,14 @@ function AppContent() {
   useNotifications()
 
   return (
-    <HashRouter>
-      <Routes>
-        <Route path="/" element={<MainLayout />}>
-          <Route index element={<Navigate to="/workbench" replace />} />
-          <Route path="workbench" element={<Workbench />} />
-          <Route path="settings" element={<Settings />} />
-        </Route>
-      </Routes>
-    </HashRouter>
+      <HashRouter>
+        <Routes>
+          <Route path="/" element={<MainLayout />}>
+            <Route index element={<Navigate to="/workbench" replace />} />
+            <Route path="workbench" element={<Workbench />} />
+          </Route>
+        </Routes>
+      </HashRouter>
   )
 }
 
@@ -35,7 +34,7 @@ function App() {
       theme={{
         algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
         token: {
-          colorPrimary: '#007aff',
+          colorPrimary: '#31B3AE',
           colorSuccess: '#34c759',
           colorWarning: '#ff9500',
           colorError: '#ff3b30',
@@ -53,7 +52,9 @@ function App() {
       }}
     >
       <AntdApp>
-        <AppContent />
+        <ErrorBoundary>
+          <AppContent />
+        </ErrorBoundary>
       </AntdApp>
     </ConfigProvider>
   )

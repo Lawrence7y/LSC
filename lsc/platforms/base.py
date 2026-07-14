@@ -330,9 +330,7 @@ class BasePlatformAdapter(abc.ABC):
                 return False
             if parsed.netloc.lower() not in hosts:
                 return False
-            if path_regex is not None and not re.search(path_regex, parsed.path):
-                return False
-            return True
+            return path_regex is None or re.search(path_regex, parsed.path) is not None
         except Exception:
             return False
 

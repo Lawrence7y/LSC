@@ -26,10 +26,14 @@ const TRIGGERS: Record<string, (data: any) => NotificationPayload | null> = {
     title: '后端连接断开',
     body: 'WebSocket 重连失败，请检查后端状态',
   }),
+  recording_stopped: (d) => ({
+    title: d.reason === 'disk_full' ? '磁盘空间不足' : '录制已停止',
+    body: d.message || (d.room_name || '房间') + '录制已停止',
+  }),
 }
 
 // 关键错误事件：即使窗口聚焦也必须通知，避免用户错过重要失败信息
-const CRITICAL_EVENTS = new Set(['clip_failed', 'recording_started', 'room_connect_finished', 'reconnect_failed'])
+const CRITICAL_EVENTS = new Set(['clip_failed', 'reconnect_failed', 'recording_stopped'])
 
 export function useNotifications() {
   const unsubsRef = useRef<(() => void)[]>([])
@@ -46,7 +50,7 @@ export function useNotifications() {
         if (document.hasFocus() && !CRITICAL_EVENTS.has(event)) return
         window.electronAPI?.showNotification?.(payload)
       }
-      unsubsRef.current.push(wsClient.on(event, handler))
+      unsubsRef.current.push(wsClient.on(event as any, handler))
     }
 
     // backend-error 监听
@@ -64,6 +68,7 @@ export function useNotifications() {
     return () => {
       unsubsRef.current.forEach((fn) => fn())
       unsubsRef.current = []
+      window.electronAPI?.removeBackendErrorListeners?.()
     }
   }, [])
 }

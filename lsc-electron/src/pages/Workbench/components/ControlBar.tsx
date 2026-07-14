@@ -1,5 +1,5 @@
-import { memo, useMemo, useState, useEffect } from 'react'
-import { Space, Button, Tooltip } from 'antd'
+import { memo, useMemo, useState, useEffect, useRef } from 'react'
+import { Space, Button, Tooltip, Select } from 'antd'
 import {
   StepBackwardOutlined,
   PlayCircleOutlined,
@@ -15,8 +15,10 @@ import {
 } from '@ant-design/icons'
 import { RoomSession, ClipSegment, TimelineHighlightBand } from '@/types'
 import type { TimelineAlignStatus } from '@/utils/timelineCoords'
+import { panTimelineWindowStart } from '@/utils/timelineCoords'
 import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
+import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
 
 export interface TimelineViewModel {
   duration: number
@@ -35,9 +37,16 @@ interface ControlBarProps {
   loopPreview?: boolean
   clips?: ClipSegment[]
   previewPos?: number
+  /** 跟随直播沿（窗口贴右）；用户 scrub 后为 false，左缘可回到 0:00:00 */
+  followLive?: boolean
+  /** 拖拽 scrub 中：冻结 windowStart */
+  isScrubbing?: boolean
+  frozenWindowStart?: number | null
   alignStatus?: TimelineAlignStatus
   timelineView?: TimelineViewModel | null
   onSeek: (time: number) => void
+  onScrubStart?: (windowStart: number) => void
+  onScrubEnd?: (finalTime?: number) => void
   onPlayPause: () => void
   onSeekBack: () => void
   onSeekFwd: () => void
@@ -46,11 +55,20 @@ interface ControlBarProps {
   onAddClip: () => void
   onToggleLoop?: () => void
   onGoLive?: () => void
+  playbackRate?: PlaybackRate
+  onPlaybackRateChange?: (rate: PlaybackRate) => void
   zoomLevel?: number
   onZoomChange?: (zoom: number) => void
   onMarkerDrag?: (type: 'in' | 'out', time: number) => void
+  onMarkerDragEnd?: (type: 'in' | 'out', time: number) => void
   onDeleteMarker?: (type: 'in' | 'out') => void
   onHighlightClick?: (highlight: TimelineHighlightBand) => void
+  /** 本地拖拽 marker 的即时显示值 */
+  localDragMark?: { type: 'in' | 'out'; time: number } | null
+  /** 精修中选区（绝对时间，含 windowStart 偏移前的全局秒） */
+  activeRefine?: { start: number; end: number } | null
+  /** @deprecated 不再用于 windowStart；保留以兼容调用方 props */
+  recordedDurationHint?: number
 }
 
 /**
@@ -70,14 +88,25 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (prev.onAddClip !== next.onAddClip) return false
   if (prev.onToggleLoop !== next.onToggleLoop) return false
   if (prev.previewPos !== next.previewPos) return false
+  if (prev.followLive !== next.followLive) return false
+  if (prev.isScrubbing !== next.isScrubbing) return false
+  if (prev.frozenWindowStart !== next.frozenWindowStart) return false
   if (prev.zoomLevel !== next.zoomLevel) return false
   if (prev.onZoomChange !== next.onZoomChange) return false
   if (prev.onGoLive !== next.onGoLive) return false
+  if (prev.onScrubStart !== next.onScrubStart) return false
+  if (prev.onScrubEnd !== next.onScrubEnd) return false
+  if (prev.playbackRate !== next.playbackRate) return false
+  if (prev.onPlaybackRateChange !== next.onPlaybackRateChange) return false
   if (prev.onMarkerDrag !== next.onMarkerDrag) return false
+  if (prev.onMarkerDragEnd !== next.onMarkerDragEnd) return false
   if (prev.onDeleteMarker !== next.onDeleteMarker) return false
   if (prev.alignStatus !== next.alignStatus) return false
   if (prev.timelineView !== next.timelineView) return false
   if (prev.onHighlightClick !== next.onHighlightClick) return false
+  if (prev.localDragMark !== next.localDragMark) return false
+  if (prev.activeRefine !== next.activeRefine) return false
+  if (prev.recordedDurationHint !== next.recordedDurationHint) return false
 
   const a = prev.room
   const b = next.room
@@ -101,7 +130,12 @@ export const ControlBar = memo(function ControlBar({
   loopPreview = false,
   clips = [],
   previewPos = 0,
+  followLive = true,
+  isScrubbing = false,
+  frozenWindowStart = null,
   onSeek,
+  onScrubStart,
+  onScrubEnd,
   onPlayPause,
   onSeekBack,
   onSeekFwd,
@@ -110,14 +144,22 @@ export const ControlBar = memo(function ControlBar({
   onAddClip,
   onToggleLoop,
   onGoLive,
+  playbackRate = 1,
+  onPlaybackRateChange,
   zoomLevel = 1,
   onZoomChange,
   onMarkerDrag,
+  onMarkerDragEnd,
   onDeleteMarker,
-  alignStatus = 'local',
+  alignStatus: _alignStatus = 'local',
   timelineView = null,
   onHighlightClick,
+  localDragMark,
+  activeRefine = null,
+  recordedDurationHint: _recordedDurationHint = 0,
 }: ControlBarProps) {
+  void _recordedDurationHint
+  void _alignStatus
   // 录制中时每秒刷新一次时间显示，非录制时不触发
   const [tick, setTick] = useState(0)
   useEffect(() => {
@@ -141,42 +183,107 @@ export const ControlBar = memo(function ControlBar({
   const isPlaying = room ? (room.preview_enabled && !room.preview_paused) : false
   const isDisabled = !room && (multiSelectCount ?? 0) === 0
 
-  const TIMELINE_WINDOW = 14400 // 4 小时
+  // 可视窗跟内容走：不设默认时长；光标贴内容右端（像原生预览进度条）
+  const TIMELINE_MAX_WINDOW = 600
+  const contentEdgeRef = useRef(1)
+  const contentEdgeRoomRef = useRef<string | null>(null)
   const localTimeline = useMemo(() => {
-    let dur = TIMELINE_WINDOW
+    const roomId = room?.room_id ?? null
+    if (contentEdgeRoomRef.current !== roomId) {
+      contentEdgeRoomRef.current = roomId
+      contentEdgeRef.current = 1
+    }
     let cur = 0
+    // 仅用预览轴时间（previewPos / mark / refine），禁止混入录制墙钟与 recorded_duration
     let elapsed = 0
     if (room?.mark_out !== null && room?.mark_out !== undefined && room.mark_out > 0) {
       elapsed = room.mark_out
     }
-    if (room?.is_recording && room?.record_started_at) {
-      elapsed = Math.max(elapsed, (Date.now() - new Date(room.record_started_at).getTime()) / 1000)
+    if (room?.mark_in != null && room.mark_in > elapsed) {
+      elapsed = room.mark_in
     }
+    if (previewPos > elapsed) {
+      elapsed = previewPos
+    }
+    if (activeRefine && activeRefine.end > elapsed) {
+      elapsed = activeRefine.end
+    }
+    if (activeRefine && activeRefine.start > elapsed) {
+      elapsed = activeRefine.start
+    }
+    // 右沿只增不减：回看时不得随 previewPos 收缩
+    const rawEnd = Math.max(elapsed, previewPos, 0)
+    const contentEnd = Math.max(contentEdgeRef.current, rawEnd, 1)
+    contentEdgeRef.current = contentEnd
     let ws = 0
-    if (elapsed > TIMELINE_WINDOW) {
-      ws = elapsed - TIMELINE_WINDOW
-    } else {
-      dur = Math.max(TIMELINE_WINDOW, elapsed)
+    let dur = contentEnd
+    if (activeRefine && activeRefine.end > activeRefine.start) {
+      const mid = (activeRefine.start + activeRefine.end) / 2
+      const half = Math.min(TIMELINE_MAX_WINDOW, Math.max(30, (activeRefine.end - activeRefine.start) * 4)) / 2
+      ws = Math.max(0, mid - half)
+      dur = Math.max(contentEnd, ws + half * 2, 1)
+    } else if (contentEnd > TIMELINE_MAX_WINDOW) {
+      dur = contentEnd
+      if (followLive && !isScrubbing) {
+        ws = contentEnd - TIMELINE_MAX_WINDOW
+      } else if (isScrubbing && frozenWindowStart != null) {
+        ws = frozenWindowStart
+      } else {
+        // scrub 后仅越界时平移；缩放窗左缘 = ws；短内容 ws=0 即 0:00:00
+        const playhead = Math.max(0, previewPos)
+        ws = panTimelineWindowStart(
+          playhead,
+          contentEnd,
+          TIMELINE_MAX_WINDOW,
+          frozenWindowStart ?? 0,
+        )
+      }
     }
-    if (previewPos > 0) {
-      cur = previewPos
+    if (followLive && !isScrubbing) {
+      cur = contentEnd
+    } else if (previewPos > 0 || !followLive) {
+      cur = Math.max(0, previewPos)
     } else if (room?.mark_in !== null && room?.mark_in !== undefined && room.mark_in > 0) {
       cur = room.mark_in
+    } else if (activeRefine) {
+      cur = activeRefine.start
+    } else {
+      cur = contentEnd
     }
     return { duration: dur, currentTime: cur, windowStart: ws }
-  }, [room?.mark_out, room?.is_recording, room?.record_started_at, room?.mark_in, previewPos, tick])
+  }, [
+    room?.room_id, room?.mark_out, room?.mark_in,
+    previewPos, tick, activeRefine, followLive, isScrubbing, frozenWindowStart,
+  ])
 
   const { duration, currentTime, windowStart } = timelineView ?? localTimeline
+  // Timeline 内时间一律相对 windowStart；轨长 = 可视窗长度（无默认垫高）
+  // 缩放时左缘 = windowStart（片段最左），未缩放短内容时 ws=0 即 0:00:00
+  const trackDuration = Math.max(1, duration - windowStart)
 
-  const displayMarkIn = timelineView
-    ? (timelineView.markIn != null ? Math.max(0, timelineView.markIn - windowStart) : null)
-    : (room?.mark_in != null ? Math.max(0, room.mark_in - windowStart) : null)
-  const displayMarkOut = timelineView
-    ? (timelineView.markOut != null ? Math.max(0, timelineView.markOut - windowStart) : null)
-    : (room?.mark_out != null ? Math.max(0, room.mark_out - windowStart) : null)
-  const displayCurrent = timelineView
+  const displayMarkIn = (() => {
+    if (localDragMark?.type === 'in') {
+      return Math.max(0, localDragMark.time - windowStart)
+    }
+    return timelineView
+      ? (timelineView.markIn != null ? Math.max(0, timelineView.markIn - windowStart) : null)
+      : (room?.mark_in != null ? Math.max(0, room.mark_in - windowStart) : null)
+  })()
+  const displayMarkOut = (() => {
+    if (localDragMark?.type === 'out') {
+      return Math.max(0, localDragMark.time - windowStart)
+    }
+    return timelineView
+      ? (timelineView.markOut != null ? Math.max(0, timelineView.markOut - windowStart) : null)
+      : (room?.mark_out != null ? Math.max(0, room.mark_out - windowStart) : null)
+  })()
+  const displayCurrentRaw = timelineView
     ? Math.max(0, timelineView.currentTime - windowStart)
     : Math.max(0, currentTime - windowStart)
+  // Live：钉最右；非 Live / 拖拽中：跟真实位置（可回看）
+  const displayCurrent = (followLive && !isScrubbing)
+    ? trackDuration
+    : Math.min(Math.max(0, displayCurrentRaw), trackDuration)
 
   const roomClips = useMemo(() => {
     if (timelineView) {
@@ -200,12 +307,6 @@ export const ControlBar = memo(function ControlBar({
     }))
   }, [timelineView?.highlights, windowStart])
 
-  const alignBadge = alignStatus === 'ready'
-    ? { text: '公共轴已就绪', color: 'var(--state-success-dark, #30d158)', bg: 'rgba(48, 209, 88, 0.12)' }
-    : alignStatus === 'invalidated'
-      ? { text: '公共轴已失效 · 请重新对齐', color: 'var(--state-warning-dark, #ff9f0a)', bg: 'rgba(255, 159, 10, 0.12)' }
-      : { text: '未对齐 · 本地时间', color: 'var(--text-tertiary)', bg: 'rgba(142, 142, 147, 0.12)' }
-
   return (
     <div style={{
       padding: '12px 24px',
@@ -215,42 +316,29 @@ export const ControlBar = memo(function ControlBar({
       flexDirection: 'column',
       gap: 12,
       flexShrink: 0,
+      position: 'sticky',
+      bottom: 0,
+      zIndex: 20,
     }}>
-      {/* 对齐状态 + 多选提示 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: -4 }}>
+      {multiSelectCount > 0 && (
         <div style={{
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 6,
-          padding: '4px 10px',
-          background: alignBadge.bg,
+          gap: 8,
+          padding: '4px 12px',
+          background: 'rgba(0, 122, 255, 0.06)',
           borderRadius: 6,
           fontSize: 12,
-          color: alignBadge.color,
+          color: 'var(--accent-primary)',
           fontWeight: 500,
+          alignSelf: 'flex-start',
         }}>
-          <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: alignBadge.color }} />
-          {alignBadge.text}
+          <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-primary)' }} />
+          {multiSelectCount} 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效
         </div>
-        {multiSelectCount > 0 && (
-          <div style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 8,
-            padding: '4px 12px',
-            background: 'rgba(0, 122, 255, 0.06)',
-            borderRadius: 6,
-            fontSize: 12,
-            color: 'var(--accent-primary)',
-            fontWeight: 500,
-          }}>
-            <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-primary)' }} />
-            {multiSelectCount} 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效
-          </div>
-        )}
-      </div>
+      )}
       <Timeline
-        duration={duration}
+        duration={trackDuration}
         currentTime={displayCurrent}
         markIn={displayMarkIn}
         markOut={displayMarkOut}
@@ -267,11 +355,15 @@ export const ControlBar = memo(function ControlBar({
           : undefined}
         windowStart={windowStart}
         onSeek={onSeek}
+        onScrubStart={onScrubStart}
+        onScrubEnd={onScrubEnd}
         onMarkIn={onMarkIn}
         onMarkOut={onMarkOut}
         onMarkerDrag={onMarkerDrag}
+        onMarkerDragEnd={onMarkerDragEnd}
         onDeleteMarker={onDeleteMarker}
-        height={80}
+        activeRefine={activeRefine}
+        height={96}
         zoomLevel={zoomLevel}
         onZoomChange={onZoomChange}
       />
@@ -281,6 +373,7 @@ export const ControlBar = memo(function ControlBar({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
+        marginTop: 4,
       }}>
         {/* 左侧：播放控制 + 选区操作 */}
         <Space size={2}>
@@ -311,6 +404,20 @@ export const ControlBar = memo(function ControlBar({
               disabled={isDisabled}
             />
           </Tooltip>
+
+          {onPlaybackRateChange && (
+            <Tooltip title="播放速率 (Shift+,/. 或 <> )">
+              <Select
+                size="small"
+                value={playbackRate}
+                onChange={(v) => onPlaybackRateChange(v as PlaybackRate)}
+                disabled={isDisabled}
+                style={{ width: 72 }}
+                options={PLAYBACK_RATE_STEPS.map(r => ({ value: r, label: `${r}×` }))}
+                popupMatchSelectWidth={false}
+              />
+            </Tooltip>
+          )}
 
           <Tooltip title="设置入点 (I)">
             <Button 

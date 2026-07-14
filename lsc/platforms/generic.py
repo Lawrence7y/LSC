@@ -5,6 +5,10 @@ common stream patterns (.m3u8, .flv, rtmp://) in HTML source.
 """
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -38,6 +42,7 @@ class GenericPageAdapter(BasePlatformAdapter):
     display_name = "通用"
 
     def can_handle(self, url: str) -> bool:
+        _log.debug("Generic: checking %s", url[:60])
         """Match any http(s) URL that looks like a web page (not a direct stream)."""
         clean_url = (url or "").strip()
         parsed = urlparse(clean_url)
@@ -47,11 +52,10 @@ class GenericPageAdapter(BasePlatformAdapter):
         if parsed.path.lower().endswith(_DIRECT_SUFFIXES):
             return False
         # Skip API endpoints with stream-like query params
-        if any(k in parsed.query.lower() for k in ("stream=", "video=", "m3u8", ".flv")):
-            return False
-        return True
+        return not any(k in parsed.query.lower() for k in ("stream=", "video=", "m3u8", ".flv"))
 
     def parse(self, url: str) -> StreamInfo:
+        _log.info("Generic: parsing %s", url[:80])
         clean_url = (url or "").strip()
 
         try:
@@ -142,10 +146,8 @@ class GenericPageAdapter(BasePlatformAdapter):
         """Clean and validate a URL."""
         url = url.strip().rstrip("\\").rstrip('"').rstrip("'")
         url = url.replace("\\u002F", "/").replace("\\/", "/")
-        if url.startswith("http://") or url.startswith("https://"):
-            # Basic sanity check
-            if len(url) > 20 and "." in url:
-                return url
+        if (url.startswith("http://") or url.startswith("https://")) and len(url) > 20 and "." in url:
+            return url
         return ""
 
     def _failed(self, url: str, error: str, code: str, raw: Any = None) -> StreamInfo:

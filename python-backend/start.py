@@ -14,12 +14,12 @@ if _ROOT not in sys.path:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from PySide6.QtWidgets import QApplication
-
-from server import server
-from message_bridge import QtManagerBridge
-from lsc.gui.multi_room.manager import MultiRoomManager
 from handlers.room_handler import register_room_handlers
+from message_bridge import QtManagerBridge
+from PySide6.QtWidgets import QApplication
+from server import server
+
+from lsc.gui.multi_room.manager import MultiRoomManager
 
 
 def main():
@@ -35,31 +35,26 @@ def main():
     loop = asyncio.new_event_loop()
 
     async def _drain_broadcasts():
-        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。
-        合并连续的 rooms_updated 消息，避免多房间同时活跃时前端 JSON.parse 压力。
-        """
+        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。"""
+        from server import drain_merge_broadcasts
         while True:
-            msg = bridge.get_broadcast(block=False)
-            if msg is None:
+            merged = drain_merge_broadcasts(bridge)
+            if not merged:
                 await asyncio.sleep(0.1)
                 continue
-            # 合并连续的 rooms_updated：只广播最新的一条
-            if msg.get('type') == 'rooms_updated':
-                while True:
-                    next_msg = bridge.get_broadcast(block=False)
-                    if next_msg is None:
-                        break
-                    if next_msg.get('type') != 'rooms_updated':
-                        await server.broadcast(msg.get('type'), msg.get('data', {}))
-                        msg = next_msg
-                        break
-                    msg = next_msg
-            await server.broadcast(msg.get('type'), msg.get('data', {}))
+            for msg in merged:
+                await server.broadcast(msg.get('type'), msg.get('data', {}))
+
+    async def _start_export_queue():
+        """启动全局导出队列 worker。"""
+        from handlers.room_handler import _ensure_export_queue
+        await _ensure_export_queue()
 
     def _run_ws():
         asyncio.set_event_loop(loop)
         register_room_handlers(server, bridge)
         loop.create_task(_drain_broadcasts())
+        loop.create_task(_start_export_queue())
         try:
             loop.run_until_complete(server.start())
         except asyncio.CancelledError:

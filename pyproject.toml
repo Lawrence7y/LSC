@@ -34,10 +34,13 @@ select = [
 ]
 ignore = [
     "E501", # line too long — we use 100 chars
+    "E402", # module-level import not at top — sys.path manipulation before imports
     "B008", # do not perform function calls in `__init__`
     "SIM105", # use contextlib.suppress — try/except/pass is fine in cleanup code
     "SIM108", # use ternary operator — sometimes if/else is more readable
     "UP006", # use `dict[str, ...]` instead of `Dict[str, ...]`
+    "T201", # print() — some prints are intentional (Electron port detection, traceback debug)
+    "B023", # function definition in loop — function is called synchronously within same iteration
 ]
 exclude = [
     ".git",

@@ -83,7 +83,7 @@ def _setup_logging() -> logging.Logger:
 
 
 def _install_exception_hook(log: logging.Logger) -> None:
-    """安装 sys.excepthook，将未捕获异常写入日志文件而非仅控制台。"""
+    """安装 sys.excepthook + threading.excepthook，将未捕获异常桥接到 logging。"""
     def _hook(exc_type, exc_value, exc_tb):
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc_value, exc_tb)
@@ -91,13 +91,21 @@ def _install_exception_hook(log: logging.Logger) -> None:
         log.error("Unhandled exception: %s", ''.join(traceback.format_exception(exc_type, exc_value, exc_tb)))
         # 同步打到 stderr 供 Electron 捕获
         traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
+
+    def _thread_hook(args):
+        log.error(
+            "Unhandled exception in thread %s: %s",
+            args.thread.name, ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_tb)),
+        )
+
     sys.excepthook = _hook
+    threading.excepthook = _thread_hook
 
 
 def _install_qt_message_handler(log: logging.Logger) -> None:
     """安装 qInstallMessageHandler，将 Qt 警告/错误转入 Python logging。"""
     try:
-        from PySide6.QtCore import qInstallMessageHandler, QtMsgType, QtMessageHandler
+        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
     except ImportError:
         log.warning("PySide6.QtCore not available, skipping Qt message handler")
         return
@@ -126,10 +134,10 @@ _install_exception_hook(_log)
 _install_qt_message_handler(_log)
 
 
-from PySide6.QtWidgets import QApplication
-
-from server import LSCWebSocketServer
 from message_bridge import QtManagerBridge
+from PySide6.QtWidgets import QApplication
+from server import LSCWebSocketServer
+
 from lsc.gui.multi_room.manager import MultiRoomManager
 
 
@@ -140,7 +148,7 @@ class LSCWebSocketBackend:
         self.bridge = QtManagerBridge(self.manager)
         # 注意：MultiRoomManager 没有 set_bridge 方法。
         # bridge 通过构造函数接收 manager 引用，反向注册非必需。
-        self.server = LSCWebSocketServer(port=9876)
+        self.server = LSCWebSocketServer(host="127.0.0.1", port=9876)
         self._ws_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown = False
@@ -189,49 +197,32 @@ class LSCWebSocketBackend:
             try:
                 # 给 broadcaster 一点时间清理
                 self._loop.run_until_complete(asyncio.gather(broadcaster, return_exceptions=True))
-            except Exception:
-                pass
+            except Exception as exc:
+                _log.debug("操作异常（已忽略）: %s", exc)
             self._loop.close()
             _log.info("WebSocket server thread exited")
 
     async def _broadcast_coroutine(self):
-        """协程版广播循环：从 bridge 队列取消息并发送。
-
-        合并连续的 rooms_updated 消息：多房间同时变更状态时，
-        Qt 信号会快速触发多次 _queue_rooms_update，每次都序列化全部房间。
-        合并为只发送最新的一条，减少前端 JSON.parse 负载。
-        """
+        """协程版广播循环：从 bridge 队列取消息并发送。"""
+        from server import drain_merge_broadcasts
         while not self._shutdown:
-            msg = self.bridge.get_broadcast(block=False)
-            if msg is None:
-                await asyncio.sleep(0.1)
-                continue
-            msg_type = msg.get('type')
-            if msg_type == 'rooms_updated':
-                while True:
-                    next_msg = self.bridge.get_broadcast(block=False)
-                    if next_msg is None:
-                        break
-                    if next_msg.get('type') != 'rooms_updated':
-                        data = json.dumps(msg)
-                        clients = list(self.server.clients)
-                        if clients:
-                            await asyncio.gather(
-                                *[client.send(data) for client in clients],
-                                return_exceptions=True,
-                            )
-                        msg = next_msg
-                        break
-                    msg = next_msg
-            data = json.dumps(msg)
-            clients = list(self.server.clients)
-            if not clients:
-                await asyncio.sleep(0.1)
-                continue
-            await asyncio.gather(
-                *[client.send(data) for client in clients],
-                return_exceptions=True,
-            )
+            try:
+                merged = drain_merge_broadcasts(self.bridge)
+                if not merged:
+                    await asyncio.sleep(0.1)
+                    continue
+                for msg in merged:
+                    data = json.dumps(msg)
+                    clients = list(self.server.clients)
+                    if not clients:
+                        continue
+                    await asyncio.gather(
+                        *[client.send(data) for client in clients],
+                        return_exceptions=True,
+                    )
+            except Exception:
+                _log.exception("broadcast error, retrying in 1s")
+                await asyncio.sleep(1)
 
     def start(self):
         _log.info("Starting LSC Electron backend...")
@@ -243,9 +234,9 @@ class LSCWebSocketBackend:
         for _ in range(50):
             if self.server._server is not None:
                 port = self.server._bound_port or self.server.port
-                _log.info("WebSocket server ready at ws://localhost:%s", port)
+                _log.info("WebSocket server ready at ws://127.0.0.1:%s", port)
                 # 同时打到 stdout 供 Electron 主进程正则匹配
-                print(f"WebSocket server ready at ws://localhost:{port}", flush=True)
+                print(f"WebSocket server ready at ws://127.0.0.1:{port}", flush=True)
                 break
             time.sleep(0.1)
 
@@ -259,6 +250,15 @@ class LSCWebSocketBackend:
         超时被强杀）。
         """
         self._shutdown = True
+        try:
+            from handlers.room_handler import shutdown_room_handlers
+            shutdown_room_handlers(timeout_sec=10.0)
+        except Exception as exc:
+            _log.warning("room handler shutdown failed: %s", exc, exc_info=True)
+        try:
+            self.manager.shutdown(timeout_sec=10.0)
+        except Exception as exc:
+            _log.warning("manager shutdown failed: %s", exc, exc_info=True)
         # 1) 通知 WebSocket 服务器停止接受新连接
         if self.server._server is not None and self._loop is not None and not self._loop.is_closed():
             try:
@@ -274,8 +274,8 @@ class LSCWebSocketBackend:
         # 3) 退出 Qt 事件循环
         try:
             self.app.quit()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("操作异常（已忽略）: %s", exc)
         # 4) 等待 ws 线程结束（最多 3 秒）
         if self._ws_thread is not None:
             self._ws_thread.join(timeout=3.0)

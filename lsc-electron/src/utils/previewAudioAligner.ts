@@ -108,6 +108,17 @@ class PreviewAudioAligner {
     video: HTMLVideoElement,
     duration: number = 5.0,
   ): Promise<Float32Array | null> {
+    const previousMuted = video.muted
+    let mutedOverridden = false
+
+    const restoreMutedOverride = () => {
+      if (!mutedOverridden) return
+      ;(video as any).__lscSuppressMuteSync = true
+      video.muted = previousMuted
+      ;(video as any).__lscSuppressMuteSync = false
+      mutedOverridden = false
+    }
+
     try {
       const ctx = await this.getContext()
       const ok = await this.loadWorklet(ctx)
@@ -123,11 +134,18 @@ class PreviewAudioAligner {
       const sharedSource = registry?.[roomId]?.audioSource as MediaElementAudioSourceNode | undefined
 
       let source: AudioNode
-      let isSharedSource = false
 
       if (sharedSource) {
         source = sharedSource
-        isSharedSource = true
+        // Chromium 下 video.muted=true 时 MediaElementSource 可能输出近静音，捕获期临时取消静音。
+        // GainNode 在 source 之后，不改扬声器增益，避免对齐时突然外放。
+        if (video.muted) {
+          ;(video as any).__lscSuppressMuteSync = true
+          video.muted = false
+          mutedOverridden = true
+          ;(video as any).__lscSuppressMuteSync = false
+        }
+        video.play().catch(() => {})
         console.log(`[PreviewAudioAligner] Using shared MediaElementSource for room ${roomId}`)
       } else {
         // 回退：captureStream（video.muted=true 时会产出全零数据）
@@ -167,10 +185,9 @@ class PreviewAudioAligner {
         let settled = false
 
       const cleanup = () => {
-        // 共享 MediaElementSource 不能 disconnect（会影响 GainNode → 扬声器输出）
-        if (!isSharedSource) {
-          try { source.disconnect() } catch {}
-        }
+        restoreMutedOverride()
+        // 共享 MediaElementSource 只断开当前 recorder，保留扬声器路由
+        try { source.disconnect(node) } catch {}
         try { node.disconnect() } catch {}
         try { zeroGain.disconnect() } catch {}
       }
@@ -198,12 +215,19 @@ class PreviewAudioAligner {
             return
           }
 
-          // 静音检测
+          // 静音检测：只丢弃「近乎全零」的数字静音。
+          // 弱信号（如 rms≈3e-4）仍可能含可对齐的游戏音效；后端会做 std 归一化。
           let sumSq = 0
-          for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i]
+          let peak = 0
+          for (let i = 0; i < samples.length; i++) {
+            const v = samples[i]
+            const a = v < 0 ? -v : v
+            if (a > peak) peak = a
+            sumSq += v * v
+          }
           const rms = Math.sqrt(sumSq / samples.length)
-          if (rms < 1e-6) {
-            console.warn(`[PreviewAudioAligner] Room ${roomId} audio is silent (RMS=${rms.toFixed(8)}), discarding`)
+          if (peak < 1e-5 || rms < 1e-5) {
+            console.warn(`[PreviewAudioAligner] Room ${roomId} audio is silent (RMS=${rms.toFixed(8)}, peak=${peak.toFixed(8)}), discarding`)
             this.setCaptureDiagnostics(roomId, {
               reason: 'silent_audio',
               ready_state: video.readyState,
@@ -214,7 +238,15 @@ class PreviewAudioAligner {
             return
           }
 
-          const downsampled = this.downsample(samples, sampleRate, 16000)
+          // 峰值归一化：弱电平预览流也能稳定互相关（避免 quiet 房间被前端误杀）
+          let normalized = samples
+          if (peak > 0 && peak < 0.2) {
+            const scale = 0.5 / peak
+            normalized = new Float32Array(samples.length)
+            for (let i = 0; i < samples.length; i++) normalized[i] = samples[i] * scale
+          }
+
+          const downsampled = this.downsample(normalized, sampleRate, 16000)
           this.setCaptureDiagnostics(roomId, {
             reason: 'ok',
             ready_state: video.readyState,
@@ -222,11 +254,12 @@ class PreviewAudioAligner {
             rms,
             sample_count: downsampled.length,
           })
-          console.log(`[PreviewAudioAligner] Capture OK: room=${roomId}, samples=${samples.length} → ${downsampled.length} (16kHz), RMS=${rms.toFixed(4)}`)
+          console.log(`[PreviewAudioAligner] Capture OK: room=${roomId}, samples=${samples.length} → ${downsampled.length} (16kHz), RMS=${rms.toFixed(6)}, peak=${peak.toFixed(6)}`)
           resolve(downsampled)
         }
       })
     } catch (e) {
+      restoreMutedOverride()
       console.error(`[PreviewAudioAligner] captureAudio failed for room ${roomId}:`, e)
       return null
     }

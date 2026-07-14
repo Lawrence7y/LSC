@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, Notification } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, Notification, session } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import https from 'https'
@@ -152,7 +152,18 @@ function consumeBackendOutput(data: Buffer): void {
 
 // 检测可用的 Python 解释器，返回命令或可执行文件路径；找不到返回 null
 function detectPython(): string | null {
-  // 1. 优先尝试系统 PATH 中的 python / python3
+  // 1. 优先使用打包内嵌入式 Python(版本与依赖经过验证,避免系统 Python 缺依赖)
+  try {
+    const bundled = path.join(process.resourcesPath, 'python', 'python.exe')
+    if (fs.existsSync(bundled)) {
+      appLog('INFO', 'DetectPython', `使用打包内 Python: ${bundled}`)
+      return bundled
+    }
+  } catch (err) {
+    // resourcesPath 在开发模式下可能不可用,忽略
+    appLog('WARN', 'DetectPython', `检查打包内 Python 失败: ${err}`)
+  }
+  // 2. 尝试系统 PATH 中的 python / python3(开发模式或未打包时)
   const candidates = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']
   for (const cmd of candidates) {
     try {
@@ -163,7 +174,7 @@ function detectPython(): string | null {
       appLog('WARN', 'DetectPython', `${cmd} 不可用: ${err}`)
     }
   }
-  // 2. 尝试 WorkBuddy 管理的 Python（~/.workbuddy/binaries/python/versions/）
+  // 3. 尝试 WorkBuddy 管理的 Python（~/.workbuddy/binaries/python/versions/）
   try {
     const home = process.env.USERPROFILE || process.env.HOME || ''
     if (home) {
@@ -182,15 +193,18 @@ function detectPython(): string | null {
   } catch (err) {
     appLog('ERROR', 'DetectPython', `检查 WorkBuddy Python 失败: ${err}`)
   }
-  // 3. 尝试打包环境携带的嵌入式 Python（extraResources/python/python.exe）
+  return null
+}
+
+// 获取打包内的 FFmpeg 目录(开发模式下返回 null,由系统 PATH 兜底)
+function getBundledFfmpegDir(): string | null {
   try {
-    const bundled = path.join(process.resourcesPath, 'python', 'python.exe')
-    if (fs.existsSync(bundled)) {
-      return bundled
+    const dir = path.join(process.resourcesPath, 'ffmpeg')
+    if (fs.existsSync(dir) && fs.existsSync(path.join(dir, 'ffmpeg.exe'))) {
+      return dir
     }
   } catch (err) {
-    // resourcesPath 在某些环境可能不可用，忽略
-    appLog('ERROR', 'DetectPython', `检查打包内 Python 失败: ${err}`)
+    appLog('WARN', 'Backend', `检查打包内 FFmpeg 失败: ${err}`)
   }
   return null
 }
@@ -246,8 +260,24 @@ function spawnBackend(): void {
   writeLog(`\n[spawn] interpreter=${interpreter} entry=${backendEntry} cwd=${backendDir}\n`)
 
   // 环境变量白名单透传，避免传递 NODE_ENV/ELECTRON_* 等不必要变量影响子进程
+  // 优先把打包内 Python/FFmpeg 目录加入 PATH 头部,使子进程 shutil.which() 能直接定位
+  const pathParts: string[] = []
+  const bundledFfmpegDir = getBundledFfmpegDir()
+  if (bundledFfmpegDir) {
+    pathParts.push(bundledFfmpegDir)
+    appLog('INFO', 'Backend', `使用打包内 FFmpeg 目录: ${bundledFfmpegDir}`)
+  }
+  // 打包内 Python 目录也加入 PATH(便于子进程找到 python.exe,以及 PySide6 Qt 插件相对定位)
+  const bundledPythonDir = path.dirname(interpreter)
+  if (bundledPythonDir && fs.existsSync(bundledPythonDir)) {
+    pathParts.push(bundledPythonDir)
+  }
+  if (process.env.PATH) {
+    pathParts.push(process.env.PATH)
+  }
+
   const safeEnv: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
+    PATH: pathParts.join(path.delimiter),
     USERPROFILE: process.env.USERPROFILE,
     APPDATA: process.env.APPDATA,
     LOCALAPPDATA: process.env.LOCALAPPDATA,
@@ -258,6 +288,13 @@ function spawnBackend(): void {
     PATHEXT: process.env.PATHEXT,
     PYTHONUNBUFFERED: '1',
     LSC_LOG_DIR: path.join(app.getPath('userData'), 'logs'),
+  }
+  if (process.env.LSC_CONFIG_PATH) {
+    safeEnv.LSC_CONFIG_PATH = process.env.LSC_CONFIG_PATH
+  }
+  // 显式传递打包内 FFmpeg 目录,供 config.py 优先使用
+  if (bundledFfmpegDir) {
+    safeEnv.LSC_BUNDLED_FFMPEG_DIR = bundledFfmpegDir
   }
   // PYTHONPATH 如有则透传
   if (process.env.PYTHONPATH) {
@@ -687,6 +724,11 @@ function registerWindowIpc(): void {
       (_lastUpdateCheck?.result as Record<string, string> | undefined)?.releaseUrl ||
       'https://github.com/Lawrence7y/LSC/releases/latest'
     try {
+      const parsed = new URL(releaseUrl)
+      if (parsed.protocol !== 'https:') {
+        appLog('ERROR', 'Update', `Refused non-HTTPS URL: ${releaseUrl}`)
+        return { success: false, error: '仅支持 HTTPS 链接' }
+      }
       await shell.openExternal(releaseUrl)
       return { success: true }
     } catch (err) {
@@ -810,6 +852,44 @@ function createWindow() {
     show: false,
   });
 
+  // S-1: Content-Security-Policy — 限制脚本/样式/连接来源，防止 XSS 加载外部资源
+  // 仅在生产模式生效；开发模式 Vite 需要内联脚本用于 HMR
+  if (!process.env.VITE_DEV_SERVER_URL) {
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      callback({
+        responseHeaders: {
+          ...details.responseHeaders,
+          'Content-Security-Policy': [
+            "default-src 'self' file:; script-src 'self' file:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
+          ]
+        }
+      })
+    })
+  }
+
+  // S-2: 阻止渲染进程导航到非预期 URL（防 XSS 通过 location.href 跳转）
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const devUrl = process.env.VITE_DEV_SERVER_URL
+    if (devUrl) {
+      try {
+        const a = new URL(url)
+        const b = new URL(devUrl)
+        if (a.origin === b.origin && a.pathname === b.pathname) return
+      } catch {}
+    }
+    event.preventDefault()
+    appLog('WARN', 'Security', `Blocked navigation to: ${url}`)
+  })
+
+  // S-3: 拦截 window.open()，仅允许在系统浏览器中打开 HTTPS 链接
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://')) {
+      shell.openExternal(url)
+    }
+    appLog('WARN', 'Security', `Blocked window.open to: ${url}`)
+    return { action: 'deny' }
+  })
+
   // 始终注册渲染进程日志转发和生命周期日志
   mainWindow.webContents.on('console-message', (_event, level, message) => {
     const levelMap: Record<number, 'INFO' | 'WARN' | 'ERROR'> = {
@@ -926,19 +1006,29 @@ app.whenReady().then(() => {
   // 注册窗口 IPC（只注册一次）
   registerWindowIpc()
 
-  // 启动 Python 后端
+  // 并行启动后端 + 创建窗口 + 创建托盘
   spawnBackend()
-
-  // 创建窗口（保持原有 createWindow 逻辑）
   createWindow()
-
-  // 创建托盘
   createTray()
 })
 
 app.on('before-quit', () => {
-  appLog('INFO', 'App', '应用即将退出')
-  killBackend()
+  appLog('INFO', 'App', '应用即将退出，正在清理全部房间...')
+
+  // 通知渲染进程通过 WebSocket 清理所有房间（停止录制/预览/分析）
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('cleanup-all-rooms')
+      appLog('INFO', 'App', '已通知渲染进程清理全部房间')
+    }
+  } catch (err) {
+    appLog('ERROR', 'App', `通知渲染进程清理失败: ${err}`)
+  }
+
+  // 给后端 2 秒时间完成清理，然后强杀
+  setTimeout(() => {
+    killBackend()
+  }, 2000)
 })
 
 process.on('exit', () => {

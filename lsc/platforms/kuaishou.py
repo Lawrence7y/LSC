@@ -48,6 +48,7 @@ class KuaishouAdapter(BasePlatformAdapter):
     display_name = "快手"
 
     def can_handle(self, url: str) -> bool:
+        _log.debug("Kuaishou: checking %s", url[:60])
         parsed = urlparse((url or "").strip())
         host = parsed.netloc.lower()
         return host in {"live.kuaishou.com", "kuaishou.com"} and bool(
@@ -55,6 +56,7 @@ class KuaishouAdapter(BasePlatformAdapter):
         )
 
     def parse(self, url: str) -> StreamInfo:
+        _log.info("Kuaishou: parsing %s", url[:80])
         clean_url = (url or "").strip()
         try:
             html = self._fetch_page(clean_url)

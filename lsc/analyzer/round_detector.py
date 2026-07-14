@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import tempfile
 import wave
 from collections.abc import Callable
@@ -24,6 +23,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+from lsc.analyzer.ocr_accel import (
+    ffmpeg_hwaccel_args,
+    read_settings_ocr_accel,
+    run_ffmpeg_with_hwaccel_fallback,
+)
+from lsc.utils.process_launcher import run_hidden
 
 _log = logging.getLogger(__name__)
 
@@ -71,11 +77,24 @@ class ValorantRoundConfig:
 
     # OCR 状态边界：完整文件分析时优先用 HUD 的"购买阶段 0:00"和胜负结算文本
     # 切完整回合。若结算文本漏检，用下一回合开始点向前回推这一段准备/过渡时长。
-    # 2s 采样间隔：回合状态文字持续 ~5s+，2s 采样不会漏检，帧数减半大幅降低 OCR 开销
+    # 2s 采样间隔：回合状态文字持续 ~5s+，2s 采样不会漏检，帧数减半大幅降低 OCR 开销。
+    # 资源压力升高时可被外部覆盖为 3~5s。
     phase_sample_interval: float = 2.0
+    # OCR 假买枪段过滤：整段最短时长（秒），挡住纯准备期误切
+    min_ocr_round_duration: float = 35.0
     # HVV: 下回合 seg_start 已经是 buy_phase 裁剪后的战斗起点，
     # 不需要回退到准备期开始，-10~15s 作为安全余量足够。
     round_inactive_gap: float = 15.0
+
+    # 全回合模式：True = 保留完整回合语义；无 OCR 时仍用适度前 pad + 钟声/post_combat
+    # 收尾，禁止 ±buy_phase_max(55s) 糊边界。OCR 路径仍为权威边界。
+    full_round: bool = False
+    # 无 OCR 的 full_round 起点向前扩展秒数（适度上下文，远小于 buy_phase_max）
+    full_round_audio_pre_pad: float = 8.0
+    # 全回合模式下的 RMS 合并间隙（秒），比 combat_merge_gap(8s) 更大以防止
+    # 回合内安静期（埋包架枪/转点/残局对峙）导致片段切分。30s 可覆盖绝大多数
+    # 回合内安静期，同时不会跨回合合并（回合间安静期通常 30-80s）。
+    full_round_merge_gap: float = 30.0
 
 
 _DEFAULT_CONFIG = ValorantRoundConfig()
@@ -166,6 +185,12 @@ def detect_valorant_rounds(
                     " — 将继续走音频管线裁 buy phase + 尾部垃圾",
                     len(phase_rounds), duration, len(phase_markers),
                 )
+            else:
+                _log.warning(
+                    "OCR 回合状态分割无有效回合 (duration=%.0fs, markers=%d)，"
+                    "回退到纯音频检测",
+                    duration, len(phase_markers),
+                )
         except Exception as exc:
             _log.warning("OCR 回合状态分割失败，回退到纯音频检测: %s", exc)
             phase_rounds = []
@@ -214,22 +239,43 @@ def detect_valorant_rounds(
         return []
 
     if phase_rounds:
-        combat_segments = [
-            (int(round(max(0.0, float(r.get("start", 0.0)) - range_offset))),
-             int(round(min(float(len(smoothed)), float(r.get("end", 0.0)) - range_offset))))
-            for r in phase_rounds
-            if float(r.get("end", 0.0)) - float(r.get("start", 0.0)) >= cfg.min_combat_duration
-        ]
-        # 过滤无效段（start >= end 或完全超出 RMS 长度）
-        combat_segments = [(s, e) for s, e in combat_segments if 0 <= s < e <= len(smoothed)]
+        kept_phase: list[dict[str, Any]] = []
+        combat_segments = []
+        for r in phase_rounds:
+            span = float(r.get("end", 0.0)) - float(r.get("start", 0.0))
+            if span < max(cfg.min_combat_duration, cfg.min_ocr_round_duration):
+                _log.info(
+                    "丢弃过短 OCR 回合 %.1f-%.1f (%.0fs < %.0fs)",
+                    float(r.get("start", 0.0)), float(r.get("end", 0.0)),
+                    span, cfg.min_ocr_round_duration,
+                )
+                continue
+            s = int(round(max(0.0, float(r.get("start", 0.0)) - range_offset)))
+            e = int(round(min(float(len(smoothed)), float(r.get("end", 0.0)) - range_offset)))
+            if not (0 <= s < e <= len(smoothed)):
+                continue
+            if not _ocr_round_has_combat_energy(smoothed, s, e, threshold):
+                _log.info(
+                    "丢弃低能量 OCR 回合 %.1f-%.1f（疑似买枪/准备期）",
+                    float(r.get("start", 0.0)), float(r.get("end", 0.0)),
+                )
+                continue
+            kept_phase.append(r)
+            combat_segments.append((s, e))
+        phase_rounds = kept_phase
         _log.info(
             "战斗段 (OCR seed): %d 段 - OCR 边界为权威，跳过音频裁切",
             len(combat_segments),
         )
 
     if not phase_rounds:
+        _merge_gap = cfg.combat_merge_gap
+        if cfg.full_round:
+            _merge_gap = max(_merge_gap, cfg.full_round_merge_gap)
+            _log.debug("全回合模式: RMS 合并间隙 %.0fs (full_round_merge_gap=%.0f)",
+                       _merge_gap, cfg.full_round_merge_gap)
         combat_segments = _find_combat_segments(
-            smoothed, threshold, cfg.combat_merge_gap, cfg.min_combat_duration
+            smoothed, threshold, _merge_gap, cfg.min_combat_duration
         )
 
     if not combat_segments:
@@ -265,7 +311,18 @@ def detect_valorant_rounds(
                 )
                 if onset_segments:
                     _log.info("Onset 检测到 %d 个战斗段", len(onset_segments))
-                    oformat_input = [(s["start"], s["end"]) for s in onset_segments]
+                    # onset 段是秒级 float；_format_output / smoothed 切片要求整数秒索引
+                    oformat_input = [
+                        (
+                            max(0, int(round(float(s["start"])))),
+                            max(0, int(round(float(s["end"])))),
+                        )
+                        for s in onset_segments
+                        if float(s.get("end", 0)) > float(s.get("start", 0))
+                    ]
+                    oformat_input = [(a, b) for a, b in oformat_input if b > a]
+                    if not oformat_input:
+                        raise ValueError("onset segments empty after int coercion")
                     results0 = _format_output(
                         oformat_input, smoothed, threshold, analysis_duration, cfg,
                         chime_timestamps=None,
@@ -275,7 +332,7 @@ def detect_valorant_rounds(
                             item["start"] = round(float(item["start"]) + range_offset, 3)
                             item["end"] = round(float(item["end"]) + range_offset, 3)
                     results0 = _validate_first_marker(results0)
-                    if refine_with_ocr and results0 and scan_range is None:
+                    if refine_with_ocr and results0:
                         try:
                             results0 = _refine_rounds_with_ocr(
                                 results0, video_path, ffmpeg_path, duration, cfg, cancel_check
@@ -314,6 +371,16 @@ def detect_valorant_rounds(
         validated = combat_segments
         if progress_callback:
             progress_callback("round_detect", 90.0, f"OCR 回合: {len(validated)} 个")
+    elif cfg.full_round:
+        # 全回合模式：跳过钟声切分，仅用 RMS merge_gap 合并段
+        # 防止假钟声（BGM/解说/技能音效）在回合中间硬切一刀
+        round_boundaries = combat_segments
+        trimmed_rounds = round_boundaries  # 也不裁买枪期（full_round 已在 Pass 4 中跳过）
+        validated = _validate_rounds(trimmed_rounds, cfg, analysis_duration)
+        _log.debug("全回合模式: 跳过钟声分割, %d 个战斗段, 验证后 %d 个回合",
+                   len(combat_segments), len(validated))
+        if progress_callback:
+            progress_callback("round_detect", 90.0, f"全回合: {len(validated)} 个")
     else:
         # 音频路径：用 chime 分割 -> buy phase trim -> validate 细化边界
         if progress_callback:
@@ -331,7 +398,12 @@ def detect_valorant_rounds(
             progress_callback("round_detect", 75.0, "裁剪买枪阶段...")
 
         # Pass 4: 买枪期裁剪
-        trimmed_rounds = _trim_buy_phases(smoothed, round_boundaries, cfg)
+        if cfg.full_round:
+            # 全回合模式：不裁买枪期，保留完整的准备阶段
+            trimmed_rounds = round_boundaries
+            _log.debug("全回合模式: 跳过买枪期裁剪, %d 个回合段", len(round_boundaries))
+        else:
+            trimmed_rounds = _trim_buy_phases(smoothed, round_boundaries, cfg)
 
         # Pass 5: 验证
         validated = _validate_rounds(trimmed_rounds, cfg, analysis_duration)
@@ -410,7 +482,7 @@ def _extract_audio_pcm(
     cmd += ["-i", video_path, "-ar", str(sample_rate), "-ac", "1", "-f", "wav", tmp_path]
 
     try:
-        subprocess.run(cmd, capture_output=True, timeout=120)
+        run_hidden(cmd, capture_output=True, timeout=120)
 
         with wave.open(tmp_path, "rb") as wf:
             n_frames = wf.getnframes()
@@ -607,14 +679,20 @@ def _split_by_round_end_chimes(
         ]
         internal_chimes = sorted(internal_chimes)
 
-        # 过滤密集 chime（间隔 <8s 视为噪声），只保留可信的回合结束钟声。
-        # 过滤后如果仍有多个 chime，按可信 chime 切分；噪声 chime 被丢弃。
+        # 过滤密集 chime：同一战斗段内若出现间隔过近的噪声簇，整段不切分。
+        # 仅当钟声间距都足够大（接近真实回合间隔）时才按钟声切开。
         if len(internal_chimes) > 1:
+            has_dense = any(
+                internal_chimes[i] - internal_chimes[i - 1] < 12.0
+                for i in range(1, len(internal_chimes))
+            )
+            if has_dense:
+                result.append((seg_start, seg_end))
+                continue
             filtered = [internal_chimes[0]]
             for ts in internal_chimes[1:]:
                 if ts - filtered[-1] >= 8.0:
                     filtered.append(ts)
-                # 间隔 <8s 的密集 chime 视为主播音效/BGM，丢弃
             internal_chimes = filtered
 
         if not internal_chimes:
@@ -655,6 +733,37 @@ def _split_by_round_end_chimes(
         result = final
 
     return result
+
+
+def _ocr_round_has_combat_energy(
+    smoothed,
+    start_i: int,
+    end_i: int,
+    threshold: float,
+    probe_sec: int = 25,
+) -> bool:
+    """Reject OCR segments that stay buy-phase quiet after the claimed start.
+
+    Reject only when the post-start window stays clearly below the combat
+    threshold *and* shows no energy rise. Do not require peak >= threshold,
+    because the dynamic threshold is often set by later combat peaks.
+    """
+    import numpy as np
+
+    if end_i <= start_i or start_i >= len(smoothed) or threshold <= 0:
+        return False
+    window = smoothed[start_i:min(end_i, start_i + max(5, probe_sec))]
+    if len(window) < 3:
+        return True
+    peak = float(np.max(window))
+    head = window[: min(5, len(window))]
+    rest = window[min(5, len(window)) :] if len(window) > 5 else window
+    head_mean = float(np.mean(head))
+    rest_mean = float(np.mean(rest)) if len(rest) else head_mean
+    # 纯买枪：全程远低于战斗阈值，且后半段无明显抬升
+    if peak < threshold * 0.5 and rest_mean < max(head_mean * 1.3, threshold * 0.35):
+        return False
+    return True
 
 
 def _trim_buy_phases(
@@ -772,7 +881,9 @@ def _format_output(
 ) -> list[dict[str, Any]]:
     """将内部回合表示转换为前端兼容的输出格式。
 
-    回合尾冗余裁剪：若战斗段末尾附近（chime_tail_window 内）存在回合结束钟声，
+    cfg.full_round 且无 OCR：起点仅用适度前 pad（full_round_audio_pre_pad），
+    终点走钟声 / 下回合回推 / post_combat_pad，禁止 ±buy_phase_max 糊边界。
+    False（默认）时进行战斗段尾部裁剪：若战斗段末尾附近（chime_tail_window 内）存在回合结束钟声，
     以钟声位置作为战斗实际结束点，仅保留 tail_pad 秒余韵，砍掉死亡回放/结算画面
     等尾部垃圾；无钟声可定位时退回 post_combat_pad 保底 padding。
 
@@ -782,7 +893,10 @@ def _format_output(
     results: list[dict[str, Any]] = []
     chimes = sorted(chime_timestamps) if chime_timestamps else []
 
-    # 构建 OCR 回合查找索引：用 (start, end) 的四舍五入元组快速匹配
+    # 构建 OCR 回合查找索引：用 (start, end) 的四舍五入元组快速匹配。
+    # 持续分析时 combat 段 end 可能被夹断到 len(smoothed)，与 OCR end 差 1s，
+    # 仅靠精确坐标会丢元数据并退回 full_round → 永远无法自动入列。
+    # phase_rounds 与 rounds 在 OCR seed 路径中是 1:1 同序，优先按索引取。
     ocr_by_pos: dict[tuple[int, int], dict[str, Any]] = {}
     if phase_rounds:
         for pr in phase_rounds:
@@ -795,40 +909,57 @@ def _format_output(
 
     for idx, (seg_start, seg_end) in enumerate(rounds):
         # 查找该回合是否有 OCR 确认的边界
-        ocr_info = ocr_by_pos.get((seg_start, seg_end))
+        ocr_info = None
+        if phase_rounds and idx < len(phase_rounds):
+            ocr_info = phase_rounds[idx]
+        if ocr_info is None:
+            ocr_info = ocr_by_pos.get((int(round(float(seg_start))), int(round(float(seg_end)))))
         ocr_confirmed = bool(ocr_info and ocr_info.get("ocr_confirmed"))
         ocr_end_ts = float(ocr_info["ocr_end"]) if ocr_info and ocr_info.get("ocr_end") is not None else None
 
         # 计算该回合的战斗强度评分
-        if seg_start < len(smoothed) and seg_end <= len(smoothed):
-            peak_rms = float(np.max(smoothed[seg_start:seg_end]))
+        try:
+            seg_start_i = int(round(float(seg_start)))
+            seg_end_i = int(round(float(seg_end)))
+        except (TypeError, ValueError):
+            seg_start_i, seg_end_i = 0, 0
+        if seg_start_i < len(smoothed) and seg_end_i <= len(smoothed) and seg_end_i > seg_start_i:
+            peak_rms = float(np.max(smoothed[seg_start_i:seg_end_i]))
             score = min(1.0, peak_rms / (threshold * 2.0))
             score = max(0.3, score)
         else:
             score = 0.5
 
-        combat_duration = seg_end - seg_start
-        start_sec = max(0.0, float(seg_start) - cfg.pre_combat_pad)
+        combat_duration = float(seg_end) - float(seg_start)
+        if cfg.full_round and not ocr_info:
+            # 无 OCR：适度前 pad，禁止 buy_phase_max(55s) 糊起点
+            pre_pad = max(cfg.pre_combat_pad, float(cfg.full_round_audio_pre_pad))
+            buy_start = max(0, int(round(float(seg_start) - pre_pad)))
+            if idx > 0:
+                prev_end = int(round(results[-1].get("end", 0)))
+                buy_start = max(buy_start, prev_end)
+            start_sec = float(buy_start)
+        else:
+            start_sec = max(0.0, float(seg_start) - cfg.pre_combat_pad)
         if ocr_info:
             start_sec = max(0.0, float(ocr_info.get("start", seg_start)))
 
         # OCR 确认的回合：直接使用 OCR 边界，跳过音频裁切
         if ocr_info:
-            # OCR 起点已经是战斗开始（buy phase 已裁），仅加 pre_combat_pad
-            combat_end_sec = float(seg_end)
+            # 优先 OCR 权威 end；combat 段可能被夹断到 len(smoothed)
+            try:
+                ocr_span_end = float(ocr_info.get("end", seg_end))
+            except (TypeError, ValueError):
+                ocr_span_end = float(seg_end)
+            combat_end_sec = ocr_span_end
             tail_reason = ocr_info.get("tail_by", "ocr_phase")
 
-            # 如果 OCR 有明确的结束时间戳（胜负结算文字），用它精确裁尾
             if ocr_end_ts is not None and ocr_end_ts > float(seg_start):
                 combat_end_sec = ocr_end_ts
                 tail_reason = "ocr_phase"
-            else:
-                # OCR 推断的结束点（无明确结算文字），仍保留但不被音频覆盖
-                combat_end_sec = float(seg_end)
 
             end_sec = min(duration, combat_end_sec + cfg.tail_pad)
 
-            # 安全阀：OCR 确认的边界不被覆盖回 audio 兜底
             if end_sec <= start_sec + cfg.min_combat_duration:
                 end_sec = min(duration, float(seg_end) + cfg.post_combat_pad)
 
@@ -849,26 +980,27 @@ def _format_output(
             })
             continue
 
-        # === 以下为无 OCR 确认时的音频裁切逻辑（原有逻辑不变）===
-
-        # 尾部裁剪（三级优先级）：
-        #   1. 回声定位：优先用落在 [seg_end - window, seg_end + window] 内的回合结束钟声
-        #   2. 下回合回推：无回声时，用下一回合起点向前回推 round_inactive_gap，裁掉死亡回放/结算
-        #   3. 保底 padding：无回推可用时退回 post_combat_pad
+        # === 无 OCR：钟声 / 回推 / post_combat（full_round 也不再用 ±buy_phase_max）===
         combat_end_sec = float(seg_end)
         tail_reason = "audio"
 
         if chimes:
-            lo = float(seg_end) - cfg.chime_tail_window
+            # 残响可能把 seg_end 拉过真正的回合结束钟声；不能只在 tip 窗口搜，
+            # 否则钟声会落在 lo 之外被漏掉。取段内（或略超 seg_end）最后一声作为结束。
             hi = float(seg_end) + cfg.chime_tail_window
-            candidates = [c for c in chimes if lo <= c <= hi and c > float(seg_start)]
+            candidates = [
+                c for c in chimes
+                if float(seg_start) + 1.0 < float(c) <= hi
+            ]
             if candidates:
-                # 取最接近战斗段末尾的钟声作为回合结束点
-                combat_end_sec = min(candidates, key=lambda c: abs(c - float(seg_end)))
+                in_segment = [c for c in candidates if float(c) <= float(seg_end) + 1.0]
+                if in_segment:
+                    combat_end_sec = max(in_segment)
+                else:
+                    combat_end_sec = min(candidates, key=lambda c: abs(float(c) - float(seg_end)))
                 tail_reason = "chime"
 
         if tail_reason == "audio":
-            # 无回声可用，尝试用下一回合起点回推（裁掉死亡回放/结算等尾部垃圾）
             next_start = rounds[idx + 1][0] if idx + 1 < len(rounds) else None
             if next_start is not None and float(next_start) > float(seg_end):
                 inferred_end = min(
@@ -880,23 +1012,41 @@ def _format_output(
                     tail_reason = "inferred"
 
         end_sec = min(duration, combat_end_sec + cfg.tail_pad)
-        # 安全阀：裁尾后不得短于战斗段的绝大部分（避免钟声/回推误定位切掉战斗）
         if end_sec <= start_sec + cfg.min_combat_duration:
             end_sec = min(duration, float(seg_end) + cfg.post_combat_pad)
             tail_reason = "audio"
+        if idx + 1 < len(rounds):
+            next_start = float(rounds[idx + 1][0])
+            end_sec = min(end_sec, next_start - 1.0)
 
-        results.append({
-            "start": round(start_sec, 3),
-            "end": round(end_sec, 3),
-            "score": round(score, 3),
-            "reason": f"回合 {idx + 1}: 战斗阶段 ({combat_duration}s)",
-            "phase": "combat",
-            "round_index": idx + 1,
-            "tail_by": tail_reason,
-            "speech_score": 0.0,
-            "visual_score": 0.0,
-            "transcript": "",
-        })
+        if cfg.full_round:
+            results.append({
+                "start": round(start_sec, 3),
+                "end": round(end_sec, 3),
+                "score": round(score, 3),
+                "reason": f"回合 {idx + 1}: 完整阶段 ({combat_duration}s 战斗)",
+                "phase": "full_round",
+                "round_index": idx + 1,
+                "tail_by": tail_reason if tail_reason != "audio" else "full_round",
+                "start_by": "full_round",
+                "end_by": "full_round",
+                "speech_score": 0.0,
+                "visual_score": 0.0,
+                "transcript": "",
+            })
+        else:
+            results.append({
+                "start": round(start_sec, 3),
+                "end": round(end_sec, 3),
+                "score": round(score, 3),
+                "reason": f"回合 {idx + 1}: 战斗阶段 ({combat_duration}s)",
+                "phase": "combat",
+                "round_index": idx + 1,
+                "tail_by": tail_reason,
+                "speech_score": 0.0,
+                "visual_score": 0.0,
+                "transcript": "",
+            })
 
     return results
 
@@ -979,14 +1129,8 @@ def _detect_round_phase_markers(
             "-q:v", "2",
             output_pattern,
         ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=360,
-        )
+        hw = ffmpeg_hwaccel_args(read_settings_ocr_accel())
+        result = run_ffmpeg_with_hwaccel_fallback(cmd, hwaccel_args=hw, timeout=360)
 
         frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
         precise_timestamps = [
@@ -1206,7 +1350,7 @@ def _get_duration(video_path: str, ffmpeg_path: str) -> float:
     """获取视频时长。"""
     ffprobe = ffmpeg_path.replace("ffmpeg", "ffprobe")
     try:
-        result = subprocess.run(
+        result = run_hidden(
             [ffprobe, "-v", "error", "-probesize", "50M", "-analyzeduration", "10M",
              "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
@@ -1219,7 +1363,7 @@ def _get_duration(video_path: str, ffmpeg_path: str) -> float:
     # fallback: ffmpeg -i
     try:
         import re
-        result = subprocess.run(
+        result = run_hidden(
             [ffmpeg_path, "-i", video_path, "-hide_banner"],
             capture_output=True, text=True, timeout=10,
         )
@@ -1289,7 +1433,7 @@ def _build_round_segments_from_phase_markers(
 
         start = max(0.0, round(start, 3))
         end = min(duration, round(end, 3))
-        if end - start < cfg.min_combat_duration:
+        if end - start < max(cfg.min_combat_duration, cfg.min_ocr_round_duration):
             continue
 
         results.append({

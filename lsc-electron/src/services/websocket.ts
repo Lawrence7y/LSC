@@ -1,7 +1,18 @@
-import { WSMessage } from '@/types'
+import { type WSPayloadMap, type WSMessageType } from '@/types'
 import { resolveWebSocketUrl, type BackendElectronApi, type WebSocketEnv } from './websocketUrl'
 
-type MessageHandler = (data: any) => void
+type MessageHandler<T = unknown> = (data: T) => void
+
+const DISCONNECTED_QUEUEABLE_TYPES = new Set([
+  'get_rooms',
+  'get_settings',
+  'get_system_stats',
+  'check_dependencies',
+])
+
+export function shouldQueueWhenDisconnected(type: string): boolean {
+  return DISCONNECTED_QUEUEABLE_TYPES.has(type)
+}
 
 /**
  * WebSocket 客户端：管理单条 WebSocket 连接的生命周期与消息分发。
@@ -113,9 +124,15 @@ class WebSocketClient {
 
     this.pendingConnect = this.resolveUrl()
       .then((url) => new Promise<void>((resolve, reject) => {
+        // D-9: 15 秒连接超时，防止 pendingConnect 永不 resolve
+        const connectTimeout = setTimeout(() => {
+          reject(new Error('WebSocket connect timeout (15s)'))
+        }, 15000)
+
         this.ws = new WebSocket(url)
 
         this.ws.onopen = () => {
+          clearTimeout(connectTimeout)
           console.log('WebSocket connected')
           this.isConnected = true
           this.reconnectAttempts = 0
@@ -128,9 +145,11 @@ class WebSocketClient {
 
         this.ws.onmessage = (event) => {
           try {
-            const message: WSMessage = JSON.parse(event.data)
+            const message: { type: string; data: unknown } = JSON.parse(event.data)
             if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
-              console.log(`[WebSocket] Received message type=${message.type} (length: ${event.data.length})`)
+              if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) {
+                console.log(`[WebSocket] Received message type=${message.type} (length: ${event.data.length})`)
+              }
             } else {
               const logData = JSON.parse(JSON.stringify(message.data || {}))
               if (typeof logData === 'object' && logData !== null) {
@@ -151,6 +170,7 @@ class WebSocketClient {
         }
 
         this.ws.onclose = () => {
+          clearTimeout(connectTimeout)
           console.log('WebSocket disconnected')
           this.isConnected = false
           this.pendingConnect = null
@@ -162,6 +182,7 @@ class WebSocketClient {
         }
 
         this.ws.onerror = (error) => {
+          clearTimeout(connectTimeout)
           console.error('WebSocket error:', error)
           reject(error)
         }
@@ -216,14 +237,13 @@ class WebSocketClient {
   /**
    * 发送消息。若连接未就绪，消息会进入断连队列等待重连后 flush。
    *
-   * 消息格式为 {@link WSMessage}：`{ type: string, data: any }`。
    * 队列上限为 {@link maxQueueSize}（100 条），超出时丢弃最旧消息，保留最新。
    * 当 {@link ws} 处于 OPEN 状态时直接通过 WebSocket.send() 发出。
    *
    * @param type - 消息类型标识，用于 on() 路由分发
-   * @param data - 消息载荷，任意可序列化对象
+   * @param data - 消息载荷
    */
-  send(type: string, data: any): void {
+  send(type: string, data: unknown): void {
     if (type === 'align_preview_audio') {
       console.log(`[WebSocket] Sending message type=${type} (PCM base64 audio payload)`)
     } else {
@@ -240,9 +260,13 @@ class WebSocketClient {
       console.log(`[WebSocket] Sending message type=${type}, data=`, logData)
     }
 
-    const message: WSMessage = { type, data }
+    const message = { type, data }
     const payload = JSON.stringify(message)
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      if (!shouldQueueWhenDisconnected(type)) {
+        console.warn(`[WebSocket] Dropping stale message while disconnected: ${type}`)
+        return
+      }
       // 断连时入队，超出上限丢弃最旧的消息
       if (this.messageQueue.length >= this.maxQueueSize) {
         this.messageQueue.shift()
@@ -257,18 +281,15 @@ class WebSocketClient {
   /**
    * 注册事件处理器。
    *
-   * 支持的内部事件：
-   * - `connected`：连接建立成功（data 为 null）
-   * - `disconnected`：连接断开（data 为 null）
-   * - `reconnecting`：进入重连等待（data 为 null）
-   * - `reconnect_failed`：超过最大重连次数（data 为 null）
-   * - 业务消息类型：对应 {@link WSMessage.type}，data 为消息体
-   *
    * @param event - 事件名称
-   * @param handler - 回调函数，接收消息 data；注册 `connected` 时若已连接会立即同步触发一次
+   * @param handler - 回调函数，接收消息 data
    * @returns 取消订阅函数，调用后移除该 handler
    */
-  on(event: string, handler: MessageHandler): () => void {
+  on<T extends WSMessageType>(event: T, handler: (data: WSPayloadMap[T]) => void): () => void {
+    return this._on(event, handler as MessageHandler)
+  }
+
+  private _on(event: string, handler: MessageHandler): () => void {
     if (!this.handlers.has(event)) {
       this.handlers.set(event, new Set())
     }
@@ -311,6 +332,7 @@ class WebSocketClient {
       this.ws = null
     }
     this.pendingConnect = null
+    this.messageQueue = []
     this.isConnected = false
   }
 

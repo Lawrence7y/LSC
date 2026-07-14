@@ -50,7 +50,6 @@ from lsc.config import ExportProfile, load_config
 from lsc.core.services.ingest_registry import get_shared_ingest_registry
 from lsc.core.services.recording_service import RecordingService
 from lsc.core.services.timeline_service import get_timeline_service
-from lsc.editor.audio_aligner import _SEEK_BUFFER, AUDIO_DURATION
 from lsc.platforms.base import StreamInfo
 from lsc.platforms.registry import parse_stream, select_quality
 
@@ -129,6 +128,7 @@ _STREAM_CACHE_REUSE_SEC = 120.0
 _HIGH_FREQ_INTERVAL = 1
 # Medium-frequency: file size, FFmpeg health (every N ticks)
 _MEDIUM_FREQ_INTERVAL = 5
+_SHARED_INGEST_STALL_CHECKS = 6  # 6 × 5s medium tick ≈ 30s，与 capture.check_health 对齐
 # Low-frequency: disk space check (every N ticks)
 _LOW_FREQ_INTERVAL = 10
 
@@ -405,53 +405,13 @@ class _BatchRecordWorker(QThread):
         self.batch_finished.emit(started, len(self._room_ids))
 
 
-class _AudioAlignWorker(QThread):
-    """Background thread for audio cross-correlation alignment.
-
-    Extracts audio PCM from each room's source (recording file or live stream)
-    via FFmpeg, then computes time offsets using numpy cross-correlation.
-    Results are emitted via ``align_done`` signal back to the main thread.
-
-    The worker accepts a list of ``rooms_data`` dicts, each describing a
-    room's audio source path or stream URL and an optional seek offset
-    (used to capture only the most recent segment of a long recording).
-    ``align_rooms`` in ``lsc.editor.audio_aligner`` performs the heavy
-    lifting; this worker's only responsibility is to run it off the GUI
-    thread and ferry the structured result back via Qt signals.
-    """
-
-    align_done = Signal(dict)  # result dict matching AlignResult fields
-
-    def __init__(self, rooms_data: list[dict[str, Any]], ffmpeg_path: str):
-        super().__init__()
-        self._rooms_data = rooms_data
-        self._ffmpeg_path = ffmpeg_path
-
-    def run(self):
-        if self.isInterruptionRequested():
-            return
-        try:
-            from lsc.editor.audio_aligner import align_rooms
-            result = align_rooms(self._rooms_data, self._ffmpeg_path)
-            self.align_done.emit({
-                "success": result.success,
-                "offsets": result.offsets,
-                "reference_room_id": result.reference_room_id,
-                "method": result.method,
-                "correlation_scores": result.correlation_scores,
-                "error": result.error,
-            })
-        except Exception as exc:
-            _log.warning("音频对齐失败: %s", exc, exc_info=True)
-            self.align_done.emit({"success": False, "error": str(exc)})
-
-
 class MultiRoomManager(QObject):
     """Own room session lifecycle and batch operations."""
 
     room_connect_finished = Signal(str, bool, str)  # room_id, success, error
     batch_record_progress = Signal(str, bool)  # room_id, success
     batch_record_finished = Signal(int, int)  # started_count, total_count
+    recording_stopped = Signal(str, str, str)  # room_id, reason, message
     # Emitted on every global tick so the UI can refresh timelines and
     # recording elapsed-time displays without polling on its own timer.
     global_tick = Signal()
@@ -461,8 +421,6 @@ class MultiRoomManager(QObject):
     # Emitted on low-frequency ticks (every 10s) for disk space checks
     # and other low-frequency monitoring tasks.
     low_tick = Signal()
-    # Emitted when audio cross-correlation alignment completes.
-    align_finished = Signal(dict)  # result dict
 
     def __init__(
         self,
@@ -476,7 +434,6 @@ class MultiRoomManager(QObject):
         self._connect_workers: dict[str, _ConnectWorker] = {}
         self._metadata_probe_workers: dict[str, _MetadataProbeWorker] = {}
         self._batch_record_worker: _BatchRecordWorker | None = None
-        self._audio_align_worker: _AudioAlignWorker | None = None
 
         # Global heartbeat timer — created lazily when QCoreApplication exists
         self._global_timer: QTimer | None = None
@@ -1220,107 +1177,6 @@ class MultiRoomManager(QObject):
             aligned += 1
         return aligned
 
-    # ── Audio cross-correlation alignment ────────────────────
-
-    def start_audio_align(self, room_ids: list[str]) -> bool:
-        """Launch background audio cross-correlation alignment for selected rooms.
-
-        Only rooms that are actively recording can participate in audio
-        alignment, because the algorithm relies on local recording files
-        (which are guaranteed to be in sync with the preview). Non-
-        recording rooms fall back to buffer-based alignment instead.
-
-        Args:
-            room_ids: List of room identifiers to align. Must contain at
-                least two valid recording rooms.
-
-        Returns:
-            True if the alignment worker was started successfully (or if
-                the call was short-circuited due to insufficient recording
-                rooms). Failures are reported through the
-                ``align_finished`` signal instead.
-        """
-        from lsc.config import load_config as _load_config
-        _cfg = _load_config()
-        ffmpeg_path = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
-
-        _log.info("开始音频对齐: 请求房间=%s", room_ids)
-
-        rooms_data: list[dict[str, Any]] = []
-        skipped_names: list[str] = []
-        for rid in room_ids:
-            room = self.get_room(rid)
-            if room is None or not room.stream_info:
-                _log.warning("对齐跳过: room_id=%s, 原因=房间不存在或无stream_info", rid)
-                continue
-            if room.is_recording and room.record_output_path and room.recording_start_mono:
-                elapsed = _time.monotonic() - room.recording_start_mono
-                seek = max(0.0, elapsed - AUDIO_DURATION - _SEEK_BUFFER)
-                _log.info("对齐房间: room_id=%s, 主播=%s, 录制文件=%s, seek=%.1fs, elapsed=%.1fs", rid, room.streamer_name, room.record_output_path, seek, elapsed)
-                rooms_data.append({
-                    "room_id": rid,
-                    "source": room.record_output_path,
-                    "seek": seek,
-                    "is_recording": True,
-                    "streamer_name": room.streamer_name,
-                })
-            else:
-                name = room.streamer_name or rid[:8]
-                reason = "未在录制" if not room.is_recording else ("无录制文件" if not room.record_output_path else "无录制开始时间")
-                _log.warning("对齐跳过: room_id=%s, 主播=%s, 原因=%s", rid, name, reason)
-                skipped_names.append(name)
-                continue
-
-        if len(rooms_data) < 2:
-            skipped = "、".join(skipped_names) if skipped_names else "所选房间"
-            _log.warning("音频对齐中止: 有效录制房间=%d, 跳过=%s", len(rooms_data), skipped)
-            self._on_align_finished({
-                "success": False,
-                "error": f"未录制的直播间不能参与音频对齐（{skipped} 未在录制），请先开始录制",
-            })
-            return True
-
-        _log.info("启动对齐worker: 有效房间=%s, ffmpeg=%s", [rd["room_id"] for rd in rooms_data], ffmpeg_path)
-        worker = _AudioAlignWorker(rooms_data, ffmpeg_path)
-        worker.align_done.connect(self._on_align_finished)
-        worker.finished.connect(lambda: worker.deleteLater())
-        self._audio_align_worker = worker
-        worker.start()
-        return True
-
-    def _on_align_finished(self, result: dict) -> None:
-        """Handle the completion of an audio alignment job.
-
-        On success, each room's ``content_offset`` is updated with the
-        computed time delta so that previews can be synchronised when the
-        UI requests it. The raw result dict is then forwarded to the
-        ``align_finished`` signal for the UI to consume.
-
-        Args:
-            result: Alignment result dictionary containing at least
-                ``success`` (bool), ``offsets`` (dict of room_id → float),
-                and optionally ``error``, ``reference_room_id``, and
-                ``correlation_scores``.
-        """
-        if result.get("success"):
-            offsets = result.get("offsets", {})
-            _log.info(
-                "音频对齐完成: reference=%s, method=%s, offsets=%s",
-                result.get("reference_room_id"),
-                result.get("method"),
-                {k: f"{v:.4f}" for k, v in offsets.items()},
-            )
-            # 对齐组 ID：所有参与房间共享，多房间同步导出时校验一致性
-            group_id = f"align_{int(_time.time())}"
-            for rid, offset in offsets.items():
-                room = self.get_room(rid)
-                if room is not None:
-                    room.content_offset = float(offset)
-                    room.align_group_id = group_id
-        else:
-            _log.warning("音频对齐失败: error=%s", result.get("error"))
-        self.align_finished.emit(result)
-
     # ── Range loop preview ─────────────────────────────────
 
     def start_range_loop(self, room_id: str, start: float, end: float) -> None:
@@ -1639,6 +1495,8 @@ class MultiRoomManager(QObject):
             room.recording_start_mono = _time.monotonic()
             room.recording_media_start_mono = media_start_mono or None
             room._first_frame_corrected = False
+            room._shared_ingest_last_file_size = 0
+            room._shared_ingest_stall_checks = 0
             room.recording_id = uuid4().hex
             get_timeline_service().on_recording_id_change(room_id, room.recording_id)
             self._dirty_recording = True
@@ -1680,6 +1538,8 @@ class MultiRoomManager(QObject):
             room.recording_media_start_mono = None
             # 重置首帧校正标记, 以便中频 tick 重新校正 (重连场景)
             room._first_frame_corrected = False
+            room._shared_ingest_last_file_size = 0
+            room._shared_ingest_stall_checks = 0
             room.recording_id = uuid4().hex
             get_timeline_service().on_recording_id_change(room_id, room.recording_id)
         else:
@@ -1794,9 +1654,9 @@ class MultiRoomManager(QObject):
             True if the controller accepted the stop request.
         """
         room = self.get_room(room_id)
-        controller = None if room is None else room.controller
-        if room is None or controller is None:
+        if room is None:
             return False
+        controller = room.controller
         registry = get_shared_ingest_registry()
         shared_ingest = registry.get(room_id)
         if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
@@ -1813,6 +1673,8 @@ class MultiRoomManager(QObject):
             if output_path:
                 room.record_output_path = output_path
             return True
+        if controller is None:
+            return False
         ok, _size_mb, output_path = controller.stop_recording()
         room.is_recording = False
         room.is_reconnecting = False
@@ -1839,9 +1701,9 @@ class MultiRoomManager(QObject):
         The caller can continue immediately; FFmpeg is cleaned up in a background thread.
         """
         room = self.get_room(room_id)
-        controller = None if room is None else room.controller
-        if room is None or controller is None:
+        if room is None:
             return False
+        controller = room.controller
         registry = get_shared_ingest_registry()
         shared_ingest = registry.get(room_id)
         if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
@@ -1858,6 +1720,8 @@ class MultiRoomManager(QObject):
             if output_path:
                 room.record_output_path = output_path
             return True
+        if controller is None:
+            return False
         output_path = room.record_output_path or ""
         controller.stop_recording_async()
         room.is_recording = False
@@ -2007,10 +1871,6 @@ class MultiRoomManager(QObject):
             stats["workers_cancelled"] += 1
         self._batch_record_worker = None
 
-        if _stop_worker(self._audio_align_worker):
-            stats["workers_cancelled"] += 1
-        self._audio_align_worker = None
-
         for room in list(self._rooms.values()):
             try:
                 self._cancel_reconnect_thread(room.room_id)
@@ -2143,6 +2003,26 @@ class MultiRoomManager(QObject):
     # ── Global heartbeat ─────────────────────────────────────
 
     # ── Recording reconnect ─────────────────────────────────
+
+    def _check_shared_ingest_file_stall(self, room: RoomSession) -> str:
+        """检测共享进样录制文件是否停滞。返回错误信息或空字符串。"""
+        output_path = room.record_output_path
+        if not output_path:
+            return ""
+        file_exists = os.path.isfile(output_path)
+        cur_size = os.path.getsize(output_path) if file_exists else 0
+        if cur_size == 0 or cur_size == room._shared_ingest_last_file_size:
+            room._shared_ingest_stall_checks += 1
+            stall_checks = room._shared_ingest_stall_checks
+        else:
+            room._shared_ingest_stall_checks = 0
+            stall_checks = 0
+        room._shared_ingest_last_file_size = cur_size
+        if stall_checks >= _SHARED_INGEST_STALL_CHECKS:
+            if cur_size == 0:
+                return "录制文件未写入数据，直播流可能已中断"
+            return "输出文件长时间未增长，录制可能已卡住"
+        return ""
 
     def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str) -> None:
         """Attempt to reconnect a failed recording with exponential backoff.
@@ -2360,15 +2240,35 @@ class MultiRoomManager(QObject):
 
         for room in list(self._rooms.values()):
             controller = room.controller
-            if controller is None:
+
+            # ── Shared ingest health check (controller is None in Electron) ──
+            if controller is None and room.is_recording:
+                registry = get_shared_ingest_registry()
+                ingest = registry.get(room.room_id)
+                if ingest is not None:
+                    ingest_error = getattr(ingest, "recording_error", "") or getattr(ingest, "upstream_error", "")
+                    if ingest_error and not room.is_reconnecting:
+                        _log.warning("Room %s shared ingest error: %s", room.room_id, ingest_error)
+                        self._start_recording_reconnect_thread(room, ingest_error)
+                    elif is_medium_tick and not room.is_reconnecting:
+                        if getattr(ingest, "recording_active", False) and room.record_output_path:
+                            stall_msg = self._check_shared_ingest_file_stall(room)
+                            if stall_msg:
+                                _log.warning("Room %s shared ingest stall: %s", room.room_id, stall_msg)
+                                self._start_recording_reconnect_thread(room, stall_msg)
+                    elif is_medium_tick and room.is_reconnecting:
+                        if (room.reconnect_next_attempt_at > 0
+                                and _time.monotonic() >= room.reconnect_next_attempt_at):
+                            self._start_recording_reconnect_thread(
+                                room,
+                                room.last_error or "录制恢复到期",
+                            )
                 continue
 
             # ── High-frequency (every 1s): lightweight operations ──
-            # Update elapsed time for recording rooms
             if room.is_recording:
                 controller.tick()
 
-            # Sync playback position from the preview widget
             if room.preview_enabled and not room.preview_paused:
                 widget = room.preview_widget
                 if widget is not None:
@@ -2383,17 +2283,16 @@ class MultiRoomManager(QObject):
 
             # ── Medium-frequency (every 5s): file size + health check ──
             if is_medium_tick:
-                # 首帧写入校正: recording_start_mono 原为 FFmpeg 进程启动时刻,
-                # 实际首帧写入磁盘比进程启动晚 0.5-3s (CDN 响应 + 探测),
-                # 首次检测到文件有数据时校正为更接近首帧写入的时刻
+                # 首帧写入校正: 仅在 recording_media_start_mono 未设置精确值时执行。
+                # 共享进样模式下 _wait_for_start_mono 已写入精确值，不可被启发式覆盖。
                 if (room.is_recording and room.record_output_path
                         and room.recording_start_mono
-                        and not getattr(room, '_first_frame_corrected', False)):
+                        and not getattr(room, '_first_frame_corrected', False)
+                        and not getattr(room, 'recording_media_start_mono', None)):
                     try:
                         if os.path.exists(room.record_output_path):
                             file_size = os.path.getsize(room.record_output_path)
-                            if file_size > 10240:  # >10KB 视为首帧已写入
-                                # 误差 ≈ 轮询间隔/2 (平均 2.5s), 但比进程启动时刻误差小得多
+                            if file_size > 10240:
                                 media_start = _time.monotonic() - 2.5
                                 room.recording_start_mono = media_start
                                 room.recording_media_start_mono = media_start
@@ -2405,13 +2304,11 @@ class MultiRoomManager(QObject):
                     except OSError:
                         pass
 
-                # File size tracking
                 if room.is_recording and room.record_output_path:
                     QThreadPool.globalInstance().start(
                         SizeUpdateRunnable(room, room.record_output_path)
                     )
 
-                # Watchdog: check FFmpeg health + auto-reconnect
                 if room.is_recording and room.is_reconnecting:
                     if (room.reconnect_next_attempt_at > 0
                             and _time.monotonic() >= room.reconnect_next_attempt_at):
@@ -2443,10 +2340,15 @@ class MultiRoomManager(QObject):
                                 free / (1024 ** 3),
                             )
                             self.stop_recording_async(room.room_id)
-                            room.last_error = (
-                                f"磁盘空间不足，录制已自动停止（剩余 {free / (1024 ** 3):.1f} GB）"
-                            )
+                            disk_msg = f"磁盘空间不足，录制已自动停止（剩余 {free / (1024 ** 3):.1f} GB）"
+                            room.last_error = disk_msg
                             self._dirty_recording = True
+                            try:
+                                self.recording_stopped.emit(
+                                    room.room_id, 'disk_full', disk_msg,
+                                )
+                            except Exception as exc:
+                                _log.debug("recording_stopped emit failed: %s", exc)
                 except Exception as exc:
                     _log.warning("Disk space check failed for room %s: %s", room.room_id, exc)
 
@@ -2462,12 +2364,18 @@ class MultiRoomManager(QObject):
                         import threading
                         def _proactive_reconnect(room=room):
                             try:
-                                controller = room.controller
-                                if controller is not None:
-                                    try:
-                                        controller.stop_recording()
-                                    except Exception as exc:
-                                        _log.warning("Proactive reconnect stop failed room=%s: %s", room.room_id, exc)
+                                registry = get_shared_ingest_registry()
+                                shared_ingest = registry.get(room.room_id)
+                                if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
+                                    shared_ingest.stop(reason="proactive reconnect")
+                                    registry.stop_room(room.room_id, reason="proactive reconnect")
+                                else:
+                                    controller = room.controller
+                                    if controller is not None:
+                                        try:
+                                            controller.stop_recording()
+                                        except Exception as exc:
+                                            _log.warning("Proactive reconnect stop failed room=%s: %s", room.room_id, exc)
                                 room.is_recording = False
                                 ok = self.start_recording(
                                     room.room_id,

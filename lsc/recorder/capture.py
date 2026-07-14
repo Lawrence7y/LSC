@@ -30,7 +30,7 @@ _FRIENDLY_STDERR_RULES = (
     ("Cookie", "Cookie 无效或已过期"),
 )
 
-STARTUP_PROBE_TIMEOUT_SEC = 5.0
+STARTUP_PROBE_TIMEOUT_SEC = 8.0
 STARTUP_PROBE_INTERVAL_SEC = 0.1
 
 
@@ -108,11 +108,7 @@ def validate_recording(output_path: str, min_size_mb: float = 0.1) -> tuple[bool
 
             # Check for common video file signatures
             # MP4: ftyp at offset 4
-            if header[4:8] != b'ftyp':
-                # Not MP4, check if it's a valid video format
-                # FLV starts with 'FLV'
-                # MKV starts with 0x1A45DFA3
-                if not (header[:3] == b'FLV' or header[:4] == b'\x1A\x45\xDF\xA3'):
+            if header[4:8] != b'ftyp' and not (header[:3] == b'FLV' or header[:4] == b'\x1A\x45\xDF\xA3'):
                     return False, "文件格式异常，可能不是有效的视频文件"
     except OSError as e:
         return False, f"文件读取失败: {e}"
@@ -267,7 +263,7 @@ class StreamCapture:
         - URL 是否有效
         - FFmpeg 是否能正常连接并写入数据
 
-        超时时间由 STARTUP_PROBE_TIMEOUT_SEC（默认 5 秒）控制，
+        超时时间由 STARTUP_PROBE_TIMEOUT_SEC（默认 8 秒）控制，
         轮询间隔由 STARTUP_PROBE_INTERVAL_SEC（默认 0.1 秒）控制。
 
         Returns:
@@ -371,10 +367,14 @@ class StreamCapture:
             # 自定义编码，参数由 extra_args 提供
             pass
         else:
-            # 使用 libx264 编码视频，AAC 编码音频
-            # preset medium: 编码速度与压缩率的平衡
-            # crf 23: 恒定质量因子（18-28 为常用范围，越小质量越高）
-            cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
+            # 优先硬件编码，避免默认 libx264 打满 CPU
+            from lsc.config import preferred_hw_video_codec
+
+            hw = preferred_hw_video_codec()
+            if hw.endswith("_nvenc"):
+                cmd += ["-c:v", hw, "-preset", "p4", "-rc", "vbr", "-cq", "23"]
+            else:
+                cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
             cmd += ["-c:a", "aac", "-b:a", "128k"]
 
         if extra_args:
@@ -392,7 +392,7 @@ class StreamCapture:
         self._set_status(CaptureStatus.CONNECTING)
 
         # Build a clean environment and platform-specific launch flags
-        from lsc.utils.process_launcher import prepare_launch
+        from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
         env, creation_flags, cwd = prepare_launch(self.ffmpeg)
 
         try:
@@ -408,6 +408,7 @@ class StreamCapture:
                 cwd=cwd,
                 creationflags=creation_flags,
             )
+            set_stream_nonblocking(proc.stderr)
             with self._lock:
                 self._process = proc
                 self._output_path = output_path
@@ -520,8 +521,8 @@ class StreamCapture:
                     # Final safety net: do not block forever.
                     try:
                         orphaned_pid = proc.pid
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.debug("操作异常（已忽略）: %s", exc)
                     _log.error(
                         "FFmpeg process %s refused to exit after kill; "
                         "leaving it orphan and releasing capture resources",
@@ -595,8 +596,8 @@ class StreamCapture:
             if pipe is not None:
                 try:
                     pipe.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("Capture pipe close failed pipe=%s: %s", pipe_name, exc)
 
     def force_cleanup(self) -> None:
         """Force-kill FFmpeg and clean up. Safe to call even after stop().
@@ -639,8 +640,8 @@ class StreamCapture:
                         try:
                             if not pipe.closed:
                                 pipe.close()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _log.warning("Force-kill pipe close failed pipe=%s: %s", pipe_name, exc)
                 self._release_stderr_executor_once()
 
     def check_health(self) -> str:
@@ -677,21 +678,23 @@ class StreamCapture:
             self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return _friendly_ffmpeg_message(rc, self.stderr_tail)
-        # Check if file is growing
-        if os.path.isfile(output_path):
-            cur_size = os.path.getsize(output_path)
-            with self._lock:
-                if cur_size == self._last_file_size and cur_size > 0:
-                    self._stall_checks += 1
-                    stall_checks = self._stall_checks
-                else:
-                    self._stall_checks = 0
-                    stall_checks = 0
-                self._last_file_size = cur_size
-            if stall_checks >= 6:
-                _log.warning(
-                    "Output file not growing, stream may be stalled (checks=%d)",
-                    stall_checks,
-                )
-                return "输出文件长时间未增长，录制可能已卡住"
+        # Check if file exists and is growing
+        # 检测两种异常：1) 文件不存在或为空 2) 文件存在但大小不增长
+        file_exists = os.path.isfile(output_path)
+        cur_size = os.path.getsize(output_path) if file_exists else 0
+        with self._lock:
+            if cur_size == 0 or cur_size == self._last_file_size:
+                self._stall_checks += 1
+                stall_checks = self._stall_checks
+            else:
+                self._stall_checks = 0
+                stall_checks = 0
+            self._last_file_size = cur_size
+        if stall_checks >= 6:
+            if cur_size == 0:
+                msg = "录制文件未写入数据，直播流可能已中断"
+            else:
+                msg = "输出文件长时间未增长，录制可能已卡住"
+            _log.warning("%s (checks=%d, path=%s)", msg, stall_checks, output_path)
+            return msg
         return ""

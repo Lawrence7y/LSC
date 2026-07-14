@@ -1,6 +1,10 @@
 """Adapter for direct stream URLs."""
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger(__name__)
+
 from urllib.parse import parse_qsl, urlparse
 
 from .base import BasePlatformAdapter, StreamInfo
@@ -16,6 +20,7 @@ class DirectAdapter(BasePlatformAdapter):
     display_name = "直链"
 
     def can_handle(self, url: str) -> bool:
+        _log.debug("Direct: checking %s", url[:60])
         clean_url = (url or "").strip()
         parsed = urlparse(clean_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -25,6 +30,7 @@ class DirectAdapter(BasePlatformAdapter):
         return self._has_direct_query_hint(parsed)
 
     def parse(self, url: str) -> StreamInfo:
+        _log.info("Direct: parsing %s", url[:80])
         clean_url = (url or "").strip()
         return self._success(
             clean_url,

@@ -99,6 +99,9 @@ class RoomSession:
     # 首帧写入校正标记：recording_start_mono 首帧校正完成后置 True，避免重复校正
     # 录制启动时重置为 False（支持重连场景重新校正）
     _first_frame_corrected: bool = False
+    # 共享进样录制文件停滞检测（中频 tick 每 5s 检查，6 次无增长 ≈ 30s）
+    _shared_ingest_last_file_size: int = 0
+    _shared_ingest_stall_checks: int = 0
     # 预览 epoch ID：每次预览启动/重建时生成新 UUID，用于检测预览流版本变化
     preview_epoch_id: str = ""
     # 录制 ID：每次录制启动/重连时生成新 UUID，用于绑定 ClipSnapshot 到特定录制文件

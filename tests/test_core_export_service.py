@@ -61,7 +61,7 @@ def service():
 class TestExportOptions:
     def test_defaults(self):
         opts = ExportOptions()
-        assert opts.codec == "libx264"
+        assert opts.codec == "h264_nvenc"
         assert opts.crf == 23
         assert opts.generate_thumbnail is True
 

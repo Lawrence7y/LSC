@@ -5,8 +5,10 @@ Maps raw FFmpeg/network/OS errors to readable Chinese messages.
 Used by the WebSocket handler to return friendly messages to the frontend.
 """
 
+import logging
 import re
 
+_log = logging.getLogger(__name__)
 
 # 需要保留原始错误信息的模式（路径/磁盘相关，原始信息对定位问题关键）。
 # 命中后追加 `（原始错误：{raw}）`，让用户看到具体路径与 strerror。
@@ -94,21 +96,28 @@ def humanize_error(raw: str) -> str:
     Returns the original message with a prefix if no pattern matches.
     """
     if not raw or not isinstance(raw, str):
+        _log.debug("humanize_error: empty or non-string input: %r", raw)
         return "发生未知错误"
 
     raw_stripped = raw.strip()
+    if not raw_stripped:
+        _log.debug("humanize_error: whitespace-only input")
+        return "发生未知错误"
 
     # 优先匹配需要保留原始信息的模式（权限/磁盘类），追加原始错误便于定位
     for pattern, msg in _PRESERVE_RAW_PATTERNS:
         if pattern.search(raw_stripped):
             snippet = raw_stripped[:200] + ("..." if len(raw_stripped) > 200 else "")
+            _log.debug("humanize_error matched PRESERVE_RAW: %s", pattern.pattern)
             return f"{msg}（原始错误：{snippet}）"
 
     for pattern, msg in _PATTERNS:
         if pattern.search(raw_stripped):
+            _log.debug("humanize_error matched: %s -> %s", pattern.pattern, msg)
             return msg
 
     # No match: return original with prefix
+    _log.debug("humanize_error no pattern matched, returning original prefix")
     # Truncate very long messages
     if len(raw_stripped) > 200:
         raw_stripped = raw_stripped[:200] + "..."
@@ -124,19 +133,25 @@ def is_recoverable_error(raw: str) -> bool:
     对未知错误默认返回 False，避免无限重连浪费资源。
     """
     if not raw or not isinstance(raw, str):
+        _log.debug("is_recoverable_error: empty or non-string input: %r", raw)
         return False
 
     # 先判不可恢复（权限/磁盘/鉴权类优先）
     for pattern in _NON_RECOVERABLE_PATTERNS:
         if pattern.search(raw):
+            _log.debug("is_recoverable_error: matched NON_RECOVERABLE: %s", pattern.pattern)
             return False
     # 再判可恢复
-    for pattern in _RECOVERABLE_PATTERNS:
-        if pattern.search(raw):
-            return True
-    return False
+    recoverable = any(pattern.search(raw) for pattern in _RECOVERABLE_PATTERNS)
+    if recoverable:
+        _log.debug("is_recoverable_error: matched RECOVERABLE pattern")
+    else:
+        _log.debug("is_recoverable_error: no pattern matched, defaulting to non-recoverable")
+    return recoverable
 
 
 def friendly_connect_error(raw: str) -> str:
     """Specialized version for connection-stage errors (more context)."""
-    return humanize_error(raw)
+    result = humanize_error(raw)
+    _log.debug("friendly_connect_error: mapped to: %s", result[:80])
+    return result

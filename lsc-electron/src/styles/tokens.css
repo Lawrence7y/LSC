@@ -7,17 +7,17 @@
 :root {
   /* ===== PRIMITIVE PALETTE ===== */
 
-  /* brand */
-  --brand-50: #e8f2ff;
-  --brand-100: #cfe5ff;
-  --brand-200: #9fcbff;
-  --brand-300: #66abff;
-  --brand-400: #2e8dff;
-  --brand-500: #007aff;
-  --brand-600: #0064d6;
-  --brand-700: #004fad;
-  --brand-800: #003b82;
-  --brand-900: #00275a;
+  /* brand (teal) */
+  --brand-50: #e6f7f7;
+  --brand-100: #ccefef;
+  --brand-200: #99dfdf;
+  --brand-300: #66cfcf;
+  --brand-400: #4DC4BF;
+  --brand-500: #31B3AE;
+  --brand-600: #279E99;
+  --brand-700: #1d7a76;
+  --brand-800: #145652;
+  --brand-900: #0a322f;
 
   /* background */
   --background-50: #ffffff;

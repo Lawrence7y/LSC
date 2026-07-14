@@ -79,12 +79,16 @@ class BilibiliAdapter(BasePlatformAdapter):
         host = parsed.netloc.lower()
         if host in _SHORT_LINK_HOSTS:
             return True
-        return host == "live.bilibili.com" and bool(_ROOM_PATH_RE.fullmatch(parsed.path))
+        result = host == "live.bilibili.com" and bool(_ROOM_PATH_RE.fullmatch(parsed.path))
+        if result:
+            _log.debug("BilibiliAdapter accepted: %s", url[:80])
+        return result
 
     def parse(self, url: str) -> StreamInfo:
         clean_url = (url or "").strip()
         is_short_link = self._is_short_link(clean_url)
         if is_short_link:
+            _log.info("Bilibili: expanding short link: %s", clean_url[:80])
             expanded = self._expand_short_link(clean_url)
             if expanded:
                 clean_url = expanded
@@ -105,6 +109,7 @@ class BilibiliAdapter(BasePlatformAdapter):
                 )
             return self._failed(clean_url, "无法识别 B 站直播间号。", ERROR_PARSE_FAILED)
 
+        _log.info("Bilibili: parsing room %s", room_id)
         room_init = self._fetch_json(ROOM_INIT_URL, params={"id": room_id})
         room_data = room_init.get("data")
         if room_init.get("code") != 0 or not isinstance(room_data, dict):
@@ -151,8 +156,7 @@ class BilibiliAdapter(BasePlatformAdapter):
                             streamer = str(info_data.get("uname") or "")
                         if not category:
                             category = str(info_data.get("area_v2_name") or info_data.get("parent_area_name") or "")
-                        if int(room_data.get("live_status") or 0) != 1:
-                            if int(info_data.get("live_status") or 0) == 1:
+                        if int(room_data.get("live_status") or 0) != 1 and int(info_data.get("live_status") or 0) == 1:
                                 room_data["live_status"] = 1
                 except Exception as exc:
                     _log.debug("B站 getInfo 请求失败: %s", exc)
@@ -205,6 +209,7 @@ class BilibiliAdapter(BasePlatformAdapter):
     def _extract_room_id(self, url: str) -> str:
         match = _ROOM_PATH_RE.fullmatch(urlparse(url).path)
         if match is None:
+            _log.debug("Bilibili: no room_id in path: %s", urlparse(url).path)
             return ""
         return match.group("room_id")
 
@@ -219,6 +224,7 @@ class BilibiliAdapter(BasePlatformAdapter):
         header directly, avoiding a full page download.
         """
         final_url = fetch_head(url, headers=BILIBILI_HEADERS)
+        _log.debug("Bilibili: short link %s -> %s", url[:60], final_url[:60])
         # fetch_head returns the original URL on failure; treat that as failure
         # for a short link because it should always redirect to live.bilibili.com.
         if final_url == url:
@@ -227,6 +233,7 @@ class BilibiliAdapter(BasePlatformAdapter):
 
     def _fetch_json(self, url: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         headers = _build_headers_with_cookies()
+        _log.debug("Bilibili: fetch_json %s", url[:100])
         return fetch_json(url, headers=headers, params=params)
 
     def _extract_play_urls(self, payload: dict[str, Any]) -> tuple[str, dict[str, str]]:

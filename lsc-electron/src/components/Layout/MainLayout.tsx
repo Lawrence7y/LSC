@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
-import { Layout, Menu, Button } from 'antd'
+import { Layout, Menu, Button, Drawer } from 'antd'
 import {
   DesktopOutlined,
   SettingOutlined,
@@ -12,6 +12,7 @@ import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
 import type { ConnectionStatus } from '@/store/appStore'
 import SystemMonitor from './SystemMonitor'
+import Settings from '@/pages/Settings'
 
 const { Sider, Content } = Layout
 
@@ -50,6 +51,8 @@ export default function MainLayout() {
   const appSettings = useAppStore((state) => state.appSettings)
   const setAppSettings = useAppStore((state) => state.setAppSettings)
   const settings = useAppStore((state) => state.settings)
+  const settingsDrawerOpen = useAppStore((state) => state.settingsDrawerOpen)
+  const setSettingsDrawerOpen = useAppStore((state) => state.setSettingsDrawerOpen)
   const [connectionVisible, setConnectionVisible] = useState(false)
 
   // 连接断开时延迟 2 秒再显示 banner，避免 WS 短暂重连期间误报「无法连接到后端」。
@@ -98,10 +101,10 @@ export default function MainLayout() {
     useCallback(
       (id: string) => {
         if (id === 'page:workbench') navigate('/workbench')
-        else if (id === 'page:settings') navigate('/settings')
+        else if (id === 'page:settings') setSettingsDrawerOpen(true)
         else if (id === 'page:reload') window.location.reload()
       },
-      [navigate]
+      [navigate, setSettingsDrawerOpen]
     )
   )
 
@@ -160,7 +163,13 @@ export default function MainLayout() {
           mode="inline"
           selectedKeys={[location.pathname]}
           items={menuItems}
-          onClick={({ key }) => navigate(key)}
+          onClick={({ key }) => {
+            if (key === '/settings') {
+              setSettingsDrawerOpen(true)
+            } else {
+              navigate(key)
+            }
+          }}
           style={{
             flex: 1,
             background: 'transparent',
@@ -273,6 +282,21 @@ export default function MainLayout() {
           <Outlet />
         </Content>
       </Layout>
+
+      {/* 设置抽屉 — 侧边弹出，不离开工作台，保持 Workbench 状态 */}
+      <Drawer
+        title="设置"
+        placement="right"
+        width={520}
+        open={settingsDrawerOpen}
+        onClose={() => setSettingsDrawerOpen(false)}
+        destroyOnClose={false}
+        styles={{
+          body: { padding: 0, background: 'var(--background-900)', overflow: 'hidden' },
+        }}
+      >
+        <Settings />
+      </Drawer>
     </Layout>
   )
 }

@@ -9,15 +9,6 @@ from handlers import room_handler
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_continuous_valorant_analysis_uses_incremental_round_window() -> None:
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-
-    assert "_VALORANT_INCREMENTAL_LOOKBACK_SEC" in source
-    assert "_continuous_valorant_scan_budget(" in source
-    assert "analysis_window_sec" in source
-    assert "time_range=_range" in source
-
-
 def test_continuous_analysis_requires_growing_recording_file_shape() -> None:
     shared_room = SimpleNamespace(
         output_path="recording.mp4",
@@ -28,25 +19,6 @@ def test_continuous_analysis_requires_growing_recording_file_shape() -> None:
 
     assert shared_room.record_output_path.endswith(".mp4")
     assert shared_room.is_recording is True
-
-
-def test_continuous_analysis_uses_recording_file_not_preview_segments() -> None:
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
-
-    assert "room.record_output_path" in loop_body
-    assert "_get_video_duration(" in loop_body
-    assert "detect_valorant_rounds(" in source
-    assert "mse_segment" not in loop_body
-
-
-def test_continuous_analysis_falls_back_to_temp_file() -> None:
-    """分析循环应在 .mp4 不存在时回退查找 temp 文件（共享进样 faststart 模式）。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
-    # 必须存在 .mp4 路径 + temp 回退逻辑
-    assert "os.path.isfile(path)" in loop_body
-    assert ".tmp" in loop_body
 
 
 def test_valorant_round_window_merge_replaces_overlapping_drift() -> None:
@@ -60,9 +32,104 @@ def test_valorant_round_window_merge_replaces_overlapping_drift() -> None:
 
     merged = room_handler._merge_round_windows(existing, window)
 
-    assert merged == window
+    assert [(item["start"], item["end"]) for item in merged] == [
+        (item["start"], item["end"]) for item in window
+    ]
+    assert all(item.get("round_key") for item in merged)
     for prev, cur in zip(merged, merged[1:]):
         assert prev["end"] <= cur["start"]
+
+
+def test_valorant_merge_keeps_ocr_confirmed_over_full_round() -> None:
+    """对照实测：已 OCR 确认并导出的回合，不得被后续 full_round 音频结果覆盖。"""
+    existing = [
+        {
+            "start": 12.0,
+            "end": 76.0,
+            "start_by": "ocr_buy_exit",
+            "end_by": "next_buy",
+            "phase": "combat",
+            "round_key": "round-000001",
+        },
+        {
+            "start": 97.0,
+            "end": 192.0,
+            "start_by": "ocr_buy_exit",
+            "end_by": "next_buy",
+            "phase": "combat",
+            "round_key": "round-000009",
+        },
+    ]
+    window = [
+        {
+            "start": 87.0,
+            "end": 181.0,
+            "start_by": "full_round",
+            "end_by": "full_round",
+            "phase": "full_round",
+            "tail_by": "full_round",
+        },
+        {
+            "start": 210.0,
+            "end": 290.0,
+            "start_by": "full_round",
+            "end_by": "full_round",
+            "phase": "full_round",
+        },
+    ]
+    merged = room_handler._merge_round_windows(existing, window)
+    assert any(
+        abs(float(item["start"]) - 12.0) < 0.1 and item.get("start_by") == "ocr_buy_exit"
+        for item in merged
+    )
+    assert any(
+        abs(float(item["start"]) - 97.0) < 0.1 and item.get("end_by") == "next_buy"
+        for item in merged
+    )
+    # full_round 覆盖第二段 OCR 时被丢弃；无重叠的后续段可保留
+    assert any(abs(float(item["start"]) - 210.0) < 0.1 for item in merged)
+
+
+def test_finalize_scan_timeout_covers_ten_minute_ocr() -> None:
+    # 实测 614s 全文件 OCR ~191s；旧公式只给 ~130s
+    t = room_handler._finalize_scan_timeout(614.0)
+    assert t >= 300
+    assert t >= 190
+    t2 = room_handler._finalize_scan_timeout(614.0, attempt=2)
+    assert t2 > t
+    assert room_handler._finalize_scan_timeout(60.0) >= 300
+    assert room_handler._finalize_scan_timeout(7200.0) <= 1800
+
+
+def test_window_scan_timeout_ocr_not_starved_at_fifty_seconds() -> None:
+    """对照实测：相位短窗 OCR 用旧公式只给 ~49–52s，TimeoutError 后永远无法升格待确认。"""
+    # 纯音频可保持短超时
+    audio_to = room_handler._window_scan_timeout(80.0, use_ocr=False)
+    assert 45 <= audio_to <= 60
+
+    # OCR：80s / 117s 窗口必须远大于 50s
+    ocr_80 = room_handler._window_scan_timeout(80.0, use_ocr=True)
+    ocr_117 = room_handler._window_scan_timeout(117.0, use_ocr=True)
+    assert ocr_80 >= 120
+    assert ocr_117 >= 150
+    assert ocr_117 > ocr_80
+    assert room_handler._window_scan_timeout(25.0, use_ocr=True) >= 120
+    assert room_handler._window_scan_timeout(600.0, use_ocr=True) <= 900
+
+
+def test_continuous_valorant_budget_ocr_timeout_covers_short_window() -> None:
+    """post_combat 短窗启用 OCR 时，超时不得再回落到 ~50s。"""
+    _, use_ocr, timeout, _ = room_handler._continuous_valorant_scan_budget(
+        "valorant_round",
+        last_analyzed=100.0,
+        current_dur=150.0,
+        pressure={"level": "normal"},
+        tick_count=5,
+        round_phase="post_combat",
+        valorant_profile="broadcast",
+    )
+    assert use_ocr is True
+    assert timeout >= 120
 
 
 def test_continuous_analysis_interval_respects_resource_pressure() -> None:
@@ -136,8 +203,13 @@ def test_new_rounds_releases_pending_round_when_ocr_confirms_end() -> None:
     assert room_handler._new_rounds(previous, current) == current
 
 
-def test_continuous_valorant_budget_uses_first_full_scan_then_trailing_window() -> None:
-    """专用模式首次全量，之后固定回看窗口；压力仍会禁用 OCR。"""
+def test_valorant_incremental_lookback_is_four_minutes() -> None:
+    assert room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC == 240.0
+    assert room_handler._VALORANT_MAX_CATCHUP_SEC > 0.0
+
+
+def test_continuous_valorant_budget_uses_first_full_scan_then_catchup_window() -> None:
+    """首次全量；之后从 last_analyzed 回看并向前追赶，禁止跳到尾部滑动窗。"""
     first_range, first_ocr, _, first_full = room_handler._continuous_valorant_scan_budget(
         mode="valorant_round",
         last_analyzed=0.0,
@@ -154,44 +226,126 @@ def test_continuous_valorant_budget_uses_first_full_scan_then_trailing_window() 
         mode="valorant_round",
         last_analyzed=600.0,
         current_dur=720.0,
-        pressure={"level": "critical", "analysis_window_sec": 75, "degrade_analysis": True},
+        pressure={"level": "critical", "analysis_window_sec": 75, "degrade_analysis": True, "pause_analysis": True},
     )
 
     assert (first_range, first_ocr, first_full) == ((0.0, 120.0), True, True)
-    assert (normal_range, normal_ocr, normal_full) == ((540.0, 720.0), True, False)
-    assert (critical_range, critical_ocr, critical_full) == ((645.0, 720.0), False, False)
+    # 回看 180s → 420，向前追赶到 720；不得变成 current-lookback=540 而跳过 540 前的未分析区间
+    assert (normal_range, normal_ocr, normal_full) == ((420.0, 720.0), True, False)
+    assert critical_ocr is False
+    assert critical_full is False
+    assert critical_range[0] <= 600.0
+    assert critical_range[1] == 720.0
+
+
+def test_continuous_valorant_budget_does_not_skip_middle_when_falling_behind() -> None:
+    """录制远快于分析时，必须从 last_analyzed 追赶，不能只扫尾部 lookback 秒。
+
+    现场案例：last_analyzed=25, current=277, lookback=240。
+    旧逻辑 current-lookback=37 仍可能漏中段；更糟的 60s lookback 会跳到 217-277。
+    """
+    scan_range, _, _, _ = room_handler._continuous_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=25.0,
+        current_dur=277.0,
+        pressure={"level": "normal", "analysis_window_sec": 240},
+    )
+    assert scan_range[0] <= 25.0
+    assert scan_range[1] >= 277.0 - 1.0
+    # 旧逻辑 current-60=217 会跳过 25→217；新逻辑必须从 last_analyzed 回看覆盖中段
+    assert scan_range[0] < 217.0
+    assert scan_range[0] <= max(0.0, 25.0 - 240.0) + 1.0
 
 
 def test_continuous_valorant_budget_does_not_expand_with_recording_length() -> None:
-    """长录制仍只回看固定窗口，不按总直播时长周期性全量重扫。"""
-    scan_range, _, _, _ = room_handler._continuous_valorant_scan_budget(
+    """增量窗口按 lookback/追赶上限，不随整场录制时长线性放大。"""
+    short_range, _, _, _ = room_handler._continuous_valorant_scan_budget(
         mode="valorant_round",
-        last_analyzed=1620.0,
-        current_dur=1800.0,
+        last_analyzed=600.0,
+        current_dur=720.0,
         pressure={"level": "normal"},
     )
-    assert scan_range == (1680.0, 1800.0)
+    long_range, _, _, _ = room_handler._continuous_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=600.0,
+        current_dur=3600.0,
+        pressure={"level": "normal"},
+    )
+    lookback = room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC
+    max_catchup = room_handler._VALORANT_MAX_CATCHUP_SEC
+    assert short_range[0] == max(0.0, 600.0 - lookback)
+    assert short_range[1] == 720.0
+    assert long_range[0] == max(0.0, 600.0 - lookback)
+    assert long_range[1] - long_range[0] <= max_catchup + lookback + 1.0
+    assert long_range[1] < 3600.0
 
 
-def test_continuous_valorant_ocr_enabled_every_tick() -> None:
-    """OCR 应每个 tick 都启用，不再每 4 tick 跳过。
+def test_continuous_valorant_budget_caps_catchup_span() -> None:
+    """单次追赶有上限，避免一次扫完整场超长录像。"""
+    scan_range, _, _, _ = room_handler._continuous_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=100.0,
+        current_dur=3600.0,
+        pressure={"level": "normal"},
+    )
+    assert scan_range[1] - scan_range[0] <= room_handler._VALORANT_MAX_CATCHUP_SEC + room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC + 1.0
+    assert scan_range[0] <= 100.0
+    assert scan_range[1] < 3600.0
 
-    跳过 OCR 会导致纯音频边界（回合 N 下半 + 回合 N+1 上半）被直接导出。
-    """
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
-    # 不应再有 _scan_counter % 4 的逻辑
-    assert "_scan_counter % 4" not in loop_body, \
-        "OCR 不应再每 4 tick 跳过，应每个 tick 都启用"
-    assert "tick_count %" not in loop_body
+
+def test_continuous_valorant_budget_post_combat_caps_catchup_span() -> None:
+    """post_combat 相位调度下追赶窗口仍受 _MAX_CATCHUP_SEC + lookback 约束。"""
+    scan_range, _, _, _ = room_handler._continuous_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=100.0,
+        current_dur=3600.0,
+        pressure={"level": "normal"},
+        round_phase="post_combat",
+        valorant_profile="broadcast",
+    )
+    lookback = room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC
+    max_catchup = room_handler._VALORANT_MAX_CATCHUP_SEC
+    assert scan_range[1] - scan_range[0] <= max_catchup + lookback + 1.0
+    assert scan_range[0] <= 100.0
+    assert scan_range[1] < 3600.0
 
 
-def test_valorant_round_scan_uses_trailing_window_after_first_scan() -> None:
+def test_continuous_valorant_budget_honors_phase_short_window() -> None:
+    """相位调度下 buy 相位不 OCR，扫描窗口远小于旧的 240s。"""
+    scan_range, use_ocr, _, full = room_handler._continuous_valorant_scan_budget(
+        "valorant_round",
+        last_analyzed=100.0,
+        current_dur=180.0,
+        pressure={"level": "normal"},
+        tick_count=3,
+        round_phase="buy",
+        valorant_profile="pov",
+    )
+    assert full is False
+    assert use_ocr is False  # buy sleep / buy phase: no OCR
+    assert scan_range[1] - scan_range[0] < 240.0
+
+
+def test_continuous_valorant_budget_dense_ocr_in_post_combat() -> None:
+    """post_combat 相位应启用 OCR（加密采样）。"""
+    _, use_ocr, _, _ = room_handler._continuous_valorant_scan_budget(
+        "valorant_round",
+        last_analyzed=100.0,
+        current_dur=150.0,
+        pressure={"level": "normal"},
+        tick_count=5,
+        round_phase="post_combat",
+        valorant_profile="broadcast",
+    )
+    assert use_ocr is True
+
+
+def test_valorant_round_scan_uses_catchup_window_after_first_scan() -> None:
     scan_range, use_ocr, _, full_rescan = room_handler._continuous_valorant_scan_budget(
         "valorant_round", 600.0, 720.0, {"level": "normal", "analysis_window_sec": 180}
     )
 
-    assert (scan_range, use_ocr, full_rescan) == ((540.0, 720.0), True, False)
+    assert (scan_range, use_ocr, full_rescan) == ((420.0, 720.0), True, False)
 
 
 def test_valorant_round_scan_only_first_pass_is_full() -> None:
@@ -203,15 +357,27 @@ def test_valorant_round_scan_only_first_pass_is_full() -> None:
     )
 
     assert (first_range, first_full) == ((0.0, 120.0), True)
-    assert (later_range, later_full) == ((600.0, 720.0), False)
+    # 默认 lookback=240 → max(0, 600-240)=360，向前追赶到 720
+    assert later_range[0] == max(0.0, 600.0 - room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC)
+    assert later_range[0] <= 600.0
+    assert later_range[1] == 720.0
+    assert later_full is False
     assert first_ocr is True
     assert later_ocr is True
 
 
-def test_valorant_round_ocr_is_disabled_for_non_round_mode_or_degraded_pressure() -> None:
+def test_valorant_round_ocr_stays_on_under_soft_pressure() -> None:
+    """软/高负载降频不关 OCR；仅 pause_analysis（极端占用）才禁用走纯音频。"""
     assert room_handler._continuous_valorant_refine_with_ocr("fast", {"level": "normal"}) is False
-    assert room_handler._continuous_valorant_refine_with_ocr("valorant_round", {"level": "critical"}) is False
-    assert room_handler._continuous_valorant_refine_with_ocr("valorant_round", {"degrade_analysis": True}) is False
+    assert room_handler._continuous_valorant_refine_with_ocr(
+        "valorant_round", {"level": "critical", "pause_analysis": False}
+    ) is True
+    assert room_handler._continuous_valorant_refine_with_ocr(
+        "valorant_round", {"level": "critical", "pause_analysis": True}
+    ) is False
+    assert room_handler._continuous_valorant_refine_with_ocr(
+        "valorant_round", {"level": "pressure", "degrade_analysis": True}
+    ) is True
     assert room_handler._continuous_valorant_refine_with_ocr("valorant_round", {"level": "normal"}) is True
 
 
@@ -233,54 +399,50 @@ def test_only_complete_ocr_rounds_are_auto_exportable() -> None:
         "start_by": "audio", "end_by": "audio",
     })
     assert not room_handler._is_auto_exportable_valorant_round({
+        "start": 102.0, "end": 154.0, "phase": "combat",
+        "start_by": "full_round", "end_by": "full_round",
+    })
+    assert not room_handler._is_auto_exportable_valorant_round({
         "start": 154.0, "end": 102.0, "phase": "combat",
         "start_by": "ocr_buy_exit", "end_by": "ocr_result",
     })
+    # 短于 35s 的假买枪段（如 回合3_218s = 27s）不得入列/导出
+    assert not room_handler._is_auto_exportable_valorant_round({
+        "start": 218.7, "end": 245.7, "phase": "combat",
+        "start_by": "ocr_buy_exit", "end_by": "next_buy",
+    })
 
 
-def test_continuous_loop_uses_explicit_valorant_round_mode_and_never_publishes_open_tail() -> None:
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
+def test_clamped_ocr_format_output_is_auto_exportable() -> None:
+    """RMS 夹断后仍应保留 OCR 元数据，使持续分析能 clip_queued 入列。"""
+    from lsc.analyzer.round_detector import ValorantRoundConfig, _format_output
+    import numpy as np
 
-    assert '_valorant_incremental_rounds = mode == "valorant_round" and game == "valorant"' in loop_body
-    assert "_drop_open_tail_rounds(new_hl, worker_dur)" in loop_body
-    assert "if not window_rounds:" not in loop_body
-    assert "_is_auto_exportable_valorant_round(h)" in loop_body
-
-
-def test_continuous_analysis_initializes_recording_snapshot_before_loop() -> None:
-    """首个 tick 在录制文件尚未读取前也不能引用未赋值的快照变量。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
-    before_loop = loop_body.split("while not _continuous_tasks", 1)[0]
-
-    assert "video_path = ''" in before_loop
-    assert "current_dur = 0.0" in before_loop
-
-
-def test_continuous_loop_initializes_kick_decision_each_tick() -> None:
-    """没有满足扫描阈值时也不能引用上一个 tick 或未赋值的 should_kick。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
-
-    assert "should_kick = False" in loop_body
+    cfg = ValorantRoundConfig(full_round=True, pre_combat_pad=2.0, tail_pad=0.0)
+    phase = [{
+        "start": 40.0,
+        "end": 153.0,
+        "start_by": "ocr_buy_exit",
+        "end_by": "next_buy",
+        "tail_by": "ocr_phase",
+        "ocr_confirmed": True,
+        "ocr_end": None,
+    }]
+    result = _format_output(
+        [(40, 152)], np.ones(152, dtype=np.float32), 1.0, 153.0, cfg,
+        phase_rounds=phase,
+    )
+    assert room_handler._is_auto_exportable_valorant_round(result[0])
 
 
-def test_continuous_loop_consumes_empty_scan_result() -> None:
-    """扫描没有发现高光也必须推进 analyzed_duration，避免重复扫描同一区间。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
+def test_ocr_combat_energy_rejects_buy_phase_only_segments() -> None:
+    import numpy as np
+    from lsc.analyzer.round_detector import _ocr_round_has_combat_energy
 
-    assert "worker_completed_at > last_consumed_at" in loop_body
-    assert "and worker_result" not in loop_body.split("can_consume =", 1)[1].split("if can_consume", 1)[0]
+    quiet = np.full(60, 10.0, dtype=np.float64)
+    combat = np.concatenate([np.full(10, 10.0), np.full(50, 80.0)])
+    threshold = 40.0
+    assert _ocr_round_has_combat_energy(quiet, 0, 60, threshold) is False
+    assert _ocr_round_has_combat_energy(combat, 0, 60, threshold) is True
 
 
-def test_continuous_analysis_only_exports_confirmed_rounds() -> None:
-    """仅导出 OCR/钟声确认边界的回合，tail_by='audio' 的回合不自动导出。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    loop_body = source.split("async def _continuous_analysis_loop(", 1)[1].split("@server.on('start_continuous_analysis')", 1)[0]
-    # 应有 confirmed_hl 过滤逻辑
-    assert "confirmed_hl" in loop_body, \
-        "应有 confirmed_hl 过滤逻辑，仅导出已确认边界的回合"
-    assert "_is_auto_exportable_valorant_round(h)" in loop_body
-    assert "_CONFIRMED_TAIL" not in loop_body

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from argparse import Namespace
+
 from PySide6.QtCore import QThread, Signal
 
 from lsc.exporter.clip import ClipExporter

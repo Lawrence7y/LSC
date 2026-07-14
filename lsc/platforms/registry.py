@@ -29,6 +29,7 @@ _log = logging.getLogger(__name__)
 QUALITY_PRESET_CANDIDATES = {
     "原画": ["origin", "source", "蓝光", "超清", "FULL_HD1", "uhd", "UHD1", "10000", "400", "hd", "HD1", "sd", "SD1", "SD2", "ld", "ao"],
     "高清": ["hd", "HD1", "250", "300", "uhd", "UHD1", "FULL_HD1", "origin", "source", "sd", "SD1", "SD2", "ld", "ao"],
+    "标清": ["sd", "SD1", "SD2", "150", "300", "ld", "hd", "HD1", "origin", "source", "uhd", "UHD1", "FULL_HD1", "ao"],
     "流畅": ["sd", "SD1", "SD2", "150", "80", "ld", "origin", "source", "hd", "HD1", "uhd", "UHD1", "FULL_HD1", "ao"],
 }
 
@@ -90,6 +91,9 @@ class _ParseCache:
         self._cleanup_every = 20
         self._success_ttl = 30.0
         self._failure_ttl = 10.0
+        self._stop_event = threading.Event()
+        self._cleanup_thread = threading.Thread(target=self._cleanup_worker, daemon=True)
+        self._cleanup_thread.start()
 
     def _ttl_for(self, info: StreamInfo) -> float:
         return self._failure_ttl if info.error else self._success_ttl
@@ -121,25 +125,33 @@ class _ParseCache:
                     continue
                 if now > ts - 60:
                     return True
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("操作异常（已忽略）: %s", exc)
         return False
 
     def _cleanup(self) -> None:
-        """清理过期条目。在锁外调用以减少锁持有时间。"""
+        """清理过期条目。单次加锁内完成检查和删除，防止竞态误删新条目。"""
         now = time.monotonic()
-        # 先收集需要删除的 key（在锁内）
         with self._lock:
-            expired = [
-                key
-                for key, (timestamp, info) in self._store.items()
-                if now - timestamp > self._ttl_for(info)
-            ]
-        # 删除过期条目（在锁外，避免长时间持有锁）
-        if expired:
-            with self._lock:
-                for key in expired:
-                    self._store.pop(key, None)
+            expired_keys = []
+            for key, (timestamp, info) in list(self._store.items()):
+                if now - timestamp > self._ttl_for(info):
+                    # 二次验证：加锁后重新检查时间戳，确保未被 set() 刷新
+                    existing = self._store.get(key)
+                    if existing and existing[0] == timestamp:
+                        expired_keys.append(key)
+            for key in expired_keys:
+                self._store.pop(key, None)
+            if expired_keys:
+                _log.debug("cleaned up %d expired cache entries", len(expired_keys))
+
+    def _cleanup_worker(self) -> None:
+        """单后台线程，复用而非每次创建。"""
+        while not self._stop_event.wait(timeout=60):
+            try:
+                self._cleanup()
+            except Exception as exc:
+                _log.debug("cleanup worker error: %s", exc)
 
     def get(self, url: str, platform: str) -> StreamInfo | None:
         with self._lock:
@@ -150,24 +162,25 @@ class _ParseCache:
 
             entry = self._store.get((url, platform))
             if entry is None:
-                # 异步触发清理，不阻塞当前调用
-                if should_cleanup:
-                    import threading
-                    threading.Thread(target=self._cleanup, daemon=True).start()
-                return None
-            timestamp, info = entry
-            if time.monotonic() - timestamp > self._ttl_for(info):
-                self._store.pop((url, platform), None)
-                return None
-            # 即使在 TTL 内，如果 stream_url 本身已过期，也需要重新解析
-            if not info.error and self._is_stream_url_expired(info):
-                self._store.pop((url, platform), None)
-                return None
-            return info
+                result: StreamInfo | None = None
+            else:
+                timestamp, info = entry
+                if (time.monotonic() - timestamp > self._ttl_for(info)) or (
+                    not info.error and self._is_stream_url_expired(info)
+                ):
+                    self._store.pop((url, platform), None)
+                    result = None
+                else:
+                    result = info
+
+        # 单后台线程定期清理，无需每次创建新线程
+        # cleanup_worker 由 __init__ 启动，通过 _stop_event 控制生命周期
+        return result
 
     def set(self, url: str, platform: str, info: StreamInfo) -> None:
         with self._lock:
             self._store[(url, platform)] = (time.monotonic(), info)
+        _log.debug("cached parse result for %s (%s) ttl=%.0fs", url[:60], platform, self._ttl_for(info))
 
 
 _parse_cache = _ParseCache()
@@ -263,8 +276,10 @@ def parse_stream(
     if candidate_platforms is not None:
         candidate_set = set(candidate_platforms)
         candidates = [a for a in adapter_list if a.platform in candidate_set]
+        _log.debug("host routing matched %s for %s", candidate_platforms, clean_url[:60])
     else:
         candidates = list(adapter_list)
+        _log.debug("no host route match, scanning all %d adapters", len(candidates))
 
     for adapter in candidates:
         if not adapter.can_handle(clean_url):
@@ -288,6 +303,7 @@ def parse_stream(
         _parse_cache.set(clean_url, adapter.platform, info)
         return info
 
+    _log.warning("no adapter could handle URL: %s", clean_url[:100])
     return StreamInfo(
         platform="unknown",
         room_url=clean_url,
@@ -323,5 +339,7 @@ def select_quality(info: StreamInfo | Mapping[str, object], quality_preset: str)
     for quality_key in QUALITY_PRESET_CANDIDATES.get(quality_preset, ()):
         url = quality_urls.get(quality_key, "")
         if isinstance(url, str) and url.startswith(("http://", "https://")):
+            _log.debug("selected quality '%s' for preset '%s'", quality_key, quality_preset)
             return url, quality_key
+    _log.debug("no quality matched preset '%s', falling back to '%s'", quality_preset, selected_quality)
     return stream_url, selected_quality

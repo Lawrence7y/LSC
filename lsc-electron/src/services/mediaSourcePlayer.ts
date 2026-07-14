@@ -102,6 +102,7 @@ export class MsePlayer {
   private _stallRecoveryCount = 0
   private readonly _stallRecoveryLimit = 3
   private readonly _bufferStallTimeoutMs = 8000
+  private _currentBlobUrl: string | null = null
 
   constructor(options: MsePlayerOptions) {
     this._video = options.videoElement
@@ -225,7 +226,9 @@ export class MsePlayer {
   /** Play the video. */
   play(): void {
     if (this._video && this._state !== 'error') {
-      this._video.play().catch(() => {})
+      this._video.play().catch((err) => {
+        console.warn('[MsePlayer] play() failed:', err)
+      })
     }
   }
 
@@ -233,6 +236,9 @@ export class MsePlayer {
   pause(): void {
     if (this._video) {
       this._video.pause()
+    }
+    if (this._state === 'playing') {
+      this._setState('paused')
     }
   }
 
@@ -271,7 +277,7 @@ export class MsePlayer {
    * @remarks
    * 仅当状态非 idle/error 时生效；paused 状态不自动恢复（尊重用户主动暂停）。
    */
-  resumePlayback(): void {
+  resumePlayback(userInitiated = false): void {
     if (this._state === 'error' || this._state === 'idle') return
     if (this._video && this._video.buffered.length > 0) {
       const bufStart = this._video.buffered.start(0)
@@ -281,7 +287,35 @@ export class MsePlayer {
       }
     }
     this._liveEdgeAligned = false
+    if (userInitiated && this._state === 'paused') {
+      this._setState('playing')
+      return
+    }
     if (this._state !== 'paused') {
+      this._tryPlay(0)
+    }
+  }
+
+  /**
+   * 强制跳到直播最新位置。
+   *
+   * 与 resumePlayback() 不同，这里即使 currentTime 仍在缓冲区内，也会主动
+   * seek 到缓冲区末尾附近，用于控制栏“直播”按钮。
+   */
+  goLive(): void {
+    if (this._state === 'error' || this._state === 'idle') return
+    if (this._video && this._video.buffered.length > 0) {
+      const bufStart = this._video.buffered.start(0)
+      const bufEnd = this._video.buffered.end(this._video.buffered.length - 1)
+      const target = Math.max(bufStart, bufEnd - 0.3)
+      this._video.currentTime = target
+    } else {
+      this._log('goLive: buffer empty, waiting for next segment')
+    }
+    this._liveEdgeAligned = false
+    if (this._state === 'paused') {
+      this._setState('playing')
+    } else {
       this._tryPlay(0)
     }
   }
@@ -339,7 +373,8 @@ export class MsePlayer {
     this._cleanup()
     try {
       this._mediaSource = new MediaSource()
-      this._video.src = URL.createObjectURL(this._mediaSource)
+      this._currentBlobUrl = URL.createObjectURL(this._mediaSource)
+      this._video.src = this._currentBlobUrl
       // 用 AbortController 统一管理事件监听器，_cleanup 时 abort 即可全部移除（M14）
       this._abortController = new AbortController()
       const { signal } = this._abortController
@@ -362,10 +397,6 @@ export class MsePlayer {
 
           this._log(`MediaSource opened${this._sourceBuffer ? ', SourceBuffer created' : ''}`)
 
-          // 通知外部：MediaSource 已 open，video.src 已绑定。
-          // VideoPreview 在此回调中创建 Web Audio 路由（createMediaElementSource），
-          // 确保不会因 player.start() 内部的 stop()/load() 断开音频连接。
-          this._onSourceOpen?.()
         } catch (e) {
           this._handleError(`MediaSource init failed: ${e}`)
         }
@@ -598,6 +629,8 @@ export class MsePlayer {
    * 3. 将 _sourceBuffer 和 _mediaSource 置 null，等待下次 start() 重新初始化。
    */
   private _cleanup(): void {
+    this._abortController?.abort()
+    this._abortController = null
     if (this._sourceBuffer) {
       try {
         if (this._mediaSource?.readyState === 'open') {
@@ -607,7 +640,10 @@ export class MsePlayer {
       this._sourceBuffer = null
     }
     if (this._mediaSource) {
-      URL.revokeObjectURL(this._video.src)
+      if (this._currentBlobUrl) {
+        URL.revokeObjectURL(this._currentBlobUrl)
+      }
+      this._currentBlobUrl = null
       this._mediaSource = null
     }
   }
@@ -694,6 +730,7 @@ export class MsePlayer {
   private _handleError(msg: string): void {
     this._log(`ERROR: ${msg}`)
     this._setState('error')
+    this._stopStallDetection()
     this._onError?.(msg)
   }
 

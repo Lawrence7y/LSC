@@ -10,7 +10,10 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    // 5173 落在本机 Windows 排除端口 5150-5249，会导致 EACCES
+    host: '127.0.0.1',
+    port: 5250,
+    strictPort: true,
     proxy: {
       '/ws': {
         target: 'ws://localhost:9876',

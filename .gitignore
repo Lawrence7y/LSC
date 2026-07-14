@@ -79,6 +79,9 @@ lsc-electron/dist-electron/
 lsc-electron/out/
 lsc-electron/tsconfig.node.tsbuildinfo
 
+# Electron 打包用嵌入式 Python / FFmpeg（由 prep-bundle 生成，勿入库）
+lsc-electron/.bundle/
+
 # Runtime data (user-specific)
 data/rooms.json
 python-backend/recording_history.json
@@ -93,6 +96,7 @@ logs/
 .mimocode/
 .trae/
 .workbuddy/
+.zcode/
 
 # Unrelated prototype/scratch files
 bun-socket-v2.ts
@@ -129,5 +133,13 @@ socket.ts
 ws-relay.js
 ws-server.js
 
+# Debug dump/log/profiling throwaway artifacts
+_dump_*.txt
+_dump_*.py
+_log_now.txt
+*.pstats
+
 # Brainstorm visual companion sessions
 .superpowers/
+
+.worktrees/

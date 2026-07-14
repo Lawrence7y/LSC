@@ -1,0 +1,5 @@
+{
+  "shared_ingest_enabled": false,
+  "shared_ingest_preview_crf": 23,
+  "shared_ingest_preview_preset": "veryfast"
+}
