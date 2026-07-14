@@ -83,6 +83,7 @@ _DEFAULT_GAME = "valorant"
 
 # RapidOCR 单例：避免每次调用重新加载 ONNX 模型（每次构造需 ~1-2s 加载检测+识别模型）
 _ocr_instance: Any = None
+_ocr_lock = threading.Lock()  # #8: prevent concurrent multi-room OCR init
 
 
 def invalidate_ocr() -> None:
@@ -92,11 +93,12 @@ def invalidate_ocr() -> None:
 
 
 def _get_ocr() -> Any:
-    """获取 RapidOCR 单例（懒加载，无锁）。"""
+    """获取 RapidOCR 单例（懒加载，线程安全）。"""
     global _ocr_instance
-    if _ocr_instance is None:
-        from lsc.analyzer.ocr_accel import create_ocr, read_settings_ocr_accel
-        _ocr_instance = create_ocr(read_settings_ocr_accel())
+    with _ocr_lock:
+        if _ocr_instance is None:
+            from lsc.analyzer.ocr_accel import create_ocr, read_settings_ocr_accel
+            _ocr_instance = create_ocr(read_settings_ocr_accel())
     return _ocr_instance
 
 

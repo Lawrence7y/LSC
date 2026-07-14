@@ -1348,7 +1348,8 @@ def _refine_rounds_with_ocr(
 
 def _get_duration(video_path: str, ffmpeg_path: str) -> float:
     """获取视频时长。"""
-    ffprobe = ffmpeg_path.replace("ffmpeg", "ffprobe")
+    from pathlib import Path
+    ffprobe = str(Path(ffmpeg_path).with_name("ffprobe" + Path(ffmpeg_path).suffix))  # #30: basename only
     try:
         result = run_hidden(
             [ffprobe, "-v", "error", "-probesize", "50M", "-analyzeduration", "10M",

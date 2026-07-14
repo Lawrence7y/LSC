@@ -349,9 +349,15 @@ class ClipExporter:
         # Build output filename with path traversal protection
         raw_title = title or f"highlight_{clip_index}"
         # Strip Windows-illegal characters
-        safe_title = re.sub(r'[\\/:*?"<>|]', '_', raw_title)
+        safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]', '_', raw_title)  # #33: control chars
         # Prevent path traversal: reject '..' components and leading slashes
         safe_title = safe_title.replace('..', '__').strip('. ')
+    # #33: Windows reserved device names
+    reserved = {'CON','PRN','AUX','NUL','COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',
+                'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9'}
+    stem = safe_title.rsplit('.',1)[0].upper() if '.' in safe_title else safe_title.upper()
+    if stem in reserved:
+        safe_title = f'_{safe_title}'
         if not safe_title:
             safe_title = f"highlight_{clip_index}"
         output_path = os.path.join(output_dir, f"{safe_title}.mp4")
@@ -471,7 +477,7 @@ class ClipExporter:
             if prof.is_copy:
                 out += prof.ffmpeg_audio_args()
             else:
-                out += ["-c:a", "copy"]
+                out += ["-c:a", "aac", "-b:a", "128k"]  # #36: transcode to AAC for MP4 compatibility
             out += vf
             out += ["-movflags", "+faststart"]
             return out
@@ -546,7 +552,17 @@ class ClipExporter:
                     """Kill FFmpeg if it runs longer than 5 minutes."""
                     nonlocal export_timed_out
                     try:
-                        proc.wait(timeout=300)
+                        # #35: scale timeout by resolution and codec
+            base_timeout = 300
+            if hasattr(self, 'width') and self.width and hasattr(self, 'height') and self.height:
+                pixels = self.width * self.height
+                if pixels > 3840 * 2160:
+                    base_timeout = int(base_timeout * 2.5)
+                elif pixels > 1920 * 1080:
+                    base_timeout = int(base_timeout * 1.5)
+            if not getattr(self, 'hardware_encoder', True):
+                base_timeout = int(base_timeout * 2.0)
+            proc.wait(timeout=base_timeout)
                     except subprocess.TimeoutExpired:
                         export_timed_out = True
                         try:
@@ -672,7 +688,7 @@ class ClipExporter:
 
         # 原子写入：临时文件 rename 到最终路径
         try:
-            os.replace(tmp_output_path, output_path)
+            os.replace(tmp_output_path, output_path)  # #34: atomic rename (caller must pick unique paths)
         except OSError as exc:
             _cleanup_tmp(tmp_output_path)
             return ExportResult(False, output_path, clip_index, safe_title,
