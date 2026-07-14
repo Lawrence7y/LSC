@@ -3119,6 +3119,11 @@ def register_room_handlers(server, bridge):
             raw = str(data.get('cookies') or data.get('text') or '')
         if not raw.strip():
             return {'success': False, 'error': '请粘贴 Cookie 内容'}
+        # 限制 Cookie 输入大小，防止超大 payload 导致 OOM（正常 Cookie < 16KB）
+        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
+        if len(raw) > _MAX_COOKIE_BYTES:
+            _log.warning("抖音 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
+            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
         try:
             status = save_douyin_cookies_from_text(raw)
             _log.info("抖音 Cookie 已保存: count=%s", status.get('count'))
@@ -3165,6 +3170,12 @@ def register_room_handlers(server, bridge):
         if len(rooms_data) < 2:
             _align_log.warning("预览音频对齐请求房间数不足: %d", len(rooms_data))
             return {'success': False, 'error': '至少需要 2 个房间'}
+        # 限制房间数与单路 PCM 大小，防止超大 payload 导致 OOM
+        _MAX_ALIGN_ROOMS = 64
+        _MAX_PCM_BASE64_BYTES = 20 * 1024 * 1024  # 20 MB per room
+        if len(rooms_data) > _MAX_ALIGN_ROOMS:
+            _align_log.warning("预览音频对齐房间数过多: %d (limit %d)", len(rooms_data), _MAX_ALIGN_ROOMS)
+            return {'success': False, 'error': f'房间数过多（{len(rooms_data)}），上限 {_MAX_ALIGN_ROOMS}'}
         try:
             import base64
 
@@ -3193,6 +3204,11 @@ def register_room_handlers(server, bridge):
                 )
                 if not room_id or not pcm_b64:
                     _align_log.warning("预览音频对齐跳过: room_id=%s, 缺少数据", room_id)
+                    continue
+                # 限制单路 PCM 大小，防止超大 base64 解码导致 OOM
+                if len(pcm_b64) > _MAX_PCM_BASE64_BYTES:
+                    _align_log.warning("预览音频对齐跳过: room_id=%s, PCM 过大=%d bytes (limit %d)",
+                                       room_id, len(pcm_b64), _MAX_PCM_BASE64_BYTES)
                     continue
                 try:
                     raw = base64.b64decode(pcm_b64)
@@ -6156,7 +6172,7 @@ def register_room_handlers(server, bridge):
         round_key = data.get('round_key', '') or data.get('clip_id', '')
         if not round_key:
             _log.warning("begin_refine_clip: 缺少 round_key")
-            return
+            return {'success': False, 'error': 'missing round_key'}
         # 冻结：OCR 不得再改该 round_key 的边界
         _refined_round_keys.add(round_key)
         _clip_refine_state[round_key] = {
@@ -6176,6 +6192,7 @@ def register_room_handlers(server, bridge):
             },
         })
         _log.info("精修开始: room=%s, round_key=%s", room_id, round_key)
+        return {'success': True, 'round_key': round_key, 'status': 'refining'}
 
     @server.on('confirm_highlight_clip')
     async def handle_confirm_highlight_clip(data):
@@ -6187,7 +6204,7 @@ def register_room_handlers(server, bridge):
         target_room_ids = data.get('target_room_ids', [])
         if not round_key:
             _log.warning("confirm_highlight_clip: 缺少 round_key")
-            return
+            return {'success': False, 'error': 'missing round_key'}
         # 主房确认
         _refined_round_keys.add(round_key)
         _clip_refine_state[round_key] = {
@@ -6235,6 +6252,12 @@ def register_room_handlers(server, bridge):
             })
         _log.info("精修确认: room=%s, round_key=%s, targets=%d, %.1f-%.1f",
                   room_id, round_key, len(target_room_ids), start, end)
+        return {
+            'success': True,
+            'round_key': round_key,
+            'status': 'user_confirmed',
+            'target_room_ids': target_room_ids,
+        }
 
     @server.on('cancel_refine_clip')
     async def handle_cancel_refine_clip(data):
@@ -6243,7 +6266,7 @@ def register_room_handlers(server, bridge):
         round_key = data.get('round_key', '') or data.get('clip_id', '')
         if not round_key:
             _log.warning("cancel_refine_clip: 缺少 round_key")
-            return
+            return {'success': False, 'error': 'missing round_key'}
         saved = _clip_refine_state.pop(round_key, None)
         if saved and not room_id:
             room_id = saved.get('room_id', '')
@@ -6269,6 +6292,7 @@ def register_room_handlers(server, bridge):
             'data': broadcast_data,
         })
         _log.info("精修取消: room=%s, round_key=%s", room_id, round_key)
+        return {'success': True, 'round_key': round_key, 'status': 'pending'}
 
     # ── TimelineContext 集成（已抽离至 handlers.timeline_handlers）──
     register_timeline_handlers(server, bridge=bridge, manager=manager, queue_export=queue_export)
