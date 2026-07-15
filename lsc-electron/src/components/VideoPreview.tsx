@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
 import { LoadingOutlined, PlayCircleOutlined } from '@ant-design/icons'
 import { MsePlayer, MsePlayerState } from '@/services/mediaSourcePlayer'
-import { drainPendingMseSegments, getMseInitCache } from '@/hooks/useWebSocket'
+import { clearMseRoomCache, drainPendingMseSegments, getMseInitCache } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
 
@@ -51,6 +51,15 @@ export function VideoPreview({
   const platform = useAppStore(
     (s) => s.rooms.find((r) => r.room_id === roomId)?.platform
   )
+  const previewMode = useAppStore(
+    (s) => s.rooms.find((r) => r.room_id === roomId)?.preview_mode,
+  )
+  const previewEpochId = useAppStore(
+    (s) => s.rooms.find((r) => r.room_id === roomId)?.preview_epoch_id,
+  )
+  // 预览源切换（live ↔ recording_review / epoch 轮换）时递增，强制重建 MsePlayer
+  const [playerGeneration, setPlayerGeneration] = useState(0)
+  const previewSourceRef = useRef<{ mode: string; epoch: string } | null>(null)
   // 超时检测：加载后 30 秒未收到任何帧则报错。
   // B站等平台首次预览需要 refresh_stream_url（重新解析直播页面），耗时可达 10+ 秒。
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -84,6 +93,34 @@ export function VideoPreview({
     setError(null)
   }, [])
 
+  // 完整销毁播放器、Web Audio 路由与全局注册表（预览源切换时调用）
+  const disposePlayerFully = useCallback(() => {
+    if (loadTimeoutRef.current) {
+      clearTimeout(loadTimeoutRef.current)
+      loadTimeoutRef.current = null
+    }
+    const currentPlayer = playerRef.current
+    if (currentPlayer) {
+      currentPlayer.stop()
+      playerRef.current = null
+    }
+    if (audioSourceRef.current) {
+      try { audioSourceRef.current.disconnect() } catch {}
+      audioSourceRef.current = null
+    }
+    if (gainNodeRef.current) {
+      try { gainNodeRef.current.disconnect() } catch {}
+      gainNodeRef.current = null
+    }
+    const registry = (window as any).__msePlayers || {}
+    if (currentPlayer && registry[roomId]?.player === currentPlayer) {
+      delete registry[roomId]
+    }
+    autoRetriedRef.current = false
+    setState('idle')
+    setError(null)
+  }, [roomId])
+
   // S6: 重试 loading 状态，防止用户连续点击
   const [retrying, setRetrying] = useState(false)
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -115,10 +152,33 @@ export function VideoPreview({
     playerRef.current?.feedMedia(data)
   }, [])
 
-  // Auto-start when active. Deps are limited to [active, roomId]; send/onReady/onError
-  // are accessed via refs so their identity changes do not retrigger the effect.
-  // Backend enable_preview is managed by the parent — VideoPreview only creates the
-  // MsePlayer and registers it; it does NOT send enable_preview on init/cleanup.
+  // 预览源切换：live_mse ↔ recording_review 或 preview_epoch_id 轮换时重建播放器，
+  // 避免旧实例 _initReceived=true 丢弃新 mse_init。
+  useEffect(() => {
+    if (!active) return
+
+    const mode = previewMode ?? 'live_mse'
+    const epoch = previewEpochId ?? ''
+    const prev = previewSourceRef.current
+
+    if (prev !== null) {
+      const modeChanged = prev.mode !== mode
+      const epochChanged = epoch !== '' && prev.epoch !== epoch
+      if (modeChanged || epochChanged) {
+        disposePlayerFully()
+        clearMseRoomCache(roomId)
+        setPlayerGeneration((g) => g + 1)
+      }
+    }
+
+    previewSourceRef.current = { mode, epoch }
+  }, [active, roomId, previewMode, previewEpochId, disposePlayerFully])
+
+  // Auto-start when active. Deps are limited to [active, roomId, playerGeneration];
+  // send/onReady/onError are accessed via refs so their identity changes do not
+  // retrigger the effect. Backend enable_preview is managed by the parent —
+  // VideoPreview only creates the MsePlayer and registers it; it does NOT send
+  // enable_preview on init/cleanup.
   useEffect(() => {
     if (!active) return
     if (!videoRef.current || playerRef.current) return
@@ -252,7 +312,7 @@ export function VideoPreview({
         retryTimerRef.current = null
       }
     }
-  }, [active, roomId])
+  }, [active, roomId, playerGeneration])
 
   // Expose feed methods via window for WebSocket handler
   useEffect(() => {

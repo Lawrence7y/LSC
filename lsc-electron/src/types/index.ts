@@ -53,6 +53,8 @@ export interface RoomSession {
   preview_phase?: 'idle' | 'refreshing_url' | 'probing' | 'streaming' | 'error'
   /** 预览来源：live_mse=直播 MSE，recording_review=录制文件回看，degraded=降级；缺省视为 live_mse */
   preview_mode?: PreviewMode
+  /** 预览源世代 ID；切换 live/recording_review 或重建 MSE 时递增，供前端强制重建播放器 */
+  preview_epoch_id?: string
   // 直播是否在线（false 表示断联）
   is_live?: boolean
   // 当前预览画质

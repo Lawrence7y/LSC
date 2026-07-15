@@ -55,6 +55,20 @@ def test_video_preview_updates_registry_after_web_audio_route_creation() -> None
     assert "gainNode: gainNodeRef.current" in sourceopen_body
 
 
+def test_video_preview_resets_player_on_preview_source_change() -> None:
+    """preview_mode / preview_epoch_id 切换须重建 MsePlayer，避免丢弃新 mse_init。"""
+    source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    reset_body = source.split("预览源切换：", 1)[1].split("useEffect(() => {", 1)[1].split("}, [active, roomId, previewMode", 1)[0]
+
+    assert "preview_mode" in source or "previewMode" in source
+    assert "preview_epoch_id" in source or "previewEpochId" in source
+    assert "playerGeneration" in source
+    assert "disposePlayerFully" in reset_body
+    assert "clearMseRoomCache" in reset_body
+    assert "setPlayerGeneration" in reset_body
+    assert "[active, roomId, playerGeneration]" in source
+
+
 def test_preview_audio_capture_disconnects_only_current_recorder_from_shared_source() -> None:
     source = (ROOT / "lsc-electron/src/utils/previewAudioAligner.ts").read_text(encoding="utf-8")
     cleanup_body = source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
