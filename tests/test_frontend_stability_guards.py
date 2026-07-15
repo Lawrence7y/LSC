@@ -864,3 +864,9 @@ def test_timeline_scrub_can_leave_live_edge() -> None:
     assert "只增不减" in workbench or "Math.max(lastContentEndRef.current" in workbench
     assert "contentEdgeRef" in control
     assert "Math.max(contentEdgeRef.current" in control
+
+
+def test_mse_player_exposes_buffered_range() -> None:
+    src = (ROOT / "lsc-electron/src/services/mediaSourcePlayer.ts").read_text(encoding="utf-8")
+    assert "getBufferedRange(" in src
+    assert "buffered.start(0)" in src

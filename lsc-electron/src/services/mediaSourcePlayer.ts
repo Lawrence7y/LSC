@@ -320,6 +320,15 @@ export class MsePlayer {
     }
   }
 
+  /** 返回当前 SourceBuffer 可 seek 区间（preview 轴秒）；无缓冲则 null */
+  getBufferedRange(): { start: number; end: number } | null {
+    if (!this._video || this._video.buffered.length === 0) return null
+    const start = this._video.buffered.start(0)
+    const end = this._video.buffered.end(this._video.buffered.length - 1)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null
+    return { start, end }
+  }
+
   /** Get current playback time. */
   get currentTime(): number {
     return this._video?.currentTime ?? 0
