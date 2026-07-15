@@ -63,10 +63,11 @@ def test_add_clip_and_export_snapshot_content_offset() -> None:
 def test_mse_reconnect_uses_compute_preview_quality_params() -> None:
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     # 重连循环内不得再手写 >=6 / >=8 降级；应复用统一函数
-    reconnect = source.split("async def _on_mse_error", 1)[1].split("async def ", 1)[0]
-    assert "_compute_preview_quality_params" in reconnect
-    assert "active_mse_count >= 8" not in reconnect
-    assert "active_mse_count >= 6" not in reconnect
+    # _on_mse_error 内含嵌套 async def，不能按首个 async def 截断
+    reconnect_loop = source.split("async def _on_mse_error", 1)[1].split("while True:", 1)[1]
+    assert "_compute_preview_quality_params" in reconnect_loop
+    assert "active_mse_count >= 8" not in reconnect_loop
+    assert "active_mse_count >= 6" not in reconnect_loop
 
     compute = source.split("def _compute_preview_quality_params", 1)[1].split(
         "\ndef _preview_quality_response_fields", 1
