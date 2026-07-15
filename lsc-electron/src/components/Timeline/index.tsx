@@ -33,6 +33,10 @@ interface TimelineProps {
   windowStart?: number
   /** 精修区间硬色带 */
   activeRefine?: { start: number; end: number } | null
+  /** DVR 可回看窗口左边界（绝对秒），紫标位置 */
+  dvrStart?: number | null
+  /** @deprecated 保留兼容；紫标已改用 dvrStart */
+  recordedEnd?: number | null
 }
 
 const DEFAULT_CLIP_COLOR = 'rgba(52, 199, 89, 0.25)'
@@ -101,9 +105,12 @@ function isKeyStage(absSec: number): boolean {
   return t % 3600 === 0 || t % 600 === 0
 }
 
+type SnapType = 'mark' | 'highlight' | 'playhead' | 'tick' | 'record' | 'clip'
+
 interface SnapTarget {
   time: number
   priority: number
+  type?: SnapType
 }
 
 function findSnapTarget(
@@ -114,21 +121,30 @@ function findSnapTarget(
   currentTime: number,
   tickInterval: number,
   highlights: TimelineHighlightBand[] = [],
-  opts?: { skipCurrentTime?: boolean },
+  opts?: { skipCurrentTime?: boolean; clips?: TimelineClip[]; dvrStartRel?: number | null; recordedEnd?: number | null },
 ): number {
   const targets: SnapTarget[] = []
-  if (markIn !== null) targets.push({ time: markIn, priority: 100 })
-  if (markOut !== null) targets.push({ time: markOut, priority: 100 })
+  if (markIn !== null) targets.push({ time: markIn, priority: 100, type: 'mark' })
+  if (markOut !== null) targets.push({ time: markOut, priority: 100, type: 'mark' })
   for (const h of highlights) {
-    targets.push({ time: h.start, priority: 90 })
-    targets.push({ time: h.end, priority: 90 })
+    targets.push({ time: h.start, priority: 90, type: 'highlight' })
+    targets.push({ time: h.end, priority: 90, type: 'highlight' })
   }
-  // scrub 拖拽中不吸到旧播放头，避免小幅拖被吸回原位
+  for (const c of opts?.clips ?? []) {
+    targets.push({ time: c.start, priority: 88, type: 'clip' })
+    targets.push({ time: c.end, priority: 88, type: 'clip' })
+  }
+  if (opts?.dvrStartRel != null) {
+    targets.push({ time: opts.dvrStartRel, priority: 85, type: 'record' })
+  }
+  if (opts?.recordedEnd != null) {
+    targets.push({ time: opts.recordedEnd, priority: 85, type: 'record' })
+  }
   if (!opts?.skipCurrentTime) {
-    targets.push({ time: currentTime, priority: 80 })
+    targets.push({ time: currentTime, priority: 80, type: 'playhead' })
   }
   for (let t = 0; t <= duration; t += tickInterval) {
-    targets.push({ time: t, priority: 50 })
+    targets.push({ time: t, priority: 50, type: 'tick' })
   }
   targets.sort((a, b) => b.priority - a.priority || Math.abs(a.time - rawTime) - Math.abs(b.time - rawTime))
   for (const target of targets) {
@@ -162,11 +178,13 @@ export function Timeline({
   onZoomChange,
   windowStart = 0,
   activeRefine,
+  dvrStart = null,
+  recordedEnd = null,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
-  const [isDragging, setIsDragging] = useState(false)
-  const [draggingMarker, setDraggingMarker] = useState<'in' | 'out' | null>(null)
+  const [, setIsDragging] = useState(false)
+  const [, setDraggingMarker] = useState<'in' | 'out' | null>(null)
   /** 拖拽中本地乐观播放头（相对 windowStart），避免等父级重渲染才动 */
   const [dragTime, setDragTime] = useState<number | null>(null)
   const [hoverTime, setHoverTime] = useState<number | null>(null)
@@ -180,9 +198,11 @@ export function Timeline({
   const lastPreviewSeekTimeRef = useRef<number | null>(null)
   /** 同步挂在 window 上的监听，避免等 useEffect 才注册导致拖不动 */
   const windowDragCleanupRef = useRef<(() => void) | null>(null)
-  const [snapFlash, setSnapFlash] = useState<{ time: number; type: 'in' | 'out' | 'playhead' } | null>(null)
+  const [snapFlash, setSnapFlash] = useState<{ time: number; type: SnapType | 'in' | 'out' } | null>(null)
   const snapFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const ws = windowStart
+  const dvrStartRef = useRef<number | null>(null)
+  const recordedEndRef = useRef<number | null>(null)
 
   // 最新回调进 ref，window 监听始终读最新闭包
   const getTimeFromXRef = useRef<(clientX: number) => number>(() => 0)
@@ -192,7 +212,7 @@ export function Timeline({
   const onMarkerDragEndRef = useRef(onMarkerDragEnd)
   const onScrubEndRef = useRef(onScrubEnd)
   const wsRef = useRef(ws)
-  const triggerSnapFlashRef = useRef<(time: number, type: 'in' | 'out' | 'playhead') => void>(() => {})
+  const triggerSnapFlashRef = useRef<(time: number, type: SnapType | 'in' | 'out' | 'playhead') => void>(() => {})
 
   const zoom = zoomLevel
   const effectiveDuration = useMemo(() => Math.max(duration || 1, 1), [duration])
@@ -233,6 +253,8 @@ export function Timeline({
     return ratio * effectiveDuration
   }, [effectiveDuration])
 
+  const dvrStartRel = dvrStart !== null ? dvrStart - ws : null
+
   const snapTime = useCallback((rawTime: number, skipCurrentTime = false) => {
     return findSnapTarget(
       rawTime,
@@ -242,11 +264,11 @@ export function Timeline({
       currentTime,
       tickInterval,
       highlights,
-      { skipCurrentTime },
+      { skipCurrentTime, clips, dvrStartRel, recordedEnd: recordedEnd != null ? recordedEnd - ws : null },
     )
-  }, [effectiveDuration, markIn, markOut, currentTime, tickInterval, highlights])
+  }, [effectiveDuration, markIn, markOut, currentTime, tickInterval, highlights, clips, dvrStartRel, recordedEnd, ws])
 
-  const triggerSnapFlash = useCallback((time: number, type: 'in' | 'out' | 'playhead') => {
+  const triggerSnapFlash = useCallback((time: number, type: SnapType | 'in' | 'out' | 'playhead') => {
     setSnapFlash({ time, type })
     if (snapFlashTimer.current) clearTimeout(snapFlashTimer.current)
     snapFlashTimer.current = setTimeout(() => {
@@ -262,7 +284,16 @@ export function Timeline({
   onMarkerDragEndRef.current = onMarkerDragEnd
   onScrubEndRef.current = onScrubEnd
   wsRef.current = ws
+  dvrStartRef.current = dvrStart
+  recordedEndRef.current = recordedEnd
   triggerSnapFlashRef.current = triggerSnapFlash
+
+  const clampToDvrStart = useCallback((relTime: number, absWs: number): number => {
+    const dvrStartAbs = dvrStartRef.current
+    if (dvrStartAbs == null) return relTime
+    const dvrStartRel = dvrStartAbs - absWs
+    return relTime < dvrStartRel ? dvrStartRel : relTime
+  }, [])
 
   const applyPointerTime = useCallback((clientX: number, seekPlayhead: boolean) => {
     const time = getTimeFromXRef.current(clientX)
@@ -285,7 +316,8 @@ export function Timeline({
       }
       if (seekPlayhead && isDraggingRef.current) {
         // scrub 中不磁吸旧播放头；光标只走本地 dragTime，不中途 onSeek（避免父级缩轨/video 抢回最右）
-        const snapped = snapTimeRef.current(t, true)
+        let snapped = snapTimeRef.current(t, true)
+        snapped = clampToDvrStart(snapped, absWs)
         if (Math.abs(snapped - t) > 0.01) {
           triggerSnapFlashRef.current(snapped, 'playhead')
         }
@@ -319,7 +351,7 @@ export function Timeline({
     if (wasScrubbing) {
       let finalAbs: number | undefined
       if (finalRel !== null) {
-        const snapped = snapTimeRef.current(finalRel, true)
+        const snapped = clampToDvrStart(snapTimeRef.current(finalRel, true), wsRef.current)
         finalAbs = snapped + wsRef.current
         lastPreviewSeekTimeRef.current = finalAbs
       }
@@ -366,7 +398,7 @@ export function Timeline({
     // 同步挂监听，不要等 useEffect
     attachWindowDragListeners()
     onScrubStart?.(ws)
-    const snapped = snapTime(time, true)
+    const snapped = clampToDvrStart(snapTime(time, true), ws)
     if (Math.abs(snapped - time) > 0.01) {
       triggerSnapFlash(snapped, 'playhead')
     }
@@ -374,7 +406,7 @@ export function Timeline({
     pendingTimeRef.current = snapped
     // 按下只动本地光标；正式 seek 在松手 onScrubEnd
     lastPreviewSeekTimeRef.current = snapped + ws
-  }, [getTimeFromX, onMarkIn, onMarkOut, onScrubStart, snapTime, ws, triggerSnapFlash, attachWindowDragListeners])
+  }, [getTimeFromX, onMarkIn, onMarkOut, onScrubStart, snapTime, clampToDvrStart, ws, triggerSnapFlash, attachWindowDragListeners])
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     // 非拖拽时只更新 hover；拖拽由 window listener 处理
@@ -424,6 +456,7 @@ export function Timeline({
   const markerInPct = markIn !== null ? clamp((markIn / effectiveDuration) * 100, 0, 100) : null
   const markerOutPct = markOut !== null ? clamp((markOut / effectiveDuration) * 100, 0, 100) : null
   const hoverPct = hoverTime !== null ? clamp((hoverTime / effectiveDuration) * 100, 0, 100) : null
+  const dvrStartPct = dvrStart != null ? clamp(((dvrStart - ws) / effectiveDuration) * 100, 0, 100) : null
 
   const ticks = useMemo(() => {
     const result: { time: number; abs: number; isMajor: boolean; isKey: boolean }[] = []
@@ -574,6 +607,17 @@ export function Timeline({
                 />
               )
             })}
+
+            {dvrStartPct !== null && (
+              <div
+                className={`lsc-timeline__record-end ${
+                  snapFlash?.type === 'record' ? 'lsc-timeline__record-end--snap' : ''
+                }`}
+                style={{ left: `${dvrStartPct}%` }}
+              >
+                <span className="lsc-timeline__record-end-label">{formatTime(dvrStart!)}</span>
+              </div>
+            )}
 
             {markerInPct !== null && (
               <div

@@ -870,3 +870,12 @@ def test_mse_player_exposes_buffered_range() -> None:
     src = (ROOT / "lsc-electron/src/services/mediaSourcePlayer.ts").read_text(encoding="utf-8")
     assert "getBufferedRange(" in src
     assert "buffered.start(0)" in src
+
+
+def test_timeline_dvr_start_prop() -> None:
+    timeline = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
+    control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
+    assert "dvrStart" in timeline
+    assert "dvrStart=" in control or "dvrStart={" in control
+    # 紫标应对齐 dvrStart
+    assert "dvrStartPct" in timeline or ("dvrStart" in timeline and "lsc-timeline__record-end" in timeline)

@@ -29,6 +29,7 @@ export interface TimelineViewModel {
   clips: { start: number; end: number; color?: string }[]
   highlights?: TimelineHighlightBand[]
   waveformPeaks?: number[]
+  contentEnd?: number
 }
 
 interface ControlBarProps {
@@ -69,6 +70,8 @@ interface ControlBarProps {
   activeRefine?: { start: number; end: number } | null
   /** @deprecated 不再用于 windowStart；保留以兼容调用方 props */
   recordedDurationHint?: number
+  /** DVR 可回看窗口左边界（绝对秒）；Task 3 接入 bufStart */
+  dvrStart?: number | null
 }
 
 /**
@@ -107,6 +110,7 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (prev.localDragMark !== next.localDragMark) return false
   if (prev.activeRefine !== next.activeRefine) return false
   if (prev.recordedDurationHint !== next.recordedDurationHint) return false
+  if (prev.dvrStart !== next.dvrStart) return false
 
   const a = prev.room
   const b = next.room
@@ -157,6 +161,7 @@ export const ControlBar = memo(function ControlBar({
   localDragMark,
   activeRefine = null,
   recordedDurationHint: _recordedDurationHint = 0,
+  dvrStart = null,
 }: ControlBarProps) {
   void _recordedDurationHint
   void _alignStatus
@@ -183,7 +188,7 @@ export const ControlBar = memo(function ControlBar({
   const isPlaying = room ? (room.preview_enabled && !room.preview_paused) : false
   const isDisabled = !room && (multiSelectCount ?? 0) === 0
 
-  // 可视窗跟内容走：不设默认时长；光标贴内容右端（像原生预览进度条）
+  // 可视窗跟内容走；不设默认时长；光标贴内容右端（像原生预览进度条）
   const TIMELINE_MAX_WINDOW = 600
   const contentEdgeRef = useRef(1)
   const contentEdgeRoomRef = useRef<string | null>(null)
@@ -250,7 +255,7 @@ export const ControlBar = memo(function ControlBar({
     } else {
       cur = contentEnd
     }
-    return { duration: dur, currentTime: cur, windowStart: ws }
+    return { duration: dur, currentTime: cur, windowStart: ws, contentEnd }
   }, [
     room?.room_id, room?.mark_out, room?.mark_in,
     previewPos, tick, activeRefine, followLive, isScrubbing, frozenWindowStart,
@@ -363,6 +368,7 @@ export const ControlBar = memo(function ControlBar({
         onMarkerDragEnd={onMarkerDragEnd}
         onDeleteMarker={onDeleteMarker}
         activeRefine={activeRefine}
+        dvrStart={dvrStart ?? null}
         height={96}
         zoomLevel={zoomLevel}
         onZoomChange={onZoomChange}
