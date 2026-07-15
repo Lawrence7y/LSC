@@ -64,24 +64,6 @@ interface RoomCardProps {
   onExitFullscreen?: (roomId: string) => void
 }
 
-type RoomStatus = 'recording' | 'connected' | 'connecting' | 'failed' | 'idle'
-
-const statusColors: Record<RoomStatus, string> = {
-  recording: 'var(--state-success)',
-  connected: 'var(--state-success)',
-  connecting: 'var(--state-warning)',
-  failed: 'var(--state-error)',
-  idle: 'var(--text-tertiary)',
-}
-
-const statusLabels: Record<RoomStatus, string> = {
-  recording: '录制中',
-  connected: '已连接',
-  connecting: '连接中',
-  failed: '失败',
-  idle: '未连接',
-}
-
 /**
  * rooms_updated 广播每次都会创建新的 room 对象引用，即使字段值没有变化，
  * 也会导致 React.memo 默认浅比较认为 props 变了而触发重渲染。
@@ -116,6 +98,7 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
     a.is_recording_queued === b.is_recording_queued &&
     a.recording_queue_position === b.recording_queue_position &&
     a.preview_enabled === b.preview_enabled &&
+    a.preview_phase === b.preview_phase &&
     a.preview_paused === b.preview_paused &&
     a.preview_muted === b.preview_muted &&
     a.streamer_name === b.streamer_name &&
@@ -193,19 +176,15 @@ export const RoomCard = memo(function RoomCard({
       .room-card-recording-bar {
         animation: roomCardPulse 1.5s ease-in-out infinite;
       }
+      @keyframes livePulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.35; transform: scale(0.85); }
+      }
     `
     document.head.appendChild(style)
   }, [])
 
-  const getStatus = (): RoomStatus => {
-    if (room.is_recording) return 'recording'
-    if (room.is_connecting) return 'connecting'
-    if (room.is_connected) return 'connected'
-    if (room.last_error) return 'failed'
-    return 'idle'
-  }
-
-  const status = getStatus()
+  const isLive = !!(room.preview_enabled && room.preview_phase === 'streaming')
 
   const recordingElapsedSeconds = useMemo(() => {
     if (!room.is_recording || !room.record_started_at) return 0
@@ -232,24 +211,16 @@ export const RoomCard = memo(function RoomCard({
       }}
       styles={{ body: { padding: 12 } }}
     >
-      {/* 预览区域 */}
+      {/* Header：checkbox | 主播名 | LIVE */}
       <div
         style={{
-          width: '100%',
-          height: isAnyExpanded ? 'auto' : 180,
-          aspectRatio: isAnyExpanded ? '16 / 9' : undefined,
-          minHeight: isAnyExpanded ? 420 : undefined,
-          background: '#0a0a0a',
-          borderRadius: 8,
-          marginBottom: 10,
           display: 'flex',
           alignItems: 'center',
-          justifyContent: 'center',
-          position: 'relative',
-          overflow: 'hidden',
+          gap: 8,
+          marginBottom: 8,
+          minWidth: 0,
         }}
       >
-        {/* 多选 Checkbox */}
         {onToggleMultiSelect && (
           <div
             role="checkbox"
@@ -260,23 +231,19 @@ export const RoomCard = memo(function RoomCard({
             }}
             title={multiSelected || selected ? '取消选择' : '选择此房间'}
             style={{
-              position: 'absolute',
-              top: 8,
-              left: 8,
-              zIndex: 5,
+              flexShrink: 0,
               width: 22,
               height: 22,
               borderRadius: 6,
               border: `2px solid ${
                 multiSelected || selected
                   ? 'var(--accent-primary)'
-                  : 'rgba(255,255,255,0.45)'
+                  : 'var(--border-secondary, rgba(255,255,255,0.2))'
               }`,
               background:
                 multiSelected || selected
                   ? 'var(--accent-primary)'
-                  : 'rgba(0,0,0,0.45)',
-              backdropFilter: 'blur(8px)',
+                  : 'transparent',
               cursor: 'pointer',
               display: 'flex',
               alignItems: 'center',
@@ -292,6 +259,103 @@ export const RoomCard = memo(function RoomCard({
             {multiSelected || selected ? '✓' : ''}
           </div>
         )}
+        <Tooltip title={room.streamer_name || '未知主播'}>
+          <span
+            style={{
+              flex: 1,
+              minWidth: 0,
+              fontWeight: 600,
+              fontSize: 14,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {room.streamer_name || '未知主播'}
+          </span>
+        </Tooltip>
+        {multiSelected && (
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              padding: '1px 6px',
+              borderRadius: 4,
+              fontSize: 9,
+              fontWeight: 600,
+              background: 'rgba(0, 122, 255, 0.12)',
+              color: 'var(--accent-primary)',
+              border: '1px solid rgba(0, 122, 255, 0.25)',
+              flexShrink: 0,
+            }}
+          >
+            <span
+              style={{
+                display: 'inline-block',
+                width: 5,
+                height: 5,
+                borderRadius: '50%',
+                background: 'var(--accent-primary)',
+              }}
+            />
+            已选中
+          </span>
+        )}
+        {isLive && (
+          <div
+            className="room-card__live-badge"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              flexShrink: 0,
+              padding: '2px 8px',
+              borderRadius: 6,
+              background: 'rgba(48, 209, 88, 0.12)',
+              border: '1px solid rgba(48, 209, 88, 0.25)',
+            }}
+          >
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: '#30d158',
+                animation: 'livePulse 1.4s ease-in-out infinite',
+              }}
+            />
+            <span
+              style={{
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: 0.8,
+                color: '#30d158',
+              }}
+            >
+              LIVE
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* 预览区域 */}
+      <div
+        style={{
+          width: '100%',
+          height: isAnyExpanded ? 'auto' : 180,
+          aspectRatio: isAnyExpanded ? '16 / 9' : undefined,
+          minHeight: isAnyExpanded ? 420 : undefined,
+          background: '#0a0a0a',
+          borderRadius: 8,
+          marginBottom: 8,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          position: 'relative',
+          overflow: 'hidden',
+        }}
+      >
         {room.last_error ? (
           <div style={{ textAlign: 'center', padding: '0 16px' }}>
             <div
@@ -488,89 +552,6 @@ export const RoomCard = memo(function RoomCard({
           </div>
         )}
       
-        {/* 状态 badge（左上角，偏移到 checkbox 右侧） */}
-        <div
-          style={{
-            position: 'absolute',
-            top: 8,
-            left: onToggleMultiSelect ? 38 : 8,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-          }}
-        >
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 5,
-              background: 'rgba(0,0,0,0.65)',
-              backdropFilter: 'blur(8px)',
-              padding: '3px 8px',
-              borderRadius: 6,
-            }}
-          >
-            <div
-              style={{
-                width: 7,
-                height: 7,
-                borderRadius: '50%',
-                background: statusColors[status],
-                boxShadow:
-                  status === 'recording'
-                    ? `0 0 8px ${statusColors[status]}`
-                    : 'none',
-              }}
-            />
-            <span style={{ fontSize: 11, color: '#fff' }}>
-              {statusLabels[status]}
-            </span>
-          </div>
-
-        </div>
-      
-        {/* 录制时间（右上角，始终暗色） */}
-        {room.is_recording && room.record_started_at && (
-          <div
-            style={{
-              position: 'absolute',
-              top: 8,
-              right: 8,
-              background: 'rgba(0,0,0,0.7)',
-              backdropFilter: 'blur(8px)',
-              padding: '2px 8px',
-              borderRadius: 6,
-              fontSize: 11,
-              color: '#fff',
-              fontFamily: 'monospace',
-            }}
-          >
-            {formatTime(recordingElapsedSeconds)}
-          </div>
-        )}
-      
-        {/* 录制文件大小（右上角时间下方，始终暗色） */}
-        {room.is_recording && room.record_size_mb > 0 && (
-          <div
-            style={{
-              position: 'absolute',
-              top: 30,
-              right: 8,
-              background: 'rgba(0,0,0,0.55)',
-              backdropFilter: 'blur(8px)',
-              padding: '1px 6px',
-              borderRadius: 4,
-              fontSize: 10,
-              color: 'rgba(255,255,255,0.75)',
-              fontFamily: 'monospace',
-            }}
-          >
-            {room.record_size_mb >= 1024
-              ? `${(room.record_size_mb / 1024).toFixed(1)} GB`
-              : `${room.record_size_mb.toFixed(0)} MB`}
-          </div>
-        )}
-      
         {/* 录制中指示条（脉冲动画提示录制进行中） */}
         {room.is_recording && (
           <div
@@ -583,51 +564,54 @@ export const RoomCard = memo(function RoomCard({
               height: 2,
               width: '100%',
               background: 'var(--accent-primary)',
+              zIndex: 4,
             }}
           />
         )}
       </div>
-      
-      {/* 房间信息 */}
-      <div style={{ marginBottom: 10 }}>
+
+      {/* Meta 行：录制状态 · 时长 · 文件大小 */}
+      {room.is_recording && (
         <div
           style={{
-            fontWeight: 600,
-            fontSize: 14,
-            marginBottom: 2,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
             display: 'flex',
             alignItems: 'center',
             gap: 6,
+            marginBottom: 6,
+            fontSize: 12,
+            color: 'var(--text-secondary)',
+            minWidth: 0,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
           }}
         >
-          <Tooltip title={room.streamer_name || '未知主播'}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-              {room.streamer_name || '未知主播'}
-            </span>
-          </Tooltip>
-          {/* Multi-select badge: "已选中" (blue) — not "已同步" which only applies after audio alignment */}
-          {multiSelected && (
-            <span style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 4,
-              padding: '1px 6px',
-              borderRadius: 4,
-              fontSize: 9,
-              fontWeight: 600,
-              background: 'rgba(0, 122, 255, 0.12)',
-              color: 'var(--accent-primary)',
-              border: '1px solid rgba(0, 122, 255, 0.25)',
-              flexShrink: 0,
-            }}>
-              <span style={{ display: 'inline-block', width: 5, height: 5, borderRadius: '50%', background: 'var(--accent-primary)' }} />
-              已选中
-            </span>
+          <span style={{ color: 'var(--state-success)', fontWeight: 500, flexShrink: 0 }}>
+            录制中
+          </span>
+          {room.record_started_at && (
+            <>
+              <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
+              <span style={{ fontFamily: 'monospace', flexShrink: 0 }}>
+                {formatTime(recordingElapsedSeconds)}
+              </span>
+            </>
+          )}
+          {room.record_size_mb > 0 && (
+            <>
+              <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
+              <span style={{ fontFamily: 'monospace', flexShrink: 0 }}>
+                {room.record_size_mb >= 1024
+                  ? `${(room.record_size_mb / 1024).toFixed(1)} GB`
+                  : `${room.record_size_mb.toFixed(0)} MB`}
+              </span>
+            </>
           )}
         </div>
+      )}
+
+      {/* 标题行：仅 stream_title */}
+      <div style={{ marginBottom: 10 }}>
         <Tooltip title={room.stream_title || '暂无标题'}>
           <div
             style={{
