@@ -339,34 +339,39 @@ _MSE_RECONNECT_BASE_DELAY = 2.0
 _MSE_RECONNECT_MAX_DELAY = 30.0
 
 
-def _room_stream_offline_confirmed(mgr: MultiRoomManager, room_id: str) -> bool:
-    """确认直播间已下播（非瞬时网络失败）。"""
+def _is_stream_info_offline(info) -> bool:
+    if info is None:
+        return False
+    return not info.is_live or _is_stream_offline_error(info.error or '')
+
+
+def _mse_offline_error_message(raw: str = '') -> str:
+    if raw:
+        friendly = humanize_error(raw)
+        if friendly:
+            return friendly
+    return '主播已下线'
+
+
+def _probe_stream_offline(mgr: MultiRoomManager, room_id: str) -> tuple[bool, str]:
+    """确认直播间已下播，必要时强制解析。返回 (is_offline, friendly_message)。"""
     room = mgr.get_room(room_id)
     if room is None:
-        return False
+        return False, ''
     if _is_stream_offline_error(room.last_error or ''):
-        return True
-    info = room.stream_info
-    if info is not None and not info.is_live:
-        if not info.stream_url or _is_stream_offline_error(info.error or ''):
-            return True
-    return False
-
-
-def _probe_stream_offline(mgr: MultiRoomManager, room_id: str) -> bool:
-    """刷新失败时强制解析，确认是否下播。"""
-    if _room_stream_offline_confirmed(mgr, room_id):
-        return True
-    room = mgr.get_room(room_id)
-    if room is None:
-        return False
+        return True, _mse_offline_error_message(room.last_error)
+    if _is_stream_info_offline(room.stream_info):
+        raw = (room.stream_info.error if room.stream_info else '') or room.last_error or ''
+        return True, _mse_offline_error_message(raw)
     try:
         from lsc.platforms.registry import parse_stream
         info = parse_stream(room.room_url, force_refresh=True)
     except Exception as exc:
         _log.debug("offline probe parse failed for %s: %s", room_id, exc)
-        return False
-    return not info.is_live or _is_stream_offline_error(info.error or '')
+        return False, ''
+    if _is_stream_info_offline(info):
+        return True, _mse_offline_error_message(info.error or '')
+    return False, ''
 
 
 def _invalidate_room_timeline(room_id: str, reason: str = "") -> None:
@@ -3954,6 +3959,31 @@ def register_room_handlers(server, bridge):
                     current_error = err
                     mse_failure_reason = 'network'
 
+                    async def _finalize_mse_error(error_text: str, reason: str, timeline_reason: str) -> None:
+                        _mse_reconnect_state.pop(room_id, None)
+                        await srv.broadcast('mse_error', {
+                            'room_id': room_id,
+                            'error': error_text,
+                            'reason': reason,
+                        })
+
+                        def _clear_preview():
+                            room = mgr.get_room(room_id)
+                            if room is not None:
+                                room.preview_enabled = False
+                            _invalidate_room_timeline(room_id, reason=timeline_reason)
+
+                        try:
+                            await loop.run_in_executor(
+                                _bridge_executor, lambda: bridge.call(_clear_preview)
+                            )
+                        except Exception as exc:
+                            _log.error("MSE error cleanup failed: %s", exc)
+                        bridge.queue_broadcast({
+                            'type': 'rooms_updated',
+                            'data': {'rooms': _rooms_list(mgr)},
+                        })
+
                     while True:
                         # 2. 检查是否仍需预览（用户可能已手动关闭）
                         def _check_preview():
@@ -3980,33 +4010,16 @@ def register_room_handlers(server, bridge):
                                 "MSE reconnect exhausted for room %s (%d attempts)",
                                 room_id, state['attempts'],
                             )
-                            _mse_reconnect_state.pop(room_id, None)
-                            await srv.broadcast('mse_error', {
-                                'room_id': room_id,
-                                'error': '预览重连失败，已达到最大重试次数，请手动重新开启预览',
-                                'reason': mse_failure_reason,
-                            })
-
-                            def _clear_preview():
-                                room = mgr.get_room(room_id)
-                                if room is not None:
-                                    room.preview_enabled = False
-                                # 预览彻底清除时使 timeline 失效（ClipSnapshot 保留）
-                                _invalidate_room_timeline(
-                                    room_id,
-                                    reason=f"mse_reconnect_exhausted:{room_id}",
-                                )
-
-                            try:
-                                await loop.run_in_executor(
-                                    _bridge_executor, lambda: bridge.call(_clear_preview)
-                                )
-                            except Exception as exc:
-                                _log.error("MSE error cleanup failed: %s", exc)
-                            bridge.queue_broadcast({
-                                'type': 'rooms_updated',
-                                'data': {'rooms': _rooms_list(mgr)},
-                            })
+                            exhausted_msg = (
+                                _mse_offline_error_message(current_error)
+                                if mse_failure_reason == 'offline'
+                                else '预览重连失败，已达到最大重试次数，请手动重新开启预览'
+                            )
+                            await _finalize_mse_error(
+                                exhausted_msg,
+                                mse_failure_reason,
+                                f"mse_reconnect_exhausted:{room_id}",
+                            )
                             return
 
                         # 4. 计算指数退避延迟
@@ -4059,15 +4072,20 @@ def register_room_handlers(server, bridge):
 
                         if not refresh_ok:
                             try:
-                                offline = await loop.run_in_executor(
+                                offline, offline_msg = await loop.run_in_executor(
                                     _recording_executor,
                                     lambda: _probe_stream_offline(mgr, room_id),
                                 )
                             except Exception as exc:
                                 _log.debug("MSE reconnect offline probe failed: %s", exc)
-                                offline = False
+                                offline, offline_msg = False, ''
                             if offline:
-                                mse_failure_reason = 'offline'
+                                await _finalize_mse_error(
+                                    offline_msg or _mse_offline_error_message(),
+                                    'offline',
+                                    f"mse_offline:{room_id}",
+                                )
+                                return
                             current_error = '流地址刷新失败'
                             continue  # 进入下一次循环重试
 
@@ -4093,15 +4111,20 @@ def register_room_handlers(server, bridge):
 
                         if snapshot is None or not snapshot['is_connected'] or not snapshot['stream_url']:
                             try:
-                                offline = await loop.run_in_executor(
-                                    _bridge_executor,
-                                    lambda: bridge.call(lambda: _room_stream_offline_confirmed(mgr, room_id)),
+                                offline, offline_msg = await loop.run_in_executor(
+                                    _recording_executor,
+                                    lambda: _probe_stream_offline(mgr, room_id),
                                 )
                             except Exception as exc:
-                                _log.debug("MSE reconnect offline check failed: %s", exc)
-                                offline = False
+                                _log.debug("MSE reconnect offline probe failed: %s", exc)
+                                offline, offline_msg = False, ''
                             if offline:
-                                mse_failure_reason = 'offline'
+                                await _finalize_mse_error(
+                                    offline_msg or _mse_offline_error_message(),
+                                    'offline',
+                                    f"mse_offline:{room_id}",
+                                )
+                                return
                             current_error = '房间未连接或无流信息'
                             continue  # 进入下一次循环重试
 
