@@ -1,61 +1,46 @@
-# LSC Electron 版本
+# LSC Electron 前端
 
-这是 LSC 直播切片系统的 Electron + React 前端。
+LSC 直播切片系统的 Electron + React 桌面前端。后端为仓库根目录的 `python-backend/`（WebSocket 默认 `ws://localhost:9876`）。
 
-## 启动方式
+完整产品说明、架构与功能清单见根目录 [README.md](../README.md)。
 
-需要先启动 Python WebSocket 后端，再启动 Electron 前端。
-
-### 1. 安装依赖
+## 开发启动
 
 ```bash
-# 安装前端依赖
+# 推荐：一键拉起后端 + Electron
 cd lsc-electron
 npm install
-
-# 安装后端依赖（在项目根目录）
-cd ..
-pip install -r requirements.txt
+npm run dev
 ```
 
-### 2. 启动 Python 后端
+或分别启动：
 
 ```bash
+# 终端 1：Python 后端
 cd python-backend
 python main.py
-```
 
-后端默认监听 `ws://localhost:8765`。
-
-### 3. 启动 Electron 桌面端
-
-```bash
+# 终端 2：Electron
 cd lsc-electron
 npm run dev
 ```
 
-开发模式会同时启动 Vite 开发服务器和 Electron 窗口。
-
-### 4. 仅浏览器模式
-
-如果你只想在浏览器中调试 UI：
+仅浏览器调 UI（无 Electron 原生 API）：
 
 ```bash
-cd lsc-electron
-npm run preview
+npx vite --config vite.dev.config.ts
 ```
 
-然后打开输出的本地 URL。注意浏览器模式无法使用 `selectDirectory` 等 Electron 原生 API。
+## 构建安装包
 
-## 构建
-
-```bash
-cd lsc-electron
-npm run build
+```powershell
+.\build-installer.ps1
 ```
 
-## 目录结构
+## 目录
 
-- `electron/` - Electron 主进程与预加载脚本
-- `src/` - React 前端源码
-- `python-backend/` - Python WebSocket 后端（与 Qt 版复用核心逻辑）
+- `electron/` — 主进程、托盘、Python 生命周期、更新检测
+- `src/pages/` — Dashboard / 工作台 / 设置
+- `src/components/` — 预览、时间线、分析进度、导出队列
+- `src/services/` — WebSocket、MSE 播放器
+- `scripts/prep-bundle.ps1` — 嵌入式 Python + FFmpeg
