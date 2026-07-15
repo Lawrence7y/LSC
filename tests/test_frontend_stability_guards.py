@@ -636,6 +636,14 @@ def test_frontend_sends_valorant_profile() -> None:
     assert "游戏视角" in wb
 
 
+def test_mse_error_does_not_unconditionally_stop_recording() -> None:
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    block = workbench.split("on('mse_error'", 1)[1].split("return () =>", 1)[0]
+    assert "reason" in block
+    assert "主播已下线" in block
+    assert "offline" in block
+
+
 def test_mse_error_offers_retry() -> None:
     """mse_error 覆盖层须有重试按钮，并走 enable_preview 重开预览。"""
     card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")

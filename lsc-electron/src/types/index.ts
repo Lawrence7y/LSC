@@ -158,7 +158,7 @@ export interface WSPayloadMap {
   room_updated: { room_id: string; [key: string]: unknown }
   mse_init: { room_id: string; data: string }
   mse_segment: { room_id: string; data: string }
-  mse_error: { room_id: string; error: string }
+  mse_error: { room_id: string; error: string; reason?: 'offline' | 'network' | 'disk_full' | 'unknown' }
   mse_reconnecting: { room_id: string; attempt: number; max_attempts: number }
   mse_reconnected: { room_id: string; degraded?: boolean; width?: number; height?: number; fps?: number; reason?: string }
   clip_completed: { job_id: string; output_path: string; room_name?: string; thumbnail_path?: string; clip_id?: string }

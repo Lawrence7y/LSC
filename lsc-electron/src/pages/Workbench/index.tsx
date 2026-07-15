@@ -600,14 +600,17 @@ export default function Workbench() {
       }
     }))
 
-    // MSE 断流（主播下线）：自动停止录制 + 黄色提示
-    unsubs.push(on('mse_error', (data: { room_id?: string; error?: string }) => {
+    // MSE 断流：按 reason 分层——仅 offline 停录并提示下线，网络类错误只提示预览异常
+    unsubs.push(on('mse_error', (data: { room_id?: string; error?: string; reason?: string }) => {
       if (!data?.room_id) return
-      const r = useAppStore.getState().rooms.find(r => r.room_id === data.room_id)
-      if (r?.is_recording) {
-        send('stop_recording', { room_id: data.room_id })
+      const reason = data.reason || 'unknown'
+      const r = useAppStore.getState().rooms.find(x => x.room_id === data.room_id)
+      if (reason === 'offline') {
+        if (r?.is_recording) send('stop_recording', { room_id: data.room_id })
+        message.warning('主播已下线，录制已保存', 5)
+        return
       }
-      message.warning('主播已下线，录制已保存，可回看', 5)
+      message.warning(data.error || '预览异常，请检查网络或重试预览', 5)
     }))
 
     return () => unsubs.forEach(u => u())

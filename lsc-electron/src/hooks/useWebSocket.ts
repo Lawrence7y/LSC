@@ -340,13 +340,16 @@ function _attachSharedWebSocketHandlers(): () => void {
     }
   })
 
-  const unsubMseError = wsClient.on('mse_error', (data: { room_id: string; error: string }) => {
+  const unsubMseError = wsClient.on('mse_error', (data: { room_id: string; error: string; reason?: string }) => {
     if (data?.room_id) {
       console.warn(`MSE error for ${data.room_id}:`, data.error)
+      const reason = data.reason || 'unknown'
       useAppStore.getState().updateRoom(data.room_id, {
         mse_error: data.error,
-        preview_enabled: false,
         mse_reconnecting: undefined,
+        ...(reason === 'offline'
+          ? { preview_phase: 'error' as const }
+          : { preview_enabled: false, preview_phase: 'error' as const }),
       })
     }
   })
