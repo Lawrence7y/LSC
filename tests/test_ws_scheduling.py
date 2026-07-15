@@ -71,7 +71,8 @@ class _FakeWebSocket:
     def __init__(self, messages):
         self._messages = iter(messages)
         self.sent = []
-        self.request_headers = {}
+        # server.handle_client 校验 Origin（小写 key）；缺省会直接拒绝连接
+        self.request_headers = {'origin': 'http://localhost:5173'}
 
     def __aiter__(self):
         return self
@@ -86,36 +87,36 @@ class _FakeWebSocket:
         self.sent.append(message)
 
 
-class TestConcurrentDispatch:
-    def test_slow_handler_does_not_block_following_command(self, server):
-        """同一客户端的慢操作不应阻塞后续按钮命令。"""
+class TestSequentialDispatch:
+    def test_handlers_run_sequentially_preserving_order(self, server):
+        """同一连接上的消息按序执行，保证依赖状态的命令不错乱。
+
+        慢 handler 会挡住后续消息——这是有意设计（见 server.handle_client 注释）。
+        长耗时工作必须在 handler 内入队后立刻返回，不得在 handler 里 await 阻塞。
+        """
         import json
 
-        slow_started = asyncio.Event()
-        release_slow = asyncio.Event()
-        fast_finished = asyncio.Event()
+        order: list[str] = []
 
-        @server.on('slow')
-        async def slow_handler(_data):
-            slow_started.set()
-            await release_slow.wait()
+        @server.on('first')
+        async def first_handler(_data):
+            order.append('first_start')
+            await asyncio.sleep(0.05)
+            order.append('first_end')
             return {'success': True}
 
-        @server.on('fast')
-        async def fast_handler(_data):
-            fast_finished.set()
+        @server.on('second')
+        async def second_handler(_data):
+            order.append('second')
             return {'success': True}
 
         async def run_test():
             websocket = _FakeWebSocket([
-                json.dumps({'type': 'slow', 'data': {}}),
-                json.dumps({'type': 'fast', 'data': {}}),
+                json.dumps({'type': 'first', 'data': {}}),
+                json.dumps({'type': 'second', 'data': {}}),
             ])
-            client_task = asyncio.create_task(server.handle_client(websocket))
-            await asyncio.wait_for(slow_started.wait(), timeout=0.2)
-            await asyncio.wait_for(fast_finished.wait(), timeout=0.2)
-            release_slow.set()
-            await asyncio.wait_for(client_task, timeout=0.2)
+            await asyncio.wait_for(server.handle_client(websocket), timeout=1.0)
+            assert order == ['first_start', 'first_end', 'second']
 
         asyncio.run(run_test())
 

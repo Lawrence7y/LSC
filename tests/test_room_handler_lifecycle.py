@@ -341,11 +341,16 @@ def test_mse_preview_attaches_existing_shared_ingest_when_enabled(monkeypatch) -
     bridge = _FakeBridge(manager)
     ingest = SharedRoomIngest("room-1", "http://example/live.flv")
     ingest.recording_active = True
+    ingest.is_stopped = False
     ingest.publish_preview_segment(b"init-data", kind="init")
 
     class _FakeSharedRegistry:
         def get(self, room_id):
             return ingest if room_id == "room-1" else None
+
+        def stop_room(self, room_id, reason: str = "") -> None:
+            # 错误路径会调用 stop_room；测试桩只需吞掉，避免二次异常掩盖主断言
+            return None
 
     monkeypatch.setattr(room_handler, "_mse_streamers", {})
     monkeypatch.setattr(room_handler, "_shared_ingests", _FakeSharedRegistry())
@@ -363,6 +368,7 @@ def test_mse_preview_attaches_existing_shared_ingest_when_enabled(monkeypatch) -
             "mode": "mse",
         })
         await asyncio.sleep(0)
+        attached = room_handler._preview_stream_registry().get("room-1")
         ingest.publish_preview_segment(b"media-data", kind="media")
         for _ in range(20):
             if any(event == "mse_segment" for event, _payload in server.broadcasts):
@@ -373,11 +379,10 @@ def test_mse_preview_attaches_existing_shared_ingest_when_enabled(monkeypatch) -
             if any(event == "mse_error" for event, _payload in server.broadcasts):
                 break
             await asyncio.sleep(0.02)
-        return result
+        return result, attached
 
-    result = asyncio.run(scenario())
+    result, handle = asyncio.run(scenario())
 
-    handle = room_handler._preview_stream_registry().get("room-1")
     assert result["success"] is True
     assert result["note"] == "shared ingest preview attached"
     assert isinstance(handle, SharedPreviewHandle)
@@ -385,8 +390,10 @@ def test_mse_preview_attaches_existing_shared_ingest_when_enabled(monkeypatch) -
     assert manager.refresh_calls == []
     assert server.broadcasts[0][0] == "mse_init"
     assert any(event == "mse_segment" for event, _payload in server.broadcasts)
-    assert any(
-        event == "mse_error" and payload["room_id"] == "room-1" and payload["error"] == "source failed"
+    # 上游错误后进入自动重连（不再立刻广播 mse_error）；验证重连状态已推进
+    reconnect = getattr(room_handler, "_mse_reconnect_state", {}).get("room-1") or {}
+    assert int(reconnect.get("attempts", 0)) >= 1 or any(
+        event == "mse_error" and payload.get("room_id") == "room-1"
         for event, payload in server.broadcasts
     )
 

@@ -131,9 +131,14 @@ _ANALYSIS_JOB_TTL = 300.0  # 5 分钟后自动清理已完成的分析结果
 # 持续分析任务状态：room_id -> {task, last_analyzed, highlights, cancelled}
 # 边录边分析：后台 asyncio 任务定期对录制文件新增段做增量场景检测
 _continuous_tasks: dict[str, dict[str, Any]] = {}
-_VALORANT_INCREMENTAL_LOOKBACK_SEC = 240.0  # 4 分钟增量回看窗口
+_VALORANT_INCREMENTAL_LOOKBACK_SEC = 360.0  # 6 分钟增量回看（质量优先）
 _VALORANT_MAX_CATCHUP_SEC = 480.0  # 单次 tick 最多向前追赶的新内容时长
 _VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期
+_VALORANT_POST_ROUND_JUNK_SEC = 8.0  # 回合结束后垃圾时间（结算/回放）先验
+_VALORANT_TRIM_START_PAD_SEC = 0.5  # OCR 起点后移，避开买枪尾帧
+_VALORANT_TRIM_END_PAD_SEC = 1.5  # OCR 终点前移，避开结算字帧
+# 与 ValorantRoundConfig.full_round_audio_pre_pad 对齐：入列时抵消无 OCR full_round 向前糊窗
+_VALORANT_FULL_ROUND_AUDIO_PRE_PAD_SEC = 8.0
 _deferred_export_jobs: list[dict[str, Any]] = []  # 延后导出队列（先入列，压力缓解后再导出）
 
 def _clip_id(room_id: str, start: float, end: float) -> str:
@@ -1221,6 +1226,92 @@ def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
     )
 
 
+def _trim_valorant_combat_bounds(round_data: dict[str, Any]) -> dict[str, Any]:
+    """将回合收紧为正赛段：去掉准备期与回合结束垃圾尾。
+
+    OCR：ocr_start/round_start +0.5；ocr_end -1.5；next_buy 回推 post junk。
+    音频钟声：终点贴 round_end_sec（不再 -1.5，避免砍掉回合末击杀）。
+    full_round 糊窗：抵消 audio_pre_pad，并砍尾 junk。
+    """
+    out = dict(round_data)
+    try:
+        start = float(out.get("start", 0.0))
+        end = float(out.get("end", 0.0))
+    except (TypeError, ValueError):
+        return out
+
+    start_by = str(out.get("start_by", "") or "")
+    end_by = str(out.get("end_by", "") or "")
+    tail_by = str(out.get("tail_by", "") or "")
+    phase = str(out.get("phase", "") or "")
+
+    def _f(key: str) -> float | None:
+        raw = out.get(key)
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    ocr_start = _f("ocr_start")
+    ocr_end = _f("ocr_end")
+    round_start = _f("round_start_sec")
+    round_end = _f("round_end_sec")
+
+    # --- start ---
+    if ocr_start is not None or start_by == "ocr_buy_exit":
+        base = ocr_start if ocr_start is not None else round_start
+        # 防御：增量窗对 buy/ocr_start 双重 range_offset 时会偏离 start 数十秒
+        if base is not None and abs(base - start) <= 20.0:
+            start = base + _VALORANT_TRIM_START_PAD_SEC
+        elif round_start is not None and abs(round_start - start) <= 20.0:
+            start = round_start + _VALORANT_TRIM_START_PAD_SEC
+        elif start_by == "ocr_buy_exit":
+            start = start + _VALORANT_TRIM_START_PAD_SEC
+    elif start_by == "full_round" or phase == "full_round":
+        # 无 OCR full_round 曾向前扩 pre_pad；入列时抵消，贴近战斗抬升
+        start = start + _VALORANT_FULL_ROUND_AUDIO_PRE_PAD_SEC
+        if round_start is not None:
+            start = max(start, round_start + _VALORANT_FULL_ROUND_AUDIO_PRE_PAD_SEC)
+    # 纯音频 combat：检测侧已买枪 trim，保持 start 不动
+
+    # --- end ---
+    # next_buy = 下一准备阶段开始，必须原样保留（用户要录到准备之前的全部内容）
+    # 禁止因附带的胜利字 ocr_end 把终点拽回结算点（对照：105.4 → 95.1）
+    if end_by == "next_buy":
+        pass
+    elif end_by == "ocr_result" or (
+        ocr_end is not None and end_by not in {"next_buy", "open_tail"}
+    ):
+        base = ocr_end if ocr_end is not None else round_end
+        if base is not None:
+            end = base - _VALORANT_TRIM_END_PAD_SEC
+        elif end_by == "ocr_result":
+            end = end - _VALORANT_TRIM_END_PAD_SEC
+    elif (round_end is not None and (tail_by == "chime" or end_by == "chime")):
+        # 钟声即正赛终点；夹到钟声附近，保留至多 0.5s 余韵
+        # 防御：增量窗局部 round_end 未加 range_offset 时会 < start，忽略坏元数据
+        if round_end > start:
+            end = min(end, round_end + 0.5)
+    elif start_by == "full_round" or end_by == "full_round" or phase == "full_round":
+        end = max(
+            start + _VALORANT_MIN_EXPORT_DURATION_SEC * 0.5,
+            end - _VALORANT_POST_ROUND_JUNK_SEC,
+        )
+    elif end_by in ("audio", "inferred") and tail_by != "chime":
+        end = max(
+            start + _VALORANT_MIN_EXPORT_DURATION_SEC * 0.5,
+            end - _VALORANT_POST_ROUND_JUNK_SEC * 0.5,
+        )
+
+    if end <= start:
+        return out
+    out["start"] = round(start, 3)
+    out["end"] = round(end, 3)
+    return out
+
+
 def _valorant_round_key(round_data: dict[str, Any]) -> str:
     """Return a boundary-stable key for one Valorant round."""
     existing = str(round_data.get("round_key") or "").strip()
@@ -1373,6 +1464,17 @@ def _build_continuous_status_payload(
     return payload
 
 
+def _is_ocr_quality_round(round_data: dict[str, Any]) -> bool:
+    """OCR 边界回合（含未完全可导的 pending），合并时优先于纯音频。"""
+    if round_data.get("ocr_confirmed"):
+        return True
+    start_by = str(round_data.get("start_by", "") or "")
+    end_by = str(round_data.get("end_by", "") or "")
+    return start_by in {"ocr_buy_exit", "ocr_prev_end", "ocr"} or end_by in {
+        "ocr_result", "next_buy",
+    }
+
+
 def _merge_round_windows(
     existing: list[dict[str, Any]],
     window_rounds: list[dict[str, Any]],
@@ -1399,8 +1501,7 @@ def _merge_round_windows(
         except (TypeError, ValueError):
             return 0.0, 0.0
 
-    # 已 OCR 确认的回合优先保留：后续纯音频/full_round 窗口不得覆盖确认边界。
-    # 对照实测：已导出的 OCR 回合会被无 OCR 增量扫成 full_round，导致 confirmed→pending。
+    # OCR 回合优先：后续纯音频/full_round 不得覆盖；对照实测 round-000033 被吃掉。
     window_use: list[dict[str, Any]] = []
     superseded_old_keys: set[str] = set()
     for new in window_rounds:
@@ -1413,13 +1514,12 @@ def _merge_round_windows(
                 continue
             if old.get("round_key") and not new_item.get("round_key"):
                 new_item["round_key"] = old["round_key"]
-            old_ok = _is_auto_exportable_valorant_round(old)
-            new_ok = _is_auto_exportable_valorant_round(new_item)
-            if old_ok and not new_ok:
-                # 保留旧确认回合，丢弃本窗口的弱结果
+            old_ocr = _is_ocr_quality_round(old) or _is_auto_exportable_valorant_round(old)
+            new_ocr = _is_ocr_quality_round(new_item) or _is_auto_exportable_valorant_round(new_item)
+            if old_ocr and not new_ocr:
                 replaced_confirmed = True
                 break
-            if new_ok or not old_ok:
+            if new_ocr or not old_ocr:
                 key = str(old.get("round_key") or "")
                 if key:
                     superseded_old_keys.add(key)
@@ -1449,6 +1549,7 @@ def _merge_round_windows(
     )
     for item in merged:
         item.setdefault("round_key", _valorant_round_key(item))
+    # 轻微重叠：邻接对齐，禁止直接丢后段（丢回合）
     cleaned: list[dict[str, Any]] = []
     for item in merged:
         start, end = _span(item)
@@ -1457,12 +1558,15 @@ def _merge_round_windows(
         if cleaned:
             prev_start, prev_end = _span(cleaned[-1])
             if start < prev_end:
-                if end > prev_end:
-                    cleaned[-1]["end"] = round(start, 3)
-                    if float(cleaned[-1].get("end", 0.0)) - prev_start < 5.0:
-                        cleaned.pop()
-                    cleaned.append(dict(item))
-                continue
+                # 后段整体被前段覆盖 → 保留前段（通常是更早确认的 OCR）
+                if end <= prev_end + overlap_tol:
+                    continue
+                # 轻微重叠：把后段起点推到前段终点
+                start = prev_end
+                if end - start < 5.0:
+                    continue
+                item = dict(item)
+                item["start"] = round(start, 3)
         cleaned.append(dict(item))
     return cleaned
 
@@ -1491,16 +1595,12 @@ def _continuous_valorant_refine_with_ocr(
     mode: str,
     pressure: dict[str, Any] | None = None,
 ) -> bool:
-    """Return whether continuous Valorant analysis may use OCR at all.
+    """Return whether continuous Valorant analysis may use OCR.
 
-    Soft pressure / critical-without-pause keep OCR enabled but with a longer
-    sample interval (see ocr_sample_interval). Only extreme pause_analysis
-    disables OCR for this tick (audio-first catch-up).
+    质量优先档：valorant_round 始终允许 OCR，忽略 pause_analysis / 资源压力。
+    非 valorant_round 模式不走此 OCR 路径。
     """
     if mode != "valorant_round":
-        return False
-    pressure = pressure or {}
-    if pressure.get("pause_analysis"):
         return False
     return True
 
@@ -1802,8 +1902,8 @@ def _run_scene_analysis(
             from lsc.utils.gpu_ffmpeg import nvenc_available
             if nvenc_available():
                 cmd += ["-hwaccel", "cuda"]
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("scene detect: nvenc probe skipped: %s", exc)
         if time_range is not None:
             tr_start, tr_end = time_range
             # -ss input seek（快速）+ -t duration，限定增量分析范围
@@ -2519,6 +2619,166 @@ def register_room_handlers(server, bridge):
             _rooms_throttle_task = None
         _rooms_throttle_task = asyncio.create_task(_flush())
 
+    async def _shared_mse_on_error(room_id: str, err: str, loop) -> None:
+        """共享进样预览出错后自动重连：刷新 CDN URL 并重启预览。
+
+        旧逻辑只广播 mse_error 并清理，前端会立刻把 preview_enabled 置 false，
+        导致无法恢复。此处对齐 legacy MseStreamer 的 _on_mse_error 重连策略。
+        """
+        _log.info("Shared MSE error for room %s: %s", room_id, err)
+
+        old_handle = _preview_stream_registry().pop(room_id)
+        if old_handle is not None:
+            try:
+                old_handle.stop()
+            except Exception as exc:
+                _log.debug("停止旧 shared preview handle 失败: %s", exc)
+        _stop_idle_shared_ingest(room_id, reason="shared mse error cleanup")
+
+        current_error = err
+        mse_failure_reason = 'network'
+
+        async def _finalize(error_text: str, reason: str, timeline_reason: str) -> None:
+            _mse_reconnect_state.pop(room_id, None)
+            await server.broadcast('mse_error', {
+                'room_id': room_id,
+                'error': error_text,
+                'reason': reason,
+            })
+
+            def _clear_preview():
+                room = manager.get_room(room_id)
+                if room is not None:
+                    room.preview_enabled = False
+                    room.preview_mode = 'live_mse'
+                _invalidate_room_timeline(room_id, reason=timeline_reason)
+
+            try:
+                await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_clear_preview)
+                )
+            except Exception as exc:
+                _log.error("Shared MSE error cleanup failed: %s", exc)
+            bridge.queue_broadcast({
+                'type': 'rooms_updated',
+                'data': {'rooms': _rooms_list(manager)},
+            })
+
+        while True:
+            def _check_preview():
+                room = manager.get_room(room_id)
+                if room is None:
+                    return False
+                return bool(room.preview_enabled)
+
+            try:
+                still_previewing = await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_check_preview)
+                )
+            except Exception:
+                still_previewing = False
+
+            if not still_previewing:
+                _mse_reconnect_state.pop(room_id, None)
+                return
+
+            state = _mse_reconnect_state.get(room_id, {'attempts': 0})
+            if state['attempts'] >= _MSE_MAX_RECONNECT:
+                _log.warning(
+                    "Shared MSE reconnect exhausted for room %s (%d attempts)",
+                    room_id, state['attempts'],
+                )
+                exhausted_msg = (
+                    _mse_offline_error_message(current_error)
+                    if mse_failure_reason == 'offline'
+                    else '预览重连失败，已达到最大重试次数，请手动重新开启预览'
+                )
+                await _finalize(
+                    exhausted_msg,
+                    mse_failure_reason,
+                    f"mse_reconnect_exhausted:{room_id}",
+                )
+                return
+
+            delay = min(
+                _MSE_RECONNECT_BASE_DELAY * (2 ** state['attempts']),
+                _MSE_RECONNECT_MAX_DELAY,
+            )
+            state['attempts'] += 1
+            _mse_reconnect_state[room_id] = state
+            _log.info(
+                "Shared MSE reconnect attempt %d/%d for room %s (delay=%.1fs, error=%s)",
+                state['attempts'], _MSE_MAX_RECONNECT, room_id, delay, current_error,
+            )
+            await server.broadcast('mse_reconnecting', {
+                'room_id': room_id,
+                'attempt': state['attempts'],
+                'max_attempts': _MSE_MAX_RECONNECT,
+                'delay': delay,
+            })
+            await asyncio.sleep(delay)
+
+            try:
+                still_previewing = await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_check_preview)
+                )
+            except Exception:
+                still_previewing = False
+            if not still_previewing:
+                _mse_reconnect_state.pop(room_id, None)
+                return
+
+            # 强制刷新流地址，避免复用已 404 的 CDN 死链
+            try:
+                refresh_ok = await loop.run_in_executor(
+                    _recording_executor,
+                    lambda: manager.refresh_stream_url(room_id, force=True),
+                )
+            except Exception as exc:
+                _log.error("Shared MSE reconnect URL refresh failed: %s", exc)
+                refresh_ok = False
+
+            if not refresh_ok:
+                try:
+                    offline, offline_msg = await loop.run_in_executor(
+                        _recording_executor,
+                        lambda: _probe_stream_offline(manager, room_id),
+                    )
+                except Exception as exc:
+                    _log.debug("Shared MSE reconnect offline probe failed: %s", exc)
+                    offline, offline_msg = False, ''
+                if offline:
+                    mse_failure_reason = 'offline'
+                    await _finalize(
+                        offline_msg or _mse_offline_error_message(),
+                        'offline',
+                        f"mse_offline:{room_id}",
+                    )
+                    return
+                current_error = '流地址刷新失败'
+                continue
+
+            try:
+                result = await _handle_mse_preview(
+                    server, manager, room_id, True, None, force_restart=True,
+                )
+            except Exception as exc:
+                _log.warning("Shared MSE reconnect start failed for %s: %s", room_id, exc)
+                result = {'success': False, 'error': str(exc)}
+
+            if result.get('success'):
+                _mse_reconnect_state.pop(room_id, None)
+                _log.info("Shared MSE reconnect succeeded for room %s", room_id)
+                await server.broadcast('mse_reconnected', {'room_id': room_id})
+                _broadcast_rooms()
+                return
+
+            current_error = result.get('error') or '重连失败'
+            _log.warning(
+                "Shared MSE reconnect failed for room %s: %s",
+                room_id, current_error,
+            )
+
     def _attach_shared_preview_handle(room_id: str, shared_ingest, loop):
         return _preview_stream_registry().attach_shared(
             room_id,
@@ -2537,16 +2797,8 @@ def register_room_handlers(server, bridge):
                 }),
                 loop,
             ),
-            on_error=lambda err: (
-                asyncio.run_coroutine_threadsafe(
-                    server.broadcast('mse_error', {
-                        'room_id': room_id,
-                        'error': err,
-                        'reason': 'network',
-                    }),
-                    loop,
-                ),
-                _stop_idle_shared_ingest(room_id, reason="shared preview error"),
+            on_error=lambda err: asyncio.run_coroutine_threadsafe(
+                _shared_mse_on_error(room_id, err, loop), loop
             ),
         )
 
@@ -2642,13 +2894,37 @@ def register_room_handlers(server, bridge):
     # 每 5 秒中频 tick 时广播 rooms_updated，让前端刷新录制文件大小
     manager.medium_tick.connect(_queue_rooms_update)
 
-    _ws_loop = asyncio.get_event_loop()
+    # 不要在注册期调用 asyncio.get_event_loop()：Python 3.12+ 在无运行中
+    # 事件循环时会抛 RuntimeError，导致 handler 注册整体失败。改为惰性解析，
+    # 并在 on_connect / 首个异步入口捕获真正的 WS 循环。
+    _ws_loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {'loop': None}
+
+    def _capture_ws_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop | None:
+        if loop is not None and not loop.is_closed():
+            _ws_loop_holder['loop'] = loop
+            return loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and not running.is_closed():
+            _ws_loop_holder['loop'] = running
+            return running
+        cached = _ws_loop_holder.get('loop')
+        if cached is not None and not cached.is_closed():
+            return cached
+        return None
 
     def _on_manager_recording_stopped_offline(room_id: str, reason: str, message: str) -> None:
         """录制侧重连判定下播时，若预览仍开启则切换为文件回看。"""
         if reason != 'offline':
             return
-        if not _ws_loop.is_running():
+        loop = _capture_ws_loop()
+        if loop is None or not loop.is_running():
+            _log.debug(
+                "skip offline→file preview: no running WS loop (room_id=%s)",
+                room_id,
+            )
             return
         asyncio.run_coroutine_threadsafe(
             _start_recording_file_mse(
@@ -2656,11 +2932,11 @@ def register_room_handlers(server, bridge):
                 manager,
                 bridge,
                 room_id,
-                _ws_loop,
+                loop,
                 offline_message=message,
                 stop_recording_if_active=False,
             ),
-            _ws_loop,
+            loop,
         )
 
     manager.recording_stopped.connect(_on_manager_recording_stopped_offline)
@@ -2686,6 +2962,8 @@ def register_room_handlers(server, bridge):
         旧实现仅用 URL 重新 add_room 导致偏好丢失。
         仅在 manager 当前无房间时恢复，避免重复加载。
         """
+        _capture_ws_loop()
+
         def _restore():
             existing = manager.list_rooms()
             if existing:
@@ -4006,16 +4284,8 @@ def register_room_handlers(server, bridge):
                                 }),
                                 loop,
                             ),
-                            on_error=lambda err: (
-                                asyncio.run_coroutine_threadsafe(
-                                    srv.broadcast('mse_error', {
-                                        'room_id': room_id,
-                                        'error': err,
-                                        'reason': 'network',
-                                    }),
-                                    loop,
-                                ),
-                                _stop_idle_shared_ingest(room_id, reason="shared preview error"),
+                            on_error=lambda err: asyncio.run_coroutine_threadsafe(
+                                _shared_mse_on_error(room_id, err, loop), loop
                             ),
                         )
 
@@ -5610,9 +5880,10 @@ def register_room_handlers(server, bridge):
                         except (TypeError, ValueError):
                             _ocr_iv = 2.0
                         _round_config = ValorantRoundConfig(
-                            full_round=True,
-                            # 相位加密需要 1.0–1.5s 采样；不再钳到 2.0
-                            phase_sample_interval=max(1.0, _ocr_iv),
+                            # 战斗优先：买枪 trim + 钟声裁尾；禁止 full_round 把买枪/结算糊进入列边界
+                            full_round=False,
+                            # 质量档允许 0.8s 密采样
+                            phase_sample_interval=max(0.8, _ocr_iv),
                         )
                         return detect_valorant_rounds(
                             _vp, ffmpeg_path=_ffmpeg, duration=_dur,
@@ -5727,7 +5998,11 @@ def register_room_handlers(server, bridge):
             return None, 0.0
 
         def _derive_round_signals(highlights, current_dur_val):
-            """从最新扫描结果推导相位调度器信号。"""
+            """从最新扫描结果推导相位调度器信号。
+
+            OCR 标签（round_start/end）与音频（energy_rise/collapse、chime）交叉验证；
+            禁止用 score 冒充能量信号。
+            """
             _signals = {
                 'energy_rise': False,
                 'left_buy_ocr': False,
@@ -5755,28 +6030,25 @@ def register_room_handlers(server, bridge):
             # next_buy_seen: 终点由下一买枪确定
             if end_by == 'next_buy':
                 _signals['next_buy_seen'] = True
-            # chime: 钟声裁尾
+            # chime: 钟声裁尾 → 同时视为能量塌陷
             if tail_by == 'chime':
                 _signals['chime'] = True
+                _signals['energy_collapse'] = True
             # left_buy_ocr: 最新回合已超越买枪期（phase != pending 且 start_by=ocr）
             if start_by in ('ocr_buy_exit', 'ocr') and phase_val not in ('pending', ''):
                 _signals['left_buy_ocr'] = True
-            # energy_rise / energy_collapse: 由 score 近似
-            try:
-                _score = float(latest.get('score', 0.0))
-            except (TypeError, ValueError):
-                _score = 0.0
-            if _score >= 0.6:
+            # 真实 RMS 信号（round_detector 写入）；缺省时不回退到 score
+            if latest.get('energy_rise') is True:
                 _signals['energy_rise'] = True
-            if _score < 0.3 and phase_val not in ('pending', ''):
+            if latest.get('energy_collapse') is True:
                 _signals['energy_collapse'] = True
             return _signals
 
         # 初始化任务状态
         if room_id not in _continuous_tasks:
             _continuous_tasks[room_id] = {}
-        # 规范化 valorant_profile
-        _profile_name = 'pov'
+        # 规范化 valorant_profile（pov/broadcast 等旧别名一律映射为统一档）
+        _profile_name = 'valorant'
         if _valorant_incremental_rounds:
             from lsc.analyzer.phase_scheduler import get_profile as _get_profile_init
             _profile_name = _get_profile_init(valorant_profile).name
@@ -5941,7 +6213,7 @@ def register_room_handlers(server, bridge):
                 worker_result = scan_result.get('result', [])
                 worker_error = scan_result.get('error')
                 _time_since_last_consume = time.time() - last_consumed_at
-                _min_consume_interval = 30.0 if _valorant_incremental_rounds else 0.0
+                _min_consume_interval = 10.0 if _valorant_incremental_rounds else 0.0
                 can_consume = (
                     worker_completed_at > last_consumed_at
                     and (
@@ -6061,13 +6333,14 @@ def register_room_handlers(server, bridge):
                             with _refined_round_keys_lock:
                                 refined_snapshot = set(_refined_round_keys)
                             ocr_confirmed_hl = [
-                                h for h in pending_hl
+                                _trim_valorant_combat_bounds(h) for h in pending_hl
                                 if _is_auto_exportable_valorant_round(h)
                                 and _valorant_round_key(h) not in refined_snapshot
                             ]
                             ocr_keys = {_valorant_round_key(h) for h in ocr_confirmed_hl}
+                            # 质量档：pending 也 trim，列表边界更接近正赛
                             pending_only_hl = [
-                                h for h in pending_hl
+                                _trim_valorant_combat_bounds(h) for h in pending_hl
                                 if _valorant_round_key(h) not in ocr_keys
                             ]
                         else:
@@ -6181,37 +6454,67 @@ def register_room_handlers(server, bridge):
                             _prev_phase = state.get('round_phase')
                             if _transition.phase.value != _prev_phase:
                                 state['round_phase_entered_at'] = time.monotonic()
-                                # 录像轴锚点：确认闭合用上回合终点；进入 buy/intermission 用当前进度
+                                # 录像轴锚点：优先 OCR round_end / round_start，避免 full_round 把买枪算进交战
                                 if _transition.just_confirmed and all_highlights:
+                                    _last_hl = all_highlights[-1]
+                                    _anchor_raw = (
+                                        _last_hl.get('round_end_sec')
+                                        or _last_hl.get('ocr_end')
+                                        or _last_hl.get('end')
+                                        or current_dur
+                                    )
                                     try:
-                                        state['phase_anchor_sec'] = float(
-                                            all_highlights[-1].get('end', current_dur) or current_dur
-                                        )
+                                        state['phase_anchor_sec'] = float(_anchor_raw)
                                     except (TypeError, ValueError):
                                         state['phase_anchor_sec'] = float(current_dur)
                                 elif _transition.phase in (_RP.BUY, _RP.INTERMISSION, _RP.UNKNOWN):
                                     state['phase_anchor_sec'] = float(current_dur)
+                                elif _transition.phase == _RP.COMBAT and all_highlights:
+                                    _last_hl = all_highlights[-1]
+                                    _cs = (
+                                        _last_hl.get('round_start_sec')
+                                        or _last_hl.get('ocr_start')
+                                        or _last_hl.get('start')
+                                    )
+                                    try:
+                                        if _cs is not None:
+                                            state['phase_anchor_sec'] = float(_cs)
+                                    except (TypeError, ValueError):
+                                        pass
                             state['round_phase'] = _transition.phase.value
                             state['round_phase_detail'] = _PDZH.get(_transition.detail, _transition.detail)
-                            # pending_start: 有起点未终点
+                            # pending_start: 有起点未终点（用正赛起点，不含买枪）
                             if _transition.just_confirmed:
                                 state['pending_start'] = None
                             elif _signals.get('has_start') and not _signals.get('has_end'):
                                 if all_highlights:
-                                    state['pending_start'] = float(all_highlights[-1].get('start', 0.0))
+                                    _ps = (
+                                        all_highlights[-1].get('round_start_sec')
+                                        or all_highlights[-1].get('ocr_start')
+                                        or all_highlights[-1].get('start', 0.0)
+                                    )
+                                    state['pending_start'] = float(_ps)
                             # 回合时钟预测（只调扫描密度，不入列）
                             _anchor = float(state.get('phase_anchor_sec') or 0.0)
                             _combat_start = None
                             _combat_end_hint = None
                             if all_highlights:
+                                _last_hl = all_highlights[-1]
                                 try:
-                                    _combat_start = float(all_highlights[-1].get('start'))
+                                    _combat_start = float(
+                                        _last_hl.get('round_start_sec')
+                                        or _last_hl.get('ocr_start')
+                                        or _last_hl.get('start')
+                                    )
                                 except (TypeError, ValueError):
                                     _combat_start = None
                                 if _signals.get('chime') or _signals.get('has_end'):
                                     try:
                                         _combat_end_hint = float(
-                                            all_highlights[-1].get('end', current_dur) or current_dur
+                                            _last_hl.get('round_end_sec')
+                                            or _last_hl.get('ocr_end')
+                                            or _last_hl.get('end', current_dur)
+                                            or current_dur
                                         )
                                     except (TypeError, ValueError):
                                         _combat_end_hint = float(current_dur)
@@ -6301,19 +6604,10 @@ def register_room_handlers(server, bridge):
                             if _bgt.need_ocr and _bgt.ocr_interval_sec < 999.0:
                                 _budget_ocr_iv = _bgt.ocr_interval_sec
                         if _finalize_started or _finalize_pending:
-                            _budget_ocr_iv = min(_budget_ocr_iv, 2.0)
+                            _budget_ocr_iv = min(_budget_ocr_iv, 1.0)
                         state['ocr_sample_interval'] = _budget_ocr_iv
-                        # critical 且未 pause：奇数 tick 纯音频先追赶，偶数 tick 再 OCR（降载）
-                        # 收尾扫描跳过此降载，必须 OCR 确认边界。
-                        if (
-                            not (_finalize_started or _finalize_pending)
-                            and pressure.get('level') == 'critical'
-                            and not pressure.get('pause_analysis')
-                            and _scan_counter % 2 == 1
-                        ):
-                            state['refine_with_ocr'] = False
-                        else:
-                            state['refine_with_ocr'] = use_ocr_this_tick
+                        # 质量优先：不再在 critical 奇数 tick 关掉 OCR
+                        state['refine_with_ocr'] = use_ocr_this_tick
                         state['scan_range'] = scan_range
                         state['full_rescan'] = full_rescan
                         state['scan_timeout'] = _scan_timeout
@@ -6453,12 +6747,11 @@ def register_room_handlers(server, bridge):
         except Exception as exc:
             _log.warning("广播持续分析高光失败: %s", exc)
 
-        # 对于非 Valorant 回合模式（scene/generic），在此自动导出高光到各目标房间
-        # Valorant 模式在主循环中已调用 _auto_export_highlights 完成导出
+        # 非 Valorant 回合（scene/generic）：与 Valorant 一致，仅 list_only 入列待确认，
+        # 禁止 defer→flush 自动 FFmpeg 导出（用户须确认后再导出）。
         if mode != 'valorant_round':
             try:
                 if mapped_highlights_by_room and main_room_for_map is not None and target_rooms_for_map:
-                    # 从 settings 读取用户默认导出预设，保证持续分析与手动导出使用同一配置
                     _auto_preset_generic = load_settings().get('appSettings', {}).get('default_export_preset', '')
                     for target_rid, hls in mapped_highlights_by_room.items():
                         if not hls:
@@ -6474,9 +6767,12 @@ def register_room_handlers(server, bridge):
                                 hls,
                                 job_prefix=f"auto-{int(time.time() * 1000)}",
                                 preset_id=_auto_preset_generic,
+                                defer_export=True,
+                                confirm_status='pending',
+                                list_only=True,
                             )
             except Exception as exc:
-                _log.warning("持续分析自动导出失败: %s", exc)
+                _log.warning("持续分析入列失败: %s", exc)
 
         if video_path:
             save_analysis_results(video_path, room_id, mode, all_highlights)
@@ -6486,11 +6782,13 @@ def register_room_handlers(server, bridge):
         """启动持续分析（边录边分析）。
 
         参数:
-            room_id: 房间 ID
-            mode: 分析模式 'fast'（快速回合检测）| 'scene'（场景+音频检测）|
-                'ai'（仅语音）| 'combined'（AI深度）
-            interval: 增量分析间隔（秒，默认 60，AI 模式建议 300）
-            threshold: 场景检测阈值（默认 0.3，会自适应降低）
+            main_room_id / room_id: 主房间 ID（只分析该房录制文件）
+            target_room_ids: 映射入列的目标房间（须含主房；多房须同对齐组）
+            mode: 'valorant_round' | 'scene'
+            game: 'valorant' | 'generic'
+            interval: 增量分析间隔（秒，默认 60，最小 10）
+            threshold: 场景检测阈值（默认 0.3）
+            valorant_profile: 遗留字段；pov/broadcast/hvv 等均映射到统一 valorant 档
         """
         data = data or {}
         main_room_id = data.get('main_room_id') or data.get('room_id')
@@ -6499,8 +6797,8 @@ def register_room_handlers(server, bridge):
         interval = int(data.get('interval', 60))
         threshold = _safe_float(data.get('threshold', 0.3), 0.3)
         game = data.get('game', 'valorant')  # 'valorant' | 'generic'
-        # 无畏契约相位调度 profile（缺省 pov）
-        _start_valorant_profile = (data.get('valorant_profile') or 'pov')
+        # 统一保守档；旧客户端传 pov/broadcast 仍兼容
+        _start_valorant_profile = (data.get('valorant_profile') or 'valorant')
         if not main_room_id:
             return {'error': 'room_id is required'}
         if _continuous_tasks:

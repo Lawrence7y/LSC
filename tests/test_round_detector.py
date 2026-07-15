@@ -19,6 +19,7 @@ import types
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from lsc.analyzer.round_detector import (
     ValorantRoundConfig,
@@ -133,6 +134,48 @@ class TestRoundCompleteness:
         assert res[0].get("tail_by") in ("ocr_phase", "ocr"), \
             f"OCR 确认的回合 tail_by 应为 ocr_phase/ocr, 实际 {res[0].get('tail_by')}"
 
+    def test_time_range_ocr_metadata_not_double_offset(self):
+        """增量窗：ocr_start/buy_marker 必须与 start 同轴，禁止 +range_offset 两次。
+
+        对照 recording_20260715_225308：start=375 但 buy/ocr_start≈747（≈375+372）。
+        """
+        markers = [
+            {"timestamp": 157.0, "type": "round_prep"},
+            {"timestamp": 185.0, "type": "round_start"},  # 战斗起点
+            {"timestamp": 240.0, "type": "round_end"},
+            {"timestamp": 248.0, "type": "round_prep"},
+            {"timestamp": 275.0, "type": "round_start"},
+        ]
+        # 窗口 100-300 → offset=100；局部 RMS 覆盖 0..200
+        fake_rms = np.ones(200, dtype=np.float32) * 2000.0
+        fake_pcm = np.zeros(16000, dtype=np.float32)
+        with (
+            patch("lsc.analyzer.round_detector._detect_round_phase_markers",
+                  return_value=markers),
+            patch("lsc.analyzer.round_detector._extract_audio_pcm",
+                  return_value=(fake_pcm, 16000)),
+            patch("lsc.analyzer.round_detector._compute_rms_envelope",
+                  return_value=fake_rms),
+            patch("lsc.analyzer.round_detector._detect_chimes_from_samples",
+                  return_value=[]),
+            patch("os.path.isfile", return_value=True),
+        ):
+            res = detect_valorant_rounds(
+                "fake.mp4",
+                ffmpeg_path="ffmpeg",
+                duration=400.0,
+                refine_with_ocr=True,
+                time_range=(100.0, 300.0),
+                config=ValorantRoundConfig(phase_sample_interval=2.0),
+            )
+        assert res, "应产出 OCR 回合"
+        first = res[0]
+        assert first["start"] == pytest.approx(187.0, abs=0.1)
+        # 元数据必须贴近 start，绝不能再 +100 → ~287
+        assert first.get("ocr_start") == pytest.approx(first["start"], abs=0.5)
+        assert first.get("buy_marker_sec") == pytest.approx(185.0, abs=0.5)
+        assert first.get("buy_marker_sec") < first["start"] + 5.0
+
     def test_three_rounds_stay_independent(self):
         """3 个回合各自独立成片，数量守恒（不碎片化、不误合并）。"""
         rms = _build_rms(
@@ -184,6 +227,9 @@ class TestRoundCompleteness:
         assert 119.0 <= res[0]["start"] <= 121.0
         # local chime=60 → global 160；+tail_pad
         assert 160.0 <= res[0]["end"] <= 160.0 + ValorantRoundConfig().tail_pad + 1.0
+        # 元数据必须同样回到全局轴，否则 trim 会用局部 round_end 把终点夹坏
+        assert res[0].get("round_end_sec") is not None
+        assert 159.0 <= float(res[0]["round_end_sec"]) <= 161.0
 
     def test_long_round_not_split_at_midpoint(self):
         """加时长回合(~95s)不被 max_combat_duration 中点强切成两段。
@@ -306,7 +352,8 @@ class TestOcrPhaseRoundSegments:
         res = _build_round_segments_from_phase_markers(markers, 292.0, cfg)
 
         assert res[-1]["start"] == 237.0
-        assert res[-1]["end"] > 280.0
+        # 无胜利/无 prep：下一 buy_exit(291) - 30s；再被 min_round_duration 抬到 237+35=272
+        assert res[-1]["end"] == 272.0
         assert res[-1]["tail_by"] == "ocr_phase"
         assert res[-1]["end_by"] == "next_buy"
         assert res[-1]["ocr_confirmed"] is True
@@ -329,6 +376,68 @@ class TestOcrPhaseRoundSegments:
             f"不应有从 0.0 开始的回合: {[(r['start'], r['end']) for r in res]}"
         assert len(res) == 1  # 只有 71.0->135.0 一个完整回合
 
+    def test_broadcast_end_only_markers_build_rounds(self):
+        """解说/转播流常只有「回合胜利」无「购买阶段」：须用连续 end 建段，禁止空结果回退音频。
+
+        对照实测：月子 200–500s OCR 检出 end@280/@350，旧逻辑 segs=0 → 全程 audio 糊窗。
+        终点改为「下一准备阶段开始」≈ 上一胜利 + post_to_combat，而非贴胜利字本身。
+        """
+        cfg = ValorantRoundConfig()
+        markers = [
+            {"timestamp": 280.0, "type": "round_end", "text": "回合3 回合胜利"},
+            {"timestamp": 350.0, "type": "round_end", "text": "回合4 回合胜利"},
+        ]
+        res = _build_round_segments_from_phase_markers(markers, 1286.0, cfg)
+        assert len(res) >= 1
+        post_to_combat = max(cfg.round_inactive_gap, 25.0)
+        # 有下一胜利时：本段终点 = 下一准备起点（胜利后 post_to_combat）
+        first = next(r for r in res if float(r["ocr_end"] or 0) == 280.0)
+        assert first["end_by"] == "next_buy"
+        assert first["end"] == pytest.approx(280.0 + post_to_combat, abs=0.1)
+        assert first["ocr_end"] == 280.0  # 胜利字保留为元数据
+        # 末段无下一准备：终点仍贴本段胜利字
+        last = res[-1]
+        assert last["end_by"] == "ocr_result"
+        assert last["end"] == 350.0
+        assert last["start_by"] != "ocr_buy_exit"
+
+    def test_prefer_next_prep_start_over_victory_as_end(self):
+        """有下一准备标记时，终点用准备开始（round_prep），不得用买枪结束（round_start）。
+
+        对照实测：next_buy 误用 buy_run[-1]（屏障解除）会把整段买枪糊进上一段，
+        用户确认时常再砍尾 2–29s。
+        """
+        cfg = ValorantRoundConfig(phase_sample_interval=2.0)
+        markers = [
+            {"timestamp": 100.0, "type": "round_start"},  # 本回合买枪结束→战斗
+            {"timestamp": 160.0, "type": "round_end"},    # 胜利
+            {"timestamp": 168.0, "type": "round_prep"},   # 下一准备阶段开始
+            {"timestamp": 195.0, "type": "round_start"},  # 下一买枪结束（不得作上段终点）
+            {"timestamp": 240.0, "type": "round_end"},
+        ]
+        res = _build_round_segments_from_phase_markers(markers, 400.0, cfg)
+        assert len(res) >= 1
+        first = res[0]
+        assert first["end_by"] == "next_buy"
+        assert first["end"] == 168.0
+        assert first["ocr_end"] == 160.0
+        # 绝不能拖到下一 round_start(195)
+        assert first["end"] < 195.0
+
+    def test_next_buy_without_prep_falls_back_to_victory_not_next_exit(self):
+        """仅有 buy_exit 无 prep 时：用下一开战-30s 估准备开始，禁止用下一 buy_exit，也不贴死胜利字。"""
+        cfg = ValorantRoundConfig(phase_sample_interval=2.0)
+        markers = [
+            {"timestamp": 100.0, "type": "round_start"},
+            {"timestamp": 160.0, "type": "round_end"},
+            {"timestamp": 195.0, "type": "round_start"},
+        ]
+        res = _build_round_segments_from_phase_markers(markers, 400.0, cfg)
+        assert res[0]["end"] == 165.0  # 195 - 30
+        assert res[0]["end_by"] == "next_buy"
+        assert res[0]["ocr_end"] == 160.0
+        assert res[0]["end"] < 195.0
+
     def test_ocr_inferred_end_uses_8s_gap_not_15s(self):
         """OCR 推断结束点用 8s 间隔（死亡回放~3s + 结算~5s），不是音频路径的 15s。"""
         cfg = ValorantRoundConfig()
@@ -339,9 +448,8 @@ class TestOcrPhaseRoundSegments:
             {"timestamp": 300.0, "type": "round_end"},
         ]
         res = _build_round_segments_from_phase_markers(markers, 400.0, cfg)
-        # 第一回合无 end 标记，用 next_start(200) - 8 = 192
-        # 不是 next_start(200) - 15 = 185
-        assert res[0]["end"] == 200.0
+        # 第一回合无 end/prep：下一 buy_exit(200) - 30s 估准备开始
+        assert res[0]["end"] == 170.0
         assert res[0]["end_by"] == "next_buy"
         assert res[0]["ocr_confirmed"] is True
 
@@ -456,13 +564,16 @@ class TestOcrRefineFallback:
 
         rounds = _build_round_segments_from_phase_markers(markers, 408.4, cfg)
 
-        # 去掉 [0.0] 硬编码：首段不再从 0.0 开始，而是从第一个 round_start (71.0)
-        assert [(r["start"], r["end"]) for r in rounds] == [
-            (73.0, 135.0),
-            (174.0, 216.0),
-            (254.0, 296.0),
-            (333.0, 408.4),
+        # 无 round_prep 时：下一开战-30s 估准备；胜利字保留在 ocr_end；末段 open_tail
+        assert [(r["start"], r["end"], r["end_by"]) for r in rounds] == [
+            (73.0, 142.0, "next_buy"),   # 172 - 30
+            (174.0, 222.0, "next_buy"),  # 252 - 30
+            (254.0, 301.0, "next_buy"),  # 331 - 30
+            (333.0, 408.4, "open_tail"),
         ]
+        assert rounds[0]["ocr_end"] == 135.0
+        assert rounds[1]["ocr_end"] == 216.0
+        assert rounds[2]["ocr_end"] == 296.0
 
     def test_ocr_phase_path_can_add_audio_missed_rounds(self):
         """完整文件 OCR 状态路径应能产出音频能量漏掉的完整回合数量。"""
@@ -510,11 +621,13 @@ class TestOcrRefineFallback:
             assert r["end"] <= 408.4 + 1.0
 
     def test_refine_disabled_by_default(self):
-        """refine_with_ocr=False 时不触碰 OCR，纯音频结果直出。"""
+        """refine_with_ocr=False 时不触碰 OCR，纯音频结果直出（标记为 audio/chime）。"""
         rms = _build_rms(rounds=[(10, 35, 65)], total_sec=100)
         res = _run_detect(rms, chimes=[65.0])  # _run_detect 固定 refine_with_ocr=False
         assert len(res) == 1
-        assert "start_by" not in res[0], "未启用 OCR 时不应有 start_by 标记"
+        assert res[0].get("start_by") == "audio"
+        assert res[0].get("end_by") == "chime"
+        assert res[0].get("start_by") != "ocr_buy_exit"
 
     def test_refine_falls_back_when_ocr_unavailable(self):
         """OCR 模块导入失败时，refine_with_ocr=True 仍返回音频结果（不抛异常）。"""
@@ -576,9 +689,12 @@ class TestOcrConfirmedBoundaryPriority:
         # OCR 确认的回合 tail_by 应为 ocr_phase，不是 chime
         assert res[0]["tail_by"] == "ocr_phase", \
             f"OCR 确认的回合不应被钟声覆盖: {res[0]['tail_by']}"
-        # end 应基于 OCR end(150) + tail_pad，而非钟声覆盖
-        assert res[0]["end"] == round(150.0 + cfg.tail_pad, 3), \
-            f"OCR end 应 150+tail_pad={150.0 + cfg.tail_pad}, 实际 {res[0]['end']}"
+        # 有下一买枪时终点估准备(200-30=170)，胜利字留在 ocr_end；不被钟声覆盖
+        assert res[0]["end"] == round(170.0, 3), \
+            f"OCR end 应 170（估准备）, 实际 {res[0]['end']}"
+        assert res[0].get("end_by") == "next_buy"
+        assert res[0].get("ocr_end") == 150.0
+        assert res[0].get("round_end_sec") == 150.0
 
     def test_audio_only_rounds_still_use_chime(self):
         """无 OCR 时（refine_with_ocr=False）仍用钟声裁尾。"""
@@ -665,6 +781,7 @@ class TestDegenerate:
 
 class TestOcrRoundBoundaryMetadata:
     def test_ocr_round_uses_barrier_exit_and_explicit_end(self):
+        """有下一买枪时终点估准备开始；胜利字写入 ocr_end，不得拖到下一 buy_exit。"""
         cfg = ValorantRoundConfig(phase_sample_interval=2.0)
         rounds = _build_round_segments_from_phase_markers(
             [
@@ -676,12 +793,14 @@ class TestOcrRoundBoundaryMetadata:
             cfg,
         )
         assert rounds[0]["start"] == 102.0
-        assert rounds[0]["end"] == 154.0
+        assert rounds[0]["end"] == 170.0  # 200 - 30
         assert rounds[0]["start_by"] == "ocr_buy_exit"
-        assert rounds[0]["end_by"] == "ocr_result"
+        assert rounds[0]["end_by"] == "next_buy"
+        assert rounds[0]["ocr_end"] == 154.0
         assert rounds[0]["ocr_confirmed"] is True
 
     def test_ocr_round_uses_next_buy_as_confirmed_end(self):
+        """无胜利/无 prep 时：用下一 buy_exit 回推典型买枪时长估准备开始。"""
         rounds = _build_round_segments_from_phase_markers(
             [
                 {"timestamp": 100.0, "type": "round_start"},
@@ -691,7 +810,7 @@ class TestOcrRoundBoundaryMetadata:
             ValorantRoundConfig(phase_sample_interval=2.0),
         )
         assert rounds[0]["start"] == 102.0
-        assert rounds[0]["end"] == 200.0
+        assert rounds[0]["end"] == 170.0  # 200 - 30
         assert rounds[0]["end_by"] == "next_buy"
         assert rounds[0]["ocr_confirmed"] is True
 
@@ -706,6 +825,43 @@ class TestOcrRoundBoundaryMetadata:
 
 
 class TestOcrOutputBoundaryRegression:
+    def test_next_buy_end_not_replaced_by_victory_ocr_end(self):
+        """end_by=next_buy 时终点必须是准备开始，不得被胜利字 ocr_end 覆盖回退。"""
+        cfg = ValorantRoundConfig(pre_combat_pad=2.0, min_combat_duration=3.0)
+        phase = [{
+            "start": 100.0,
+            "end": 168.0,  # next prep
+            "start_by": "ocr_buy_exit",
+            "end_by": "next_buy",
+            "ocr_confirmed": True,
+            "ocr_start": 100.0,
+            "ocr_end": 155.0,  # 胜利字（仅元数据）
+            "buy_marker_sec": 98.0,
+        }]
+        result = _format_output(
+            [(100, 168)], np.ones(200, dtype=np.float32), 1.0, 200.0, cfg,
+            phase_rounds=phase,
+        )
+        assert result[0]["end"] == 168.0
+        assert result[0]["end_by"] == "next_buy"
+        assert result[0]["ocr_end"] == 155.0
+
+    def test_build_caps_glued_next_buy_with_mid_victory(self):
+        """漏检中间买枪时：有下一开战则估准备/胜利+过渡，不得把终点停在纯胜利字。"""
+        cfg = ValorantRoundConfig(phase_sample_interval=2.0, max_combat_duration=90.0)
+        markers = [
+            {"timestamp": 100.0, "type": "round_start"},
+            {"timestamp": 160.0, "type": "round_end"},  # 第一回合胜利
+            {"timestamp": 230.0, "type": "round_start"},  # 隔了两回合的开战
+        ]
+        res = _build_round_segments_from_phase_markers(markers, 400.0, cfg)
+        assert res, "应至少产出一段"
+        # 胜利+12s 过渡，仍标 next_buy（接近准备），不要 ocr_result 砍光结算后
+        assert res[0]["end"] == 172.0
+        assert res[0]["end_by"] == "next_buy"
+        assert res[0]["ocr_end"] == 160.0
+        assert res[0]["end"] - res[0]["start"] < 90.0
+
     def test_ocr_output_uses_phase_start_without_prepad(self):
         cfg = ValorantRoundConfig(pre_combat_pad=10.0)
         phase = [{

@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from lsc.analyzer.round_clock_predictor import RoundClockPrediction
 
 
+PROFILE_VALORANT = "valorant"
+# 兼容旧别名（pov / broadcast / hvv 等一律映射到统一 profile）
 PROFILE_POV = "pov"
 PROFILE_BROADCAST = "broadcast"
 
@@ -49,7 +51,7 @@ class RoundPhase(str, Enum):
 class ValorantProfile:
     """无畏契约相位调度 profile 参数。
 
-    pov 与 broadcast 共用同一状态机，仅参数与信号权重不同。
+    游戏视角与赛事解说已合并为单一保守档：不信纯 RMS 出买枪，密 OCR + 加宽 lookback。
     """
 
     name: str
@@ -68,63 +70,52 @@ class ValorantProfile:
     buy_duration_pistol_sec: float = 45.0
     buy_wake_early_sec: float = 5.0
     post_round_sec: float = 5.0
+    # 典型交战时长先验（经验分布中位附近），用于预测收尾窗加密 OCR
+    typical_combat_sec: float = 80.0
     intermission_enter_sec: float = 45.0
     intermission_max_sec: float = 90.0
     intermission_ocr_interval_sec: float = 15.0
 
 
+# 统一保守档（原 broadcast 参数 + 质量优先 OCR 间隔）
+_UNIFIED_PROFILE = ValorantProfile(
+    name=PROFILE_VALORANT,
+    # buy_sleep ≈ 30 - 8 = 22（更早醒来锁准备→交战）
+    buy_sleep_sec=22.0,
+    pre_combat_window_sec=18.0,
+    post_combat_window_sec=35.0,
+    rms_trust_high=False,
+    ocr_sparse_interval_sec=1.5,
+    ocr_dense_interval_sec=0.8,
+    unknown_reanchor_sec=30.0,
+    max_combat_force_post_sec=130.0,
+    lookback_sec=120.0,
+    buy_duration_sec=30.0,
+    buy_duration_pistol_sec=45.0,
+    buy_wake_early_sec=8.0,
+    post_round_sec=5.0,
+    intermission_enter_sec=45.0,
+    intermission_max_sec=120.0,
+    intermission_ocr_interval_sec=2.0,
+)
+
 _PROFILES = {
-    PROFILE_POV: ValorantProfile(
-        name=PROFILE_POV,
-        # buy_sleep ≈ buy_duration(30) - wake_early(5) = 25
-        buy_sleep_sec=25.0,
-        pre_combat_window_sec=12.0,
-        post_combat_window_sec=25.0,
-        rms_trust_high=True,
-        ocr_sparse_interval_sec=12.0,
-        ocr_dense_interval_sec=2.0,
-        unknown_reanchor_sec=45.0,
-        max_combat_force_post_sec=130.0,
-        lookback_sec=40.0,
-        buy_duration_sec=30.0,
-        buy_duration_pistol_sec=45.0,
-        buy_wake_early_sec=5.0,
-        post_round_sec=5.0,
-        intermission_enter_sec=45.0,
-        intermission_max_sec=90.0,
-        intermission_ocr_interval_sec=15.0,
-    ),
-    PROFILE_BROADCAST: ValorantProfile(
-        name=PROFILE_BROADCAST,
-        # buy_sleep ≈ 30 - 8 = 22（解说需更早醒来）
-        buy_sleep_sec=22.0,
-        pre_combat_window_sec=18.0,
-        post_combat_window_sec=35.0,
-        rms_trust_high=False,
-        ocr_sparse_interval_sec=7.0,
-        ocr_dense_interval_sec=1.5,
-        unknown_reanchor_sec=30.0,
-        max_combat_force_post_sec=130.0,
-        lookback_sec=55.0,
-        buy_duration_sec=30.0,
-        buy_duration_pistol_sec=45.0,
-        buy_wake_early_sec=8.0,
-        post_round_sec=5.0,
-        intermission_enter_sec=45.0,
-        intermission_max_sec=120.0,
-        intermission_ocr_interval_sec=10.0,
-    ),
+    PROFILE_VALORANT: _UNIFIED_PROFILE,
+    # 旧名保留为同一实例，避免分叉
+    PROFILE_POV: _UNIFIED_PROFILE,
+    PROFILE_BROADCAST: _UNIFIED_PROFILE,
 }
 
 
 def get_profile(name: str | None) -> ValorantProfile:
-    """按名称获取 profile；None 或无法识别时返回 pov 默认。"""
-    key = (name or PROFILE_POV).strip().lower()
-    if key in ("hvv", "commentary", "broadcast"):
-        key = PROFILE_BROADCAST
-    if key in ("game", "client", "pov"):
-        key = PROFILE_POV
-    return _PROFILES.get(key, _PROFILES[PROFILE_POV])
+    """按名称获取 profile；任意旧别名 / None 均返回统一保守档。"""
+    key = (name or PROFILE_VALORANT).strip().lower()
+    if key in (
+        "hvv", "commentary", "broadcast", "game", "client", "pov",
+        "unified", "valorant", "",
+    ):
+        return _UNIFIED_PROFILE
+    return _PROFILES.get(key, _UNIFIED_PROFILE)
 
 
 @dataclass
@@ -319,25 +310,30 @@ def scan_budget_for_phase(
         if pending_start is not None:
             start = min(start, max(0.0, float(pending_start) - 5.0))
 
-    # OCR 帧率按相位在 sparse / dense / off 之间切换
+    # OCR 帧率：质量优先档所有相位均开 OCR；转场用 dense，其余 sparse
     dense = phase in (RoundPhase.PRE_COMBAT, RoundPhase.POST_COMBAT, RoundPhase.UNKNOWN)
-    # 预测窗：买枪已到 wake 时刻 → 打开稀疏 OCR，便于更早看到 left_buy
     pred_dense = bool(prediction is not None and prediction.in_dense_window)
+    if phase == RoundPhase.INTERMISSION:
+        need_ocr = True
+        interval = float(cfg.intermission_ocr_interval_sec)
+    elif phase == RoundPhase.COMBAT and pred_dense:
+        need_ocr = True
+        interval = cfg.ocr_dense_interval_sec
+    elif phase in (RoundPhase.BUY, RoundPhase.COMBAT):
+        # 买枪/交战中段也保持稀疏 OCR，避免漏结算字与买枪退出
+        need_ocr = True
+        interval = cfg.ocr_sparse_interval_sec
+    elif dense:
+        need_ocr = True
+        interval = cfg.ocr_dense_interval_sec
+    else:
+        need_ocr = True
+        interval = cfg.ocr_sparse_interval_sec
+
+    # 买枪末期预测窗：可提前打开（仍为 sparse，除非已是 dense 相位）
     if phase == RoundPhase.BUY and pred_dense:
         need_ocr = True
         interval = cfg.ocr_sparse_interval_sec
-    elif phase == RoundPhase.INTERMISSION:
-        need_ocr = True
-        interval = float(cfg.intermission_ocr_interval_sec)
-    elif phase == RoundPhase.COMBAT:
-        need_ocr = False
-        interval = cfg.ocr_sparse_interval_sec
-    elif phase == RoundPhase.BUY:
-        need_ocr = False
-        interval = cfg.ocr_sparse_interval_sec
-    else:
-        need_ocr = dense
-        interval = cfg.ocr_dense_interval_sec if dense else cfg.ocr_sparse_interval_sec
 
     return PhaseScanBudget(
         scan_start=round(start, 3),
@@ -375,6 +371,7 @@ PHASE_DETAIL_ZH = {
 
 
 __all__ = [
+    "PROFILE_VALORANT",
     "PROFILE_POV",
     "PROFILE_BROADCAST",
     "RoundPhase",

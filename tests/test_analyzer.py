@@ -45,7 +45,7 @@ class TestHighlightAnalyzer:
             {"start": 15.0, "end": 20.0, "score": 0.9, "reason": "击杀: player", "speech_score": 0.0, "visual_score": 0.9, "transcript": "第二个片段"},
             {"start": 30.0, "end": 40.0, "score": 0.7, "reason": "场景切换频繁", "speech_score": 0.1, "visual_score": 0.7, "transcript": "第三个"},
         ]
-        merged = _merge_close_segments(segments, iou_threshold=0.6)
+        merged = _merge_close_segments(segments, max_gap=15.0)
         assert len(merged) <= len(segments)
 
 

@@ -108,6 +108,18 @@ class TestHumanizeErrorPatterns:
         result = humanize_error("系统找不到指定的路径")
         assert "路径不存在" in result
 
+    def test_shared_ingest_upstream_exit(self):
+        result = humanize_error("shared ingest upstream ffmpeg exited unexpectedly")
+        assert "共享进样" in result or "预览中断" in result
+
+    def test_stream_refresh_failed(self):
+        result = humanize_error("stream url refresh failed")
+        assert "刷新" in result or "流地址" in result
+
+    def test_ocr_unavailable(self):
+        result = humanize_error("rapidocr 未安装")
+        assert "OCR" in result
+
 
 class TestHumanizeErrorFallback:
     """Test fallback behavior when no pattern matches."""

@@ -93,9 +93,12 @@ def _install_exception_hook(log: logging.Logger) -> None:
         traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
 
     def _thread_hook(args):
+        # threading.ExceptHookArgs 字段名为 exc_traceback（非 exc_tb）
+        tb = getattr(args, 'exc_traceback', None) or getattr(args, 'exc_tb', None)
         log.error(
             "Unhandled exception in thread %s: %s",
-            args.thread.name, ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_tb)),
+            args.thread.name,
+            ''.join(traceback.format_exception(args.exc_type, args.exc_value, tb)),
         )
 
     sys.excepthook = _hook

@@ -228,7 +228,7 @@ export default function Settings() {
           }}>通用设置</div>
           <div style={{
             background: 'var(--background-800)',
-            borderRadius: 14,
+            borderRadius: 'var(--radius)',
             overflow: 'hidden',
           }}>
             <SettingsRow label="主题">
@@ -283,7 +283,7 @@ export default function Settings() {
           </div>
           <div style={{
             background: 'var(--background-800)',
-            borderRadius: 14,
+            borderRadius: 'var(--radius)',
             overflow: 'hidden',
           }}>
             <SettingsRow label="FFmpeg">
@@ -329,7 +329,7 @@ export default function Settings() {
           }}>录制设置</div>
           <div style={{
             background: 'var(--background-800)',
-            borderRadius: 14,
+            borderRadius: 'var(--radius)',
             overflow: 'hidden',
           }}>
             <SettingsRow label="默认画质">
@@ -373,25 +373,23 @@ export default function Settings() {
               </div>
             </SettingsRow>
             <SettingsRow label="OCR 加速">
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-end', maxWidth: 360 }}>
-                <select
-                  value={settings.ocr_accel || 'dml'}
-                  onChange={(e) => {
-                    const v = e.target.value as 'auto' | 'dml' | 'cuda' | 'cpu'
-                    handleRecordChange('ocr_accel', v)
-                    send('save_settings', { ...settings, ocr_accel: v, appSettings })
-                    message.success('OCR 加速已保存（下次识别生效）', 2)
-                  }}
-                  className="settings-select"
-                >
-                  <option value="dml">DirectML（Windows GPU，推荐）</option>
-                  <option value="auto">自动</option>
-                  <option value="cuda">CUDA（NVIDIA）</option>
-                  <option value="cpu">仅 CPU</option>
-                </select>
-                <div style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.5, textAlign: 'right' }}>
-                  持续分析 OCR 推理加速；自动会探测并选最快后端，弱核显可能回退 CPU。
-                </div>
+              <select
+                value={settings.ocr_accel || 'dml'}
+                onChange={(e) => {
+                  const v = e.target.value as 'auto' | 'dml' | 'cuda' | 'cpu'
+                  handleRecordChange('ocr_accel', v)
+                  send('save_settings', { ...settings, ocr_accel: v, appSettings })
+                  message.success('OCR 加速已保存（下次识别生效）', 2)
+                }}
+                className="settings-select"
+              >
+                <option value="dml">DirectML（Windows GPU，推荐）</option>
+                <option value="auto">自动</option>
+                <option value="cuda">CUDA（NVIDIA）</option>
+                <option value="cpu">仅 CPU</option>
+              </select>
+              <div style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.5, textAlign: 'right', maxWidth: 280 }}>
+                持续分析 OCR 推理加速；自动会探测并选最快后端，弱核显可能回退 CPU。
               </div>
             </SettingsRow>
             <SettingsRow label="默认编码器">
@@ -513,12 +511,12 @@ export default function Settings() {
               </select>
             </SettingsRow>
             <SettingsRow label="存储路径">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', maxWidth: 320 }}>
                 <span style={{
                   background: 'var(--background-700)',
                   color: 'var(--text-300)',
                   border: '1px solid var(--border-default)',
-                  borderRadius: 10,
+                  borderRadius: 'var(--radius-sm)',
                   padding: '6px 12px',
                   fontSize: 12,
                   fontFamily: 'var(--font-mono)',
@@ -582,7 +580,7 @@ export default function Settings() {
           }}>快捷键</div>
           <div style={{
             background: 'var(--background-800)',
-            borderRadius: 14,
+            borderRadius: 'var(--radius)',
             overflow: 'hidden',
           }}>
             <SettingsRow label="页面：工作台">
@@ -609,7 +607,7 @@ export default function Settings() {
             <SettingsRow label="静音/取消静音">
               <KeyBadge keys={['M']} />
             </SettingsRow>
-            <SettingsRow label="全屏预览">
+            <SettingsRow label="放大预览">
               <KeyBadge keys={['F']} />
             </SettingsRow>
             <SettingsRow label="批量开始录制">
@@ -640,7 +638,7 @@ export default function Settings() {
           }}>抖音 Cookie</div>
           <div style={{
             background: 'var(--background-800)',
-            borderRadius: 14,
+            borderRadius: 'var(--radius)',
             overflow: 'hidden',
             padding: 16,
           }}>
@@ -684,7 +682,7 @@ export default function Settings() {
           }}>关于</div>
           <div style={{
             background: 'var(--background-800)',
-            borderRadius: 14,
+            borderRadius: 'var(--radius)',
             overflow: 'hidden',
           }}>
             <SettingsRow label="版本">
@@ -756,7 +754,7 @@ export default function Settings() {
           }}>日志</div>
           <div style={{
             background: 'var(--background-800)',
-            borderRadius: 14,
+            borderRadius: 'var(--radius)',
             padding: 16,
           }}>
             <LogViewer />
@@ -771,13 +769,16 @@ export default function Settings() {
           background: var(--background-700);
           color: var(--text-50);
           border: 1px solid var(--border-default);
-          border-radius: 10px;
+          border-radius: var(--radius-sm);
           padding: 6px 32px 6px 12px;
           font-size: 13px;
           font-family: inherit;
           cursor: pointer;
           outline: none;
-          min-width: 140px;
+          box-sizing: border-box;
+          min-width: 0;
+          max-width: 280px;
+          width: 100%;
           background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
           background-repeat: no-repeat;
           background-position: right 10px center;
@@ -887,10 +888,27 @@ function SettingsRow({ label, children }: { label: string; children: React.React
       flexWrap: 'wrap',
       gap: 8,
     }}>
-      <span style={{ fontSize: 13, fontWeight: 400, color: 'var(--text-50)', whiteSpace: 'nowrap' }}>
+      <span style={{
+        fontSize: 13,
+        fontWeight: 400,
+        color: 'var(--text-50)',
+        whiteSpace: 'nowrap',
+        flexShrink: 0,
+        marginRight: 8,
+      }}>
         {label}
       </span>
-      {children}
+      <div style={{
+        flex: '1 1 auto',
+        minWidth: 0,
+        maxWidth: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'flex-end',
+        gap: 4,
+      }}>
+        {children}
+      </div>
     </div>
   )
 }
@@ -946,7 +964,7 @@ function KeyBadge({ keys }: { keys: string[] }) {
       gap: 4,
       background: 'var(--background-700)',
       border: '1px solid var(--border-default)',
-      borderRadius: 6,
+      borderRadius: 'var(--radius-xs)',
       padding: '3px 10px',
       fontFamily: 'var(--font-mono)',
       fontSize: 12,

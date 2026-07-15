@@ -14,6 +14,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from lsc.analyzer.ocr_detector import _BUY_PHASE_PATTERNS
 
 
+def test_ocr_detector_module_imports_with_threading_lock() -> None:
+    """回归：_ocr_lock 依赖 threading；缺 import 会导致 OCR 全线回退纯音频。"""
+    import threading
+
+    from lsc.analyzer import ocr_detector as od
+
+    assert isinstance(od._ocr_lock, type(threading.Lock()))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # _BUY_PHASE_PATTERNS 常量测试
 # ──────────────────────────────────────────────────────────────────────

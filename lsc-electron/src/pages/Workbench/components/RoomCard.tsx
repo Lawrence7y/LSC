@@ -56,12 +56,8 @@ interface RoomCardProps {
   onToggleMultiSelect?: (roomId: string, e: React.MouseEvent) => void
   /** 当前区域放大的 roomId */
   expandedRoomId?: string | null
-  /** 当前全屏的 roomId */
-  fullscreenRoomId?: string | null
   /** 退出区域放大 */
   onCollapse?: (roomId: string) => void
-  /** 退出全屏后回到区域放大 */
-  onExitFullscreen?: (roomId: string) => void
 }
 
 /**
@@ -131,18 +127,13 @@ export const RoomCard = memo(function RoomCard({
   onFullscreen,
   onToggleMultiSelect,
   expandedRoomId,
-  fullscreenRoomId,
   onCollapse,
-  onExitFullscreen,
 }: RoomCardProps) {
   const [tick, setTick] = useState(0)
   const [disconnecting, setDisconnecting] = useState(false)
   const [localMuted, setLocalMuted] = useState(room.preview_muted)
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // 放大状态：区域放大 / 真全屏
   const isExpanded = expandedRoomId === room.room_id
-  const isFullscreen = fullscreenRoomId === room.room_id
-  const isAnyExpanded = isExpanded || isFullscreen
 
   useEffect(() => {
     if (!room.is_recording) return
@@ -380,9 +371,9 @@ export const RoomCard = memo(function RoomCard({
       <div
         style={{
           width: '100%',
-          height: isAnyExpanded ? 'auto' : 180,
-          aspectRatio: isAnyExpanded ? '16 / 9' : undefined,
-          minHeight: isAnyExpanded ? 420 : undefined,
+          height: isExpanded ? 'auto' : 180,
+          aspectRatio: isExpanded ? '16 / 9' : undefined,
+          minHeight: isExpanded ? 420 : undefined,
           background: '#0a0a0a',
           borderRadius: 8,
           marginBottom: 8,
@@ -434,41 +425,30 @@ export const RoomCard = memo(function RoomCard({
           </div>
         ) : room.preview_enabled ? (
           <>
-            {/* VideoPreview 实例始终保持挂载，区域放大时铺满卡片，
-                全屏时通过 CSS position:fixed 覆盖视口，不销毁/重建 MsePlayer */}
+            {/* VideoPreview 实例始终保持挂载，区域放大时铺满卡片，不销毁/重建 MsePlayer */}
             <div style={{ position: 'relative', width: '100%', height: '100%' }}>
               <VideoPreview
                 key={`preview-${room.room_id}`}
                 roomId={room.room_id}
                 active={true}
                 send={send}
-                controls={isExpanded || isFullscreen}
+                controls={isExpanded}
                 style={
-                  isFullscreen
+                  isExpanded
                     ? {
-                        position: 'fixed',
+                        position: 'absolute',
                         inset: 0,
-                        zIndex: 9999,
-                        width: '100vw',
-                        height: '100vh',
+                        zIndex: 8,
+                        width: '100%',
+                        height: '100%',
                         background: '#000',
-                        borderRadius: 0,
                       }
-                    : isExpanded
-                      ? {
-                          position: 'absolute',
-                          inset: 0,
-                          zIndex: 8,
-                          width: '100%',
-                          height: '100%',
-                          background: '#000',
-                        }
-                      : { width: '100%', height: '100%' }
+                    : { width: '100%', height: '100%' }
                 }
                 muted={localMuted}
               />
               {/* 放大时的退出按钮 */}
-              {(isExpanded || isFullscreen) && (
+              {isExpanded && (
                 <Button
                   icon={<CloseOutlined />}
                   size="small"
@@ -486,18 +466,14 @@ export const RoomCard = memo(function RoomCard({
                   }}
                   onClick={(e) => {
                     e.stopPropagation()
-                    if (isFullscreen) {
-                      onExitFullscreen?.(room.room_id)
-                      return
-                    }
                     onCollapse?.(room.room_id)
                   }}
                 >
-                  {isFullscreen ? '退出全屏' : '缩小'}
+                  缩小
                 </Button>
               )}
             </div>
-                        {/* 底部渐变栏：预览控制 */}
+            {/* 底部渐变栏：预览控制（放大时须高于 VideoPreview zIndex:8） */}
             <div
               style={{
                 position: 'absolute',
@@ -509,7 +485,7 @@ export const RoomCard = memo(function RoomCard({
                 justifyContent: 'space-between',
                 padding: '6px 8px',
                 background: 'linear-gradient(transparent, rgba(0,0,0,0.7))',
-                zIndex: 3,
+                zIndex: isExpanded ? 9 : 3,
               }}
             >
               {/* 预览画质选择 */}
@@ -536,7 +512,7 @@ export const RoomCard = memo(function RoomCard({
                     type="text"
                     size="small"
                     icon={localMuted ? <MutedOutlined /> : <SoundOutlined />}
-                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 6 }}
+                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 'var(--radius-md)' }}
                     onClick={(e) => {
                       e.stopPropagation()
                       // 本地图标即时翻转；store/后端由 onToggleMute 乐观更新
@@ -545,12 +521,12 @@ export const RoomCard = memo(function RoomCard({
                     }}
                   />
                 </Tooltip>
-                <Tooltip title={isFullscreen ? '退出全屏' : '放大'}>
+                <Tooltip title={isExpanded ? '缩小' : '放大'}>
                   <Button
                     type="text"
                     size="small"
                     icon={<FullscreenOutlined />}
-                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 6 }}
+                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 'var(--radius-md)' }}
                     onClick={(e) => {
                       e.stopPropagation()
                       onFullscreen(room.room_id)
@@ -562,7 +538,7 @@ export const RoomCard = memo(function RoomCard({
                     type="text"
                     size="small"
                     icon={<StopOutlined />}
-                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 6 }}
+                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 'var(--radius-md)' }}
                     onClick={(e) => {
                       e.stopPropagation()
                       onTogglePreview(room.room_id, false)

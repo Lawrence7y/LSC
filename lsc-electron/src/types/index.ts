@@ -317,8 +317,8 @@ export interface ContinuousAnalysisStatus {
   effective_interval?: number
   progress?: number
   error?: string
-  // 无畏契约相位调度字段
-  valorant_profile?: 'pov' | 'broadcast'
+  // 无畏契约相位调度字段（valorant_profile 为遗留字段，pov/broadcast/valorant 均表示统一档）
+  valorant_profile?: 'pov' | 'broadcast' | 'valorant' | string
   round_phase?: 'unknown' | 'buy' | 'pre_combat' | 'combat' | 'post_combat' | 'intermission'
   round_phase_detail?: string
   pending_round?: boolean

@@ -306,11 +306,11 @@ def test_workbench_continuous_analysis_uses_explicit_game_modes() -> None:
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
 
     assert "type AnalysisMode = 'valorant_round' | 'generic'" in source
-    assert "useState<AnalysisMode>('generic')" in source
+    assert "useState<AnalysisMode>('valorant_round')" in source
     assert "const isValorantRoundCutting = analysisGameType === 'valorant_round'" in source
     assert "mode: isValorantRoundCutting ? 'valorant_round' : 'scene'" in source
     assert "game: isValorantRoundCutting ? 'valorant' : 'generic'" in source
-    assert '<Radio.Button value="valorant_round">无畏契约回合切割</Radio.Button>' in source
+    assert '<Radio.Button value="valorant_round">无畏契约</Radio.Button>' in source
     assert '<Radio.Button value="generic">通用直播</Radio.Button>' in source
     assert "setAnalysisGameType('valorant')" not in source
     # 无畏契约持续分析：无预览 45s / 有预览 60s，禁止再写死 20s
@@ -353,7 +353,12 @@ def test_analysis_progress_renders_recorded_duration_round_counts_and_export_sum
     assert "confirmed_rounds" in source
     assert "pending_rounds" in source
     assert "analysis_stage" in source
-    assert "export_status" in source
+    # 导出摘要走 exportSummary prop（排队/导出中/完成/失败），不再读 clip.export_status
+    assert "exportSummary" in source
+    assert "summary.queued" in source
+    assert "summary.exporting" in source
+    assert "summary.completed" in source
+    assert "summary.failed" in source
 
 
 def test_workbench_updates_clip_export_status_for_queue_progress_completion_and_failure() -> None:
@@ -378,17 +383,120 @@ def test_clip_list_blocks_duplicate_export_and_allows_failed_retry() -> None:
     assert "Checkbox" in source
 
 
+def test_clip_list_batch_export_includes_pending_confirmable_clips() -> None:
+    """AI pending 切片应能通过「导出全部/所选」走确认并导出，禁止静默无响应。"""
+    clip_list = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+
+    # 批量按钮按「可导出或可确认导出」启用，而非仅 canExportClip
+    assert "canExportOrConfirmExport" in clip_list
+    assert "导出所选" in clip_list
+    # 导出所选禁用应对齐「无可用条目」，避免选中 pending 后点击无效果
+    assert "selectedActionable" in clip_list or "selectedClips.filter(canExportOrConfirmExport)" in clip_list
+    assert "disabled={selectedActionable.length === 0}" in clip_list or (
+        "selectedClips.filter(canExportOrConfirmExport)" in clip_list
+        and "disabled={" in clip_list
+    )
+    # Workbench 批量导出对 pending 先确认再导出，空列表有提示
+    export_many = workbench.split("const handleExportMany", 1)[1].split("const handleOpenExportFile", 1)[0]
+    assert "handleConfirmClip" in export_many
+    assert "没有可导出的切片" in export_many
+    # 批量确认不得串用非精修条的房间 mark
+    confirm_body = workbench.split("const handleConfirmClip", 1)[1].split("const handleConfirmAndExport", 1)[0]
+    assert "isThisRefining" in confirm_body
+    assert "boundsOnly" in confirm_body
+    assert "c.room_id !== clip.room_id" in confirm_body or "c.room_id === clip.room_id" in confirm_body
+
+
+def test_confirm_clip_optimistic_update_scoped_to_room() -> None:
+    """确认时不得把其它房间同 round_key 切片改成同一 start/end。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    confirm_body = src.split("const handleConfirmClip", 1)[1].split("const handleConfirmAndExport", 1)[0]
+    update_block = confirm_body.split("store.setClips", 1)[1].split("return confirmed", 1)[0]
+    assert "c.room_id !== clip.room_id" in update_block or "c.room_id === clip.room_id" in update_block
+    unscoped = "(clipKey && (c.round_key === clipKey || c.clip_id === clipKey))"
+    # 若仍出现 round_key 匹配，必须先被 room_id 守卫拦住
+    if unscoped in update_block:
+        assert "c.room_id !== clip.room_id" in update_block.split(unscoped, 1)[0]
+
+
+def test_batch_export_confirms_each_clip_with_own_bounds() -> None:
+    """批量导出确认须用各条自身 start/end，且 target_room_ids 为空避免串改。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    export_many = src.split("const handleExportMany", 1)[1].split("const handleOpenExportFile", 1)[0]
+    assert "target_room_ids: []" in export_many or "syncTargets: false" in export_many
+    assert "clip.start" in export_many
+    assert "clip.end" in export_many
+
+
+def test_confirm_clip_sync_targets_scoped_to_analysis_set() -> None:
+    """单条确认不得同步到「所有已连接房间」，须收敛到本次分析目标或同对齐组。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    confirm_body = src.split("const handleConfirmClip", 1)[1].split("const handleConfirmAndExport", 1)[0]
+    assert "continuousTargetRoomIds" in confirm_body
+    assert "align_group_id" in confirm_body
+    assert "r.is_connected" not in confirm_body or "continuousTargetRoomIds" in confirm_body
+    # 禁止仅用 is_connected 过滤全量房间作为默认同步目标
+    assert "filter(r => r.room_id !== clip.room_id && r.is_connected)" not in confirm_body
+
+
+def test_continuous_analysis_copy_matches_list_only_behavior() -> None:
+    """文案不得承诺「自动导出」；须提示入列待确认。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "开始分析与导出" not in src
+    assert "单次分析并导出所有选中房间" not in src
+    assert "快速回合检测" not in src
+    assert "入列" in src
+    assert "待确认" in src or "确认后" in src
+
+
+def test_stop_continuous_analysis_confirms_during_finalize() -> None:
+    """收尾中停止须二次确认，避免打断 OCR 升格。"""
+    src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "Modal.confirm" in src or "window.confirm" in src
+    stop_region = src.split("停止持续分析", 1)[1].split("分析导出", 1)[0] if "停止持续分析" in src else src
+    assert "finalizing" in src or "收尾" in stop_region or "收尾" in src
+    assert "stop_continuous_analysis" in src
+
+
+def test_analysis_progress_compact_shows_room_and_wraps() -> None:
+    """compact 进度条须展示主房并允许换行，避免窄窗挤爆。"""
+    src = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
+    compact = src.split("if (compact)", 1)[1].split("return (", 2)[1].split(")\n  }", 1)[0]
+    assert "flexWrap" in compact or "flex-wrap" in compact
+    assert "room_id" in compact or "主房" in compact or "roomName" in compact
+
+
 def test_analysis_progress_receives_real_export_summary_counts() -> None:
     progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
 
     assert "exportSummary" in progress
     assert "ExportSummary" in progress
+    assert "pendingConfirm" in progress
+    assert "listed" in progress
     assert "queued" in progress and "exporting" in progress and "completed" in progress and "failed" in progress
     assert "useMemo" in workbench
     assert "exportSummary" in workbench
+    assert "pendingConfirm" in workbench
     assert "queued" in workbench and "exporting" in workbench and "completed" in workbench and "failed" in workbench
+    # 待确认不得计入导出入队
+    assert "status === 'pending') summary.queued" not in workbench.replace(" ", "")
+    assert "export_status === 'pending'" in workbench
+    # 收尾完成须保留上一轮确认计数，不得整表重置
+    complete = workbench.split("on('continuous_analysis_complete'", 1)[1].split("unsubs.push", 1)[0]
+    assert "...previous" in complete or "{ ...previous" in complete
+    assert "confirmed_rounds" in complete
 
+
+def test_analysis_progress_labels_listed_not_raw_highlights() -> None:
+    """状态栏应以入列/待调为主，避免「9 高光 vs 6 切片」误导。"""
+    progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
+    assert "入列" in progress
+    assert "待调" in progress
+    assert "OCR可导" in progress
+    assert "分析完成·待确认" in progress
+    assert "不含待确认" in progress or "另有待调" in progress
 
 def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording() -> None:
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
@@ -652,11 +760,19 @@ def test_preview_phase_broadcast_and_ui() -> None:
     assert "getRoomBufferedRange" in dvr_block
 
 
-def test_frontend_sends_valorant_profile() -> None:
-    """持续分析启动 payload 包含 valorant_profile，UI 提供游戏视角/赛事解说选择。"""
+def test_frontend_no_longer_offers_valorant_perspective() -> None:
+    """分析入口已合并视角：不再提供游戏视角/赛事解说选择，也不再发送 valorant_profile。"""
     wb = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    assert "valorant_profile" in wb
-    assert "游戏视角" in wb
+    assert "游戏视角" not in wb or "自动适配游戏视角与赛事解说" in wb
+    assert 'Radio.Button value="pov"' not in wb
+    assert 'Radio.Button value="broadcast"' not in wb
+    # 启动 payload 不再带 valorant_profile
+    start_block = wb.split("send('start_continuous_analysis'", 1)[1].split("})", 1)[0]
+    assert "valorant_profile" not in start_block
+    # 进度条不再展示视角分流
+    progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
+    assert "PROFILE_LABEL" not in progress
+    assert "视角：" not in progress
 
 
 def test_mse_error_does_not_unconditionally_stop_recording() -> None:

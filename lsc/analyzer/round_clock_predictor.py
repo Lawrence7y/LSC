@@ -87,17 +87,29 @@ def predict_round_clock(
         )
 
     if phase == RoundPhase.COMBAT:
-        # 预测终点只作提示，不强制切相位、不因此开 OCR
-        soft_end = None
-        if combat_start_sec is not None:
-            soft_end = float(combat_start_sec) + 80.0  # 典型交战提示，非硬切
+        # 经验分布：典型交战 ~80s，硬上限 max_combat_force_post_sec。
+        # 进入「预计收尾窗」时打开 dense，供调度加密 OCR 锁 round_end（非入列门）。
+        combat_start = float(combat_start_sec) if combat_start_sec is not None else anchor
+        typical = float(getattr(cfg, "typical_combat_sec", 80.0) or 80.0)
+        soft_end = combat_start + typical
+        force_wake = combat_start + float(cfg.max_combat_force_post_sec) - float(
+            cfg.buy_wake_early_sec
+        )
+        wake_at = max(0.0, soft_end - float(cfg.buy_wake_early_sec))
+        # 已观测钟声/终点提示：立即视为收尾窗
+        if combat_end_hint_sec is not None or bool(signals.get("chime")):
+            in_dense = True
+            detail = "combat_end_hint"
+        else:
+            in_dense = now >= min(wake_at, force_wake)
+            detail = "combat_post_window" if in_dense else "combat_soft_end"
         return RoundClockPrediction(
-            predicted_wake_at=soft_end,
-            predicted_phase=RoundPhase.POST_COMBAT,
-            in_dense_window=False,
+            predicted_wake_at=wake_at,
+            predicted_phase=RoundPhase.POST_COMBAT if in_dense else RoundPhase.COMBAT,
+            in_dense_window=in_dense,
             buy_expected_end=None,
             post_expected_at=soft_end,
-            detail="combat_soft_end",
+            detail=detail,
         )
 
     if phase == RoundPhase.POST_COMBAT:

@@ -43,7 +43,7 @@ function getRoomBufferedRange(roomId: string): { start: number; end: number } | 
 function resolveDvrSourceRoomId(
   referenceRoomId: string | null,
   selectedRoomId: string | null,
-  selectedRoomIds: string[],
+  selectedRoomIds: Iterable<string>,
   rooms: { room_id: string; preview_enabled?: boolean; preview_phase?: string; preview_mode?: string }[],
 ): string | null {
   const candidates = [
@@ -95,12 +95,13 @@ type CaptureFailure = {
 }
 
 function canExportForShortcut(c: ClipSegment): boolean {
+  if (c.export_status === 'queued' || c.export_status === 'exporting') return false
   const confirmed = !c.confirm_status ||
     c.confirm_status === 'user_confirmed' ||
     c.confirm_status === 'ocr_confirmed'
-  if (!confirmed) return false
-  if (c.export_status === 'queued' || c.export_status === 'exporting') return false
-  return true
+  if (confirmed) return true
+  // pending / refining：快捷键走批量「确认并导出」路径
+  return c.confirm_status === 'pending' || c.confirm_status === 'refining'
 }
 
 function isApproximateClip(c: ClipSegment): boolean {
@@ -215,9 +216,8 @@ export default function Workbench() {
   const [continuousAnalyzing, setContinuousAnalyzing] = useState(false)
   const [continuousRoomId, setContinuousRoomId] = useState<string | null>(null)
   const [continuousTargetRoomIds, setContinuousTargetRoomIds] = useState<string[]>([])
-  const [analysisGameType, setAnalysisGameType] = useState<AnalysisMode>('generic')
+  const [analysisGameType, setAnalysisGameType] = useState<AnalysisMode>('valorant_round')
   const isValorantRoundCutting = analysisGameType === 'valorant_round'
-    const [valorantProfile, setValorantProfile] = useState<'pov' | 'broadcast'>('pov')
   const continuousActiveRoomRef = useRef<string | null>(null)
   // 同步导出模式标记（response 监听器据此预创建 clips 关联 job_id）
   const isSyncExportModeRef = useRef(false)
@@ -240,8 +240,7 @@ export default function Workbench() {
   const loopRafRef = useRef<number | null>(null)
   const loopBoundsRef = useRef<{ in: number; out: number; common: boolean } | null>(null)
   // 长按刷新：由 RefreshButton 组件内部管理粒子动效
-  const [fullscreenRoomId, setFullscreenRoomId] = useState<string | null>(null)
-  // 两级放大：第一级为“区域放大”（填满左侧面板），第二级为“全屏”（fixed 覆盖视口）
+  // 区域放大：填满左侧房间网格区域
   const [expandedRoomId, setExpandedRoomId] = useState<string | null>(null)
   const [selectedRoomIds, setSelectedRoomIds] = useState<Set<string>>(new Set())
   const [clipSelectedIndices, setClipSelectedIndices] = useState<Set<number>>(new Set())
@@ -545,21 +544,17 @@ export default function Workbench() {
 
   // Escape 键退出放大（capture 阶段拦截，避免触发其他快捷键如 mark_in/out）
   useEffect(() => {
-    if (expandedRoomId === null && fullscreenRoomId === null) return
+    if (expandedRoomId === null) return
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
         e.stopPropagation()
-        if (fullscreenRoomId !== null) {
-          setFullscreenRoomId(null)
-        } else {
-          setExpandedRoomId(null)
-        }
+        setExpandedRoomId(null)
       }
     }
     window.addEventListener('keydown', handleKeyDown, true)
     return () => window.removeEventListener('keydown', handleKeyDown, true)
-  }, [expandedRoomId, fullscreenRoomId])
+  }, [expandedRoomId])
 
   // 程序切到后台后再切回前台时，恢复所有 MSE player 的播放
   useEffect(() => {
@@ -631,7 +626,7 @@ export default function Workbench() {
         setContinuousAnalyzing(false)
         setContinuousRoomId(null)
         continuousActiveRoomRef.current = null
-        setContinuousTargetRoomIds([])
+        // 保留 continuousTargetRoomIds：停析后用户仍可能确认切片，须按原目标集同步
       }
     }
     unsubs.push(on('continuous_analysis_status', applyContinuousStatus))
@@ -990,47 +985,20 @@ export default function Workbench() {
     send('enable_preview', { room_id: roomId, enabled, mode: 'mse' })
   }, [send, rooms])
 
-  // 放大预览（两级：第一次进入左侧区域放大，第二次进入真正全屏）
+  // 放大预览：切换左侧区域放大
   const handleFullscreen = useCallback((roomId: string) => {
-    if (fullscreenRoomId === roomId) {
-      setFullscreenRoomId(null)
-      setExpandedRoomId(roomId)
-      return
-    }
-    if (expandedRoomId === roomId) {
-      setFullscreenRoomId(roomId)
-      return
-    }
-    setExpandedRoomId(roomId)
-    setFullscreenRoomId(null)
-  }, [expandedRoomId, fullscreenRoomId])
+    setExpandedRoomId(prev => (prev === roomId ? null : roomId))
+  }, [])
 
   const handleCollapse = useCallback((roomId: string) => {
-    if (fullscreenRoomId === roomId) {
-      setFullscreenRoomId(null)
-      return
-    }
     if (expandedRoomId === roomId) {
       setExpandedRoomId(null)
     }
-  }, [expandedRoomId, fullscreenRoomId])
-
-  const handleExitFullscreen = useCallback((roomId: string) => {
-    if (fullscreenRoomId === roomId) {
-      setFullscreenRoomId(null)
-      setExpandedRoomId(roomId)
-    }
-  }, [fullscreenRoomId])
+  }, [expandedRoomId])
 
   // 删除房间
   const handleRemove = useCallback((roomId: string) => {
     console.log('[Workbench] 用户操作: 删除房间, roomId:', roomId);
-    // 项目记忆硬约束：“Fullscreen preview must be exited before deleting a
-    // room to avoid crashes”。若该房间正处于全屏预览，先退出全屏再删除，
-    // 避免 VideoPreview 组件实例继续渲染已删除房间的 MSE streamer 导致崩溃。
-    if (fullscreenRoomId === roomId) {
-      setFullscreenRoomId(null)
-    }
     if (expandedRoomId === roomId) {
       setExpandedRoomId(null)
     }
@@ -1041,7 +1009,7 @@ export default function Workbench() {
       next.delete(roomId)
       return next
     })
-  }, [send, fullscreenRoomId, expandedRoomId])
+  }, [send, expandedRoomId])
 
   // 选择房间（支持 Ctrl/Shift 多选）
   const handleSelect = useCallback((roomId: string, e: React.MouseEvent) => {
@@ -2084,12 +2052,21 @@ export default function Workbench() {
     applySelectClip(clip, clipKey, oldRefiningClip)
   }
 
-  const handleConfirmClip = (clip: ClipSegment, _index: number): ClipSegment | null => {
+  const handleConfirmClip = (
+    clip: ClipSegment,
+    _index: number,
+    opts?: { syncTargets?: boolean; boundsOnly?: boolean },
+  ): ClipSegment | null => {
     const clipKey = clip.round_key || clip.clip_id || ''
     const store = useAppStore.getState()
     const room = store.rooms.find(r => r.room_id === clip.room_id)
     const ctx = store.timelineContext
     const status = getAlignStatus(ctx, store.timelineInvalidated)
+    const syncTargets = opts?.syncTargets !== false
+    const boundsOnly = opts?.boundsOnly === true
+    // 仅当前精修条才读时间线 mark；批量确认 pending 必须用该条自身边界，避免串用残留 mark
+    const isThisRefining = !boundsOnly && refiningClipId != null &&
+      (clip.round_key === refiningClipId || clip.clip_id === refiningClipId)
 
     const rid = clip.room_id
     const toRecording = (pv: number): number => {
@@ -2100,20 +2077,20 @@ export default function Workbench() {
 
     let start = clip.start
     let end = clip.end
-    if (status === 'ready' && ctx && rid && commonMarkIn != null && commonMarkOut != null && commonMarkIn < commonMarkOut) {
+    if (isThisRefining && status === 'ready' && ctx && rid && commonMarkIn != null && commonMarkOut != null && commonMarkIn < commonMarkOut) {
       try {
         start = commonToRecording(ctx, rid, commonMarkIn)
         end = commonToRecording(ctx, rid, commonMarkOut)
       } catch {
         /* fall through to room marks */
       }
-    } else if (room?.mark_in != null && room?.mark_out != null && room.mark_in < room.mark_out) {
+    } else if (isThisRefining && room?.mark_in != null && room?.mark_out != null && room.mark_in < room.mark_out) {
       try {
         start = toRecording(room.mark_in)
         end = toRecording(room.mark_out)
       } catch { /* keep clip.start/end */ }
     }
-    if (localDragMark) {
+    if (isThisRefining && localDragMark) {
       try {
         if (status === 'ready' && ctx && rid) {
           if (localDragMark.type === 'in') start = commonToRecording(ctx, rid, localDragMark.time)
@@ -2129,9 +2106,27 @@ export default function Workbench() {
       return null
     }
 
-    const targetRoomIds = store.rooms
-      .filter(r => r.room_id !== clip.room_id && r.is_connected)
-      .map(r => r.room_id)
+    const targetRoomIds = syncTargets
+      ? (() => {
+          // 优先本次持续/同步分析冻结的目标集；否则同对齐组；禁止全量已连接房
+          const analysisTargets = continuousTargetRoomIds.filter(
+            (id) => id && id !== clip.room_id,
+          )
+          if (analysisTargets.length > 0) return analysisTargets
+          const clipRoom = store.rooms.find((r) => r.room_id === clip.room_id)
+          const groupId = clipRoom?.align_group_id || ''
+          if (groupId) {
+            return store.rooms
+              .filter(
+                (r) =>
+                  r.room_id !== clip.room_id &&
+                  r.align_group_id === groupId,
+              )
+              .map((r) => r.room_id)
+          }
+          return []
+        })()
+      : []
     send('confirm_highlight_clip', {
       room_id: clip.room_id,
       round_key: clipKey,
@@ -2139,8 +2134,10 @@ export default function Workbench() {
       end,
       target_room_ids: targetRoomIds,
     })
-    setRefiningClipId(null)
-    setLocalDragMark(null)
+    if (isThisRefining) {
+      setRefiningClipId(null)
+      setLocalDragMark(null)
+    }
 
     const confirmed: ClipSegment = {
       ...clip,
@@ -2148,11 +2145,13 @@ export default function Workbench() {
       end,
       confirm_status: 'user_confirmed',
     }
+    // 乐观更新必须限定同 room_id：同 round_key 的其它房间由后端映射后再广播
     store.setClips(store.clips.map(c => {
+      if (c.room_id !== clip.room_id) return c
       const same =
         (clipKey && (c.round_key === clipKey || c.clip_id === clipKey)) ||
         (c.clip_id && c.clip_id === clip.clip_id) ||
-        (c.room_id === clip.room_id && c.start === clip.start && c.end === clip.end)
+        (c.start === clip.start && c.end === clip.end)
       return same ? { ...c, start, end, confirm_status: 'user_confirmed' as const } : c
     }))
     return confirmed
@@ -2166,16 +2165,35 @@ export default function Workbench() {
   }
 
   const handleExportMany = (targets: ClipSegment[]) => {
-    if (targets.length === 0) return
-    if (targets.length === 1) {
-      handleExportClip(targets[0])
+    if (targets.length === 0) {
+      message.warning('没有可导出的切片。AI 回合请先确认，或使用单条「确认并导出」')
       return
     }
-    const hasApproximate = targets.some(isApproximateClip)
+    // pending / refining：批量入口用各条自身边界确认，禁止串用 mark / 跨房改写
+    const prepared: ClipSegment[] = []
+    targets.forEach((clip, i) => {
+      const needsConfirm =
+        clip.confirm_status === 'pending' || clip.confirm_status === 'refining'
+      if (needsConfirm) {
+        const confirmed = handleConfirmClip(clip, i, { syncTargets: false, boundsOnly: true })
+        if (confirmed) prepared.push(confirmed)
+      } else {
+        prepared.push(clip)
+      }
+    })
+    if (prepared.length === 0) {
+      message.warning('没有可导出的切片（确认失败或入出点无效）')
+      return
+    }
+    if (prepared.length === 1) {
+      handleExportClip(prepared[0])
+      return
+    }
+    const hasApproximate = prepared.some(isApproximateClip)
     const store = useAppStore.getState()
     let queued = 0
     let skipped = 0
-    targets.forEach((clip, i) => {
+    prepared.forEach((clip, i) => {
       const room = store.rooms.find(r => r.room_id === clip.room_id)
       if (!room?.record_output_path) { skipped++; return }
       const jobId = `export-${Date.now()}-${i}`
@@ -2482,7 +2500,6 @@ export default function Workbench() {
         preview_enabled: mainRoomPreviewEnabled,
         threshold: 0.3,
         game: isValorantRoundCutting ? 'valorant' : 'generic',
-        valorant_profile: isValorantRoundCutting ? valorantProfile : undefined,
       })
       setContinuousModalOpen(false)
       message.info('持续分析启动请求已发送')
@@ -2525,7 +2542,7 @@ export default function Workbench() {
       syncTargetRoomIdsRef.current = []
       if (data?.success && data?.highlights) {
         // 与持续分析一致：切片通过 clip_queued 事件入列（confirm_status=pending），不自动导出
-        message.success(`已分析 ${data.highlights.length} 个高光（${data.submitted_count} 个已入列待确认）`)
+        message.success(`已分析 ${data.highlights.length} 个高光（${data.submitted_count} 个已入列待确认，确认后再导出）`)
       } else {
         message.error(data?.error || '同步分析失败')
       }
@@ -2550,11 +2567,16 @@ export default function Workbench() {
           phase: 'running',
           updated_at: Date.now(),
         })
-        message.success('持续分析已启动（快速回合检测），边录边分析新内容')
+        message.success(
+          data.mode === 'valorant_round'
+            ? '持续分析已启动（无畏契约回合），切片将入列待确认'
+            : '持续分析已启动（通用场景），切片将入列待确认',
+        )
       } else {
         setContinuousAnalyzing(false)
         setContinuousRoomId(null)
         continuousActiveRoomRef.current = null
+        // 保留目标房，便于停析后确认切片仍同步到原分析集
         setContinuousAnalysisStatus({
           running: false,
           room_id: null,
@@ -2577,15 +2599,20 @@ export default function Workbench() {
     }))
     // 录制结束后持续分析收尾完成通知
     unsubs.push(on('continuous_analysis_complete', (data: any) => {
-      message.success(`录制结束分析完成：共 ${data?.total_highlights || 0} 个回合`)
+      message.success(`录制结束分析完成：共 ${data?.total_highlights || 0} 个回合（已入列，请确认后导出）`)
       setContinuousAnalyzing(false)
       setContinuousRoomId(null)
       continuousActiveRoomRef.current = null
+      const previous = useAppStore.getState().continuousAnalysisStatus
       setContinuousAnalysisStatus({
+        ...previous,
         running: false,
-        room_id: data?.room_id ?? null,
-        total_highlights: data?.total_highlights ?? 0,
+        room_id: data?.room_id ?? previous?.room_id ?? null,
+        total_highlights: data?.total_highlights ?? previous?.total_highlights ?? 0,
+        confirmed_rounds: previous?.confirmed_rounds ?? 0,
+        pending_rounds: previous?.pending_rounds ?? 0,
         phase: 'completed',
+        analysis_stage: '已完成',
         updated_at: Date.now(),
       })
     }))
@@ -2880,12 +2907,28 @@ export default function Workbench() {
     return computeRecordedDurationHint(selectedRoom, continuousAnalysisStatus?.recorded_duration)
   }, [continuousAnalysisStatus?.recorded_duration, selectedRoom?.is_recording, selectedRoom?.record_started_at, timelineTick])
 
-  const exportSummary = useMemo(() => clips.reduce((summary, clip) => {
-    const status = clip.export_status ?? (clip.exported ? 'completed' : undefined)
-    if (status === 'pending') summary.queued += 1
-    else if (status === 'queued' || status === 'exporting' || status === 'completed' || status === 'failed') summary[status] += 1
+  const exportSummary = useMemo(() => {
+    const summary = {
+      pendingConfirm: 0,
+      queued: 0,
+      exporting: 0,
+      completed: 0,
+      failed: 0,
+      listed: clips.length,
+    }
+    for (const clip of clips) {
+      const needsTune = clip.confirm_status === 'pending' || clip.confirm_status === 'refining'
+      if (needsTune || clip.export_status === 'pending') {
+        summary.pendingConfirm += 1
+      }
+      const status = clip.export_status ?? (clip.exported ? 'completed' : undefined)
+      // pending = 待确认，不算导出入队
+      if (status === 'queued' || status === 'exporting' || status === 'completed' || status === 'failed') {
+        summary[status] += 1
+      }
+    }
     return summary
-  }, { queued: 0, exporting: 0, completed: 0, failed: 0 }), [clips])
+  }, [clips])
 
   // Sort rooms (memoize to prevent new array reference on every render)
   const sortedRooms = useMemo(() => [...rooms].sort((a, b) => {
@@ -3017,6 +3060,7 @@ export default function Workbench() {
           break
         case 'export:clip': {
           // 优先级：勾选可导项 → refining 条 → 第一条可导 → toast
+          // pending/refining 经 handleExportMany 自动确认后再导出
           const exportableClips = clips.filter((c, i) => {
             if (!clipSelectedIndices.has(i)) return false
             const room = rooms.find(r => r.room_id === c.room_id)
@@ -3032,7 +3076,7 @@ export default function Workbench() {
           if (refiningClip) {
             const room = rooms.find(r => r.room_id === refiningClip.room_id)
             if (room?.record_output_path) {
-              handleExportClip(refiningClip)
+              handleExportMany([refiningClip])
               break
             }
           }
@@ -3041,7 +3085,7 @@ export default function Workbench() {
             return !!room?.record_output_path && canExportForShortcut(c)
           })
           if (firstExportable) {
-            handleExportClip(firstExportable)
+            handleExportMany([firstExportable])
           } else if (clips.length > 0) {
             message.info('没有可导出的切片（缺少录制文件或未确认）')
           } else {
@@ -3200,7 +3244,21 @@ export default function Workbench() {
                 { value: 'name', label: '按名称' },
               ]}
             />
-            <Tooltip title={continuousAnalyzing ? '停止持续分析' : analysisTooltip}>
+            <Tooltip title={
+              continuousAnalyzing
+                ? (() => {
+                    const ca = continuousAnalysisStatus
+                    const mainName = rooms.find(r => r.room_id === (ca?.room_id || continuousRoomId))?.streamer_name
+                      || ca?.room_id
+                      || continuousRoomId
+                      || '当前主房'
+                    if (ca?.phase === 'finalizing' || ca?.analysis_stage === '收尾中') {
+                      return `正在收尾精修（主房：${mainName}），此时停止可能丢升格`
+                    }
+                    return `停止持续分析（主房：${mainName}）`
+                  })()
+                : analysisTooltip
+            }>
               <span>
                 <Button
                   size="small"
@@ -3221,8 +3279,23 @@ export default function Workbench() {
                     }
                     if (continuousAnalyzing) {
                       const activeRoomId = continuousActiveRoomRef.current || continuousRoomId || undefined
-                      send('stop_continuous_analysis', { main_room_id: activeRoomId })
-                      setContinuousModalOpen(false)
+                      const ca = useAppStore.getState().continuousAnalysisStatus
+                      const doStop = () => {
+                        send('stop_continuous_analysis', { main_room_id: activeRoomId })
+                        setContinuousModalOpen(false)
+                      }
+                      if (ca?.phase === 'finalizing' || ca?.analysis_stage === '收尾中' || ca?.analysis_stage === '等待收尾') {
+                        Modal.confirm({
+                          title: '收尾尚未完成',
+                          content: '停止后待确认回合可能无法完成 OCR 升格。确定停止持续分析？',
+                          okText: '仍要停止',
+                          okButtonProps: { danger: true },
+                          cancelText: '继续等待',
+                          onOk: doStop,
+                        })
+                      } else {
+                        doStop()
+                      }
                       // 后端响应成功后会通过 stop_continuous_analysis_response 提示
                     } else {
                       const targetRoomIds = currentTargetIds
@@ -3350,7 +3423,7 @@ export default function Workbench() {
             ) : (
               <Row gutter={[16, 16]}>
                 {sortedRooms.map(room => {
-                  const isExpanded = expandedRoomId === room.room_id && !fullscreenRoomId
+                  const isExpanded = expandedRoomId === room.room_id
                   return (
                     <Col key={room.room_id} xs={24} sm={isExpanded ? 24 : 12} lg={isExpanded ? 24 : 12} xl={isExpanded ? 24 : 8}>
                       <RoomCard
@@ -3369,9 +3442,7 @@ export default function Workbench() {
                         onFullscreen={handleFullscreen}
                         onToggleMultiSelect={handleToggleMultiSelect}
                         expandedRoomId={expandedRoomId}
-                        fullscreenRoomId={fullscreenRoomId}
                         onCollapse={handleCollapse}
-                        onExitFullscreen={handleExitFullscreen}
                       />
                     </Col>
                   )
@@ -3429,6 +3500,7 @@ export default function Workbench() {
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
+          minHeight: 0,
         }}>
           {/* 添加直播间 */}
           <Card 
@@ -3497,15 +3569,16 @@ export default function Workbench() {
             <div><strong>入点：</strong>{formatTime(previewClip.start)}</div>
             <div><strong>出点：</strong>{formatTime(previewClip.end)}</div>
             <div><strong>时长：</strong>{formatTime(previewClip.end - previewClip.start)}</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <strong>导出预设：</strong>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+              <strong>导出预设</strong>
               <Select
                 value={exportPresetId}
                 onChange={setExportPresetId}
-                style={{ flex: 1, fontSize: 13 }}
+                style={{ width: '100%', minWidth: 0 }}
                 options={EXPORT_PRESETS.map(p => ({
                   value: p.id,
-                  label: `${p.name} — ${p.description}`,
+                  label: p.name,
+                  title: `${p.name} — ${p.description}`,
                 }))}
               />
             </div>
@@ -3515,7 +3588,7 @@ export default function Workbench() {
 
       {/* 分析导出 Modal（持续分析 + 同步分析导出合并） */}
       <Modal
-        title={analysisIsContinuous ? '持续分析设置' : '多房间同步分析导出'}
+        title={analysisIsContinuous ? '持续分析设置' : '多房间同步分析'}
         open={continuousModalOpen}
         onCancel={() => setContinuousModalOpen(false)}
         width={520}
@@ -3528,14 +3601,14 @@ export default function Workbench() {
             disabled={!continuousMainRoom || (!analysisIsContinuous && selectedRoomList.length > 1 && !targetAlignGroupReady)}
             onClick={handleConfirmAnalysisExport}
           >
-            {analysisIsContinuous ? '开始持续分析' : '开始分析与导出'}
+            {analysisIsContinuous ? '开始持续分析' : '开始分析并入列'}
           </Button>,
         ]}
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           {!analysisIsContinuous && selectedRoomList.length > 1 && !targetAlignGroupReady && (
             <div style={{
-              padding: '8px 12px', borderRadius: 6,
+              padding: '8px 12px', borderRadius: 'var(--radius-xs)',
               background: 'rgba(255, 153, 10, 0.15)', fontSize: 12, color: 'var(--state-warning-dark)',
               border: '1px solid var(--state-warning-dark)',
             }}>
@@ -3543,12 +3616,12 @@ export default function Workbench() {
             </div>
           )}
           <div style={{
-            padding: '8px 12px', borderRadius: 6,
+            padding: '8px 12px', borderRadius: 'var(--radius-xs)',
             background: 'var(--bg-tertiary)', fontSize: 12, color: 'var(--text-secondary)',
           }}>
             {analysisIsContinuous
-              ? `边录边分析主直播间高光，自动同步导入所有目标房间的切片列表（目标 ${continuousTargetRooms.length} 间）。`
-              : `分析主直播间高光，按 content_offset 映射到所有目标房间导出。目标 ${continuousTargetRooms.length} 个房间。`}
+              ? `边录边分析主直播间高光，自动同步导入所有目标房间的切片列表（目标 ${continuousTargetRooms.length} 间）。切片入列后需确认再导出。`
+              : `分析主直播间高光，按对齐偏移映射到所有目标房间的切片列表（目标 ${continuousTargetRooms.length} 间）。入列待确认，不会自动导出。`}
           </div>
           <div>
             <div style={{ fontWeight: 600, marginBottom: 8 }}>主直播间（用于高光分析）</div>
@@ -3573,41 +3646,34 @@ export default function Workbench() {
               optionType="button"
               buttonStyle="solid"
             >
-              <Radio.Button value="valorant_round">无畏契约回合切割</Radio.Button>
+              <Radio.Button value="valorant_round">无畏契约</Radio.Button>
               <Radio.Button value="generic">通用直播</Radio.Button>
             </Radio.Group>
+            {isValorantRoundCutting && (
+              <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+                自动适配游戏视角与赛事解说画面，回合入列后需确认再导出
+              </div>
+            )}
           </div>
 
-          {isValorantRoundCutting && analysisIsContinuous && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <strong>视角类型：</strong>
-              <Radio.Group
-                value={valorantProfile}
-                onChange={(e) => setValorantProfile(e.target.value)}
-                optionType="button"
-                buttonStyle="solid"
-                size="small"
-              >
-                <Radio.Button value="pov">游戏视角</Radio.Button>
-                <Radio.Button value="broadcast">赛事解说</Radio.Button>
-              </Radio.Group>
-            </div>
-          )}
-
           {!analysisIsContinuous && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <strong>导出预设：</strong>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
+              <strong>导出预设</strong>
               <Select
                 value={continuousPresetId}
                 onChange={setContinuousPresetId}
-                style={{ flex: 1, fontSize: 13 }}
-                options={EXPORT_PRESETS.map(p => ({ value: p.id, label: `${p.name} — ${p.description}` }))}
+                style={{ width: '100%', minWidth: 0 }}
+                options={EXPORT_PRESETS.map(p => ({
+                  value: p.id,
+                  label: p.name,
+                  title: `${p.name} — ${p.description}`,
+                }))}
               />
             </div>
           )}
           <div style={{
             display: 'flex', alignItems: 'center', gap: 8,
-            padding: '8px 12px', borderRadius: 6,
+            padding: '8px 12px', borderRadius: 'var(--radius-xs)',
             background: 'var(--bg-tertiary)',
           }}>
             <strong>持续分析</strong>
@@ -3620,8 +3686,8 @@ export default function Workbench() {
             />
             <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
               {analysisIsContinuous
-                ? '边录边分析。结束时请先停录，再等状态变为「收尾中/已完成」后再关分析；未确认回合会在收尾 OCR 后再导出。'
-                : '关闭则为单次分析并导出所有选中房间'}
+                ? '边录边分析。结束时请先停录，再等状态变为「收尾中/已完成」；回合入列后需确认再导出，收尾 OCR 只会升格状态不会自动导出。'
+                : '关闭则为单次分析：高光入列待确认，确认后再导出'}
             </span>
           </div>
         </div>

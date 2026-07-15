@@ -14,11 +14,11 @@
   overflow-x: auto;
   overflow-y: hidden;
   position: relative;
-  /* 上 padding 给刻度标签；左右给播放头圆点半宽 */
-  padding: 28px 14px 4px;
+  /* 上 padding 给刻度标签 + 紫标三角；左右给播放头圆点半宽 */
+  padding: 32px 14px 4px;
   scrollbar-width: none;
   -ms-overflow-style: none;
-  min-height: 64px;
+  min-height: 68px;
 }
 
 .lsc-timeline__scroll::-webkit-scrollbar {
@@ -385,23 +385,24 @@
 /* DVR 左边界 — 紫色竖线（约 MSE 缓冲起点 / 最近 ~120s） */
 .lsc-timeline__record-end {
   position: absolute;
-  top: 0;
-  bottom: 0;
+  top: -10px;
+  bottom: -2px;
   width: 3px;
   background: #c084fc;
   transform: translateX(-50%);
   z-index: 6;
   pointer-events: none;
   box-shadow: 0 0 0 1px rgba(192, 132, 252, 0.35), 0 0 8px 2px rgba(162, 89, 255, 0.55);
+  border-radius: 1px;
 }
 
 .lsc-timeline__record-end::before {
   content: '';
   position: absolute;
-  top: -7px;
+  top: -1px;
   left: 50%;
   transform: translateX(-50%);
-  border: 6px solid transparent;
+  border: 5px solid transparent;
   border-top-color: #c084fc;
   filter: drop-shadow(0 0 3px rgba(162, 89, 255, 0.8));
 }

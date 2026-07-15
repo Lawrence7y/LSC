@@ -41,11 +41,14 @@ def parse_fps(fps_str: str) -> float:
 
 
 def safe_terminate(proc: subprocess.Popen, timeout_sec: float = 3.0) -> None:
+    import logging
     import time
+
+    _log = logging.getLogger(__name__)
     try:
         proc.terminate()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.debug("safe_terminate: terminate failed: %s", exc)
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -53,8 +56,8 @@ def safe_terminate(proc: subprocess.Popen, timeout_sec: float = 3.0) -> None:
         time.sleep(0.1)
     try:
         proc.kill()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.debug("safe_terminate: kill failed: %s", exc)
 
 
 def detect_audio_energy_peaks(

@@ -126,7 +126,7 @@ def test_build_continuous_status_confirmed_rounds_default_zero() -> None:
             "analysis_stage": "分析中",
             "refine_with_ocr": True,
             "round_phase": "combat",
-            "valorant_profile": "broadcast",
+            "valorant_profile": "valorant",
             "scan_running": False,
         },
         room_id="r1",
@@ -136,4 +136,4 @@ def test_build_continuous_status_confirmed_rounds_default_zero() -> None:
     assert payload["total_highlights"] == 2
     assert payload["refine_with_ocr"] is True
     assert payload["round_phase"] == "combat"
-    assert payload["valorant_profile"] == "broadcast"
+    assert payload["valorant_profile"] == "valorant"

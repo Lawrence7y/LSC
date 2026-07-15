@@ -70,7 +70,7 @@ function primaryStatus(
   switch (clip.confirm_status as ClipConfirmStatus | undefined) {
     case 'pending': return { text: '待调', color: 'orange' }
     case 'user_confirmed': return { text: '可导', color: 'cyan' }
-    case 'ocr_confirmed': return { text: 'AI', color: 'purple' }
+    case 'ocr_confirmed': return { text: 'AI可导', color: 'purple' }
     default:
       if (clip.exported) return { text: '已导', color: 'green' }
       return null
@@ -88,10 +88,18 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
     onSelectedIndicesChange?.(next)
   }
 
-  const exportableClips = useMemo(() => clips.filter(canExportClip), [clips])
+  const hasConfirmAndExport = !!onConfirmAndExport
+  const actionableClips = useMemo(
+    () => clips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
+    [clips, hasConfirmAndExport],
+  )
   const selectedClips = useMemo(
     () => [...selectedIndices].sort((a, b) => a - b).map(i => clips[i]).filter(Boolean),
     [selectedIndices, clips],
+  )
+  const selectedActionable = useMemo(
+    () => selectedClips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
+    [selectedClips, hasConfirmAndExport],
   )
   const pendingCount = useMemo(() => clips.filter(needsConfirm).length, [clips])
 
@@ -111,6 +119,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
       style={{
         margin: '8px 16px 16px',
         flex: 1,
+        minHeight: 0,
         overflow: 'hidden',
         display: 'flex',
         flexDirection: 'column',
@@ -119,6 +128,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
       styles={{
         body: {
           flex: 1,
+          minHeight: 0,
           overflow: 'auto',
           padding: '0 6px 6px',
         }
@@ -127,22 +137,38 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         <Space size={6}>
           {clips.length > 0 && onExportMany && (
             <>
-              <Button
-                type="link"
-                size="small"
-                disabled={exportableClips.length === 0}
-                onClick={() => onExportMany(exportableClips)}
+              <Tooltip
+                title={actionableClips.length === 0
+                  ? (pendingCount > 0 ? '请先确认待调整的切片' : '没有可导出的切片')
+                  : (pendingCount > 0 && actionableClips.some(needsConfirm)
+                    ? '待确认切片将先确认再导出'
+                    : undefined)}
               >
-                导出全部
-              </Button>
-              <Button
-                type="link"
-                size="small"
-                disabled={selectedClips.length === 0}
-                onClick={() => onExportMany(selectedClips.filter(canExportClip))}
+                <Button
+                  type="link"
+                  size="small"
+                  disabled={actionableClips.length === 0}
+                  onClick={() => onExportMany(actionableClips)}
+                >
+                  导出全部
+                </Button>
+              </Tooltip>
+              <Tooltip
+                title={selectedClips.length === 0
+                  ? '请先勾选切片'
+                  : selectedActionable.length === 0
+                    ? '所选切片需先确认或正在导出'
+                    : undefined}
               >
-                导出所选
-              </Button>
+                <Button
+                  type="link"
+                  size="small"
+                  disabled={selectedActionable.length === 0}
+                  onClick={() => onExportMany(selectedActionable)}
+                >
+                  导出所选
+                </Button>
+              </Tooltip>
             </>
           )}
           <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>

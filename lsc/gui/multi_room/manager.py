@@ -2152,6 +2152,17 @@ class MultiRoomManager(QObject):
             room.last_error = f"恢复失败：缺少录制参数（原始错误: {original_error}）"
             return
 
+        # CDN 地址失效后必须强制刷新，禁止复用 120s 内的死链缓存
+        room.stream_parsed_at = 0.0
+        try:
+            if not self.refresh_stream_url(room.room_id, force=True):
+                _log.warning(
+                    "Room %s reconnect URL refresh failed, start_recording will retry parse",
+                    room.room_id,
+                )
+        except Exception as exc:
+            _log.warning("Room %s reconnect URL refresh error: %s", room.room_id, exc)
+
         ok = self.start_recording(
             room.room_id,
             room.reconnect_output_dir,

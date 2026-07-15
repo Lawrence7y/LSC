@@ -24,7 +24,7 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"403|Forbidden", re.I),
      "平台拒绝了连接（403）。可能主播未开播，或需要登录 Cookie。"),
     (re.compile(r"404|Not Found", re.I),
-     "直播流地址不存在（404）。主播可能已下播。"),
+     "直播流地址失效（404）。可能是 CDN 链接过期，系统将尝试自动刷新。"),
     (re.compile(r"Connection refused|ECONNREFUSED|连接被拒绝|拒绝连接", re.I),
      "无法连接到直播服务器。请检查网络或稍后重试。"),
     (re.compile(r"Connection timed out|ETIMEDOUT|连接超时|操作超时", re.I),
@@ -56,6 +56,14 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"解析流地址失败|parse.*fail|extract.*fail", re.I),
      "无法解析直播流地址。平台可能已更新协议。"),
 
+    # Shared ingest / continuous analysis
+    (re.compile(r"shared ingest|upstream ffmpeg exited", re.I),
+     "共享进样预览中断。录制可能仍在继续，请尝试重新开启预览。"),
+    (re.compile(r"stream url refresh failed|refresh.*stream", re.I),
+     "刷新直播流地址失败。主播可能已下播或网络异常。"),
+    (re.compile(r"rapidocr|OCR.*(失败|不可用|未安装)", re.I),
+     "OCR 引擎不可用，已回退到纯音频检测。"),
+
     # Quality / Format
     (re.compile(r"Unsupported codec|unsupported format", re.I),
      "不支持的视频格式。请尝试切换编码器。"),
@@ -66,6 +74,7 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 # 可恢复错误模式：网络抖动、流暂时中断、流地址过期等，值得自动重连。
+# 403/404 对直播 CDN 常表示签名 URL 失效，应刷新房间流地址后重试，而非直接放弃。
 _RECOVERABLE_PATTERNS: list[re.Pattern] = [
     re.compile(r"Server returned 5\d\d", re.I),
     re.compile(r"Connection (timed out|refused|reset)", re.I),
@@ -74,15 +83,18 @@ _RECOVERABLE_PATTERNS: list[re.Pattern] = [
     re.compile(r"Invalid data found", re.I),
     re.compile(r"未增长|stalled|not growing", re.I),
     re.compile(r"流.*过期|链接已过期|鉴权失败", re.I),
+    re.compile(r"403|Forbidden", re.I),
+    re.compile(r"404|Not Found", re.I),
+    re.compile(r"I/O error|Input/output error|demuxing", re.I),
+    re.compile(r"upstream ffmpeg exited|shared ingest upstream", re.I),
 ]
 
 # 不可恢复错误模式：权限/磁盘/配置类，重连也无效。
+# 注意：直播 CDN 的 403/404 不在此列（见 _RECOVERABLE_PATTERNS）。
 _NON_RECOVERABLE_PATTERNS: list[re.Pattern] = [
     re.compile(r"Permission denied|EACCES|WinError 5|拒绝访问", re.I),
     re.compile(r"No space left|ENOSPC|disk full|磁盘空间不足|磁盘已满", re.I),
     re.compile(r"Encoder.*not found|cannot find encoder", re.I),
-    re.compile(r"403|Forbidden", re.I),
-    re.compile(r"404|Not Found", re.I),
 ]
 
 

@@ -104,7 +104,8 @@
   --font-sans: 'SF Pro Display', 'PingFang SC', system-ui, -apple-system, sans-serif;
   --font-mono: 'SF Mono', 'JetBrains Mono', 'Menlo', monospace;
 
-  /* Radius */
+  /* Radius — 统一档：控件 6 / 默认 8 / 卡片小 10 / 分区 14 / 大面板 18 */
+  --radius-xs: 6px;
   --radius: 14px;
   --radius-sm: 10px;
   --radius-md: 8px;

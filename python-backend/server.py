@@ -96,7 +96,13 @@ class LSCWebSocketServer:
         # 发送 Origin 头，缺失通常意味着非浏览器客户端或 CSRF 尝试。
         origin = ''
         if hasattr(websocket, 'request_headers'):
-            origin = websocket.request_headers.get('origin', '')
+            headers = websocket.request_headers
+            getter = getattr(headers, 'get', None)
+            if callable(getter):
+                # websockets Headers 大小写不敏感；普通 dict 测试桩兼容 Origin/origin
+                origin = getter('origin') or getter('Origin') or ''
+            elif isinstance(headers, dict):
+                origin = headers.get('origin') or headers.get('Origin') or ''
         if not origin:
             _log.warning("Rejected WebSocket connection: missing Origin header")
             close_fn = getattr(websocket, 'close', None)
@@ -167,8 +173,8 @@ class LSCWebSocketServer:
                             'type': f'{msg_type}_response',
                             'data': error_data,
                         }))
-                    except Exception:
-                        pass
+                    except Exception as send_exc:
+                        _log.debug("Failed to send error response: %s", send_exc)
 
         # Process messages sequentially per connection to guarantee in-order
         # handler execution. Previously each message spawned an independent

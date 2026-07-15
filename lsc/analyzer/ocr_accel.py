@@ -221,8 +221,8 @@ def _make_probe_image() -> Path:
                 2,
                 cv2.LINE_AA,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("cv2 putText for OCR probe skipped: %s", exc)
         cv2.imwrite(str(path), img)
         return path
     except Exception as exc:

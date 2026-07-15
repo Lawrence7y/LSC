@@ -135,7 +135,7 @@ export default function MainLayout() {
             style={{
               width: 32,
               height: 32,
-              borderRadius: 8,
+              borderRadius: 'var(--radius-md)',
               objectFit: 'cover',
               flexShrink: 0,
             }} 

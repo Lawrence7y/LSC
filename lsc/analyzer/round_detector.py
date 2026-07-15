@@ -70,7 +70,7 @@ class ValorantRoundConfig:
     # 余韵，砍掉死亡回放/结算画面等尾部垃圾。post_combat_pad 是无钟声可定位时的
     # 保底 padding。
     post_combat_pad: float = 5.0
-    tail_pad: float = 6.0
+    tail_pad: float = 3.0
     # 钟声落在战斗段末尾附近多少秒内，视为该回合的结束点（用于精确裁尾）。
     # HVV: 死亡回放/结算画面可达 20-30s，需要更宽的窗口才能捕获尾声钟声。
     chime_tail_window: float = 20.0
@@ -255,11 +255,17 @@ def detect_valorant_rounds(
             if not (0 <= s < e <= len(smoothed)):
                 continue
             if not _ocr_round_has_combat_energy(smoothed, s, e, threshold):
+                # 解说流 end-only 段：结算字已确认终点，能量不足也保留（避免再回退音频）
+                if str(r.get("start_by") or "") != "ocr_prev_end":
+                    _log.info(
+                        "丢弃低能量 OCR 回合 %.1f-%.1f（疑似买枪/准备期）",
+                        float(r.get("start", 0.0)), float(r.get("end", 0.0)),
+                    )
+                    continue
                 _log.info(
-                    "丢弃低能量 OCR 回合 %.1f-%.1f（疑似买枪/准备期）",
+                    "保留低能量 OCR end-only 回合 %.1f-%.1f（结算字权威）",
                     float(r.get("start", 0.0)), float(r.get("end", 0.0)),
                 )
-                continue
             kept_phase.append(r)
             combat_segments.append((s, e))
         phase_rounds = kept_phase
@@ -420,10 +426,13 @@ def detect_valorant_rounds(
         for pr in phase_rounds:
             lpr = dict(pr)
             try:
-                lpr["start"] = float(pr.get("start", 0.0)) - range_offset
-                lpr["end"] = float(pr.get("end", 0.0)) - range_offset
-                if pr.get("ocr_end") is not None:
-                    lpr["ocr_end"] = float(pr["ocr_end"]) - range_offset
+                for key in (
+                    "start", "end", "ocr_start", "ocr_end",
+                    "buy_marker_sec", "round_start_sec", "round_end_sec",
+                ):
+                    if pr.get(key) is None:
+                        continue
+                    lpr[key] = float(pr[key]) - range_offset
             except (TypeError, ValueError):
                 pass
             local_phase_rounds.append(lpr)
@@ -432,9 +441,19 @@ def detect_valorant_rounds(
         phase_rounds=local_phase_rounds,
     )
     if range_offset:
+        _OFFSET_KEYS = (
+            "start", "end", "ocr_start", "ocr_end",
+            "buy_marker_sec", "round_start_sec", "round_end_sec",
+        )
         for item in results:
-            item["start"] = round(float(item["start"]) + range_offset, 3)
-            item["end"] = round(float(item["end"]) + range_offset, 3)
+            for key in _OFFSET_KEYS:
+                raw = item.get(key)
+                if raw is None:
+                    continue
+                try:
+                    item[key] = round(float(raw) + range_offset, 3)
+                except (TypeError, ValueError):
+                    continue
 
     # OCR/场景增强兜底（仅录制结束后，失败静默回退纯音频结果）
     # 当 phase_rounds 已提供 OCR 确认边界时，跳过此步骤（避免冗余的全量 OCR 重扫，
@@ -766,6 +785,38 @@ def _ocr_round_has_combat_energy(
     return True
 
 
+def _segment_energy_signals(
+    smoothed,
+    start_i: int,
+    end_i: int,
+    threshold: float,
+) -> tuple[bool, bool]:
+    """从 RMS 包络推导 energy_rise / energy_collapse（供相位调度交叉验证）。
+
+    不用 score 冒充：上升看段首是否越过阈值，塌陷看段尾是否回落到阈值以下。
+    """
+    import numpy as np
+
+    if end_i <= start_i or start_i >= len(smoothed) or threshold <= 0:
+        return False, False
+    lo = max(0, start_i)
+    hi = min(len(smoothed), end_i)
+    if hi - lo < 3:
+        return False, False
+    span = hi - lo
+    head_n = max(3, min(12, span // 3))
+    tail_n = max(3, min(12, span // 3))
+    head = smoothed[lo:lo + head_n]
+    tail = smoothed[hi - tail_n:hi]
+    mid = smoothed[lo + head_n:hi - tail_n] if span > head_n + tail_n else smoothed[lo:hi]
+    head_peak = float(np.max(head))
+    mid_peak = float(np.max(mid)) if len(mid) else head_peak
+    tail_mean = float(np.mean(tail))
+    energy_rise = head_peak >= threshold * 0.7 or mid_peak >= threshold
+    energy_collapse = tail_mean < threshold * 0.55 and mid_peak >= threshold * 0.6
+    return energy_rise, energy_collapse
+
+
 def _trim_buy_phases(
     smoothed: np.ndarray,
     rounds: list[tuple[int, int]],
@@ -923,10 +974,14 @@ def _format_output(
             seg_end_i = int(round(float(seg_end)))
         except (TypeError, ValueError):
             seg_start_i, seg_end_i = 0, 0
+        energy_rise, energy_collapse = False, False
         if seg_start_i < len(smoothed) and seg_end_i <= len(smoothed) and seg_end_i > seg_start_i:
             peak_rms = float(np.max(smoothed[seg_start_i:seg_end_i]))
             score = min(1.0, peak_rms / (threshold * 2.0))
             score = max(0.3, score)
+            energy_rise, energy_collapse = _segment_energy_signals(
+                smoothed, seg_start_i, seg_end_i, threshold,
+            )
         else:
             score = 0.5
 
@@ -953,16 +1008,35 @@ def _format_output(
                 ocr_span_end = float(seg_end)
             combat_end_sec = ocr_span_end
             tail_reason = ocr_info.get("tail_by", "ocr_phase")
+            end_by_val = ocr_info.get("end_by")
 
-            if ocr_end_ts is not None and ocr_end_ts > float(seg_start):
+            # 胜利字仅写入 ocr_end 元数据；next_buy 终点必须保持准备开始，不得被胜利覆盖
+            if (
+                end_by_val != "next_buy"
+                and ocr_end_ts is not None
+                and ocr_end_ts > float(seg_start)
+            ):
                 combat_end_sec = ocr_end_ts
                 tail_reason = "ocr_phase"
 
-            end_sec = min(duration, combat_end_sec + cfg.tail_pad)
+            # OCR 结算点即正赛终点；不再追加 tail_pad 把 5s 垃圾尾算进片段
+            if end_by_val == "ocr_result":
+                end_sec = min(duration, combat_end_sec)
+            elif end_by_val == "next_buy":
+                # 终点即下一准备/购买阶段开始，不再回推 post_combat（避免切进结算前）
+                end_sec = min(duration, max(
+                    start_sec + cfg.min_combat_duration,
+                    combat_end_sec,
+                ))
+            else:
+                end_sec = min(duration, combat_end_sec + cfg.tail_pad)
 
             if end_sec <= start_sec + cfg.min_combat_duration:
                 end_sec = min(duration, float(seg_end) + cfg.post_combat_pad)
 
+            buy_marker = ocr_info.get("buy_marker_sec")
+            round_start = ocr_info.get("ocr_start", start_sec)
+            round_end = ocr_info.get("ocr_end", combat_end_sec if end_by_val == "ocr_result" else None)
             results.append({
                 "start": round(start_sec, 3),
                 "end": round(end_sec, 3),
@@ -972,8 +1046,19 @@ def _format_output(
                 "round_index": idx + 1,
                 "tail_by": tail_reason,
                 "start_by": ocr_info.get("start_by", "ocr_buy_exit") if ocr_info else "ocr_buy_exit",
-                "end_by": ocr_info.get("end_by") if ocr_info else None,
+                "end_by": end_by_val,
                 "ocr_confirmed": ocr_confirmed,
+                "ocr_start": round(float(round_start), 3) if round_start is not None else None,
+                "ocr_end": round(float(round_end), 3) if round_end is not None else None,
+                "buy_marker_sec": (
+                    round(float(buy_marker), 3) if buy_marker is not None else None
+                ),
+                "round_start_sec": round(float(round_start), 3) if round_start is not None else round(start_sec, 3),
+                "round_end_sec": (
+                    round(float(round_end), 3) if round_end is not None else None
+                ),
+                "energy_rise": energy_rise,
+                "energy_collapse": energy_collapse,
                 "speech_score": 0.0,
                 "visual_score": 0.0,
                 "transcript": "",
@@ -1019,6 +1104,9 @@ def _format_output(
             next_start = float(rounds[idx + 1][0])
             end_sec = min(end_sec, next_start - 1.0)
 
+        # 钟声裁尾本身就是能量塌陷的强信号
+        if tail_reason == "chime":
+            energy_collapse = True
         if cfg.full_round:
             results.append({
                 "start": round(start_sec, 3),
@@ -1030,11 +1118,21 @@ def _format_output(
                 "tail_by": tail_reason if tail_reason != "audio" else "full_round",
                 "start_by": "full_round",
                 "end_by": "full_round",
+                "round_start_sec": round(start_sec, 3),
+                "round_end_sec": round(end_sec, 3) if tail_reason == "chime" else None,
+                "energy_rise": energy_rise,
+                "energy_collapse": energy_collapse,
                 "speech_score": 0.0,
                 "visual_score": 0.0,
                 "transcript": "",
             })
         else:
+            if tail_reason == "chime":
+                end_by_audio = "chime"
+            elif tail_reason == "inferred":
+                end_by_audio = "inferred"
+            else:
+                end_by_audio = "audio"
             results.append({
                 "start": round(start_sec, 3),
                 "end": round(end_sec, 3),
@@ -1043,6 +1141,13 @@ def _format_output(
                 "phase": "combat",
                 "round_index": idx + 1,
                 "tail_by": tail_reason,
+                "start_by": "audio",
+                "end_by": end_by_audio,
+                # 音频战斗起点不是 OCR 屏障点；不写 round_start_sec，避免入列 trim 误 +0.5
+                "round_start_sec": None,
+                "round_end_sec": round(combat_end_sec, 3) if tail_reason == "chime" else None,
+                "energy_rise": energy_rise,
+                "energy_collapse": energy_collapse,
                 "speech_score": 0.0,
                 "visual_score": 0.0,
                 "transcript": "",
@@ -1206,7 +1311,11 @@ def _detect_round_phase_markers(
             if timestamp < 0 or timestamp > duration + 1:
                 continue
 
-            is_buy = "购买阶段" in current_text or "购买" in current_text
+            is_buy = (
+                "购买阶段" in current_text
+                or "准备阶段" in current_text
+                or "购买" in current_text
+            )
             if is_buy and timestamp - last_start >= 1.0:
                 buy_hits.append({
                     "timestamp": round(timestamp, 3),
@@ -1228,6 +1337,7 @@ def _detect_round_phase_markers(
                 last_end = timestamp
 
         start_markers: list[dict[str, Any]] = []
+        prep_markers: list[dict[str, Any]] = []
         buy_run: list[dict[str, Any]] = []
         for hit in buy_hits:
             ts = float(hit.get("timestamp", 0.0))
@@ -1235,10 +1345,29 @@ def _detect_round_phase_markers(
             if not buy_run or ts - prev_ts <= 12.0:
                 buy_run.append(hit)
                 continue
-            start_markers.append(buy_run[-1])
+            # 同一买枪期内：首帧=准备开始，末帧=买枪结束/屏障解除
+            prep_markers.append({
+                **buy_run[0],
+                "type": "round_prep",
+                "timestamp": round(float(buy_run[0].get("timestamp", 0.0)), 3),
+            })
+            start_markers.append({
+                **buy_run[-1],
+                "type": "round_start",
+                "timestamp": round(float(buy_run[-1].get("timestamp", 0.0)), 3),
+            })
             buy_run = [hit]
         if buy_run:
-            start_markers.append(buy_run[-1])
+            prep_markers.append({
+                **buy_run[0],
+                "type": "round_prep",
+                "timestamp": round(float(buy_run[0].get("timestamp", 0.0)), 3),
+            })
+            start_markers.append({
+                **buy_run[-1],
+                "type": "round_start",
+                "timestamp": round(float(buy_run[-1].get("timestamp", 0.0)), 3),
+            })
 
         grouped_end_markers: list[dict[str, Any]] = []
         end_run: list[dict[str, Any]] = []
@@ -1253,7 +1382,7 @@ def _detect_round_phase_markers(
         if end_run:
             grouped_end_markers.append(end_run[-1])
 
-        markers = start_markers + grouped_end_markers
+        markers = prep_markers + start_markers + grouped_end_markers
         markers.sort(key=lambda item: item.get("timestamp", 0.0))
         return markers
     except Exception as exc:
@@ -1382,7 +1511,12 @@ def _build_round_segments_from_phase_markers(
     duration: float,
     cfg: ValorantRoundConfig,
 ) -> list[dict[str, Any]]:
-    """Build round clips from OCR buy-phase and result markers."""
+    """Build round clips from OCR buy-phase and result markers.
+
+    round_start = 买枪期结束（屏障解除，正赛起点）
+    round_prep  = 准备/购买阶段开始（上一回合应在此收尾）
+    round_end   = 胜利/结算字
+    """
     if duration <= 0:
         return []
 
@@ -1394,6 +1528,14 @@ def _build_round_segments_from_phase_markers(
         ],
         min_gap=cfg.min_round_gap,
     )
+    preps = _dedupe_marker_times(
+        [
+            float(m.get("timestamp", 0.0))
+            for m in markers
+            if m.get("type") == "round_prep"
+        ],
+        min_gap=cfg.min_round_gap * 0.5,
+    )
     ends = _dedupe_marker_times(
         [
             float(m.get("timestamp", 0.0))
@@ -1403,29 +1545,108 @@ def _build_round_segments_from_phase_markers(
         min_gap=cfg.min_round_gap * 0.5,
     )
     segment_starts = [s for s in starts if 0 < s < duration]
+    prep_starts = [p for p in preps if 0 < p <= duration]
     results: list[dict[str, Any]] = []
+    min_span = max(cfg.min_combat_duration, cfg.min_ocr_round_duration)
+    typical_buy_sec = 30.0
+
+    # 解说/转播流：无 buy 标记时用连续胜利字建段
+    if not segment_starts:
+        usable_ends = [e for e in ends if 0 < e <= duration]
+        post_to_combat = max(cfg.round_inactive_gap, 25.0)
+        for idx, victory in enumerate(usable_ends):
+            if idx == 0:
+                start = max(0.0, victory - cfg.max_combat_duration)
+            else:
+                start = usable_ends[idx - 1] + post_to_combat
+            start = max(0.0, round(start, 3))
+            if idx + 1 < len(usable_ends):
+                end = min(duration, round(victory + post_to_combat, 3))
+                end_by = "next_buy"
+            else:
+                end = min(duration, round(float(victory), 3))
+                end_by = "ocr_result"
+            if end - start < min_span or start >= end:
+                continue
+            results.append({
+                "start": start,
+                "end": end,
+                "score": 0.75,
+                "reason": "Valorant round OCR end-only boundary",
+                "phase": "combat",
+                "round_index": len(results) + 1,
+                "tail_by": "ocr_phase",
+                "start_by": "ocr_prev_end",
+                "end_by": end_by,
+                "ocr_confirmed": False,
+                "ocr_start": None,
+                "ocr_end": round(float(victory), 3),
+                "buy_marker_sec": None,
+                "round_start_sec": start,
+                "round_end_sec": round(float(victory), 3),
+                "speech_score": 0.0,
+                "visual_score": 0.0,
+                "transcript": "",
+            })
+        return results
 
     for idx, buy_marker in enumerate(segment_starts):
-        # ponytail: reuse the existing OCR interval as the barrier-exit estimate.
         start = min(duration, round(buy_marker + cfg.phase_sample_interval, 3))
-        next_buy = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else None
+        next_exit = segment_starts[idx + 1] if idx + 1 < len(segment_starts) else None
+        next_prep_candidates = [p for p in prep_starts if p > start + 1.0]
+        if next_exit is not None:
+            next_prep_candidates = [
+                p for p in next_prep_candidates if p < next_exit + 1.0
+            ]
+        next_prep = next_prep_candidates[0] if next_prep_candidates else None
+
         explicit_ends = [
             e for e in ends
             if start + cfg.min_combat_duration <= e
-            and (next_buy is None or e < next_buy)
+            and (next_exit is None or e < next_exit)
+            and (next_prep is None or e <= next_prep + 1.0)
             and e <= duration
         ]
+        victory = explicit_ends[0] if explicit_ends else None
 
-        if explicit_ends:
-            end = explicit_ends[0]
+        # 终点优先级（用户语义：录到「下回合准备阶段开始」之前的全部内容）：
+        #   1) next_prep（购买/准备首帧）
+        #   2) 估准备 = next_exit - 典型买枪
+        #   3) 仅无下一买枪标记时才贴胜利字
+        # 禁止：有下一买枪时仍用胜利字当终点（会丢掉结算后～准备前）
+        glue_limit = max(cfg.max_combat_duration, cfg.min_ocr_round_duration + 40.0)
+        if next_prep is not None:
+            if (next_prep - start) > glue_limit and victory is not None:
+                # 漏检中间回合：先在胜利后留一段结算过渡，避免整段糊到很远的 prep
+                end = min(next_prep, max(victory + 12.0, start + min_span))
+                end_by = "next_buy"
+                tail_by = "ocr_phase"
+                ocr_end = victory
+            else:
+                end = next_prep
+                end_by = "next_buy"
+                tail_by = "ocr_phase"
+                ocr_end = victory
+        elif next_exit is not None:
+            estimated = max(start + min_span, next_exit - typical_buy_sec)
+            if estimated - start > glue_limit:
+                if victory is not None:
+                    end = min(estimated, max(victory + 12.0, start + min_span))
+                else:
+                    end = start + cfg.max_combat_duration
+                end_by = "next_buy"
+                tail_by = "ocr_phase"
+                ocr_end = victory
+            else:
+                end = estimated
+                end_by = "next_buy"
+                tail_by = "ocr_phase"
+                ocr_end = victory
+        elif victory is not None:
+            end = victory
             end_by = "ocr_result"
             tail_by = "ocr_phase"
-            ocr_end = end
-        elif next_buy is not None:
-            end = next_buy
-            end_by = "next_buy"
-            tail_by = "ocr_phase"
-            ocr_end = None
+            ocr_end = victory
         else:
             end = duration
             end_by = "open_tail"
@@ -1433,8 +1654,8 @@ def _build_round_segments_from_phase_markers(
             ocr_end = None
 
         start = max(0.0, round(start, 3))
-        end = min(duration, round(end, 3))
-        if end - start < max(cfg.min_combat_duration, cfg.min_ocr_round_duration):
+        end = min(duration, round(float(end), 3))
+        if end - start < min_span:
             continue
 
         results.append({
@@ -1450,6 +1671,9 @@ def _build_round_segments_from_phase_markers(
             "ocr_confirmed": end_by in {"ocr_result", "next_buy"},
             "ocr_start": start,
             "ocr_end": ocr_end,
+            "buy_marker_sec": round(float(buy_marker), 3),
+            "round_start_sec": start,
+            "round_end_sec": ocr_end,
             "speech_score": 0.0,
             "visual_score": 0.0,
             "transcript": "",
