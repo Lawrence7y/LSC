@@ -240,22 +240,23 @@ export const RoomCard = memo(function RoomCard({
               border: `2px solid ${
                 multiSelected || selected
                   ? 'var(--accent-primary)'
-                  : 'var(--border-secondary, rgba(255,255,255,0.2))'
+                  : 'var(--text-primary, #1a1d23)'
               }`,
               background:
                 multiSelected || selected
                   ? 'var(--accent-primary)'
-                  : 'transparent',
+                  : 'var(--bg-primary, #fff)',
               cursor: 'pointer',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               transition: 'all .15s ease',
-              color: '#fff',
+              color: multiSelected || selected ? '#fff' : 'var(--text-primary, #1a1d23)',
               fontSize: 13,
               fontWeight: 700,
               lineHeight: 1,
               userSelect: 'none',
+              boxSizing: 'border-box',
             }}
           >
             {multiSelected || selected ? '✓' : ''}
@@ -606,44 +607,47 @@ export const RoomCard = memo(function RoomCard({
         )}
       </div>
 
-      {/* Meta 行：录制状态 · 时长 · 文件大小 */}
+      {/* Meta 行：已录墙钟时长（与时间线预览轴不同，可能差几秒） */}
       {room.is_recording && (
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            marginBottom: 6,
-            fontSize: 12,
-            color: 'var(--text-secondary)',
-            minWidth: 0,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          <span style={{ color: 'var(--state-success)', fontWeight: 500, flexShrink: 0 }}>
-            录制中
-          </span>
-          {room.record_started_at && (
-            <>
-              <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
-              <span style={{ fontFamily: 'monospace', flexShrink: 0 }}>
-                {formatTime(recordingElapsedSeconds)}
-              </span>
-            </>
-          )}
-          {room.record_size_mb > 0 && (
-            <>
-              <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
-              <span style={{ fontFamily: 'monospace', flexShrink: 0 }}>
-                {room.record_size_mb >= 1024
-                  ? `${(room.record_size_mb / 1024).toFixed(1)} GB`
-                  : `${room.record_size_mb.toFixed(0)} MB`}
-              </span>
-            </>
-          )}
-        </div>
+        <Tooltip title="「已录」为录制墙钟时长；时间线显示的是预览播放位置，二者可能相差数秒">
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              marginBottom: 6,
+              fontSize: 12,
+              color: 'var(--text-secondary)',
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              cursor: 'help',
+            }}
+          >
+            <span style={{ color: 'var(--state-success)', fontWeight: 500, flexShrink: 0 }}>
+              录制中
+            </span>
+            {room.record_started_at && (
+              <>
+                <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
+                <span style={{ fontFamily: 'monospace', flexShrink: 0 }}>
+                  已录 {formatTime(recordingElapsedSeconds)}
+                </span>
+              </>
+            )}
+            {room.record_size_mb > 0 && (
+              <>
+                <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
+                <span style={{ fontFamily: 'monospace', flexShrink: 0 }}>
+                  {room.record_size_mb >= 1024
+                    ? `${(room.record_size_mb / 1024).toFixed(1)} GB`
+                    : `${room.record_size_mb.toFixed(0)} MB`}
+                </span>
+              </>
+            )}
+          </div>
+        </Tooltip>
       )}
 
       {/* 标题行：仅 stream_title */}

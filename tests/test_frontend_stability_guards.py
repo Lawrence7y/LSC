@@ -642,6 +642,15 @@ def test_preview_phase_broadcast_and_ui() -> None:
     ws = (ROOT / "lsc-electron/src/hooks/useWebSocket.ts").read_text(encoding="utf-8")
     assert "preview_phase" in ws
 
+    # rooms_updated 整表替换时必须保留前端 preview_phase，否则 DVR 紫标/LIVE 失效
+    store = (ROOT / "lsc-electron/src/store/appStore.ts").read_text(encoding="utf-8")
+    assert "preview_phase: incoming.preview_phase ?? prev.preview_phase" in store
+
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    dvr_block = workbench.split("const dvrStart = useMemo", 1)[1].split("}, [", 1)[0]
+    assert "preview_phase !== 'streaming'" not in dvr_block
+    assert "getRoomBufferedRange" in dvr_block
+
 
 def test_frontend_sends_valorant_profile() -> None:
     """持续分析启动 payload 包含 valorant_profile，UI 提供游戏视角/赛事解说选择。"""
@@ -897,10 +906,14 @@ def test_mse_player_exposes_buffered_range() -> None:
 def test_timeline_dvr_start_prop() -> None:
     timeline = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
     control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
+    css = (ROOT / "lsc-electron/src/components/Timeline/Timeline.css").read_text(encoding="utf-8")
     assert "dvrStart" in timeline
     assert "dvrStart=" in control or "dvrStart={" in control
-    # 紫标应对齐 dvrStart
+    # 紫标应对齐 dvrStart（竖线本身，无文案标签）
     assert "dvrStartPct" in timeline or ("dvrStart" in timeline and "lsc-timeline__record-end" in timeline)
+    assert "lsc-timeline__record-end" in css
+    assert "不可回放" not in timeline
+    assert "可回放" not in timeline
 
 
 def test_preview_mode_type_exists() -> None:

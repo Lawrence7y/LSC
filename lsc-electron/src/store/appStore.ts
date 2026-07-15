@@ -97,7 +97,20 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
 
   setRooms: (rooms) => set((state) => {
     if (state.rooms === rooms) return state
-    return { rooms }
+    // rooms_updated 来自后端 _room_to_dict，不含 preview_phase 等前端字段；
+    // 整表替换会冲掉 updateRoom 写入的 phase，导致 LIVE 胶囊 / DVR 紫标条件失效。
+    const merged = rooms.map((incoming) => {
+      const prev = state.rooms.find((r) => r.room_id === incoming.room_id)
+      if (!prev) return incoming
+      return {
+        ...incoming,
+        preview_phase: incoming.preview_phase ?? prev.preview_phase,
+        mse_error: incoming.mse_error ?? prev.mse_error,
+        mse_reconnecting: incoming.mse_reconnecting ?? prev.mse_reconnecting,
+        preview_frame_data: incoming.preview_frame_data ?? prev.preview_frame_data,
+      }
+    })
+    return { rooms: merged }
   }),
 
   addRoom: (room) =>

@@ -352,12 +352,12 @@ class ClipExporter:
         safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]', '_', raw_title)  # #33: control chars
         # Prevent path traversal: reject '..' components and leading slashes
         safe_title = safe_title.replace('..', '__').strip('. ')
-    # #33: Windows reserved device names
-    reserved = {'CON','PRN','AUX','NUL','COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',
-                'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9'}
-    stem = safe_title.rsplit('.',1)[0].upper() if '.' in safe_title else safe_title.upper()
-    if stem in reserved:
-        safe_title = f'_{safe_title}'
+        # #33: Windows reserved device names
+        reserved = {'CON','PRN','AUX','NUL','COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',
+                    'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9'}
+        stem = safe_title.rsplit('.',1)[0].upper() if '.' in safe_title else safe_title.upper()
+        if stem in reserved:
+            safe_title = f'_{safe_title}'
         if not safe_title:
             safe_title = f"highlight_{clip_index}"
         output_path = os.path.join(output_dir, f"{safe_title}.mp4")
@@ -538,7 +538,7 @@ class ClipExporter:
                 last_reported_percent = -1.0
                 last_reported_time = 0.0
                 stderr_tail: deque[str] = deque(maxlen=20)
-                export_timed_out = False
+                _timed_out_flag: list[bool] = [False]
 
                 def _stderr_reader() -> None:
                     """后台线程：持续读取 FFmpeg stderr 并保留尾部用于错误诊断。"""
@@ -550,21 +550,20 @@ class ClipExporter:
 
                 def _watchdog() -> None:
                     """Kill FFmpeg if it runs longer than 5 minutes."""
-                    nonlocal export_timed_out
                     try:
                         # #35: scale timeout by resolution and codec
-            base_timeout = 300
-            if hasattr(self, 'width') and self.width and hasattr(self, 'height') and self.height:
-                pixels = self.width * self.height
-                if pixels > 3840 * 2160:
-                    base_timeout = int(base_timeout * 2.5)
-                elif pixels > 1920 * 1080:
-                    base_timeout = int(base_timeout * 1.5)
-            if not getattr(self, 'hardware_encoder', True):
-                base_timeout = int(base_timeout * 2.0)
-            proc.wait(timeout=base_timeout)
+                        base_timeout = 300
+                        if hasattr(self, 'width') and self.width and hasattr(self, 'height') and self.height:
+                            pixels = self.width * self.height
+                            if pixels > 3840 * 2160:
+                                base_timeout = int(base_timeout * 2.5)
+                            elif pixels > 1920 * 1080:
+                                base_timeout = int(base_timeout * 1.5)
+                        if not getattr(self, 'hardware_encoder', True):
+                            base_timeout = int(base_timeout * 2.0)
+                        proc.wait(timeout=base_timeout)
                     except subprocess.TimeoutExpired:
-                        export_timed_out = True
+                        _timed_out_flag[0] = True
                         try:
                             proc.kill()
                             proc.wait(timeout=5)
@@ -610,12 +609,12 @@ class ClipExporter:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    export_timed_out = True
+                    _timed_out_flag[0] = True
 
                 stderr_thread.join(timeout=2)
                 watchdog_thread.join(timeout=2)
 
-                if export_timed_out:
+                if _timed_out_flag[0]:
                     _cleanup_tmp(tmp_output_path)
                     return ExportResult(False, output_path, clip_index, safe_title,
                                         error="导出超时（FFmpeg 运行超过 300 秒）")

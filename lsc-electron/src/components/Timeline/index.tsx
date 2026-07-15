@@ -610,13 +610,12 @@ export function Timeline({
 
             {dvrStartPct !== null && (
               <div
-                className={`lsc-timeline__record-end ${
-                  snapFlash?.type === 'record' ? 'lsc-timeline__record-end--snap' : ''
+                className={`lsc-timeline__record-end${
+                  snapFlash?.type === 'record' ? ' lsc-timeline__record-end--snap' : ''
                 }`}
                 style={{ left: `${dvrStartPct}%` }}
-              >
-                <span className="lsc-timeline__record-end-label">{formatTime(dvrStart!)}</span>
-              </div>
+                title={`DVR 左边界 ${formatTime(dvrStart!)}：左侧回跟播，右侧可回看`}
+              />
             )}
 
             {markerInPct !== null && (

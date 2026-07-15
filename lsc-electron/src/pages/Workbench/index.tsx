@@ -34,8 +34,37 @@ const TIMELINE_MAX_WINDOW = 600
 
 function getRoomBufferedRange(roomId: string): { start: number; end: number } | null {
   const registry = (window as any).__msePlayers
-  const player = registry?.[roomId]?.player
+  const entry = registry?.[roomId]
+  const player = entry?.player ?? entry
   return player?.getBufferedRange?.() ?? null
+}
+
+/** 优先参考房，否则选中列表里第一个有缓冲的预览房 */
+function resolveDvrSourceRoomId(
+  referenceRoomId: string | null,
+  selectedRoomId: string | null,
+  selectedRoomIds: string[],
+  rooms: { room_id: string; preview_enabled?: boolean; preview_phase?: string; preview_mode?: string }[],
+): string | null {
+  const candidates = [
+    referenceRoomId,
+    selectedRoomId,
+    ...selectedRoomIds,
+    ...rooms.map((r) => r.room_id),
+  ].filter(Boolean) as string[]
+  const seen = new Set<string>()
+  for (const rid of candidates) {
+    if (seen.has(rid)) continue
+    seen.add(rid)
+    const room = rooms.find((r) => r.room_id === rid)
+    if (!room?.preview_enabled) continue
+    if (room.preview_mode === 'recording_review' || room.preview_mode === 'degraded') continue
+    // preview_phase 可能被 rooms_updated 冲掉；有缓冲即可作为 DVR 源
+    const phase = room.preview_phase
+    if (phase === 'error' || phase === 'idle' || phase === 'refreshing_url' || phase === 'probing') continue
+    if (getRoomBufferedRange(rid)) return rid
+  }
+  return null
 }
 
 function getRoomMediaDuration(roomId: string): number | null {
@@ -476,11 +505,20 @@ export default function Workbench() {
 
   // 紫标 = MSE 缓冲左沿（与 timelineView / contentEnd 同轴）；recording_review / degraded 无紫标
   const dvrStart = useMemo((): number | null => {
-    const rid = referenceRoomId || selectedRoomId
+    const rid = resolveDvrSourceRoomId(
+      referenceRoomId,
+      selectedRoomId,
+      selectedRoomIds,
+      rooms,
+    )
     if (!rid) return null
     const room = rooms.find(r => r.room_id === rid)
     if (isNoDvrPreviewMode(room?.preview_mode)) return null
-    if (!room?.preview_enabled || room.preview_phase !== 'streaming') return null
+    if (!room?.preview_enabled) return null
+    const phase = room.preview_phase
+    if (phase === 'error' || phase === 'idle' || phase === 'refreshing_url' || phase === 'probing') {
+      return null
+    }
     const buf = getRoomBufferedRange(rid)
     if (!buf) return null
     const bufStart = buf.start
@@ -488,11 +526,12 @@ export default function Workbench() {
       try {
         return previewToCommon(timelineContext, rid, bufStart)
       } catch {
-        return null
+        // 对齐快照瞬时不可用时回退 preview 轴，避免紫标整段消失
+        return bufStart
       }
     }
     return bufStart
-  }, [referenceRoomId, selectedRoomId, rooms, commonMode, timelineContext, previewPositions])
+  }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, commonMode, timelineContext, previewPositions, timelineTick])
 
   // recording_review / degraded：强制退出 followLive
   useEffect(() => {

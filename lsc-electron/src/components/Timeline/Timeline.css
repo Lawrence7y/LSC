@@ -14,12 +14,11 @@
   overflow-x: auto;
   overflow-y: hidden;
   position: relative;
-  /* 上 padding 给刻度标签；左右给播放头圆点半宽，避免贴边被裁 */
-  padding: 14px 14px 4px;
+  /* 上 padding 给刻度标签；左右给播放头圆点半宽 */
+  padding: 28px 14px 4px;
   scrollbar-width: none;
   -ms-overflow-style: none;
-  /* 刻度(16) + 轨道(22) + padding ≈ 56；禁止被 flex 压扁导致轨道被 overflow 裁切 */
-  min-height: 56px;
+  min-height: 64px;
 }
 
 .lsc-timeline__scroll::-webkit-scrollbar {
@@ -383,45 +382,31 @@
   100% { opacity: 1; }
 }
 
-/* DVR 左边界指示器 — 紫色，区别于 mark_in(绿)/mark_out(红)/highlight(橙)/clip(绿) */
+/* DVR 左边界 — 紫色竖线（约 MSE 缓冲起点 / 最近 ~120s） */
 .lsc-timeline__record-end {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 2px;
-  background: #a259ff;
+  width: 3px;
+  background: #c084fc;
   transform: translateX(-50%);
   z-index: 6;
   pointer-events: none;
+  box-shadow: 0 0 0 1px rgba(192, 132, 252, 0.35), 0 0 8px 2px rgba(162, 89, 255, 0.55);
 }
 
 .lsc-timeline__record-end::before {
   content: '';
   position: absolute;
-  top: -5px;
+  top: -7px;
   left: 50%;
   transform: translateX(-50%);
-  border: 4px solid transparent;
-  border-top-color: #a259ff;
-}
-
-.lsc-timeline__record-end-label {
-  position: absolute;
-  top: -22px;
-  left: 50%;
-  transform: translateX(-50%);
-  font-size: 9px;
-  font-weight: 600;
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-  color: #a259ff;
-  background: rgba(162, 89, 255, 0.12);
-  padding: 1px 5px;
-  border-radius: 3px;
-  white-space: nowrap;
-  pointer-events: none;
+  border: 6px solid transparent;
+  border-top-color: #c084fc;
+  filter: drop-shadow(0 0 3px rgba(162, 89, 255, 0.8));
 }
 
 .lsc-timeline__record-end--snap {
-  box-shadow: 0 0 6px 1px rgba(162, 89, 255, 0.6);
+  box-shadow: 0 0 0 1px rgba(192, 132, 252, 0.5), 0 0 12px 3px rgba(162, 89, 255, 0.85);
   transition: box-shadow 0.18s ease;
 }

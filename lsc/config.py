@@ -334,10 +334,10 @@ def load_config(force_reload: bool = False) -> LscConfig:
     """
     global _config_instance
     if force_reload or _config_instance is None:
-        from dataclasses import fields
+        from typing import get_type_hints
         overrides = _load_config_overrides()
         validated = {}
-        field_map = {f.name: f.type for f in fields(LscConfig)}
+        field_map = get_type_hints(LscConfig)
         for key, val in overrides.items():
             expected = field_map.get(key)
             if expected is None:

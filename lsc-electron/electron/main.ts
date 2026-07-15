@@ -853,19 +853,19 @@ function createWindow() {
   });
 
   // S-1: Content-Security-Policy — 限制脚本/样式/连接来源，防止 XSS 加载外部资源
-  // 仅在生产模式生效；开发模式 Vite 需要内联脚本用于 HMR
-  if (!process.env.VITE_DEV_SERVER_URL) {
-    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-      callback({
-        responseHeaders: {
-          ...details.responseHeaders,
-          'Content-Security-Policy': [
-            "default-src 'self' file:; script-src 'self' file:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
-          ]
-        }
-      })
+  // 开发模式 Vite 需要 unsafe-inline + unsafe-eval 用于 HMR/React Refresh
+  // 生产模式使用严格策略（无 unsafe-eval，script-src 限 self + file:）
+  const csp = process.env.VITE_DEV_SERVER_URL
+    ? "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
+    : "default-src 'self' file:; script-src 'self' file:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [csp]
+      }
     })
-  }
+  })
 
   // S-2: 阻止渲染进程导航到非预期 URL（防 XSS 通过 location.href 跳转）
   mainWindow.webContents.on('will-navigate', (event, url) => {

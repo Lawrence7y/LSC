@@ -461,15 +461,17 @@ export const ControlBar = memo(function ControlBar({
           </Tooltip>
         </Space>
 
-        {/* 中间：时间码 */}
-        <Space size={2}>
-          <span style={{
-            fontFamily: 'monospace',
-            fontSize: 14,
-            color: 'var(--text-primary)',
-          }}>
-            {formatTime(timelineView ? timelineView.currentTime : currentTime)}
-          </span>
+        {/* 中间：时间码（预览轴）；录制中另显已录墙钟，避免与房间卡片混淆 */}
+        <Space size={2} align="center">
+          <Tooltip title="预览播放位置（时间线坐标）">
+            <span style={{
+              fontFamily: 'monospace',
+              fontSize: 14,
+              color: 'var(--text-primary)',
+            }}>
+              {formatTime(timelineView ? timelineView.currentTime : currentTime)}
+            </span>
+          </Tooltip>
           <span style={{ color: 'var(--text-tertiary)' }}>/</span>
           <span style={{
             fontFamily: 'monospace',
@@ -478,6 +480,20 @@ export const ControlBar = memo(function ControlBar({
           }}>
             {formatTime(duration)}
           </span>
+          {room?.is_recording && room.record_started_at && (
+            <Tooltip title="录制墙钟时长（与预览轴可能差几秒）">
+              <span style={{
+                marginLeft: 8,
+                fontFamily: 'monospace',
+                fontSize: 12,
+                color: 'var(--text-tertiary)',
+              }}>
+                已录 {formatTime(
+                  Math.max(0, (Date.now() - new Date(room.record_started_at).getTime()) / 1000),
+                )}
+              </span>
+            </Tooltip>
+          )}
         </Space>
 
         {/* 右侧：视图控制 + 添加切片 */}

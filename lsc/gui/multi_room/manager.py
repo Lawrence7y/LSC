@@ -817,14 +817,10 @@ class MultiRoomManager(QObject):
         return True
 
     def _on_connect_finished(self, room_id: str, success: bool, error: str,
-        room = self.get_room(room_id)
-        if room is None or room.disconnect_requested:
-            return
-        self._connect_workers.pop(room_id, None)
                              info: StreamInfo | None) -> None:
         self._connect_workers.pop(room_id, None)
         room = self.get_room(room_id)
-        if room is None:
+        if room is None or room.disconnect_requested:
             return
 
         if success and info is not None:
