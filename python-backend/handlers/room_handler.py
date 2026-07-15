@@ -49,7 +49,7 @@ from handlers.timeline_handlers import (
     register_timeline_handlers,
     timeline_to_dict,
 )
-from lsc.gui.multi_room.manager import MultiRoomManager
+from lsc.gui.multi_room.manager import MultiRoomManager, _is_stream_offline_error
 from lsc.platforms.registry import select_quality
 from lsc.utils.error_messages import humanize_error
 from lsc.utils.process_launcher import prepare_launch, run_hidden, set_stream_nonblocking
@@ -337,6 +337,36 @@ _mse_reconnect_state: dict[str, dict[str, Any]] = {}
 _MSE_MAX_RECONNECT = 3
 _MSE_RECONNECT_BASE_DELAY = 2.0
 _MSE_RECONNECT_MAX_DELAY = 30.0
+
+
+def _room_stream_offline_confirmed(mgr: MultiRoomManager, room_id: str) -> bool:
+    """确认直播间已下播（非瞬时网络失败）。"""
+    room = mgr.get_room(room_id)
+    if room is None:
+        return False
+    if _is_stream_offline_error(room.last_error or ''):
+        return True
+    info = room.stream_info
+    if info is not None and not info.is_live:
+        if not info.stream_url or _is_stream_offline_error(info.error or ''):
+            return True
+    return False
+
+
+def _probe_stream_offline(mgr: MultiRoomManager, room_id: str) -> bool:
+    """刷新失败时强制解析，确认是否下播。"""
+    if _room_stream_offline_confirmed(mgr, room_id):
+        return True
+    room = mgr.get_room(room_id)
+    if room is None:
+        return False
+    try:
+        from lsc.platforms.registry import parse_stream
+        info = parse_stream(room.room_url, force_refresh=True)
+    except Exception as exc:
+        _log.debug("offline probe parse failed for %s: %s", room_id, exc)
+        return False
+    return not info.is_live or _is_stream_offline_error(info.error or '')
 
 
 def _invalidate_room_timeline(room_id: str, reason: str = "") -> None:
@@ -2216,6 +2246,7 @@ def register_room_handlers(server, bridge):
                     server.broadcast('mse_error', {
                         'room_id': room_id,
                         'error': err,
+                        'reason': 'network',
                     }),
                     loop,
                 ),
@@ -3661,6 +3692,7 @@ def register_room_handlers(server, bridge):
                                     srv.broadcast('mse_error', {
                                         'room_id': room_id,
                                         'error': err,
+                                        'reason': 'network',
                                     }),
                                     loop,
                                 ),
@@ -3920,6 +3952,7 @@ def register_room_handlers(server, bridge):
                         _stop_idle_shared_ingest(room_id, reason="mse error cleanup")
 
                     current_error = err
+                    mse_failure_reason = 'network'
 
                     while True:
                         # 2. 检查是否仍需预览（用户可能已手动关闭）
@@ -3951,6 +3984,7 @@ def register_room_handlers(server, bridge):
                             await srv.broadcast('mse_error', {
                                 'room_id': room_id,
                                 'error': '预览重连失败，已达到最大重试次数，请手动重新开启预览',
+                                'reason': mse_failure_reason,
                             })
 
                             def _clear_preview():
@@ -4024,6 +4058,16 @@ def register_room_handlers(server, bridge):
                             refresh_ok = False
 
                         if not refresh_ok:
+                            try:
+                                offline = await loop.run_in_executor(
+                                    _recording_executor,
+                                    lambda: _probe_stream_offline(mgr, room_id),
+                                )
+                            except Exception as exc:
+                                _log.debug("MSE reconnect offline probe failed: %s", exc)
+                                offline = False
+                            if offline:
+                                mse_failure_reason = 'offline'
                             current_error = '流地址刷新失败'
                             continue  # 进入下一次循环重试
 
@@ -4048,6 +4092,16 @@ def register_room_handlers(server, bridge):
                             snapshot = None
 
                         if snapshot is None or not snapshot['is_connected'] or not snapshot['stream_url']:
+                            try:
+                                offline = await loop.run_in_executor(
+                                    _bridge_executor,
+                                    lambda: bridge.call(lambda: _room_stream_offline_confirmed(mgr, room_id)),
+                                )
+                            except Exception as exc:
+                                _log.debug("MSE reconnect offline check failed: %s", exc)
+                                offline = False
+                            if offline:
+                                mse_failure_reason = 'offline'
                             current_error = '房间未连接或无流信息'
                             continue  # 进入下一次循环重试
 

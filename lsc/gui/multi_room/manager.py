@@ -2179,8 +2179,13 @@ class MultiRoomManager(QObject):
                 room.is_reconnecting = False
                 room.record_started_at = None
                 room.reconnect_next_attempt_at = 0.0
+                offline_msg = room.last_error or _offline_stream_error_message()
                 _log.info("Room %s reconnect stopped because stream is offline: %s",
-                          room.room_id, room.last_error)
+                          room.room_id, offline_msg)
+                try:
+                    self.recording_stopped.emit(room.room_id, 'offline', offline_msg)
+                except Exception as exc:
+                    _log.debug("recording_stopped emit failed: %s", exc)
                 return
             _log.warning("Room %s reconnect attempt %d failed: %s",
                          room.room_id, room.reconnect_attempts, room.last_error)
