@@ -448,7 +448,7 @@ export default function Workbench() {
       try {
         return previewToCommon(timelineContext, rid, bufStart)
       } catch {
-        return bufStart
+        return null
       }
     }
     return bufStart
