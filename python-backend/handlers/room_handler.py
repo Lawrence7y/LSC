@@ -374,6 +374,296 @@ def _probe_stream_offline(mgr: MultiRoomManager, room_id: str) -> tuple[bool, st
     return False, ''
 
 
+_offline_file_review_in_progress: set[str] = set()
+
+
+def _stop_live_preview_streamer(room_id: str) -> None:
+    """停止房间的直播 CDN / 共享进样预览流（为文件回看让路）。"""
+    old = _preview_stream_registry().pop(room_id)
+    if old is not None:
+        try:
+            old.stop()
+        except Exception as exc:
+            _log.debug("停止直播预览 streamer 失败: %s", exc)
+    try:
+        ingest = _shared_ingests.get(room_id)
+        if ingest is not None:
+            stop_preview = getattr(ingest, "stop_preview_sink", None)
+            if callable(stop_preview):
+                try:
+                    stop_preview()
+                except Exception as exc:
+                    _log.debug("stop_preview_sink 失败: %s", exc)
+    except Exception as exc:
+        _log.debug("shared ingest preview stop lookup failed: %s", exc)
+    _stop_idle_shared_ingest(room_id, reason="offline file review cleanup")
+
+
+def _is_normal_file_playback_end(error_text: str) -> bool:
+    if not error_text:
+        return True
+    lowered = error_text.lower()
+    markers = ("end of file", "eof", "播放结束", "review ended", "nothing to read")
+    return any(marker in lowered for marker in markers)
+
+
+async def _start_recording_file_mse(
+    srv,
+    mgr: MultiRoomManager,
+    bridge,
+    room_id: str,
+    loop,
+    *,
+    offline_message: str = "",
+    stop_recording_if_active: bool = True,
+) -> tuple[bool, str]:
+    """下播确认后切换为录制文件 MSE 回看。返回 (success, error_message)。"""
+    if room_id in _offline_file_review_in_progress:
+        return False, "offline file review already in progress"
+    _offline_file_review_in_progress.add(room_id)
+    try:
+        def _read_preview_state():
+            room = mgr.get_room(room_id)
+            if room is None:
+                return None
+            return {
+                "preview_enabled": bool(room.preview_enabled),
+                "is_recording": bool(room.is_recording),
+                "record_output_path": room.record_output_path or "",
+            }
+
+        try:
+            state = await loop.run_in_executor(
+                _bridge_executor, lambda: bridge.call(_read_preview_state)
+            )
+        except Exception as exc:
+            _log.error("offline file review state read failed: %s", exc)
+            return False, str(exc)
+
+        if state is None:
+            return False, "房间不存在"
+        if not state["preview_enabled"]:
+            return False, "预览未开启"
+
+        if stop_recording_if_active and state["is_recording"]:
+            def _stop_recording():
+                mgr.stop_recording_async(room_id)
+                return True
+
+            try:
+                await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_stop_recording, timeout=10.0)
+                )
+            except Exception as exc:
+                _log.warning("offline file review stop recording failed: %s", exc)
+            await asyncio.sleep(0.5)
+
+        def _stop_live():
+            _stop_live_preview_streamer(room_id)
+            return True
+
+        await loop.run_in_executor(_bridge_executor, lambda: bridge.call(_stop_live))
+
+        def _validate_recording_path():
+            from lsc.recorder.capture import validate_recording
+
+            room = mgr.get_room(room_id)
+            if room is None:
+                return False, "", "房间不存在"
+            path = room.record_output_path or ""
+            valid, err = validate_recording(path)
+            return valid, path, err
+
+        try:
+            valid, path, validation_err = await loop.run_in_executor(
+                _recording_executor, lambda: bridge.call(_validate_recording_path)
+            )
+        except Exception as exc:
+            _log.error("offline file review validate failed: %s", exc)
+            valid, path, validation_err = False, "", str(exc)
+
+        if not valid or not path:
+            friendly = validation_err or "录制文件无效，无法回看"
+            if offline_message and friendly:
+                friendly = f"{offline_message}（{friendly}）"
+            elif offline_message:
+                friendly = offline_message
+
+            def _set_degraded():
+                room = mgr.get_room(room_id)
+                if room is not None:
+                    room.preview_mode = "degraded"
+                    room.preview_enabled = False
+                    room.preview_error = friendly
+                    if offline_message:
+                        room.last_error = offline_message
+                return True
+
+            try:
+                await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_set_degraded)
+                )
+            except Exception as exc:
+                _log.error("offline degraded state update failed: %s", exc)
+            bridge.queue_broadcast({
+                "type": "rooms_updated",
+                "data": {"rooms": _rooms_list(mgr)},
+            })
+            await srv.broadcast("preview_phase", {"room_id": room_id, "phase": "error"})
+            return False, friendly
+
+        preview_params = _compute_preview_quality_params({})
+        width = int(preview_params.get("width") or 0)
+        height = int(preview_params.get("height") or 0)
+        fps = int(preview_params.get("fps") or 0)
+        video_bitrate = preview_params.get("video_bitrate")
+        crf_value = preview_params.get("crf_value")
+
+        async def _on_file_mse_error(err: str) -> None:
+            if _is_normal_file_playback_end(err):
+                _log.info("Recording file review ended quietly for %s", room_id)
+                ended = _preview_stream_registry().pop(room_id)
+                if ended is not None:
+                    try:
+                        await loop.run_in_executor(_bridge_executor, ended.stop)
+                    except Exception as exc:
+                        _log.debug("file review streamer stop failed: %s", exc)
+                await srv.broadcast("preview_phase", {"room_id": room_id, "phase": "idle"})
+                return
+            _log.warning("Recording file review error for %s: %s", room_id, err)
+            def _set_degraded():
+                room = mgr.get_room(room_id)
+                if room is not None:
+                    room.preview_mode = "degraded"
+                    room.preview_enabled = False
+                    room.preview_error = err or "录制回看失败"
+                return True
+
+            try:
+                await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_set_degraded)
+                )
+            except Exception as exc:
+                _log.debug("file review degraded update failed: %s", exc)
+            bridge.queue_broadcast({
+                "type": "rooms_updated",
+                "data": {"rooms": _rooms_list(mgr)},
+            })
+            await srv.broadcast("preview_phase", {"room_id": room_id, "phase": "error"})
+
+        def _start_file_streamer():
+            from lsc.core.services.mse_streamer import MseStreamer
+
+            try:
+                streamer = MseStreamer(
+                    url=path,
+                    is_file=True,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    video_bitrate=video_bitrate,
+                    crf_value=crf_value,
+                    on_init_segment=lambda seg, _room_id=room_id: asyncio.run_coroutine_threadsafe(
+                        srv.broadcast("mse_init", {
+                            "room_id": _room_id,
+                            "data": base64.b64encode(seg).decode("ascii"),
+                        }),
+                        loop,
+                    ),
+                    on_media_segment=lambda seg, _room_id=room_id: asyncio.run_coroutine_threadsafe(
+                        srv.broadcast("mse_segment", {
+                            "room_id": _room_id,
+                            "data": base64.b64encode(seg).decode("ascii"),
+                        }),
+                        loop,
+                    ),
+                    on_error=lambda err, _room_id=room_id: asyncio.run_coroutine_threadsafe(
+                        _on_file_mse_error(err), loop
+                    ),
+                )
+                ok = streamer.start(startup_probe_timeout=5.0)
+                if ok:
+                    _preview_stream_registry().set_legacy(room_id, streamer)
+                    return True, ""
+                stderr_tail = ""
+                try:
+                    stderr_tail = (streamer._last_stderr or "").strip()[:300]
+                except AttributeError:
+                    pass
+                try:
+                    streamer.stop()
+                except Exception as exc:
+                    _log.debug("停止失败的文件 streamer 失败: %s", exc)
+                return False, stderr_tail or "文件预览启动失败"
+            except Exception as exc:
+                _log.error("file MSE start failed: %s", exc)
+                return False, str(exc)
+
+        try:
+            started, start_err = await loop.run_in_executor(
+                _recording_executor, _start_file_streamer
+            )
+        except Exception as exc:
+            started, start_err = False, str(exc)
+
+        if not started:
+            def _set_degraded():
+                room = mgr.get_room(room_id)
+                if room is not None:
+                    room.preview_mode = "degraded"
+                    room.preview_enabled = False
+                    room.preview_error = start_err or "录制回看启动失败"
+                return True
+
+            try:
+                await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.call(_set_degraded)
+                )
+            except Exception as exc:
+                _log.debug("file review start degraded update failed: %s", exc)
+            bridge.queue_broadcast({
+                "type": "rooms_updated",
+                "data": {"rooms": _rooms_list(mgr)},
+            })
+            await srv.broadcast("preview_phase", {"room_id": room_id, "phase": "error"})
+            return False, start_err or "录制回看启动失败"
+
+        def _set_review_mode():
+            room = mgr.get_room(room_id)
+            if room is not None:
+                new_epoch = uuid4().hex
+                room.preview_enabled = True
+                room.preview_mode = "recording_review"
+                room.preview_error = ""
+                room.preview_epoch_id = new_epoch
+                get_timeline_service().on_preview_epoch_change(room_id, new_epoch)
+            return True
+
+        try:
+            await loop.run_in_executor(
+                _bridge_executor, lambda: bridge.call(_set_review_mode)
+            )
+        except Exception as exc:
+            leak = _preview_stream_registry().pop(room_id)
+            if leak is not None:
+                try:
+                    await loop.run_in_executor(_bridge_executor, leak.stop)
+                except Exception as stop_exc:
+                    _log.debug("file review leak cleanup failed: %s", stop_exc)
+            return False, f"预览状态同步失败：{exc}"
+
+        _mse_reconnect_state.pop(room_id, None)
+        bridge.queue_broadcast({
+            "type": "rooms_updated",
+            "data": {"rooms": _rooms_list(mgr)},
+        })
+        await srv.broadcast("preview_phase", {"room_id": room_id, "phase": "streaming"})
+        _log.info("Switched room %s to recording file MSE review: %s", room_id, path)
+        return True, ""
+    finally:
+        _offline_file_review_in_progress.discard(room_id)
+
+
 def _invalidate_room_timeline(room_id: str, reason: str = "") -> None:
     """若房间绑定了活动 TimelineContext，则使其失效（不删除 ClipSnapshot）。"""
     svc = get_timeline_service()
@@ -2352,6 +2642,29 @@ def register_room_handlers(server, bridge):
     # 每 5 秒中频 tick 时广播 rooms_updated，让前端刷新录制文件大小
     manager.medium_tick.connect(_queue_rooms_update)
 
+    _ws_loop = asyncio.get_event_loop()
+
+    def _on_manager_recording_stopped_offline(room_id: str, reason: str, message: str) -> None:
+        """录制侧重连判定下播时，若预览仍开启则切换为文件回看。"""
+        if reason != 'offline':
+            return
+        if not _ws_loop.is_running():
+            return
+        asyncio.run_coroutine_threadsafe(
+            _start_recording_file_mse(
+                server,
+                manager,
+                bridge,
+                room_id,
+                _ws_loop,
+                offline_message=message,
+                stop_recording_if_active=False,
+            ),
+            _ws_loop,
+        )
+
+    manager.recording_stopped.connect(_on_manager_recording_stopped_offline)
+
     def _broadcast_system_stats():
         """广播系统资源快照到前端。"""
         try:
@@ -3968,10 +4281,23 @@ def register_room_handlers(server, bridge):
                             'reason': reason,
                         })
 
+                        if reason == 'offline':
+                            await _start_recording_file_mse(
+                                srv,
+                                mgr,
+                                bridge,
+                                room_id,
+                                loop,
+                                offline_message=error_text,
+                                stop_recording_if_active=True,
+                            )
+                            return
+
                         def _clear_preview():
                             room = mgr.get_room(room_id)
                             if room is not None:
                                 room.preview_enabled = False
+                                room.preview_mode = 'live_mse'
                             _invalidate_room_timeline(room_id, reason=timeline_reason)
 
                         try:
@@ -4081,6 +4407,7 @@ def register_room_handlers(server, bridge):
                                 _log.debug("MSE reconnect offline probe failed: %s", exc)
                                 offline, offline_msg = False, ''
                             if offline:
+                                mse_failure_reason = 'offline'
                                 await _finalize_mse_error(
                                     offline_msg or _mse_offline_error_message(),
                                     'offline',
@@ -4120,6 +4447,7 @@ def register_room_handlers(server, bridge):
                                 _log.debug("MSE reconnect offline probe failed: %s", exc)
                                 offline, offline_msg = False, ''
                             if offline:
+                                mse_failure_reason = 'offline'
                                 await _finalize_mse_error(
                                     offline_msg or _mse_offline_error_message(),
                                     'offline',
@@ -4325,6 +4653,8 @@ def register_room_handlers(server, bridge):
                     if room is not None:
                         new_epoch = uuid4().hex
                         room.preview_enabled = True
+                        room.preview_mode = 'live_mse'
+                        room.preview_error = ''
                         room.preview_epoch_id = new_epoch
                         get_timeline_service().on_preview_epoch_change(room_id, new_epoch)
                     return True
@@ -4366,6 +4696,7 @@ def register_room_handlers(server, bridge):
                 room = mgr.get_room(room_id)
                 if room:
                     room.preview_enabled = False
+                    room.preview_mode = 'live_mse'
                 return True
 
             await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_disable))

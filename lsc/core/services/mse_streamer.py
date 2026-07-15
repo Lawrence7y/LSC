@@ -106,8 +106,10 @@ class MseStreamer:
         headers: dict[str, str] | None = None,
         video_bitrate: str = "",
         crf_value: int = 0,
+        is_file: bool = False,
     ):
         self._url = url
+        self._is_file = is_file or (os.path.isfile(url) if url else False)
         self._on_init = on_init_segment
         self._on_segment = on_media_segment
         self._on_error = on_error
@@ -177,28 +179,27 @@ class MseStreamer:
         # FFmpeg command for low-latency fMP4 output.
         # 直接映射直播流的音视频轨（-map 0:v / -map 0:a?），保留真实音频。
         # -map 0:a? 的 ? 后缀表示音频轨可选，无音频轨的直播流不会报错。
-        # 增加 -re/-fflags +genpts/-thread_queue_size 以兼容直播平台 HLS/FLV 流；
-        # HLS 直播从最新分片开始读取，避免等待过期分片。
-        # 添加 timeout/rw_timeout 防止网络层面长时间挂起；
-        # reconnect 选项在网络中断时自动重连。
+        # 直播模式：增加 timeout/reconnect 等网络选项；本地文件模式跳过这些。
         cmd = [
             self._ffmpeg_path,
             "-loglevel", "error",
             "-re",
             "-fflags", "+genpts",
             "-thread_queue_size", "1024",
-            # 网络超时：连接超时 10s，读写超时 15s
-            "-timeout", "10000000",
-            "-rw_timeout", "15000000",
-            # 断流自动重连（适用于 HLS/RTMP 流）
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
         ]
-
-        # 插入 HTTP headers（B站/虎牙/斗鱼 CDN 强制检查 Referer，缺少会 403）
-        if self._headers:
-            cmd += headers_to_ffmpeg_input_args(self._headers)
+        if not self._is_file:
+            cmd += [
+                # 网络超时：连接超时 10s，读写超时 15s
+                "-timeout", "10000000",
+                "-rw_timeout", "15000000",
+                # 断流自动重连（适用于 HLS/RTMP 流）
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+            ]
+            # 插入 HTTP headers（B站/虎牙/斗鱼 CDN 强制检查 Referer，缺少会 403）
+            if self._headers:
+                cmd += headers_to_ffmpeg_input_args(self._headers)
 
         cmd += [
             "-i", self._url,
@@ -244,7 +245,7 @@ class MseStreamer:
             "-frag_duration", "1000000",  # 1000ms fragments
             "pipe:1",
         ]
-        if self._url.lower().endswith('.m3u8'):
+        if not self._is_file and self._url.lower().endswith('.m3u8'):
             # 从 HLS 直播最新分片开始读取；插入到唯一的 -i 之前
             # 由于 FFmpeg 按位置解析选项，-live_start_index -1 必须在对应 -i 之前
             i_indices = [i for i, arg in enumerate(cmd) if arg == '-i']
@@ -300,7 +301,8 @@ class MseStreamer:
         self._thread.start()
         self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self._stderr_thread.start()
-        _log.info("MseStreamer started for %s", self._url[:80])
+        source_kind = "file" if self._is_file else "live"
+        _log.info("MseStreamer started (%s) for %s", source_kind, self._url[:80])
 
         # 启动探测：轮询检查 init segment 是否已产出或 FFmpeg 是否已退出
         # 比固定 sleep 更快——init 产出后立即返回，不必等满 probe_timeout
@@ -428,8 +430,9 @@ class MseStreamer:
                     return
                 time.sleep(1.0)
 
-        self._watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
-        self._watchdog_thread.start()
+        if not self._is_file:
+            self._watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+            self._watchdog_thread.start()
 
         try:
             while self._running:
@@ -448,7 +451,9 @@ class MseStreamer:
                                 stderr_output = proc.stderr.read(4096)
                             except Exception as exc:
                                 _log.debug("操作异常（已忽略）: %s", exc)
-                        if self._running and not self._error_reported and self._on_error:
+                        if self._is_file:
+                            _log.info("File MSE playback finished: %s", self._url[:80])
+                        elif self._running and not self._error_reported and self._on_error:
                             self._error_reported = True
                             err_msg = (
                                 self._last_stderr
