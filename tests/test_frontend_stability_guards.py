@@ -879,3 +879,12 @@ def test_timeline_dvr_start_prop() -> None:
     assert "dvrStart=" in control or "dvrStart={" in control
     # 紫标应对齐 dvrStart
     assert "dvrStartPct" in timeline or ("dvrStart" in timeline and "lsc-timeline__record-end" in timeline)
+
+
+def test_timeline_seek_snaps_left_of_dvr_to_live() -> None:
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    handler = workbench.split("const handleTimelineSeek = useCallback", 1)[1].split(
+        "const handleTimelineScrubStart", 1
+    )[0]
+    assert "dvrStart" in handler or "bufStart" in handler
+    assert "enterTimelineLive" in handler

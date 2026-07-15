@@ -16,7 +16,15 @@ import { commonToPreview, commonToRecording, getAlignStatus, pickReferenceRoomId
 
 /** 贴右此容差内视为回到 Live（秒） */
 const LIVE_EDGE_TOLERANCE_SEC = 1.0
+/** 越过紫标左沿此容差内视为回到 Live（秒） */
+const DVR_LEFT_TOLERANCE_SEC = 0.25
 const TIMELINE_MAX_WINDOW = 600
+
+function getRoomBufferedRange(roomId: string): { start: number; end: number } | null {
+  const registry = (window as any).__msePlayers
+  const player = registry?.[roomId]?.player
+  return player?.getBufferedRange?.() ?? null
+}
 import { sendRequest } from '@/utils/wsRequest'
 import { scheduleBatchedToast } from '@/utils/toastBatch'
 import { formatManualClipLabel } from '@/utils/clipNaming'
@@ -419,12 +427,32 @@ export default function Workbench() {
       clips: clipBlocks,
       highlights: timelineHighlights,
       waveformPeaks,
+      contentEnd,
     }
   }, [
     commonMode, timelineContext, referenceRoomId, rooms, previewPositions,
     commonMarkIn, commonMarkOut, clips, timelineHighlights, timelineTick,
-    refiningClipId, waveformPeaks, timelineFollowLive, timelineScrubbing, frozenWindowStart,
+    refiningClipId, waveformPeaks,     timelineFollowLive, timelineScrubbing, frozenWindowStart,
   ])
+
+  // 紫标 = MSE 缓冲左沿（与 timelineView / contentEnd 同轴）；随 previewPositions tick 刷新
+  const dvrStart = useMemo((): number | null => {
+    const rid = referenceRoomId || selectedRoomId
+    if (!rid) return null
+    const room = rooms.find(r => r.room_id === rid)
+    if (!room?.preview_enabled || room.preview_phase !== 'streaming') return null
+    const buf = getRoomBufferedRange(rid)
+    if (!buf) return null
+    const bufStart = buf.start
+    if (commonMode && timelineContext?.room_snapshots[rid]) {
+      try {
+        return previewToCommon(timelineContext, rid, bufStart)
+      } catch {
+        return bufStart
+      }
+    }
+    return bufStart
+  }, [referenceRoomId, selectedRoomId, rooms, commonMode, timelineContext, previewPositions])
 
   // Escape 键退出放大（capture 阶段拦截，避免触发其他快捷键如 mark_in/out）
   useEffect(() => {
@@ -571,8 +599,19 @@ export default function Workbench() {
         message.error(`停止录制失败：${data?.error || '未知错误'}`)
       }
     }))
+
+    // MSE 断流（主播下线）：自动停止录制 + 黄色提示
+    unsubs.push(on('mse_error', (data: { room_id?: string; error?: string }) => {
+      if (!data?.room_id) return
+      const r = useAppStore.getState().rooms.find(r => r.room_id === data.room_id)
+      if (r?.is_recording) {
+        send('stop_recording', { room_id: data.room_id })
+      }
+      message.warning('主播已下线，录制已保存，可回看', 5)
+    }))
+
     return () => unsubs.forEach(u => u())
-  }, [on])
+  }, [on, send])
 
   // 添加/删除房间成功后，发送 save_rooms 持久化房间列表
   useEffect(() => {
@@ -1129,6 +1168,10 @@ export default function Workbench() {
     const edge = Math.max(lastContentEndRef.current, 1)
     // 不可拖过直播沿；贴右容差内视为回 Live（拖拽中不进 Live，等松手判定）
     const clamped = Math.max(0, Math.min(time, edge))
+    if (!scrubbing && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+      enterTimelineLive(targets)
+      return
+    }
     if (!scrubbing && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
@@ -1148,7 +1191,7 @@ export default function Workbench() {
       const offset = room?.content_offset ?? 0
       mseSeek(rid, Math.max(0, clamped - offset), { quiet: scrubbing })
     })
-  }, [resolveSeekTargets, enterTimelineLive, mseSeek, rooms])
+  }, [resolveSeekTargets, enterTimelineLive, mseSeek, rooms, dvrStart])
 
   const handleTimelineScrubStart = useCallback((ws: number) => {
     // 冻结真实左缘；一拖即退出 Live
@@ -1183,6 +1226,10 @@ export default function Workbench() {
     }
 
     const clamped = Math.max(0, Math.min(playhead, edge))
+    if (dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+      enterTimelineLive(targets)
+      return
+    }
     if (edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
@@ -1198,7 +1245,7 @@ export default function Workbench() {
       const offset = room?.content_offset ?? 0
       mseSeek(targetRid, Math.max(0, clamped - offset))
     })
-  }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, enterTimelineLive, resolveSeekTargets, mseSeek])
+  }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, enterTimelineLive, resolveSeekTargets, mseSeek, dvrStart])
 
   // 添加到切片列表
   const handleAddClip = useCallback((roomId: string) => {
@@ -1257,6 +1304,10 @@ export default function Workbench() {
       if (!refId) return
       const commonT = previewToCommon(ctx, refId, getPreviewCurrentTime(refId)) + delta
       const clamped = Math.max(0, Math.min(commonT, edge))
+      if (dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+        enterTimelineLive(targets)
+        return
+      }
       if (edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
         enterTimelineLive(targets)
         return
@@ -1270,6 +1321,10 @@ export default function Workbench() {
     }
     const anyId = [...targets][0]
     const next = Math.max(0, Math.min(getPreviewCurrentTime(anyId) + delta, edge))
+    if (dvrStart != null && next < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+      enterTimelineLive(targets)
+      return
+    }
     if (edge - next <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
@@ -1279,7 +1334,7 @@ export default function Workbench() {
       const cur = getPreviewCurrentTime(rid)
       mseSeek(rid, Math.max(0, Math.min(cur + delta, edge)))
     })
-  }, [selectedRoomIds, selectedRoomId, getPreviewCurrentTime, mseSeek, resolveSeekTargets, enterTimelineLive])
+  }, [selectedRoomIds, selectedRoomId, getPreviewCurrentTime, mseSeek, resolveSeekTargets, enterTimelineLive, dvrStart])
 
   const handleControlSeekBack = useCallback(() => {
     handleSeekByDelta(-10)
@@ -3247,6 +3302,7 @@ export default function Workbench() {
             localDragMark={localDragMark}
             activeRefine={activeRefineRange}
             recordedDurationHint={recordedDurationHint}
+            dvrStart={dvrStart}
             onHighlightClick={(h) => {
               setCommonMarkIn(h.start)
               setCommonMarkOut(h.end)
