@@ -12,7 +12,19 @@ import { ClipSegment, ContinuousAnalysisStatus, TimelineHighlightBand } from '@/
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
 import { formatTime } from '@/utils/time'
 import { getAligner, type PreviewAudioCaptureDiagnostics } from '@/utils/previewAudioAligner'
-import { commonToPreview, commonToRecording, getAlignStatus, pickReferenceRoomId, previewToCommon, recordingToCommon, panTimelineWindowStart } from '@/utils/timelineCoords'
+import {
+  commonToPreview,
+  commonToRecording,
+  computeRecordedDurationHint,
+  getAlignStatus,
+  isNoDvrPreviewMode,
+  isRecordingReviewMode,
+  pickReferenceRoomId,
+  previewToCommon,
+  recordingToCommon,
+  panTimelineWindowStart,
+  resolveRecordingReviewSpan,
+} from '@/utils/timelineCoords'
 
 /** 贴右此容差内视为回到 Live（秒） */
 const LIVE_EDGE_TOLERANCE_SEC = 1.0
@@ -24,6 +36,20 @@ function getRoomBufferedRange(roomId: string): { start: number; end: number } | 
   const registry = (window as any).__msePlayers
   const player = registry?.[roomId]?.player
   return player?.getBufferedRange?.() ?? null
+}
+
+function getRoomMediaDuration(roomId: string): number | null {
+  const video = (window as any).__msePlayers?.[roomId]?.player?.videoElement as HTMLVideoElement | undefined
+  const dur = video?.duration
+  return dur != null && Number.isFinite(dur) && dur > 0 ? dur : null
+}
+
+function targetsIncludeNoDvrMode(targets: Set<string>, roomList: { room_id: string; preview_mode?: string }[]): boolean {
+  for (const rid of targets) {
+    const mode = roomList.find(r => r.room_id === rid)?.preview_mode
+    if (isNoDvrPreviewMode(mode)) return true
+  }
+  return false
 }
 import { sendRequest } from '@/utils/wsRequest'
 import { scheduleBatchedToast } from '@/utils/toastBatch'
@@ -340,8 +366,20 @@ export default function Workbench() {
     const refRoom = rooms.find(r => r.room_id === referenceRoomId)
     const previewT = previewPositions[referenceRoomId] ?? 0
     const curCommon = previewToCommon(timelineContext, referenceRoomId, previewT)
-    // 仅用与播放头同轴的 common 时间撑开窗口，禁止混入录制墙钟 / recorded_duration
+    const isRecordingReview = isRecordingReviewMode(refRoom?.preview_mode)
+  // 仅用与播放头同轴的 common 时间撑开窗口；recording_review 额外允许录制全长撑右沿
     let elapsed = Math.max(commonMarkOut ?? 0, commonMarkIn ?? 0, curCommon)
+    if (isRecordingReview) {
+      const recordedHint = computeRecordedDurationHint(refRoom, continuousAnalysisStatus?.recorded_duration)
+      const reviewSpan = resolveRecordingReviewSpan(
+        previewT,
+        recordedHint,
+        getRoomMediaDuration(referenceRoomId),
+        commonMarkIn,
+        commonMarkOut,
+      )
+      elapsed = Math.max(elapsed, reviewSpan)
+    }
     const refineClip = refiningClipId
       ? clips.find(c => c.round_key === refiningClipId || c.clip_id === refiningClipId)
       : null
@@ -433,13 +471,15 @@ export default function Workbench() {
     commonMode, timelineContext, referenceRoomId, rooms, previewPositions,
     commonMarkIn, commonMarkOut, clips, timelineHighlights, timelineTick,
     refiningClipId, waveformPeaks,     timelineFollowLive, timelineScrubbing, frozenWindowStart,
+    continuousAnalysisStatus?.recorded_duration,
   ])
 
-  // 紫标 = MSE 缓冲左沿（与 timelineView / contentEnd 同轴）；随 previewPositions tick 刷新
+  // 紫标 = MSE 缓冲左沿（与 timelineView / contentEnd 同轴）；recording_review / degraded 无紫标
   const dvrStart = useMemo((): number | null => {
     const rid = referenceRoomId || selectedRoomId
     if (!rid) return null
     const room = rooms.find(r => r.room_id === rid)
+    if (isNoDvrPreviewMode(room?.preview_mode)) return null
     if (!room?.preview_enabled || room.preview_phase !== 'streaming') return null
     const buf = getRoomBufferedRange(rid)
     if (!buf) return null
@@ -453,6 +493,16 @@ export default function Workbench() {
     }
     return bufStart
   }, [referenceRoomId, selectedRoomId, rooms, commonMode, timelineContext, previewPositions])
+
+  // recording_review / degraded：强制退出 followLive
+  useEffect(() => {
+    const rid = referenceRoomId || selectedRoomId
+    if (!rid) return
+    const room = rooms.find(r => r.room_id === rid)
+    if (isNoDvrPreviewMode(room?.preview_mode)) {
+      setTimelineFollowLive(false)
+    }
+  }, [rooms, referenceRoomId, selectedRoomId])
 
   // Escape 键退出放大（capture 阶段拦截，避免触发其他快捷键如 mark_in/out）
   useEffect(() => {
@@ -607,7 +657,7 @@ export default function Workbench() {
       const r = useAppStore.getState().rooms.find(x => x.room_id === data.room_id)
       if (reason === 'offline') {
         if (r?.is_recording) send('stop_recording', { room_id: data.room_id })
-        message.warning('主播已下线，录制已保存', 5)
+        message.warning('主播已下线，录制已保存，可回看录制内容', 5)
         return
       }
       message.warning(data.error || '预览异常，请检查网络或重试预览', 5)
@@ -1070,6 +1120,26 @@ export default function Workbench() {
     return 0
   }, [])
 
+  const resolveReviewSeekEdge = useCallback((targets: Set<string>): number => {
+    const refId = referenceRoomId || selectedRoomId || [...targets][0]
+    if (!refId) return Math.max(lastContentEndRef.current, 1)
+    const refRoom = rooms.find(r => r.room_id === refId)
+    if (!isRecordingReviewMode(refRoom?.preview_mode)) {
+      return Math.max(lastContentEndRef.current, 1)
+    }
+    const hint = computeRecordedDurationHint(refRoom, continuousAnalysisStatus?.recorded_duration)
+    return resolveRecordingReviewSpan(
+      getPreviewCurrentTime(refId),
+      hint,
+      getRoomMediaDuration(refId),
+      refRoom?.mark_in,
+      refRoom?.mark_out,
+    )
+  }, [
+    referenceRoomId, selectedRoomId, rooms,
+    continuousAnalysisStatus?.recorded_duration, getPreviewCurrentTime,
+  ])
+
   // 直接控制 MSE player 的 video 元素（Electron 模式下后端无法控制 MSE video）
   const mseSeek = useCallback((roomId: string, time: number, opts?: { quiet?: boolean }) => {
     const t = Math.max(0, time)
@@ -1126,12 +1196,14 @@ export default function Workbench() {
   }, [selectedRoomIds, selectedRoomId, referenceRoomId, rooms])
 
   const enterTimelineLive = useCallback((targets?: Set<string>) => {
+    const ids = targets && targets.size > 0 ? targets : resolveSeekTargets()
+    const roomList = useAppStore.getState().rooms
+    if (targetsIncludeNoDvrMode(ids, roomList)) return
     scrubOverrideRef.current = {}
     setFrozenWindowStart(null)
     setTimelineFollowLive(true)
     timelineScrubbingRef.current = false
     setTimelineScrubbing(false)
-    const ids = targets && targets.size > 0 ? targets : resolveSeekTargets()
     const registry = (window as any).__msePlayers
     ids.forEach(rid => {
       const entry = registry?.[rid]
@@ -1168,14 +1240,15 @@ export default function Workbench() {
     }
     if (targets.size === 0) return
 
-    const edge = Math.max(lastContentEndRef.current, 1)
-    // 不可拖过直播沿；贴右容差内视为回 Live（拖拽中不进 Live，等松手判定）
+    const noDvr = targetsIncludeNoDvrMode(targets, rooms)
+    const edge = noDvr ? resolveReviewSeekEdge(targets) : Math.max(lastContentEndRef.current, 1)
+    // 不可拖过直播沿；贴右容差内视为回 Live（recording_review 无 Live 沿）
     const clamped = Math.max(0, Math.min(time, edge))
-    if (!scrubbing && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+    if (!scrubbing && !noDvr && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
     }
-    if (!scrubbing && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
+    if (!scrubbing && !noDvr && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
     }
@@ -1194,7 +1267,7 @@ export default function Workbench() {
       const offset = room?.content_offset ?? 0
       mseSeek(rid, Math.max(0, clamped - offset), { quiet: scrubbing })
     })
-  }, [resolveSeekTargets, enterTimelineLive, mseSeek, rooms, dvrStart])
+  }, [resolveSeekTargets, enterTimelineLive, mseSeek, rooms, dvrStart, resolveReviewSeekEdge])
 
   const handleTimelineScrubStart = useCallback((ws: number) => {
     // 冻结真实左缘；一拖即退出 Live
@@ -1208,7 +1281,8 @@ export default function Workbench() {
     timelineScrubbingRef.current = false
     setTimelineScrubbing(false)
     const targets = resolveSeekTargets()
-    const edge = Math.max(lastContentEndRef.current, 1)
+    const noDvr = targetsIncludeNoDvrMode(targets, rooms)
+    const edge = noDvr ? resolveReviewSeekEdge(targets) : Math.max(lastContentEndRef.current, 1)
     const ctx = useAppStore.getState().timelineContext
     const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
 
@@ -1229,11 +1303,11 @@ export default function Workbench() {
     }
 
     const clamped = Math.max(0, Math.min(playhead, edge))
-    if (dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+    if (!noDvr && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
     }
-    if (edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
+    if (!noDvr && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
     }
@@ -1248,7 +1322,7 @@ export default function Workbench() {
       const offset = room?.content_offset ?? 0
       mseSeek(targetRid, Math.max(0, clamped - offset))
     })
-  }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, enterTimelineLive, resolveSeekTargets, mseSeek, dvrStart])
+  }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, enterTimelineLive, resolveSeekTargets, mseSeek, dvrStart, resolveReviewSeekEdge])
 
   // 添加到切片列表
   const handleAddClip = useCallback((roomId: string) => {
@@ -1301,17 +1375,18 @@ export default function Workbench() {
     if (targets.size === 0) return
     const ctx = useAppStore.getState().timelineContext
     const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
-    const edge = Math.max(lastContentEndRef.current, 1)
+    const noDvr = targetsIncludeNoDvrMode(targets, rooms)
+    const edge = noDvr ? resolveReviewSeekEdge(targets) : Math.max(lastContentEndRef.current, 1)
     if (status === 'ready' && ctx) {
       const refId = pickReferenceRoomId(ctx, selectedRoomIds, selectedRoomId)
       if (!refId) return
       const commonT = previewToCommon(ctx, refId, getPreviewCurrentTime(refId)) + delta
       const clamped = Math.max(0, Math.min(commonT, edge))
-      if (dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+      if (!noDvr && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
         enterTimelineLive(targets)
         return
       }
-      if (edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
+      if (!noDvr && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
         enterTimelineLive(targets)
         return
       }
@@ -1324,11 +1399,11 @@ export default function Workbench() {
     }
     const anyId = [...targets][0]
     const next = Math.max(0, Math.min(getPreviewCurrentTime(anyId) + delta, edge))
-    if (dvrStart != null && next < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
+    if (!noDvr && dvrStart != null && next < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
     }
-    if (edge - next <= LIVE_EDGE_TOLERANCE_SEC) {
+    if (!noDvr && edge - next <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
     }
@@ -1337,7 +1412,7 @@ export default function Workbench() {
       const cur = getPreviewCurrentTime(rid)
       mseSeek(rid, Math.max(0, Math.min(cur + delta, edge)))
     })
-  }, [selectedRoomIds, selectedRoomId, getPreviewCurrentTime, mseSeek, resolveSeekTargets, enterTimelineLive, dvrStart])
+  }, [selectedRoomIds, selectedRoomId, getPreviewCurrentTime, mseSeek, resolveSeekTargets, enterTimelineLive, dvrStart, rooms, resolveReviewSeekEdge])
 
   const handleControlSeekBack = useCallback(() => {
     handleSeekByDelta(-10)
@@ -1502,14 +1577,15 @@ export default function Workbench() {
   }, [selectedRoomIds, handleAddClip, addClip, commonMarkIn, commonMarkOut, send, on])
 
   const handleGoLive = useCallback(() => {
-    console.log('[Workbench] 用户操作: 跳转到直播最新位置, 房间数:', selectedRoomIds.size)
     const targets = resolveSeekTargets()
+    if (targetsIncludeNoDvrMode(targets, rooms)) return
+    console.log('[Workbench] 用户操作: 跳转到直播最新位置, 房间数:', targets.size)
     if (targets.size === 0) {
       console.warn('[Workbench] 直播按钮诊断: 未选中房间')
       return
     }
     enterTimelineLive(targets)
-  }, [selectedRoomIds, resolveSeekTargets, enterTimelineLive])
+  }, [rooms, resolveSeekTargets, enterTimelineLive])
 
   // Phase 3: 音频对齐结果监听器
   useEffect(() => {
@@ -2762,14 +2838,7 @@ export default function Workbench() {
   ])
 
   const recordedDurationHint = useMemo(() => {
-    let hint = continuousAnalysisStatus?.recorded_duration ?? 0
-    if (selectedRoom?.is_recording && selectedRoom.record_started_at) {
-      hint = Math.max(
-        hint,
-        (Date.now() - new Date(selectedRoom.record_started_at).getTime()) / 1000,
-      )
-    }
-    return hint
+    return computeRecordedDurationHint(selectedRoom, continuousAnalysisStatus?.recorded_duration)
   }, [continuousAnalysisStatus?.recorded_duration, selectedRoom?.is_recording, selectedRoom?.record_started_at, timelineTick])
 
   const exportSummary = useMemo(() => clips.reduce((summary, clip) => {

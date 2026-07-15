@@ -15,7 +15,7 @@ import {
 } from '@ant-design/icons'
 import { RoomSession, ClipSegment, TimelineHighlightBand } from '@/types'
 import type { TimelineAlignStatus } from '@/utils/timelineCoords'
-import { panTimelineWindowStart } from '@/utils/timelineCoords'
+import { panTimelineWindowStart, computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, resolveRecordingReviewSpan } from '@/utils/timelineCoords'
 import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
 import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
@@ -124,7 +124,8 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
     a.record_started_at === b.record_started_at &&
     a.mark_in === b.mark_in &&
     a.mark_out === b.mark_out &&
-    a.record_output_path === b.record_output_path
+    a.record_output_path === b.record_output_path &&
+    a.preview_mode === b.preview_mode
   )
 }
 
@@ -163,8 +164,10 @@ export const ControlBar = memo(function ControlBar({
   recordedDurationHint: _recordedDurationHint = 0,
   dvrStart = null,
 }: ControlBarProps) {
-  void _recordedDurationHint
+  const recordedDurationHint = _recordedDurationHint
   void _alignStatus
+  const isRecordingReview = isRecordingReviewMode(room?.preview_mode)
+  const goLiveDisabled = isNoDvrPreviewMode(room?.preview_mode)
   // 录制中时每秒刷新一次时间显示，非录制时不触发
   const [tick, setTick] = useState(0)
   useEffect(() => {
@@ -199,7 +202,7 @@ export const ControlBar = memo(function ControlBar({
       contentEdgeRef.current = 1
     }
     let cur = 0
-    // 仅用预览轴时间（previewPos / mark / refine），禁止混入录制墙钟与 recorded_duration
+    // 仅用预览轴时间；recording_review 额外允许录制全长撑右沿
     let elapsed = 0
     if (room?.mark_out !== null && room?.mark_out !== undefined && room.mark_out > 0) {
       elapsed = room.mark_out
@@ -209,6 +212,13 @@ export const ControlBar = memo(function ControlBar({
     }
     if (previewPos > elapsed) {
       elapsed = previewPos
+    }
+    if (isRecordingReview) {
+      const recordedHint = computeRecordedDurationHint(room, recordedDurationHint)
+      elapsed = Math.max(
+        elapsed,
+        resolveRecordingReviewSpan(previewPos, recordedHint, null, room?.mark_in, room?.mark_out),
+      )
     }
     if (activeRefine && activeRefine.end > elapsed) {
       elapsed = activeRefine.end
@@ -257,8 +267,9 @@ export const ControlBar = memo(function ControlBar({
     }
     return { duration: dur, currentTime: cur, windowStart: ws, contentEnd }
   }, [
-    room?.room_id, room?.mark_out, room?.mark_in,
+    room?.room_id, room?.mark_out, room?.mark_in, room?.preview_mode,
     previewPos, tick, activeRefine, followLive, isScrubbing, frozenWindowStart,
+    recordedDurationHint, isRecordingReview,
   ])
 
   const { duration, currentTime, windowStart } = timelineView ?? localTimeline
@@ -472,13 +483,13 @@ export const ControlBar = memo(function ControlBar({
         {/* 右侧：视图控制 + 添加切片 */}
         <Space size={2}>
           {onGoLive && (
-            <Tooltip title="跳转到直播最新位置">
+            <Tooltip title={goLiveDisabled ? '回看模式不可用' : '跳转到直播最新位置'}>
               <Button
                 type="text"
                 size="small"
                 icon={<ThunderboltOutlined />}
                 onClick={onGoLive}
-                disabled={isDisabled}
+                disabled={isDisabled || goLiveDisabled}
               >
                 直播
               </Button>

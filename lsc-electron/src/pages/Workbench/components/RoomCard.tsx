@@ -110,7 +110,8 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
     a.record_size_mb === b.record_size_mb &&
     a.mark_in === b.mark_in &&
     a.mark_out === b.mark_out &&
-    a.stream_url === b.stream_url
+    a.stream_url === b.stream_url &&
+    a.preview_mode === b.preview_mode
   )
 }
 
@@ -184,7 +185,8 @@ export const RoomCard = memo(function RoomCard({
     document.head.appendChild(style)
   }, [])
 
-  const isLive = !!(room.preview_enabled && room.preview_phase === 'streaming')
+  const isLive = !!(room.preview_enabled && room.preview_phase === 'streaming' && room.preview_mode !== 'recording_review')
+  const isRecordingReview = room.preview_mode === 'recording_review'
 
   const recordingElapsedSeconds = useMemo(() => {
     if (!room.is_recording || !room.record_started_at) return 0
@@ -301,6 +303,40 @@ export const RoomCard = memo(function RoomCard({
             />
             已选中
           </span>
+        )}
+        {isRecordingReview && (
+          <div
+            className="room-card__review-badge"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              flexShrink: 0,
+              padding: '2px 8px',
+              borderRadius: 6,
+              background: 'rgba(175, 82, 222, 0.12)',
+              border: '1px solid rgba(175, 82, 222, 0.25)',
+            }}
+          >
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: '#af52de',
+              }}
+            />
+            <span
+              style={{
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: 0.8,
+                color: '#af52de',
+              }}
+            >
+              回看
+            </span>
+          </div>
         )}
         {isLive && (
           <div

@@ -69,3 +69,39 @@ export function panTimelineWindowStart(
   }
   return ws
 }
+
+/** recording_review：文件回看，无 DVR 紫标 */
+export function isRecordingReviewMode(mode?: string | null): boolean {
+  return mode === 'recording_review'
+}
+
+/** recording_review / degraded：禁用 followLive 与 dvrStart */
+export function isNoDvrPreviewMode(mode?: string | null): boolean {
+  return mode === 'recording_review' || mode === 'degraded'
+}
+
+/** 录制回看时间线右沿：仅 recording_review 模式使用 */
+export function resolveRecordingReviewSpan(
+  previewPos: number,
+  recordedDurationHint: number,
+  fileDuration: number | null | undefined,
+  markIn?: number | null,
+  markOut?: number | null,
+): number {
+  let span = Math.max(previewPos, recordedDurationHint, fileDuration ?? 0, 1)
+  if (markIn != null && markIn > span) span = markIn
+  if (markOut != null && markOut > span) span = markOut
+  return span
+}
+
+export function computeRecordedDurationHint(
+  room: { is_recording?: boolean; record_started_at?: string | null } | null | undefined,
+  continuousRecorded?: number,
+  nowMs: number = Date.now(),
+): number {
+  let hint = continuousRecorded ?? 0
+  if (room?.is_recording && room.record_started_at) {
+    hint = Math.max(hint, (nowMs - new Date(room.record_started_at).getTime()) / 1000)
+  }
+  return hint
+}

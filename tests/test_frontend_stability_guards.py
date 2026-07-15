@@ -902,3 +902,44 @@ def test_timeline_seek_snaps_left_of_dvr_to_live() -> None:
     )[0]
     assert "dvrStart" in handler or "bufStart" in handler
     assert "enterTimelineLive" in handler
+
+
+def test_recording_review_timeline_guards() -> None:
+    """recording_review：无紫标、强制退出 followLive、回看胶囊、禁 goLive。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
+    room_card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    coords = (ROOT / "lsc-electron/src/utils/timelineCoords.ts").read_text(encoding="utf-8")
+
+    assert "isNoDvrPreviewMode" in workbench
+    assert "isRecordingReviewMode" in workbench
+    dvr_block = workbench.split("const dvrStart = useMemo", 1)[1].split("}, [referenceRoomId", 1)[0]
+    assert "isNoDvrPreviewMode" in dvr_block
+
+    assert "setTimelineFollowLive(false)" in workbench
+    follow_block = workbench.split("// recording_review / degraded：强制退出 followLive", 1)[1].split("}, [rooms", 1)[0]
+    assert "isNoDvrPreviewMode" in follow_block
+
+    timeline_view = workbench.split("const timelineView = useMemo", 1)[1].split("const dvrStart = useMemo", 1)[0]
+    assert "isRecordingReview" in timeline_view
+    assert "resolveRecordingReviewSpan" in timeline_view
+
+    enter_live = workbench.split("const enterTimelineLive = useCallback", 1)[1].split(
+        "const handleTimelineSeek", 1
+    )[0]
+    assert "targetsIncludeNoDvrMode" in enter_live
+
+    go_live = workbench.split("const handleGoLive = useCallback", 1)[1].split(
+        "// Phase 3: 音频对齐", 1
+    )[0]
+    assert "targetsIncludeNoDvrMode" in go_live
+
+    assert "回看" in room_card
+    assert "recording_review" in room_card
+    assert "isRecordingReview" in room_card
+
+    assert "goLiveDisabled" in control
+    assert "resolveRecordingReviewSpan" in control
+
+    assert "resolveRecordingReviewSpan" in coords
+    assert "isNoDvrPreviewMode" in coords
