@@ -1,3 +1,6 @@
+// 预览来源模式
+export type PreviewMode = 'live_mse' | 'recording_review' | 'degraded'
+
 // 房间相关
 export interface RoomSession {
   room_id: string
@@ -48,6 +51,8 @@ export interface RoomSession {
   mse_reconnecting?: { attempt: number; maxAttempts: number }
   // 预览启动阶段进度（refreshing_url=刷新流地址/probing=探测转码/streaming=拉流中/error/idle）
   preview_phase?: 'idle' | 'refreshing_url' | 'probing' | 'streaming' | 'error'
+  /** 预览来源：live_mse=直播 MSE，recording_review=录制文件回看，degraded=降级；缺省视为 live_mse */
+  preview_mode?: PreviewMode
   // 直播是否在线（false 表示断联）
   is_live?: boolean
   // 当前预览画质

@@ -889,6 +889,12 @@ def test_timeline_dvr_start_prop() -> None:
     assert "dvrStartPct" in timeline or ("dvrStart" in timeline and "lsc-timeline__record-end" in timeline)
 
 
+def test_preview_mode_type_exists() -> None:
+    types = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
+    assert "preview_mode" in types
+    assert "recording_review" in types
+
+
 def test_timeline_seek_snaps_left_of_dvr_to_live() -> None:
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     handler = workbench.split("const handleTimelineSeek = useCallback", 1)[1].split(

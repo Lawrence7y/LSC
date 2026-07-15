@@ -2029,6 +2029,7 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
         'preview_enabled': room.preview_enabled,
         'preview_paused': room.preview_paused,
         'preview_muted': room.preview_muted,
+        'preview_mode': getattr(room, 'preview_mode', None) or 'live_mse',
         'preview_quality': getattr(room, 'preview_quality', '') or '',
         'mark_in': room.mark_in,
         'mark_out': room.mark_out,
