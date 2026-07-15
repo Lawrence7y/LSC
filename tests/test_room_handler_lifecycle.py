@@ -102,6 +102,7 @@ class _FakeManager:
         self.batch_record_finished = _FakeSignal()
         self.medium_tick = _FakeSignal()
         self.low_tick = _FakeSignal()
+        self.recording_stopped = _FakeSignal()
         self.refresh_calls = []
 
     def get_room(self, room_id: str):

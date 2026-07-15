@@ -1,7 +1,7 @@
 # 直播 DVR 左边界紫标 · 下线录制回看 · 分层错误处理 设计
 
 > **日期：** 2026-07-15  
-> **状态：** 已批准；实施计划见 [2026-07-15-live-dvr-boundary-offline-review.md](../plans/2026-07-15-live-dvr-boundary-offline-review.md)  
+> **状态：** Phase 1+2 已实现（shared-ingest 路径下 offline 文件回看待后续验证）；实施计划见 [2026-07-15-live-dvr-boundary-offline-review.md](../plans/2026-07-15-live-dvr-boundary-offline-review.md)  
 > **交付策略：** 完整设计一次定稿；实现分两期（一期语义/误伤/房间 UI，二期文件回看）  
 > **相关：** CLAUDE.md §7–8（预览/切片时间轴）、现有 MSE ~120s 缓冲、`mse_error` 误判链路
 
