@@ -1,9 +1,9 @@
 # CS2 开箱精调与规则编辑器验收增强设计
 
 > **日期：** 2026-07-16  
-> **状态：** 契约修订稿 — 待用户审阅；**审阅通过前不得进入实施计划**  
+> **状态：** 契约修订稿 v3 — 待用户审阅；**审阅通过前不得进入实施计划**  
 > **方案：** A — 引擎优先（多官方预设 + 编辑器验收；不重做向导）  
-> **修订：** 纳入审阅 P1/P2 契约（基线、草稿试用、phase 直传、关键词 casefold、试跑执行期、状态区校验、砍 audio / 补样例清单）
+> **修订：** v2 基线/草稿/phase/casefold/试跑/状态区；v3 收敛 C1 互斥模式、C4 双向 busy + 超时拍板、C5 完整 draft 信任边界、C6 checklist 失效、试读错误语义、试跑范围声明、观战可计算指标
 
 ## 代码基线（P1 · 前置条件）
 
@@ -28,7 +28,7 @@
 在无畏契约持续分析已达标、且规则包引擎已在基线分支可用的前提下：
 
 1. 把 **CS2** 官方规则包拉到接近无畏的开箱体验（切回合、默认框/词、相位节奏），并修掉会静默回退 Valorant / 关键词大小写不一致等契约洞。
-2. 在**不重做**「复制→编辑→保存→启动」主流程的前提下，补齐 **checklist + 试读/试跑**；试用必须能验**未保存草稿**，且与正式扫描共用同一套匹配与 phase 语义。
+2. 在**不重做**「复制→编辑→保存→启动」主流程的前提下，补齐 **checklist + 试读/试跑**；试用必须能验**未保存草稿**，且与正式扫描共用同一套匹配与边界检测语义（见 C2 范围声明）。
 
 ## 决策摘要（已确认）
 
@@ -39,8 +39,9 @@
 | HUD 覆盖 | 中英双语关键词 + 选手包 + 观战/赛事包 |
 | 自定义痛点 | 步骤多、缺引导、缺验收（预览标定可接受） |
 | 验收形态 | 单帧试读增强（绿/黄/红）+ 短片段试跑时间轴预览 |
-| 试用输入 | **优先 `draft_pack`**；`rule_pack_id` 仅兼容已保存包 |
-| 无畏契约 | 行为与产品链路不改（修复共享匹配/phase 直传时须跑 Valorant 回归） |
+| 试用输入 | 三种互斥模式（见 C1）；编辑页走 `image + draft_pack` |
+| 试跑超时 | 单次同步请求；无进度任务系统；客户端超时 > 服务端 deadline + 余量 |
+| 无畏契约 | 行为与产品链路不改（共享匹配/phase 直传修复须跑 Valorant 回归） |
 | `audio.*` 本轮 | **不做**映射与精调（见非目标） |
 
 ## 非目标
@@ -51,8 +52,9 @@
 - 改变 pending → 精修 → 手动导出产品链路
 - 改变「只分析主房录制」、预览与录制分离、导出队列
 - 无畏产品行为变更（回归测试必须绿）
-- 本轮为规则包增加 / 消费 `audio.*` 字段映射（解释器现状未消费；无样例证据前不扩）
+- 本轮为规则包增加 / 消费 `audio.*` 字段映射
 - 新建独立试跑任务系统 / 与持续分析并行的第二套 FFmpeg 池
+- 试跑完整回放持续分析的 phase 状态机调度节奏（见 C2）
 
 ## Architecture
 
@@ -61,7 +63,7 @@ draft_pack 或 已保存 rule_pack_id
         │
         ▼
 ┌──────────────────────────┐
-│ validate_rule_pack()     │  ← 只校验，试用路径不落盘
+│ validate_rule_pack()     │  ← draft 信任边界：结构+数值+区域（不落盘）
 └────────────┬─────────────┘
              ▼
 ┌──────────────────────────┐
@@ -73,86 +75,115 @@ draft_pack 或 已保存 rule_pack_id
         ┌────┴────┬────────────────┐
         ▼         ▼                ▼
       试读     试跑（短窗）      正式 continuous
-   (单帧OCR)  (_analysis_semaphore)  (同信号语义)
+   (单帧OCR)  (_analysis_busy)   (增量+状态机)
 ```
 
-编辑器路径（骨架不变，试用语义修正）：
+编辑器路径（骨架不变）：
 
 ```
 选包 → 管理规则 → 复制/编辑（内存 draft）
          │
-         ├─ checklist（框有效 → 试读绿 → 试跑有回合 → 保存）
-         ├─ 试读(draft_pack) / 试跑(draft_pack)
+         ├─ checklist（仅当前 draft revision 的试读/试跑结果）
+         ├─ 试读(image + draft_pack) / 试跑(draft_pack)
          │
          ▼
-保存落盘 →（启动前可对已保存 id 或再带 draft 试跑）→ start_continuous_analysis
+保存落盘 → start_continuous_analysis（试跑 busy 时拒绝）
 ```
 
 ## 关键契约修订（实施前必须落地）
 
-### C1 · 试用接受草稿包（P1）
+### C1 · 试用输入三种互斥模式（P1）
 
-**问题：** 流程是「试读 → 试跑 → 保存」，但若只用 `rule_pack_id` 读磁盘，试用验的是旧包，与 UI 草稿不一致。
+**问题：** 同时允许框、`draft_pack`、关键词子集、`rule_pack_id` 时，框与草稿 `ocr_regions.status` 冲突无权威来源。
 
-**契约：**
+**契约：删除「关键词子集」模式。** `trial_ocr_region` / `trial_scan_rounds` 解析规则包时仅允许下列模式（按优先级判定）：
 
-| 接口 | 入参 | 行为 |
-|------|------|------|
-| `trial_ocr_region` | 必填：框 + 图像；**可选 `draft_pack` 或关键词子集**；可选 `rule_pack_id` | 有 `draft_pack` 时：`validate_rule_pack(draft)`（**不保存**）后用其 `keywords` 做命中分类；仅 id 时加载已保存包。无词表时不得假装「命中绿」 |
-| `trial_scan_rounds` | **`draft_pack` 优先**；否则 `rule_pack_id`；另需房间 id、时间窗 | 有 draft：校验不落盘 → 解释器扫描；仅 id：加载已保存包。二者互斥时 **draft 胜出** |
+| 模式 | 入参 | 权威字段 | 行为 |
+|------|------|----------|------|
+| A · 草稿 | `image` + `draft_pack`（试跑无 image，仅 `draft_pack` + 房间/窗口） | **整包草稿**：含 `ocr_regions.status` 与全部 `keywords` | `validate_rule_pack(draft)`（**不保存**）→ 用草稿框+词；忽略同请求里额外的 `region` / `rule_pack_id`（若误传） |
+| B · 已保存 | `image` + `rule_pack_id`（无 `draft_pack`） | 磁盘包内的框与关键词 | 加载已保存包后同样校验 |
+| C · 兼容旧调用 | `image` + `region`（无 `draft_pack`、无 `rule_pack_id`） | 仅请求中的 `region` | **只返回 OCR 文本**；**不做**命中分类（无 `status`/`matched_categories`，或显式 `classified=false`） |
 
-响应试读增加：
+- `draft_pack` 与 `rule_pack_id` 同时存在 → **draft 胜出**（模式 A）。
+- 编辑页试读/试跑**必须**走模式 A，禁止只发框图指望服务端拼词。
+- 模式 A/B 的试读成功响应：
+  - `matched_categories`: `string[]`，元素为 `"buy"` / `"result"`（可同时命中；空数组表示未命中任一类）
+  - `status`: `"hit" | "partial" | "empty"`  
+    - `hit`：`matched_categories` 非空  
+    - `partial`：OCR 成功且有可信文字，但未命中任何关键词  
+    - `empty`：**仅**表示 OCR 成功但无可信文字（空白/乱码到不可信阈值）  
+  - UI：`hit`→绿，`partial`→黄，`empty`→红（「框里没字」类提示）
+- **禁止**把依赖缺失、FFmpeg 失败、超时等并入 `empty`。此类必须 `success: false` + `error`（及可选 `error_code`）；UI 显示错误，不得伪装成「框里没字」。
 
-- `matched_category`: `"buy" | "result" | "none"`
-- `status`: `"hit" | "partial" | "empty"`（有字未命中 = partial；空白/失败 = empty）
+### C2 · Phase profile 对象直传 + 试跑范围（P1）
 
-前端编辑中的试读/试跑**必须**带上当前表单拼出的 `draft_pack`（含框与关键词），不得只发框图。
-
-### C2 · Phase profile 对象直传（P1）
-
-**问题：** 包内写了 `phase` 后，`profile_from_mapping` 可能生成名 `pack`，扫描预算再 `get_profile("pack")` 会静默回退 Valorant（实测 lookback 30→120）。
+**问题：** 包内写了 `phase` 后，再 `get_profile("pack")` 会静默回退 Valorant。
 
 **契约：**
 
 - 持续分析与试跑的扫描窗口/预算，必须接收 `_continuous_valorant_phase_profile(state)`（或等价）**返回的 profile 对象**，直接使用其字段。
 - **禁止**再通过 `get_profile(profile.name)` 二次解析。
 - 为 CS2 官方包写入专用 `phase` **同时**修直传；只改 JSON 不算完成本条。
-- 回归：构造 `phase.lookback_sec` 与 Valorant 默认不同的包，断言扫描预算采用包内值。
+- 回归：构造与 Valorant 默认不同的 `phase.lookback_sec`，断言扫描预算采用包内值。
+
+**试跑范围声明（避免实施成回放调度器）：**
+
+- 试跑 = 对选定时间窗调用与正式路径相同的 **规则包 + casefold 关键词 + OCR 边界检测 / 解释器扫描**。
+- 试跑**验证**：框、词、duration/trim、确认门相关的边界检出是否合理。
+- 试跑**不承诺**：与正式持续分析完全相同的 phase 状态机推进节奏、买枪休眠唤醒时序、增量窗推进过程。
+- 产品文案可写「预览本窗口能切出的回合」，勿写「与正式分析逐秒一致」。
 
 ### C3 · 共享 casefold 关键词匹配（P1）
 
-**问题：** 买枪词按原大小写、结算侧文本小写但词表不转；`COUNTER-TERRORISTS WIN` 等正式扫描可 False，试读若另写匹配会「试读绿、正式不中」。
+- 抽出共享函数；文本与词表两侧均 `casefold()` 后再包含匹配。
+- **正式扫描**与 **试读命中分类** 必须调用同一函数。
+- 扩展 CS2 词表不能替代本修复。
+- 单测：大写结果句 + 混合大小写词表 → 正式与试读均命中；可同时落入 `buy` 与 `result` 时两者都进入 `matched_categories`。
 
-**契约：**
-
-- 抽出共享函数（名实施定），对文本与词表两侧均 `casefold()`（或等价）后再做包含匹配。
-- **正式扫描**（`round_detector` 买枪/结果路径）与 **试读命中分类** 必须调用同一函数。
-- 扩展 CS2 英文词表**不能**替代本修复；词表仍可保留常见大小写写法，匹配不依赖大小写。
-- 单测：大写结果句 + 小写/混合词表 → 正式路径与试读分类均为命中。
-
-### C4 · 试跑执行期契约（P1）
+### C4 · 试跑执行期与双向 busy（P1）
 
 | 项 | 契约 |
 |----|------|
-| 资源 | 试跑复用 `_analysis_semaphore` 与 `_ai_executor`，与持续分析同一串行护栏 |
-| 并发 | **持续分析运行中禁止试跑**（返回明确错误，如 `analysis_busy`）；不新建并行任务系统 |
-| 超时 | 服务端：短窗扫描须有明确上限（建议与窗长挂钩，且 ≤ 现有单次 OCR/扫描可接受上限；具体秒数写入实施计划）。客户端：试跑请求不得沿用默认 10s；须单独更长超时或进度/可取消约定（实施计划二选一写死） |
-| 取消 | 至少支持：前端关闭/取消时中断等待；服务端在 executor 任务可检查取消点则检查（最小：客户端放弃结果，服务端仍占 semaphore 至任务结束 — 若采用此降级须在 UI 标明「请等待当前试跑结束」） |
-| 录制中文件 | 活动录制若 `moov` 未完成可能导致无法 OCR：试跑前检测；不支持时返回明确错误（如 `recording_file_not_seekable`），提示停止录制后再试或仅对已收尾文件试跑 |
-| 响应坐标 | 必须包含 `window_start_sec`、`window_end_sec`、`recording_duration_sec`，以及回合 `{start,end,...}`（相对录制文件时间轴），供时间轴渲染 |
+| 资源 | 试跑复用 `_analysis_semaphore` 与 `_ai_executor` |
+| 双向门禁（服务端权威） | ① 持续分析运行中 → 拒绝试跑（如 `analysis_busy`）② **试跑运行中 → 拒绝 `start_continuous_analysis`**（如 `trial_scan_busy`）③ **重复试跑**（已有试跑未结束）→ 拒绝（如 `trial_scan_busy`）。前端可禁用按钮，**不能**只靠 UI |
+| Semaphore 生命周期 | `_analysis_semaphore` **必须持有到 executor 内真实扫描结束**（含异常路径）。**禁止**外层 await 超时后释放 semaphore、而工作线程仍继续跑 |
+| 超时方案（已拍板） | **单次同步请求**；不建进度/任务系统。服务端对单次试跑设 `deadline`（与窗长挂钩，上限写入实施计划）。客户端超时 = 服务端 deadline **+ 余量**（余量写入实施计划，须明显大于网络抖动）。超时后：客户端放弃展示；服务端 busy / semaphore **仍保留到真实任务结束**；UI 标明「试跑仍在结束后才会解除占用，请稍候再试」 |
+| 关闭 UI | 只放弃显示结果，**不**视为服务端取消；busy 同上 |
+| 录制中文件 | 不可 seek / `moov` 未完成 → `success:false` + 明确错误（如 `recording_file_not_seekable`） |
+| 响应坐标 | 必含 `window_start_sec`、`window_end_sec`、`recording_duration_sec`，以及回合 `{start,end,...}` |
 
 试跑**不**写入切片列表、**不**触发导出。
 
-### C5 · 有效状态区服务端校验（P2→本轮必做）
+### C5 · `validate_rule_pack()` 作为 draft 信任边界（P1）
 
-**问题：** `x=1,y=1` 会归一成零面积框而非拒绝；设计不得声称「与既有后端约束一致」。
+**问题：** 仅补最小框不够；当前校验器仍可能接受负 duration、NaN、把字符串拆成字符列表、非法 phase 等。`draft_pack` 经 WebSocket 传入，校验器是信任边界。
 
-**契约：**
+**契约：** `validate_rule_pack()`（保存 / 启动 / 试用模式 A·B 共用）至少拒绝：
 
-- 在 `validate_rule_pack()` 中增加状态区**最小宽高**校验（相对坐标，阈值实施计划写死，如 `w≥0.02` 且 `h≥0.02` 且落在画面内）。
-- 零面积 / 过小 / 越界 → 校验失败。
-- **保存用户包**与 **启动持续分析**与 **试用 validate** 共用同一校验。
-- 前端可同步提示，但权威在服务端。
+| 类别 | 规则 |
+|------|------|
+| 数值 | 所有数值字段必须为有限数：`math.isfinite(...)`；拒绝 NaN / Inf / 非数字字符串冒充 |
+| 区域 | **先**检查原始边界与类型，再谈归一化；`ocr_regions.status`（及若存在的 killfeed）：有限数、最小宽高（如 `w≥0.02` 且 `h≥0.02`）、`x≥0,y≥0`、`x+w≤1`、`y+h≤1`。**禁止**先 clamp 再放行以掩盖越界/零面积 |
+| duration | `0 < min_sec < max_sec`，且不超过与 UI 一致的上限（上限写入实施计划，前后端同一常量来源或文档对齐） |
+| trim | `start_pad_sec` / `end_pad_sec` 有限且 **≥ 0** |
+| 列表字段 | `keywords.buy` / `combat` / `result` 与 `confirm.end_by` **必须是 list**；拒绝字符串被拆成字符列表的静默通过 |
+| phase | 若存在 `phase`：字段有限且类型正确，且 **能成功构造 profile 对象**；构造成功才算校验通过 |
+
+失败返回明确错误，试用路径同样不落盘。
+
+### C6 · Checklist / 试用结果失效（P1）
+
+**问题：** 试读变绿后改框或关键词，checklist 仍显示已通过。
+
+**契约（前端状态机，无需 hash 系统）：**
+
+| 变更 | 失效范围 |
+|------|----------|
+| 状态框、任一类关键词、试读用帧、当前规则包身份（换包/复制源） | 清空**试读与试跑**结果 |
+| `duration`、`trim`、试跑目标房间、试跑时间窗 | 清空**试跑**结果（试读可保留） |
+
+- Checklist 勾选**只能**依据清空后仍有效的、对应当前 draft 的最近一次成功结果。
+- 实现：在现有 `updateEditing()`（及等价修改路径）里重置结果状态即可。
 
 ## CS2 引擎
 
@@ -163,99 +194,86 @@ draft_pack 或 已保存 rule_pack_id
 | `builtin:cs2` | 选手第一人称 HUD（主流 16:9） |
 | `builtin:cs2_spectator` | 观战 / 赛事解说 HUD |
 
-- 关键词：中英双语同一列表；匹配走 **C3 casefold**。
-- `combat` 可空：开始仍以「离开买枪」为主。
-- `confirm`：`require_ocr_bounds=true`，`start_by=ocr_buy_exit`，`end_by=[ocr_result, next_buy]`。
+- 关键词：中英双语；匹配走 C3。
+- `combat` 可空；`confirm` 与现网一致。
 
 ### 相对基线 `builtin:cs2` 的缺口
 
-1. **写入 CS2 专用 `phase`**，并落实 **C2 直传**（二者缺一不可）。
-2. **精调 `ocr_regions.status`**：选手 vs 观战分开，用样例标定。
-3. **扩展 `keywords.buy` / `keywords.result`**：Freeze / Buy / 中英胜负等；依赖 C3，而非靠大小写变体碰运气。
-4. **`duration.min_sec` / `max_sec`**：按样例收紧。
-5. ~~按需微调 `audio.*`~~ → **本轮删除**（见非目标）。
+1. 写入 CS2 专用 `phase` + 落实 C2 直传。  
+2. 精调选手 / 观战 `ocr_regions.status`。  
+3. 扩展 `keywords.buy` / `result`（依赖 C3）。  
+4. 收紧 `duration`。  
+5. ~~`audio.*`~~ 本轮不做。
 
-### 样例与可复现验收（P2）
-
-仓库当前无受版本控制的 CS2 黄金样例。本轮验收前必须具备：
+### 样例与可复现验收
 
 | 交付物 | 要求 |
 |--------|------|
-| 样例清单 | 至少：选手 HUD、观战/赛事 HUD；中英尽量覆盖；路径/获取方式写入 `docs` 或测试夹具说明（大文件可 Git LFS / 外部固定 URL，但清单入仓） |
-| 期望标注 | 每条样例的期望回合 `{start,end}`（容差目标 ≤ 1.0s） |
-| 自动化或脚本 | 至少能对清单跑解释器并比对边界（可先脚本后 pytest） |
-
-无清单与标注时，不得声称「明显改善」或「≤1s」已验收。
+| 样例清单 | 选手 + 观战/赛事；中英尽量覆盖；路径/获取方式入仓 |
+| 期望标注 | 每条样例期望回合 `{start,end}` |
+| 指标 | 对每条样例计算：`missed`（漏切）、`merged`（粘连）、`false_positive`（多切），以及边界 **MAE**（与标注起止的平均绝对误差，秒） |
+| 观战包判定 | 在**同一观战标注集**上：`missed + merged + false_positive` 总数 **低于**误用 `builtin:cs2` 的结果，并报告两边的边界 MAE；不得只写「优于」 |
+| 选手开箱 | 在选手标注集上报告上述指标；边界 MAE 目标 ≤ 1.0s（作为目标，未达标须在验收记录说明差距） |
 
 ## 编辑器验收 UX
 
-### 单帧试读
-
-- 入口：编辑页现有「从这帧试读」。
-- 必须带 **draft 关键词**（C1）；色态：绿 hit / 黄 partial / 红 empty。
-- 与正式扫描共用 C3 匹配。
-
-### 短片段试跑
-
-- 入口：编辑页 + 启动前；遵守 C4。
-- 默认最近 3 或 5 分钟，封顶建议 5 分钟。
-- UI 用响应中的 `window_*` 与 `recording_duration_sec` 画轴。
-- 0 回合：提示换选手/观战预设、挪框、改词。
-- 分析中 / 文件不可 seek：明确错误文案。
-
-### 轻引导（非向导）
-
-Checklist：有效状态区 → 试读绿（或黄且用户知悉）→ 试跑 ≥1 回合 → 保存。  
-弱引导不强制阻断保存；**无效状态区**由 C5 在保存/启动/试用校验时拒绝。
+- 试读：模式 A；绿/黄/红对应 hit/partial/empty；基础设施错误走 error UI。  
+- 试跑：遵守 C4；用窗口字段画轴；文案符合 C2 范围声明。  
+- Checklist：遵守 C6；弱引导不强制保存；无效包由 C5 拒绝保存/启动/试用。
 
 ## 与现有契约的关系
 
-- 正式持续分析仍 pending → 精修 → 手动导出。
-- `round_key` 含 `rule_pack_id`。
-- 旧 `game=valorant` → `builtin:valorant`。
-- 用户包仍「复制官方 → 改可编辑字段」。
-- 试用草稿**不**自动落盘；只有用户点保存才写入 `data/analysis_rules/`。
+- 正式持续分析仍 pending → 精修 → 手动导出。  
+- `round_key` 含 `rule_pack_id`。  
+- 旧 `game=valorant` → `builtin:valorant`。  
+- 用户包仍「复制官方 → 改可编辑字段」。  
+- 试用草稿不自动落盘。
 
 ## Testing / 验收
 
-1. **基线**：在 `feat/fps-round-rule-pack`（已与 main 对齐）上开发与测。
-2. **C1**：改关键词未保存 → 试读/试跑反映新词；保存后 id 路径一致。
-3. **C2**：CS2 `lookback`（或其它 phase 字段）与 Valorant 默认不同时，扫描预算等于包内值。
-4. **C3**：`COUNTER-TERRORISTS WIN` 类句在正式扫描与试读均为命中。
-5. **C4**：分析运行中试跑被拒；响应含窗口与时长字段；切片列表不被试跑污染。
-6. **C5**：零面积/过小状态区保存与启动失败。
-7. **CS2 开箱**：按样例清单与标注验收边界 ≤ 1.0s 与漏切/粘连改善。
-8. **观战包**：观战样例上优于误用选手包。
-9. **无畏回归**：parity / continuous / confirm 相关测试通过。
+1. 基线分支已与 main 对齐。  
+2. **C1**：模式 A 改词未保存即反映；A/B/C 互斥；模式 C 不分类；OCR 失败为 `success:false`。  
+3. **C2**：phase 预算直传；试跑不做状态机回放断言。  
+4. **C3**：大小写句正式+试读均命中；双类同时命中进 `matched_categories`。  
+5. **C4**：分析中拒试跑；试跑中拒启动与重复试跑；semaphore 持有至真实结束。  
+6. **C5**：负 duration / NaN / 字符串 keywords / 越界框 / 非法 phase 均校验失败。  
+7. **C6**：改框后 checklist 试读勾选清除。  
+8. CS2 样例指标报告；观战包满足可计算「优于」定义。  
+9. 无畏回归通过。
 
 ## 成功标准（产品体感）
 
-- 选 CS2 官方包，常见选手 HUD 开箱可进 pending 回合。
-- 观战局换观战包后质量可接受。
-- 自定义时：对**当前草稿**试读看色、试跑看轴，结果与正式启动语义一致。
-- 无畏用户无感（回归绿）。
+- CS2 选手官方包开箱可进 pending。  
+- 观战包在标注集上满足可计算优于标准。  
+- 草稿试读/试跑与正式边界检测语义一致（在 C2 声明范围内）。  
+- 无畏回归绿。
 
 ## 实施顺序（供计划拆解 — 仅审阅通过后）
 
-0. **基线对齐**：`feat/fps-round-rule-pack` ↔ `main`；前置规格入仓可引用  
-1. **C3** 共享 casefold 匹配 + 测试  
-2. **C2** phase profile 直传 + 测试  
-3. **C5** `validate_rule_pack` 最小状态区  
-4. CS2 `phase` + 双语词 + 选手框；新增 `builtin:cs2_spectator`  
-5. **C1** 试用 draft_pack；试读命中色 UI  
-6. **C4** `trial_scan_rounds` 执行期 + 时间轴 UI + checklist  
-7. 样例清单/标注 + CS2/无畏回归  
+0. 基线对齐  
+1. C3 casefold  
+2. C2 phase 直传  
+3. C5 完整 validate  
+4. CS2 phase/词/框 + `builtin:cs2_spectator`  
+5. C1 模式 A/B/C + 试读 UI  
+6. C4 试跑 + 双向 busy + 超时常量  
+7. C6 checklist 失效  
+8. 样例清单/标注/指标脚本 + 回归  
 
 ## 开放问题（已拍板）
 
 | 问题 | 决定 |
 |------|------|
-| 是否做 4 步向导 | 否（方案 A） |
+| 是否做 4 步向导 | 否 |
 | 观战是否单独官方包 | 是，`builtin:cs2_spectator` |
 | 试跑是否入切片列表 | 否 |
 | 试跑默认窗口 | 3 或 5 分钟可选，封顶建议 5 分钟 |
-| 用户能否关 OCR 确认门 | 否 |
-| 试用是否支持未保存草稿 | **是，draft_pack 优先** |
-| 分析中能否试跑 | **否** |
-| 本轮是否映射 audio.* | **否** |
+| 试用输入 | **三种互斥模式；删关键词子集** |
+| 试跑超时 | **单次同步；客户端 > 服务端 deadline + 余量；关 UI 不取消后端** |
+| 双向 busy | **是（分析↔试跑、重复试跑）** |
+| 试跑 vs 正式状态机 | **不承诺节奏等同；只验包/词/边界语义** |
+| 同帧 buy+result | **`matched_categories: string[]`** |
+| `empty` 含义 | **仅 OCR 成功无字；失败走 success:false** |
+| 观战「优于」 | **missed+merged+FP 更低，并报告 MAE** |
+| 本轮 audio.* | **否** |
 | 实施基线 | **`feat/fps-round-rule-pack`，先与 main 对齐** |
