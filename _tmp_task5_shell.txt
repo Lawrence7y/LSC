@@ -1,0 +1,61 @@
+=== 1. git status -sb ===
+## feat/fps-round-rule-pack
+ M lsc-electron/package-lock.json
+ M lsc/gui/common_workers.py
+ M lsc/gui/multi_room/config/rooms.json
+ M lsc/gui/multi_room/config/rooms.json.bak
+ M lsc/gui/multi_room/manager.py
+ M lsc/gui/pages/recording_controller.py
+ M lsc/platforms/bilibili.py
+ M tests/test_connect_worker_lifecycle.py
+ M tests/test_frontend_stability_guards.py
+ M tests/test_platform_adapters.py
+?? _pytest_review.txt
+?? _pytest_task13.txt
+?? _pytest_task4.txt
+?? data/
+
+=== 2. git log -5 --oneline ===
+8572456 feat: add CS2 phase pack and builtin cs2_spectator
+3f64499 fix: harden validate_rule_pack as draft_pack trust boundary
+22467fa fix: pass phase profile object into scan budget (no name fallback)
+a5e4c77 fix: casefold shared keyword matching for OCR buy/result
+8841fd9 chore: align feat/fps-round-rule-pack with main before CS2 plan
+
+=== 3. dir lsc\analyzer ===
+    Directory: D:\Project\直播切片多人\.worktrees\fps-round-rule-pack\lsc\analyzer
+
+d-----  2026/07/16 11:49         <DIR>  __pycache__
+d-----  2026/07/16 11:51         <DIR>  rule_packs
+-a----  2026/07/16 08:56           556  __init__.py
+-a----  2026/07/16 09:11         2,102  fps_round_interpreter.py
+-a----  2026/07/16 11:39           670  keyword_match.py
+-a----  2026/07/16 08:56        11,709  ocr_accel.py
+-a----  2026/07/16 08:56        16,962  ocr_detector.py
+-a----  2026/07/16 08:56         4,220  onset_detector.py
+-a----  2026/07/16 09:07        14,866  phase_scheduler.py
+-a----  2026/07/16 08:56        12,016  pipeline.py
+-a----  2026/07/16 08:56         5,532  round_clock_predictor.py
+-a----  2026/07/16 11:39        70,429  round_detector.py
+-a----  2026/07/16 11:49         9,545  rule_pack.py
+-a----  2026/07/16 08:56        10,382  sound_detector.py
+
+=== 4. pytest tests/test_analysis_rule_handlers.py -v --tb=short -k trial ===
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.3.4, pluggy-1.6.0 -- C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+PySide6 6.11.1 -- Qt runtime 6.11.1 -- Qt compiled 6.11.1
+rootdir: D:\Project\直播切片多人\.worktrees\fps-round-rule-pack
+configfile: pytest.ini
+plugins: anyio-4.13.0, asyncio-0.25.0, cov-7.1.0, qt-4.5.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None
+collecting ... collected 5 items / 3 deselected / 2 selected
+
+tests/test_analysis_rule_handlers.py::test_trial_ocr_region_impl_uses_base64_path PASSED [ 50%]
+tests/test_analysis_rule_handlers.py::test_resolve_trial_video_path_prefers_existing_file PASSED [100%]
+
+======================= 2 passed, 3 deselected in 0.45s =======================
+C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\pytest_asyncio\plugin.py:207: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))

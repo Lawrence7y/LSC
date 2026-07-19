@@ -892,6 +892,7 @@ function createWindow() {
 
   // 始终注册渲染进程日志转发和生命周期日志
   mainWindow.webContents.on('console-message', (_event, level, message) => {
+    if (message.includes('Electron Security Warning')) return
     const levelMap: Record<number, 'INFO' | 'WARN' | 'ERROR'> = {
       0: 'INFO',
       1: 'INFO',
@@ -902,13 +903,23 @@ function createWindow() {
     appLog(logLevel, 'renderer', message);
   });
 
+  // 加载失败自动重试（处理 Vite 开发服务器竞态）
+  let _loadRetries = 0
+  const _MAX_LOAD_RETRIES = 3
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
     appLog('ERROR', 'createWindow', `LOAD FAILED: code=${errorCode} desc=${errorDescription} url=${validatedURL}`);
-  });
+    const retriable = [-3, -102, -106, -111] // ERR_NETWORK_CHANGED, CONNECTION_REFUSED, CONNECTION_RESET, CONNECTION_CLOSED
+    if (retriable.includes(errorCode) && process.env.VITE_DEV_SERVER_URL && _loadRetries < _MAX_LOAD_RETRIES) {
+      _loadRetries++
+      const delay = Math.pow(2, _loadRetries - 1) * 1000
+      appLog('WARN', 'createWindow', `正在重试加载 (${_loadRetries}/${_MAX_LOAD_RETRIES})，${delay}ms 后重试`)
+      setTimeout(() => mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL!), delay)
+    }
+  })
 
   mainWindow.webContents.on('crashed', () => {
     appLog('ERROR', 'createWindow', `RENDERER CRASHED`);
-  });
+  })
 
   if (process.env.VITE_DEV_SERVER_URL) {
     appLog('INFO', 'createWindow', `加载开发服务器: ${process.env.VITE_DEV_SERVER_URL}`);

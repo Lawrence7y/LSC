@@ -1,0 +1,21 @@
+﻿python : C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\pytest_asyncio\plugin.py:207:
+ PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 C:\Users\Administrator\AppData\Local\Temp\ps-script-dc213bf9-bc40-4706-9231-67cf2cbfedaf.ps1:7 字符: 59
++ ... offscreen'; python -m pytest tests/test_continuous_analysis_guards.py ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\Admini...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asy
+ncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explic
+itly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module",
+ "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+........................................................F............... [ 93%]
+.....                                                                    [100%]
+================================== FAILURES ===================================
+D:\Project\直播切片多人\tests\test_round_detector.py:517: AssertionError: 未启用 OCR 时不应有 start_by 标记
+=========================== short test summary info ===========================
+FAILED tests/test_round_detector.py::TestOcrRefineFallback::test_refine_disabled_by_default
+1 failed, 76 passed in 4.05s

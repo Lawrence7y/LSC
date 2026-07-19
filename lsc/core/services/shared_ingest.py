@@ -21,6 +21,8 @@ STARTUP_PROBE_TIMEOUT_SEC = 10.0
 STARTUP_PROBE_INTERVAL_SEC = 0.2
 TS_PACKET_SIZE = 188
 _WRITE_TIMEOUT_SEC = 10.0
+# 预览 stdout 超过该秒数无数据视为挂死，触发 on_error / 进程恢复
+_PREVIEW_STDOUT_STALL_SEC = 15.0
 
 
 def _is_network_url(url: str) -> bool:
@@ -907,6 +909,40 @@ class SharedRoomIngest:
         if stdout is None:
             self._handle_preview_process_exit(proc, "preview ffmpeg stdout unavailable")
             return
+        last_data_time = [time.monotonic()]
+        stop_watchdog = threading.Event()
+
+        def _stdout_stall_watchdog() -> None:
+            while not stop_watchdog.wait(1.0):
+                with self._lock:
+                    if self._preview_process is not proc:
+                        return
+                if self._poll(proc) is not None:
+                    return
+                if time.monotonic() - last_data_time[0] > _PREVIEW_STDOUT_STALL_SEC:
+                    _log.error(
+                        "shared preview stdout stalled (%ds) room=%s",
+                        _PREVIEW_STDOUT_STALL_SEC,
+                        self.room_id,
+                    )
+                    try:
+                        proc.kill()
+                    except Exception as exc:
+                        _log.warning(
+                            "shared preview stall kill failed room=%s: %s",
+                            self.room_id, exc,
+                        )
+                    try:
+                        if proc.stdout:
+                            proc.stdout.close()
+                    except Exception as exc:
+                        _log.debug(
+                            "shared preview stall stdout close failed: %s", exc,
+                        )
+                    return
+
+        watchdog = threading.Thread(target=_stdout_stall_watchdog, daemon=True)
+        watchdog.start()
         try:
             while True:
                 chunk = stdout.read(65536)
@@ -918,6 +954,7 @@ class SharedRoomIngest:
                             f"preview ffmpeg exited: code={return_code}",
                         )
                     return
+                last_data_time[0] = time.monotonic()
                 if isinstance(chunk, str):
                     chunk = chunk.encode("utf-8", errors="ignore")
                 for segment in self._preview_parser.feed(chunk):
@@ -927,6 +964,10 @@ class SharedRoomIngest:
                 current = self._preview_process is proc
             if current:
                 self._handle_preview_process_exit(proc, f"preview ffmpeg read failed: {exc}")
+        finally:
+            stop_watchdog.set()
+            if watchdog.is_alive() and watchdog is not threading.current_thread():
+                watchdog.join(timeout=2)
 
     def _watch_upstream_process_loop(self, proc) -> None:
         while True:

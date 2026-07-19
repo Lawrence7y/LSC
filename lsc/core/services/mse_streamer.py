@@ -180,10 +180,14 @@ class MseStreamer:
         # 直接映射直播流的音视频轨（-map 0:v / -map 0:a?），保留真实音频。
         # -map 0:a? 的 ? 后缀表示音频轨可选，无音频轨的直播流不会报错。
         # 直播模式：增加 timeout/reconnect 等网络选项；本地文件模式跳过这些。
+        # -re 仅用于本地文件回放限速，直播路径禁止追加（避免人为限速累积延迟）。
         cmd = [
             self._ffmpeg_path,
             "-loglevel", "error",
-            "-re",
+        ]
+        if self._is_file:
+            cmd += ["-re"]
+        cmd += [
             "-fflags", "+genpts",
             "-thread_queue_size", "1024",
         ]

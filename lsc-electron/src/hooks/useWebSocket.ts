@@ -1,4 +1,5 @@
 import { useEffect, useCallback } from 'react'
+import { message } from 'antd'
 import { wsClient } from '@/services/websocket'
 import { useAppStore } from '@/store/appStore'
 
@@ -27,9 +28,14 @@ const _MSE_CACHE_TTL_MS = 5 * 60 * 1000
 // mse_segment 接收 watchdog：按房间记录最后接收时间，超时按房间恢复预览
 const _lastMseSegmentTimePerRoom: Map<string, number> = new Map()
 const _mseWatchdogLastRecovery: Record<string, number> = {}
+const _mseWatchdogFailCount: Record<string, number> = {}
 const _MSE_WATCHDOG_TIMEOUT_MS = 10000
 const _MSE_WATCHDOG_RECOVERY_COOLDOWN_MS = 15000
 let _mseWatchdogTimer: ReturnType<typeof setInterval> | null = null
+
+/** system_stats 节流：避免高频推送触发全树重渲染 */
+const SYSTEM_STATS_MIN_INTERVAL_MS = 1000
+let _lastSystemStatsAt = 0
 
 /** 清理某房间的 MSE 缓存与重试定时器（预览关闭时调用）。 */
 export function clearMseRoomCache(roomId: string): void {
@@ -43,6 +49,7 @@ export function clearMseRoomCache(roomId: string): void {
   }
   _lastMseSegmentTimePerRoom.delete(roomId)
   delete _mseWatchdogLastRecovery[roomId]
+  delete _mseWatchdogFailCount[roomId]
 }
 
 function _pruneExpiredMseCache(): void {
@@ -275,17 +282,19 @@ function _attachSharedWebSocketHandlers(): () => void {
   })
 
   const handleSystemStats = (data: any) => {
-    if (data && typeof data.cpu_percent === 'number') {
-      useAppStore.getState().setSystemStats({
-        cpu_percent: data.cpu_percent,
-        memory_percent: data.memory_percent,
-        memory_total_gb: data.memory_total_gb,
-        memory_used_gb: data.memory_used_gb,
-        disk_percent: data.disk_percent,
-        disk_total_gb: data.disk_total_gb,
-        disk_free_gb: data.disk_free_gb,
-      })
-    }
+    if (!data || typeof data.cpu_percent !== 'number') return
+    const now = Date.now()
+    if (now - _lastSystemStatsAt < SYSTEM_STATS_MIN_INTERVAL_MS) return
+    _lastSystemStatsAt = now
+    useAppStore.getState().setSystemStats({
+      cpu_percent: data.cpu_percent,
+      memory_percent: data.memory_percent,
+      memory_total_gb: data.memory_total_gb,
+      memory_used_gb: data.memory_used_gb,
+      disk_percent: data.disk_percent,
+      disk_total_gb: data.disk_total_gb,
+      disk_free_gb: data.disk_free_gb,
+    })
   }
   const unsubSystemStats = wsClient.on('system_stats', handleSystemStats)
 
@@ -336,6 +345,7 @@ function _attachSharedWebSocketHandlers(): () => void {
   const unsubMseSegment = wsClient.on('mse_segment', (data: { room_id: string; data: string }) => {
     if (data?.room_id && data?.data) {
       _lastMseSegmentTimePerRoom.set(data.room_id, Date.now())
+      _mseWatchdogFailCount[data.room_id] = 0
       _feedMseSegment(data.room_id, data.data, 'segment')
     }
   })
@@ -344,12 +354,12 @@ function _attachSharedWebSocketHandlers(): () => void {
     if (data?.room_id) {
       console.warn(`MSE error for ${data.room_id}:`, data.error)
       const reason = data.reason || 'unknown'
+      // 非 offline：保持 preview_enabled，以便后端自动重连后仍能挂载 VideoPreview 收分片
       useAppStore.getState().updateRoom(data.room_id, {
         mse_error: data.error,
         mse_reconnecting: undefined,
-        ...(reason === 'offline'
-          ? { preview_phase: 'error' as const }
-          : { preview_enabled: false, preview_phase: 'error' as const }),
+        preview_phase: 'error' as const,
+        ...(reason === 'offline' ? { preview_enabled: false } : {}),
       })
     }
   })
@@ -494,10 +504,15 @@ function _attachSharedWebSocketHandlers(): () => void {
       if (now - lastRecovery < _MSE_WATCHDOG_RECOVERY_COOLDOWN_MS) continue
 
       _mseWatchdogLastRecovery[r.room_id] = now
-      _lastMseSegmentTimePerRoom.set(r.room_id, now)
+      // 恢复时不得把 lastRecv 伪装成 now，否则会掩盖持续 stall
+      const fails = (_mseWatchdogFailCount[r.room_id] ?? 0) + 1
+      _mseWatchdogFailCount[r.room_id] = fails
       console.warn(`[WS] Stall detected for room ${r.room_id} (${(stall / 1000).toFixed(1)}s), recovering preview...`)
 
-      if (_mseInitCache[r.room_id]) {
+      if (fails >= 2 || r.preview_phase === 'error') {
+        message.warning({ content: '预览恢复中', key: `mse-stall-${r.room_id}`, duration: 3 })
+        wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
+      } else if (_mseInitCache[r.room_id]) {
         wsClient.send('request_mse_init', { room_id: r.room_id })
       } else {
         wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })

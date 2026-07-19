@@ -1,0 +1,80 @@
+﻿python : C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\pytest_asyncio\plugin.py:207:
+ PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 C:\Users\Administrator\AppData\Local\Temp\ps-script-d81f74b9-d161-4d96-8f8e-73c66a019074.ps1:7 字符: 69
++ ... ct\直播切片多人'; python -m pytest tests/test_multi_room_manager.py::test_s ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\Admini...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asy
+ncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explic
+itly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module",
+ "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.3.4, pluggy-1.6.0 -- C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+PySide6 6.11.1 -- Qt runtime 6.11.1 -- Qt compiled 6.11.1
+rootdir: D:\Project\直播切片多人
+configfile: pytest.ini
+plugins: anyio-4.13.0, asyncio-0.25.0, cov-7.1.0, qt-4.5.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None
+collecting ... collected 3 items
+
+tests/test_multi_room_manager.py::test_start_recording_failure_preserves_previous_record_output_path FAILED [ 33%]
+tests/test_multi_room_manager.py::test_stop_recording_async_cancels_reconnect_and_keeps_path FAILED [ 66%]
+tests/test_multi_room_manager.py::test_start_export_falls_back_to_room_record_output_path FAILED [100%]
+
+================================== FAILURES ===================================
+_____ test_start_recording_failure_preserves_previous_record_output_path ______
+tests\test_multi_room_manager.py:689: in test_start_recording_failure_preserves_previous_record_output_path
+    assert room.record_output_path == existing
+E   AssertionError: assert '' == 'C:\\Users\\A...\\keep_me.mp4'
+E     
+E     - C:\Users\Administrator\AppData\Local\Temp\pytest-of-Administrator\pytest-40\test_start_recording_failure_p0\keep_me.mp4
+---------------------------- Captured stderr call -----------------------------
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: Saved 1 rooms to D:\Project\直播切片多人\lsc\gui\multi_room\config\rooms.json
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: [录制诊断] start_recording called for room_id=66f0d3cdbe6e4de4803368e1ac674c67
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: [录制诊断] controller OK, is_connected=True, stream_url=True
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: [录制诊断] refreshing stream for recording...
+2026-07-16 14:34:47 [INFO] lsc.platforms.direct: Direct: parsing https://example.com/live.m3u8
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: [录制诊断] stream refreshed, stream_url=True
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: [录制诊断] calling start_recording_with_crf, output_dir=C:\Users\Administrator\AppData\Local\Temp\pytest-of-Administrator\pytest-40\test_start_recording_failure_p0\direct_直链_674c67
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: [录制诊断] start_recording_with_crf returned ok=False, error_msg=模拟启动失败
+------------------------------ Captured log call ------------------------------
+INFO     lsc.gui.multi_room.manager:manager.py:698 Saved 1 rooms to D:\Project\直播切片多人\lsc\gui\multi_room\config\rooms.json
+INFO     lsc.gui.multi_room.manager:manager.py:1421 [录制诊断] start_recording called for room_id=66f0d3cdbe6e4de4803368e1ac674c67
+INFO     lsc.gui.multi_room.manager:manager.py:1431 [录制诊断] controller OK, is_connected=True, stream_url=True
+INFO     lsc.gui.multi_room.manager:manager.py:1457 [录制诊断] refreshing stream for recording...
+INFO     lsc.platforms.direct:direct.py:33 Direct: parsing https://example.com/live.m3u8
+INFO     lsc.gui.multi_room.manager:manager.py:1463 [录制诊断] stream refreshed, stream_url=True
+INFO     lsc.gui.multi_room.manager:manager.py:1491 [录制诊断] calling start_recording_with_crf, output_dir=C:\Users\Administrator\AppData\Local\Temp\pytest-of-Administrator\pytest-40\test_start_recording_failure_p0\direct_直链_674c67
+INFO     lsc.gui.multi_room.manager:manager.py:1544 [录制诊断] start_recording_with_crf returned ok=False, error_msg=模拟启动失败
+_________ test_stop_recording_async_cancels_reconnect_and_keeps_path __________
+tests\test_multi_room_manager.py:732: in test_stop_recording_async_cancels_reconnect_and_keeps_path
+    assert room._cancel_reconnect.is_set()
+E   AssertionError: assert False
+E    +  where False = is_set()
+E    +    where is_set = <threading.Event at 0x288c33388c0: unset>.is_set
+E    +      where <threading.Event at 0x288c33388c0: unset> = RoomSession(room_id='7eff777536c54550b44acfd2d13300ec', room_url='https://example.com/live.m3u8', platform='', platform_name='', streamer_name='', stream_title='', stream_info=None, selected_quality='', preview_muted=True, preview_enabled=False, preview_paused=False, preview_error='', preview_mode='live_mse', include_in_cut=True, is_connecting=False, is_connected=True, is_recording=False, record_output_path='C:\\Users\\Administrator\\AppData\\Local\\Temp\\pytest-of-Administrator\\pytest-40\\test_stop_recording_async_canc0\\recording.mp4', record_started_at=None, last_error='', controller=<test_multi_room_manager.test_stop_recording_async_cancels_reconnect_and_keeps_path.<locals>.FakeController object at 0x00000288C33387D0>, preview_widget=None, mark_in=None, mark_out=None, mark_in_wallclock=None, mark_out_wallclock=None, recording_start_mono=None, recording_media_start_mono=None, preview_latency=2.0, record_size_mb=0.0, stream_resolution='', stream_fps='', analysis_highlights=[], analysis_in_progress=False, export_in_progress=False, is_reconnecting=False, reconnect_next_attempt_at=0.0, reconnect_attempts=0, reconnect_output_dir='', reconnect_encoder='', reconnect_crf=23, reconnect_param_mode='CRF 质量', reconnect_bitrate='', reconnect_bitrate_unit='kbps', reconnect_resolution='', reconnect_framerate='', reconnect_audio_bitrate='', preview_quality='', category='', _room_lock=<unlocked _thread.lock object at 0x00000288C35404C0>, content_offset=0.0, align_group_id='', disconnect_requested=False, _cancel_reconnect=<threading.Event at 0x288c33388c0: unset>, _reconnect_thread=None, _first_frame_corrected=False, _shared_ingest_last_file_size=0, _shared_ingest_stall_checks=0, preview_epoch_id='', recording_id='', stream_url_cached='', stream_parsed_at=0.0)._cancel_reconnect
+---------------------------- Captured stderr call -----------------------------
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: Saved 1 rooms to D:\Project\直播切片多人\lsc\gui\multi_room\config\rooms.json
+------------------------------ Captured log call ------------------------------
+INFO     lsc.gui.multi_room.manager:manager.py:698 Saved 1 rooms to D:\Project\直播切片多人\lsc\gui\multi_room\config\rooms.json
+___________ test_start_export_falls_back_to_room_record_output_path ___________
+tests\test_multi_room_manager.py:768: in test_start_export_falls_back_to_room_record_output_path
+    assert export_id == "export-ok"
+E   AssertionError: assert '' == 'export-ok'
+E     
+E     - export-ok
+---------------------------- Captured stderr call -----------------------------
+2026-07-16 14:34:47 [INFO] lsc.gui.multi_room.manager: Saved 1 rooms to D:\Project\直播切片多人\lsc\gui\multi_room\config\rooms.json
+------------------------------ Captured log call ------------------------------
+INFO     lsc.gui.multi_room.manager:manager.py:698 Saved 1 rooms to D:\Project\直播切片多人\lsc\gui\multi_room\config\rooms.json
+=========================== short test summary info ===========================
+FAILED tests/test_multi_room_manager.py::test_start_recording_failure_preserves_previous_record_output_path
+FAILED tests/test_multi_room_manager.py::test_stop_recording_async_cancels_reconnect_and_keeps_path
+FAILED tests/test_multi_room_manager.py::test_start_export_falls_back_to_room_record_output_path
+============================== 3 failed in 0.54s ==============================
+EXIT=1

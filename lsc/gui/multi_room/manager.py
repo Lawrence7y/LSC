@@ -82,12 +82,14 @@ class SizeUpdateRunnable(QRunnable):
             with self._cache_lock:
                 cached = self._size_cache.get(self.path)
                 if cached and (now - cached[1]) < self._CACHE_TTL:
-                    self.room.record_size_mb = cached[0]
+                    with self.room._room_lock:
+                        self.room.record_size_mb = cached[0]
                     return
 
             # Query file system
             size = os.path.getsize(self.path) / (1024 * 1024)
-            self.room.record_size_mb = size
+            with self.room._room_lock:
+                self.room.record_size_mb = size
 
             # Update cache
             with self._cache_lock:
@@ -1354,8 +1356,24 @@ class MultiRoomManager(QObject):
 
     def _refresh_room_stream_for_recording(self, room: RoomSession) -> bool:
         """Refresh short-lived CDN URLs before starting FFmpeg recording."""
+        # 共享进样已在 preview-only：切录制会重建上游，强制刷流避免缓存 URL 触发 CDN 断流
+        force_fresh = False
+        try:
+            cfg = load_config()
+            if getattr(cfg, "shared_ingest_enabled", False):
+                shared = get_shared_ingest_registry().get(room.room_id)
+                if shared is not None and not getattr(shared, "recording_active", False):
+                    if getattr(shared, "preview_subscribers", 0) > 0:
+                        force_fresh = True
+                        _log.info(
+                            "recording force-refresh stream for %s (shared preview→recording)",
+                            room.room_id,
+                        )
+        except Exception as exc:
+            _log.debug("shared ingest force-refresh check failed: %s", exc)
+
         # 刚连接成功时直接复用缓存，避免录制前再解析一次（抖音/B站可达 10s+）
-        if _room_stream_is_reusable(room):
+        if not force_fresh and _room_stream_is_reusable(room):
             room.is_connected = True
             _sync_controller_stream(room)
             _log.info(
@@ -1367,7 +1385,7 @@ class MultiRoomManager(QObject):
 
         previous_quality = room.selected_quality
         try:
-            info = parse_stream(room.room_url, force_refresh=False)
+            info = parse_stream(room.room_url, force_refresh=force_fresh)
             if not info or not info.stream_url or not info.is_live or _is_stream_url_expiring(info.stream_url):
                 info = parse_stream(room.room_url, force_refresh=True)
         except Exception as exc:
@@ -1434,8 +1452,15 @@ class MultiRoomManager(QObject):
             if not _heal_connected_flag(room):
                 room.last_error = "房间未连接"
                 return False
-        # Pre-flight disk space check (2GB threshold per project memory constraint)
-        preflight = RecordingService.preflight_check(output_dir, concurrent_streams=1)
+        # Pre-flight disk space check；重连中用 2GB 阈值，开录仍用默认 8GB/路
+        _preflight_min = (
+            _MIN_FREE_BYTES_WHILE_RECORDING if room.is_reconnecting else None
+        )
+        preflight = RecordingService.preflight_check(
+            output_dir,
+            concurrent_streams=1,
+            min_free_bytes_per_stream=_preflight_min,
+        )
         if preflight:
             # Fallback chain for unwritable / full output directories:
             #   1. If the configured dir fails, try ~/.lsc/output (user home, usually writable).
@@ -1444,7 +1469,11 @@ class MultiRoomManager(QObject):
             fallback_base = os.path.join(os.path.expanduser('~'), '.lsc', 'output')
             if os.path.abspath(fallback_base) != os.path.abspath(output_dir):
                 _log.warning("预检失败 %s，回退到 %s", output_dir, fallback_base)
-                fallback_preflight = RecordingService.preflight_check(fallback_base, concurrent_streams=1)
+                fallback_preflight = RecordingService.preflight_check(
+                    fallback_base,
+                    concurrent_streams=1,
+                    min_free_bytes_per_stream=_preflight_min,
+                )
                 if not fallback_preflight:
                     output_dir = fallback_base
                     preflight = ""
@@ -2207,28 +2236,60 @@ class MultiRoomManager(QObject):
             room.reconnect_next_attempt_at = _time.monotonic() + next_delay
             room.is_reconnecting = True
 
-    def _start_recording_reconnect_thread(self, room: RoomSession, error_msg: str) -> bool:
-        t = getattr(room, '_reconnect_thread', None)
+    def _do_proactive_reconnect(self, room: RoomSession) -> None:
+        """URL 过期前在 Qt 主线程重启录制（由 global tick 调用）。"""
         try:
-            if t is not None and hasattr(t, 'is_alive') and t.is_alive():
-                return False
+            registry = get_shared_ingest_registry()
+            shared_ingest = registry.get(room.room_id)
+            if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
+                shared_ingest.stop(reason="proactive reconnect")
+                registry.stop_room(room.room_id, reason="proactive reconnect")
+            else:
+                controller = room.controller
+                if controller is not None:
+                    try:
+                        controller.stop_recording()
+                    except Exception as exc:
+                        _log.warning("Proactive reconnect stop failed room=%s: %s", room.room_id, exc)
+            room.is_recording = False
+            ok = self.start_recording(
+                room.room_id,
+                room.reconnect_output_dir,
+                room.reconnect_encoder,
+                room.reconnect_crf,
+                param_mode=room.reconnect_param_mode,
+                bitrate=room.reconnect_bitrate,
+                bitrate_unit=room.reconnect_bitrate_unit,
+                resolution=room.reconnect_resolution or None,
+                framerate=room.reconnect_framerate or None,
+                audio_bitrate=room.reconnect_audio_bitrate or None,
+            )
+            if ok:
+                _log.info("Room %s proactive reconnect succeeded", room.room_id)
+            else:
+                _log.warning("Room %s proactive reconnect failed: %s", room.room_id, room.last_error)
         except Exception as exc:
-            _log.debug("Reconnect thread state check failed for room %s: %s", room.room_id, exc)
+            _log.warning("Room %s proactive reconnect failed: %s", room.room_id, exc)
+        finally:
+            room.is_reconnecting = False
+            self._dirty_recording = True
 
-        import threading
+    def _start_recording_reconnect_thread(self, room: RoomSession, error_msg: str) -> bool:
+        """在 Qt 主线程执行重连（由 global tick 调用），禁止后台线程改房间状态。
+
+        URL 刷新可能短暂阻塞主线程，但跨线程写 RoomSession/controller 的风险更高。
+        """
+        if getattr(room, "_reconnect_in_progress", False):
+            return False
         room._cancel_reconnect.clear()
-
-        def _reconnect_in_background(room=room, error_msg=error_msg):
-            try:
-                self._attempt_recording_reconnect(room, error_msg)
-            except Exception as exc:
-                _log.error("Room %s reconnect failed: %s", room.room_id, exc)
-            finally:
-                self._dirty_recording = True
-
-        t = threading.Thread(target=_reconnect_in_background, daemon=True)
-        room._reconnect_thread = t
-        t.start()
+        room._reconnect_in_progress = True
+        try:
+            self._attempt_recording_reconnect(room, error_msg)
+        except Exception as exc:
+            _log.error("Room %s reconnect failed: %s", room.room_id, exc)
+        finally:
+            room._reconnect_in_progress = False
+            self._dirty_recording = True
         return True
 
     def _start_global_timer(self) -> None:
@@ -2389,44 +2450,7 @@ class MultiRoomManager(QObject):
                         _log.info("Room %s stream URL expiring soon, proactive reconnect", room.room_id)
                         room.is_reconnecting = True
                         room._cancel_reconnect.clear()
-                        import threading
-                        def _proactive_reconnect(room=room):
-                            try:
-                                registry = get_shared_ingest_registry()
-                                shared_ingest = registry.get(room.room_id)
-                                if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
-                                    shared_ingest.stop(reason="proactive reconnect")
-                                    registry.stop_room(room.room_id, reason="proactive reconnect")
-                                else:
-                                    controller = room.controller
-                                    if controller is not None:
-                                        try:
-                                            controller.stop_recording()
-                                        except Exception as exc:
-                                            _log.warning("Proactive reconnect stop failed room=%s: %s", room.room_id, exc)
-                                room.is_recording = False
-                                ok = self.start_recording(
-                                    room.room_id,
-                                    room.reconnect_output_dir,
-                                    room.reconnect_encoder,
-                                    room.reconnect_crf,
-                                    param_mode=room.reconnect_param_mode,
-                                    bitrate=room.reconnect_bitrate,
-                                    bitrate_unit=room.reconnect_bitrate_unit,
-                                    resolution=room.reconnect_resolution or None,
-                                    framerate=room.reconnect_framerate or None,
-                                    audio_bitrate=room.reconnect_audio_bitrate or None,
-                                )
-                                if ok:
-                                    _log.info("Room %s proactive reconnect succeeded", room.room_id)
-                                else:
-                                    _log.warning("Room %s proactive reconnect failed: %s", room.room_id, room.last_error)
-                            except Exception as exc:
-                                _log.warning("Room %s proactive reconnect failed: %s", room.room_id, exc)
-                            finally:
-                                room.is_reconnecting = False
-                                self._dirty_recording = True
-                        threading.Thread(target=_proactive_reconnect, daemon=True).start()
+                        self._do_proactive_reconnect(room)
 
         # Notify UI to refresh timelines and stats.
         # Always emit on high-frequency ticks for smooth timeline updates.

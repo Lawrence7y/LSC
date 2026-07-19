@@ -1,0 +1,74 @@
+FILE_LIST
+debug.log|213823|2026-07-19 16:02:31
+backend-stdout.log|4219537|2026-07-19 16:02:31
+backend.log|905748|2026-07-19 16:02:31
+debug.log.1|2097546|2026-07-19 15:46:21
+backend.log.1|2096734|2026-07-19 14:58:26
+debug.log.2|2110339|2026-07-19 12:33:10
+debug.log.3|2121682|2026-07-19 12:04:47
+debug.log.4|2107635|2026-07-18 19:11:06
+debug.log.5|2107642|2026-07-18 17:14:20
+backend.log.2|2096929|2026-07-17 16:56:51
+backend-stdout.log.1|294093807|2026-07-16 10:03:14
+backend.log.3|2097169|2026-07-15 19:31:08
+backend.log.5|2097091|2026-07-14 22:57:02
+test_write.txt|9|2026-06-25 22:42:07
+COMBINED_COUNTS
+  [backend-exit]: 0
+  ACCESS_VIOLATION: 0
+  timeout_family: 84
+  ffmpeg_-138_or_probe: 5
+  ERROR_or_Traceback: 2
+  pressure=critical: 1
+PER_FILE {'backend.log': {'[backend-exit]': 0, 'ACCESS_VIOLATION': 0, 'timeout_family': 12, 'ffmpeg_-138_or_probe': 0, 'ERROR_or_Traceback': 1, 'pressure=critical': 0}, 'backend-stdout.log': {'[backend-exit]': 0, 'ACCESS_VIOLATION': 0, 'timeout_family': 72, 'ffmpeg_-138_or_probe': 5, 'ERROR_or_Traceback': 1, 'pressure=critical': 1}}
+SUBCOUNTS {'TimeoutError': 6, 'OCR 超时降级': 1, '中止 OCR': 1, 'scan_abort': 0, '持续分析 Worker 异常': 1, '持续分析扫描失败': 1, 'kick worker': 76}
+COMBINED_SAMPLES
+-- [backend-exit] --
+-- ACCESS_VIOLATION --
+-- timeout_family --
+backend.log: 2026-07-19 15:00:53 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=658s, range=322-658, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:05:23 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=925s, range=538-925, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:11:18 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=1275s, range=805-1275, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:18:59 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=1733s, range=1155-1733, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:29:06 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=2342s, range=1613-2213, OCR=True, full=False, finalize=False
+-- ffmpeg_-138_or_probe --
+backend-stdout.log: 2026-07-19 11:55:52 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=c6600f2efd36458780aa5678ca5c4a4f reason=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 00000208d36da9c0] Error opening input: Error number -138 occurred | Error opening input file http://pull-q5.douyincdn.co
+backend-stdout.log: 2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE error for room c6600f2efd36458780aa5678ca5c4a4f: shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 00000208d36da9c0] Error opening input: Error number -138 occurred | Error opening input file http://pull-q5.douyincdn.com/thirdgame/stream-40798100
+backend-stdout.log: 2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room c6600f2efd36458780aa5678ca5c4a4f (delay=2.0s, error=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 00000208d36da9c0] Error opening input: Error number -138 occurred | Error opening input file http://pull-q5.douyi
+backend-stdout.log: 2026-07-19 11:55:52 [WARNING] lsc.gui.multi_room.manager: shared ingest recording failed room=c6600f2efd36458780aa5678ca5c4a4f: recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 000002cc3baea140] could not find codec parameters | Error opening input file pipe:0. | Error opening input files: End of file
+backend-stdout.log: 2026-07-19 11:55:52 [WARNING] lsc.recording: [¼��] failed for room c6600f2efd36458780aa5678ca5c4a4f, last_error=recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 000002cc3baea140] could not find codec parameters | Error opening input file pipe:0. | Error opening input files: End of file
+-- ERROR_or_Traceback --
+backend.log: 2026-07-19 15:58:52 [ERROR] lsc.handlers: 持续分析超时扫描未在 90s 内退出: room_id=09c0602e503f41f9a5a33a7d4a6ff915
+backend-stdout.log: 2026-07-19 15:58:52 [ERROR] lsc.handlers: ����������ʱɨ��δ�� 90s ���˳�: room_id=09c0602e503f41f9a5a33a7d4a6ff915
+-- pressure=critical --
+backend-stdout.log: 2026-07-19 12:02:52 [INFO] lsc.handlers: ����������·: room_id=c6600f2efd36458780aa5678ca5c4a4f, pressure=critical
+SUB_SAMPLES
+-- TimeoutError --
+backend.log: 2026-07-19 15:58:52 [WARNING] lsc.handlers: 持续分析 Worker 异常: room_id=09c0602e503f41f9a5a33a7d4a6ff915, err=TimeoutError(), timeout=900s
+backend.log: 2026-07-19 15:58:52 [WARNING] lsc.handlers: 持续分析扫描失败（非收尾）: room_id=09c0602e503f41f9a5a33a7d4a6ff915, err=TimeoutError()
+backend-stdout.log: 2026-07-19 12:47:14 [WARNING] lsc.handlers: �������� Worker �쳣: room_id=c6600f2efd36458780aa5678ca5c4a4f, err=TimeoutError(), timeout=446s
+backend-stdout.log: 2026-07-19 12:47:14 [WARNING] lsc.handlers: ��������ɨ��ʧ�ܣ�����β��: room_id=c6600f2efd36458780aa5678ca5c4a4f, err=TimeoutError()
+backend-stdout.log: 2026-07-19 15:58:52 [WARNING] lsc.handlers: �������� Worker �쳣: room_id=09c0602e503f41f9a5a33a7d4a6ff915, err=TimeoutError(), timeout=900s
+-- OCR 超时降级 --
+backend.log: 2026-07-19 15:58:52 [WARNING] lsc.handlers: 持续分析 OCR 超时降级: room_id=09c0602e503f41f9a5a33a7d4a6ff915, degrade_ticks=3, max_catchup=120s
+-- 中止 OCR --
+backend.log: 2026-07-19 15:57:22 [WARNING] lsc.handlers: 持续分析扫描超时，中止 OCR/抽帧: room_id=09c0602e503f41f9a5a33a7d4a6ff915, timeout=900s
+-- scan_abort --
+-- 持续分析 Worker 异常 --
+backend.log: 2026-07-19 15:58:52 [WARNING] lsc.handlers: 持续分析 Worker 异常: room_id=09c0602e503f41f9a5a33a7d4a6ff915, err=TimeoutError(), timeout=900s
+-- 持续分析扫描失败 --
+backend.log: 2026-07-19 15:58:52 [WARNING] lsc.handlers: 持续分析扫描失败（非收尾）: room_id=09c0602e503f41f9a5a33a7d4a6ff915, err=TimeoutError()
+-- kick worker --
+backend.log: 2026-07-19 15:00:53 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=658s, range=322-658, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:05:23 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=925s, range=538-925, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:11:18 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=1275s, range=805-1275, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:18:59 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=1733s, range=1155-1733, OCR=True, full=False, finalize=False
+backend.log: 2026-07-19 15:29:06 [INFO] lsc.handlers: 持续分析 kick worker: room_id=09c0602e503f41f9a5a33a7d4a6ff915, dur=2342s, range=1613-2213, OCR=True, full=False, finalize=False
+AFTERNOON_138_count 0
+NEAR_1247
+backend.log.1|2026-07-19 12:47:14 [WARNING] lsc.handlers: 持续分析 Worker 异常: room_id=c6600f2efd36458780aa5678ca5c4a4f, err=TimeoutError(), timeout=446s
+backend.log.1|2026-07-19 12:47:14 [WARNING] lsc.handlers: 持续分析扫描失败（非收尾）: room_id=c6600f2efd36458780aa5678ca5c4a4f, err=TimeoutError()
+backend.log.1|2026-07-19 12:47:14 [INFO] lsc.handlers: 持续分析 kick worker: room_id=c6600f2efd36458780aa5678ca5c4a4f, dur=3068s, range=2431-3031, OCR=True, full=False, finalize=False
+backend-stdout.log|2026-07-19 12:47:14 [WARNING] lsc.handlers: �������� Worker �쳣: room_id=c6600f2efd36458780aa5678ca5c4a4f, err=TimeoutError(), timeout=446s
+backend-stdout.log|2026-07-19 12:47:14 [WARNING] lsc.handlers: ��������ɨ��ʧ�ܣ�����β��: room_id=c6600f2efd36458780aa5678ca5c4a4f, err=TimeoutError()
+backend-stdout.log|2026-07-19 12:47:14 [INFO] lsc.handlers: �������� kick worker: room_id=c6600f2efd36458780aa5678ca5c4a4f, dur=3068s, range=2431-3031, OCR=True, full=False, finalize=False

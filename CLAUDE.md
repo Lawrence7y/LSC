@@ -243,8 +243,8 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
                  (抛物线插值实现亚毫秒精度)
 ```
 
-*   **采样规范**：提取各房间音频的 PCM 信号，采样率为 `16000Hz`（Mono，单声道，float32 编码），长度恒定为 **3.0秒** (`AUDIO_DURATION`)。
-*   **⭐ 音频来源（关键澄清）**：实际运行时的音频数据来自**预览流**，而非录制文件。前端通过 Web Audio API（AudioWorklet）从 `<video>` 元素捕获 3.0s 的 PCM 数据，base64 编码后通过 `align_preview_audio` WebSocket 消息发送给后端。后端 `room_handler.py:handle_align_preview_audio` 解码后直接调用 `compute_offset` 计算互相关。
+*   **采样规范**：后端互相关算法窗提取各房间音频的 PCM 信号，采样率为 `16000Hz`（Mono，单声道，float32 编码），长度恒定为 **3.0秒** (`AUDIO_DURATION`)。
+*   **⭐ 音频来源（关键澄清）**：实际运行时的音频数据来自**预览流**，而非录制文件。前端通过 Web Audio API（AudioWorklet）从 `<video>` 元素捕获约 **8 秒** 的预览音频（对齐采集窗口），base64 编码后通过 `align_preview_audio` WebSocket 消息发送给后端。后端 `room_handler.py:handle_align_preview_audio` 解码后直接调用 `compute_offset` 计算互相关。
     *   `audio_aligner.py` 中虽存在 `align_rooms` 函数（支持从录制文件用 FFmpeg 提取音频），但**该函数从未被业务代码调用**（死代码）。
     *   即：对齐算法的输入永远是**预览流的实时音频**，这与"预览流和录制流完全独立"的核心约束一致。
 *   **对齐基准选择**：通过 FFT 互相关计算，以**拉流进度最慢（内容最新、延迟最大）**的房间作为基准房间。
@@ -482,7 +482,7 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 当用户同时对多个房间标记相同事件（如同一精彩片段的多视角），系统通过以下方式实现对齐批量导出：
 
-1.  用户点击工作台"一键对齐"按钮，前端通过 Web Audio API 从各房间的 `<video>` 元素（**预览流**）捕获 3.0s PCM 音频，base64 编码后发送 `align_preview_audio` 消息到后端。
+1.  用户点击工作台"一键对齐"按钮，前端通过 Web Audio API 从各房间的 `<video>` 元素（**预览流**）捕获约 **8 秒** 预览音频，base64 编码后发送 `align_preview_audio` 消息到后端。
 2.  后端 `handle_align_preview_audio` 调用 `audio_aligner.py` 的 `compute_offset` 计算各房间相对于"进度最慢"基准房间的 `content_offset`，返回给前端。
 3.  前端将 `content_offset` 通过 `set_content_offset` 消息回传后端，存入 `room.content_offset` 字段。
 4.  导出时，每个房间使用各自的 `content_offset` 调整导出入/出点（通过墙钟映射公式 + FFmpeg `-ss` 参数），使导出的多路视频在画面内容层面完全对齐。

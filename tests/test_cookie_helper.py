@@ -73,6 +73,59 @@ def test_load_cookies_from_file_sanitizes_json(tmp_path):
     assert cookies == {"ttwid": "good"}
 
 
+def test_get_bilibili_cookie_status_reads_saved_file(tmp_path, monkeypatch):
+    import os
+
+    from lsc.platforms import cookie_helper
+
+    cookie_dir = tmp_path / ".lsc" / "cookies"
+    cookie_dir.mkdir(parents=True)
+    (cookie_dir / "bilibili.json").write_text(
+        json.dumps({"SESSDATA": "abc", "bili_jct": "xyz"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("LSC_BILIBILI_COOKIES", raising=False)
+
+    def _expand(path: str) -> str:
+        if path.startswith("~"):
+            return str(tmp_path / path[2:].lstrip("/\\").replace("/", os.sep))
+        return path
+
+    monkeypatch.setattr(cookie_helper.os.path, "expanduser", _expand)
+    # 避免测到真实浏览器 Cookie
+    monkeypatch.setattr(cookie_helper, "get_chrome_cookies_for_domain", lambda _d: {})
+    monkeypatch.setattr(cookie_helper, "get_edge_cookies_for_domain", lambda _d: {})
+
+    status = cookie_helper.get_bilibili_cookie_status()
+    assert status["configured"] is True
+    assert status["count"] >= 2
+    assert "SESSDATA" in status["keys"]
+
+
+def test_save_bilibili_cookies_from_text_writes_file(tmp_path, monkeypatch):
+    import os
+
+    from lsc.platforms import cookie_helper
+
+    def _expand(path: str) -> str:
+        if path.startswith("~"):
+            return str(tmp_path / path[2:].lstrip("/\\").replace("/", os.sep))
+        return path
+
+    monkeypatch.setattr(cookie_helper.os.path, "expanduser", _expand)
+    monkeypatch.delenv("LSC_BILIBILI_COOKIES", raising=False)
+    monkeypatch.setattr(cookie_helper, "get_chrome_cookies_for_domain", lambda _d: {})
+    monkeypatch.setattr(cookie_helper, "get_edge_cookies_for_domain", lambda _d: {})
+
+    status = cookie_helper.save_bilibili_cookies_from_text(
+        '{"SESSDATA":"s1","bili_jct":"j1"}'
+    )
+    assert status["configured"] is True
+    assert status["count"] == 2
+    saved = json.loads((tmp_path / ".lsc" / "cookies" / "bilibili.json").read_text(encoding="utf-8"))
+    assert saved["SESSDATA"] == "s1"
+
+
 def test_fetch_page_cookie_header_ignores_replacement_chars(monkeypatch):
     """脏 Cookie 不得导致 urllib latin-1 编码异常。"""
     import scripts.douyin_record as douyin_record

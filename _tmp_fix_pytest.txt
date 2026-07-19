@@ -1,0 +1,38 @@
+﻿python : C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\pytest_asyncio\plugin.py:207:
+ PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 C:\Users\Administrator\AppData\Local\Temp\ps-script-3fc9ff23-dac5-4ec6-93ef-cd171f596066.ps1:133 字符: 69
++ ... ct\直播切片多人'; python -m pytest tests/test_ux_habit_guards.py::test_can_ ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\Admini...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asy
+ncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explic
+itly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module",
+ "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.3.4, pluggy-1.6.0 -- C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+PySide6 6.11.1 -- Qt runtime 6.11.1 -- Qt compiled 6.11.1
+rootdir: D:\Project\直播切片多人
+configfile: pytest.ini
+plugins: anyio-4.13.0, asyncio-0.25.0, cov-7.1.0, qt-4.5.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None
+collecting ... collected 12 items
+
+tests/test_ux_habit_guards.py::test_can_export_for_shortcut_rejects_pending_and_refining PASSED [  8%]
+tests/test_ux_habit_guards.py::test_handle_export_many_does_not_auto_confirm_pending_with_bounds_only PASSED [ 16%]
+tests/test_ux_habit_guards.py::test_clip_list_batch_export_uses_can_export_clip_only PASSED [ 25%]
+tests/test_ux_habit_guards.py::test_clip_list_batch_export_tooltip_warns_pending PASSED [ 33%]
+tests/test_ux_habit_guards.py::test_ctrl_e_export_shortcut_does_not_auto_export_refining PASSED [ 41%]
+tests/test_cross_feature_guards.py::test_apply_select_clip_mark_in_only_current_room PASSED [ 50%]
+tests/test_cross_feature_guards.py::test_handle_remove_stops_continuous_analysis_when_involved PASSED [ 58%]
+tests/test_cross_feature_guards.py::test_disconnect_warns_secondary_room_leaves_analysis_mapping PASSED [ 66%]
+tests/test_cross_feature_guards.py::test_pending_clip_confirm_skips_existing_manual_marks PASSED [ 75%]
+tests/test_stability_latency_guards.py::test_export_start_failure_broadcasts_clip_failed PASSED [ 83%]
+tests/test_stability_latency_guards.py::test_export_jobs_registered_inside_run_export PASSED [ 91%]
+tests/test_stability_latency_guards.py::test_mse_streamer_live_without_re_flag PASSED [100%]
+
+============================= 12 passed in 0.28s ==============================

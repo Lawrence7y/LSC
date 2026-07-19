@@ -267,25 +267,63 @@ server = LSCWebSocketServer()
 
 
 def drain_merge_broadcasts(bridge):
-    """从 bridge 队列消费所有待发消息，按 type 做 last-value coalesce。
+    """从 bridge 队列消费所有待发消息，按规则做 last-value coalesce。
 
-    同 type 的消息只保留最后一条（覆盖式合并），减少前端 JSON 序列化与
-    React 重渲染负载。返回保序的消息列表，供 _broadcast_coroutine 发送。
+    - rooms_updated / system_stats / continuous_analysis_status：按 type 合并
+    - recording_stopped / clip_* / mse_* / export_progress：按 type + room_id/job_id 分桶
+    - 其余消息：不合并（每条保留）
+
+    返回保序的消息列表，供 _broadcast_coroutine 发送。
     """
+    _LAST_VALUE_TYPES = frozenset({
+        'rooms_updated',
+        'system_stats',
+        'continuous_analysis_status',
+        'analysis_progress',
+    })
+
+    def _keyed(msg_type: str, data: dict[str, Any]) -> str | None:
+        if msg_type == 'recording_stopped':
+            return f"{msg_type}:{data.get('room_id', '')}"
+        if msg_type in ('clip_completed', 'clip_failed', 'export_progress', 'clip_export_started'):
+            return f"{msg_type}:{data.get('job_id') or data.get('clip_id', '')}"
+        if msg_type in ('mse_error', 'mse_reconnecting', 'mse_reconnected', 'mse_init'):
+            return f"{msg_type}:{data.get('room_id', '')}"
+        if msg_type == 'clip_queued':
+            return f"{msg_type}:{data.get('room_id', '')}:{data.get('clip_id') or data.get('round_key', '')}"
+        if msg_type == 'highlight_stream':
+            return f"{msg_type}:{data.get('room_id', '')}:{data.get('start', '')}"
+        if msg_type in ('timeline_invalidated', 'timeline_invalidated_broadcast'):
+            return f"{msg_type}:{data.get('timeline_id') or data.get('reason', '')}"
+        if msg_type == 'timeline_ready':
+            return msg_type
+        if msg_type == 'continuous_highlights':
+            return f"{msg_type}:{data.get('room_id', '')}"
+        if msg_type == 'clip_confirm_status':
+            return f"{msg_type}:{data.get('room_id', '')}:{data.get('round_key', '')}"
+        return None
+
     messages: list[dict[str, Any]] = []
     while True:
         msg = bridge.get_broadcast(block=False)
         if msg is None:
             break
         messages.append(msg)
+
     coalesced: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for msg in messages:
         msg_type = msg.get('type', '')
-        if msg_type not in coalesced:
-            order.append(msg_type)
-        coalesced[msg_type] = msg
-    return [coalesced[t] for t in order]
+        data = msg.get('data') if isinstance(msg.get('data'), dict) else {}
+        if msg_type in _LAST_VALUE_TYPES:
+            key = msg_type
+        else:
+            keyed = _keyed(msg_type, data or {})
+            key = keyed if keyed is not None else f"{msg_type}:{id(msg)}"
+        if key not in coalesced:
+            order.append(key)
+        coalesced[key] = msg
+    return [coalesced[k] for k in order]
 
 
 def main():

@@ -93,7 +93,8 @@ export function VideoPreview({
     setError(null)
   }, [])
 
-  // 完整销毁播放器、Web Audio 路由与全局注册表（预览源切换时调用）
+  // 完整销毁播放器与全局注册表（预览源切换时调用）。
+  // 注意：不得 disconnect MediaElementSource——同一 <video> 只能 createMediaElementSource 一次。
   const disposePlayerFully = useCallback(() => {
     if (loadTimeoutRef.current) {
       clearTimeout(loadTimeoutRef.current)
@@ -103,14 +104,6 @@ export function VideoPreview({
     if (currentPlayer) {
       currentPlayer.stop()
       playerRef.current = null
-    }
-    if (audioSourceRef.current) {
-      try { audioSourceRef.current.disconnect() } catch {}
-      audioSourceRef.current = null
-    }
-    if (gainNodeRef.current) {
-      try { gainNodeRef.current.disconnect() } catch {}
-      gainNodeRef.current = null
     }
     const registry = (window as any).__msePlayers || {}
     if (currentPlayer && registry[roomId]?.player === currentPlayer) {
@@ -236,8 +229,10 @@ export function VideoPreview({
         // MediaSource.sourceopen 触发后 video.src 已绑定到新 MediaSource，
         // 此时创建 Web Audio 路由才安全。若在 player.start() 之前创建，
         // start() 内部的 stop() → video.load() 会断开 MediaElementSource 连接。
-        if (!audioSourceRef.current && videoRef.current) {
-          try {
+        // HTMLMediaElement 一生只能 createMediaElementSource 一次；播放器重建时复用已有图。
+        if (!videoRef.current) return
+        try {
+          if (!audioSourceRef.current) {
             const ctx = getAligner().getContextSync()
             if (ctx.state === 'suspended') {
               ctx.resume().catch((e) => {
@@ -251,20 +246,20 @@ export function VideoPreview({
             gain.connect(ctx.destination)
             audioSourceRef.current = source
             gainNodeRef.current = gain
-            const registry = (window as any).__msePlayers || {}
-            registry[roomId] = {
-              ...(registry[roomId] || {}),
-              feedInit,
-              feedMedia,
-              player: playerRef.current,
-              audioSource: audioSourceRef.current,
-              gainNode: gainNodeRef.current,
-            }
-            ;(window as any).__msePlayers = registry
             console.log(`[VideoPreview] Web Audio routing created on sourceopen for ${roomId}`)
-          } catch (e) {
-            console.warn(`[VideoPreview] Failed to create Web Audio routing for ${roomId}:`, e)
           }
+          const registry = (window as any).__msePlayers || {}
+          registry[roomId] = {
+            ...(registry[roomId] || {}),
+            feedInit,
+            feedMedia,
+            player: playerRef.current,
+            audioSource: audioSourceRef.current,
+            gainNode: gainNodeRef.current,
+          }
+          ;(window as any).__msePlayers = registry
+        } catch (e) {
+          console.warn(`[VideoPreview] Failed to create Web Audio routing for ${roomId}:`, e)
         }
       },
     })
@@ -291,19 +286,18 @@ export function VideoPreview({
         loadTimeoutRef.current = null
       }
       // Local cleanup only — do NOT notify backend (parent owns backend state)
-      if (playerRef.current) {
-        playerRef.current.stop()
+      const stopping = playerRef.current
+      if (stopping) {
+        stopping.stop()
         playerRef.current = null
       }
-      // 清理 Web Audio 路由，防止重新挂载时旧 source 绑定到已移除的 video 元素
-      if (audioSourceRef.current) {
-        try { audioSourceRef.current.disconnect() } catch {}
-        audioSourceRef.current = null
+      // playerGeneration 重建时同步注销注册表，避免 stale player 被读播放头
+      const registry = (window as any).__msePlayers || {}
+      if (stopping && registry[roomId]?.player === stopping) {
+        delete registry[roomId]
       }
-      if (gainNodeRef.current) {
-        try { gainNodeRef.current.disconnect() } catch {}
-        gainNodeRef.current = null
-      }
+      // 保留 Web Audio 路由：同一 video 元素上 createMediaElementSource 只能成功一次，
+      // MSE 重连 / playerGeneration 递增时复用已有 MediaElementSource + GainNode。
       autoRetriedRef.current = false
       setState('idle')
       setError(null)
@@ -313,6 +307,20 @@ export function VideoPreview({
       }
     }
   }, [active, roomId, playerGeneration])
+
+  // 组件卸载或切换房间时才拆掉 Web Audio 图（此时 video 元素随之销毁）
+  useEffect(() => {
+    return () => {
+      if (audioSourceRef.current) {
+        try { audioSourceRef.current.disconnect() } catch { /* ignore */ }
+        audioSourceRef.current = null
+      }
+      if (gainNodeRef.current) {
+        try { gainNodeRef.current.disconnect() } catch { /* ignore */ }
+        gainNodeRef.current = null
+      }
+    }
+  }, [roomId])
 
   // Expose feed methods via window for WebSocket handler
   useEffect(() => {
@@ -349,7 +357,7 @@ export function VideoPreview({
         }
       }
     }
-  }, [active, roomId, feedInit, feedMedia])
+  }, [active, roomId, feedInit, feedMedia, playerGeneration])
 
   // 同步 muted prop 到 GainNode（替代 video.muted）
   // GainNode 控制扬声器输出音量，不影响 MediaElementSource 的音频数据

@@ -105,3 +105,34 @@ export function computeRecordedDurationHint(
   }
   return hint
 }
+
+/**
+ * 时间线内容右沿：播放头轴进度 + 切片末端。
+ * 无预览 / recording_review / 非 followLive 时可用录制时长撑开，避免长录制卡在冻结预览轴。
+ * 有预览且 followLive 时禁止用 recorded_duration（§8.7，防止播放头被钳到 0%）。
+ */
+export function resolveLiveContentSpan(opts: {
+  axisProgress: number
+  clipEnds?: Iterable<number>
+  recordedHint?: number
+  previewEnabled?: boolean
+  recordingReview?: boolean
+  followLive?: boolean
+}): number {
+  let span = Math.max(0, Number(opts.axisProgress) || 0)
+  if (opts.clipEnds) {
+    for (const end of opts.clipEnds) {
+      const v = Number(end)
+      if (Number.isFinite(v) && v > span) span = v
+    }
+  }
+  const allowRecorded =
+    Boolean(opts.recordingReview) ||
+    !opts.previewEnabled ||
+    opts.followLive === false
+  const hint = Number(opts.recordedHint)
+  if (allowRecorded && Number.isFinite(hint) && hint > span) {
+    span = hint
+  }
+  return Math.max(span, 1)
+}

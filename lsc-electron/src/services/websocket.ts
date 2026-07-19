@@ -14,6 +14,26 @@ export function shouldQueueWhenDisconnected(type: string): boolean {
   return DISCONNECTED_QUEUEABLE_TYPES.has(type)
 }
 
+/** 将 WebSocket 载荷规范为 UTF-8 文本（兼容误发为二进制帧的 JSON）。 */
+export function normalizeWebSocketPayload(data: unknown): string | Promise<string> {
+  if (typeof data === 'string') {
+    return data
+  }
+  if (data instanceof ArrayBuffer) {
+    return new TextDecoder('utf-8').decode(data)
+  }
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView
+    return new TextDecoder('utf-8').decode(
+      new Uint8Array(view.buffer, view.byteOffset, view.byteLength),
+    )
+  }
+  if (typeof Blob !== 'undefined' && data instanceof Blob) {
+    return data.text()
+  }
+  throw new TypeError(`Unsupported WebSocket payload type: ${Object.prototype.toString.call(data)}`)
+}
+
 /**
  * WebSocket 客户端：管理单条 WebSocket 连接的生命周期与消息分发。
  *
@@ -130,6 +150,8 @@ class WebSocketClient {
         }, 15000)
 
         this.ws = new WebSocket(url)
+        // 二进制帧以 ArrayBuffer 同步解码，避免默认 Blob 触发 "[object Blob]" JSON 解析失败
+        this.ws.binaryType = 'arraybuffer'
 
         this.ws.onopen = () => {
           clearTimeout(connectTimeout)
@@ -144,28 +166,43 @@ class WebSocketClient {
         }
 
         this.ws.onmessage = (event) => {
-          try {
-            const message: { type: string; data: unknown } = JSON.parse(event.data)
-            if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
-              if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) {
-                console.log(`[WebSocket] Received message type=${message.type} (length: ${event.data.length})`)
-              }
-            } else {
-              const logData = JSON.parse(JSON.stringify(message.data || {}))
-              if (typeof logData === 'object' && logData !== null) {
-                for (const key of Object.keys(logData)) {
-                  if (typeof logData[key] === 'string' && logData[key].length > 200) {
-                    logData[key] = `<string length=${logData[key].length}>`
-                  } else if (Array.isArray(logData[key]) && logData[key].length > 10) {
-                    logData[key] = `<array length=${logData[key].length}>`
+          const handleText = (text: string) => {
+            try {
+              const message: { type: string; data: unknown } = JSON.parse(text)
+              if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
+                if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) {
+                  console.log(`[WebSocket] Received message type=${message.type} (length: ${text.length})`)
+                }
+              } else {
+                const logData = JSON.parse(JSON.stringify(message.data || {}))
+                if (typeof logData === 'object' && logData !== null) {
+                  for (const key of Object.keys(logData)) {
+                    if (typeof logData[key] === 'string' && logData[key].length > 200) {
+                      logData[key] = `<string length=${logData[key].length}>`
+                    } else if (Array.isArray(logData[key]) && logData[key].length > 10) {
+                      logData[key] = `<array length=${logData[key].length}>`
+                    }
                   }
                 }
+                console.log(`[WebSocket] Received message type=${message.type}, data=`, logData)
               }
-              console.log(`[WebSocket] Received message type=${message.type}, data=`, logData)
+              this.emit(message.type, message.data)
+            } catch (err) {
+              console.error('Failed to parse WebSocket message:', err)
             }
-            this.emit(message.type, message.data)
+          }
+
+          try {
+            const normalized = normalizeWebSocketPayload(event.data)
+            if (typeof normalized === 'string') {
+              handleText(normalized)
+            } else {
+              normalized.then(handleText).catch((err) => {
+                console.error('Failed to read WebSocket binary message:', err)
+              })
+            }
           } catch (err) {
-            console.error('Failed to parse WebSocket message:', err)
+            console.error('Failed to normalize WebSocket message:', err)
           }
         }
 

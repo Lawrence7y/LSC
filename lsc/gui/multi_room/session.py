@@ -99,9 +99,11 @@ class RoomSession:
     align_group_id: str = ""
     # #7: set by disconnect_room, checked by _on_connect_finished
     disconnect_requested: bool = False
-    # 重连取消事件：用户断开/删除房间时 set()，通知后台重连线程退出
+    # 重连取消事件：用户断开/删除房间时 set()，通知进行中的重连退出
     _cancel_reconnect: Event = field(default_factory=Event)
-    # 后台重连线程引用，用于在断开/删除时取消
+    # 主线程重连进行中标记（防 global tick 重入）
+    _reconnect_in_progress: bool = False
+    # 兼容旧字段名（已不再使用后台线程）
     _reconnect_thread: object | None = None
     # 首帧写入校正标记：recording_start_mono 首帧校正完成后置 True，避免重复校正
     # 录制启动时重置为 False（支持重连场景重新校正）

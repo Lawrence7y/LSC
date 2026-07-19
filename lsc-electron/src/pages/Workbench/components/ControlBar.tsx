@@ -15,7 +15,7 @@ import {
 } from '@ant-design/icons'
 import { RoomSession, ClipSegment, TimelineHighlightBand } from '@/types'
 import type { TimelineAlignStatus } from '@/utils/timelineCoords'
-import { panTimelineWindowStart, computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, resolveRecordingReviewSpan } from '@/utils/timelineCoords'
+import { panTimelineWindowStart, computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, resolveLiveContentSpan, resolveRecordingReviewSpan } from '@/utils/timelineCoords'
 import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
 import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
@@ -202,30 +202,38 @@ export const ControlBar = memo(function ControlBar({
       contentEdgeRef.current = 1
     }
     let cur = 0
-    // 仅用预览轴时间；recording_review 额外允许录制全长撑右沿
-    let elapsed = 0
+    // 仅用预览轴时间；无预览 / 回看 / 非 Live 时允许录制全长与切片撑右沿
+    let axisProgress = 0
     if (room?.mark_out !== null && room?.mark_out !== undefined && room.mark_out > 0) {
-      elapsed = room.mark_out
+      axisProgress = room.mark_out
     }
-    if (room?.mark_in != null && room.mark_in > elapsed) {
-      elapsed = room.mark_in
+    if (room?.mark_in != null && room.mark_in > axisProgress) {
+      axisProgress = room.mark_in
     }
-    if (previewPos > elapsed) {
-      elapsed = previewPos
+    if (previewPos > axisProgress) {
+      axisProgress = previewPos
     }
-    if (isRecordingReview) {
-      const recordedHint = computeRecordedDurationHint(room, recordedDurationHint)
-      elapsed = Math.max(
-        elapsed,
-        resolveRecordingReviewSpan(previewPos, recordedHint, null, room?.mark_in, room?.mark_out),
-      )
+    if (activeRefine && activeRefine.end > axisProgress) {
+      axisProgress = activeRefine.end
     }
-    if (activeRefine && activeRefine.end > elapsed) {
-      elapsed = activeRefine.end
+    if (activeRefine && activeRefine.start > axisProgress) {
+      axisProgress = activeRefine.start
     }
-    if (activeRefine && activeRefine.start > elapsed) {
-      elapsed = activeRefine.start
-    }
+    const roomClips = roomId
+      ? clips.filter(c => (!c.room_id || c.room_id === roomId) && c.end > c.start)
+      : []
+    const recordedHint = computeRecordedDurationHint(room, recordedDurationHint)
+    const reviewSpan = isRecordingReview
+      ? resolveRecordingReviewSpan(previewPos, recordedHint, null, room?.mark_in, room?.mark_out)
+      : 0
+    const elapsed = resolveLiveContentSpan({
+      axisProgress: Math.max(axisProgress, reviewSpan),
+      clipEnds: roomClips.map(c => c.end),
+      recordedHint,
+      previewEnabled: Boolean(room?.preview_enabled),
+      recordingReview: isRecordingReview,
+      followLive,
+    })
     // 右沿只增不减：回看时不得随 previewPos 收缩
     const rawEnd = Math.max(elapsed, previewPos, 0)
     const contentEnd = Math.max(contentEdgeRef.current, rawEnd, 1)
@@ -267,9 +275,10 @@ export const ControlBar = memo(function ControlBar({
     }
     return { duration: dur, currentTime: cur, windowStart: ws, contentEnd }
   }, [
-    room?.room_id, room?.mark_out, room?.mark_in, room?.preview_mode,
+    room?.room_id, room?.mark_out, room?.mark_in, room?.preview_mode, room?.preview_enabled,
+    room?.is_recording, room?.record_started_at,
     previewPos, tick, activeRefine, followLive, isScrubbing, frozenWindowStart,
-    recordedDurationHint, isRecordingReview,
+    recordedDurationHint, isRecordingReview, clips,
   ])
 
   const { duration, currentTime, windowStart } = timelineView ?? localTimeline

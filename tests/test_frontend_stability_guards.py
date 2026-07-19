@@ -15,6 +15,43 @@ def test_websocket_defines_disconnected_queue_policy() -> None:
     assert "'request_mse_init'" not in source.split("DISCONNECTED_QUEUEABLE_TYPES", 1)[1].split(")", 1)[0]
 
 
+def test_websocket_parses_blob_and_arraybuffer_frames() -> None:
+    """MSE 等大包偶发以 Blob/ArrayBuffer 到达时，须先解码为文本再 JSON.parse。
+
+    直接 JSON.parse(Blob) 会得到 "[object Blob]" 并丢掉全部 mse_init/mse_segment。
+    """
+    source = (ROOT / "lsc-electron/src/services/websocket.ts").read_text(encoding="utf-8")
+
+    assert "normalizeWebSocketPayload" in source
+    assert "binaryType" in source
+    assert "ArrayBuffer" in source
+    assert "Blob" in source
+    assert "TextDecoder" in source or ".text()" in source
+    # 禁止裸 JSON.parse(event.data)，必须先规范化载荷
+    onmessage_body = source.split("this.ws.onmessage", 1)[1].split("this.ws.onclose", 1)[0]
+    assert "JSON.parse(event.data)" not in onmessage_body
+
+
+def test_video_preview_keeps_media_element_source_across_player_restart() -> None:
+    """同一 <video> 只能 createMediaElementSource 一次；播放器重建不得拆掉/重建音频图。"""
+    source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    sourceopen_body = source.split("onSourceOpen: () => {", 1)[1].split("},", 1)[0]
+    auto_start = source.split("Auto-start when active", 1)[1].split("}, [active, roomId, playerGeneration]", 1)[0]
+    cleanup_body = auto_start.rsplit("return () => {", 1)[1]
+
+    assert "createMediaElementSource" in sourceopen_body
+    assert "audioSourceRef.current" in sourceopen_body
+    # player 重建 cleanup 不得 disconnect MediaElementSource（元素会永久绑定）
+    assert "audioSourceRef.current.disconnect" not in cleanup_body
+    assert "audioSourceRef.current = null" not in cleanup_body
+    # disposePlayerFully 同样保留音频图
+    dispose_body = source.split("const disposePlayerFully = useCallback", 1)[1].split("}, [roomId]", 1)[0]
+    assert "audioSourceRef.current.disconnect" not in dispose_body
+    assert "audioSourceRef.current = null" not in dispose_body
+    # 卸载时才拆音频图
+    assert "audioSourceRef.current.disconnect" in source
+
+
 def test_media_source_player_source_open_and_cleanup_are_single_lifecycle_paths() -> None:
     source = (ROOT / "lsc-electron/src/services/mediaSourcePlayer.ts").read_text(encoding="utf-8")
     sourceopen_body = source.split("addEventListener('sourceopen'", 1)[1].split("}, { signal })", 1)[0]
@@ -660,6 +697,24 @@ def test_douyin_cookie_error_shows_settings_guidance() -> None:
     assert "setSettingsDrawerOpen" in room_card or "settingsDrawerOpen" in room_card
 
 
+def test_settings_has_bilibili_cookie_management() -> None:
+    """设置页须提供与抖音同款的 B 站 Cookie 粘贴/保存入口。"""
+    settings = (ROOT / "lsc-electron/src/pages/Settings/index.tsx").read_text(encoding="utf-8")
+    assert "B站 Cookie" in settings or "B 站 Cookie" in settings
+    assert "get_bilibili_cookie_status" in settings
+    assert "save_bilibili_cookies" in settings
+
+
+def test_connect_does_not_restore_persisted_rooms() -> None:
+    """启动/WebSocket 连接不得从磁盘恢复上次房间列表。"""
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    connect_body = source.split("async def handle_connect(websocket):", 1)[1].split(
+        "@server.on(", 1
+    )[0]
+    assert "manager.load_rooms()" not in connect_body
+    assert "load_rooms()" not in connect_body
+
+
 def test_recording_queue_broadcast_before_semaphore() -> None:
     """多路开录进入 semaphore 前应广播 recording_queue 含 position/waiting。"""
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
@@ -1086,3 +1141,27 @@ def test_recording_review_timeline_guards() -> None:
 
     assert "resolveRecordingReviewSpan" in coords
     assert "isNoDvrPreviewMode" in coords
+
+
+def test_timeline_content_span_uses_recording_when_preview_off() -> None:
+    """无预览时长录制：时间线右沿须跟录制/切片，不得卡在冻结的预览轴（现场 ~21min vs 1h+）。"""
+    coords = (ROOT / "lsc-electron/src/utils/timelineCoords.ts").read_text(encoding="utf-8")
+    control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+
+    assert "export function resolveLiveContentSpan" in coords
+    assert "previewEnabled" in coords
+    # 有预览且 followLive 时禁止用 recorded 撑窗（§8.7）
+    assert "followLive" in coords.split("resolveLiveContentSpan", 1)[1][:800]
+
+    local = control.split("const localTimeline = useMemo", 1)[1].split(
+        "const { duration, currentTime, windowStart }", 1
+    )[0]
+    assert "resolveLiveContentSpan" in local
+    assert "clips" in local
+    assert "preview_enabled" in local
+
+    timeline_view = workbench.split("const timelineView = useMemo", 1)[1].split(
+        "const dvrStart = useMemo", 1
+    )[0]
+    assert "resolveLiveContentSpan" in timeline_view

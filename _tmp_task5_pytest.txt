@@ -1,0 +1,34 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.3.4, pluggy-1.6.0 -- C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+PySide6 6.11.1 -- Qt runtime 6.11.1 -- Qt compiled 6.11.1
+rootdir: D:\Project\直播切片多人\.worktrees\fps-round-rule-pack
+configfile: pytest.ini
+plugins: anyio-4.13.0, asyncio-0.25.0, cov-7.1.0, qt-4.5.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None
+collecting ... collected 9 items / 3 deselected / 6 selected
+
+tests/test_analysis_rule_handlers.py::test_resolve_trial_ocr_mode_priority FAILED [ 16%]
+tests/test_analysis_rule_handlers.py::test_trial_ocr_region_impl_uses_base64_path PASSED [ 33%]
+tests/test_analysis_rule_handlers.py::test_trial_ocr_draft_mode_uses_unsaved_keywords_for_hit PASSED [ 50%]
+tests/test_analysis_rule_handlers.py::test_trial_ocr_legacy_mode_no_classification PASSED [ 66%]
+tests/test_analysis_rule_handlers.py::test_trial_ocr_unavailable_returns_error_not_empty PASSED [ 83%]
+tests/test_analysis_rule_handlers.py::test_resolve_trial_video_path_prefers_existing_file PASSED [100%]
+
+================================== FAILURES ===================================
+____________________ test_resolve_trial_ocr_mode_priority _____________________
+tests\test_analysis_rule_handlers.py:89: in test_resolve_trial_ocr_mode_priority
+    assert room_handler.resolve_trial_ocr_mode({"draft_pack": {}, "rule_pack_id": "x"}) == "draft"
+E   AssertionError: assert 'saved' == 'draft'
+E     
+E     - draft
+E     + saved
+=========================== short test summary info ===========================
+FAILED tests/test_analysis_rule_handlers.py::test_resolve_trial_ocr_mode_priority
+================== 1 failed, 5 passed, 3 deselected in 0.56s ==================
+C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\pytest_asyncio\plugin.py:207: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+
+EXIT_CODE=1

@@ -1,0 +1,50 @@
+﻿=== 0) raw urllib probe ===
+status: 200
+final_url: https://www.xiaohongshu.com/livestream/570367035144136880?track_id=&source=pc_search&xsec_token=ABxpVja1bW9hj2iPWlKpP48wO9pmvPNcTG9pMDrS8YnrrppWxvZbJ3u5GGThTFLyRv
+content-type: text/plain
+raw bytes: 0
+raw preview: b''
+=== 1) fetch_url ===
+fetch_url ok, type=str
+HTML length: 0
+=== 2) substring presence ===
+  'LIVING': False
+  'isLive': False
+  'status': False
+  'm3u8': False
+  'flv': False
+  'streamUrl': False
+  'hlsUrl': False
+  'flvUrl': False
+  '__INITIAL_STATE__': False
+  'window.__INITIAL_STATE__': False
+  'roomData': False
+  'liveStatus': False
+  'living': False
+  'pull_url': False
+  'playUrl': False
+  'originUrl': False
+=== 3) saved HTML to D:\Project\鐩存挱鍒囩墖澶氫汉\_xhs_diag.html (0 bytes) ===
+=== 4) interesting snippets (up to 20) ===
+(no keyword matches)
+=== 5) XiaohongshuAdapter().parse ===
+python : 2026-07-17 17:06:10 [INFO] lsc.platforms.xiaohongshu: Xiaohongshu: parsing https://www.xiaohongshu.com/livestr
+eam/570367035144136880?track_id=&source=pc_se
+所在位置 C:\Users\Administrator\AppData\Local\Temp\ps-script-a5c3b77f-b828-427c-87b6-092e92aebb40.ps1:257 字符: 1
++ python '_xhs_diag.py' 2>&1 | Out-File -Encoding utf8 '_xhs_diag_out.t ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-07-17 17:0...d=&source=pc_se:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  error: '灏忕孩涔︾洿鎾祦鑾峰彇澶辫触锛屽彲鑳介渶瑕佺櫥褰?
+  error_code: 'restricted'
+  stream_url: ''
+  is_live: False
+  platform: 'xiaohongshu'
+  title: ''
+  streamer: ''
+  room_url: 'https://www.xiaohongshu.com/livestream/570367035144136880?track_id=&source=pc_search&xsec_token=ABxpVja1bW9hj2iPWlKpP48wO9pmvPNcTG9pMDrS8YnrrppWxvZbJ3u5GGThTFLyRv'
+=== 6) cookie files under ~/.lsc/cookies ===
+exists: True
+  bilibili.json  size=1161  xhs-related=False
+  douyin.json  size=7189  xhs-related=False

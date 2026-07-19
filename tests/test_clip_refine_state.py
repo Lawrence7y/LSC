@@ -154,6 +154,20 @@ def test_save_douyin_cookies_rejects_oversized_input():
     assert "过大" in result.get("error", "") or "large" in result.get("error", "").lower()
 
 
+def test_save_bilibili_cookies_rejects_oversized_input():
+    """save_bilibili_cookies must reject payloads exceeding the 1MB limit."""
+    server, _ = _register_refine_handlers()
+    oversized = "x" * (2 * 1024 * 1024)
+
+    async def scenario():
+        return await server.handlers["save_bilibili_cookies"]({"cookies": oversized})
+
+    result = asyncio.run(scenario())
+    assert result is not None
+    assert result.get("success") is False
+    assert "过大" in result.get("error", "") or "large" in result.get("error", "").lower()
+
+
 def test_align_preview_audio_rejects_too_many_rooms():
     """align_preview_audio must reject > 64 rooms (#4)."""
     server, _ = _register_refine_handlers()

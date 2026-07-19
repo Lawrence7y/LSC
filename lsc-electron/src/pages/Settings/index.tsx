@@ -31,6 +31,13 @@ export default function Settings() {
     keys?: string[]
   } | null>(null)
   const [savingDouyinCookie, setSavingDouyinCookie] = useState(false)
+  const [bilibiliCookieText, setBilibiliCookieText] = useState('')
+  const [bilibiliCookieStatus, setBilibiliCookieStatus] = useState<{
+    configured?: boolean
+    count?: number
+    keys?: string[]
+  } | null>(null)
+  const [savingBilibiliCookie, setSavingBilibiliCookie] = useState(false)
 
   useEffect(() => {
     // 获取应用版本号
@@ -52,6 +59,7 @@ export default function Settings() {
       setCheckingDeps(true)
       send('check_dependencies', {})
       send('get_douyin_cookie_status', {})
+      send('get_bilibili_cookie_status', {})
     }
   }, [isConnected, send])
 
@@ -93,6 +101,43 @@ export default function Settings() {
         })
         setDouyinCookieText('')
         message.success(`抖音 Cookie 已保存（${data.count || 0} 项），请重新连接直播间`)
+      }),
+      on('get_bilibili_cookie_status_response', (data: {
+        success?: boolean
+        configured?: boolean
+        count?: number
+        keys?: string[]
+        error?: string
+      }) => {
+        if (data?.success === false && data.error) {
+          message.error(`读取 B站 Cookie 状态失败：${data.error}`)
+          return
+        }
+        setBilibiliCookieStatus({
+          configured: !!data?.configured,
+          count: data?.count || 0,
+          keys: data?.keys || [],
+        })
+      }),
+      on('save_bilibili_cookies_response', (data: {
+        success?: boolean
+        configured?: boolean
+        count?: number
+        keys?: string[]
+        error?: string
+      }) => {
+        setSavingBilibiliCookie(false)
+        if (!data?.success) {
+          message.error(data?.error || '保存 B站 Cookie 失败')
+          return
+        }
+        setBilibiliCookieStatus({
+          configured: !!data.configured,
+          count: data.count || 0,
+          keys: data.keys || [],
+        })
+        setBilibiliCookieText('')
+        message.success(`B站 Cookie 已保存（${data.count || 0} 项），请重新连接直播间`)
       }),
     ]
     return () => unsubs.forEach((u) => u())
@@ -203,6 +248,15 @@ export default function Settings() {
     }
     setSavingDouyinCookie(true)
     send('save_douyin_cookies', { cookies: douyinCookieText })
+  }
+
+  const handleSaveBilibiliCookies = () => {
+    if (!bilibiliCookieText.trim()) {
+      message.warning('请先粘贴 Cookie 内容')
+      return
+    }
+    setSavingBilibiliCookie(true)
+    send('save_bilibili_cookies', { cookies: bilibiliCookieText })
   }
 
   return (
@@ -348,7 +402,10 @@ export default function Settings() {
             <SettingsRow label="预览画质">
               <select
                 value={settings.preview_quality}
-                onChange={e => handleRecordChange('preview_quality', e.target.value)}
+                onChange={e => {
+                  handleRecordChange('preview_quality', e.target.value)
+                  message.warning('更改预览画质会重启预览，公共轴可能失效，请重新一键对齐', 4)
+                }}
                 className="settings-select"
               >
                 <option value="原画">原画（不缩放）</option>
@@ -665,6 +722,50 @@ export default function Settings() {
               disabled={!isConnected}
             >
               保存抖音 Cookie
+            </Button>
+          </div>
+        </div>
+
+        {/* B站 Cookie */}
+        <div style={{ marginBottom: 20 }}>
+          <div style={{
+            fontSize: 13,
+            fontWeight: 600,
+            color: 'var(--text-300)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.04em',
+            padding: '0 4px',
+            marginBottom: 8,
+          }}>B站 Cookie</div>
+          <div style={{
+            background: 'var(--background-800)',
+            borderRadius: 'var(--radius)',
+            overflow: 'hidden',
+            padding: 16,
+          }}>
+            <div style={{ fontSize: 12, color: 'var(--text-400)', lineHeight: 1.6, marginBottom: 10 }}>
+              Windows 下浏览器 Cookie 常无法自动读取。请在浏览器登录 B 站后，用 Cookie-Editor 等插件导出 JSON（需含 SESSDATA），粘贴到下方并保存，否则可能无法拉取高画质流。
+            </div>
+            <div style={{ fontSize: 12, marginBottom: 10, color: bilibiliCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
+              {bilibiliCookieStatus?.configured
+                ? `已配置 ${bilibiliCookieStatus.count || 0} 项（${(bilibiliCookieStatus.keys || []).slice(0, 6).join(', ') || '已保存'}）`
+                : '尚未配置有效 Cookie'}
+            </div>
+            <Input.TextArea
+              value={bilibiliCookieText}
+              onChange={(e) => setBilibiliCookieText(e.target.value)}
+              placeholder='支持 JSON 对象/数组，或 SESSDATA=...; bili_jct=... 格式'
+              autoSize={{ minRows: 4, maxRows: 10 }}
+              style={{ marginBottom: 10 }}
+            />
+            <Button
+              type="primary"
+              size="small"
+              loading={savingBilibiliCookie}
+              onClick={handleSaveBilibiliCookies}
+              disabled={!isConnected}
+            >
+              保存 B站 Cookie
             </Button>
           </div>
         </div>

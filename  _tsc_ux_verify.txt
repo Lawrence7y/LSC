@@ -1,0 +1,12 @@
+﻿src/pages/Workbench/components/ClipList.tsx(90,9): error TS6133: 'hasConfirmAndExport' is declared but its value is never read.
+node.exe : npm notice
+所在位置 行:1 字符: 1
++ & "C:\Users\Administrator\.workbuddy\binaries\node\versions\22.22.2/n ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (npm notice:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+npm notice New major version of npm available! 10.9.7 -> 12.0.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.0.1
+npm notice To update run: npm install -g npm@12.0.1
+npm notice

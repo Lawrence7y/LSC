@@ -48,6 +48,7 @@ function canExportClip(clip: ClipSegment): boolean {
   return true
 }
 
+/** 单条「确认并导出」可用；批量 actionableClips 不得使用此函数 */
 function canExportOrConfirmExport(clip: ClipSegment, hasConfirmAndExport: boolean): boolean {
   if (clip.export_status === 'queued' || clip.export_status === 'exporting') return false
   if (canExportClip(clip)) return true
@@ -90,16 +91,16 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
 
   const hasConfirmAndExport = !!onConfirmAndExport
   const actionableClips = useMemo(
-    () => clips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
-    [clips, hasConfirmAndExport],
+    () => clips.filter(c => canExportClip(c)),
+    [clips],
   )
   const selectedClips = useMemo(
     () => [...selectedIndices].sort((a, b) => a - b).map(i => clips[i]).filter(Boolean),
     [selectedIndices, clips],
   )
   const selectedActionable = useMemo(
-    () => selectedClips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
-    [selectedClips, hasConfirmAndExport],
+    () => selectedClips.filter(c => canExportClip(c)),
+    [selectedClips],
   )
   const pendingCount = useMemo(() => clips.filter(needsConfirm).length, [clips])
 
@@ -140,9 +141,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
               <Tooltip
                 title={actionableClips.length === 0
                   ? (pendingCount > 0 ? '请先确认待调整的切片' : '没有可导出的切片')
-                  : (pendingCount > 0 && actionableClips.some(needsConfirm)
-                    ? '待确认切片将先确认再导出'
-                    : undefined)}
+                  : undefined}
               >
                 <Button
                   type="link"
@@ -274,6 +273,11 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                         style={{ margin: 0, flexShrink: 0, lineHeight: '18px', padding: '0 6px' }}
                       >
                         {status.text}
+                      </Tag>
+                    )}
+                    {isApprox && (
+                      <Tag color="orange" style={{ margin: 0, flexShrink: 0, lineHeight: '18px', padding: '0 6px' }}>
+                        近似
                       </Tag>
                     )}
                   </div>

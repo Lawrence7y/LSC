@@ -33,7 +33,6 @@ if _LSC_ROOT not in sys.path:
 from persistence import (
     is_analysis_stale,
     load_analysis_results,
-    load_rooms,
     save_analysis_results,
     save_rooms,
 )
@@ -133,6 +132,10 @@ _ANALYSIS_JOB_TTL = 300.0  # 5 分钟后自动清理已完成的分析结果
 _continuous_tasks: dict[str, dict[str, Any]] = {}
 _VALORANT_INCREMENTAL_LOOKBACK_SEC = 360.0  # 6 分钟增量回看（质量优先）
 _VALORANT_MAX_CATCHUP_SEC = 480.0  # 单次 tick 最多向前追赶的新内容时长
+# OCR 扫描 TimeoutError 后：降级纯音频追赶，避免立刻再开超大 OCR 窗压垮 DirectML
+_OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 3
+_POST_TIMEOUT_MAX_CATCHUP_SEC = 120.0
+_SCAN_ABORT_GRACE_SEC = 90.0  # 超时后等 cancel_check 退出的宽限
 _VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期
 _VALORANT_POST_ROUND_JUNK_SEC = 8.0  # 回合结束后垃圾时间（结算/回放）先验
 _VALORANT_TRIM_START_PAD_SEC = 0.5  # OCR 起点后移，避开买枪尾帧
@@ -148,6 +151,7 @@ def _clip_id(room_id: str, start: float, end: float) -> str:
 
 # 导出任务映射：前端 job_id -> 后端 clip_id，用于取消导出时定位 FFmpeg 进程
 export_jobs: dict[str, str] = {}
+_export_jobs_lock = threading.Lock()
 
 # 分析 FFmpeg 串行化：确保同时只有 1 个分析任务跑 FFmpeg（音频提取+OCR），
 # 避免与录制/预览/导出 FFmpeg 竞争导致 8+ 进程同时运行
@@ -159,6 +163,7 @@ _EXPORT_WORKERS: list[asyncio.Task] = []  # 常驻 worker 池（4 个），实�
 _MAX_EXPORT_WORKERS = 4  # 常驻 worker 数（> max possible concurrency，semaphore 限流）
 _export_semaphore = asyncio.Semaphore(2)  # 实际并发限制（动态跟随 settings）
 _export_semaphore_limit = 2  # 当前 semaphore 配置的上限（勿用 _waiters 反推，空闲时可为 None）
+_export_in_flight = 0  # 已出队、正在执行 FFmpeg 的导出任务数（热更新须与 empty() 联判）
 _export_queue_lock = asyncio.Lock()
 
 
@@ -723,7 +728,8 @@ def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
     _recording_starting.clear()
     _recording_wait_queue.clear()
     _analysis_jobs.clear()
-    export_jobs.clear()
+    with _export_jobs_lock:
+        export_jobs.clear()
 
     streamers = _preview_stream_registry().clear_items()
     for room_id, streamer in streamers:
@@ -1378,12 +1384,70 @@ def _should_skip_continuous_scan_kick(
     """同 scan_range 且 OCR 意图未变时跳过 kick；finalize 永不跳过。"""
     if finalize:
         return False
+    # OCR/扫描失败后必须允许同窗重试，否则会永久卡在 skip-kick
+    if state.get("last_scan_error"):
+        return False
     phase = "full" if full_rescan else "incremental"
     return (
         state.get("scan_range") == scan_range
         and state.get("scan_phase") == phase
         and bool(state.get("refine_with_ocr")) == bool(use_ocr)
     )
+
+
+def _is_timeout_scan_error(err: Any) -> bool:
+    """识别扫描 TimeoutError（str() 常为空，须看 repr / 类型名）。"""
+    if err is None:
+        return False
+    if isinstance(err, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    text = err if isinstance(err, str) else repr(err)
+    return "TimeoutError" in text
+
+
+def _apply_scan_timeout_backoff(state: dict[str, Any]) -> None:
+    """OCR/扫描超时后降级：后续若干 tick 强制纯音频 + 缩小追赶窗。"""
+    state["ocr_degraded_remaining"] = max(
+        int(state.get("ocr_degraded_remaining") or 0),
+        int(_OCR_DEGRADE_TICKS_AFTER_TIMEOUT),
+    )
+    state["post_timeout_max_catchup_sec"] = float(_POST_TIMEOUT_MAX_CATCHUP_SEC)
+
+
+def _apply_scan_budget_degrade(
+    state: dict[str, Any],
+    *,
+    scan_range: tuple[float, float],
+    last_analyzed: float,
+    use_ocr: bool,
+) -> tuple[bool, tuple[float, float]]:
+    """若处于超时降级期：关 OCR，并把 scan_end 钳到 last_analyzed+cap。"""
+    remaining = int(state.get("ocr_degraded_remaining") or 0)
+    if remaining <= 0:
+        return bool(use_ocr), (float(scan_range[0]), float(scan_range[1]))
+    try:
+        cap = float(state.get("post_timeout_max_catchup_sec") or _POST_TIMEOUT_MAX_CATCHUP_SEC)
+    except (TypeError, ValueError):
+        cap = float(_POST_TIMEOUT_MAX_CATCHUP_SEC)
+    cap = max(30.0, min(cap, float(_VALORANT_MAX_CATCHUP_SEC)))
+    start = float(scan_range[0])
+    end = float(scan_range[1])
+    la = max(0.0, float(last_analyzed))
+    capped_end = min(end, max(la, start) + cap)
+    if capped_end < start:
+        capped_end = start
+    return False, (round(start, 3), round(capped_end, 3))
+
+
+def _note_successful_scan_after_degrade(state: dict[str, Any]) -> None:
+    """成功消费一次扫描后递减降级计数。"""
+    remaining = int(state.get("ocr_degraded_remaining") or 0)
+    if remaining <= 0:
+        return
+    remaining -= 1
+    state["ocr_degraded_remaining"] = remaining
+    if remaining <= 0:
+        state.pop("post_timeout_max_catchup_sec", None)
 
 
 def _build_continuous_status_payload(
@@ -2769,6 +2833,23 @@ def register_room_handlers(server, bridge):
             if result.get('success'):
                 _mse_reconnect_state.pop(room_id, None)
                 _log.info("Shared MSE reconnect succeeded for room %s", room_id)
+
+                def _rotate_shared_epoch_on_reconnect():
+                    room = manager.get_room(room_id)
+                    if room is None:
+                        return False
+                    new_epoch = uuid4().hex
+                    room.preview_epoch_id = new_epoch
+                    get_timeline_service().on_preview_epoch_change(room_id, new_epoch)
+                    return True
+
+                try:
+                    await loop.run_in_executor(
+                        _bridge_executor, lambda: bridge.call(_rotate_shared_epoch_on_reconnect)
+                    )
+                except Exception as exc:
+                    _log.debug("Shared MSE reconnect epoch rotate failed: %s", exc)
+
                 await server.broadcast('mse_reconnected', {'room_id': room_id})
                 _broadcast_rooms()
                 return
@@ -2871,12 +2952,21 @@ def register_room_handlers(server, bridge):
             _log.debug("preview state sync failed after shared reattach: %s", exc)
         return True
 
-    def _queue_rooms_update(*_args, **_kwargs):
-        """Qt 主线程槽：异步操作（连接/录制）完成后通过线程安全队列广播 rooms_updated。
+    # 不要在注册期调用 asyncio.get_event_loop()：Python 3.12+ 在无运行中
+    # 事件循环时会抛 RuntimeError，导致 handler 注册整体失败。改为惰性解析，
+    # 并在 on_connect / 首个异步入口捕获真正的 WS 循环。
+    _ws_loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {'loop': None}
 
-        此时 manager 的房间状态已更新（is_connected/is_recording/stream_url 等），
-        借助 bridge.queue_broadcast 推送给前端，避免 asyncio 事件循环不可用的限制。
-        """
+    def _queue_rooms_update(*_args, **_kwargs):
+        """Qt 主线程槽：走 _broadcast_rooms 节流/coalesce，避免 5s medium_tick 绕过 300ms 合并。"""
+        loop = _ws_loop_holder.get('loop')
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(_broadcast_rooms)
+                return
+            except Exception as exc:
+                _log.debug("schedule _broadcast_rooms failed: %s", exc)
+        # WS loop 尚未就绪时降级直发（仍由 drain_merge 做 last-value coalesce）
         bridge.queue_broadcast({
             'type': 'rooms_updated',
             'data': {'rooms': _rooms_list(manager)},
@@ -2893,11 +2983,6 @@ def register_room_handlers(server, bridge):
     manager.batch_record_finished.connect(_queue_rooms_update)
     # 每 5 秒中频 tick 时广播 rooms_updated，让前端刷新录制文件大小
     manager.medium_tick.connect(_queue_rooms_update)
-
-    # 不要在注册期调用 asyncio.get_event_loop()：Python 3.12+ 在无运行中
-    # 事件循环时会抛 RuntimeError，导致 handler 注册整体失败。改为惰性解析，
-    # 并在 on_connect / 首个异步入口捕获真正的 WS 循环。
-    _ws_loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {'loop': None}
 
     def _capture_ws_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop | None:
         if loop is not None and not loop.is_closed():
@@ -2955,46 +3040,14 @@ def register_room_handlers(server, bridge):
 
     @server.on_connect
     async def handle_connect(websocket):
-        """新客户端连接时推送已保存的房间列表。
+        """新客户端连接时推送当前房间列表与设置。
 
-        优先使用 MultiRoomManager.load_rooms() 恢复房间（含 mark_in /
-        mark_out / preview_muted / include_in_cut 等用户偏好），避免
-        旧实现仅用 URL 重新 add_room 导致偏好丢失。
-        仅在 manager 当前无房间时恢复，避免重复加载。
+        不再从磁盘 load_rooms 恢复上次会话：每次启动工作台从空房间开始。
+        若本进程内已有房间（例如前端热重连），则推送内存中的当前列表。
         """
         _capture_ws_loop()
 
-        def _restore():
-            existing = manager.list_rooms()
-            if existing:
-                _log.info("已有 %d 个房间，跳过恢复", len(existing))
-                return len(existing)
-            try:
-                count = manager.load_rooms()
-                _log.info("从持久化恢复 %d 个房间", count)
-                return count
-            except Exception as exc:
-                _log.error("manager.load_rooms failed: %s", exc)
-                # 回退到旧持久化路径（仅恢复 URL，无偏好）
-                rooms = load_rooms()
-                if not rooms:
-                    return 0
-                restored = 0
-                for r in rooms:
-                    url = r.get('room_url')
-                    if not url:
-                        continue
-                    if manager.add_room(url) is not None:
-                        restored += 1
-                _log.info("从旧持久化恢复 %d 个房间（仅URL）", restored)
-                return restored
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_restore)
-            )
-        except Exception as exc:
-            _log.error("Restore rooms failed: %s", exc)
-        # 推送 manager 中的房间（room_id 与 manager 一致，含用户偏好）
+        # 推送 manager 中的房间（不恢复持久化）
         await websocket.send(json.dumps({
             'type': 'rooms_loaded',
             'data': {'rooms': _rooms_list(manager)},
@@ -3803,6 +3856,40 @@ def register_room_handlers(server, bridge):
             _log.error("保存抖音 Cookie 失败: %s", exc)
             return {'success': False, 'error': humanize_error(str(exc))}
 
+    @server.on('get_bilibili_cookie_status')
+    async def handle_get_bilibili_cookie_status(data):
+        """查询 B 站 Cookie 是否已配置。"""
+        from lsc.platforms.cookie_helper import get_bilibili_cookie_status
+        try:
+            return {'success': True, **get_bilibili_cookie_status()}
+        except Exception as exc:
+            _log.warning("get_bilibili_cookie_status failed: %s", exc)
+            return {'success': False, 'error': str(exc), 'configured': False, 'count': 0}
+
+    @server.on('save_bilibili_cookies')
+    async def handle_save_bilibili_cookies(data):
+        """保存用户粘贴的 B 站 Cookie（JSON / Cookie 头）。"""
+        from lsc.platforms.cookie_helper import save_bilibili_cookies_from_text
+        raw = ''
+        if isinstance(data, dict):
+            raw = str(data.get('cookies') or data.get('text') or '')
+        if not raw.strip():
+            return {'success': False, 'error': '请粘贴 Cookie 内容'}
+        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
+        if len(raw) > _MAX_COOKIE_BYTES:
+            _log.warning("B站 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
+            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
+        try:
+            status = save_bilibili_cookies_from_text(raw)
+            _log.info("B站 Cookie 已保存: count=%s", status.get('count'))
+            return {'success': True, **status}
+        except (ValueError, json.JSONDecodeError) as exc:
+            return {'success': False, 'error': str(exc)}
+        except OSError as exc:
+            from lsc.utils.error_messages import humanize_error
+            _log.error("保存 B站 Cookie 失败: %s", exc)
+            return {'success': False, 'error': humanize_error(str(exc))}
+
     @server.on('set_content_offset')
     async def handle_set_content_offset(data):
         """设置房间的音频互相关内容偏移量（由前端音频对齐后回传）。"""
@@ -3895,7 +3982,11 @@ def register_room_handlers(server, bridge):
                 _align_log.warning("有效预览音频不足 2 路: %s", valid_ids)
                 return {'success': False, 'error': '有效音频不足 2 路，无法互相关对齐'}
 
-            result = align_audio_map(audio_map, sample_rate, method='preview_audio')
+            # 互相关 FFT 可能阻塞数百 ms～数秒，卸载到线程池避免堵死 WS 事件循环
+            result = await asyncio.get_running_loop().run_in_executor(
+                _recording_executor,
+                lambda: align_audio_map(audio_map, sample_rate, method='preview_audio'),
+            )
             if not result.success:
                 def _clear_on_align_fail():
                     for rid in audio_map.keys():
@@ -4037,8 +4128,44 @@ def register_room_handlers(server, bridge):
                         "create_timeline 未创建（offset 已保留）: reference=%s trusted=%s",
                         reference_room_id, list(trusted.keys()),
                     )
+
+                    def _clear_on_timeline_fail():
+                        for rid in trusted:
+                            room = manager.get_room(rid)
+                            if room is None:
+                                continue
+                            room.align_group_id = ''
+                            room.content_offset = 0.0
+                        return True
+
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            _bridge_executor, lambda: bridge.call(_clear_on_timeline_fail)
+                        )
+                        _broadcast_rooms(force=True)
+                    except Exception as clear_exc:
+                        _align_log.warning("公共时间轴创建失败后清除对齐组失败: %s", clear_exc)
+                    return {
+                        'success': False,
+                        'error': '公共时间轴创建失败',
+                        'offsets': result.offsets,
+                        'reference_room_id': result.reference_room_id,
+                        'method': result.method,
+                        'scores': result.correlation_scores,
+                        'precision': 'buffer_only',
+                    }
             except Exception as exc:
                 _align_log.warning("写入对齐组/创建 TimelineContext 失败: %s", exc)
+                return {
+                    'success': False,
+                    'error': '公共时间轴创建失败',
+                    'detail': str(exc),
+                    'offsets': result.offsets,
+                    'reference_room_id': result.reference_room_id,
+                    'method': result.method,
+                    'scores': result.correlation_scores,
+                    'precision': 'buffer_only',
+                }
 
             response = {
                 'success': True,
@@ -4166,7 +4293,8 @@ def register_room_handlers(server, bridge):
             return {'success': False, 'error': 'job_id is required'}
 
         # 情况 1：任务正在执行（已经注册了 clip_id）
-        clip_id = export_jobs.get(job_id)
+        with _export_jobs_lock:
+            clip_id = export_jobs.get(job_id)
         if clip_id:
             _log.info("取消导出(执行中): job_id=%s, clip_id=%s", job_id, clip_id)
             def _cancel():
@@ -4179,7 +4307,8 @@ def register_room_handlers(server, bridge):
                 _log.error("取消导出异常: job_id=%s, error=%s", job_id, exc)
                 return {'success': False, 'error': humanize_error(str(exc))}
             if cancelled:
-                export_jobs.pop(job_id, None)
+                with _export_jobs_lock:
+                    export_jobs.pop(job_id, None)
                 _log.info("导出已取消: job_id=%s", job_id)
                 return {'success': True}
             return {'success': False, 'error': 'job not found'}
@@ -5582,7 +5711,8 @@ def register_room_handlers(server, bridge):
 
         def on_done(success, output_path, error, size_mb, thumbnail_path):
             """FFmpeg 导出完成的回调（Qt 主线程）。"""
-            export_jobs.pop(job_id, None)
+            with _export_jobs_lock:
+                export_jobs.pop(job_id, None)
             if success:
                 asyncio.run_coroutine_threadsafe(server.broadcast('clip_completed', {
                     'room_id': room_id, 'start': export_start, 'end': export_end,
@@ -5620,6 +5750,9 @@ def register_room_handlers(server, bridge):
                     loop.call_soon_threadsafe(done_event.set)
                 else:
                     result['success'] = True
+                    # 在 Qt 线程内立即注册，缩小 cancel 窗口期
+                    with _export_jobs_lock:
+                        export_jobs[job_id] = clip_id
                     # 成功启动：等待 on_done 回调中 set event
             except Exception as exc:
                 result['error'] = str(exc)
@@ -5627,17 +5760,19 @@ def register_room_handlers(server, bridge):
 
         await loop.run_in_executor(_bridge_executor, lambda: bridge.call(_run_export))
 
-        if result['success'] and result['clip_id']:
-            # 立即注册，使 cancel 可以在 FFmpeg 执行期间定位进程
-            export_jobs[job_id] = result['clip_id']
-        elif result['error']:
+        if result['error']:
             _log.error("导出任务失败: room=%s, job=%s, error=%s", room_id, job_id, result['error'])
+            await server.broadcast('clip_failed', {
+                'room_id': room_id, 'job_id': job_id,
+                'error': result['error'] or '导出启动失败',
+            })
 
         # 等待 FFmpeg 实际完成（通过 on_done 回调 set event）
         await done_event.wait()
 
     async def _export_queue_worker():
         """常驻 worker 消费循环；并发由 _export_semaphore 控制（动态跟随 settings）。"""
+        global _export_in_flight
         while True:
             job = await _export_queue.get()
             job_id = job.get('job_id', '')
@@ -5652,11 +5787,16 @@ def register_room_handlers(server, bridge):
                 continue
             try:
                 async with _export_semaphore:
-                    await _process_export_job(job)
+                    _export_in_flight += 1
+                    try:
+                        await _process_export_job(job)
+                    finally:
+                        _export_in_flight -= 1
             except Exception as exc:
                 _log.error("导出队列异常: %s", exc, exc_info=True)
                 if job_id:
-                    export_jobs.pop(job_id, None)
+                    with _export_jobs_lock:
+                        export_jobs.pop(job_id, None)
                     room_id = job.get('room_id', '')
                     asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
                         'room_id': room_id, 'job_id': job_id, 'error': f'导出异常: {exc}',
@@ -5674,17 +5814,17 @@ def register_room_handlers(server, bridge):
             #（空闲时 _waiters 可为 None，调用 __len__ 会抛 NoneType 错误）
             desired = _get_export_max_concurrent()
             if _export_semaphore_limit != desired:
-                # 仅在队列为空（无在途任务）时替换 semaphore，避免在途 worker
-                # 持有旧 semaphore 的 permit 而新 worker 用新 semaphore，导致
-                # 短暂超并发或旧 semaphore 的 permit 永久丢失（#16）
-                if _export_queue.empty():
+                # 仅在队列为空且无在途导出时替换 semaphore，避免 empty() 误判
+                # （job 已出队、worker 正持有旧 permit 处理 FFmpeg 时队列可为空）
+                if _export_queue.empty() and _export_in_flight == 0:
                     _export_semaphore = asyncio.Semaphore(desired)
                     _export_semaphore_limit = desired
                     _log.info("导出并发上限已更新: %d", desired)
                 else:
                     _log.warning(
-                        "导出并发上限变更(%d->%d)延迟生效：队列非空，待队列清空后下次 _ensure_export_queue 再替换",
-                        _export_semaphore_limit, desired,
+                        "导出并发上限变更(%d->%d)延迟生效：队列非空或有在途任务(in_flight=%d)，"
+                        "待清空后下次 _ensure_export_queue 再替换",
+                        _export_semaphore_limit, desired, _export_in_flight,
                     )
             # 清理已结束的 worker，补充到常驻池大小
             _EXPORT_WORKERS[:] = [t for t in _EXPORT_WORKERS if not t.done()]
@@ -5824,7 +5964,12 @@ def register_room_handlers(server, bridge):
             'label': label, 'output_dir': output_dir, 'profile': profile,
             'job_id': job_id, 'room_name': room_name,
         }
-        await _export_queue.put(job)
+        try:
+            _export_queue.put_nowait(job)
+        except asyncio.QueueFull:
+            _log.warning("导出队列已满: room=%s, job=%s, qsize=%d",
+                         room_id, job_id, _export_queue.qsize())
+            return {'success': False, 'error': '导出队列已满，请稍后重试'}
         _log.debug("导出已入队: room=%s, job=%s, %.1f-%.1f, precision=%s, queue_size=%d",
                    room_id, job_id, export_start, export_end, precision, _export_queue.qsize())
         return {'success': True, 'queued': True, 'job_id': job_id, 'precision': precision}
@@ -5864,7 +6009,8 @@ def register_room_handlers(server, bridge):
 
                 _vp = video_path  # capture for closure
                 def _scan_cancel_check():
-                    return _continuous_tasks.get(room_id, {}).get('cancelled', False)
+                    st = _continuous_tasks.get(room_id, {})
+                    return bool(st.get('cancelled') or st.get('scan_abort'))
 
                 def _do_scan(_vp=_vp, _dur=current_dur, _ocr=refine_with_ocr, _range=scan_range):
                     from lsc.config import load_config as _load_cfg_r
@@ -5900,13 +6046,36 @@ def register_room_handlers(server, bridge):
 
                 task_state['scan_requested'] = False
                 task_state['scan_running'] = True
+                task_state['scan_abort'] = False
                 task_state['_scan_start_mono'] = time.monotonic()
                 try:
+                    # 超时后仍须持锁等到线程经 cancel_check 退出，避免双 OCR 并发压垮 DirectML。
                     async with _analysis_semaphore:
-                        result = await asyncio.wait_for(
-                            loop.run_in_executor(_ai_executor, _do_scan),
-                            timeout=scan_timeout,
-                        )
+                        fut = loop.run_in_executor(_ai_executor, _do_scan)
+                        try:
+                            result = await asyncio.wait_for(
+                                asyncio.shield(fut),
+                                timeout=scan_timeout,
+                            )
+                        except TimeoutError:
+                            task_state['scan_abort'] = True
+                            _log.warning(
+                                "持续分析扫描超时，中止 OCR/抽帧: room_id=%s, timeout=%ss",
+                                room_id,
+                                scan_timeout,
+                            )
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(fut),
+                                    timeout=_SCAN_ABORT_GRACE_SEC,
+                                )
+                            except TimeoutError:
+                                _log.error(
+                                    "持续分析超时扫描未在 %.0fs 内退出: room_id=%s",
+                                    _SCAN_ABORT_GRACE_SEC,
+                                    room_id,
+                                )
+                            raise
                     scan_result_container['result'] = result or []
                     scan_result_container['error'] = None
                     scan_result_container['video_path'] = video_path
@@ -5930,6 +6099,7 @@ def register_room_handlers(server, bridge):
                     scan_result_container['completed_at'] = time.time()
                 finally:
                     task_state['scan_running'] = False
+                    task_state['scan_abort'] = False
                     done_ev = task_state.get('scan_done_event')
                     if done_ev is not None:
                         try:
@@ -6227,6 +6397,23 @@ def register_room_handlers(server, bridge):
                 if can_consume and worker_error:
                     last_consumed_at = worker_completed_at
                     scan_result['error'] = None
+                    if room_id in _continuous_tasks:
+                        _continuous_tasks[room_id]['last_scan_error'] = worker_error
+                        # 非收尾 OCR 超时：降级纯音频 + 缩小追赶，避免立刻再开 600s OCR
+                        if (
+                            _is_timeout_scan_error(worker_error)
+                            and not (_finalize_started or _finalize_pending)
+                        ):
+                            _apply_scan_timeout_backoff(_continuous_tasks[room_id])
+                            _log.warning(
+                                "持续分析 OCR 超时降级: room_id=%s, degrade_ticks=%s, max_catchup=%.0fs",
+                                room_id,
+                                _continuous_tasks[room_id].get("ocr_degraded_remaining"),
+                                _continuous_tasks[room_id].get(
+                                    "post_timeout_max_catchup_sec",
+                                    _POST_TIMEOUT_MAX_CATCHUP_SEC,
+                                ),
+                            )
                     if _finalize_started or _finalize_pending:
                         _finalize_failures += 1
                         if _finalize_failures < _finalize_max_attempts:
@@ -6273,6 +6460,9 @@ def register_room_handlers(server, bridge):
                         )
                 elif can_consume:
                     last_consumed_at = worker_completed_at
+                    if room_id in _continuous_tasks:
+                        _continuous_tasks[room_id]['last_scan_error'] = None
+                        _note_successful_scan_after_degrade(_continuous_tasks[room_id])
                     new_hl = _cleanup_segments(list(worker_result))
                     for h in new_hl:
                         h.setdefault("reason", "回合战斗阶段")
@@ -6566,6 +6756,17 @@ def register_room_handlers(server, bridge):
                             _scan_timeout = max(
                                 _scan_timeout,
                                 _finalize_scan_timeout(current_dur, attempt=_finalize_failures + 1),
+                            )
+                        else:
+                            use_ocr_this_tick, scan_range = _apply_scan_budget_degrade(
+                                state,
+                                scan_range=scan_range,
+                                last_analyzed=last_analyzed,
+                                use_ocr=use_ocr_this_tick,
+                            )
+                            _scan_timeout = _window_scan_timeout(
+                                max(1.0, float(scan_range[1]) - float(scan_range[0])),
+                                use_ocr=use_ocr_this_tick,
                             )
                         if _should_skip_continuous_scan_kick(
                             state,
@@ -7068,4 +7269,4 @@ def register_room_handlers(server, bridge):
     # ── TimelineContext 集成（已抽离至 handlers.timeline_handlers）──
     register_timeline_handlers(server, bridge=bridge, manager=manager, queue_export=queue_export)
 
-    # 已保存的房间列表会在新客户端连接时由 on_connect 推送
+    # 新客户端连接时由 on_connect 推送当前内存房间（不再从磁盘恢复）

@@ -741,15 +741,22 @@ class RecordingService:
     _MIN_FREE_BYTES_PER_STREAM = 8 * 1024 * 1024 * 1024  # 8 GB
 
     @classmethod
-    def preflight_check(cls, output_dir: str, concurrent_streams: int = 1) -> str:
+    def preflight_check(
+        cls,
+        output_dir: str,
+        concurrent_streams: int = 1,
+        min_free_bytes_per_stream: int | None = None,
+    ) -> str:
         """录制前磁盘空间预检。
 
         在开始录制前检查输出目录所在磁盘的可用空间是否满足要求。
-        每路并发录制至少需要 8 GB 可用空间。
+        每路并发录制默认至少需要 8 GB 可用空间；重连路径可传入更低阈值
+        （如 ``_MIN_FREE_BYTES_WHILE_RECORDING`` = 2GB）。
 
         Args:
             output_dir: 输出目录路径
             concurrent_streams: 并发录制路数，默认 1
+            min_free_bytes_per_stream: 每路最低可用字节数；None 则用默认 8GB
 
         Returns:
             错误信息字符串；空字符串表示检查通过，非空字符串表示空间不足
@@ -758,7 +765,12 @@ class RecordingService:
 
         os.makedirs(output_dir, exist_ok=True)
         _total, _used, free = shutil.disk_usage(output_dir)
-        required = cls._MIN_FREE_BYTES_PER_STREAM * max(1, concurrent_streams)
+        per_stream = (
+            int(min_free_bytes_per_stream)
+            if min_free_bytes_per_stream is not None
+            else cls._MIN_FREE_BYTES_PER_STREAM
+        )
+        required = per_stream * max(1, concurrent_streams)
         if free < required:
             free_gb = free / (1024**3)
             required_gb = required / (1024**3)

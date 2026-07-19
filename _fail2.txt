@@ -1,0 +1,90 @@
+﻿python : C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\pytest_asyncio\plugin.py:207:
+ PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 C:\Users\Administrator\AppData\Local\Temp\ps-script-12df917a-d98c-451a-aee3-23b208e17a98.ps1:128 字符: 59
++ ... offscreen"; python -m pytest tests/test_room_handler_lifecycle.py::te ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\Admini...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asy
+ncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explic
+itly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module",
+ "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.3.4, pluggy-1.6.0 -- C:\Users\Administrator\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+PySide6 6.11.1 -- Qt runtime 6.11.1 -- Qt compiled 6.11.1
+rootdir: D:\Project\直播切片多人
+configfile: pytest.ini
+plugins: anyio-4.13.0, asyncio-0.25.0, cov-7.1.0, qt-4.5.0
+asyncio: mode=Mode.STRICT, asyncio_default_fixture_loop_scope=None
+collecting ... collected 2 items
+
+tests/test_room_handler_lifecycle.py::test_mse_preview_attaches_existing_shared_ingest_when_enabled FAILED [ 50%]
+tests/test_ws_scheduling.py::TestSequentialDispatch::test_handlers_run_sequentially_preserving_order FAILED [100%]
+
+================================== FAILURES ===================================
+________ test_mse_preview_attaches_existing_shared_ingest_when_enabled ________
+tests\test_room_handler_lifecycle.py:393: in test_mse_preview_attaches_existing_shared_ingest_when_enabled
+    assert any(
+E   assert False
+E    +  where False = any(<generator object test_mse_preview_attaches_existing_shared_ingest_when_enabled.<locals>.<genexpr> at 0x000001DCFFF4FAC0>)
+---------------------------- Captured stderr call -----------------------------
+2026-07-16 00:22:13 [INFO] lsc.handlers: 预览切换: room_id=room-1, enabled=True, mode=mse
+2026-07-16 00:22:13 [INFO] lsc.config: Found ffmpeg in PATH: C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Links\ffmpeg.EXE
+2026-07-16 00:22:13 [INFO] lsc.config: Found ffprobe in PATH: C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Links\ffprobe.EXE
+2026-07-16 00:22:13 [INFO] lsc.config: LSC config loaded (singleton created)
+2026-07-16 00:22:13 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=room-1 reason=source failed
+2026-07-16 00:22:13 [INFO] lsc.handlers: Shared MSE error for room room-1: source failed
+2026-07-16 00:22:13 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room room-1 (delay=2.0s, error=source failed)
+------------------------------ Captured log call ------------------------------
+INFO     lsc.handlers:room_handler.py:4200 预览切换: room_id=room-1, enabled=True, mode=mse
+INFO     lsc.config:config.py:248 Found ffmpeg in PATH: C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Links\ffmpeg.EXE
+INFO     lsc.config:config.py:248 Found ffprobe in PATH: C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Links\ffprobe.EXE
+INFO     lsc.config:config.py:356 LSC config loaded (singleton created)
+INFO     lsc.core.services.shared_ingest:shared_ingest.py:1087 shared ingest stopping room=room-1 reason=source failed
+INFO     lsc.handlers:room_handler.py:2628 Shared MSE error for room room-1: source failed
+INFO     lsc.handlers:room_handler.py:2709 Shared MSE reconnect attempt 1/3 for room room-1 (delay=2.0s, error=source failed)
+___ TestSequentialDispatch.test_handlers_run_sequentially_preserving_order ____
+tests\test_ws_scheduling.py:121: in test_handlers_run_sequentially_preserving_order
+    asyncio.run(run_test())
+C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\asyncio\runners.py:195: in run
+    return runner.run(main)
+C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\asyncio\runners.py:118: in run
+    return self._loop.run_until_complete(task)
+C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\asyncio\base_events.py:691: in run_until_complete
+    return future.result()
+tests\test_ws_scheduling.py:119: in run_test
+    assert order == ['first_start', 'first_end', 'second']
+E   AssertionError: assert [] == ['first_start', 'first_end', 'second']
+E     
+E     Right contains 3 more items, first extra item: 'first_start'
+E     
+E     Full diff:
+E     + []
+E     - [
+E     -     'first_start',
+E     -     'first_end',
+E     -     'second',
+E     - ]
+---------------------------- Captured stderr call -----------------------------
+2026-07-16 00:22:14 [WARNING] lsc.server: Rejected WebSocket connection: missing Origin header
+------------------------------ Captured log call ------------------------------
+WARNING  lsc.server:server.py:101 Rejected WebSocket connection: missing Origin header
+=========================== short test summary info ===========================
+FAILED tests/test_room_handler_lifecycle.py::test_mse_preview_attaches_existing_shared_ingest_when_enabled - assert False
+ +  where False = any(<generator object test_mse_preview_attaches_existing_shared_ingest_when_enabled.<locals>.<genexpr> at 0x000001DCFFF4FAC0>)
+FAILED tests/test_ws_scheduling.py::TestSequentialDispatch::test_handlers_run_sequentially_preserving_order - AssertionError: assert [] == ['first_start', 'first_end', 'second']
+  
+  Right contains 3 more items, first extra item: 'first_start'
+  
+  Full diff:
+  + []
+  - [
+  -     'first_start',
+  -     'first_end',
+  -     'second',
+  - ]
+============================== 2 failed in 2.20s ==============================

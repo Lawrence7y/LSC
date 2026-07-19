@@ -1,0 +1,23 @@
+﻿python : C:\Users\Administrator\AppData\Local\Programs\Python\Python312\Lib\site-packages\pytest_asyncio\plugin.py:207:
+ PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 C:\Users\Administrator\AppData\Local\Temp\ps-script-449aa081-dd28-4820-997c-9c6173cca7aa.ps1:128 字符: 35
++ ... offscreen'; python -m pytest tests/test_round_detector.py::TestOcrPha ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\Admini...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asy
+ncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explic
+itly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module",
+ "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+F                                                                        [100%]
+================================== FAILURES ===================================
+_ TestOcrPhaseRoundSegments.test_trailing_buy_phase_does_not_back_cut_previous_round _
+tests\test_round_detector.py:314: in test_trailing_buy_phase_does_not_back_cut_previous_round
+    assert res[-1]["end"] == 261.0
+E   assert 272.0 == 261.0
+=========================== short test summary info ===========================
+FAILED tests/test_round_detector.py::TestOcrPhaseRoundSegments::test_trailing_buy_phase_does_not_back_cut_previous_round
+1 failed in 0.58s

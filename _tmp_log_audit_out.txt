@@ -1,0 +1,174 @@
+=== 1. FILE METADATA ===
+backend.log	1200471	mtime=2026-07-19 12:04:58	ctime=2026-06-26 18:04:16
+backend.log.1	2096929	mtime=2026-07-17 16:56:51	ctime=2026-06-26 18:04:16
+backend.log.2	2097169	mtime=2026-07-15 19:31:08	ctime=2026-06-26 18:04:16
+backend.log.5	2097091	mtime=2026-07-14 22:57:02	ctime=2026-06-26 18:04:16
+backend-stdout.log	2383338	mtime=2026-07-19 12:04:58	ctime=2026-07-01 01:14:40
+backend-stdout.log.1	294093807	mtime=2026-07-16 10:03:14	ctime=2026-07-01 01:14:40
+debug.log	14801	mtime=2026-07-19 12:04:59	ctime=2026-06-28 19:44:54
+debug.log.1	2121682	mtime=2026-07-19 12:04:47	ctime=2026-06-28 19:44:54
+debug.log.2	2107635	mtime=2026-07-18 19:11:06	ctime=2026-06-28 19:44:54
+debug.log.3	2107642	mtime=2026-07-18 17:14:20	ctime=2026-06-28 19:44:54
+debug.log.4	2115024	mtime=2026-07-18 16:31:24	ctime=2026-06-28 19:44:54
+debug.log.5	2117713	mtime=2026-07-18 15:44:46	ctime=2026-06-28 19:44:54
+
+=== DATED LINE COUNTS (2026-07-19) ===
+backend.log	511
+backend-stdout.log	499
+
+=== 2. HIT COUNTS BY TAG ===
+ERROR	23
+WARNING	16
+mse_error	14
+reconnect_fail	2
+
+=== 3. HIT COUNTS BY FILE ===
+backend.log	22
+backend-stdout.log	13
+
+=== 4. TOP ERROR PATTERNS (normalized) ===
+COUNT=2	TAGS=WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 01:18:01 [WARNING] lsc.core.services.shared_ingest: shared preview start failed room=3bd1767d369e42039c9ff08626f8639b: preview ffmpeg exited immediately: code=3221225794
+
+COUNT=2	TAGS=ERROR,mse_error	FILE=backend.log
+  EXAMPLE: 2026-07-19 01:18:01 [INFO] lsc.handlers: Shared MSE error for room 3bd1767d369e42039c9ff08626f8639b: 发生错误：preview ffmpeg exited immediately: code=3221225794
+
+COUNT=2	TAGS=ERROR,mse_error	FILE=backend.log
+  EXAMPLE: 2026-07-19 01:18:01 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room 3bd1767d369e42039c9ff08626f8639b (delay=2.0s, error=发生错误：preview ffmpeg exited immediately: code=3221225794)
+
+COUNT=2	TAGS=ERROR	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:55:52 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=c6600f2efd36458780aa5678ca5c4a4f reason=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 00000208d36da9c0] Error opening input: Error numbe
+
+COUNT=2	TAGS=ERROR,mse_error	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE error for room c6600f2efd36458780aa5678ca5c4a4f: shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 00000208d36da9c0] Error opening input: Error number -138 occurred | Error ope
+
+COUNT=2	TAGS=ERROR,reconnect_fail,mse_error	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room c6600f2efd36458780aa5678ca5c4a4f (delay=2.0s, error=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 00000208d36da9c0] Error opening input: Erro
+
+COUNT=2	TAGS=ERROR,WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:55:52 [WARNING] lsc.gui.multi_room.manager: shared ingest recording failed room=c6600f2efd36458780aa5678ca5c4a4f: recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 000002cc3baea140] could not find codec parameters | Error opening input
+
+COUNT=2	TAGS=ERROR,mse_error	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=request_mse_init_response, data={'success': False, 'error': 'MSE 流未启动'}
+
+COUNT=2	TAGS=ERROR,mse_error	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=request_mse_init_response, data={'success': False, 'error': 'MSE ��δ����'}
+
+COUNT=1	TAGS=ERROR	FILE=backend.log
+  EXAMPLE: 2026-07-19 01:17:58 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=3bd1767d369e42039c9ff08626f8639b reason=shared ingest upstream ffmpeg exited: code=1073807364 | stderr: [http @ 0000020703700400] Stream ends prematurely at 1111353, should be 18446744073709551615 | [http @ 0000020703700400] Will reconnect at 1111353 in 0 second
+
+COUNT=1	TAGS=ERROR,mse_error	FILE=backend.log
+  EXAMPLE: 2026-07-19 01:17:58 [INFO] lsc.handlers: Shared MSE error for room 3bd1767d369e42039c9ff08626f8639b: 平台拒绝了连接（403）。可能主播未开播，或需要登录 Cookie。
+
+COUNT=1	TAGS=ERROR,mse_error	FILE=backend.log
+  EXAMPLE: 2026-07-19 01:17:58 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room 3bd1767d369e42039c9ff08626f8639b (delay=2.0s, error=平台拒绝了连接（403）。可能主播未开播，或需要登录 Cookie。)
+
+COUNT=1	TAGS=ERROR,WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:55:52 [WARNING] lsc.recording: [录制] failed for room c6600f2efd36458780aa5678ca5c4a4f, last_error=recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 000002cc3baea140] could not find codec parameters | Error opening input file pipe:0. | E
+
+COUNT=1	TAGS=ERROR	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=start_recording_response, data={'success': False, 'error': '录制引擎出错。请检查编码器设置或重启应用。', 'room_id': 'c6600f2efd36458780aa5678ca5c4a4f'}
+
+COUNT=1	TAGS=WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:56:30 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=18s, markers=0)，回退到纯音频检测
+
+COUNT=1	TAGS=WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:56:49 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=34s, markers=0)，回退到纯音频检测
+
+COUNT=1	TAGS=WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:57:13 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=59s, markers=0)，回退到纯音频检测
+
+COUNT=1	TAGS=WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:57:44 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=93s, markers=0)，回退到纯音频检测
+
+COUNT=1	TAGS=WARNING	FILE=backend.log
+  EXAMPLE: 2026-07-19 11:58:28 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=134s, markers=3)，回退到纯音频检测
+
+COUNT=1	TAGS=ERROR,WARNING	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:55:52 [WARNING] lsc.recording: [¼��] failed for room c6600f2efd36458780aa5678ca5c4a4f, last_error=recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 000002cc3baea140] could not find codec parameters | Error opening input file pipe:0. | 
+
+COUNT=1	TAGS=ERROR	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=start_recording_response, data={'success': False, 'error': '¼�����������������������û�����Ӧ�á�', 'room_id': 'c6600f2efd36458780aa5678ca5c4a4f'}
+
+COUNT=1	TAGS=WARNING	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:56:30 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=18s, markers=0)�����˵�����Ƶ���
+
+COUNT=1	TAGS=WARNING	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:56:49 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=34s, markers=0)�����˵�����Ƶ���
+
+COUNT=1	TAGS=WARNING	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:57:13 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=59s, markers=0)�����˵�����Ƶ���
+
+COUNT=1	TAGS=WARNING	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:57:44 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=93s, markers=0)�����˵�����Ƶ���
+
+COUNT=1	TAGS=WARNING	FILE=backend-stdout.log
+  EXAMPLE: 2026-07-19 11:58:28 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=134s, markers=3)�����˵�����Ƶ���
+
+
+=== 5. CHRONOLOGICAL ERROR/WARN SAMPLE ===
+01:17:58	ERROR	backend.log:2969	2026-07-19 01:17:58 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=3bd1767d369e42039c9ff08626f8639b reason=shared ingest upstream ffmpeg exited: code=1073807364 | stderr: [http @ 0000020703700400] Stream ends prematurely at 1111353, should be 1844674407370955
+01:17:58	ERROR,mse_error	backend.log:2970	2026-07-19 01:17:58 [INFO] lsc.handlers: Shared MSE error for room 3bd1767d369e42039c9ff08626f8639b: 平台拒绝了连接（403）。可能主播未开播，或需要登录 Cookie。
+01:17:58	ERROR,mse_error	backend.log:2971	2026-07-19 01:17:58 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room 3bd1767d369e42039c9ff08626f8639b (delay=2.0s, error=平台拒绝了连接（403）。可能主播未开播，或需要登录 Cookie。)
+01:18:01	WARNING	backend.log:2974	2026-07-19 01:18:01 [WARNING] lsc.core.services.shared_ingest: shared preview start failed room=3bd1767d369e42039c9ff08626f8639b: preview ffmpeg exited immediately: code=3221225794
+01:18:01	ERROR,mse_error	backend.log:2975	2026-07-19 01:18:01 [INFO] lsc.handlers: Shared MSE error for room 3bd1767d369e42039c9ff08626f8639b: 发生错误：preview ffmpeg exited immediately: code=3221225794
+01:18:01	ERROR,mse_error	backend.log:2977	2026-07-19 01:18:01 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room 3bd1767d369e42039c9ff08626f8639b (delay=2.0s, error=发生错误：preview ffmpeg exited immediately: code=3221225794)
+01:18:03	WARNING	backend.log:2980	2026-07-19 01:18:03 [WARNING] lsc.core.services.shared_ingest: shared preview start failed room=3bd1767d369e42039c9ff08626f8639b: preview ffmpeg exited immediately: code=3221225794
+01:18:03	ERROR,mse_error	backend.log:2981	2026-07-19 01:18:03 [INFO] lsc.handlers: Shared MSE error for room 3bd1767d369e42039c9ff08626f8639b: 发生错误：preview ffmpeg exited immediately: code=3221225794
+01:18:03	ERROR,mse_error	backend.log:2983	2026-07-19 01:18:03 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room 3bd1767d369e42039c9ff08626f8639b (delay=2.0s, error=发生错误：preview ffmpeg exited immediately: code=3221225794)
+11:55:52	ERROR	backend-stdout.log:7140	2026-07-19 11:55:52 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=c6600f2efd36458780aa5678ca5c4a4f reason=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138
+11:55:52	ERROR,mse_error	backend-stdout.log:7141	2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE error for room c6600f2efd36458780aa5678ca5c4a4f: shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 0000020
+11:55:52	ERROR,reconnect_fail,mse_error	backend-stdout.log:7142	2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room c6600f2efd36458780aa5678ca5c4a4f (delay=2.0s, error=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error numb
+11:55:52	ERROR,WARNING	backend-stdout.log:7143	2026-07-19 11:55:52 [WARNING] lsc.gui.multi_room.manager: shared ingest recording failed room=c6600f2efd36458780aa5678ca5c4a4f: recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 0
+11:55:52	ERROR,WARNING	backend-stdout.log:7145	2026-07-19 11:55:52 [WARNING] lsc.recording: [¼��] failed for room c6600f2efd36458780aa5678ca5c4a4f, last_error=recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 000002cc3baea140]
+11:55:52	ERROR	backend-stdout.log:7146	2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=start_recording_response, data={'success': False, 'error': '¼�����������������������û�����Ӧ�á�', 'room_id': 'c6600f2efd36458780aa5678ca5c4a4f'}
+11:55:52	ERROR,mse_error	backend-stdout.log:7148	2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=request_mse_init_response, data={'success': False, 'error': 'MSE ��δ����'}
+11:55:52	ERROR,mse_error	backend-stdout.log:7150	2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=request_mse_init_response, data={'success': False, 'error': 'MSE ��δ����'}
+11:55:52	ERROR	backend.log:3057	2026-07-19 11:55:52 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=c6600f2efd36458780aa5678ca5c4a4f reason=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138
+11:55:52	ERROR,mse_error	backend.log:3058	2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE error for room c6600f2efd36458780aa5678ca5c4a4f: shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error number -138 occurred | [in#0 @ 0000020
+11:55:52	ERROR,reconnect_fail,mse_error	backend.log:3059	2026-07-19 11:55:52 [INFO] lsc.handlers: Shared MSE reconnect attempt 1/3 for room c6600f2efd36458780aa5678ca5c4a4f (delay=2.0s, error=shared ingest upstream ffmpeg exited: code=4294967158 | stderr: [tcp @ 00000208d36d6000] Connection to tcp://61.240.135.175:80 failed: Error numb
+11:55:52	ERROR,WARNING	backend.log:3060	2026-07-19 11:55:52 [WARNING] lsc.gui.multi_room.manager: shared ingest recording failed room=c6600f2efd36458780aa5678ca5c4a4f: recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 0
+11:55:52	ERROR,WARNING	backend.log:3062	2026-07-19 11:55:52 [WARNING] lsc.recording: [录制] failed for room c6600f2efd36458780aa5678ca5c4a4f, last_error=recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defaulting to non-FEC/DVHS | [in#0/mpegts @ 000002cc3baea140] 
+11:55:52	ERROR	backend.log:3063	2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=start_recording_response, data={'success': False, 'error': '录制引擎出错。请检查编码器设置或重启应用。', 'room_id': 'c6600f2efd36458780aa5678ca5c4a4f'}
+11:55:52	ERROR,mse_error	backend.log:3065	2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=request_mse_init_response, data={'success': False, 'error': 'MSE 流未启动'}
+11:55:52	ERROR,mse_error	backend.log:3067	2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=request_mse_init_response, data={'success': False, 'error': 'MSE 流未启动'}
+11:56:30	WARNING	backend-stdout.log:7195	2026-07-19 11:56:30 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=18s, markers=0)�����˵�����Ƶ���
+11:56:30	WARNING	backend.log:3109	2026-07-19 11:56:30 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=18s, markers=0)，回退到纯音频检测
+11:56:49	WARNING	backend-stdout.log:7211	2026-07-19 11:56:49 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=34s, markers=0)�����˵�����Ƶ���
+11:56:49	WARNING	backend.log:3125	2026-07-19 11:56:49 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=34s, markers=0)，回退到纯音频检测
+11:57:13	WARNING	backend-stdout.log:7229	2026-07-19 11:57:13 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=59s, markers=0)�����˵�����Ƶ���
+11:57:13	WARNING	backend.log:3143	2026-07-19 11:57:13 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=59s, markers=0)，回退到纯音频检测
+11:57:44	WARNING	backend-stdout.log:7252	2026-07-19 11:57:44 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=93s, markers=0)�����˵�����Ƶ���
+11:57:44	WARNING	backend.log:3166	2026-07-19 11:57:44 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=93s, markers=0)，回退到纯音频检测
+11:58:28	WARNING	backend-stdout.log:7278	2026-07-19 11:58:28 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=134s, markers=3)�����˵�����Ƶ���
+11:58:28	WARNING	backend.log:3192	2026-07-19 11:58:28 [WARNING] lsc.analyzer.round_detector: OCR 回合状态分割无有效回合 (duration=134s, markers=3)，回退到纯音频检测
+
+=== 6. TIMELINE KEY EVENTS ===
+01:17:58	connect	INFO	backend.log:2969	2026-07-19 01:17:58 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=3bd1767d369e42039c9ff08626f8639b reason=shared ingest upstream ffmpeg exited: code=1073807364 | stderr: [http @ 0000020703700400] Stream ends prematurel
+01:18:01	preview	INFO	backend.log:2975	2026-07-19 01:18:01 [INFO] lsc.handlers: Shared MSE error for room 3bd1767d369e42039c9ff08626f8639b: 发生错误：preview ffmpeg exited immediately: code=3221225794
+01:18:01	preview	WARN	backend.log:2974	2026-07-19 01:18:01 [WARNING] lsc.core.services.shared_ingest: shared preview start failed room=3bd1767d369e42039c9ff08626f8639b: preview ffmpeg exited immediately: code=3221225794
+11:25:32	startup	INFO	backend-stdout.log:7065	2026-07-19 11:25:32 [INFO] message_bridge: QtManagerBridge initialized (broadcast_queue maxsize=1000)
+11:26:20	analysis	INFO	backend-stdout.log:7080	2026-07-19 11:26:20 [INFO] lsc.server: Received WS message: type=get_continuous_analysis_status, data={}
+11:26:20	connect	INFO	backend-stdout.log:7077	2026-07-19 11:26:20 [INFO] lsc.server: Client connected. Total: 1
+11:26:20	record	INFO	backend-stdout.log:7087	2026-07-19 11:26:20 [INFO] lsc.server: Sending WS response: type=get_system_stats_response, data={'type': 'system_stats', 'data': {'cpu_percent': 64.1, 'memory_percent': 82.2, 'memory_total_gb': 15.2, 'memory_used_gb': 12.5, 'disk_percent':
+11:54:13	preview	INFO	backend-stdout.log:7089	2026-07-19 11:54:13 [INFO] lsc.server: Sending WS response: type=get_settings_response, data={'output_dir': 'D:\\desktop\\�½��ļ���\\�½��ļ���\\�½��ļ���', 'encoder': 'h264_nvenc', 'crf': 26, 'param_mode': 'CRF ����', 'bitrate': '8000', 'bitra
+11:54:35	connect	INFO	backend-stdout.log:7106	2026-07-19 11:54:35 [INFO] lsc.server: Received WS message: type=add_room, data={'url': 'https://live.douyin.com/963223086705?enter_from_merge=link_share&enter_method=copy_link_share&action_type=click&from=web_code_link'}
+11:55:43	record	INFO	backend-stdout.log:7130	2026-07-19 11:55:43 [INFO] lsc.server: Received WS message: type=start_recording, data={'room_id': 'c6600f2efd36458780aa5678ca5c4a4f'}
+11:55:52	record	WARN	backend-stdout.log:7143	2026-07-19 11:55:52 [WARNING] lsc.gui.multi_room.manager: shared ingest recording failed room=c6600f2efd36458780aa5678ca5c4a4f: recording ffmpeg startup probe failed | stderr: [in#0 @ 000002cc3baf25c0] Could not detect TS packet size, defau
+11:55:52	startup	INFO	backend.log:3065	2026-07-19 11:55:52 [INFO] lsc.server: Sending WS response: type=request_mse_init_response, data={'success': False, 'error': 'MSE 流未启动'}
+11:56:12	analysis	INFO	backend-stdout.log:7178	2026-07-19 11:56:12 [INFO] lsc.server: Sending WS response: type=start_continuous_analysis_response, data={'success': True, 'message': '����������������valorant_round ģʽ����� 60s��', 'main_room_id': 'c6600f2efd36458780aa5678ca5c4a4f', 'targ
+11:56:30	analysis	WARN	backend-stdout.log:7195	2026-07-19 11:56:30 [WARNING] lsc.analyzer.round_detector: OCR �غ�״̬�ָ�����Ч�غ� (duration=18s, markers=0)�����˵�����Ƶ���
+12:00:02	analysis	INFO	backend-stdout.log:7336	2026-07-19 12:00:02 [INFO] lsc.server: Received WS message: type=get_continuous_analysis_status, data={}
+12:01:55	record	INFO	backend-stdout.log:7404	2026-07-19 12:01:55 [INFO] persistence: ��������ѱ���: recording_20260719_115559_8acc49.analysis.json (4 �θ߹�, ��ʱ=0.0s)
+12:02:53	connect	INFO	backend-stdout.log:7447	2026-07-19 12:02:53 [INFO] lsc.server: Client connected. Total: 2
+12:02:53	preview	INFO	backend-stdout.log:7451	2026-07-19 12:02:53 [INFO] lsc.server: Sending WS response: type=get_settings_response, data={'output_dir': 'D:\\desktop\\�½��ļ���\\�½��ļ���\\�½��ļ���', 'encoder': 'h264_nvenc', 'crf': 26, 'param_mode': 'CRF ����', 'bitrate': '8000', 'bitra
+12:02:53	startup	INFO	backend-stdout.log:7446	2026-07-19 12:02:53 [INFO] websockets.server: connection open
+
+=== 7. FIRST/LAST DATED LINE PER ACTIVE FILE ===
+backend.log	FIRST 01:17:58 L2969: 2026-07-19 01:17:58 [INFO] lsc.core.services.shared_ingest: shared ingest stopping room=3bd1767d369e42039c9ff08626f8639b reason=shared ingest upstream ffmpeg exited: code=107380736
+backend.log	LAST  12:05:03 L3481: 2026-07-19 12:05:03 [INFO] lsc.server: Sending WS response: type=get_continuous_analysis_status_response, data={'running': True, 'room_id': 'c6600f2efd36458780aa5678ca5c4a4f', 'tar
+backend-stdout.log	FIRST 11:25:32 L7065: 2026-07-19 11:25:32 [INFO] message_bridge: QtManagerBridge initialized (broadcast_queue maxsize=1000)
+backend-stdout.log	LAST  12:05:03 L7567: 2026-07-19 12:05:03 [INFO] lsc.server: Sending WS response: type=get_continuous_analysis_status_response, data={'running': True, 'room_id': 'c6600f2efd36458780aa5678ca5c4a4f', 'tar
+debug.log	NO_LINES_FOR_DATE
+
+TOTAL_HITS=35

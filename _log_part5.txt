@@ -1,0 +1,12 @@
+======== afternoon session starts / reconnects ========
+-- backend.log.1 --
+2026-07-19 11:25:34 [INFO] websockets.server: server listening on 127.0.0.1:9876
+2026-07-19 11:25:34 [INFO] lsc.server: WebSocket server listening on ws://127.0.0.1:9876
+2026-07-19 14:38:23 [INFO] websockets.server: server listening on 127.0.0.1:9876
+2026-07-19 14:38:23 [INFO] lsc.server: WebSocket server listening on ws://127.0.0.1:9876
+-- backend.log --
+-- backend-stdout.log --
+2026-07-19 11:25:34 [INFO] websockets.server: server listening on 127.0.0.1:9876
+2026-07-19 11:25:34 [INFO] lsc.server: WebSocket server listening on ws://127.0.0.1:9876
+2026-07-19 14:38:23 [INFO] websockets.server: server listening on 127.0.0.1:9876
+2026-07-19 14:38:23 [INFO] lsc.server: WebSocket server listening on ws://127.0.0.1:9876

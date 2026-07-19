@@ -145,6 +145,8 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
             return {'success': False, 'error': '该房间没有录制文件'}
 
         content_offset = getattr(room, 'content_offset', 0.0)
+        # 入队时冻结 content_offset 快照，避免导出排队期间重对齐改变历史切片
+        snap_content_offset = float(content_offset or 0.0)
         ctx = timeline_svc.get_timeline(snap.timeline_id)
         if ctx is not None and snap.room_id in ctx.room_snapshots:
             rec_delta = ctx.room_snapshots[snap.room_id].recording_to_common_delta
@@ -155,11 +157,11 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
             mark_in_wc = getattr(room, 'mark_in_wallclock', None)
             mark_out_wc = getattr(room, 'mark_out_wallclock', None)
             if mark_in_wc is not None and mark_out_wc is not None and rec_start is not None:
-                export_start = max(0.0, mark_in_wc - rec_start - content_offset)
-                export_end = max(0.0, mark_out_wc - rec_start - content_offset)
+                export_start = max(0.0, mark_in_wc - rec_start - snap_content_offset)
+                export_end = max(0.0, mark_out_wc - rec_start - snap_content_offset)
             else:
-                export_start = max(0.0, snap.common_start - content_offset)
-                export_end = max(0.0, snap.common_end - content_offset)
+                export_start = max(0.0, snap.common_start - snap_content_offset)
+                export_end = max(0.0, snap.common_end - snap_content_offset)
 
         jid = f"clip-{clip_id[:8]}"
 
@@ -169,6 +171,7 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
             preset_id=data.get('preset_id', ''),
             source=snap.source or data.get('source', 'manual'),
             job_id=jid,
+            content_offset=snap_content_offset,
         )
 
         if result.get('error'):

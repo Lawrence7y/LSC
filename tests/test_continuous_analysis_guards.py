@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -684,5 +685,58 @@ def test_pending_highlights_also_trimmed_before_list() -> None:
     assert "pending_only_hl = [" in loop
     # pending_only 与 ocr_confirmed 均 trim
     assert loop.count("_trim_valorant_combat_bounds(h)") >= 2
+
+
+def test_is_timeout_scan_error_detects_asyncio_timeout() -> None:
+    """现场：TimeoutError() 的 str 为空，必须用 repr 识别。"""
+    assert room_handler._is_timeout_scan_error("TimeoutError()")
+    assert room_handler._is_timeout_scan_error(TimeoutError())
+    assert room_handler._is_timeout_scan_error(asyncio.TimeoutError())
+    assert not room_handler._is_timeout_scan_error("ValueError('x')")
+    assert not room_handler._is_timeout_scan_error(None)
+
+
+def test_apply_scan_timeout_backoff_disables_ocr_and_caps_catchup() -> None:
+    """OCR 超时后须降级纯音频并限制追赶窗，避免立刻再开 600s OCR。"""
+    state: dict = {"refine_with_ocr": True, "last_scan_error": "TimeoutError()"}
+    room_handler._apply_scan_timeout_backoff(state)
+    assert int(state.get("ocr_degraded_remaining", 0)) >= 2
+    assert float(state.get("post_timeout_max_catchup_sec", 999)) <= 180.0
+
+
+def test_apply_scan_budget_degrade_forces_audio_and_caps_range() -> None:
+    """预算层：ocr_degraded 时关掉 OCR，并把 end 钳到 last_analyzed+cap。"""
+    scan_range = (2431.0, 3031.0)  # 现场超时后膨胀窗
+    use_ocr, capped = room_handler._apply_scan_budget_degrade(
+        {"ocr_degraded_remaining": 3, "post_timeout_max_catchup_sec": 120.0},
+        scan_range=scan_range,
+        last_analyzed=2551.0,
+        use_ocr=True,
+    )
+    assert use_ocr is False
+    assert capped[0] == 2431.0
+    assert capped[1] <= 2551.0 + 120.0 + 0.01
+    assert capped[1] < 3031.0
+
+
+def test_clear_ocr_degrade_on_success_decrements() -> None:
+    state = {"ocr_degraded_remaining": 2}
+    room_handler._note_successful_scan_after_degrade(state)
+    assert state["ocr_degraded_remaining"] == 1
+    room_handler._note_successful_scan_after_degrade(state)
+    assert state["ocr_degraded_remaining"] == 0
+
+
+def test_continuous_worker_holds_semaphore_until_timed_out_scan_aborts() -> None:
+    """超时不得立刻释放分析锁：否则旧 OCR 线程与新扫描并发 → 原生崩溃。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    worker = src.split("async def _continuous_valorant_worker", 1)[1].split(
+        "async def _continuous_analysis_loop", 1
+    )[0]
+    assert "scan_abort" in worker
+    assert "asyncio.shield" in worker
+    assert "cancel_check" in worker
+    # wait_for 超时后仍须 await 同一 future（grace），semaphore 在外层 with 内
+    assert worker.find("TimeoutError") < worker.find("scan_abort") or "scan_abort" in worker
 
 

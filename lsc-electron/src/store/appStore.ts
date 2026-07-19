@@ -80,6 +80,21 @@ const defaultAppSettings: AppSettings = {
   default_export_preset: 'douyin_vertical',
 }
 
+/** rooms_updated 浅比较：字段全同则跳过 set，避免无意义整树替换。 */
+function roomsShallowEqual(a: RoomSession[], b: RoomSession[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const left = a[i] as Record<string, unknown>
+    const right = b[i] as Record<string, unknown>
+    const keys = new Set([...Object.keys(left), ...Object.keys(right)])
+    for (const key of keys) {
+      if (left[key] !== right[key]) return false
+    }
+  }
+  return true
+}
+
 export const useAppStore = create<AppState & AppActions>((set) => ({
   rooms: [],
   selectedRoomId: null,
@@ -110,6 +125,7 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
         preview_frame_data: incoming.preview_frame_data ?? prev.preview_frame_data,
       }
     })
+    if (roomsShallowEqual(state.rooms, merged)) return state
     return { rooms: merged }
   }),
 

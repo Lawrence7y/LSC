@@ -395,6 +395,20 @@ def get_douyin_cookie_status() -> dict[str, object]:
     }
 
 
+def get_bilibili_cookie_status() -> dict[str, object]:
+    """返回 B 站 Cookie 状态，供设置页展示。"""
+    cookies = get_bilibili_cookies()
+    config_dir = os.path.expanduser("~/.lsc/cookies")
+    cookie_file = os.path.join(config_dir, "bilibili.json")
+    return {
+        "configured": bool(cookies),
+        "count": len(cookies),
+        "keys": sorted(cookies.keys())[:20],
+        "source_file": cookie_file if os.path.exists(cookie_file) else "",
+        "has_env": bool(os.environ.get("LSC_BILIBILI_COOKIES")),
+    }
+
+
 def save_douyin_cookies_from_text(raw: str) -> dict[str, object]:
     """解析并保存抖音 Cookie，返回状态。"""
     cookies = parse_cookie_input(raw)
@@ -409,6 +423,21 @@ def save_douyin_cookies_from_text(raw: str) -> dict[str, object]:
         )
     save_cookies(cookies, platform="douyin")
     return get_douyin_cookie_status()
+
+
+def save_bilibili_cookies_from_text(raw: str) -> dict[str, object]:
+    """解析并保存 B 站 Cookie，返回状态。"""
+    cookies = parse_cookie_input(raw)
+    if not cookies:
+        raise ValueError("未解析到有效 Cookie，请确认格式（JSON 或 name=value; ...）")
+    important = ("SESSDATA", "bili_jct", "DedeUserID")
+    if not any(k in cookies for k in important):
+        _log.warning(
+            "B站 Cookie 已保存，但未发现常见登录字段 %s，高画质流可能仍受限",
+            "/".join(important),
+        )
+    save_cookies(cookies, platform="bilibili")
+    return get_bilibili_cookie_status()
 
 
 def cookies_to_header(cookies: dict[str, str]) -> str:
