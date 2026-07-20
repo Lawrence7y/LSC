@@ -29,3 +29,4 @@
 
 - 仓库内**不**包含真实生产 ONNX（体积大、需标注数据训练）。
 - 模型缺失时 Valorant 持续分析会报 `ModelContractError` 并禁用自动切片，不会回退旧音频/OCR 边界算法。
+- `valorant_round` 持续分析与同步导出均以混合视觉（`valorant_hybrid_v1`）为唯一边界权威；legacy OCR/音频回合不可入列。
