@@ -42,7 +42,8 @@ function needsConfirm(clip: ClipSegment): boolean {
 function canExportClip(clip: ClipSegment): boolean {
   const confirmed = !clip.confirm_status ||
     clip.confirm_status === 'user_confirmed' ||
-    clip.confirm_status === 'ocr_confirmed'
+    clip.confirm_status === 'ocr_confirmed' ||
+    clip.confirm_status === 'vision_confirmed'
   if (!confirmed) return false
   if (clip.export_status === 'queued' || clip.export_status === 'exporting') return false
   return true
@@ -72,6 +73,7 @@ function primaryStatus(
     case 'pending': return { text: '待调', color: 'orange' }
     case 'user_confirmed': return { text: '可导', color: 'cyan' }
     case 'ocr_confirmed': return { text: 'AI可导', color: 'purple' }
+    case 'vision_confirmed': return { text: '视觉确认', color: 'geekblue' }
     default:
       if (clip.exported) return { text: '已导', color: 'green' }
       return null
@@ -208,6 +210,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
               formatTime,
             })
               + (isApprox ? ' · 近似定位' : '')
+              + (clip.boundary_evidence?.length ? `\n${clip.boundary_evidence.join(' · ')}` : '')
               + (isFailed && clip.export_error ? `\n${clip.export_error}` : '')
 
             const accent = isRefining
@@ -306,6 +309,11 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                     }}>
                       {formatTime(clip.start)}–{formatTime(clip.end)}
                       <span style={{ opacity: 0.55, marginLeft: 6 }}>{formatDuration(clip.end - clip.start)}</span>
+                      {clip.boundary_evidence?.length ? (
+                        <span style={{ opacity: 0.7, marginLeft: 6 }}>
+                          {clip.boundary_evidence.slice(0, 2).join(' · ')}
+                        </span>
+                      ) : null}
                     </span>
 
                     <Space

@@ -1165,3 +1165,15 @@ def test_timeline_content_span_uses_recording_when_preview_off() -> None:
         "const dvrStart = useMemo", 1
     )[0]
     assert "resolveLiveContentSpan" in timeline_view
+
+
+def test_clip_confirm_status_type_includes_vision_confirmed() -> None:
+    """ClipConfirmStatus 须包含 vision_confirmed，供工作台导出门禁使用。"""
+    types = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
+    clip_list = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+
+    assert "vision_confirmed" in types
+    assert "'vision_confirmed'" in types or '"vision_confirmed"' in types
+    assert "vision_confirmed" in clip_list
+    assert "vision_confirmed" in workbench.split("on('clip_confirm_status'", 1)[1].split("on('clip_export_started'", 1)[0]

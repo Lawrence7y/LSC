@@ -30,6 +30,7 @@ def test_can_export_for_shortcut_rejects_pending_and_refining() -> None:
     assert "confirm_status === 'refining'" not in body
     assert "user_confirmed" in body
     assert "ocr_confirmed" in body
+    assert "vision_confirmed" in body
 
 
 def test_handle_export_many_does_not_auto_confirm_pending_with_bounds_only() -> None:
@@ -39,6 +40,15 @@ def test_handle_export_many_does_not_auto_confirm_pending_with_bounds_only() -> 
     assert "boundsOnly" not in body
     assert "handleConfirmClip(clip, i, { syncTargets: false, boundsOnly: true })" not in body
     assert "handleConfirmClip" not in body
+
+
+def test_can_export_clip_includes_vision_confirmed() -> None:
+    """视觉确认回合与 ocr_confirmed 一样可直接导出。"""
+    source = _clip_list_source()
+    body = source.split("function canExportClip", 1)[1].split("\n}", 1)[0]
+
+    assert "vision_confirmed" in body
+    assert "case 'vision_confirmed'" in source
 
 
 def test_clip_list_batch_export_uses_can_export_clip_only() -> None:

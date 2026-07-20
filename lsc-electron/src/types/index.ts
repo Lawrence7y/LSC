@@ -65,7 +65,7 @@ export interface RoomSession {
 }
 
 // 切片确认状态（与导出状态正交：确认管可信度，export 管导出队列）
-export type ClipConfirmStatus = 'pending' | 'refining' | 'user_confirmed' | 'ocr_confirmed'
+export type ClipConfirmStatus = 'pending' | 'refining' | 'user_confirmed' | 'ocr_confirmed' | 'vision_confirmed'
 
 // 切片相关
 export interface ClipSegment {
@@ -84,8 +84,12 @@ export interface ClipSegment {
   is_ai_highlight?: boolean
   /** 切片来源：'manual' = 手动添加, 'ai_highlight' = AI 高光 */
   source?: 'manual' | 'ai_highlight'
-  /** AI 检出的确认状态（pending/refining/user_confirmed/ocr_confirmed） */
+  /** AI 检出的确认状态（pending/refining/user_confirmed/ocr_confirmed/vision_confirmed） */
   confirm_status?: ClipConfirmStatus
+  /** 混合视觉边界短证据标签（如「买枪退出 + 比分变化」） */
+  boundary_evidence?: string[]
+  /** 边界来源（如 valorant_hybrid_v1） */
+  boundary_source?: string
   /** 稳定回合键（与持续分析 _valorant_round_key 一致），用于多房同步 */
   round_key?: string
   /** 入队时快照的墙钟入点（time.monotonic），导出时优先于房间当前 mark */

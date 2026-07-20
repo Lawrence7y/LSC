@@ -100,7 +100,8 @@ function canExportForShortcut(c: ClipSegment): boolean {
   // 与 canExportClip 一致：pending/refining 不可直接导出，须先确认
   return !c.confirm_status ||
     c.confirm_status === 'user_confirmed' ||
-    c.confirm_status === 'ocr_confirmed'
+    c.confirm_status === 'ocr_confirmed' ||
+    c.confirm_status === 'vision_confirmed'
 }
 
 function isApproximateClip(c: ClipSegment): boolean {
@@ -2808,6 +2809,8 @@ export default function Workbench() {
                 common_start: commonStart ?? c.common_start,
                 common_end: commonEnd ?? c.common_end,
                 confirm_status: data.confirm_status ?? c.confirm_status,
+                boundary_evidence: data.boundary_evidence ?? c.boundary_evidence,
+                boundary_source: data.boundary_source ?? c.boundary_source,
                 label: data.label || c.label,
                 clip_id: data.clip_id || c.clip_id,
                 job_id: data.job_id || c.job_id,
@@ -2840,6 +2843,8 @@ export default function Workbench() {
           highlight_score: data.score,
           mark_precision: data.clip_snapshot_id ? 'exact' : undefined,
           confirm_status: data.confirm_status ?? (data.export_deferred ? 'pending' : undefined),
+          boundary_evidence: data.boundary_evidence,
+          boundary_source: data.boundary_source,
           round_key: data.round_key,
         })
         return
@@ -2862,6 +2867,8 @@ export default function Workbench() {
         highlight_score: data.score,
         mark_precision: data.clip_snapshot_id ? 'exact' : undefined,
         confirm_status: data.confirm_status ?? (data.export_deferred ? 'pending' : undefined),
+        boundary_evidence: data.boundary_evidence,
+        boundary_source: data.boundary_source,
         round_key: data.round_key,
       })
       scheduleBatchedToast(
@@ -2882,7 +2889,7 @@ export default function Workbench() {
         { label: data.label, duration: data.end - data.start },
       )
     }))
-    // 精修状态更新（refining / user_confirmed / ocr_confirmed）；目标房缺条目时 upsert
+    // 精修状态更新（refining / user_confirmed / ocr_confirmed / vision_confirmed）；目标房缺条目时 upsert
     unsubs.push(on('clip_confirm_status', (data: any) => {
       if (!data?.room_id || !data?.round_key) return
       const st = useAppStore.getState()
@@ -2924,7 +2931,7 @@ export default function Workbench() {
         return
       }
       // 多房确认同步：目标房尚无同 round_key 条目则补一条
-      if (data.confirm_status === 'user_confirmed' || data.confirm_status === 'ocr_confirmed') {
+      if (data.confirm_status === 'user_confirmed' || data.confirm_status === 'ocr_confirmed' || data.confirm_status === 'vision_confirmed') {
         const start = typeof data.start === 'number' ? data.start : 0
         const end = typeof data.end === 'number' ? data.end : start
         const room = st.rooms.find(r => r.room_id === data.room_id)
