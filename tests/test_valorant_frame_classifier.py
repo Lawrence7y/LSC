@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
+
+from lsc.analyzer.valorant_frame_classifier import (
+    ModelContractError,
+    ValorantFrameClassifier,
+)
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "valorant_vision"
 META_PATH = FIXTURE_DIR / "valorant_phase_v1.json"
@@ -31,3 +38,33 @@ def test_fixture_metadata_has_required_keys() -> None:
     ]
     assert meta["input_size"] == [224, 224]
     assert meta["color_order"] == "RGB"
+    onnx_path = FIXTURE_DIR / "valorant_phase_v1.onnx"
+    digest = hashlib.sha256(onnx_path.read_bytes()).hexdigest()
+    assert meta["sha256"] == digest
+
+
+def test_load_rejects_sha_mismatch(tmp_path: Path) -> None:
+    meta = json.loads(META_PATH.read_text(encoding="utf-8"))
+    bad = tmp_path / "valorant_phase_v1.json"
+    onnx = FIXTURE_DIR / "valorant_phase_v1.onnx"
+    meta["sha256"] = "0" * 64
+    bad.write_text(json.dumps(meta), encoding="utf-8")
+    clf = ValorantFrameClassifier(model_dir=tmp_path)
+    (tmp_path / "valorant_phase_v1.onnx").write_bytes(onnx.read_bytes())
+    with pytest.raises(ModelContractError, match="sha256"):
+        clf.load()
+
+
+def test_predict_batch_returns_five_probs() -> None:
+    clf = ValorantFrameClassifier(model_dir=FIXTURE_DIR)
+    clf.load()
+    frames = [np.zeros((240, 320, 3), dtype=np.uint8) for _ in range(2)]
+    out = clf.predict_batch(frames)
+    assert out.shape == (2, 5)
+    assert np.allclose(out.sum(axis=1), 1.0, atol=1e-3)
+
+
+def test_missing_model_raises_diagnostic_error(tmp_path: Path) -> None:
+    clf = ValorantFrameClassifier(model_dir=tmp_path)
+    with pytest.raises(ModelContractError, match="missing"):
+        clf.load()
