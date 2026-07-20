@@ -1225,6 +1225,13 @@ def _resolve_valorant_model_dir():
     return _DEFAULT_DIR
 
 
+def _valorant_vision_shadow_enabled() -> bool:
+    """Pre-cutover shadow: run hybrid detection but skip clip_queued / listing."""
+    return os.environ.get("LSC_VALORANT_VISION_SHADOW", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _is_hybrid_round(round_data: dict[str, Any]) -> bool:
     return round_data.get("boundary_source") == _HYBRID_BOUNDARY_SOURCE
 
@@ -1248,11 +1255,9 @@ def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
 
 
 def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
-    """Return whether a round is exportable (hybrid vision_confirmed or legacy OCR).
-
-  Hybrid: vision_confirmed + valorant_hybrid_v1 + model boundaries.
-  Legacy OCR (Task 14 removal): ocr_buy_exit + ocr_result/next_buy, min duration.
-    """
+    """Return whether a hybrid round is exportable (vision_confirmed + model boundaries)."""
+    if not _is_hybrid_round(round_data):
+        return False
     try:
         start = float(round_data.get("start", 0.0))
         end = float(round_data.get("end", 0.0))
@@ -1260,20 +1265,11 @@ def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
         return False
     if end <= start:
         return False
-    if _is_hybrid_round(round_data):
-        if round_data.get("confirm_status") != "vision_confirmed":
-            return False
-        start_by = str(round_data.get("start_by", "") or "")
-        end_by = str(round_data.get("end_by", "") or "")
-        return start_by in _HYBRID_VALID_START_BY and end_by in _HYBRID_VALID_END_BY
-    # Legacy OCR path — kept until Task 14
-    if end - start < _VALORANT_MIN_EXPORT_DURATION_SEC:
+    if round_data.get("confirm_status") != "vision_confirmed":
         return False
-    return (
-        round_data.get("phase") != "pending"
-        and round_data.get("start_by") == "ocr_buy_exit"
-        and round_data.get("end_by") in {"ocr_result", "next_buy"}
-    )
+    start_by = str(round_data.get("start_by", "") or "")
+    end_by = str(round_data.get("end_by", "") or "")
+    return start_by in _HYBRID_VALID_START_BY and end_by in _HYBRID_VALID_END_BY
 
 
 def _trim_valorant_combat_bounds(round_data: dict[str, Any]) -> dict[str, Any]:
@@ -1571,6 +1567,11 @@ def _build_continuous_status_payload(
         "model_version": task.get("model_version"),
         "provider": task.get("provider"),
     }
+    if task.get("shadow_mode"):
+        payload["shadow_mode"] = True
+        payload["shadow_rounds_detected"] = int(task.get("shadow_rounds_detected", 0) or 0)
+        payload["shadow_listable_rounds"] = int(task.get("shadow_listable_rounds", 0) or 0)
+        payload["shadow_vision_confirmed"] = int(task.get("shadow_vision_confirmed", 0) or 0)
     if effective_interval is not None:
         payload["effective_interval"] = effective_interval
     return payload
@@ -1626,12 +1627,12 @@ def _merge_round_windows(
                 continue
             if old.get("round_key") and not new_item.get("round_key"):
                 new_item["round_key"] = old["round_key"]
-            old_ocr = _is_ocr_quality_round(old) or _is_auto_exportable_valorant_round(old)
-            new_ocr = _is_ocr_quality_round(new_item) or _is_auto_exportable_valorant_round(new_item)
-            if old_ocr and not new_ocr:
+            old_hybrid = _is_hybrid_round(old) or _is_listable_hybrid_round(old)
+            new_hybrid = _is_hybrid_round(new_item) or _is_listable_hybrid_round(new_item)
+            if old_hybrid and not new_hybrid:
                 replaced_confirmed = True
                 break
-            if new_ocr or not old_ocr:
+            if new_hybrid or not old_hybrid:
                 key = str(old.get("round_key") or "")
                 if key:
                     superseded_old_keys.add(key)
@@ -1707,14 +1708,11 @@ def _continuous_valorant_refine_with_ocr(
     mode: str,
     pressure: dict[str, Any] | None = None,
 ) -> bool:
-    """Return whether continuous Valorant analysis may use OCR.
+    """Return whether continuous Valorant analysis may use legacy OCR refine.
 
-    质量优先档：valorant_round 始终允许 OCR，忽略 pause_analysis / 资源压力。
-    非 valorant_round 模式不走此 OCR 路径。
+    valorant_round 已切换为混合视觉边界，不再通过 refine_with_ocr 升格旧 OCR 路径。
     """
-    if mode != "valorant_round":
-        return False
-    return True
+    return False
 
 
 def _finalize_scan_timeout(duration_sec: float, attempt: int = 1) -> int:
@@ -2204,28 +2202,31 @@ def _analyze_scene_or_rounds(
     """
     if game == 'valorant':
         try:
-            from lsc.analyzer.round_detector import detect_valorant_rounds
+            from lsc.analyzer.round_detector import detect_valorant_rounds_hybrid
+            from lsc.analyzer.valorant_frame_classifier import ModelContractError
             from lsc.config import load_config as _load_cfg_r
             _cfg = _load_cfg_r()
             _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
             if progress_callback:
-                progress_callback("round_detect", 0.0, "Valorant 回合检测中...")
-            highlights = detect_valorant_rounds(
+                progress_callback("round_detect", 0.0, "Valorant 混合视觉回合检测中...")
+            highlights = detect_valorant_rounds_hybrid(
                 video_path,
                 ffmpeg_path=_ffmpeg,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
-                refine_with_ocr=True,  # 一次性分析文件已完整，可用 OCR 校正
+                model_dir=_resolve_valorant_model_dir(),
             )
             if cancel_check and cancel_check():
                 return None
             if highlights:
-                _log.info("Valorant 回合检测: %d 回合 (path=%s)",
+                _log.info("Valorant 混合视觉回合检测: %d 回合 (path=%s)",
                           len(highlights), os.path.basename(video_path))
                 return highlights
-            _log.info("Valorant 回合检测无结果，回退到场景检测")
+            _log.info("Valorant 混合视觉检测无结果，回退到场景检测")
+        except ModelContractError as exc:
+            _log.warning("Valorant 模型不可用，回退到场景检测: %s", exc)
         except Exception as exc:
-            _log.warning("Valorant 回合检测失败，回退到场景检测: %s", exc)
+            _log.warning("Valorant 混合视觉检测失败，回退到场景检测: %s", exc)
 
     return _run_scene_analysis(
         video_path, threshold=threshold,
@@ -6080,25 +6081,6 @@ def register_room_handlers(server, bridge):
                             )
                         except ModelContractError as exc:
                             raise RuntimeError(f"ModelContractError: {exc}") from exc
-                    if game == 'valorant':
-                        from lsc.analyzer.round_detector import (
-                            ValorantRoundConfig, detect_valorant_rounds,
-                        )
-                        try:
-                            _ocr_iv = float(task_state.get('ocr_sample_interval', 2.0) or 2.0)
-                        except (TypeError, ValueError):
-                            _ocr_iv = 2.0
-                        _round_config = ValorantRoundConfig(
-                            full_round=False,
-                            phase_sample_interval=max(0.8, _ocr_iv),
-                        )
-                        return detect_valorant_rounds(
-                            _vp, ffmpeg_path=_ffmpeg, duration=_dur,
-                            cancel_check=_cancel,
-                            refine_with_ocr=_ocr,
-                            time_range=_range,
-                            config=_round_config,
-                        )
                     return _detect_rounds_by_audio_rhythm(
                         _vp, duration=_dur, ffmpeg_path=_ffmpeg,
                         time_range=_range,
@@ -6297,6 +6279,10 @@ def register_room_handlers(server, bridge):
             'last_analyzed': 0.0,
             'highlights': [],
             'result_ready': False,
+            'shadow_mode': _valorant_vision_shadow_enabled() and _valorant_incremental_rounds,
+            'shadow_rounds_detected': 0,
+            'shadow_listable_rounds': 0,
+            'shadow_vision_confirmed': 0,
             # 相位调度状态
             'round_phase': 'unknown',
             'round_phase_detail': '',
@@ -6607,10 +6593,27 @@ def register_room_handlers(server, bridge):
                                 if _valorant_round_key(h) not in vision_keys
                             ]
                             ocr_confirmed_hl = vision_confirmed_hl
+                            if state and state.get('shadow_mode'):
+                                state['shadow_rounds_detected'] = len(all_highlights)
+                                state['shadow_listable_rounds'] = len(listable_hl)
+                                state['shadow_vision_confirmed'] = len(vision_confirmed_hl)
+                                _log.info(
+                                    "Shadow 模式: room_id=%s, 检测 %d 回合, 可入列 %d, 视觉确认 %d（跳过 clip_queued）",
+                                    room_id,
+                                    len(all_highlights),
+                                    len(listable_hl),
+                                    len(vision_confirmed_hl),
+                                )
                         else:
                             pending_only_hl = list(new_hl)
                             ocr_confirmed_hl = []
-                        if (pending_only_hl or ocr_confirmed_hl) and ok and main_room_for_map is not None and target_rooms_for_map:
+                        if (
+                            (pending_only_hl or ocr_confirmed_hl)
+                            and ok
+                            and main_room_for_map is not None
+                            and target_rooms_for_map
+                            and not (state and state.get('shadow_mode'))
+                        ):
                             _auto_preset = load_settings().get('appSettings', {}).get('default_export_preset', '')
                             if pending_only_hl:
                                 await _auto_export_highlights(
