@@ -1874,4 +1874,60 @@ def read_top_digit_anchors(
     return timer_seconds, left_score, right_score
 
 
+def refine_boundary_from_sequence(
+    seq: list[tuple[float, str]],
+    *,
+    target: str,
+    min_stable: int,
+    fps: float,
+) -> float | None:
+    """Return timestamp of first run of min_stable consecutive target labels."""
+    del fps  # reserved for future frame-quantized windows
+    if min_stable <= 0:
+        return None
+
+    run = 0
+    run_start: float | None = None
+    for ts, label in seq:
+        if label == target:
+            if run == 0:
+                run_start = ts
+            run += 1
+            if run >= min_stable:
+                return run_start
+        else:
+            run = 0
+            run_start = None
+    return None
+
+
+def compute_clip_end(
+    result_event_ts: float,
+    next_states: list[tuple[float, str]],
+    *,
+    tail_sec: float = 1.5,
+) -> float:
+    """Keep result tail unless replay/non_game/buy appears sooner."""
+    default_end = result_event_ts + tail_sec
+    cutoff_states = {"replay", "non_game", "buy"}
+    for ts, state in sorted(next_states, key=lambda item: item[0]):
+        if ts < result_event_ts:
+            continue
+        if state in cutoff_states:
+            return min(default_end, ts)
+    return default_end
+
+
+def grade_round_confirmation(
+    *,
+    start_strong: bool,
+    end_strong: bool,
+    score_confirm: bool,
+) -> str:
+    """Grade hybrid boundary confidence; never vision_confirmed on weak end alone."""
+    if start_strong and (end_strong or score_confirm):
+        return "vision_confirmed"
+    return "pending"
+
+
 __all__ = ["detect_valorant_rounds", "ValorantRoundConfig"]
