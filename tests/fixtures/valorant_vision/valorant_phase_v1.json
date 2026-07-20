@@ -1,0 +1,32 @@
+{
+  "model_version": "valorant_phase_v1_stub",
+  "class_names": [
+    "non_game",
+    "buy",
+    "combat",
+    "result",
+    "replay"
+  ],
+  "input_size": [
+    224,
+    224
+  ],
+  "color_order": "RGB",
+  "normalize_mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "normalize_std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "threshold_version": "v1",
+  "sha256": "75c06971728d0a70df9f445991f9c612afd04610e030ace91236291dd834c9b1",
+  "dataset_version": "stub-0",
+  "thresholds": {
+    "stable_prob": 0.55,
+    "high_prob": 0.8
+  }
+}
