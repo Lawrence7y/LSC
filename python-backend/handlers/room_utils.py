@@ -130,12 +130,12 @@ def valorant_round_key(hl: dict) -> str:
 
 
 def is_auto_exportable_valorant_round(hl: dict) -> bool:
-    if hl.get('confirm_status') not in ('user_confirmed', 'ocr_confirmed'):
-        return False
-    if hl.get('is_buy_phase', False):
-        return False
-    duration = hl.get('end', 0) - hl.get('start', 0)
-    return duration >= 2.0
+    if hl.get('confirm_status') in ('user_confirmed', 'ocr_confirmed', 'vision_confirmed'):
+        if hl.get('is_buy_phase', False):
+            return False
+        duration = hl.get('end', 0) - hl.get('start', 0)
+        return duration >= 2.0
+    return False
 
 
 def drop_open_tail_rounds(new_hl: list[dict], worker_dur: float) -> list[dict]:

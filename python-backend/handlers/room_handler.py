@@ -137,6 +137,10 @@ _OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 3
 _POST_TIMEOUT_MAX_CATCHUP_SEC = 120.0
 _SCAN_ABORT_GRACE_SEC = 90.0  # 超时后等 cancel_check 退出的宽限
 _VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期
+_HYBRID_BOUNDARY_SOURCE = "valorant_hybrid_v1"
+_HYBRID_VALID_START_BY = frozenset({"model_buy_exit"})
+_HYBRID_VALID_END_BY = frozenset({"model_result", "model_score"})
+_HYBRID_FINALIZE_OVERLAP_SEC = 2.0
 _VALORANT_POST_ROUND_JUNK_SEC = 8.0  # 回合结束后垃圾时间（结算/回放）先验
 _VALORANT_TRIM_START_PAD_SEC = 0.5  # OCR 起点后移，避开买枪尾帧
 _VALORANT_TRIM_END_PAD_SEC = 1.5  # OCR 终点前移，避开结算字帧
@@ -1209,24 +1213,64 @@ def _drop_open_tail_rounds(
     return cleaned
 
 
-def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
-    """Return whether a round has confirmed OCR boundaries for auto-export.
+def _resolve_valorant_model_dir():
+    """Resolve hybrid vision model directory (env override or package default)."""
+    from pathlib import Path
 
-    Only OCR-confirmed rounds (start_by=ocr_buy_exit, end_by=ocr_result/next_buy)
-    are auto-exported. Audio-only / full_round fuzzy boundaries must wait for OCR.
-    Segments shorter than _VALORANT_MIN_EXPORT_DURATION_SEC are treated as false
-    buy-phase clips (e.g. 回合3_218s ≈ 27s) and rejected.
+    env = os.environ.get("LSC_VALORANT_MODEL_DIR", "").strip()
+    if env:
+        return Path(env)
+    from lsc.analyzer.valorant_frame_classifier import _DEFAULT_DIR
+
+    return _DEFAULT_DIR
+
+
+def _is_hybrid_round(round_data: dict[str, Any]) -> bool:
+    return round_data.get("boundary_source") == _HYBRID_BOUNDARY_SOURCE
+
+
+def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
+    """Hybrid rounds listable when boundary_source + confirm_status + valid bounds."""
+    if not _is_hybrid_round(round_data):
+        return False
+    if round_data.get("confirm_status") not in ("vision_confirmed", "pending"):
+        return False
+    try:
+        start = float(round_data.get("start", 0.0))
+        end = float(round_data.get("end", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if end <= start:
+        return False
+    start_by = str(round_data.get("start_by", "") or "")
+    end_by = str(round_data.get("end_by", "") or "")
+    return start_by in _HYBRID_VALID_START_BY and end_by in _HYBRID_VALID_END_BY
+
+
+def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
+    """Return whether a round is exportable (hybrid vision_confirmed or legacy OCR).
+
+  Hybrid: vision_confirmed + valorant_hybrid_v1 + model boundaries.
+  Legacy OCR (Task 14 removal): ocr_buy_exit + ocr_result/next_buy, min duration.
     """
     try:
         start = float(round_data.get("start", 0.0))
         end = float(round_data.get("end", 0.0))
     except (TypeError, ValueError):
         return False
+    if end <= start:
+        return False
+    if _is_hybrid_round(round_data):
+        if round_data.get("confirm_status") != "vision_confirmed":
+            return False
+        start_by = str(round_data.get("start_by", "") or "")
+        end_by = str(round_data.get("end_by", "") or "")
+        return start_by in _HYBRID_VALID_START_BY and end_by in _HYBRID_VALID_END_BY
+    # Legacy OCR path — kept until Task 14
     if end - start < _VALORANT_MIN_EXPORT_DURATION_SEC:
         return False
     return (
-        end > start
-        and round_data.get("phase") != "pending"
+        round_data.get("phase") != "pending"
         and round_data.get("start_by") == "ocr_buy_exit"
         and round_data.get("end_by") in {"ocr_result", "next_buy"}
     )
@@ -1522,6 +1566,10 @@ def _build_continuous_status_payload(
         "prediction_detail": task.get("prediction_detail"),
         "finalizing": finalizing,
         "completed": bool(task.get("completed", False)),
+        "status": task.get("status", "running"),
+        "analysis_lag_sec": max(0.0, rec_dur - analyzed) if rec_dur else 0.0,
+        "model_version": task.get("model_version"),
+        "provider": task.get("provider"),
     }
     if effective_interval is not None:
         payload["effective_interval"] = effective_interval
@@ -5979,7 +6027,7 @@ def register_room_handlers(server, bridge):
         _continuous_tasks, _analysis_semaphore, _bridge_executor,
         scan_result_container: dict,
     ) -> None:
-        """后台 Worker：连续执行 detect_valorant_rounds / detect_rounds_by_audio_rhythm。
+        """后台 Worker：连续执行 detect_valorant_rounds_hybrid / detect_rounds_by_audio_rhythm。
 
         持有 _analysis_semaphore 确保同时只有 1 个 FFmpeg。
         主循环通过 scan_result_container['video_path'] / ['current_dur'] / ['refine_with_ocr']
@@ -6012,11 +6060,26 @@ def register_room_handlers(server, bridge):
                     st = _continuous_tasks.get(room_id, {})
                     return bool(st.get('cancelled') or st.get('scan_abort'))
 
-                def _do_scan(_vp=_vp, _dur=current_dur, _ocr=refine_with_ocr, _range=scan_range):
+                def _do_scan(_vp=_vp, _dur=current_dur, _ocr=refine_with_ocr, _range=scan_range, _mode=mode):
                     from lsc.config import load_config as _load_cfg_r
                     _cfg = _load_cfg_r()
                     _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
                     _cancel = _scan_cancel_check
+                    if game == 'valorant' and _mode == 'valorant_round':
+                        from lsc.analyzer.round_detector import detect_valorant_rounds_hybrid
+                        from lsc.analyzer.valorant_frame_classifier import ModelContractError
+
+                        try:
+                            return detect_valorant_rounds_hybrid(
+                                _vp,
+                                ffmpeg_path=_ffmpeg,
+                                time_range=_range,
+                                model_dir=_resolve_valorant_model_dir(),
+                                cancel_check=_cancel,
+                                session_id=str(task_state.get('session_id', '') or ''),
+                            )
+                        except ModelContractError as exc:
+                            raise RuntimeError(f"ModelContractError: {exc}") from exc
                     if game == 'valorant':
                         from lsc.analyzer.round_detector import (
                             ValorantRoundConfig, detect_valorant_rounds,
@@ -6026,9 +6089,7 @@ def register_room_handlers(server, bridge):
                         except (TypeError, ValueError):
                             _ocr_iv = 2.0
                         _round_config = ValorantRoundConfig(
-                            # 战斗优先：买枪 trim + 钟声裁尾；禁止 full_round 把买枪/结算糊进入列边界
                             full_round=False,
-                            # 质量档允许 0.8s 密采样
                             phase_sample_interval=max(0.8, _ocr_iv),
                         )
                         return detect_valorant_rounds(
@@ -6134,7 +6195,7 @@ def register_room_handlers(server, bridge):
         last_analyzed = 0.0
         last_consumed_at = 0.0
         all_highlights: list[dict[str, Any]] = []
-        # 收尾分析状态：录制停止后强制再扫一次完整文件，不丢弃尾部回合
+        # 收尾分析状态：录制停止后从游标继续处理尾部，不默认全文件重扫
         _finalize_pending = False        # 是否有待完成的收尾扫描
         _finalize_started = False        # 收尾扫描是否已启动
         _finalize_failures = 0           # 收尾失败次数（超时/异常），用于重试与加长超时
@@ -6257,6 +6318,8 @@ def register_room_handlers(server, bridge):
             ),
             name=f"continuous-worker-{room_id[:8]}",
         )
+        if room_id in _continuous_tasks:
+            _continuous_tasks[room_id]['worker_task'] = _worker_task
 
         _log.info("持续分析启动: room_id=%s, mode=%s, game=%s, interval=%ds, 增量回合窗口=%s",
                   room_id, mode, game, interval, _valorant_incremental_rounds)
@@ -6293,6 +6356,15 @@ def register_room_handlers(server, bridge):
 
                 state = _continuous_tasks.get(room_id)
                 if not state or state.get('cancelled'):
+                    if state:
+                        state['status'] = 'stopping'
+                        state['analysis_stage'] = '停止中'
+                        state['scan_abort'] = True
+                        if state.get('scan_running'):
+                            try:
+                                await asyncio.wait_for(scan_done_event.wait(), timeout=_SCAN_ABORT_GRACE_SEC)
+                            except asyncio.TimeoutError:
+                                _log.warning("停止等待扫描超时: room_id=%s", room_id)
                     break
                 video_path, current_dur = await loop.run_in_executor(
                     _probe_executor, _get_recording_file_info,
@@ -6510,7 +6582,7 @@ def register_room_handlers(server, bridge):
                             manager, main_room_id, target_room_ids, wait_for_file=True,
                         )
                         if _valorant_incremental_rounds:
-                            # 合并后的全量回合做 list upsert（边界精修时 new_hl 常为空）
+                            # Hybrid 入列：仅 listable 回合；禁止 trim；vision_confirmed / pending 分流
                             pending_hl = [
                                 h for h in all_highlights
                                 if any(
@@ -6518,21 +6590,23 @@ def register_room_handlers(server, bridge):
                                     for rid in target_room_ids
                                 )
                             ]
-                            # Snapshot under lock to avoid concurrent mutation
-                            # during the comprehension (#102)
                             with _refined_round_keys_lock:
                                 refined_snapshot = set(_refined_round_keys)
-                            ocr_confirmed_hl = [
-                                _trim_valorant_combat_bounds(h) for h in pending_hl
-                                if _is_auto_exportable_valorant_round(h)
+                            listable_hl = [
+                                h for h in pending_hl
+                                if _is_listable_hybrid_round(h)
                                 and _valorant_round_key(h) not in refined_snapshot
                             ]
-                            ocr_keys = {_valorant_round_key(h) for h in ocr_confirmed_hl}
-                            # 质量档：pending 也 trim，列表边界更接近正赛
-                            pending_only_hl = [
-                                _trim_valorant_combat_bounds(h) for h in pending_hl
-                                if _valorant_round_key(h) not in ocr_keys
+                            vision_confirmed_hl = [
+                                h for h in listable_hl
+                                if _is_auto_exportable_valorant_round(h)
                             ]
+                            vision_keys = {_valorant_round_key(h) for h in vision_confirmed_hl}
+                            pending_only_hl = [
+                                h for h in listable_hl
+                                if _valorant_round_key(h) not in vision_keys
+                            ]
+                            ocr_confirmed_hl = vision_confirmed_hl
                         else:
                             pending_only_hl = list(new_hl)
                             ocr_confirmed_hl = []
@@ -6547,18 +6621,17 @@ def register_room_handlers(server, bridge):
                                     confirm_status='pending',
                                     list_only=True,
                                 )
-                            # OCR 升格：走 clip_queued upsert（带新边界 + ocr_confirmed）
                             if ocr_confirmed_hl:
                                 await _auto_export_highlights(
                                     main_room_for_map, target_rooms_for_map, ocr_confirmed_hl,
-                                    job_prefix=f"{int(time.time() * 1000)}-ocr",
+                                    job_prefix=f"{int(time.time() * 1000)}-vision",
                                     preset_id=_auto_preset,
                                     defer_export=True,
-                                    confirm_status='ocr_confirmed',
+                                    confirm_status='vision_confirmed',
                                     list_only=True,
                                 )
                             _log.info(
-                                "持续分析入列(仅列表): room_id=%s, pending %d 段, ocr升格 %d 段 × %d 房间",
+                                "持续分析入列(仅列表): room_id=%s, pending %d 段, 视觉确认 %d 段 × %d 房间",
                                 room_id, len(pending_only_hl), len(ocr_confirmed_hl),
                                 len(target_rooms_for_map),
                             )
@@ -6570,6 +6643,13 @@ def register_room_handlers(server, bridge):
                     if room_id in _continuous_tasks:
                         _continuous_tasks[room_id]['last_analyzed'] = last_analyzed
                         _continuous_tasks[room_id]['recorded_duration'] = max(recorded_duration, worker_dur)
+                        if worker_result:
+                            _first_hybrid = next(
+                                (h for h in worker_result if h.get("model_version")),
+                                None,
+                            )
+                            if _first_hybrid:
+                                _continuous_tasks[room_id]['model_version'] = _first_hybrid.get("model_version")
                         confirmed_total = sum(
                             1 for item in all_highlights
                             if _is_auto_exportable_valorant_round(item)
@@ -6602,6 +6682,15 @@ def register_room_handlers(server, bridge):
 
                 state = _continuous_tasks.get(room_id)
                 if not state or state.get('cancelled'):
+                    if state:
+                        state['status'] = 'stopping'
+                        state['analysis_stage'] = '停止中'
+                        state['scan_abort'] = True
+                        if state.get('scan_running'):
+                            try:
+                                await asyncio.wait_for(scan_done_event.wait(), timeout=_SCAN_ABORT_GRACE_SEC)
+                            except asyncio.TimeoutError:
+                                _log.warning("停止等待扫描超时: room_id=%s", room_id)
                     break
                 if video_path:
                     should_kick = False
@@ -6746,13 +6835,14 @@ def register_room_handlers(server, bridge):
                             pending_start=_ps,
                             prediction=_pred,
                         )
-                        # 收尾：强制全文件 + OCR，不得被相位休眠 / critical 奇数 tick 关掉。
-                        # 对照实测：finalize=True 却 OCR=False 时，4 个待确认回合无法升格导出。
-                        # 超时必须用 _finalize_scan_timeout：旧公式对 10min 片只给 ~130s。
+                        # 停录收尾：从游标继续处理尾部（保留重叠），禁止默认全文件重扫
                         if _finalize_started or _finalize_pending:
-                            scan_range = (0.0, float(current_dur))
-                            use_ocr_this_tick = True
-                            full_rescan = True
+                            scan_range = (
+                                max(0.0, float(last_analyzed) - _HYBRID_FINALIZE_OVERLAP_SEC),
+                                float(current_dur),
+                            )
+                            use_ocr_this_tick = False
+                            full_rescan = False
                             _scan_timeout = max(
                                 _scan_timeout,
                                 _finalize_scan_timeout(current_dur, attempt=_finalize_failures + 1),
@@ -6891,6 +6981,9 @@ def register_room_handlers(server, bridge):
         except Exception as exc:
             _log.error("持续分析异常: room_id=%s, %s", room_id, exc, exc_info=True)
         finally:
+            stop_state = _continuous_tasks.get(room_id, {})
+            if stop_state.get('status') == 'stopping' or stop_state.get('cancelled'):
+                stop_state['scan_abort'] = True
             # 取消 worker
             if _worker_task and not _worker_task.done():
                 _worker_task.cancel()
@@ -6898,6 +6991,16 @@ def register_room_handlers(server, bridge):
                     await asyncio.wait_for(_worker_task, timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+            bridge.queue_broadcast({
+                'type': 'continuous_analysis_status',
+                'data': {
+                    'running': False,
+                    'phase': 'idle',
+                    'status': 'idle',
+                    'room_id': room_id,
+                    'updated_at': time.time(),
+                },
+            })
             _continuous_tasks.pop(room_id, None)
             _log.info("持续分析已停止: room_id=%s, 累计 %d 段高光", room_id, len(all_highlights))
 
@@ -7101,9 +7204,28 @@ def register_room_handlers(server, bridge):
         if not state:
             return {'success': False, 'error': '该房间没有持续分析任务'}
         state['cancelled'] = True
+        state['scan_abort'] = True
+        state['status'] = 'stopping'
+        state['analysis_stage'] = '停止中'
         state['task'].cancel()
+        bridge.queue_broadcast({
+            'type': 'continuous_analysis_status',
+            'data': {
+                'running': True,
+                'phase': 'stopping',
+                'status': 'stopping',
+                'room_id': room_id,
+                'analysis_stage': '停止中',
+                'updated_at': time.time(),
+            },
+        })
         _log.info("持续分析停止请求: room_id=%s", room_id)
-        return {'success': True, 'room_id': room_id, 'requested_room_id': requested_room_id}
+        return {
+            'success': True,
+            'status': 'stopping',
+            'room_id': room_id,
+            'requested_room_id': requested_room_id,
+        }
 
     @server.on('get_continuous_analysis_status')
     async def handle_get_continuous_analysis_status(data):

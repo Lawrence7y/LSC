@@ -591,15 +591,16 @@ def test_trim_full_round_audio_undoes_pre_pad_and_junk() -> None:
     assert trimmed["end"] == 202.0  # -8s post junk
 
 
-def test_continuous_valorant_worker_uses_combat_not_full_round() -> None:
-    """持续分析须走战斗段（买枪 trim + 钟声裁尾），禁止 full_round 糊边界入列。"""
+def test_continuous_valorant_worker_uses_hybrid_detect() -> None:
+    """valorant_round 持续分析须走 hybrid 视觉检测，禁止回退纯音频 detect_valorant_rounds。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     worker = src.split("def _continuous_valorant_worker", 1)[1].split(
         "async def _continuous_analysis_loop", 1
     )[0]
-    cfg_block = worker.split("ValorantRoundConfig(", 1)[1].split(")", 1)[0]
-    assert "full_round=False" in cfg_block or "full_round = False" in cfg_block
-    assert "full_round=True" not in cfg_block and "full_round = True" not in cfg_block
+    assert "detect_valorant_rounds_hybrid" in worker
+    assert "ModelContractError" in worker
+    hybrid_branch = worker.split("if game == 'valorant' and _mode == 'valorant_round':", 1)[1]
+    assert "detect_valorant_rounds_hybrid" in hybrid_branch.split("if game == 'valorant':", 1)[0]
 
 
 def test_derive_round_signals_uses_energy_fields_not_score() -> None:
@@ -676,15 +677,15 @@ def test_scene_continuous_export_branch_is_list_only() -> None:
     assert "confirm_status='pending'" in window or 'confirm_status="pending"' in window
 
 
-def test_pending_highlights_also_trimmed_before_list() -> None:
-    """质量档：pending 入列也走 trim，避免列表里仍带买枪/结算垃圾。"""
+def test_pending_highlights_hybrid_path_skips_trim() -> None:
+    """Hybrid 入列禁止 _trim_valorant_combat_bounds；仅 legacy OCR 路径保留 trim。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
         "async def _export_and_broadcast", 1
     )[0]
-    assert "pending_only_hl = [" in loop
-    # pending_only 与 ocr_confirmed 均 trim
-    assert loop.count("_trim_valorant_combat_bounds(h)") >= 2
+    assert "_is_listable_hybrid_round" in loop
+    hybrid_block = loop.split("if _valorant_incremental_rounds:", 1)[1].split("else:", 1)[0]
+    assert "_trim_valorant_combat_bounds" not in hybrid_block
 
 
 def test_is_timeout_scan_error_detects_asyncio_timeout() -> None:
@@ -739,4 +740,56 @@ def test_continuous_worker_holds_semaphore_until_timed_out_scan_aborts() -> None
     # wait_for 超时后仍须 await 同一 future（grace），semaphore 在外层 with 内
     assert worker.find("TimeoutError") < worker.find("scan_abort") or "scan_abort" in worker
 
+
+def test_vision_confirmed_is_exportable_gate() -> None:
+    rd = {
+        "start": 10.0, "end": 55.0, "phase": "combat",
+        "boundary_source": "valorant_hybrid_v1",
+        "start_by": "model_buy_exit",
+        "end_by": "model_result",
+        "confirm_status": "vision_confirmed",
+    }
+    assert room_handler._is_auto_exportable_valorant_round(rd) is True
+    assert room_handler._is_listable_hybrid_round(rd) is True
+
+
+def test_hybrid_pending_listable_not_exportable() -> None:
+    rd = {
+        "start": 10.0, "end": 55.0, "phase": "combat",
+        "boundary_source": "valorant_hybrid_v1",
+        "start_by": "model_buy_exit",
+        "end_by": "model_result",
+        "confirm_status": "pending",
+    }
+    assert room_handler._is_listable_hybrid_round(rd) is True
+    assert room_handler._is_auto_exportable_valorant_round(rd) is False
+
+
+def test_non_hybrid_not_listable_as_hybrid() -> None:
+    rd = {"start": 10.0, "end": 80.0, "start_by": "full_round", "end_by": "energy_collapse"}
+    assert room_handler._is_listable_hybrid_round(rd) is False
+
+
+def test_stop_handler_sets_stopping_not_stopped() -> None:
+    """stop 响应须返回 stopping，并在 handler 内广播 stopping 阶段。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    stop_fn = src.split("async def handle_stop_continuous_analysis", 1)[1].split(
+        "@server.on('get_continuous_analysis_status')", 1
+    )[0]
+    assert "'status': 'stopping'" in stop_fn or '"status": "stopping"' in stop_fn
+    assert "'phase': 'stopping'" in stop_fn or '"phase": "stopping"' in stop_fn
+    assert "scan_abort" in stop_fn
+
+
+def test_finalize_continues_from_cursor_not_full_rescan() -> None:
+    """停录收尾从游标继续，不默认全文件重扫。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _export_and_broadcast", 1
+    )[0]
+    assert "停录收尾：从游标继续处理尾部" in loop
+    finalize_block = loop.split("停录收尾：从游标继续处理尾部", 1)[1].split("else:", 1)[0]
+    assert "last_analyzed" in finalize_block
+    assert "full_rescan = False" in finalize_block or "full_rescan=False" in finalize_block
+    assert "(0.0, float(current_dur))" not in finalize_block
 
