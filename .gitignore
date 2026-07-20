@@ -144,3 +144,7 @@ _log_now.txt
 
 # Training datasets (local only, do not commit frames)
 datasets/valorant_phase/
+
+# Local git worktrees
+.worktrees/
+
