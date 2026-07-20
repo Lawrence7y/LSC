@@ -179,12 +179,65 @@ def test_cancel_check_returns_empty(tmp_path, hybrid_deps) -> None:
         cancelled["value"] = True
         return _fake_extract(*_args, **_kwargs)
 
-    rounds = detect_valorant_rounds_hybrid(
-        str(video),
-        time_range=(0.0, 60.0),
-        cancel_check=lambda: True,
-        extract_fn=cancel_after_first,
-        classifier=hybrid_deps["classifier"],
-        read_anchors_fn=hybrid_deps["read_anchors_fn"],
-    )
-    assert rounds == []
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    with pytest.raises(FFmpegCancelled):
+        detect_valorant_rounds_hybrid(
+            str(video),
+            time_range=(0.0, 60.0),
+            cancel_check=lambda: True,
+            extract_fn=cancel_after_first,
+            classifier=hybrid_deps["classifier"],
+            read_anchors_fn=hybrid_deps["read_anchors_fn"],
+        )
+
+
+def test_incremental_runtime_state_keeps_open_round_across_windows(tmp_path) -> None:
+    video = tmp_path / "long-round.mp4"
+    video.write_bytes(b"fake")
+
+    def long_round_class(ts: float) -> str:
+        if ts < 30.0:
+            return "buy"
+        if ts < 170.0:
+            return "combat"
+        if ts < 174.0:
+            return "result"
+        return "buy"
+
+    def long_round_extract(
+        video_path: str,
+        *,
+        start_sec: float,
+        end_sec: float,
+        fps: float,
+        ffmpeg_path: str,
+        cancel_check=None,
+        overlap_sec: float = 2.0,
+    ) -> list[tuple[float, np.ndarray]]:
+        del video_path, ffmpeg_path
+        frames = []
+        t = max(0.0, start_sec - overlap_sec)
+        stop = end_sec + overlap_sec
+        step = 1.0 / max(fps, 0.1)
+        while t <= stop + 1e-6:
+            frames.append((t, _make_class_frame(long_round_class(t))))
+            t += step
+        return frames
+
+    state: dict = {}
+    common = {
+        "classifier": _EncodedClassifier(),
+        "extract_fn": long_round_extract,
+        "read_anchors_fn": _fake_anchors,
+        "session_id": "session-long",
+        "runtime_state": state,
+    }
+
+    first = detect_valorant_rounds_hybrid(str(video), time_range=(0.0, 130.0), **common)
+    assert state["prev_predicted"] == "combat"
+    second = detect_valorant_rounds_hybrid(str(video), time_range=(100.0, 190.0), **common)
+
+    assert first == []
+    assert len(second) == 1
+    assert second[0]["round_key"].startswith("hybrid-session-long-")

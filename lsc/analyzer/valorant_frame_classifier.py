@@ -84,6 +84,23 @@ class ValorantFrameClassifier:
             raise ModelContractError("input_size mismatch")
         if meta["color_order"] != "RGB":
             raise ModelContractError("color_order mismatch")
+        try:
+            mean = np.asarray(meta["normalize_mean"], dtype=np.float32)
+            std = np.asarray(meta["normalize_std"], dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ModelContractError("normalize contract invalid") from exc
+        if mean.shape != (3,) or std.shape != (3,) or not np.all(np.isfinite(mean)):
+            raise ModelContractError("normalize contract invalid")
+        if not np.all(np.isfinite(std)) or np.any(std <= 0):
+            raise ModelContractError("normalize std invalid")
+        thresholds = meta["thresholds"]
+        try:
+            stable = float(thresholds["stable_prob"])
+            high = float(thresholds["high_prob"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModelContractError("threshold contract invalid") from exc
+        if not (0.0 < stable <= high <= 1.0):
+            raise ModelContractError("threshold contract invalid")
 
     def _create_session(self, onnx_path: Path) -> Any:
         import onnxruntime as ort
@@ -111,24 +128,31 @@ class ValorantFrameClassifier:
             return np.zeros((0, 5), dtype=np.float32)
         batch = np.stack([self._preprocess(f) for f in frames_bgr], axis=0)
         input_name = self._session.get_inputs()[0].name
-        probs = self._session.run(None, {input_name: batch})[0]
-        return np.asarray(probs, dtype=np.float32)
+        probs = np.asarray(
+            self._session.run(None, {input_name: batch})[0],
+            dtype=np.float32,
+        )
+        if probs.shape != (len(frames_bgr), len(_CLASS_NAMES)):
+            raise ModelContractError(
+                f"probabilities shape mismatch: {probs.shape}"
+            )
+        if (
+            not np.all(np.isfinite(probs))
+            or np.any(probs < -1e-5)
+            or np.any(probs > 1.0 + 1e-5)
+            or not np.allclose(probs.sum(axis=1), 1.0, atol=1e-3)
+        ):
+            raise ModelContractError("model output must be normalized probabilities")
+        return probs
 
     def _preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
         assert self._meta is not None
         import cv2
 
-        h, w = frame_bgr.shape[:2]
         size = int(self._meta["input_size"][0])
-        scale = size / max(h, w)
-        nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
-        canvas = np.zeros((size, size, 3), dtype=np.uint8)
-        y0 = (size - nh) // 2
-        x0 = (size - nw) // 2
-        canvas[y0 : y0 + nh, x0 : x0 + nw] = resized
-        x = canvas.astype(np.float32) / 255.0
+        resized = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
+        x = resized.astype(np.float32) / 255.0
         mean = np.asarray(self._meta["normalize_mean"], dtype=np.float32)
         std = np.asarray(self._meta["normalize_std"], dtype=np.float32)
         x = (x - mean) / std

@@ -253,10 +253,18 @@ def _match_ground_truth(
 ) -> int | None:
     p0 = float(pred.get("start_sec", pred.get("start", 0.0)))
     p1 = float(pred.get("end_sec", pred.get("end", 0.0)))
+    pred_video_id = pred.get("video_id")
     best_idx: int | None = None
     best_iou = 0.0
     for idx, gt in enumerate(ground_truth):
         if idx in matched_gt:
+            continue
+        gt_video_id = gt.get("video_id")
+        if (
+            pred_video_id is not None
+            and gt_video_id is not None
+            and str(pred_video_id) != str(gt_video_id)
+        ):
             continue
         g0 = float(gt.get("start_sec", gt.get("start", 0.0)))
         g1 = float(gt.get("end_sec", gt.get("end", 0.0)))
@@ -437,6 +445,10 @@ def check_classification_gates(
     for st in SOURCE_TYPES:
         block = by_source.get(st)
         if not block:
+            failures.append(GateFailure(f"{st}_missing", f"缺少 {st} 独立评估结果"))
+            continue
+        if int(block.get("total", 0) or 0) <= 0:
+            failures.append(GateFailure(f"{st}_empty", f"{st} 评估样本数为 0"))
             continue
         st_macro = float(block.get("macro_f1", 0.0))
         if st_macro < GATE_MACRO_F1_MIN:
@@ -459,6 +471,10 @@ def check_round_gates(report: RoundReport | dict[str, Any]) -> list[GateFailure]
         forced_150 = report.forced_close_150
         forced_180 = report.forced_close_180
         duplicate_keys = report.duplicate_keys
+        ground_truth_count = report.ground_truth_count
+        listed_count = report.listed_count
+        vision_confirmed_count = report.vision_confirmed_count
+        non_game_listed_count = report.non_game_listed_count
     else:
         recall = float(report.get("recall", 0.0))
         listed_precision = float(report.get("listed_precision", 0.0))
@@ -483,6 +499,21 @@ def check_round_gates(report: RoundReport | dict[str, Any]) -> list[GateFailure]
         forced_150 = int(report.get("forced_close_150", 0))
         forced_180 = int(report.get("forced_close_180", 0))
         duplicate_keys = int(report.get("duplicate_keys", 0))
+        ground_truth_count = int(report.get("ground_truth_count", 0))
+        listed_count = int(report.get("listed_count", 0))
+        vision_confirmed_count = int(report.get("vision_confirmed_count", 0))
+        non_game_listed_count = int(report.get("non_game_listed_count", 0))
+
+    if ground_truth_count <= 0:
+        failures.append(GateFailure("ground_truth_count", "完整录像 GT 回合数为 0"))
+    if listed_count <= 0:
+        failures.append(GateFailure("listed_count", "没有任何入列切片"))
+    if vision_confirmed_count <= 0:
+        failures.append(GateFailure("vision_confirmed_count", "没有任何 vision_confirmed 切片"))
+    if non_game_listed_count > 0:
+        failures.append(
+            GateFailure("non_game_listed", f"发现 {non_game_listed_count} 条非游戏画面入列")
+        )
 
     if recall < GATE_ROUND_RECALL_MIN:
         failures.append(
@@ -529,8 +560,12 @@ def check_all_gates(
     rounds: RoundReport | dict[str, Any] | None,
 ) -> list[GateFailure]:
     failures: list[GateFailure] = []
-    if classification is not None:
+    if classification is None:
+        failures.append(GateFailure("classification_missing", "缺少五分类评估报告"))
+    else:
         failures.extend(check_classification_gates(classification))
-    if rounds is not None:
+    if rounds is None:
+        failures.append(GateFailure("rounds_missing", "缺少完整录像回合评估报告"))
+    else:
         failures.extend(check_round_gates(rounds))
     return failures

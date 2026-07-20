@@ -9,6 +9,9 @@ from pathlib import Path
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from eval_gates import (
     CLASS_NAMES,
@@ -101,13 +104,63 @@ def build_from_predictions(
     return classification_report_to_dict(report)
 
 
+def load_round_manifest(path: Path) -> list[dict]:
+    if path.suffix.lower() == ".jsonl":
+        return load_jsonl(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    records = data.get("videos") if isinstance(data, dict) else data
+    if not isinstance(records, list):
+        raise ValueError("round manifest 必须是 JSON 数组或包含 videos 数组")
+    return records
+
+
+def build_rounds_from_videos(
+    records: list[dict],
+    *,
+    detector,
+    model_dir: Path | None,
+) -> dict:
+    ground_truth: list[dict] = []
+    predictions: list[dict] = []
+    for index, record in enumerate(records):
+        video_path = str(record.get("video_path") or "")
+        if not video_path:
+            raise ValueError(f"round manifest 第 {index + 1} 条缺少 video_path")
+        video_id = str(record.get("video_id") or Path(video_path).stem)
+        session_id = str(record.get("session_id") or video_id)
+        ground_truth.extend(
+            {**row, "video_id": video_id}
+            for row in record.get("ground_truth") or []
+        )
+        for row in detector(
+            video_path,
+            model_dir=model_dir,
+            session_id=session_id,
+        ):
+            start = float(row.get("start", row.get("start_sec", 0.0)))
+            end = float(row.get("end", row.get("end_sec", 0.0)))
+            listed = (
+                row.get("boundary_source") == "valorant_hybrid_v1"
+                and row.get("confirm_status") in ("vision_confirmed", "pending")
+                and end > start
+            )
+            predictions.append({**row, "video_id": video_id, "listed": listed})
+    return round_report_to_dict(compute_round_report({
+        "ground_truth": ground_truth,
+        "predictions": predictions,
+    }))
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Valorant 视觉分类与盲测回合评估")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--report", type=Path, help="已计算的评估报告 JSON")
     src.add_argument("--predictions", type=Path, help="预测 JSONL（与 --labels 联用）")
     p.add_argument("--labels", type=Path, help="标签 JSONL")
-    p.add_argument("--rounds", type=Path, help="回合真值/预测 JSON")
+    rounds = p.add_mutually_exclusive_group()
+    rounds.add_argument("--rounds", type=Path, help="回合真值/预测 JSON")
+    rounds.add_argument("--round-manifest", type=Path, help="完整录像及回合真值 manifest")
+    p.add_argument("--model-dir", type=Path, help="Valorant ONNX 模型目录")
     p.add_argument(
         "--enforce-gates",
         action="store_true",
@@ -138,6 +191,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.rounds:
         rounds_raw = json.loads(args.rounds.read_text(encoding="utf-8"))
         rounds_dict = round_report_to_dict(compute_round_report(rounds_raw))
+    elif args.round_manifest:
+        from lsc.analyzer.round_detector import detect_valorant_rounds_hybrid
+
+        rounds_dict = build_rounds_from_videos(
+            load_round_manifest(args.round_manifest),
+            detector=detect_valorant_rounds_hybrid,
+            model_dir=args.model_dir,
+        )
 
     if classification_dict:
         _print_classification(classification_dict)

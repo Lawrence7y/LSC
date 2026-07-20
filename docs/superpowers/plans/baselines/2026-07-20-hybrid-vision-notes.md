@@ -17,6 +17,9 @@ Recorded run (before synced-test fix): **931 passed, 5 failed** in ~34s
 
 After `afc8b5e` (synced hybrid gate test update): expected **932 passed, 4 failed**.
 
+After hybrid review hardening: **952 passed, 4 failed**. The four failures remain the
+same frontend guards listed below; all hybrid-related tests pass.
+
 ## Known unrelated failures (must list individually — not “tests are stale”)
 
 | Test | Notes |
@@ -40,7 +43,7 @@ After `afc8b5e` (synced hybrid gate test update): expected **932 passed, 4 faile
 
 ## Release blockers (not regression failures)
 
-1. **Real INT8 model + labeled dataset** — `train_export.py` skeleton only; production `lsc/analyzer/models/valorant_phase_v1.onnx` not shipped
+1. **Real INT8 model + labeled dataset** — exporter now writes the quantized runtime artifact, but production `lsc/analyzer/models/valorant_phase_v1.onnx` is not shipped
 2. **Blind-test gates** — run `eval_blind.py --enforce-gates` on held-out broadcast + POV VODs
 3. **Shadow soak** — `LSC_VALORANT_VISION_SHADOW=1` on one broadcast + one POV session; then remove shadow switch
 4. **Performance hand checks** — steady lag P95 ≤10s (≤15s CPU); stop→idle ≤3s; no orphan FFmpeg; finalize from cursor not full rescan

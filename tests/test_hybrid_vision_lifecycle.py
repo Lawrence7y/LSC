@@ -124,7 +124,8 @@ def test_stop_sets_stopping_until_resources_exit(tmp_path, monkeypatch) -> None:
         assert state.get("cancelled") is True
         assert state.get("scan_abort") is True
         assert state.get("status") == "stopping"
-        assert created_tasks[0].cancelled_called is True
+        assert created_tasks[0].cancelled_called is False
+        assert state.get("session_id")
         stopping_msgs = [
             m for m in broadcasts
             if m.get("type") == "continuous_analysis_status"

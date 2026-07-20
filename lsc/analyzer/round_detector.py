@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
@@ -1733,9 +1734,8 @@ def extract_frames_cancellable(
 
     try:
         import cv2
-    except ImportError:
-        _log.warning("opencv-python 未安装，无法解码抽帧")
-        return []
+    except ImportError as exc:
+        raise RuntimeError("opencv-python 未安装，无法解码抽帧") from exc
 
     tmp_dir = tempfile.mkdtemp(prefix="lsc_hybrid_frames_")
     frames: list[tuple[float, np.ndarray]] = []
@@ -1767,8 +1767,9 @@ def extract_frames_cancellable(
             raise
         if completed.returncode != 0:
             err = (completed.stderr or b"").decode("utf-8", errors="replace")[-500:]
-            _log.warning("hybrid frame extract failed rc=%s: %s", completed.returncode, err)
-            return []
+            raise RuntimeError(
+                f"hybrid frame extract failed rc={completed.returncode}: {err}"
+            )
 
         frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
         precise_timestamps: list[float] = []
@@ -1846,7 +1847,7 @@ def read_top_digit_anchors(
         return None, None, None
 
     timer_seconds: float | None = None
-    score_candidates: list[int] = []
+    score_candidates: list[tuple[float, int]] = []
     timer_pattern = re.compile(r"(\d{1,2})\s*:\s*(\d{2})")
     digit_pattern = re.compile(r"\b(\d{1,2})\b")
 
@@ -1859,16 +1860,26 @@ def read_top_digit_anchors(
             if 0 <= seconds < 60:
                 timer_seconds = float(minutes * 60 + seconds)
 
-        for digit_match in digit_pattern.finditer(text):
+        # 计时器中的 1:23 不能再被拆成比分 1 和 23。
+        if timer_match:
+            continue
+        digit_match = digit_pattern.fullmatch(text.strip())
+        if digit_match:
             value = int(digit_match.group(1))
-            if 0 <= value <= 30 and value not in score_candidates:
-                score_candidates.append(value)
+            if 0 <= value <= 30:
+                try:
+                    points = line[0]
+                    x_center = sum(float(point[0]) for point in points) / len(points)
+                except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                    x_center = float(len(score_candidates))
+                score_candidates.append((x_center, value))
 
     left_score: int | None = None
     right_score: int | None = None
     if len(score_candidates) >= 2:
-        left_score = score_candidates[0]
-        right_score = score_candidates[1]
+        ordered_scores = sorted(score_candidates, key=lambda item: item[0])
+        left_score = ordered_scores[0][1]
+        right_score = ordered_scores[-1][1]
 
     if timer_seconds is None and left_score is None and right_score is None:
         return None, None, None
@@ -1926,7 +1937,8 @@ def grade_round_confirmation(
     score_confirm: bool,
 ) -> str:
     """Grade hybrid boundary confidence; never vision_confirmed on weak end alone."""
-    if start_strong and (end_strong or score_confirm):
+    del score_confirm  # 比分只增强证据，不能替代局部密扫得到的强终点。
+    if start_strong and end_strong:
         return "vision_confirmed"
     return "pending"
 
@@ -1972,6 +1984,8 @@ def _predict_class_from_probs(
     thresholds: dict[str, float],
 ) -> str:
     idx = int(np.argmax(probs_row))
+    if float(probs_row[idx]) < float(thresholds.get("stable_prob", 0.55)):
+        return "unknown"
     return _HYBRID_CLASS_NAMES[idx]
 
 
@@ -2176,6 +2190,7 @@ def detect_valorant_rounds_hybrid(
     classifier: Any | None = None,
     extract_fn: Callable[..., list[tuple[float, np.ndarray]]] | None = None,
     read_anchors_fn: Callable[[np.ndarray], tuple[float | None, int | None, int | None]] | None = None,
+    runtime_state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """1 FPS 粗扫 -> FSM -> 候选前后 5s @8-10FPS 密扫 -> 证据分级。"""
     from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
@@ -2196,52 +2211,57 @@ def detect_valorant_rounds_hybrid(
     if scan_end <= scan_start:
         return []
 
-    clf = classifier or ValorantFrameClassifier(model_dir=model_dir)
-    if classifier is None:
+    state = runtime_state if runtime_state is not None else {}
+    clf = classifier or state.get("classifier") or ValorantFrameClassifier(model_dir=model_dir)
+    if classifier is None and state.get("classifier") is None:
         clf.load()
+    if runtime_state is not None:
+        state["classifier"] = clf
     thresholds = dict(clf.thresholds)
     model_version = clf.model_version
+    state["model_version"] = model_version
+    state["provider"] = getattr(clf, "provider", None)
     anchors_reader = read_anchors_fn or read_top_digit_anchors
     extractor = extract_fn or extract_frames_cancellable
 
     if progress_callback:
         progress_callback("hybrid_coarse", 0.0, "粗扫抽帧")
 
-    try:
-        coarse_frames = extractor(
-            video_path,
-            start_sec=scan_start,
-            end_sec=scan_end,
-            fps=_COARSE_FPS,
-            ffmpeg_path=ffmpeg_path,
-            cancel_check=cancel_check,
-            overlap_sec=_HYBRID_OVERLAP_SEC,
-        )
-    except FFmpegCancelled:
-        return []
+    coarse_frames = extractor(
+        video_path,
+        start_sec=scan_start,
+        end_sec=scan_end,
+        fps=_COARSE_FPS,
+        ffmpeg_path=ffmpeg_path,
+        cancel_check=cancel_check,
+        overlap_sec=_HYBRID_OVERLAP_SEC,
+    )
 
     coarse_frames = _dedupe_timestamp_frames(coarse_frames)
+    last_processed_ts = float(state.get("last_processed_ts", -1.0))
+    coarse_frames = [
+        item for item in coarse_frames
+        if item[0] > last_processed_ts + 0.001
+    ]
     if not coarse_frames:
         return []
 
     coarse_probs: list[np.ndarray] = []
     for offset in range(0, len(coarse_frames), _HYBRID_COARSE_BATCH):
         if cancel_check and cancel_check():
-            return []
+            raise FFmpegCancelled("cancelled during coarse classify")
         batch = coarse_frames[offset : offset + _HYBRID_COARSE_BATCH]
         probs = clf.predict_batch([img for _, img in batch])
         coarse_probs.extend(probs)
 
-    fsm = RoundFSM(RoundFSMConfig())
-    key_map: dict[str, str] = {}
+    existing_fsm = state.get("fsm")
+    fsm = copy.deepcopy(existing_fsm) if existing_fsm is not None else RoundFSM(RoundFSMConfig())
+    key_map: dict[str, str] = dict(state.get("key_map") or {})
     closed_rounds: list[dict[str, Any]] = []
-    prev_predicted: str | None = None
+    prev_predicted: str | None = state.get("prev_predicted")
     total_frames = len(coarse_frames)
 
     for idx, (ts, img) in enumerate(coarse_frames):
-        if cancel_check and cancel_check():
-            return []
-
         probs_row = coarse_probs[idx]
         probs_dict = _probs_row_to_dict(probs_row)
         predicted = _predict_class_from_probs(probs_row, thresholds=thresholds)
@@ -2355,6 +2375,7 @@ def detect_valorant_rounds_hybrid(
                         timer_combat=timer_combat,
                     ),
                     "model_version": model_version,
+                    "provider": getattr(clf, "provider", None),
                     "start_confidence": round(start_confidence, 4),
                     "end_confidence": round(end_confidence, 4),
                     "boundary_confidence": round(boundary_confidence, 4),
@@ -2369,6 +2390,14 @@ def detect_valorant_rounds_hybrid(
 
     if progress_callback:
         progress_callback("hybrid_done", 1.0, f"闭合回合 {len(closed_rounds)}")
+
+    if runtime_state is not None:
+        state["fsm"] = fsm
+        state["key_map"] = key_map
+        state["last_processed_ts"] = coarse_frames[-1][0]
+        state["prev_predicted"] = prev_predicted
+        state["model_version"] = model_version
+        state["provider"] = getattr(clf, "provider", None)
 
     return closed_rounds
 

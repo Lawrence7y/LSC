@@ -135,7 +135,7 @@ _VALORANT_MAX_CATCHUP_SEC = 480.0  # 单次 tick 最多向前追赶的新内容�
 # OCR 扫描 TimeoutError 后：降级纯音频追赶，避免立刻再开超大 OCR 窗压垮 DirectML
 _OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 3
 _POST_TIMEOUT_MAX_CATCHUP_SEC = 120.0
-_SCAN_ABORT_GRACE_SEC = 90.0  # 超时后等 cancel_check 退出的宽限
+_SCAN_ABORT_GRACE_SEC = 3.0  # 停止目标：3 秒内终止 FFmpeg 并退出当前短推理批次
 _VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期
 _HYBRID_BOUNDARY_SOURCE = "valorant_hybrid_v1"
 _HYBRID_VALID_START_BY = frozenset({"model_buy_exit"})
@@ -1236,6 +1236,19 @@ def _is_hybrid_round(round_data: dict[str, Any]) -> bool:
     return round_data.get("boundary_source") == _HYBRID_BOUNDARY_SOURCE
 
 
+def _hybrid_clip_metadata(round_data: dict[str, Any]) -> dict[str, Any]:
+    """Return the small hybrid evidence payload forwarded to clip_queued."""
+    keys = (
+        "boundary_source",
+        "boundary_evidence",
+        "model_version",
+        "start_confidence",
+        "end_confidence",
+        "boundary_confidence",
+    )
+    return {key: round_data[key] for key in keys if key in round_data}
+
+
 def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
     """Hybrid rounds listable when boundary_source + confirm_status + valid bounds."""
     if not _is_hybrid_round(round_data):
@@ -1445,6 +1458,11 @@ def _is_timeout_scan_error(err: Any) -> bool:
     return "TimeoutError" in text
 
 
+def _is_model_contract_error(err: Any) -> bool:
+    text = err if isinstance(err, str) else repr(err)
+    return "ModelContractError" in text
+
+
 def _apply_scan_timeout_backoff(state: dict[str, Any]) -> None:
     """OCR/扫描超时后降级：后续若干 tick 强制纯音频 + 缩小追赶窗。"""
     state["ocr_degraded_remaining"] = max(
@@ -1566,6 +1584,7 @@ def _build_continuous_status_payload(
         "analysis_lag_sec": max(0.0, rec_dur - analyzed) if rec_dur else 0.0,
         "model_version": task.get("model_version"),
         "provider": task.get("provider"),
+        "last_scan_error": task.get("last_scan_error"),
     }
     if task.get("shadow_mode"):
         payload["shadow_mode"] = True
@@ -1824,7 +1843,7 @@ def _continuous_effective_interval(
     pressure: dict[str, Any] | None,
 ) -> tuple[int, bool]:
     """Return continuous-analysis delay and whether this pass should skip."""
-    base_interval = max(10, int(interval))
+    base_interval = max(5 if valorant_incremental else 10, int(interval))
     effective_interval = base_interval
 
     pressure = pressure or {}
@@ -5568,6 +5587,7 @@ def register_room_handlers(server, bridge):
                             'confirm_status': confirm_status,
                             'round_key': round_key,
                             'upsert': action == "upsert",
+                            **_hybrid_clip_metadata(hl),
                         },
                     })
                     _log.info(
@@ -5612,6 +5632,7 @@ def register_room_handlers(server, bridge):
                             'export_deferred': True,
                             'confirm_status': confirm_status,
                             'round_key': round_key,
+                            **_hybrid_clip_metadata(hl),
                         },
                     })
                     _log.info("延后导出仅入列: room=%s, job_id=%s, %.1f-%.1f", rid, job_id, export_start, export_end)
@@ -5640,6 +5661,7 @@ def register_room_handlers(server, bridge):
                             'export_deferred': False,
                             'confirm_status': confirm_status,
                             'round_key': round_key,
+                            **_hybrid_clip_metadata(hl),
                         },
                     })
                     _log.info("自动导出入队: room=%s, job_id=%s, %.1f-%.1f", rid, job_id, export_start, export_end)
@@ -6078,6 +6100,7 @@ def register_room_handlers(server, bridge):
                                 model_dir=_resolve_valorant_model_dir(),
                                 cancel_check=_cancel,
                                 session_id=str(task_state.get('session_id', '') or ''),
+                                runtime_state=task_state.setdefault('hybrid_runtime_state', {}),
                             )
                         except ModelContractError as exc:
                             raise RuntimeError(f"ModelContractError: {exc}") from exc
@@ -6107,22 +6130,21 @@ def register_room_handlers(server, bridge):
                                 room_id,
                                 scan_timeout,
                             )
-                            try:
-                                await asyncio.wait_for(
-                                    asyncio.shield(fut),
-                                    timeout=_SCAN_ABORT_GRACE_SEC,
-                                )
-                            except TimeoutError:
-                                _log.error(
-                                    "持续分析超时扫描未在 %.0fs 内退出: room_id=%s",
-                                    _SCAN_ABORT_GRACE_SEC,
-                                    room_id,
-                                )
+                            # 等待同一线程真实退出后才能离开 semaphore。
+                            await asyncio.shield(fut)
                             raise
+                    runtime_state = task_state.get('hybrid_runtime_state') or {}
+                    task_state['model_version'] = runtime_state.get('model_version')
+                    task_state['provider'] = runtime_state.get('provider')
+                    completed_dur = (
+                        float(scan_range[1])
+                        if game == 'valorant' and mode == 'valorant_round'
+                        else current_dur
+                    )
                     scan_result_container['result'] = result or []
                     scan_result_container['error'] = None
                     scan_result_container['video_path'] = video_path
-                    scan_result_container['current_dur'] = current_dur
+                    scan_result_container['current_dur'] = completed_dur
                     scan_result_container['completed_at'] = time.time()
                     _log.info(f"持续分析 Worker 完成: room_id={room_id}, {len(result or [])} 回合")
                 except Exception as exc:
@@ -6137,7 +6159,11 @@ def register_room_handlers(server, bridge):
                     scan_result_container['result'] = []
                     scan_result_container['error'] = repr(exc)
                     scan_result_container['video_path'] = video_path
-                    scan_result_container['current_dur'] = current_dur
+                    scan_result_container['current_dur'] = (
+                        float(scan_range[1])
+                        if game == 'valorant' and mode == 'valorant_round'
+                        else current_dur
+                    )
                     # 写入 completed_at，让主循环能消费失败并触发收尾重试
                     scan_result_container['completed_at'] = time.time()
                 finally:
@@ -6283,6 +6309,7 @@ def register_room_handlers(server, bridge):
             'shadow_rounds_detected': 0,
             'shadow_listable_rounds': 0,
             'shadow_vision_confirmed': 0,
+            'hybrid_runtime_state': {},
             # 相位调度状态
             'round_phase': 'unknown',
             'round_phase_detail': '',
@@ -6314,8 +6341,9 @@ def register_room_handlers(server, bridge):
         try:
             while not _continuous_tasks.get(room_id, {}).get('cancelled'):
                 pressure = get_resource_pressure()
+                interval_base = 5 if _valorant_incremental_rounds else max(interval, 20)
                 effective_interval, skip_for_pressure = _continuous_effective_interval(
-                    max(interval, 20), last_analyzed, _valorant_incremental_rounds, pressure,
+                    interval_base, last_analyzed, _valorant_incremental_rounds, pressure,
                 )
                 state = _continuous_tasks.get(room_id)
                 if state:
@@ -6455,8 +6483,13 @@ def register_room_handlers(server, bridge):
                 if can_consume and worker_error:
                     last_consumed_at = worker_completed_at
                     scan_result['error'] = None
+                    terminal_model_error = _is_model_contract_error(worker_error)
                     if room_id in _continuous_tasks:
                         _continuous_tasks[room_id]['last_scan_error'] = worker_error
+                        if terminal_model_error:
+                            _continuous_tasks[room_id]['analysis_stage'] = '视觉模型不可用'
+                            _continuous_tasks[room_id]['completed'] = True
+                            _continuous_tasks[room_id]['cancelled'] = True
                         # 非收尾 OCR 超时：降级纯音频 + 缩小追赶，避免立刻再开 600s OCR
                         if (
                             _is_timeout_scan_error(worker_error)
@@ -6472,7 +6505,16 @@ def register_room_handlers(server, bridge):
                                     _POST_TIMEOUT_MAX_CATCHUP_SEC,
                                 ),
                             )
-                    if _finalize_started or _finalize_pending:
+                    if terminal_model_error:
+                        bridge.queue_broadcast({
+                            'type': 'continuous_analysis_complete',
+                            'data': {
+                                'room_id': room_id,
+                                'total_highlights': len(all_highlights),
+                                'error': worker_error,
+                            },
+                        })
+                    elif _finalize_started or _finalize_pending:
                         _finalize_failures += 1
                         if _finalize_failures < _finalize_max_attempts:
                             _finalize_started = False
@@ -6987,12 +7029,21 @@ def register_room_handlers(server, bridge):
             stop_state = _continuous_tasks.get(room_id, {})
             if stop_state.get('status') == 'stopping' or stop_state.get('cancelled'):
                 stop_state['scan_abort'] = True
-            # 取消 worker
+            # 让 worker 通过 cancel_check 自行退出；不得 cancel 协程后提前释放 semaphore。
             if _worker_task and not _worker_task.done():
-                _worker_task.cancel()
                 try:
-                    await asyncio.wait_for(_worker_task, timeout=5.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.shield(_worker_task),
+                        timeout=_SCAN_ABORT_GRACE_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    _log.warning(
+                        "worker 未在 %.1fs 内退出，继续等待资源释放: room_id=%s",
+                        _SCAN_ABORT_GRACE_SEC,
+                        room_id,
+                    )
+                    await asyncio.shield(_worker_task)
+                except asyncio.CancelledError:
                     pass
             bridge.queue_broadcast({
                 'type': 'continuous_analysis_status',
@@ -7115,7 +7166,9 @@ def register_room_handlers(server, bridge):
                 'error': '已有持续分析任务正在运行',
                 'active_room_id': active_room_id,
             }
-        if interval < 10:
+        if mode == 'valorant_round' and game == 'valorant':
+            interval = 5
+        elif interval < 10:
             interval = 10  # 最小 10s，避免过于频繁
 
         ok, error, main_room, target_rooms = _validate_synced_analysis_targets(
@@ -7148,6 +7201,7 @@ def register_room_handlers(server, bridge):
             'confirmed_rounds': 0,
             'pending_rounds': 0,
             'analysis_stage': '等待新录制',
+            'session_id': uuid4().hex,
         }
         _log.info(
             "持续分析已启动: main_room_id=%s, targets=%s, mode=%s, interval=%ds, threshold=%.2f",
@@ -7210,7 +7264,9 @@ def register_room_handlers(server, bridge):
         state['scan_abort'] = True
         state['status'] = 'stopping'
         state['analysis_stage'] = '停止中'
-        state['task'].cancel()
+        done_event = state.get('scan_done_event')
+        if done_event is not None and not state.get('scan_running'):
+            done_event.set()
         bridge.queue_broadcast({
             'type': 'continuous_analysis_status',
             'data': {

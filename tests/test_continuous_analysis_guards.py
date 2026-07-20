@@ -838,3 +838,63 @@ def test_finalize_continues_from_cursor_not_full_rescan() -> None:
     assert "full_rescan = False" in finalize_block or "full_rescan=False" in finalize_block
     assert "(0.0, float(current_dur))" not in finalize_block
 
+
+def test_status_payload_reports_provider_and_latest_error() -> None:
+    payload = room_handler._build_continuous_status_payload(
+        {
+            "mode": "valorant_round",
+            "provider": "CPUExecutionProvider",
+            "model_version": "v1",
+            "last_scan_error": "model missing",
+        },
+        room_id="main",
+    )
+
+    assert payload["provider"] == "CPUExecutionProvider"
+    assert payload["model_version"] == "v1"
+    assert payload["last_scan_error"] == "model missing"
+
+
+def test_hybrid_clip_metadata_preserves_boundary_evidence() -> None:
+    metadata = room_handler._hybrid_clip_metadata({
+        "boundary_source": "valorant_hybrid_v1",
+        "boundary_evidence": ["model_buy_exit", "score_increment"],
+        "model_version": "v1",
+        "start_confidence": 0.91,
+        "end_confidence": 0.93,
+        "boundary_confidence": 0.92,
+    })
+
+    assert metadata["boundary_source"] == "valorant_hybrid_v1"
+    assert metadata["boundary_evidence"] == ["model_buy_exit", "score_increment"]
+    assert metadata["model_version"] == "v1"
+
+
+def test_hybrid_effective_interval_allows_five_second_batches() -> None:
+    interval, skip = room_handler._continuous_effective_interval(
+        5,
+        last_analyzed=100.0,
+        valorant_incremental=True,
+        pressure={},
+    )
+
+    assert interval == 5
+    assert skip is False
+
+
+def test_model_contract_error_is_terminal_for_continuous_task() -> None:
+    assert room_handler._is_model_contract_error(
+        "RuntimeError('ModelContractError: missing model')"
+    )
+    assert not room_handler._is_model_contract_error("TimeoutError()")
+
+
+def test_model_contract_error_broadcasts_terminal_error() -> None:
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    branch = src.split("terminal_model_error = _is_model_contract_error(worker_error)", 1)[1].split(
+        "elif _finalize_started or _finalize_pending:", 1
+    )[0]
+
+    assert "continuous_analysis_complete" in branch
+    assert "'error': worker_error" in branch or '"error": worker_error' in branch
+

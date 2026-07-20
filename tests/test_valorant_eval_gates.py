@@ -10,6 +10,7 @@ _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "valorant_vision"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+import eval_blind  # noqa: E402
 from eval_gates import (  # noqa: E402
     GATE_MACRO_F1_MIN,
     build_classification_report,
@@ -51,6 +52,10 @@ def _passing_rounds_dict() -> dict:
         "listed_precision": 0.98,
         "vision_confirmed_err_p95": 0.5,
         "vision_confirmed_err_max": 1.2,
+        "ground_truth_count": 100,
+        "listed_count": 90,
+        "vision_confirmed_count": 80,
+        "non_game_listed_count": 0,
         "forced_close_150": 0,
         "forced_close_180": 0,
         "duplicate_keys": 0,
@@ -158,3 +163,108 @@ def test_synthetic_report_roundtrip() -> None:
     blob = json.dumps(merged)
     loaded = json.loads(blob)
     assert check_all_gates(loaded["classification"], loaded["rounds"]) == []
+
+
+def test_classification_gate_requires_both_source_types() -> None:
+    data = _passing_classification_dict()
+    data["by_source_type"].pop("pov")
+
+    failures = check_classification_gates(data)
+
+    assert any(f.check == "pov_missing" for f in failures)
+
+
+def test_round_gate_rejects_vacuous_zero_listed_and_zero_confirmed() -> None:
+    report = compute_round_report({
+        "ground_truth": [{"start": 10.0, "end": 20.0}],
+        "predictions": [{
+            "start": 10.0,
+            "end": 20.0,
+            "listed": False,
+            "confirm_status": "pending",
+            "round_key": "r1",
+        }],
+    })
+
+    failures = check_round_gates(report)
+
+    assert any(f.check == "listed_count" for f in failures)
+    assert any(f.check == "vision_confirmed_count" for f in failures)
+
+
+def test_round_gate_rejects_non_game_in_list() -> None:
+    data = _passing_rounds_dict()
+    data.update({
+        "ground_truth_count": 10,
+        "listed_count": 10,
+        "vision_confirmed_count": 8,
+        "non_game_listed_count": 1,
+    })
+
+    failures = check_round_gates(data)
+
+    assert any(f.check == "non_game_listed" for f in failures)
+
+
+def test_all_gates_require_classification_and_round_reports() -> None:
+    assert any(f.check == "classification_missing" for f in check_all_gates(None, _passing_rounds_dict()))
+    assert any(f.check == "rounds_missing" for f in check_all_gates(_passing_classification_dict(), None))
+
+
+def test_full_video_manifest_runs_detector_and_keeps_video_scope(tmp_path) -> None:
+    videos = []
+    for name in ("a", "b"):
+        path = tmp_path / f"{name}.mp4"
+        path.write_bytes(b"fake")
+        videos.append(path)
+
+    records = [
+        {
+            "video_id": "a",
+            "video_path": str(videos[0]),
+            "session_id": "sa",
+            "ground_truth": [{"start": 10.0, "end": 20.0}],
+        },
+        {
+            "video_id": "b",
+            "video_path": str(videos[1]),
+            "session_id": "sb",
+            "ground_truth": [{"start": 100.0, "end": 110.0}],
+        },
+    ]
+
+    def crossed_detector(video_path: str, **_kwargs):
+        if video_path.endswith("a.mp4"):
+            return [{
+                "start": 100.0, "end": 110.0,
+                "confirm_status": "vision_confirmed",
+                "boundary_source": "valorant_hybrid_v1",
+                "round_key": "a1",
+            }]
+        return [{
+            "start": 10.0, "end": 20.0,
+            "confirm_status": "vision_confirmed",
+            "boundary_source": "valorant_hybrid_v1",
+            "round_key": "b1",
+        }]
+
+    report = eval_blind.build_rounds_from_videos(
+        records,
+        detector=crossed_detector,
+        model_dir=tmp_path,
+    )
+
+    assert report["ground_truth_count"] == 2
+    assert report["listed_count"] == 2
+    assert report["recall"] == 0.0
+
+
+def test_eval_blind_parser_accepts_round_manifest_and_model_dir() -> None:
+    args = eval_blind.build_parser().parse_args([
+        "--report", "classification.json",
+        "--round-manifest", "rounds.json",
+        "--model-dir", "models",
+    ])
+
+    assert args.round_manifest == Path("rounds.json")
+    assert args.model_dir == Path("models")

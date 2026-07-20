@@ -52,16 +52,19 @@ class CancellableFFmpeg:
     def returncode(self) -> int | None:
         return None if self._proc is None else self._proc.returncode
 
-    def cancel(self, timeout_sec: float = 5.0) -> None:
+    def cancel(self, timeout_sec: float = 1.0) -> None:
         if self._proc is None or self._proc.poll() is not None:
             return
         self._terminate_tree()
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            if self._proc.poll() is not None:
-                return
-            time.sleep(0.05)
-        self._kill_tree()
+        try:
+            self._proc.wait(timeout=timeout_sec)
+            return
+        except subprocess.TimeoutExpired:
+            self._kill_tree()
+        try:
+            self._proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("ffmpeg process tree did not exit") from exc
 
     def wait(self, timeout_sec: float = 120.0) -> subprocess.CompletedProcess[bytes]:
         if self._proc is None:
@@ -71,14 +74,17 @@ class CancellableFFmpeg:
             if self._cancel_check and self._cancel_check():
                 self.cancel()
                 raise FFmpegCancelled("ffmpeg cancelled")
-            rc = self._proc.poll()
-            if rc is not None:
-                out, err = self._proc.communicate()
-                return subprocess.CompletedProcess(self._cmd, rc, out, err)
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 self.cancel()
                 raise TimeoutError("ffmpeg timeout")
-            time.sleep(0.05)
+            try:
+                out, err = self._proc.communicate(timeout=min(0.1, remaining))
+                return subprocess.CompletedProcess(
+                    self._cmd, self._proc.returncode, out, err
+                )
+            except subprocess.TimeoutExpired:
+                continue
 
     def _terminate_tree(self) -> None:
         assert self._proc is not None

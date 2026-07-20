@@ -30,3 +30,18 @@ def test_wait_raises_on_cancel_flag() -> None:
     cancelled["v"] = True
     with pytest.raises(FFmpegCancelled):
         proc.wait(timeout_sec=5.0)
+
+
+def test_wait_drains_large_stdout_without_pipe_deadlock() -> None:
+    cmd = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.buffer.write(b'x' * (5 * 1024 * 1024)); sys.stdout.flush()",
+    ]
+    proc = CancellableFFmpeg(cmd)
+    proc.start()
+
+    completed = proc.wait(timeout_sec=3.0)
+
+    assert completed.returncode == 0
+    assert len(completed.stdout) == 5 * 1024 * 1024

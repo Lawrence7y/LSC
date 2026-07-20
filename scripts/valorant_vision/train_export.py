@@ -193,8 +193,9 @@ def _train_and_export(
     model.eval()
     dummy = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE, device=device)
     model_cpu = model.to("cpu")
+    export_model = nn.Sequential(model_cpu, nn.Softmax(dim=1))
     torch.onnx.export(
-        model_cpu,
+        export_model,
         dummy.cpu(),
         str(onnx_path),
         input_names=["input"],
@@ -204,14 +205,16 @@ def _train_and_export(
     )
 
     if export_int8:
+        int8_path = out_dir / "valorant_phase_v1.int8.tmp.onnx"
         try:
             from onnxruntime.quantization import QuantType, quantize_dynamic
 
-            int8_path = out_dir / "valorant_phase_v1.int8.onnx"
             quantize_dynamic(str(onnx_path), str(int8_path), weight_type=QuantType.QUInt8)
-            print(f"INT8 模型已写出: {int8_path}（运行时默认仍使用 FP32 onnx_path）")
+            int8_path.replace(onnx_path)
+            print(f"INT8 运行时模型已写出: {onnx_path}")
         except Exception as exc:  # noqa: BLE001 — 量化可选
-            print(f"警告: INT8 量化失败，已保留 FP32 ONNX: {exc}", file=sys.stderr)
+            int8_path.unlink(missing_ok=True)
+            raise RuntimeError(f"INT8 量化失败: {exc}") from exc
 
     digest = hashlib.sha256(onnx_path.read_bytes()).hexdigest()
     dataset_version = f"manual-{len(train_samples)}t-{len(val_samples)}v"

@@ -239,7 +239,7 @@ def test_stop_continuous_analysis_accepts_synced_target_room_id(tmp_path, monkey
         assert start_result["success"] is True
         assert list(room_handler._continuous_tasks) == ["main"]
         assert stop_result["success"] is True
-        assert created_tasks[0].cancelled_called is True
+        assert created_tasks[0].cancelled_called is False
         assert room_handler._continuous_tasks["main"]["cancelled"] is True
     finally:
         room_handler._continuous_tasks.clear()
