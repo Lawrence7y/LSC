@@ -307,28 +307,38 @@ def test_wait_for_recording_file_immediate() -> None:
 
 def test_merge_round_windows_preserves_round_key_when_boundaries_shift() -> None:
     previous = [{
-        "start": 30.0, "end": 80.0, "round_key": "round-003",
-        "phase": "pending", "start_by": "ocr_buy_exit", "end_by": "open_tail",
+        "start": 30.0, "end": 80.0, "round_key": "hybrid-003",
+        "phase": "pending",
+        "boundary_source": "valorant_hybrid_v1",
+        "confirm_status": "pending",
+        "start_by": "model_buy_exit", "end_by": "open_tail",
     }]
     current = [{
         "start": 32.0, "end": 83.0, "phase": "combat",
-        "start_by": "ocr_buy_exit", "end_by": "ocr_result",
+        "boundary_source": "valorant_hybrid_v1",
+        "confirm_status": "vision_confirmed",
+        "start_by": "model_buy_exit", "end_by": "model_result",
     }]
 
     merged = room_handler._merge_round_windows(previous, current)
 
     assert len(merged) == 1
-    assert merged[0]["round_key"] == "round-003"
+    assert merged[0]["round_key"] == "hybrid-003"
 
 
 def test_new_rounds_includes_pending_to_confirmed_update() -> None:
     previous = [{
-        "start": 30.0, "end": 80.0, "round_key": "round-003",
-        "phase": "pending", "start_by": "ocr_buy_exit", "end_by": "open_tail",
+        "start": 30.0, "end": 80.0, "round_key": "hybrid-003",
+        "phase": "pending",
+        "boundary_source": "valorant_hybrid_v1",
+        "confirm_status": "pending",
+        "start_by": "model_buy_exit", "end_by": "open_tail",
     }]
     current = [{
         "start": 32.0, "end": 83.0, "phase": "combat",
-        "start_by": "ocr_buy_exit", "end_by": "ocr_result",
+        "boundary_source": "valorant_hybrid_v1",
+        "confirm_status": "vision_confirmed",
+        "start_by": "model_buy_exit", "end_by": "model_result",
     }]
 
     fresh = room_handler._new_rounds(previous, current)
@@ -336,6 +346,6 @@ def test_new_rounds_includes_pending_to_confirmed_update() -> None:
     assert len(fresh) == 1
     assert fresh[0]["start"] == current[0]["start"]
     assert fresh[0]["end"] == current[0]["end"]
-    assert fresh[0]["round_key"] == "round-003"
+    assert fresh[0]["round_key"] == "hybrid-003"
 
 
