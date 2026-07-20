@@ -1,0 +1,5 @@
+{"video_id": "vct_2026_map1", "video_path": "D:/recordings/vct_2026_map1.mp4", "timestamp_sec": 42.5, "label": "buy", "split": "train", "source_type": "broadcast", "session_id": "vct_spring_2026", "notes": "买枪结束边界前 1s，边界加密采样"}
+{"video_id": "vct_2026_map1", "video_path": "D:/recordings/vct_2026_map1.mp4", "timestamp_sec": 45.0, "label": "combat", "split": "train", "source_type": "broadcast", "session_id": "vct_spring_2026", "notes": "买枪->交战转换后首帧"}
+{"video_id": "streamer_a_r3", "video_path": "D:/recordings/streamer_a_r3.mkv", "timestamp_sec": 1280.25, "label": "result", "split": "val", "source_type": "pov", "session_id": "streamer_a_20260718", "notes": "结算大字，困难负样本邻域"}
+{"video_id": "streamer_a_r3", "video_path": "D:/recordings/streamer_a_r3.mkv", "timestamp_sec": 1283.0, "label": "replay", "split": "val", "source_type": "pov", "session_id": "streamer_a_20260718", "notes": "Replay 切入 +3s 内高密度"}
+{"video_id": "blind_holdout_01", "video_path": "D:/recordings/blind_holdout_01.mp4", "timestamp_sec": 300.0, "label": "non_game", "split": "test", "source_type": "broadcast", "session_id": "blind_holdout", "notes": "最终盲测录像，仅评估不得参与训练"}

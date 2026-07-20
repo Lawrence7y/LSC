@@ -142,4 +142,5 @@ _log_now.txt
 # Brainstorm visual companion sessions
 .superpowers/
 
-.worktrees/
+# Training datasets (local only, do not commit frames)
+datasets/valorant_phase/
