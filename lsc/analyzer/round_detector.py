@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
 import tempfile
 import wave
 from collections.abc import Callable
@@ -1680,6 +1682,196 @@ def _build_round_segments_from_phase_markers(
         })
 
     return results
+
+
+# ── Hybrid vision helpers (Task 5–6) ─────────────────────────────────────────
+
+
+def build_frame_evidence(
+    *,
+    timestamp: float,
+    probs: dict[str, float],
+    predicted_class: str,
+    timer_seconds: float | None,
+    left_score: int | None,
+    right_score: int | None,
+    model_version: str,
+) -> "FrameEvidence":
+    from lsc.analyzer.valorant_round_fsm import FrameEvidence
+
+    return FrameEvidence(
+        timestamp=timestamp,
+        class_probabilities=dict(probs),
+        predicted_class=predicted_class,
+        timer_seconds=timer_seconds,
+        left_score=left_score,
+        right_score=right_score,
+        model_version=model_version,
+    )
+
+
+def extract_frames_cancellable(
+    video_path: str,
+    *,
+    start_sec: float,
+    end_sec: float,
+    fps: float,
+    ffmpeg_path: str,
+    cancel_check: Callable[[], bool] | None = None,
+    overlap_sec: float = 2.0,
+) -> list[tuple[float, np.ndarray]]:
+    """Extract full-frame JPEGs with CancellableFFmpeg; dedupe by showinfo pts."""
+    from lsc.utils.cancellable_ffmpeg import CancellableFFmpeg, FFmpegCancelled
+    from lsc.utils.process_launcher import prepare_launch
+
+    scan_start = max(0.0, start_sec - overlap_sec)
+    scan_end = end_sec + overlap_sec
+    scan_duration = max(0.0, scan_end - scan_start)
+    if scan_duration <= 0.0:
+        return []
+
+    try:
+        import cv2
+    except ImportError:
+        _log.warning("opencv-python 未安装，无法解码抽帧")
+        return []
+
+    tmp_dir = tempfile.mkdtemp(prefix="lsc_hybrid_frames_")
+    frames: list[tuple[float, np.ndarray]] = []
+    try:
+        output_pattern = os.path.join(tmp_dir, "frame_%05d.jpg")
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-loglevel",
+            "info",
+            "-ss",
+            f"{scan_start:.3f}",
+            "-t",
+            f"{scan_duration:.3f}",
+            "-i",
+            video_path,
+            "-vf",
+            f"fps={fps:.3f},showinfo",
+            "-q:v",
+            "2",
+            output_pattern,
+        ]
+        env, _creation_flags, cwd = prepare_launch(ffmpeg_path)
+        runner = CancellableFFmpeg(cmd, cancel_check=cancel_check, env=env, cwd=cwd)
+        runner.start()
+        try:
+            completed = runner.wait(timeout_sec=360.0)
+        except FFmpegCancelled:
+            raise
+        if completed.returncode != 0:
+            err = (completed.stderr or b"").decode("utf-8", errors="replace")[-500:]
+            _log.warning("hybrid frame extract failed rc=%s: %s", completed.returncode, err)
+            return []
+
+        frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
+        precise_timestamps: list[float] = []
+        for match in frame_ts_pattern.finditer(
+            (completed.stderr or b"").decode("utf-8", errors="replace")
+        ):
+            ts = float(match.group(1))
+            if not precise_timestamps or ts > precise_timestamps[-1] + 0.001:
+                precise_timestamps.append(ts)
+
+        frame_files = sorted(f for f in os.listdir(tmp_dir) if f.endswith(".jpg"))
+        for i, fname in enumerate(frame_files):
+            if cancel_check and cancel_check():
+                raise FFmpegCancelled("ffmpeg cancelled")
+            fpath = os.path.join(tmp_dir, fname)
+            img = cv2.imread(fpath)
+            if img is None:
+                continue
+            rel_ts = precise_timestamps[i] if i < len(precise_timestamps) else i / max(fps, 0.1)
+            frames.append((scan_start + rel_ts, img))
+    except FFmpegCancelled:
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return frames
+
+
+def read_top_digit_anchors(
+    frame_bgr: np.ndarray,
+) -> tuple[float | None, int | None, int | None]:
+    """OCR top HUD strip for timer and scores; returns None on failure (never 0)."""
+    try:
+        import cv2
+    except ImportError:
+        return None, None, None
+
+    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+        return None, None, None
+
+    crop_h = max(1, int(frame_bgr.shape[0] * 0.12))
+    top = frame_bgr[:crop_h, :]
+
+    try:
+        from lsc.analyzer.ocr_detector import _get_ocr
+
+        ocr = _get_ocr()
+    except Exception as exc:
+        _log.debug("read_top_digit_anchors: OCR unavailable: %s", exc)
+        return None, None, None
+
+    tmp_path: str | None = None
+    try:
+        ok, encoded = cv2.imencode(".jpg", top)
+        if not ok:
+            return None, None, None
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(encoded.tobytes())
+            tmp_path = tmp.name
+        result_ocr, _ = ocr(tmp_path)
+    except Exception as exc:
+        _log.debug("read_top_digit_anchors: OCR failed: %s", exc)
+        return None, None, None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    confident_lines = [
+        line for line in (result_ocr or []) if len(line) >= 3 and line[2] >= 0.40
+    ]
+    if not confident_lines:
+        return None, None, None
+
+    timer_seconds: float | None = None
+    score_candidates: list[int] = []
+    timer_pattern = re.compile(r"(\d{1,2})\s*:\s*(\d{2})")
+    digit_pattern = re.compile(r"\b(\d{1,2})\b")
+
+    for line in confident_lines:
+        text = str(line[1])
+        timer_match = timer_pattern.search(text)
+        if timer_match and timer_seconds is None:
+            minutes = int(timer_match.group(1))
+            seconds = int(timer_match.group(2))
+            if 0 <= seconds < 60:
+                timer_seconds = float(minutes * 60 + seconds)
+
+        for digit_match in digit_pattern.finditer(text):
+            value = int(digit_match.group(1))
+            if 0 <= value <= 30 and value not in score_candidates:
+                score_candidates.append(value)
+
+    left_score: int | None = None
+    right_score: int | None = None
+    if len(score_candidates) >= 2:
+        left_score = score_candidates[0]
+        right_score = score_candidates[1]
+
+    if timer_seconds is None and left_score is None and right_score is None:
+        return None, None, None
+    return timer_seconds, left_score, right_score
 
 
 __all__ = ["detect_valorant_rounds", "ValorantRoundConfig"]
