@@ -47,6 +47,17 @@ def test_single_frame_jitter_does_not_transition() -> None:
     assert not any(e.kind == "opened" for e in events)
 
 
+def test_non_game_and_replay_score_increment_does_not_close() -> None:
+    fsm = RoundFSM(RoundFSMConfig(coarse_stable_frames=2))
+    events = []
+    for t, c in [(1.0, "buy"), (2.0, "buy"), (3.0, "combat"), (4.0, "combat")]:
+        events.extend(fsm.feed(_ev(t, c)))
+    events.extend(fsm.feed(_ev(5.0, "non_game", left=1, right=0)))
+    events.extend(fsm.feed(_ev(6.0, "replay", left=1, right=0)))
+    events.extend(fsm.feed(_ev(7.0, "replay", left=2, right=0)))
+    assert not any(e.kind == "closed" for e in events)
+
+
 def test_replay_and_non_game_never_open_or_close() -> None:
     fsm = RoundFSM(RoundFSMConfig(coarse_stable_frames=2))
     events = []

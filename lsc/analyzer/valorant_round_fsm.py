@@ -66,11 +66,12 @@ class RoundFSM:
 
     def feed(self, ev: FrameEvidence) -> list[RoundEvent]:
         events: list[RoundEvent] = []
+        cls = ev.predicted_class
 
         if self._state == _State.ROUND_OPEN:
             if self._open_start is not None and ev.timestamp - self._open_start > self._config.max_open_sec:
                 events.append(self._discard())
-            elif ev.predicted_class == "non_game":
+            elif cls == "non_game":
                 if self._non_game_start is None:
                     self._non_game_start = ev.timestamp
                 elif ev.timestamp - self._non_game_start > self._config.non_game_abort_sec:
@@ -78,15 +79,15 @@ class RoundFSM:
             else:
                 self._non_game_start = None
 
+        # non_game/replay must never open or close a round (including via score path).
+        if cls in ("non_game", "replay"):
+            return events
+
         if self._state == _State.ROUND_OPEN:
             score_close = self._try_close_on_score(ev)
             if score_close is not None:
                 events.append(score_close)
                 return events
-
-        cls = ev.predicted_class
-        if cls in ("non_game", "replay"):
-            return events
 
         if self._state == _State.ROUND_OPEN and cls == "result":
             self._note_score(ev)
