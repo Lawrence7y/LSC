@@ -22,6 +22,7 @@ import tempfile
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -1930,4 +1931,450 @@ def grade_round_confirmation(
     return "pending"
 
 
-__all__ = ["detect_valorant_rounds", "ValorantRoundConfig"]
+_HYBRID_CLASS_NAMES = ("non_game", "buy", "combat", "result", "replay")
+_COARSE_FPS = 1.0
+_DENSE_FPS = 9.0
+_DENSE_REFINE_WINDOW_SEC = 5.0
+_DENSE_MIN_STABLE_FRAMES = 3
+_HYBRID_OVERLAP_SEC = 2.0
+_HYBRID_COARSE_BATCH = 16
+
+
+def _make_hybrid_round_key(coarse_start: float, session_id: str) -> str:
+    base = int(coarse_start)
+    if session_id:
+        return f"hybrid-{session_id}-{base}"
+    return f"hybrid-{base}"
+
+
+def _dedupe_timestamp_frames(
+    frames: list[tuple[float, np.ndarray]],
+    *,
+    tolerance: float = 0.001,
+) -> list[tuple[float, np.ndarray]]:
+    deduped: list[tuple[float, np.ndarray]] = []
+    for ts, img in frames:
+        if not deduped or ts > deduped[-1][0] + tolerance:
+            deduped.append((ts, img))
+    return deduped
+
+
+def _probs_row_to_dict(probs_row: np.ndarray) -> dict[str, float]:
+    return {
+        name: float(probs_row[i])
+        for i, name in enumerate(_HYBRID_CLASS_NAMES)
+    }
+
+
+def _predict_class_from_probs(
+    probs_row: np.ndarray,
+    *,
+    thresholds: dict[str, float],
+) -> str:
+    idx = int(np.argmax(probs_row))
+    return _HYBRID_CLASS_NAMES[idx]
+
+
+def _needs_digit_anchors(predicted: str, prev_predicted: str | None) -> bool:
+    if predicted in ("buy", "result"):
+        return True
+    if prev_predicted == "buy" and predicted == "combat":
+        return True
+    if prev_predicted == "combat" and predicted == "result":
+        return True
+    return False
+
+
+def _confidence_from_probs(
+    probs: dict[str, float],
+    label: str,
+    *,
+    thresholds: dict[str, float],
+) -> float:
+    prob = float(probs.get(label, 0.0))
+    high = float(thresholds.get("high_prob", 0.8))
+    stable = float(thresholds.get("stable_prob", 0.55))
+    if prob >= high:
+        return prob
+    if prob >= stable:
+        return prob * 0.9
+    return prob * 0.5
+
+
+def _is_strong_confidence(confidence: float, thresholds: dict[str, float]) -> bool:
+    return confidence >= float(thresholds.get("high_prob", 0.8))
+
+
+def _build_hybrid_boundary_evidence(
+    *,
+    start_by: str,
+    end_by: str,
+    score_confirm: bool,
+    timer_combat: bool,
+) -> list[str]:
+    tags: list[str] = []
+    if start_by:
+        tags.append(start_by)
+    if end_by:
+        tags.append(end_by)
+    if score_confirm:
+        tags.append("score_increment")
+    if timer_combat:
+        tags.append("timer_combat")
+    return tags
+
+
+def _dense_classify_sequence(
+    video_path: str,
+    *,
+    center_ts: float,
+    ffmpeg_path: str,
+    cancel_check: Callable[[], bool] | None,
+    extract_fn: Callable[..., list[tuple[float, np.ndarray]]] | None,
+    classifier: Any,
+    thresholds: dict[str, float],
+) -> list[tuple[float, str, dict[str, float]]]:
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    scan_start = max(0.0, center_ts - _DENSE_REFINE_WINDOW_SEC)
+    scan_end = center_ts + _DENSE_REFINE_WINDOW_SEC
+    extractor = extract_fn or extract_frames_cancellable
+    try:
+        raw_frames = extractor(
+            video_path,
+            start_sec=scan_start,
+            end_sec=scan_end,
+            fps=_DENSE_FPS,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            overlap_sec=0.0,
+        )
+    except FFmpegCancelled:
+        raise
+
+    frames = _dedupe_timestamp_frames(raw_frames)
+    if not frames:
+        return []
+
+    sequence: list[tuple[float, str, dict[str, float]]] = []
+    for offset in range(0, len(frames), _HYBRID_COARSE_BATCH):
+        if cancel_check and cancel_check():
+            raise FFmpegCancelled("cancelled during dense classify")
+        batch = frames[offset : offset + _HYBRID_COARSE_BATCH]
+        probs = classifier.predict_batch([img for _, img in batch])
+        for i, (ts, _) in enumerate(batch):
+            probs_dict = _probs_row_to_dict(probs[i])
+            predicted = _predict_class_from_probs(probs[i], thresholds=thresholds)
+            sequence.append((ts, predicted, probs_dict))
+    return sequence
+
+
+def _refine_hybrid_start(
+    video_path: str,
+    *,
+    center_ts: float,
+    ffmpeg_path: str,
+    cancel_check: Callable[[], bool] | None,
+    extract_fn: Callable[..., list[tuple[float, np.ndarray]]] | None,
+    classifier: Any,
+    thresholds: dict[str, float],
+) -> tuple[float | None, dict[str, float]]:
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    try:
+        sequence = _dense_classify_sequence(
+            video_path,
+            center_ts=center_ts,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            extract_fn=extract_fn,
+            classifier=classifier,
+            thresholds=thresholds,
+        )
+    except FFmpegCancelled:
+        raise
+
+    label_seq = [(ts, label) for ts, label, _ in sequence]
+    refined = refine_boundary_from_sequence(
+        label_seq,
+        target="combat",
+        min_stable=_DENSE_MIN_STABLE_FRAMES,
+        fps=_DENSE_FPS,
+    )
+    if refined is None:
+        return None, {}
+
+    combat_probs = next(
+        (probs for ts, label, probs in sequence if ts == refined and label == "combat"),
+        {},
+    )
+    if not combat_probs:
+        for ts, label, probs in sequence:
+            if label == "combat":
+                combat_probs = probs
+                break
+    return refined, combat_probs
+
+
+def _refine_hybrid_end(
+    video_path: str,
+    *,
+    center_ts: float,
+    ffmpeg_path: str,
+    cancel_check: Callable[[], bool] | None,
+    extract_fn: Callable[..., list[tuple[float, np.ndarray]]] | None,
+    classifier: Any,
+    thresholds: dict[str, float],
+) -> tuple[float | None, dict[str, float]]:
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    try:
+        sequence = _dense_classify_sequence(
+            video_path,
+            center_ts=center_ts,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            extract_fn=extract_fn,
+            classifier=classifier,
+            thresholds=thresholds,
+        )
+    except FFmpegCancelled:
+        raise
+
+    label_seq = [(ts, label) for ts, label, _ in sequence]
+    result_ts = refine_boundary_from_sequence(
+        label_seq,
+        target="result",
+        min_stable=_DENSE_MIN_STABLE_FRAMES,
+        fps=_DENSE_FPS,
+    )
+    if result_ts is None:
+        result_ts = center_ts
+
+    clip_end = compute_clip_end(result_ts, label_seq)
+    result_probs = next(
+        (probs for ts, label, probs in sequence if ts == result_ts and label == "result"),
+        {},
+    )
+    if not result_probs:
+        for ts, label, probs in sequence:
+            if label == "result":
+                result_probs = probs
+                break
+    return clip_end, result_probs
+
+
+def detect_valorant_rounds_hybrid(
+    video_path: str,
+    *,
+    ffmpeg_path: str = "ffmpeg",
+    time_range: tuple[float, float] | None = None,
+    model_dir: Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str, float, str], None] | None = None,
+    session_id: str = "",
+    classifier: Any | None = None,
+    extract_fn: Callable[..., list[tuple[float, np.ndarray]]] | None = None,
+    read_anchors_fn: Callable[[np.ndarray], tuple[float | None, int | None, int | None]] | None = None,
+) -> list[dict[str, Any]]:
+    """1 FPS 粗扫 -> FSM -> 候选前后 5s @8-10FPS 密扫 -> 证据分级。"""
+    from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
+    from lsc.analyzer.valorant_round_fsm import BOUNDARY_SOURCE, RESULT_TAIL_SEC, RoundFSM, RoundFSMConfig
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    if not os.path.isfile(video_path):
+        _log.warning("视频文件不存在: %s", video_path)
+        return []
+
+    scan_start, scan_end = time_range if time_range is not None else (0.0, 0.0)
+    if time_range is None:
+        duration = _get_duration(video_path, ffmpeg_path)
+        if duration <= 0:
+            return []
+        scan_start, scan_end = 0.0, duration
+
+    if scan_end <= scan_start:
+        return []
+
+    clf = classifier or ValorantFrameClassifier(model_dir=model_dir)
+    if classifier is None:
+        clf.load()
+    thresholds = dict(clf.thresholds)
+    model_version = clf.model_version
+    anchors_reader = read_anchors_fn or read_top_digit_anchors
+    extractor = extract_fn or extract_frames_cancellable
+
+    if progress_callback:
+        progress_callback("hybrid_coarse", 0.0, "粗扫抽帧")
+
+    try:
+        coarse_frames = extractor(
+            video_path,
+            start_sec=scan_start,
+            end_sec=scan_end,
+            fps=_COARSE_FPS,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            overlap_sec=_HYBRID_OVERLAP_SEC,
+        )
+    except FFmpegCancelled:
+        return []
+
+    coarse_frames = _dedupe_timestamp_frames(coarse_frames)
+    if not coarse_frames:
+        return []
+
+    coarse_probs: list[np.ndarray] = []
+    for offset in range(0, len(coarse_frames), _HYBRID_COARSE_BATCH):
+        if cancel_check and cancel_check():
+            return []
+        batch = coarse_frames[offset : offset + _HYBRID_COARSE_BATCH]
+        probs = clf.predict_batch([img for _, img in batch])
+        coarse_probs.extend(probs)
+
+    fsm = RoundFSM(RoundFSMConfig())
+    key_map: dict[str, str] = {}
+    closed_rounds: list[dict[str, Any]] = []
+    prev_predicted: str | None = None
+    total_frames = len(coarse_frames)
+
+    for idx, (ts, img) in enumerate(coarse_frames):
+        if cancel_check and cancel_check():
+            return []
+
+        probs_row = coarse_probs[idx]
+        probs_dict = _probs_row_to_dict(probs_row)
+        predicted = _predict_class_from_probs(probs_row, thresholds=thresholds)
+
+        timer_seconds: float | None = None
+        left_score: int | None = None
+        right_score: int | None = None
+        if _needs_digit_anchors(predicted, prev_predicted):
+            timer_seconds, left_score, right_score = anchors_reader(img)
+
+        evidence = build_frame_evidence(
+            timestamp=ts,
+            probs=probs_dict,
+            predicted_class=predicted,
+            timer_seconds=timer_seconds,
+            left_score=left_score,
+            right_score=right_score,
+            model_version=model_version,
+        )
+        events = fsm.feed(evidence)
+        prev_predicted = predicted
+
+        for event in events:
+            if event.kind == "opened" and event.round_key and event.start is not None:
+                canonical_key = _make_hybrid_round_key(event.start, session_id)
+                key_map[event.round_key] = canonical_key
+                try:
+                    refined_start, start_probs = _refine_hybrid_start(
+                        video_path,
+                        center_ts=event.start,
+                        ffmpeg_path=ffmpeg_path,
+                        cancel_check=cancel_check,
+                        extract_fn=extract_fn,
+                        classifier=clf,
+                        thresholds=thresholds,
+                    )
+                except FFmpegCancelled:
+                    return []
+                if refined_start is not None:
+                    fsm.apply_refine(event.round_key, start=refined_start)
+
+            elif event.kind == "closed" and event.round_key and event.start is not None and event.end is not None:
+                canonical_key = key_map.get(event.round_key, event.round_key)
+                coarse_start = event.start
+                coarse_end = event.end
+                end_by = event.end_by or "model_result"
+                score_confirm = end_by == "model_score"
+
+                result_center = max(
+                    event.start,
+                    coarse_end - RESULT_TAIL_SEC,
+                )
+                try:
+                    refined_start, start_probs = _refine_hybrid_start(
+                        video_path,
+                        center_ts=coarse_start,
+                        ffmpeg_path=ffmpeg_path,
+                        cancel_check=cancel_check,
+                        extract_fn=extract_fn,
+                        classifier=clf,
+                        thresholds=thresholds,
+                    )
+                    refined_end, end_probs = _refine_hybrid_end(
+                        video_path,
+                        center_ts=result_center,
+                        ffmpeg_path=ffmpeg_path,
+                        cancel_check=cancel_check,
+                        extract_fn=extract_fn,
+                        classifier=clf,
+                        thresholds=thresholds,
+                    )
+                except FFmpegCancelled:
+                    return []
+
+                final_start = refined_start if refined_start is not None else coarse_start
+                final_end = refined_end if refined_end is not None else coarse_end
+
+                if not start_probs:
+                    start_probs = probs_dict if predicted == "combat" else {}
+                start_confidence = _confidence_from_probs(
+                    start_probs, "combat", thresholds=thresholds,
+                )
+                end_label = "result" if end_by == "model_result" else "combat"
+                end_confidence = _confidence_from_probs(
+                    end_probs, end_label, thresholds=thresholds,
+                )
+                timer_combat = any(
+                    ev.timer_seconds is not None and ev.timer_seconds <= 100.0
+                    for ev in [evidence]
+                )
+                confirm_status = grade_round_confirmation(
+                    start_strong=_is_strong_confidence(start_confidence, thresholds),
+                    end_strong=_is_strong_confidence(end_confidence, thresholds),
+                    score_confirm=score_confirm,
+                )
+                boundary_confidence = (start_confidence + end_confidence) / 2.0
+
+                closed_rounds.append({
+                    "start": round(final_start, 3),
+                    "end": round(final_end, 3),
+                    "phase": "combat",
+                    "round_key": canonical_key,
+                    "confirm_status": confirm_status,
+                    "boundary_source": BOUNDARY_SOURCE,
+                    "start_by": event.start_by or "model_buy_exit",
+                    "end_by": end_by,
+                    "boundary_evidence": _build_hybrid_boundary_evidence(
+                        start_by=event.start_by or "model_buy_exit",
+                        end_by=end_by,
+                        score_confirm=score_confirm,
+                        timer_combat=timer_combat,
+                    ),
+                    "model_version": model_version,
+                    "start_confidence": round(start_confidence, 4),
+                    "end_confidence": round(end_confidence, 4),
+                    "boundary_confidence": round(boundary_confidence, 4),
+                })
+
+        if progress_callback and total_frames:
+            progress_callback(
+                "hybrid_coarse",
+                (idx + 1) / total_frames,
+                f"粗扫 {idx + 1}/{total_frames}",
+            )
+
+    if progress_callback:
+        progress_callback("hybrid_done", 1.0, f"闭合回合 {len(closed_rounds)}")
+
+    return closed_rounds
+
+
+__all__ = [
+    "detect_valorant_rounds",
+    "detect_valorant_rounds_hybrid",
+    "ValorantRoundConfig",
+]
