@@ -29,6 +29,26 @@ from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
 
 _log = get_logger(__name__)
 
+
+def _redact_ffmpeg_cmd(cmd: list[str]) -> list[str]:
+    out: list[str] = []
+    hide_next = False
+    for c in cmd:
+        if hide_next:
+            out.append("<redacted>")
+            hide_next = False
+            continue
+        if c in ("-headers", "-headers:"):
+            out.append(str(c))
+            hide_next = True
+            continue
+        s = str(c)
+        if "cookie" in s.lower() or "authorization" in s.lower():
+            out.append("<redacted>")
+        else:
+            out.append(s)
+    return out
+
 # Max segment size before forcing a split (512KB)
 _MAX_SEGMENT_BYTES = 512 * 1024
 
@@ -68,7 +88,8 @@ def _check_nvenc() -> bool:
                 **run_kwargs,
             )
             _nvenc_available = result.returncode == 0
-        except Exception:
+        except Exception as exc:
+            _log.warning("NVENC probe failed, falling back to libx264: %s", exc)
             _nvenc_available = False
         return _nvenc_available
 
@@ -148,7 +169,11 @@ class MseStreamer:
         """
         if self._last_init_segment is None:
             return False
-        self._on_init(self._last_init_segment)
+        try:
+            self._on_init(self._last_init_segment)
+        except Exception as exc:
+            _log.warning("MSE init replay callback failed: %s", exc)
+            return False
         return True
 
     def start(self, startup_probe_timeout: float = 2.0) -> bool:
@@ -277,8 +302,9 @@ class MseStreamer:
 
         try:
             env, creation_flags, cwd = prepare_launch(self._ffmpeg_path)
-            # 诊断：打印完整 FFmpeg 命令，便于排查参数解析错误
-            _log.info("FFmpeg command: %s", [str(c) for c in cmd])
+            # 诊断：INFO 脱敏，完整命令仅 DEBUG
+            _log.debug("FFmpeg command: %s", [str(c) for c in cmd])
+            _log.info("FFmpeg command: %s", _redact_ffmpeg_cmd(cmd))
             popen_kwargs: dict = {
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
@@ -454,7 +480,7 @@ class MseStreamer:
                             try:
                                 stderr_output = proc.stderr.read(4096)
                             except Exception as exc:
-                                _log.debug("操作异常（已忽略）: %s", exc)
+                                _log.warning("MSE stderr read on FFmpeg exit failed: %s", exc)
                         if self._is_file:
                             _log.info("File MSE playback finished: %s", self._url[:80])
                         elif self._running and not self._error_reported and self._on_error:
@@ -473,11 +499,17 @@ class MseStreamer:
                 for segment in self._segment_parser.feed(chunk):
                     if segment.kind == "init":
                         self._last_init_segment = segment.data
-                        self._on_init(segment.data)
+                        try:
+                            self._on_init(segment.data)
+                        except Exception as exc:
+                            _log.warning("MSE init segment callback failed: %s", exc)
                         self._init_sent = True
                         _log.info("Init segment sent (%d bytes)", len(segment.data))
                     elif segment.kind == "media":
-                        self._on_segment(segment.data)
+                        try:
+                            self._on_segment(segment.data)
+                        except Exception as exc:
+                            _log.warning("MSE media segment callback failed: %s", exc)
 
         except Exception as exc:
             _log.error("Segment reader error: %s", exc)

@@ -111,6 +111,31 @@ def test_training_export_writes_probabilities_and_uses_int8_as_runtime_model() -
     assert "运行时默认仍使用 FP32" not in source
 
 
+def test_create_session_warns_when_falling_back_to_cpu(monkeypatch, caplog) -> None:
+    import logging
+
+    import onnxruntime as ort
+
+    import lsc.analyzer.valorant_frame_classifier as vfc
+
+    class _Session:
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+    monkeypatch.setattr(vfc, "list_accel_candidates", lambda: ["dml", "cpu"])
+    monkeypatch.setattr(vfc, "read_settings_ocr_accel", lambda: "dml")
+    monkeypatch.setattr(ort, "InferenceSession", lambda *_a, **_k: _Session())
+
+    clf = ValorantFrameClassifier(model_dir=FIXTURE_DIR)
+    with caplog.at_level(logging.WARNING):
+        clf.load()
+
+    assert clf.provider == "CPUExecutionProvider"
+    assert clf.provider_warning
+    assert "CPU" in clf.provider_warning
+    assert any("fell back to CPU" in r.message for r in caplog.records)
+
+
 def test_metadata_rejects_invalid_normalization_and_thresholds() -> None:
     clf = ValorantFrameClassifier(model_dir=FIXTURE_DIR)
     meta = json.loads(META_PATH.read_text(encoding="utf-8"))

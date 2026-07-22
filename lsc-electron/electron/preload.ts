@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   getPlatform: () => process.platform,
   getBackendWsUrl: () => ipcRenderer.invoke('get-backend-ws-url'),
+  getBackendWsToken: () => ipcRenderer.invoke('get-backend-ws-token'),
   
   // 窗口控制
   minimizeWindow: () => ipcRenderer.invoke('minimize-window'),

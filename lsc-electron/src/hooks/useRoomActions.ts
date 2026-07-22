@@ -1,0 +1,166 @@
+import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
+import { message, Modal } from 'antd'
+import { useAppStore } from '@/store/appStore'
+import { getAligner } from '@/utils/previewAudioAligner'
+
+type SendFn = (type: string, data?: any) => void
+
+/**
+ * 房间卡操作回调（录制/预览/静音/删除等）。
+ * 内部用 getState 现取 rooms，依赖仅 [send]（及必要的 setState），避免 rooms_updated 击穿 memo。
+ */
+export function useRoomActions(opts: {
+  send: SendFn
+  setExpandedRoomId: Dispatch<SetStateAction<string | null>>
+  setSelectedRoomIds: Dispatch<SetStateAction<Set<string>>>
+  pendingRoomSavesRef: MutableRefObject<number>
+}): {
+  handleToggleMute: (roomId: string) => void
+  handleStartRecord: (roomId: string) => void
+  handleStopRecord: (roomId: string) => void
+  handleTogglePreview: (roomId: string, enabled: boolean) => void
+  handleFullscreen: (roomId: string) => void
+  handleCollapse: (roomId: string) => void
+  handleRemove: (roomId: string) => void
+  handleConnect: (roomId: string) => void
+  handleDisconnect: (roomId: string) => void
+} {
+  const {
+    send,
+    setExpandedRoomId,
+    setSelectedRoomIds,
+    pendingRoomSavesRef,
+  } = opts
+
+  const handleToggleMute = useCallback((roomId: string) => {
+    const room = useAppStore.getState().rooms.find((r) => r.room_id === roomId)
+    if (!room) return
+    const newMuted = !room.preview_muted
+    console.log('[Workbench] 用户操作: 切换静音状态, roomId:', roomId, 'newMuted:', newMuted)
+    useAppStore.getState().updateRoom(roomId, { preview_muted: newMuted })
+    if (!newMuted) {
+      const ctx = getAligner().getContextSync()
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch((e) => {
+          console.warn('[Workbench] Failed to resume AudioContext on unmute:', e)
+        })
+      }
+    }
+    send('set_preview_muted', { room_id: roomId, muted: newMuted })
+  }, [send])
+
+  const handleStartRecord = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 开始录制, roomId:', roomId)
+    useAppStore.getState().updateRoom(roomId, { is_recording_starting: true, last_error: '' })
+    send('start_recording', { room_id: roomId })
+  }, [send])
+
+  const handleStopRecord = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 停止录制, roomId:', roomId)
+    const ca = useAppStore.getState().continuousAnalysisStatus
+    const analyzingThisRoom = Boolean(
+      ca?.running && (ca.room_id === roomId || (ca.target_room_ids || []).includes(roomId)),
+    )
+    send('stop_recording', { room_id: roomId })
+    if (analyzingThisRoom) {
+      message.info('录制已停止。请稍候，持续分析正在收尾并将回合入列待确认，请勿立刻停止分析', 6)
+    }
+  }, [send])
+
+  const handleTogglePreview = useCallback((roomId: string, enabled: boolean) => {
+    console.log('[Workbench] 用户操作: 切换预览状态, roomId:', roomId, 'enabled:', enabled)
+    if (enabled) {
+      const activePreviews = useAppStore.getState().rooms
+        .filter(r => r.preview_enabled && r.room_id !== roomId).length
+      if (activePreviews >= 4) {
+        message.warning('最多 4 路同时预览，请先关闭一路')
+        return
+      }
+      if (activePreviews >= 3) {
+        message.info('多路预览已自动降画质以保证流畅', 3)
+      }
+    }
+    send('enable_preview', { room_id: roomId, enabled, mode: 'mse' })
+  }, [send])
+
+  const handleFullscreen = useCallback((roomId: string) => {
+    setExpandedRoomId(prev => (prev === roomId ? null : roomId))
+  }, [setExpandedRoomId])
+
+  const handleCollapse = useCallback((roomId: string) => {
+    setExpandedRoomId(prev => (prev === roomId ? null : prev))
+  }, [setExpandedRoomId])
+
+  const handleRemove = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 删除房间, roomId:', roomId)
+    setExpandedRoomId(prev => (prev === roomId ? null : prev))
+    const continuousStatus = useAppStore.getState().continuousAnalysisStatus
+    if (continuousStatus?.running) {
+      const targets = continuousStatus.target_room_ids || []
+      if (continuousStatus.room_id === roomId || targets.includes(roomId)) {
+        send('stop_continuous_analysis', { main_room_id: continuousStatus.room_id })
+      }
+    }
+    pendingRoomSavesRef.current += 1
+    send('remove_room', { room_id: roomId })
+    setSelectedRoomIds(prev => {
+      const next = new Set(prev)
+      next.delete(roomId)
+      return next
+    })
+  }, [send, setExpandedRoomId, setSelectedRoomIds, pendingRoomSavesRef])
+
+  const handleConnect = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 连接房间, roomId:', roomId)
+    useAppStore.getState().updateRoom(roomId, { is_connecting: true, last_error: '' })
+    send('connect_room', { room_id: roomId })
+  }, [send])
+
+  const handleDisconnect = useCallback((roomId: string) => {
+    console.log('[Workbench] 用户操作: 断开房间连接, roomId:', roomId)
+    const doDisconnect = () => {
+      const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
+      if (room?.is_recording) {
+        send('stop_recording', { room_id: roomId })
+      }
+      if (room?.preview_enabled) {
+        send('enable_preview', { room_id: roomId, enabled: false, mode: 'mse' })
+      }
+      const continuousStatus = useAppStore.getState().continuousAnalysisStatus
+      if (continuousStatus?.running) {
+        const targets = continuousStatus.target_room_ids || []
+        if (continuousStatus.room_id === roomId) {
+          send('stop_continuous_analysis', { main_room_id: roomId })
+        } else if (targets.includes(roomId)) {
+          message.warning('该房间已退出持续分析映射，后续回合可能仅入列主房')
+        }
+      }
+      send('disconnect_room', { room_id: roomId })
+    }
+    const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
+    if (room?.is_recording) {
+      Modal.confirm({
+        title: '确认断开',
+        content: `断开将停止录制「${room.streamer_name || '未知主播'}」`,
+        okText: '确认',
+        okButtonProps: { danger: true },
+        cancelText: '取消',
+        onOk: doDisconnect,
+      })
+      return
+    }
+    doDisconnect()
+  }, [send])
+
+  return {
+    handleToggleMute,
+    handleStartRecord,
+    handleStopRecord,
+    handleTogglePreview,
+    handleFullscreen,
+    handleCollapse,
+    handleRemove,
+    handleConnect,
+    handleDisconnect,
+  }
+}

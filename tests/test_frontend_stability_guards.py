@@ -13,6 +13,21 @@ def test_websocket_defines_disconnected_queue_policy() -> None:
     assert "shouldQueueWhenDisconnected" in source
     assert "'get_rooms'" in source
     assert "'request_mse_init'" not in source.split("DISCONNECTED_QUEUEABLE_TYPES", 1)[1].split(")", 1)[0]
+    assert "send(type: string, data: unknown): boolean" in source
+    assert "return false" in source
+
+
+def test_disconnected_write_ops_surface_user_warning() -> None:
+    """断线写操作须在 useWebSocket 封装层提示用户，而非静默丢弃。"""
+    hook = (ROOT / "lsc-electron/src/hooks/useWebSocket.ts").read_text(encoding="utf-8")
+
+    assert "DISCONNECTED_SEND_WARNING" in hook
+    assert "未连接后端，操作未发送" in hook
+    assert "message.warning(DISCONNECTED_SEND_WARNING)" in hook
+
+    source = (ROOT / "lsc-electron/src/services/websocket.ts").read_text(encoding="utf-8")
+    queue_block = source.split("DISCONNECTED_QUEUEABLE_TYPES", 1)[1].split(")", 1)[0]
+    assert "'start_recording'" not in queue_block
 
 
 def test_websocket_parses_blob_and_arraybuffer_frames() -> None:
@@ -399,13 +414,15 @@ def test_analysis_progress_renders_recorded_duration_round_counts_and_export_sum
 
 
 def test_workbench_updates_clip_export_status_for_queue_progress_completion_and_failure() -> None:
-    source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    listeners = (ROOT / "lsc-electron/src/hooks/useExportProgressListeners.ts").read_text(encoding="utf-8")
 
-    assert "export_status: 'queued'" in source
-    assert "export_status: 'exporting'" in source
-    assert "export_status: 'completed'" in source
-    assert "export_status: 'failed'" in source
-    assert "export_error" in source
+    assert "useExportProgressListeners" in workbench
+    assert "export_status: 'queued'" in workbench
+    assert "export_status: 'exporting'" in listeners
+    assert "export_status: 'completed'" in listeners
+    assert "export_status: 'failed'" in listeners
+    assert "export_error" in listeners
 
 
 def test_clip_list_blocks_duplicate_export_and_allows_failed_retry() -> None:
@@ -535,6 +552,37 @@ def test_analysis_progress_labels_listed_not_raw_highlights() -> None:
     assert "分析完成·待确认" in progress
     assert "不含待确认" in progress or "另有待调" in progress
 
+
+def test_compact_analysis_progress_uses_live_following_copy_and_hides_empty_export_summary() -> None:
+    """直播跟进没有固定终点时，不应以 100% 冒充已完成。"""
+    source = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
+
+    assert "const hasFixedScanRange" in source
+    assert "已跟进至" in source
+    assert "const showProgress = hasFixedScanRange" in source
+    assert "summary.queued > 0 || summary.exporting > 0 || summary.completed > 0 || summary.failed > 0" in source
+
+
+def test_timeline_uses_one_axis_with_distinct_clip_ai_selection_and_playhead_layers() -> None:
+    """一个时间轴内须能看清候选、切片、选区和播放位置。"""
+    css = (ROOT / "lsc-electron/src/components/Timeline/Timeline.css").read_text(encoding="utf-8")
+    timeline = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
+
+    assert ".lsc-timeline__highlight" in css and "border: 1px dashed" in css
+    assert ".lsc-timeline__clip" in css and "height: 9px" in css
+    assert ".lsc-timeline__selection" in css and "border: 1px solid" in css
+    assert ".lsc-timeline__playhead::after" in css and "height: 24px" in css
+    assert "const DEFAULT_CLIP_COLOR = 'rgba(63, 131, 248, 0.72)'" in timeline
+
+
+def test_clip_list_uses_readable_summary_and_virtual_row_height_for_export_progress() -> None:
+    """虚拟行必须容纳进度条，标题不能再使用 N/N待 缩写。"""
+    source = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(encoding="utf-8")
+
+    assert "const ROW_HEIGHT = 88" in source
+    assert "共 {clips.length}" in source
+    assert "待确认" in source
+
 def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording() -> None:
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
@@ -562,16 +610,16 @@ def test_connect_room_response_uses_accepted_not_fake_success() -> None:
 
 def test_workbench_optimistically_updates_connect_record_and_mute() -> None:
     """房间连接/录制/静音点击必须乐观更新 store，避免等 rooms_updated 才有反馈。"""
-    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    actions = (ROOT / "lsc-electron/src/hooks/useRoomActions.ts").read_text(encoding="utf-8")
     room_card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
     types = (ROOT / "lsc-electron/src/types/index.ts").read_text(encoding="utf-8")
 
     assert "is_recording_starting" in types
-    connect_body = workbench.split("const handleConnect = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
+    connect_body = actions.split("const handleConnect = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
     assert "is_connecting: true" in connect_body
-    mute_body = workbench.split("const handleToggleMute = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
+    mute_body = actions.split("const handleToggleMute = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
     assert "preview_muted: newMuted" in mute_body
-    record_body = workbench.split("const handleStartRecord = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
+    record_body = actions.split("const handleStartRecord = useCallback((roomId: string) => {", 1)[1].split("}, [send])", 1)[0]
     assert "is_recording_starting: true" in record_body
     assert "loading={!!room.is_recording_starting}" in room_card
     assert "启动中" in room_card
@@ -637,7 +685,8 @@ def test_add_clip_snapshots_wallclock_fields() -> None:
 def test_destructive_stop_recording_paths_require_confirm() -> None:
     """凡会停止录制的路径（断开/R 键/长按刷新）必须二次确认。"""
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    disconnect = workbench.split("const handleDisconnect = useCallback", 1)[1].split("}, [send])", 1)[0]
+    actions = (ROOT / "lsc-electron/src/hooks/useRoomActions.ts").read_text(encoding="utf-8")
+    disconnect = actions.split("const handleDisconnect = useCallback", 1)[1].split("}, [send])", 1)[0]
     assert "Modal.confirm" in disconnect
     # R 键停止录制不得直接 handleStopRecord 而无确认
     toggle = workbench.split("case 'record:toggle'", 1)[1].split("case '", 1)[0]
@@ -1015,10 +1064,12 @@ def test_timeline_scrub_can_leave_live_edge() -> None:
     assert "enterTimelineLive" in workbench
     assert "setTimelineFollowLive(false)" in workbench
     assert "followLive={timelineFollowLive}" in workbench
-    assert "panTimelineWindowStart" in workbench
+    view_model = (ROOT / "lsc-electron/src/utils/timelineViewModel.ts").read_text(encoding="utf-8")
+    assert "panTimelineWindowStart" in view_model
     assert "panTimelineWindowStart" in coords
     assert "TIMELINE_MAX_WINDOW * 0.15" not in workbench
     assert "TIMELINE_MAX_WINDOW * 0.15" not in control
+    assert "TIMELINE_MAX_WINDOW * 0.15" not in view_model
 
     seek_body = workbench.split("const mseSeek = useCallback", 1)[1].split("const mseTogglePlayPause", 1)[0]
     assert "bufEnd - 0.5" not in seek_body
@@ -1061,8 +1112,9 @@ def test_timeline_scrub_can_leave_live_edge() -> None:
 
     # scrub 中避免每帧父级重渲染 / WS；内容右沿只增不减
     assert "timelineScrubbingRef" in workbench
+    sampling = (ROOT / "lsc-electron/src/hooks/usePlayheadSampling.ts").read_text(encoding="utf-8")
+    assert "if (timelineScrubbingRef.current) return" in sampling
     assert "quiet" in seek_body or "{ quiet:" in workbench
-    assert "if (timelineScrubbingRef.current) return" in workbench
     assert "只增不减" in workbench or "Math.max(lastContentEndRef.current" in workbench
     assert "contentEdgeRef" in control
     assert "Math.max(contentEdgeRef.current" in control
@@ -1118,9 +1170,11 @@ def test_recording_review_timeline_guards() -> None:
     follow_block = workbench.split("// recording_review / degraded：强制退出 followLive", 1)[1].split("}, [rooms", 1)[0]
     assert "isNoDvrPreviewMode" in follow_block
 
-    timeline_view = workbench.split("const timelineView = useMemo", 1)[1].split("const dvrStart = useMemo", 1)[0]
-    assert "isRecordingReview" in timeline_view
-    assert "resolveRecordingReviewSpan" in timeline_view
+    timeline_view = workbench.split("const timelineView = useTimelineViewModel", 1)[1].split("const dvrStart = useMemo", 1)[0]
+    assert "recordedDurationHint" in timeline_view or "continuousAnalysisStatus" in timeline_view
+    view_model = (ROOT / "lsc-electron/src/utils/timelineViewModel.ts").read_text(encoding="utf-8")
+    assert "isRecordingReview" in view_model
+    assert "resolveRecordingReviewSpan" in view_model
 
     enter_live = workbench.split("const enterTimelineLive = useCallback", 1)[1].split(
         "const handleTimelineSeek", 1
@@ -1148,6 +1202,7 @@ def test_timeline_content_span_uses_recording_when_preview_off() -> None:
     coords = (ROOT / "lsc-electron/src/utils/timelineCoords.ts").read_text(encoding="utf-8")
     control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    view_model = (ROOT / "lsc-electron/src/utils/timelineViewModel.ts").read_text(encoding="utf-8")
 
     assert "export function resolveLiveContentSpan" in coords
     assert "previewEnabled" in coords
@@ -1161,10 +1216,9 @@ def test_timeline_content_span_uses_recording_when_preview_off() -> None:
     assert "clips" in local
     assert "preview_enabled" in local
 
-    timeline_view = workbench.split("const timelineView = useMemo", 1)[1].split(
-        "const dvrStart = useMemo", 1
-    )[0]
-    assert "resolveLiveContentSpan" in timeline_view
+    assert "useTimelineViewModel" in workbench
+    assert "resolveLiveContentSpan" in view_model
+    assert "followLive" in view_model
 
 
 def test_clip_confirm_status_type_includes_vision_confirmed() -> None:
@@ -1177,3 +1231,284 @@ def test_clip_confirm_status_type_includes_vision_confirmed() -> None:
     assert "'vision_confirmed'" in types or '"vision_confirmed"' in types
     assert "vision_confirmed" in clip_list
     assert "vision_confirmed" in workbench.split("on('clip_confirm_status'", 1)[1].split("on('clip_export_started'", 1)[0]
+
+
+# ── 架构性能优化阶段一守卫 ──
+
+
+def test_websocket_deep_copy_logging_is_dev_only() -> None:
+    """生产环境禁止对每条 WS 消息 JSON.parse(JSON.stringify) 深拷贝打日志。"""
+    source = (ROOT / "lsc-electron/src/services/websocket.ts").read_text(encoding="utf-8")
+
+    assert "const isDev" in source
+    assert "function truncateLogData" in source
+    assert "JSON.parse(JSON.stringify" in source.split("function truncateLogData", 1)[1].split(
+        "/** 将 WebSocket", 1
+    )[0]
+
+    receive_body = source.split("this.ws.onmessage", 1)[1].split("this.ws.onclose", 1)[0]
+    send_body = source.split("send(type: string, data: unknown): boolean {", 1)[1].split(
+        "const message = { type, data }", 1
+    )[0]
+
+    for body, label in ((receive_body, "onmessage"), (send_body, "send")):
+        assert "if (isDev)" in body, f"{label} 须用 isDev 守卫日志"
+        assert "truncateLogData" in body, f"{label} DEV 日志应走 truncateLogData"
+        # 生产路径禁止在 handler 内直接深拷贝
+        assert "JSON.parse(JSON.stringify" not in body, f"{label} 不得在热路径内联深拷贝"
+
+
+def test_workbench_preview_position_poll_is_500ms() -> None:
+    """预览 setState 不得高于 500ms；允许更高频采样供播放头直写 DOM。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    hook = (ROOT / "lsc-electron/src/hooks/usePlayheadSampling.ts").read_text(encoding="utf-8")
+    assert "usePlayheadSampling" in workbench
+    assert "setPreviewPositions" in hook
+    # 关键：setState 节流 ≥500ms（即使采样间隔更短）
+    assert ">= 500" in hook or ">=500" in hook or ", 500)" in hook
+    assert "setPreviewPositions(next)" in hook
+
+
+def test_workbench_export_progress_is_throttled() -> None:
+    """export_progress 须节流合并，禁止每条消息立即 setClips + setExportProgressMap。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    hook = (ROOT / "lsc-electron/src/hooks/useExportProgressListeners.ts").read_text(encoding="utf-8")
+    assert "useExportProgressListeners" in workbench
+    assert "exportProgressPendingRef" in workbench
+    assert "flushExportProgress" in hook
+    assert "setTimeout(flushExportProgress, 500)" in hook
+    assert "scheduleExportProgressFlush" in hook
+    progress_handler = hook.split("on('export_progress'", 1)[1].split("on('clip_completed'", 1)[0]
+    assert "progressStore.setClips" not in progress_handler
+    assert "setExportProgressMap" not in progress_handler
+
+
+# ── 前端优化计划 FRONTEND_OPTIMIZATION_PLAN 守卫 ──
+
+
+def test_playhead_store_display_channel_and_timeline_subscribe() -> None:
+    """A1：播放头须经 playheadStore 显示通道 + Timeline 订阅直写 DOM。"""
+    store = (ROOT / "lsc-electron/src/utils/playheadStore.ts").read_text(encoding="utf-8")
+    timeline = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "writeDisplayPlayhead" in store
+    assert "subscribeDisplayPlayhead" in store
+    assert "subscribeDisplayPlayhead" in timeline
+    assert "playheadRef" in timeline
+    assert "writeDisplayPlayhead" in workbench
+    assert "style.left" in timeline or "style!.left" in timeline
+
+
+def test_timeline_ticks_use_quantized_window_start() -> None:
+    """A3：刻度绝对时间集合须按 quantizedWs 缓存，相对位置可每帧换算。"""
+    timeline = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
+    assert "quantizedWs" in timeline
+    assert "tickAbs" in timeline
+    tick_abs = timeline.split("const tickAbs = useMemo", 1)[1].split("const ticks =", 1)[0]
+    assert "quantizedWs" in tick_abs
+    assert "quantizedWs" in "".join(
+        ln for ln in tick_abs.splitlines() if "], [" in ln or ln.strip().startswith("}, [") or ln.strip().startswith("[")
+    ) or "quantizedWs]" in tick_abs.replace(" ", "")
+
+
+def test_room_card_uses_shared_recording_tick() -> None:
+    """C2：RoomCard 录制计时须用父级 tick，禁止每卡独立 setInterval。"""
+    room_card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "recordingTick" in room_card
+    assert "setInterval" not in room_card.split("function RoomCard", 1)[1].split("areRoomPropsEqual", 1)[0]
+    assert "recordingTick={timelineTick}" in workbench or "recordingTick={tick}" in workbench
+
+
+def test_timeline_callbacks_avoid_rooms_closure() -> None:
+    """B2：seek/scrub/步进回调不得因 rooms 引用重建。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    seek_deps = workbench.split("const handleTimelineSeek = useCallback", 1)[1].split(
+        "const handleTimelineScrubStart", 1
+    )[0]
+    assert "}, [send]" not in seek_deps  # 仍有合理依赖
+    assert seek_deps.rstrip().endswith("])") or "]," in seek_deps[-80:]
+    # rooms 不得出现在依赖数组末段
+    deps_line = [ln for ln in seek_deps.splitlines() if ln.strip().startswith("}, [")][-1]
+    assert "rooms" not in deps_line
+    scrub_deps = workbench.split("const handleTimelineScrubEnd = useCallback", 1)[1].split(
+        "const handleSeekByDelta", 1
+    )[0]
+    scrub_line = [ln for ln in scrub_deps.splitlines() if ln.strip().startswith("}, [")][-1]
+    assert "rooms" not in scrub_line
+    delta_deps = workbench.split("const handleSeekByDelta = useCallback", 1)[1].split(
+        "const handleControlSeekBack", 1
+    )[0]
+    delta_line = [ln for ln in delta_deps.splitlines() if ln.strip().startswith("}, [")][-1]
+    assert "rooms" not in delta_line
+    nudge_deps = workbench.split("const handleNudgeMark = useCallback", 1)[1].split(
+        "const applyPlaybackRate", 1
+    )[0]
+    nudge_line = [ln for ln in nudge_deps.splitlines() if ln.strip().startswith("}, [")][-1]
+    assert "commonMarkIn" not in nudge_line and "commonMarkOut" not in nudge_line
+
+
+# ── 架构性能优化阶段三守卫 ──
+
+
+def test_timeline_view_model_extracted_and_worker_exists() -> None:
+    """时间线计算须抽出纯函数，并提供 Worker 入口。"""
+    util = (ROOT / "lsc-electron/src/utils/timelineViewModel.ts").read_text(encoding="utf-8")
+    worker = (ROOT / "lsc-electron/src/workers/timelineView.worker.ts").read_text(encoding="utf-8")
+    hook = (ROOT / "lsc-electron/src/hooks/useTimelineViewModel.ts").read_text(encoding="utf-8")
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "export function computeTimelineViewModel" in util
+    assert "computeTimelineViewModel" in worker
+    assert "useTimelineViewModel" in hook and "useTimelineViewModel" in workbench
+    assert "new Worker(" in hook
+
+
+def test_mse_backpressure_protocol() -> None:
+    """MSE pending 过高须 pause/resume 通知后端丢弃 media 段。"""
+    player = (ROOT / "lsc-electron/src/services/mediaSourcePlayer.ts").read_text(encoding="utf-8")
+    preview = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    handler = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "onBackpressure" in player
+    assert "_backpressurePauseAt = 10" in player
+    assert "mse_backpressure" in preview
+    assert "@server.on('mse_backpressure')" in handler
+    assert "_mse_push_paused" in handler
+    assert "_clear_mse_push_paused" in handler
+
+
+def test_persistence_save_rooms_coalesced_without_default_fsync() -> None:
+    """房间持久化须支持写合并，默认写路径不强制每次 fsync。"""
+    src = (ROOT / "python-backend/persistence.py").read_text(encoding="utf-8")
+    assert "def schedule_save_rooms" in src
+    assert "def flush_pending_room_saves" in src
+    assert "fsync: bool = False" in src
+    save_body = src.split("def save_rooms(", 1)[1].split("def schedule_save_rooms", 1)[0]
+    assert "if fsync:" in save_body
+    handler = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "schedule_save_rooms" in handler.split("def _persist_current_rooms", 1)[1].split("\ndef ", 1)[0]
+
+
+def test_workbench_export_listeners_extracted() -> None:
+    """导出进度监听须从 Workbench 拆到独立 hook。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "useExportProgressListeners" in workbench
+    assert (ROOT / "lsc-electron/src/hooks/useExportProgressListeners.ts").is_file()
+
+
+# ── 架构性能优化阶段二守卫 ──
+
+
+def test_websocket_parses_mse_binary_frames() -> None:
+    """MSE 须走二进制帧解析，不得把 fMP4 当 UTF-8 JSON。"""
+    ws = (ROOT / "lsc-electron/src/services/websocket.ts").read_text(encoding="utf-8")
+    util = (ROOT / "lsc-electron/src/utils/mseBinary.ts").read_text(encoding="utf-8")
+    assert "tryParseMseBinaryFrame" in ws
+    assert "tryParseMseBinaryFrame" in util
+    assert "mse_init" in util and "mse_segment" in util
+    onmessage = ws.split("this.ws.onmessage", 1)[1].split("this.ws.onclose", 1)[0]
+    assert "tryParseMseBinaryFrame(event.data)" in onmessage
+    assert "room_id: mse.roomId" in onmessage
+
+
+def test_workbench_toggle_preview_stable_callback() -> None:
+    """handleTogglePreview 不得依赖 rooms，避免 rooms_updated 重建全部 RoomCard。"""
+    source = (ROOT / "lsc-electron/src/hooks/useRoomActions.ts").read_text(encoding="utf-8")
+    body = source.split("const handleTogglePreview = useCallback", 1)[1].split(
+        "const handleFullscreen = useCallback", 1
+    )[0]
+    assert "useAppStore.getState().rooms" in body
+    assert "}, [send])" in body
+    assert "[send, rooms]" not in body
+
+
+def test_cliplist_uses_content_visibility_virtualization() -> None:
+    """ClipList 须启用 content-visibility，跳过屏外绘制。"""
+    source = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "contentVisibility: 'auto'" in source or 'contentVisibility: "auto"' in source
+    assert "containIntrinsicSize" in source
+
+
+def test_timeline_view_model_splits_clip_blocks_layer() -> None:
+    """A2：clipBlocks 须独立函数，不随 previewPositions 重跑坐标转换。"""
+    util = (ROOT / "lsc-electron/src/utils/timelineViewModel.ts").read_text(encoding="utf-8")
+    hook = (ROOT / "lsc-electron/src/hooks/useTimelineViewModel.ts").read_text(encoding="utf-8")
+    assert "export function buildClipBlocks" in util
+    assert "buildClipBlocks" in hook
+    # hook 内 clipBlocks 的 useMemo 不得依赖 previewPositions
+    clip_memo = hook.split("const clipBlocks = useMemo", 1)[1].split("const ", 1)[0]
+    assert "previewPositions" not in clip_memo
+    assert "input.clips" in clip_memo or "clips" in clip_memo
+
+
+def test_cliplist_window_virtualizes_large_lists() -> None:
+    """C1：切片较多时须窗口虚拟渲染（不全量挂载行 DOM）。"""
+    source = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "VIRTUALIZE_THRESHOLD" in source
+    assert "visibleClips" in source or "visibleRange" in source
+    assert "ROW_HEIGHT" in source
+    assert "scrollTop" in source
+
+
+def test_workbench_playhead_sampling_extracted() -> None:
+    """C3：播放头采样循环须抽到独立 hook。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    hook = (ROOT / "lsc-electron/src/hooks/usePlayheadSampling.ts").read_text(encoding="utf-8")
+    assert "usePlayheadSampling" in workbench
+    assert "writeDisplayPlayhead" in hook
+    assert "setPreviewPositions" in hook
+    assert ">= 500" in hook or ">=500" in hook
+
+
+def test_workbench_room_actions_extracted() -> None:
+    """C3：录制/预览/静音等房间操作须抽到 useRoomActions。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    hook = (ROOT / "lsc-electron/src/hooks/useRoomActions.ts").read_text(encoding="utf-8")
+    assert "useRoomActions" in workbench
+    assert "handleTogglePreview" in hook
+    assert "handleToggleMute" in hook
+    assert "handleStartRecord" in hook
+    assert "}, [send])" in hook
+
+
+def test_backend_mse_broadcast_uses_binary_helper() -> None:
+    """room_handler 预览推流须走 broadcast_mse / _push_mse_segment，禁止 base64 热路径。"""
+    handler = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    server = (ROOT / "python-backend/server.py").read_text(encoding="utf-8")
+    assert "def _push_mse_segment" in handler
+    assert "broadcast_mse" in server
+    assert "base64.b64encode(seg)" not in handler
+    assert handler.count("_push_mse_segment(") >= 5
+
+
+def test_broadcaster_is_event_driven() -> None:
+    """broadcast 循环须绑定 wake event，禁止空队列固定 sleep(0.1)。"""
+    main = (ROOT / "python-backend/main.py").read_text(encoding="utf-8")
+    bridge = (ROOT / "python-backend/message_bridge.py").read_text(encoding="utf-8")
+    assert "bind_async_wake" in main and "bind_async_wake" in bridge
+    assert "notify_broadcast" in bridge
+    assert "wait_for(wake.wait()" in main or "wait_for(wake.wait(), timeout=0.5)" in main
+    assert "await asyncio.sleep(0.1)" not in main.split("async def _broadcast_coroutine", 1)[1].split(
+        "def start", 1
+    )[0]
+
+
+def test_medium_tick_emits_room_updated_patches() -> None:
+    """中频 tick 须增量 room_updated；低频 tick 保留全量 rooms_updated。"""
+    handler = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_queue_recording_size_patches" in handler
+    assert "manager.medium_tick.connect(_queue_recording_size_patches)" in handler
+    assert "manager.low_tick.connect(_queue_rooms_update)" in handler
+    assert "manager.medium_tick.connect(_queue_rooms_update)" not in handler
+
+
+def test_qt_global_tick_is_3s_with_stagger() -> None:
+    """Qt 全局 tick 须 3s 间隔 + 交错轮询。"""
+    mgr = (ROOT / "lsc/gui/multi_room/manager.py").read_text(encoding="utf-8")
+    assert "_TICK_INTERVAL_MS = 3000" in mgr
+    assert "_STAGGER_GROUPS = 3" in mgr
+    assert "setInterval(_TICK_INTERVAL_MS)" in mgr
+    assert "room_idx % _STAGGER_GROUPS" in mgr

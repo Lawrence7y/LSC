@@ -1,12 +1,15 @@
-import os, sys
+import os
+import sys
+
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-import time
 import json
-import psutil
+import time
 from datetime import datetime
+
+import psutil
 
 VIDEO_PATH = (
     r"D:\desktop\新建文件夹\新建文件夹\新建文件夹"
@@ -20,7 +23,7 @@ INTERVAL_SEC = 5  # wait between cycles (compressed)
 
 def export_clip(source_path, output_path, ffmpeg_path, start_sec, end_sec):
     """Export a clip using FFmpeg -c copy (fast, no re-encode).
-    
+
     Uses stream copy for speed. Output is GOP-aligned (may be ~1-2s off at boundaries).
     For precise frame-accurate cuts, re-encode instead.
     """
@@ -47,7 +50,6 @@ def export_clip(source_path, output_path, ffmpeg_path, start_sec, end_sec):
     wall = time.perf_counter() - t0
 
     if proc.returncode != 0:
-        stderr_tail = proc.stderr.decode("utf-8", errors="replace")[-300:]
         # Fallback: re-encode if copy fails (e.g., source has unusual codec)
         cmd_re = [
             ffmpeg_path, "-y",
@@ -63,7 +65,7 @@ def export_clip(source_path, output_path, ffmpeg_path, start_sec, end_sec):
         proc2 = subprocess.run(cmd_re, capture_output=True, timeout=120)
         wall2 = time.perf_counter() - t1
         if proc2.returncode != 0:
-            return False, f"Both copy and re-encode failed"
+            return False, "Both copy and re-encode failed"
         size_mb = os.path.getsize(output_path) / 1e6 if os.path.isfile(output_path) else 0
         return True, f"{wall+wall2:.2f}s(fallback), {size_mb:.1f}MB"
 

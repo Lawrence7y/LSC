@@ -28,11 +28,12 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time as _time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from threading import Lock
+from threading import Lock, RLock
 from typing import Any
 from uuid import uuid4
 
@@ -126,13 +127,17 @@ _STREAM_URL_REFRESH_THRESHOLD_SEC = 60
 _STREAM_CACHE_REUSE_SEC = 120.0
 
 # ── Heartbeat intervals (seconds) ────────────────────────────
-# High-frequency: elapsed time, playback position (every tick)
+# Timer fires every 3s; stagger medium work across rooms to cut I/O spikes.
+_TICK_INTERVAL_MS = 3000
+# High-frequency: elapsed time, playback position (every tick ≈ 3s)
 _HIGH_FREQ_INTERVAL = 1
-# Medium-frequency: file size, FFmpeg health (every N ticks)
-_MEDIUM_FREQ_INTERVAL = 5
-_SHARED_INGEST_STALL_CHECKS = 6  # 6 × 5s medium tick ≈ 30s，与 capture.check_health 对齐
-# Low-frequency: disk space check (every N ticks)
-_LOW_FREQ_INTERVAL = 10
+# Medium-frequency: file size / FFmpeg health — every tick, but staggered by room
+_MEDIUM_FREQ_INTERVAL = 1
+_SHARED_INGEST_STALL_CHECKS = 4  # 4 × 3s ≈ 12s，与 capture.check_health 量级对齐
+# Low-frequency: disk space check (every N ticks ≈ 12s)
+_LOW_FREQ_INTERVAL = 4
+# 交错轮询：同一次 tick 只处理 1/N 房间的 medium 工作
+_STAGGER_GROUPS = 3
 
 _OFFLINE_STREAM_ERROR_PATTERNS = (
     "下播",
@@ -433,6 +438,10 @@ class MultiRoomManager(QObject):
         self._controller_factory = controller_factory
         self._preview_factory = preview_factory
         self._rooms: dict[str, RoomSession] = {}
+        # _lock 保护_rooms 及其属性（is_recording/last_error 等）并发读写：
+        # - Qt 主线程（读取 UI）与 ConnectWorker/record worker（写入）并存
+        # - batch 操作中多个工作线程同时修改不同 room 的 is_recording
+        self._lock = RLock()
         self._connect_workers: dict[str, _ConnectWorker] = {}
         self._metadata_probe_workers: dict[str, _MetadataProbeWorker] = {}
         self._batch_record_worker: _BatchRecordWorker | None = None
@@ -460,7 +469,7 @@ class MultiRoomManager(QObject):
         if QCoreApplication.instance() is None:
             return None  # No Qt app (e.g. in unit tests)
         self._global_timer = QTimer(self)
-        self._global_timer.setInterval(1000)
+        self._global_timer.setInterval(_TICK_INTERVAL_MS)
         self._global_timer.timeout.connect(self._on_global_tick)
         return self._global_timer
 
@@ -492,33 +501,34 @@ class MultiRoomManager(QObject):
 
     def add_room(self, url: str) -> RoomSession | None:
         """Add a room. Returns None if MAX_ROOMS limit is reached."""
-        if len(self._rooms) >= MAX_ROOMS:
-            _log.warning("Room limit reached (%d), cannot add more", MAX_ROOMS)
-            return None
-
-        # #27: duplicate URL detection
-        url_stripped = url.strip().rstrip("/").lower()
-        for existing in list(self._rooms.values()):
-            existing_url = getattr(existing, "room_url", "").strip().rstrip("/").lower()
-            if existing_url == url_stripped:
-                _log.warning("duplicate URL rejected: %s", url)
+        with self._lock:
+            if len(self._rooms) >= MAX_ROOMS:
+                _log.warning("Room limit reached (%d), cannot add more", MAX_ROOMS)
                 return None
-        room_id = uuid4().hex
-        controller = self._create_controller()
 
-        # Preview widget is created lazily when the user clicks "预览".
-        # This avoids the cost of one libmpv instance per room upfront in
-        # multi-room scenarios.
-        room = RoomSession(
-            room_id=room_id,
-            room_url=url.strip(),
-            controller=controller,
-            preview_widget=None,
-        )
-        self._rooms[room_id] = room
+            # #27: duplicate URL detection
+            url_stripped = url.strip().rstrip("/").lower()
+            for existing in list(self._rooms.values()):
+                existing_url = getattr(existing, "room_url", "").strip().rstrip("/").lower()
+                if existing_url == url_stripped:
+                    _log.warning("duplicate URL rejected: %s", url)
+                    return None
+            room_id = uuid4().hex
+            controller = self._create_controller()
+
+            # Preview widget is created lazily when the user clicks "预览".
+            # This avoids the cost of one libmpv instance per room upfront in
+            # multi-room scenarios.
+            room = RoomSession(
+                room_id=room_id,
+                room_url=url.strip(),
+                controller=controller,
+                preview_widget=None,
+            )
+            self._rooms[room_id] = room
 
         # Auto-start global timer when first room is added
-        if len(self._rooms) == 1:
+        if self.room_count() == 1:
             self._start_global_timer()
 
         # Persist the updated room list (skip during batch load)
@@ -529,15 +539,18 @@ class MultiRoomManager(QObject):
 
     def get_room(self, room_id: str) -> RoomSession | None:
         """Return the ``RoomSession`` for ``room_id``, or ``None`` if not found."""
-        return self._rooms.get(room_id)
+        with self._lock:
+            return self._rooms.get(room_id)
 
     def list_rooms(self) -> list[RoomSession]:
         """Return all currently managed ``RoomSession`` objects."""
-        return list(self._rooms.values())
+        with self._lock:
+            return list(self._rooms.values())
 
     def room_count(self) -> int:
         """Return the number of rooms currently managed."""
-        return len(self._rooms)
+        with self._lock:
+            return len(self._rooms)
 
     def max_rooms(self) -> int:
         """Return the hard upper limit on concurrently managed rooms."""
@@ -554,7 +567,8 @@ class MultiRoomManager(QObject):
         Returns:
             True if the room was found and removed; False otherwise.
         """
-        room = self._rooms.pop(room_id, None)
+        with self._lock:
+            room = self._rooms.pop(room_id, None)
         if room is None:
             return False
         # 若正在循环试听这个房间,停止 timer,避免删房后空转。
@@ -604,7 +618,7 @@ class MultiRoomManager(QObject):
                     _log.warning("Preview cleanup failed for room %s: %s", room_id, exc)
 
         # Stop global timer when last room is removed
-        if not self._rooms:
+        if not self.room_count():
             self._stop_global_timer()
 
         # Persist the updated room list
@@ -663,33 +677,70 @@ class MultiRoomManager(QObject):
         return entry
 
     def save_rooms(self) -> int:
-        """Persist the current room list atomically.
+        """Persist the current room list atomically (debounced 1s, fsync every N writes).
 
         Writes to a temporary file first, then renames it into place.
         Keeps a .bak copy of the previous config so load_rooms can recover
         from a corrupt primary file.
 
-        Returns number of saved rooms.
+        Returns number of rooms queued for save.
         """
-        import json
-
         data = {
             "version": 2,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "rooms": [self._serialize_room(room) for room in self._rooms.values()],
         }
+        count = len(self._rooms)
+        self._pending_save_payload = data
+        self._pending_save_count = count
+        timer = getattr(self, "_save_rooms_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception as exc:
+                _log.debug("cancel save_rooms timer failed: %s", exc)
+        timer = threading.Timer(1.0, self._flush_save_rooms)
+        timer.daemon = True
+        self._save_rooms_timer = timer
+        timer.start()
+        return count
+
+    def flush_save_rooms(self) -> int:
+        """Cancel debounce and flush immediately (tests / shutdown)."""
+        timer = getattr(self, "_save_rooms_timer", None)
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception as exc:
+                _log.debug("cancel save_rooms timer failed: %s", exc)
+            self._save_rooms_timer = None
+        return self._flush_save_rooms()
+
+    def _flush_save_rooms(self) -> int:
+        """写出合并后的房间配置。"""
+        import json
+
+        self._save_rooms_timer = None
+        data = getattr(self, "_pending_save_payload", None)
+        count = int(getattr(self, "_pending_save_count", 0) or 0)
+        self._pending_save_payload = None
+        if data is None:
+            return 0
 
         path = self._config_file_path()
         tmp_path = self._temp_config_path()
         bak_path = self._backup_config_path()
+        write_n = int(getattr(self, "_rooms_write_count", 0) or 0) + 1
+        self._rooms_write_count = write_n
+        do_fsync = write_n % 5 == 0
 
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 f.flush()
-                os.fsync(f.fileno())
+                if do_fsync:
+                    os.fsync(f.fileno())
 
-            # Keep a backup of the existing config before overwriting it.
             if os.path.isfile(path):
                 try:
                     os.replace(path, bak_path)
@@ -697,8 +748,8 @@ class MultiRoomManager(QObject):
                     _log.warning("Failed to create config backup: %s", exc)
 
             os.replace(tmp_path, path)
-            _log.info("Saved %d rooms to %s", len(self._rooms), path)
-            return len(self._rooms)
+            _log.info("Saved %d rooms to %s", count, path)
+            return count
         except Exception as exc:
             _log.error("Failed to save rooms: %s", exc)
             return 0
@@ -1362,13 +1413,16 @@ class MultiRoomManager(QObject):
             cfg = load_config()
             if getattr(cfg, "shared_ingest_enabled", False):
                 shared = get_shared_ingest_registry().get(room.room_id)
-                if shared is not None and not getattr(shared, "recording_active", False):
-                    if getattr(shared, "preview_subscribers", 0) > 0:
-                        force_fresh = True
-                        _log.info(
-                            "recording force-refresh stream for %s (shared preview→recording)",
-                            room.room_id,
-                        )
+                if (
+                    shared is not None
+                    and not getattr(shared, "recording_active", False)
+                    and getattr(shared, "preview_subscribers", 0) > 0
+                ):
+                    force_fresh = True
+                    _log.info(
+                        "recording force-refresh stream for %s (shared preview→recording)",
+                        room.room_id,
+                    )
         except Exception as exc:
             _log.debug("shared ingest force-refresh check failed: %s", exc)
 
@@ -1447,11 +1501,10 @@ class MultiRoomManager(QObject):
             room.last_error = "录制控制器未初始化"
             return False
         _log.info("[录制诊断] controller OK, is_connected=%s, stream_url=%s", room.is_connected, bool(getattr(controller, 'stream_url', None)))
-        if not room.is_connected:
-            # 预览刷新失败可能误清 is_connected，但流缓存仍可用
-            if not _heal_connected_flag(room):
-                room.last_error = "房间未连接"
-                return False
+        # 预览刷新失败可能误清 is_connected，但流缓存仍可用
+        if not room.is_connected and not _heal_connected_flag(room):
+            room.last_error = "房间未连接"
+            return False
         # Pre-flight disk space check；重连中用 2GB 阈值，开录仍用默认 8GB/路
         _preflight_min = (
             _MIN_FREE_BYTES_WHILE_RECORDING if room.is_reconnecting else None
@@ -2304,19 +2357,18 @@ class MultiRoomManager(QObject):
     def _on_global_tick(self) -> None:
         """Layered heartbeat: high/medium/low frequency operations.
 
-        Runs every 1 second. A modulo counter gates medium-frequency
-        work (every 5 ticks) and low-frequency work (every 10 ticks).
-        This single-timer design avoids spawning multiple QTimer objects
-        and keeps all room updates in one deterministic pass.
+        Timer fires every 3s. Medium work is staggered across rooms
+        (``_STAGGER_GROUPS``) so 12-room size/health I/O is spread out.
+        Low-frequency disk guard runs every ``_LOW_FREQ_INTERVAL`` ticks.
 
         Layered breakdown:
         - **High-frequency (every tick)**: controller ``tick()`` for elapsed
           time, and sync of preview playback position into the controller.
-        - **Medium-frequency (every 5s)**: file-size polling via
+        - **Medium-frequency (staggered each tick)**: file-size polling via
           ``SizeUpdateRunnable`` and FFmpeg watchdog health-check. Failed
           recordings trigger an auto-reconnect in a background thread to
           keep the UI responsive.
-        - **Low-frequency (every 10s)**: disk-space guard; if free space
+        - **Low-frequency (~12s)**: disk-space guard; if free space
           drops below ``_MIN_FREE_BYTES_WHILE_RECORDING`` the recording is
           stopped automatically to prevent a mid-write crash.
 
@@ -2326,9 +2378,11 @@ class MultiRoomManager(QObject):
         self._tick_counter += 1
         is_medium_tick = (self._tick_counter % _MEDIUM_FREQ_INTERVAL == 0)
         is_low_tick = (self._tick_counter % _LOW_FREQ_INTERVAL == 0)
+        stagger_slot = self._tick_counter % _STAGGER_GROUPS
 
-        for room in list(self._rooms.values()):
+        for room_idx, room in enumerate(list(self._rooms.values())):
             controller = room.controller
+            room_medium = is_medium_tick and (room_idx % _STAGGER_GROUPS == stagger_slot)
 
             # ── Shared ingest health check (controller is None in Electron) ──
             if controller is None and room.is_recording:
@@ -2339,13 +2393,13 @@ class MultiRoomManager(QObject):
                     if ingest_error and not room.is_reconnecting:
                         _log.warning("Room %s shared ingest error: %s", room.room_id, ingest_error)
                         self._start_recording_reconnect_thread(room, ingest_error)
-                    elif is_medium_tick and not room.is_reconnecting:
+                    elif room_medium and not room.is_reconnecting:
                         if getattr(ingest, "recording_active", False) and room.record_output_path:
                             stall_msg = self._check_shared_ingest_file_stall(room)
                             if stall_msg:
                                 _log.warning("Room %s shared ingest stall: %s", room.room_id, stall_msg)
                                 self._start_recording_reconnect_thread(room, stall_msg)
-                    elif is_medium_tick and room.is_reconnecting:
+                    if room.is_reconnecting:
                         if (room.reconnect_next_attempt_at > 0
                                 and _time.monotonic() >= room.reconnect_next_attempt_at):
                             self._start_recording_reconnect_thread(
@@ -2354,7 +2408,7 @@ class MultiRoomManager(QObject):
                             )
                 continue
 
-            # ── High-frequency (every 1s): lightweight operations ──
+            # ── High-frequency: lightweight operations ──
             if room.is_recording:
                 controller.tick()
 
@@ -2370,8 +2424,8 @@ class MultiRoomManager(QObject):
                         except Exception as exc:
                             _log.debug("操作异常（已忽略）: %s", exc)
 
-            # ── Medium-frequency (every 5s): file size + health check ──
-            if is_medium_tick:
+            # ── Medium-frequency (staggered): file size + health check ──
+            if room_medium:
                 # 首帧写入校正: 仅在 recording_media_start_mono 未设置精确值时执行。
                 # 共享进样模式下 _wait_for_start_mono 已写入精确值，不可被启发式覆盖。
                 if (room.is_recording and room.record_output_path
@@ -2398,20 +2452,22 @@ class MultiRoomManager(QObject):
                         SizeUpdateRunnable(room, room.record_output_path)
                     )
 
-                if room.is_recording and room.is_reconnecting:
-                    if (room.reconnect_next_attempt_at > 0
-                            and _time.monotonic() >= room.reconnect_next_attempt_at):
-                        self._start_recording_reconnect_thread(
-                            room,
-                            room.last_error or "录制恢复到期",
-                        )
-                elif room.is_recording:
+                if room.is_recording and not room.is_reconnecting:
                     error_msg = controller.watchdog_check()
                     if error_msg:
                         _log.warning("Room %s watchdog: %s", room.room_id, error_msg)
                         self._start_recording_reconnect_thread(room, error_msg)
 
-            # ── Low-frequency (every 30s): disk space check ──
+            # 重连到期必须每 tick 检查，不得被交错轮询推迟
+            if room.is_recording and room.is_reconnecting:
+                if (room.reconnect_next_attempt_at > 0
+                        and _time.monotonic() >= room.reconnect_next_attempt_at):
+                    self._start_recording_reconnect_thread(
+                        room,
+                        room.last_error or "录制恢复到期",
+                    )
+
+            # ── Low-frequency (~12s): disk space check ──
             if is_low_tick and room.is_recording:
                 try:
                     rec_dir = (

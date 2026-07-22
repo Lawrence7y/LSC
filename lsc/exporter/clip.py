@@ -73,6 +73,26 @@ def _parse_stream_fps(fps_str: str) -> float | None:
         return None
 
 
+def compute_export_watchdog_timeout(
+    width: int | None,
+    height: int | None,
+    hardware_encoder: bool,
+    base: int = 300,
+) -> int:
+    """Compute FFmpeg export watchdog timeout from source resolution and encoder type."""
+    timeout = base
+    if width and height:
+        pixels = int(width) * int(height)
+        # >= so exact 4K/1080p match their tier (not just above)
+        if pixels >= 3840 * 2160:
+            timeout = int(timeout * 2.5)
+        elif pixels >= 1920 * 1080:
+            timeout = int(timeout * 1.5)
+    if not hardware_encoder:
+        timeout = int(timeout * 2.0)
+    return timeout
+
+
 def parse_ffmpeg_progress_line(line: str, state: dict[str, int]) -> None:
     """Parse a single FFmpeg progress line and update state dict.
 
@@ -185,15 +205,40 @@ class ClipExporter:
         cmd += ["-movflags", "+faststart", tmp_output_path]
         _log.info("export CPU fallback filters=%s", cpu_vf[1] if cpu_vf else "none")
         try:
-            run_kwargs: dict = {
-                "capture_output": True, "text": True, "timeout": 300,
-                "encoding": "utf-8", "errors": "replace",
-                "env": env, "cwd": cwd,
+            popen_kwargs: dict = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "env": env,
+                "cwd": cwd,
             }
             if creation_flags:
-                run_kwargs["creationflags"] = creation_flags
-            result = subprocess.run(cmd, **run_kwargs)
-            return result.returncode == 0 and os.path.isfile(tmp_output_path)
+                popen_kwargs["creationflags"] = creation_flags
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            if on_process is not None:
+                try:
+                    on_process(proc)
+                except Exception as exc:
+                    _log.warning("导出 on_process 回调异常: %s", exc)
+            src_res, _ = self._probe_source_video(video_path)
+            src_w, src_h = src_res if src_res else (None, None)
+            hw_enc = bool(getattr(effective_profile, "is_hardware", True))
+            watchdog_timeout = compute_export_watchdog_timeout(src_w, src_h, hw_enc)
+            try:
+                returncode = proc.wait(timeout=watchdog_timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception as exc:
+                    _log.warning(
+                        "Failed to kill CPU fallback FFmpeg (PID=%s): %s",
+                        proc.pid, exc,
+                    )
+                return False
+            return returncode == 0 and os.path.isfile(tmp_output_path)
         except Exception as exc:
             _log.warning("CPU fallback export failed: %s", exc)
             return False
@@ -533,12 +578,17 @@ class ClipExporter:
                     try:
                         on_process(proc)
                     except Exception as exc:
-                        _log.debug("操作异常（已忽略）: %s", exc)
+                        _log.warning("导出 on_process 回调异常: %s", exc)
                 state: dict[str, int] = {}
                 last_reported_percent = -1.0
                 last_reported_time = 0.0
                 stderr_tail: deque[str] = deque(maxlen=20)
                 _timed_out_flag: list[bool] = [False]
+
+                src_res, _ = self._probe_source_video(video_path)
+                src_w, src_h = src_res if src_res else (None, None)
+                hw_enc = bool(getattr(effective_profile, "is_hardware", True))
+                watchdog_timeout = compute_export_watchdog_timeout(src_w, src_h, hw_enc)
 
                 def _stderr_reader() -> None:
                     """后台线程：持续读取 FFmpeg stderr 并保留尾部用于错误诊断。"""
@@ -546,22 +596,12 @@ class ClipExporter:
                         for line in proc.stderr:
                             stderr_tail.append(line.rstrip())
                     except Exception as exc:
-                        _log.debug("操作异常（已忽略）: %s", exc)
+                        _log.warning("导出 stderr 读取异常: %s", exc)
 
                 def _watchdog() -> None:
-                    """Kill FFmpeg if it runs longer than 5 minutes."""
+                    """Kill FFmpeg if it runs longer than the computed watchdog timeout."""
                     try:
-                        # #35: scale timeout by resolution and codec
-                        base_timeout = 300
-                        if hasattr(self, 'width') and self.width and hasattr(self, 'height') and self.height:
-                            pixels = self.width * self.height
-                            if pixels > 3840 * 2160:
-                                base_timeout = int(base_timeout * 2.5)
-                            elif pixels > 1920 * 1080:
-                                base_timeout = int(base_timeout * 1.5)
-                        if not getattr(self, 'hardware_encoder', True):
-                            base_timeout = int(base_timeout * 2.0)
-                        proc.wait(timeout=base_timeout)
+                        proc.wait(timeout=watchdog_timeout)
                     except subprocess.TimeoutExpired:
                         _timed_out_flag[0] = True
                         try:
@@ -604,7 +644,7 @@ class ClipExporter:
                                 try:
                                     progress_callback(percent, elapsed_sec, duration)
                                 except Exception as exc:
-                                    _log.debug("进度回调异常: %s", exc)
+                                    _log.warning("导出进度回调异常: %s", exc)
                     # stdout 已关闭，等待进程退出（不会阻塞太久）
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:

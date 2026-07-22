@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import logging.handlers
 import os
@@ -206,13 +205,19 @@ class LSCWebSocketBackend:
             _log.info("WebSocket server thread exited")
 
     async def _broadcast_coroutine(self):
-        """协程版广播循环：从 bridge 队列取消息并发送。"""
-        from server import drain_merge_broadcasts, _json_dumps
+        """协程版广播循环：从 bridge 队列取消息并发送（事件驱动唤醒）。"""
+        from server import _json_dumps, drain_merge_broadcasts
+        wake = asyncio.Event()
+        self.bridge.bind_async_wake(asyncio.get_running_loop(), wake)
         while not self._shutdown:
             try:
                 merged = drain_merge_broadcasts(self.bridge)
                 if not merged:
-                    await asyncio.sleep(0.1)
+                    wake.clear()
+                    try:
+                        await asyncio.wait_for(wake.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
                     continue
                 for msg in merged:
                     # Use the numpy-aware serializer (consistent with

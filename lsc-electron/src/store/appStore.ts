@@ -85,8 +85,8 @@ function roomsShallowEqual(a: RoomSession[], b: RoomSession[]): boolean {
   if (a === b) return true
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i++) {
-    const left = a[i] as Record<string, unknown>
-    const right = b[i] as Record<string, unknown>
+    const left = a[i] as unknown as Record<string, unknown>
+    const right = b[i] as unknown as Record<string, unknown>
     const keys = new Set([...Object.keys(left), ...Object.keys(right)])
     for (const key of keys) {
       if (left[key] !== right[key]) return false

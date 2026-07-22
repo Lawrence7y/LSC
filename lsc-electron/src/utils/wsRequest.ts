@@ -1,7 +1,7 @@
 type MessageHandler = (data: unknown) => void
 
 type WsLike = {
-  send: (type: string, data: unknown) => void
+  send: (type: string, data: unknown) => boolean
   on: (event: string, handler: MessageHandler) => () => void
 }
 

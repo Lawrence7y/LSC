@@ -247,6 +247,32 @@ def test_open_tail_round_is_retained_as_pending_for_status() -> None:
     assert not room_handler._is_auto_exportable_valorant_round(retained[0])
 
 
+def test_hybrid_closed_round_near_tip_is_not_dropped() -> None:
+    """结算帧贴近扫描 tip 时，不得把已闭合 hybrid 回合当 open_tail 丢弃。"""
+    rounds = [{
+        "start": 92.444,
+        "end": 188.611,
+        "phase": "combat",
+        "boundary_source": "valorant_hybrid_v1",
+        "start_by": "model_buy_exit",
+        "end_by": "model_result",
+        "confirm_status": "pending",
+    }]
+
+    retained = room_handler._drop_open_tail_rounds(rounds, current_dur=192.0)
+
+    assert retained == rounds
+    assert room_handler._is_listable_hybrid_round(retained[0])
+
+
+def test_incomplete_non_hybrid_tip_round_still_dropped() -> None:
+    rounds = [{"start": 100.0, "end": 190.0, "phase": "combat", "end_by": "full_round"}]
+
+    retained = room_handler._drop_open_tail_rounds(rounds, current_dur=192.0)
+
+    assert retained == []
+
+
 def test_new_rounds_releases_pending_round_when_hybrid_confirms() -> None:
     previous = [{
         "start": 100.0, "end": 180.0, "phase": "pending",
@@ -700,6 +726,20 @@ def test_ocr_combat_energy_rejects_buy_phase_only_segments() -> None:
     assert _ocr_round_has_combat_energy(combat, 0, 60, threshold) is True
 
 
+def test_start_continuous_analysis_validates_off_event_loop() -> None:
+    """start_continuous_analysis 的 wait_for_file 校验不得在 event loop 线程里 time.sleep。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    handler = src.split("async def handle_start_continuous_analysis", 1)[1].split(
+        "@server.on(", 1
+    )[0]
+    assert "_validate_synced_analysis_targets" in handler
+    assert "run_in_executor" in handler
+    # 校验调用须落在 executor 提交路径内，禁止裸同步调用阻塞 asyncio
+    validate_idx = handler.find("_validate_synced_analysis_targets")
+    window = handler[max(0, validate_idx - 400) : validate_idx]
+    assert "run_in_executor" in window
+
+
 def test_scene_continuous_export_branch_is_list_only() -> None:
     """通用/场景持续分析不得走 defer→flush 自动导出，须与 Valorant 一样 list_only 入列。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
@@ -844,6 +884,7 @@ def test_status_payload_reports_provider_and_latest_error() -> None:
         {
             "mode": "valorant_round",
             "provider": "CPUExecutionProvider",
+            "provider_warning": "valorant classifier fell back to CPU",
             "model_version": "v1",
             "last_scan_error": "model missing",
         },
@@ -851,6 +892,7 @@ def test_status_payload_reports_provider_and_latest_error() -> None:
     )
 
     assert payload["provider"] == "CPUExecutionProvider"
+    assert payload["provider_warning"] == "valorant classifier fell back to CPU"
     assert payload["model_version"] == "v1"
     assert payload["last_scan_error"] == "model missing"
 

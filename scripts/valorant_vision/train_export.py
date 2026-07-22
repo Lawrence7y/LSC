@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -39,6 +40,62 @@ SPLITS = ("train", "val")
 INPUT_SIZE = 224
 NORMALIZE_MEAN = (0.485, 0.456, 0.406)
 NORMALIZE_STD = (0.229, 0.224, 0.225)
+DEFAULT_SEED = 20260722
+
+
+def experiment_metadata(
+    *,
+    seed: int,
+    train_count: int,
+    val_count: int,
+    digest: str,
+) -> dict:
+    return {
+        "seed": seed,
+        "train_count": train_count,
+        "val_count": val_count,
+        "dataset_digest": digest,
+    }
+
+
+def compute_dataset_digest(samples: list[tuple[Path, int]]) -> str:
+    hasher = hashlib.sha256()
+    for path, label in sorted(samples, key=lambda item: str(item[0])):
+        hasher.update(f"{path}:{label}:".encode())
+        hasher.update(path.read_bytes())
+    return hasher.hexdigest()
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
+
+
+def _worker_init_fn(seed: int):
+    def init_fn(worker_id: int) -> None:
+        worker_seed = seed + worker_id
+        random.seed(worker_seed)
+        try:
+            import numpy as np
+
+            np.random.seed(worker_seed)
+        except ImportError:
+            pass
+
+    return init_fn
 
 
 def _parse_args() -> argparse.Namespace:
@@ -56,6 +113,12 @@ def _parse_args() -> argparse.Namespace:
         help="Output directory for valorant_phase_v1.onnx and .json",
     )
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs (default: 10)")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=f"Random seed for reproducible training (default: {DEFAULT_SEED})",
+    )
     parser.add_argument(
         "--export-int8",
         action="store_true",
@@ -109,12 +172,16 @@ def _train_and_export(
     out_dir: Path,
     epochs: int,
     export_int8: bool,
+    seed: int,
 ) -> None:
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
     from torchvision import transforms
     from PIL import Image
+
+    _seed_everything(seed)
+    dataset_digest = compute_dataset_digest(train_samples + val_samples)
 
     class _FrameDataset(Dataset):
         def __init__(self, items: list[tuple[Path, int]], transform) -> None:
@@ -131,10 +198,12 @@ def _train_and_export(
             return self._transform(img), label
 
     train_tf = transforms.Compose([
-        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
-        transforms.ColorJitter(brightness=0.15, contrast=0.15),
-        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.2),
+        transforms.Resize((INPUT_SIZE + 16, INPUT_SIZE + 16)),
+        transforms.RandomCrop((INPUT_SIZE, INPUT_SIZE)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.25),
         transforms.ToTensor(),
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.12)),
         transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
     ])
     eval_tf = transforms.Compose([
@@ -147,21 +216,40 @@ def _train_and_export(
     model, _weights = _build_model(len(LABELS))
     model.to(device)
 
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(seed)
+    worker_init = _worker_init_fn(seed)
     train_loader = DataLoader(
         _FrameDataset(train_samples, train_tf),
         batch_size=32,
         shuffle=True,
         num_workers=0,
+        generator=loader_generator,
+        worker_init_fn=worker_init,
     )
     val_loader = DataLoader(
         _FrameDataset(val_samples, eval_tf),
         batch_size=32,
         shuffle=False,
         num_workers=0,
+        generator=loader_generator,
+        worker_init_fn=worker_init,
     )
 
-    criterion = nn.CrossEntropyLoss()
+    # Inverse-frequency class weights (combat dominates POV datasets).
+    class_counts = torch.zeros(len(LABELS), dtype=torch.float32)
+    for _, y in train_samples:
+        class_counts[y] += 1.0
+    class_counts = torch.clamp(class_counts, min=1.0)
+    weights = (class_counts.sum() / (len(LABELS) * class_counts)).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+
+    best_state = None
+    best_bal = -1.0
+    best_acc = -1.0
+    best_epoch = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -174,17 +262,42 @@ def _train_and_export(
             loss.backward()
             optimizer.step()
             running_loss += float(loss.item())
+        scheduler.step()
         model.eval()
         correct = 0
         total = 0
+        per_correct = [0] * len(LABELS)
+        per_total = [0] * len(LABELS)
         with torch.no_grad():
             for batch_x, batch_y in val_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 preds = model(batch_x).argmax(dim=1)
                 correct += int((preds == batch_y).sum().item())
                 total += int(batch_y.size(0))
+                for t, p in zip(batch_y.tolist(), preds.tolist()):
+                    per_total[t] += 1
+                    if t == p:
+                        per_correct[t] += 1
         acc = (correct / total) if total else 0.0
-        print(f"epoch {epoch}/{epochs} loss={running_loss / max(len(train_loader), 1):.4f} val_acc={acc:.4f}")
+        recalls = [
+            (per_correct[i] / per_total[i]) if per_total[i] else 0.0
+            for i in range(len(LABELS))
+        ]
+        bal = sum(recalls) / len(LABELS)
+        print(
+            f"epoch {epoch}/{epochs} loss={running_loss / max(len(train_loader), 1):.4f} "
+            f"val_acc={acc:.4f} bal_acc={bal:.4f} "
+            + " ".join(f"{LABELS[i]}={recalls[i]:.2f}" for i in range(len(LABELS)))
+        )
+        if bal > best_bal or (abs(bal - best_bal) < 1e-6 and acc > best_acc):
+            best_bal = bal
+            best_acc = acc
+            best_epoch = epoch
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"using best checkpoint epoch={best_epoch} bal_acc={best_bal:.4f} val_acc={best_acc:.4f}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_path = out_dir / "valorant_phase_v1.onnx"
@@ -232,6 +345,12 @@ def _train_and_export(
             "stable_prob": 0.55,
             "high_prob": 0.80,
         },
+        **experiment_metadata(
+            seed=seed,
+            train_count=len(train_samples),
+            val_count=len(val_samples),
+            digest=dataset_digest,
+        ),
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"导出完成: {onnx_path}")
@@ -257,12 +376,14 @@ def main() -> None:
         raise SystemExit(1)
 
     _require_torch()
+    _seed_everything(int(args.seed))
     _train_and_export(
         train_samples,
         val_samples,
         out_dir=args.out_dir.expanduser().resolve(),
         epochs=max(1, int(args.epochs)),
         export_int8=bool(args.export_int8),
+        seed=int(args.seed),
     )
 
 

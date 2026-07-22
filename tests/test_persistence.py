@@ -6,10 +6,12 @@ stale detection, and edge cases (missing files, malformed JSON).
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -24,12 +26,62 @@ if _backend_dir not in sys.path:
 from persistence import (  # noqa: E402
     load_rooms,
     save_rooms,
+    save_settings,
     save_analysis_results,
     load_analysis_results,
     is_analysis_stale,
     _ensure_dir,
     _analysis_json_path,
+    _persist_lock,
 )
+
+
+class TestPersistLockGuards:
+    """H1c: persistence writes are guarded by a process-wide lock."""
+
+    def test_persist_lock_exists(self):
+        assert isinstance(_persist_lock, type(threading.Lock()))
+
+    def test_save_functions_use_persist_lock(self):
+        mod = importlib.import_module("persistence")
+        for name in ("save_rooms", "save_settings", "save_analysis_results"):
+            source = inspect.getsource(getattr(mod, name))
+            assert "_persist_lock" in source
+            assert "with _persist_lock" in source
+
+
+class TestSaveSettings:
+    """Test settings persistence with atomic write."""
+
+    def test_save_and_load_roundtrip(self, tmp_path: Path):
+        path = tmp_path / "settings.json"
+        settings = {"output_dir": "/tmp/out", "encoder": "libx264", "crf": 23}
+        assert save_settings(settings, path) is True
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert loaded == settings
+
+    def test_concurrent_save_settings_valid_json(self, tmp_path: Path):
+        path = tmp_path / "settings.json"
+        errors: list[Exception] = []
+
+        def worker(i: int) -> None:
+            try:
+                for j in range(10):
+                    save_settings({"thread": i, "seq": j}, path)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(data, dict)
+        assert "thread" in data
+        assert "seq" in data
 
 
 class TestEnsureDir:

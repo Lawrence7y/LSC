@@ -30,6 +30,10 @@ _LSC_ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
 if _LSC_ROOT not in sys.path:
     sys.path.insert(0, _LSC_ROOT)
 
+from handlers.timeline_handlers import (
+    register_timeline_handlers,
+    timeline_to_dict,
+)
 from persistence import (
     is_analysis_stale,
     load_analysis_results,
@@ -43,10 +47,6 @@ from lsc.core.services.resource_monitor import collect_system_stats, get_resourc
 from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
     get_timeline_service,
-)
-from handlers.timeline_handlers import (
-    register_timeline_handlers,
-    timeline_to_dict,
 )
 from lsc.gui.multi_room.manager import MultiRoomManager, _is_stream_offline_error
 from lsc.platforms.registry import select_quality
@@ -125,6 +125,7 @@ _ai_clip_counters: dict[str, int] = {}
 
 # Analytics jobs in progress: {room_id: {"progress": 0.0, "highlights": [...], "completed_at": float}}
 _analysis_jobs: dict[str, dict[str, Any]] = {}
+_analysis_jobs_lock = threading.RLock()
 _ANALYSIS_JOB_TTL = 300.0  # 5 分钟后自动清理已完成的分析结果
 
 # 持续分析任务状态：room_id -> {task, last_analyzed, highlights, cancelled}
@@ -169,6 +170,8 @@ _export_semaphore = asyncio.Semaphore(2)  # 实际并发限制（动态跟随 se
 _export_semaphore_limit = 2  # 当前 semaphore 配置的上限（勿用 _waiters 反推，空闲时可为 None）
 _export_in_flight = 0  # 已出队、正在执行 FFmpeg 的导出任务数（热更新须与 empty() 联判）
 _export_queue_lock = asyncio.Lock()
+# 保护_export_in_flight 和连续分析状态的线程锁（防止 handler 异步与 bridge.sync 并发冲突）
+_export_stats_lock = threading.Lock()
 
 
 def _get_export_max_concurrent() -> int:
@@ -391,6 +394,12 @@ def _probe_stream_offline(mgr: MultiRoomManager, room_id: str) -> tuple[bool, st
 _offline_file_review_in_progress: set[str] = set()
 
 
+def _clear_mse_push_paused(room_id: str) -> None:
+    """预览停止时清除 backpressure 暂停标记，避免残留导致重开后丢帧。"""
+    with _mse_push_paused_lock:
+        _mse_push_paused.discard(room_id)
+
+
 def _stop_live_preview_streamer(room_id: str) -> None:
     """停止房间的直播 CDN / 共享进样预览流（为文件回看让路）。"""
     old = _preview_stream_registry().pop(room_id)
@@ -410,6 +419,7 @@ def _stop_live_preview_streamer(room_id: str) -> None:
                     _log.debug("stop_preview_sink 失败: %s", exc)
     except Exception as exc:
         _log.debug("shared ingest preview stop lookup failed: %s", exc)
+    _clear_mse_push_paused(room_id)
     _stop_idle_shared_ingest(room_id, reason="offline file review cleanup")
 
 
@@ -577,19 +587,11 @@ async def _start_recording_file_mse(
                     fps=fps,
                     video_bitrate=video_bitrate,
                     crf_value=crf_value,
-                    on_init_segment=lambda seg, _room_id=room_id: asyncio.run_coroutine_threadsafe(
-                        srv.broadcast("mse_init", {
-                            "room_id": _room_id,
-                            "data": base64.b64encode(seg).decode("ascii"),
-                        }),
-                        loop,
+                    on_init_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                        srv, loop, 'mse_init', _room_id, seg
                     ),
-                    on_media_segment=lambda seg, _room_id=room_id: asyncio.run_coroutine_threadsafe(
-                        srv.broadcast("mse_segment", {
-                            "room_id": _room_id,
-                            "data": base64.b64encode(seg).decode("ascii"),
-                        }),
-                        loop,
+                    on_media_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                        srv, loop, 'mse_segment', _room_id, seg
                     ),
                     on_error=lambda err, _room_id=room_id: asyncio.run_coroutine_threadsafe(
                         _on_file_mse_error(err), loop
@@ -714,24 +716,25 @@ def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
         "executors_shutdown": 0,
     }
 
-    for room_id, state in list(_continuous_tasks.items()):
-        state["cancelled"] = True
-        task = state.get("task")
-        cancel = getattr(task, "cancel", None)
-        if callable(cancel):
-            try:
-                cancel()
-            except Exception as exc:
-                _log.debug("cancel continuous task failed room_id=%s: %s", room_id, exc)
-        stats["continuous_tasks_cancelled"] += 1
-    _continuous_tasks.clear()
+    with _analysis_jobs_lock:
+        for room_id, state in list(_continuous_tasks.items()):
+            state["cancelled"] = True
+            task = state.get("task")
+            cancel = getattr(task, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception as exc:
+                    _log.debug("cancel continuous task failed room_id=%s: %s", room_id, exc)
+            stats["continuous_tasks_cancelled"] += 1
+        _continuous_tasks.clear()
+        _analysis_jobs.clear()
 
     with _mse_starting_lock:
         _mse_starting.clear()
     _mse_reconnect_state.clear()
     _recording_starting.clear()
     _recording_wait_queue.clear()
-    _analysis_jobs.clear()
     with _export_jobs_lock:
         export_jobs.clear()
 
@@ -1190,6 +1193,9 @@ def _drop_open_tail_rounds(
     使用两段式 margin 判定：
     - end >= current_dur - 3s：尾部数据不完整（_margin），直接丢弃
     - end >= current_dur - 20s：回合可能仍在进行中（pending_margin），标记为 phase="pending" 保留
+
+    Hybrid FSM 已用 model_result / model_score 闭合的回合不得按 tip 距离丢弃：
+    结算帧本来就贴近扫描尖端，误删会导致「有交战内容但 0 回合」。
     """
     if not rounds:
         return []
@@ -1202,6 +1208,10 @@ def _drop_open_tail_rounds(
     # 明确的 open_tail 需要保留，等待下一次回看确认结束边界。
     if last.get("tail_by") == "open_tail":
         last["phase"] = "pending"
+        return cleaned
+    end_by = str(last.get("end_by", "") or "")
+    # Hybrid 已闭合：保留（含 end 贴近 tip 的情况）
+    if end_by in _HYBRID_VALID_END_BY:
         return cleaned
     # 3s 内：数据本身不完整，丢弃
     if end >= current_dur - tail_margin:
@@ -1584,6 +1594,7 @@ def _build_continuous_status_payload(
         "analysis_lag_sec": max(0.0, rec_dur - analyzed) if rec_dur else 0.0,
         "model_version": task.get("model_version"),
         "provider": task.get("provider"),
+        "provider_warning": task.get("provider_warning"),
         "last_scan_error": task.get("last_scan_error"),
     }
     if task.get("shadow_mode"):
@@ -1789,7 +1800,9 @@ def _continuous_valorant_scan_budget(
     # 相位调度路径（新主路径）
     if mode == "valorant_round" and round_phase is not None:
         from lsc.analyzer.phase_scheduler import (
-            RoundPhase, get_profile, scan_budget_for_phase,
+            RoundPhase,
+            get_profile,
+            scan_budget_for_phase,
         )
         cfg = get_profile(valorant_profile)
         try:
@@ -2289,6 +2302,16 @@ def _expand_user_path(path: str) -> str:
     return path
 
 
+def _is_allowed_output_dir(path: str) -> bool:
+    real = os.path.realpath(os.path.expanduser(path))
+    home = os.path.realpath(os.path.expanduser("~"))
+    allowed_roots = [
+        home,
+        os.path.join(home, "LSC"),
+    ]
+    return any(real == root or real.startswith(root + os.sep) for root in allowed_roots)
+
+
 def _parse_fps(framerate: str) -> float:
     """Parse framerate string to float. Returns 0.0 for 原画/auto."""
     if not framerate or framerate == '原画':
@@ -2445,6 +2468,9 @@ def _normalize_settings_ocr_accel(settings: dict) -> dict:
 
 
 def save_settings(settings: dict):
+    output_dir = settings.get('output_dir')
+    if isinstance(output_dir, str) and not _is_allowed_output_dir(output_dir):
+        raise ValueError("导出目录不在允许范围内")
     try:
         from lsc.analyzer.ocr_accel import normalize_ocr_accel
 
@@ -2513,6 +2539,21 @@ def get_disk_usage_info():
     return {'total': total, 'used': used, 'free': free}
 
 
+_mse_push_paused: set[str] = set()
+_mse_push_paused_lock = threading.Lock()
+
+
+def _push_mse_segment(ws_server: Any, loop: asyncio.AbstractEventLoop, kind: str, room_id: str, seg: bytes) -> None:
+    """从 FFmpeg 回调线程调度 MSE 二进制广播（无 base64）。
+
+    前端 mse_backpressure=pause 时丢弃 media 段，仍读 FFmpeg 管道避免死锁。
+    init 始终推送。
+    """
+    if kind in ("mse_segment", "segment", "media") and room_id in _mse_push_paused:
+        return
+    asyncio.run_coroutine_threadsafe(ws_server.broadcast_mse(kind, room_id, seg), loop)
+
+
 def _room_to_dict(room: Any) -> dict[str, Any]:
     """将 Room 对象序列化为前端可消费的字典。"""
     stream_url = ''
@@ -2577,8 +2618,10 @@ def _rooms_list(manager: MultiRoomManager):
 
 
 def _persist_current_rooms(manager: MultiRoomManager) -> bool:
-    """将当前 manager 中的房间列表持久化到 JSON。"""
-    return save_rooms(_rooms_list(manager))
+    """将当前 manager 中的房间列表持久化到 JSON（1s 写合并）。"""
+    from persistence import schedule_save_rooms
+    schedule_save_rooms(_rooms_list(manager))
+    return True
 
 
 def _get_current_pos(room: Any) -> float:
@@ -2688,10 +2731,11 @@ def _resolve_export_range(
 def _purge_stale_analysis_jobs() -> None:
     """#99: periodic TTL-based purge of completed analysis jobs."""
     now = time.time()
-    stale = [rid for rid, job in list(_analysis_jobs.items())
-             if job.get('completed_at') and now - job['completed_at'] > _ANALYSIS_JOB_TTL]
-    for rid in stale:
-        _analysis_jobs.pop(rid, None)
+    with _analysis_jobs_lock:
+        stale = [rid for rid, job in list(_analysis_jobs.items())
+                 if job.get('completed_at') and now - job['completed_at'] > _ANALYSIS_JOB_TTL]
+        for rid in stale:
+            _analysis_jobs.pop(rid, None)
     if stale:
         _log.debug("purged %d stale analysis jobs", len(stale))
 
@@ -2932,19 +2976,11 @@ def register_room_handlers(server, bridge):
         return _preview_stream_registry().attach_shared(
             room_id,
             shared_ingest,
-            on_init_segment=lambda seg: asyncio.run_coroutine_threadsafe(
-                server.broadcast('mse_init', {
-                    'room_id': room_id,
-                    'data': base64.b64encode(seg).decode('ascii'),
-                }),
-                loop,
+            on_init_segment=lambda seg: _push_mse_segment(
+                server, loop, 'mse_init', room_id, seg
             ),
-            on_media_segment=lambda seg: asyncio.run_coroutine_threadsafe(
-                server.broadcast('mse_segment', {
-                    'room_id': room_id,
-                    'data': base64.b64encode(seg).decode('ascii'),
-                }),
-                loop,
+            on_media_segment=lambda seg: _push_mse_segment(
+                server, loop, 'mse_segment', room_id, seg
             ),
             on_error=lambda err: asyncio.run_coroutine_threadsafe(
                 _shared_mse_on_error(room_id, err, loop), loop
@@ -3026,7 +3062,7 @@ def register_room_handlers(server, bridge):
     _ws_loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {'loop': None}
 
     def _queue_rooms_update(*_args, **_kwargs):
-        """Qt 主线程槽：走 _broadcast_rooms 节流/coalesce，避免 5s medium_tick 绕过 300ms 合并。"""
+        """Qt 主线程槽：走 _broadcast_rooms 节流/coalesce，避免高频 tick 绕过 300ms 合并。"""
         loop = _ws_loop_holder.get('loop')
         if loop is not None and not loop.is_closed():
             try:
@@ -3040,6 +3076,40 @@ def register_room_handlers(server, bridge):
             'data': {'rooms': _rooms_list(manager)},
         })
 
+    def _queue_recording_size_patches(*_args, **_kwargs):
+        """中频 tick：仅对录制中房间推送增量 room_updated，避免全量 rooms_updated。"""
+        patches: list[dict[str, Any]] = []
+        for room in manager.list_rooms():
+            if not getattr(room, 'is_recording', False) and not getattr(room, 'is_reconnecting', False):
+                continue
+            room_id = getattr(room, 'room_id', '') or ''
+            if not room_id:
+                continue
+            patches.append({
+                'room_id': room_id,
+                'record_size_mb': getattr(room, 'record_size_mb', 0) or 0,
+                'record_output_path': getattr(room, 'record_output_path', '') or '',
+                'is_recording': bool(getattr(room, 'is_recording', False)),
+                'is_reconnecting': bool(getattr(room, 'is_reconnecting', False)),
+                'is_recording_starting': room_id in _recording_starting,
+                'last_error': getattr(room, 'last_error', '') or '',
+            })
+        if not patches:
+            return
+
+        def _emit() -> None:
+            for patch in patches:
+                bridge.queue_broadcast({'type': 'room_updated', 'data': patch})
+
+        loop = _ws_loop_holder.get('loop')
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(_emit)
+                return
+            except Exception as exc:
+                _log.debug("schedule room_updated patches failed: %s", exc)
+        _emit()
+
     # 连接/录制均通过后台 worker 异步完成，状态变更发生在信号发射时，
     # 必须在此补充 rooms_updated 广播，否则前端房间卡片状态永远停留在旧值。
     # 注意：MultiRoomManager 只有 room_connect_finished / batch_record_progress /
@@ -3049,8 +3119,9 @@ def register_room_handlers(server, bridge):
     manager.room_connect_finished.connect(_queue_rooms_update)
     manager.batch_record_progress.connect(_queue_rooms_update)
     manager.batch_record_finished.connect(_queue_rooms_update)
-    # 每 5 秒中频 tick 时广播 rooms_updated，让前端刷新录制文件大小
-    manager.medium_tick.connect(_queue_rooms_update)
+    # 中频 tick：增量刷新录制文件大小；低频 tick：全量 snapshot 愈合漂移
+    manager.medium_tick.connect(_queue_recording_size_patches)
+    manager.low_tick.connect(_queue_rooms_update)
 
     def _capture_ws_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop | None:
         if loop is not None and not loop.is_closed():
@@ -3131,9 +3202,10 @@ def register_room_handlers(server, bridge):
             _log.error("Push settings on connect failed: %s", exc)
 
         # 推送当前持续分析状态（如果有）
-        if _continuous_tasks:
-            active_room_id = next(iter(_continuous_tasks))
-            task = _continuous_tasks[active_room_id]
+        with _analysis_jobs_lock:
+            _ct_items = list(_continuous_tasks.items())
+        if _ct_items:
+            active_room_id, task = _ct_items[0]
             phase = 'finalizing' if task.get('finalizing') else ('completed' if task.get('completed') else 'running')
             scan_range = task.get('scan_range', (0.0, 0.0))
             await websocket.send(json.dumps({
@@ -3163,7 +3235,7 @@ def register_room_handlers(server, bridge):
                 from lsc.core.services.mse_streamer import _check_nvenc
                 _check_nvenc()
             except Exception as exc:
-                _log.debug("操作异常（已忽略）: %s", exc)
+                _log.warning("NVENC precheck failed: %s", exc)
         asyncio.get_running_loop().run_in_executor(None, _precheck_nvenc)
 
     @server.on('get_rooms')
@@ -3876,6 +3948,9 @@ def register_room_handlers(server, bridge):
         if not isinstance(data.get('output_dir'), str):
             _log.warning("save_settings 校验失败: output_dir 不是字符串")
             return {'success': False, 'error': 'output_dir 必须是字符串'}
+        if not _is_allowed_output_dir(data.get('output_dir', '')):
+            _log.warning("save_settings 校验失败: output_dir 不在允许范围内")
+            return {'success': False, 'error': '导出目录不在允许范围内'}
         try:
             save_settings(data)
         except OSError as exc:
@@ -4057,7 +4132,7 @@ def register_room_handlers(server, bridge):
             )
             if not result.success:
                 def _clear_on_align_fail():
-                    for rid in audio_map.keys():
+                    for rid in audio_map:
                         room = manager.get_room(rid)
                         if room is None:
                             continue
@@ -4097,7 +4172,7 @@ def register_room_handlers(server, bridge):
                 )
 
                 def _clear_stale_align_groups():
-                    for rid in offsets.keys():
+                    for rid in offsets:
                         room = manager.get_room(rid)
                         if room is None:
                             continue
@@ -4467,19 +4542,11 @@ def register_room_handlers(server, bridge):
                         shared_handle = _preview_stream_registry().attach_shared(
                             room_id,
                             shared_ingest,
-                            on_init_segment=lambda seg: asyncio.run_coroutine_threadsafe(
-                                srv.broadcast('mse_init', {
-                                    'room_id': room_id,
-                                    'data': base64.b64encode(seg).decode('ascii'),
-                                }),
-                                loop,
+                            on_init_segment=lambda seg: _push_mse_segment(
+                                srv, loop, 'mse_init', room_id, seg
                             ),
-                            on_media_segment=lambda seg: asyncio.run_coroutine_threadsafe(
-                                srv.broadcast('mse_segment', {
-                                    'room_id': room_id,
-                                    'data': base64.b64encode(seg).decode('ascii'),
-                                }),
-                                loop,
+                            on_media_segment=lambda seg: _push_mse_segment(
+                                srv, loop, 'mse_segment', room_id, seg
                             ),
                             on_error=lambda err: asyncio.run_coroutine_threadsafe(
                                 _shared_mse_on_error(room_id, err, loop), loop
@@ -4714,7 +4781,6 @@ def register_room_handlers(server, bridge):
 
                 # 提取流 headers（B站/虎牙/斗鱼 CDN 强制检查 Referer）
                 preview_headers = snapshot.get('headers') or {}
-                use_nvenc = preview_params['use_nvenc']
                 video_bitrate = preview_params['video_bitrate']
                 crf_value = preview_params['crf_value']
 
@@ -4929,7 +4995,6 @@ def register_room_handlers(server, bridge):
                         r_width = int(preview_params.get('width') or 0)
                         r_height = int(preview_params.get('height') or 0)
                         r_fps = int(preview_params.get('fps') or 0)
-                        use_nvenc = bool(preview_params.get('use_nvenc'))
                         r_bitrate = preview_params.get('video_bitrate')
                         r_crf = preview_params.get('crf_value')
 
@@ -4959,19 +5024,11 @@ def register_room_handlers(server, bridge):
                                     headers=r_headers or None,
                                     video_bitrate=r_bitrate,
                                     crf_value=r_crf,
-                                    on_init_segment=lambda seg, _room_id=room_id: asyncio.run_coroutine_threadsafe(
-                                        srv.broadcast('mse_init', {
-                                            'room_id': _room_id,
-                                            'data': base64.b64encode(seg).decode('ascii'),
-                                        }),
-                                        loop,
+                                    on_init_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                                        srv, loop, 'mse_init', _room_id, seg
                                     ),
-                                    on_media_segment=lambda seg, _room_id=room_id: asyncio.run_coroutine_threadsafe(
-                                        srv.broadcast('mse_segment', {
-                                            'room_id': _room_id,
-                                            'data': base64.b64encode(seg).decode('ascii'),
-                                        }),
-                                        loop,
+                                    on_media_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                                        srv, loop, 'mse_segment', _room_id, seg
                                     ),
                                     on_error=lambda e, _room_id=room_id: asyncio.run_coroutine_threadsafe(
                                         _on_mse_error(_room_id, e, loop), loop
@@ -5054,19 +5111,11 @@ def register_room_handlers(server, bridge):
                             video_bitrate=video_bitrate,
                             crf_value=crf_value,
                             fps=target_fps,
-                            on_init_segment=lambda seg: asyncio.run_coroutine_threadsafe(
-                                srv.broadcast('mse_init', {
-                                    'room_id': room_id,
-                                    'data': base64.b64encode(seg).decode('ascii'),
-                                }),
-                                loop,
+                            on_init_segment=lambda seg: _push_mse_segment(
+                                srv, loop, 'mse_init', room_id, seg
                             ),
-                            on_media_segment=lambda seg: asyncio.run_coroutine_threadsafe(
-                                srv.broadcast('mse_segment', {
-                                    'room_id': room_id,
-                                    'data': base64.b64encode(seg).decode('ascii'),
-                                }),
-                                loop,
+                            on_media_segment=lambda seg: _push_mse_segment(
+                                srv, loop, 'mse_segment', room_id, seg
                             ),
                             on_error=lambda err: asyncio.run_coroutine_threadsafe(
                                 _on_mse_error(room_id, err, loop), loop
@@ -5168,6 +5217,7 @@ def register_room_handlers(server, bridge):
 
             await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_disable))
             _mse_reconnect_state.pop(room_id, None)
+            _clear_mse_push_paused(room_id)
             _broadcast_rooms()
             _log.info("MSE 预览已停止: room_id=%s", room_id)
             await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'idle'})
@@ -5192,6 +5242,27 @@ def register_room_handlers(server, bridge):
         ok = streamer.replay_init()
         _log.debug("request_mse_init: room_id=%s, ok=%s", room_id, ok)
         return {'success': ok, 'room_id': room_id, 'note': 'init replayed' if ok else 'init not ready yet'}
+
+    @server.on('mse_backpressure')
+    async def handle_mse_backpressure(data):
+        """前端 MSE pending 过高时通知后端暂停推送 media 段。
+
+        data: { room_id, state: 'pause'|'resume', pending?: number }
+        """
+        room_id = (data or {}).get('room_id') or ''
+        state = (data or {}).get('state') or ''
+        if not room_id or state not in ('pause', 'resume'):
+            return {'success': False, 'error': 'room_id and state=pause|resume required'}
+        with _mse_push_paused_lock:
+            if state == 'pause':
+                _mse_push_paused.add(room_id)
+            else:
+                _mse_push_paused.discard(room_id)
+        _log.debug(
+            "mse_backpressure: room=%s state=%s pending=%s paused=%s",
+            room_id, state, (data or {}).get('pending'), room_id in _mse_push_paused,
+        )
+        return {'success': True, 'room_id': room_id, 'state': state}
 
     def _broadcast_analysis_progress(room_id: str, stage: str, progress: float, detail: str) -> None:
         """广播 AI 分析进度到前端。
@@ -5225,9 +5296,6 @@ def register_room_handlers(server, bridge):
         room_id = data.get('room_id')
         threshold = _safe_float(data.get('threshold', 0.3), 0.3)
         mode = data.get('mode', 'scene')  # 'scene' | 'ai' | 'combined'
-        whisper_model = data.get('whisper_model', 'auto')  # 'auto'/'tiny'/'base'/'small'/'medium'
-        weights = data.get('weights', {})  # {'audio': 0.45, 'visual': 0.35, 'scene': 0.20}
-        absolute_threshold = _safe_float(data.get('absolute_threshold', 0.15), 0.15)
         game = data.get('game', 'valorant')  # 'valorant' | 'generic'
 
         if not room_id:
@@ -5242,18 +5310,22 @@ def register_room_handlers(server, bridge):
                 return {'success': False, 'error': '录制文件不存在'}
 
             video_path = room.record_output_path
-            _analysis_jobs[room_id] = {"progress": 0.0, "highlights": [], "mode": mode, "cancelled": False}
+            t0 = time.monotonic()
+            with _analysis_jobs_lock:
+                _analysis_jobs[room_id] = {"progress": 0.0, "highlights": [], "mode": mode, "cancelled": False}
 
             # 进度回调与取消检查（scene 和 AI 模式共用，P0-4）
             def _progress_cb(stage, progress, detail):
-                if _analysis_jobs.get(room_id, {}).get('cancelled'):
-                    return
-                _analysis_jobs[room_id]['progress'] = progress / 100.0
-                _analysis_jobs[room_id]['stage'] = stage
+                with _analysis_jobs_lock:
+                    if _analysis_jobs.get(room_id, {}).get('cancelled'):
+                        return
+                    _analysis_jobs[room_id]['progress'] = progress / 100.0
+                    _analysis_jobs[room_id]['stage'] = stage
                 _broadcast_analysis_progress(room_id, stage, progress, detail)
 
             def _cancel_check():
-                return _analysis_jobs.get(room_id, {}).get('cancelled', False)
+                with _analysis_jobs_lock:
+                    return _analysis_jobs.get(room_id, {}).get('cancelled', False)
 
             highlights = _analyze_scene_or_rounds(
                 video_path, game=game, threshold=threshold,
@@ -5268,14 +5340,19 @@ def register_room_handlers(server, bridge):
                 _h.setdefault("speech_score", 0.0)
                 _h.setdefault("visual_score", 0.0)
                 _h.setdefault("transcript", "")
-            _analysis_jobs[room_id] = {
-                "progress": 1.0,
-                "highlights": highlights,
-                "mode": mode,
-                "completed_at": time.time(),
-            }
+            with _analysis_jobs_lock:
+                _analysis_jobs[room_id] = {
+                    "progress": 1.0,
+                    "highlights": highlights,
+                    "mode": mode,
+                    "completed_at": time.time(),
+                }
             # P0-3: 落盘到录制文件同目录 {basename}.analysis.json（重启不丢失）
-            save_analysis_results(video_path, room_id, mode, highlights)
+            analysis_time = time.monotonic() - t0
+            save_analysis_results(
+                video_path, room_id, mode, highlights,
+                analysis_time_sec=analysis_time,
+            )
             _log.info("分析完成: room_id=%s, mode=%s, highlights=%d", room_id, mode, len(highlights))
             return {'success': True, 'mode': mode, 'highlights': highlights}
 
@@ -5287,7 +5364,8 @@ def register_room_handlers(server, bridge):
                 timeout=_timeout,
             )
         except asyncio.TimeoutError:
-            _analysis_jobs.setdefault(room_id, {})['cancelled'] = True
+            with _analysis_jobs_lock:
+                _analysis_jobs.setdefault(room_id, {})['cancelled'] = True
             _log.error("分析超时（%ss），room_id=%s, mode=%s", _timeout, room_id, mode)
             return {
                 'success': False,
@@ -5313,7 +5391,6 @@ def register_room_handlers(server, bridge):
         main_room_id = data.get('main_room_id')
         target_room_ids = data.get('target_room_ids') or ([main_room_id] if main_room_id else [])
         mode = data.get('mode', 'scene')
-        whisper_model = data.get('whisper_model', 'auto')
         weights = data.get('weights', {})
         threshold = _safe_float(data.get('threshold', 0.3), 0.3)
         game = data.get('game', 'valorant')  # 'valorant' | 'generic'
@@ -5337,17 +5414,21 @@ def register_room_handlers(server, bridge):
 
             # 3. 高光分析主房间（复用 scene/AI 分析逻辑）
             video_path = main_room.record_output_path
-            _analysis_jobs[main_room_id] = {"progress": 0.0, "highlights": [], "mode": mode, "cancelled": False}
+            t0 = time.monotonic()
+            with _analysis_jobs_lock:
+                _analysis_jobs[main_room_id] = {"progress": 0.0, "highlights": [], "mode": mode, "cancelled": False}
 
             def _progress_cb(stage, progress, detail):
-                if _analysis_jobs.get(main_room_id, {}).get('cancelled'):
-                    return
-                _analysis_jobs[main_room_id]['progress'] = progress / 100.0
-                _analysis_jobs[main_room_id]['stage'] = stage
+                with _analysis_jobs_lock:
+                    if _analysis_jobs.get(main_room_id, {}).get('cancelled'):
+                        return
+                    _analysis_jobs[main_room_id]['progress'] = progress / 100.0
+                    _analysis_jobs[main_room_id]['stage'] = stage
                 _broadcast_analysis_progress(main_room_id, stage, progress, detail)
 
             def _cancel_check():
-                return _analysis_jobs.get(main_room_id, {}).get('cancelled', False)
+                with _analysis_jobs_lock:
+                    return _analysis_jobs.get(main_room_id, {}).get('cancelled', False)
 
             highlights = _analyze_scene_or_rounds(
                 video_path, game=game, threshold=threshold,
@@ -5364,14 +5445,16 @@ def register_room_handlers(server, bridge):
                 _h.setdefault("transcript", "")
 
             # 落盘分析结果（P0-3）
+            analysis_time = time.monotonic() - t0
             save_analysis_results(
                 video_path, main_room_id, mode, highlights,
                 analysis_time_sec=analysis_time,
                 weights=weights if weights else None,
             )
-            _analysis_jobs[main_room_id] = {
-                "progress": 1.0, "highlights": highlights, "mode": mode, "completed_at": time.time(),
-            }
+            with _analysis_jobs_lock:
+                _analysis_jobs[main_room_id] = {
+                    "progress": 1.0, "highlights": highlights, "mode": mode, "completed_at": time.time(),
+                }
 
             if not highlights:
                 return {'success': False, 'error': '未检测到高光片段', 'highlights': []}
@@ -5412,7 +5495,8 @@ def register_room_handlers(server, bridge):
                 timeout=_timeout,
             )
         except asyncio.TimeoutError:
-            _analysis_jobs.setdefault(main_room_id, {})['cancelled'] = True
+            with _analysis_jobs_lock:
+                _analysis_jobs.setdefault(main_room_id, {})['cancelled'] = True
             _log.error("分析导出超时（%ss），main_room=%s, mode=%s", _timeout, main_room_id, mode)
             return {
                 'success': False,
@@ -5426,10 +5510,11 @@ def register_room_handlers(server, bridge):
         room_id = data.get('room_id')
         if not room_id:
             return {'error': 'room_id is required'}
-        if room_id in _analysis_jobs:
-            _analysis_jobs[room_id]['cancelled'] = True
-            _log.info("取消分析: room_id=%s", room_id)
-            return {'success': True, 'room_id': room_id}
+        with _analysis_jobs_lock:
+            if room_id in _analysis_jobs:
+                _analysis_jobs[room_id]['cancelled'] = True
+                _log.info("取消分析: room_id=%s", room_id)
+                return {'success': True, 'room_id': room_id}
         return {'success': False, 'error': '没有正在进行的分析任务'}
 
     @server.on('get_analysis_results')
@@ -5441,13 +5526,16 @@ def register_room_handlers(server, bridge):
         _log.debug("获取分析结果: room_id=%s", room_id)
         # 清理过期的已完成分析任务，防止 _analysis_jobs 字典无限增长
         now = time.time()
-        stale_keys = [
-            rid for rid, job in _analysis_jobs.items()
-            if job.get('completed_at') and now - job['completed_at'] > _ANALYSIS_JOB_TTL
-        ]
-        for rid in stale_keys:
-            _analysis_jobs.pop(rid, None)
-        job = _analysis_jobs.get(room_id)
+        with _analysis_jobs_lock:
+            stale_keys = [
+                rid for rid, job in _analysis_jobs.items()
+                if job.get('completed_at') and now - job['completed_at'] > _ANALYSIS_JOB_TTL
+            ]
+            for rid in stale_keys:
+                _analysis_jobs.pop(rid, None)
+            job = _analysis_jobs.get(room_id)
+            if job is not None:
+                job = dict(job)
         if job is None:
             # P0-3: 内存未命中（重启/TTL 过期），回退读录制文件同目录的分析结果 JSON
             room = manager.get_room(room_id)
@@ -5858,19 +5946,21 @@ def register_room_handlers(server, bridge):
                 continue
             try:
                 async with _export_semaphore:
-                    _export_in_flight += 1
+                    with _export_stats_lock:
+                        _export_in_flight += 1
                     try:
                         await _process_export_job(job)
                     finally:
-                        _export_in_flight -= 1
+                        with _export_stats_lock:
+                            _export_in_flight -= 1
             except Exception as exc:
-                _log.error("导出队列异常: %s", exc, exc_info=True)
+                _log.error("导出队列异常：%s", exc, exc_info=True)
                 if job_id:
                     with _export_jobs_lock:
                         export_jobs.pop(job_id, None)
                     room_id = job.get('room_id', '')
                     asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
-                        'room_id': room_id, 'job_id': job_id, 'error': f'导出异常: {exc}',
+                        'room_id': room_id, 'job_id': job_id, 'error': f'导出异常：{exc}',
                     }), asyncio.get_running_loop())
             finally:
                 _export_queue.task_done()
@@ -6059,10 +6149,14 @@ def register_room_handlers(server, bridge):
         loop = asyncio.get_running_loop()
         _log.info(f"持续分析 Worker 启动: room_id={room_id}, mode={mode}")
         try:
-            while not _continuous_tasks.get(room_id, {}).get('cancelled'):
+            while True:
+                with _analysis_jobs_lock:
+                    if _continuous_tasks.get(room_id, {}).get('cancelled'):
+                        break
                 # 等待主循环 kick 或上一次结果被消费
                 await asyncio.sleep(0.5)
-                task_state = _continuous_tasks.get(room_id)
+                with _analysis_jobs_lock:
+                    task_state = _continuous_tasks.get(room_id)
                 if not task_state or task_state.get('cancelled'):
                     break
                 if not task_state.get('scan_requested'):
@@ -6080,8 +6174,9 @@ def register_room_handlers(server, bridge):
 
                 _vp = video_path  # capture for closure
                 def _scan_cancel_check():
-                    st = _continuous_tasks.get(room_id, {})
-                    return bool(st.get('cancelled') or st.get('scan_abort'))
+                    with _analysis_jobs_lock:
+                        st = _continuous_tasks.get(room_id, {})
+                        return bool(st.get('cancelled') or st.get('scan_abort'))
 
                 def _do_scan(_vp=_vp, _dur=current_dur, _ocr=refine_with_ocr, _range=scan_range, _mode=mode):
                     from lsc.config import load_config as _load_cfg_r
@@ -6136,6 +6231,7 @@ def register_room_handlers(server, bridge):
                     runtime_state = task_state.get('hybrid_runtime_state') or {}
                     task_state['model_version'] = runtime_state.get('model_version')
                     task_state['provider'] = runtime_state.get('provider')
+                    task_state['provider_warning'] = runtime_state.get('provider_warning')
                     completed_dur = (
                         float(scan_range[1])
                         if game == 'valorant' and mode == 'valorant_round'
@@ -6260,11 +6356,14 @@ def register_room_handlers(server, bridge):
             end_by = str(latest.get('end_by', ''))
             tail_by = str(latest.get('tail_by', ''))
             phase_val = str(latest.get('phase', ''))
-            # has_start: OCR 可信起点
-            if start_by in ('ocr_buy_exit', 'ocr') or latest.get('ocr_confirmed'):
+            # has_start: OCR 或 hybrid 模型可信起点
+            if (
+                start_by in ('ocr_buy_exit', 'ocr', 'model_buy_exit')
+                or latest.get('ocr_confirmed')
+            ):
                 _signals['has_start'] = True
-            # has_end: OCR 可信终点
-            if end_by in ('ocr_result', 'next_buy'):
+            # has_end: OCR 或 hybrid 模型可信终点
+            if end_by in ('ocr_result', 'next_buy', 'model_result', 'model_score'):
                 _signals['has_end'] = True
             # next_buy_seen: 终点由下一买枪确定
             if end_by == 'next_buy':
@@ -6273,8 +6372,11 @@ def register_room_handlers(server, bridge):
             if tail_by == 'chime':
                 _signals['chime'] = True
                 _signals['energy_collapse'] = True
-            # left_buy_ocr: 最新回合已超越买枪期（phase != pending 且 start_by=ocr）
-            if start_by in ('ocr_buy_exit', 'ocr') and phase_val not in ('pending', ''):
+            # left_buy: 最新回合已超越买枪期（OCR / hybrid 起点）
+            if (
+                start_by in ('ocr_buy_exit', 'ocr', 'model_buy_exit')
+                and phase_val not in ('pending', '')
+            ):
                 _signals['left_buy_ocr'] = True
             # 真实 RMS 信号（round_detector 写入）；缺省时不回退到 score
             if latest.get('energy_rise') is True:
@@ -6284,43 +6386,44 @@ def register_room_handlers(server, bridge):
             return _signals
 
         # 初始化任务状态
-        if room_id not in _continuous_tasks:
-            _continuous_tasks[room_id] = {}
-        # 规范化 valorant_profile（pov/broadcast 等旧别名一律映射为统一档）
-        _profile_name = 'valorant'
-        if _valorant_incremental_rounds:
-            from lsc.analyzer.phase_scheduler import get_profile as _get_profile_init
-            _profile_name = _get_profile_init(valorant_profile).name
-        _continuous_tasks[room_id].update({
-            'cancelled': False,
-            'scan_requested': False,
-            'scan_running': False,
-            'scan_done_event': scan_done_event,
-            'video_path': '',
-            'current_dur': 0.0,
-            'refine_with_ocr': False,
-            'scan_range': (0.0, 0.0),
-            'scan_timeout': 120,
-            'full_rescan': True,
-            'last_analyzed': 0.0,
-            'highlights': [],
-            'result_ready': False,
-            'shadow_mode': _valorant_vision_shadow_enabled() and _valorant_incremental_rounds,
-            'shadow_rounds_detected': 0,
-            'shadow_listable_rounds': 0,
-            'shadow_vision_confirmed': 0,
-            'hybrid_runtime_state': {},
-            # 相位调度状态
-            'round_phase': 'unknown',
-            'round_phase_detail': '',
-            'round_phase_entered_at': time.monotonic(),
-            'valorant_profile': _profile_name,
-            'pending_start': None,
-            'phase_anchor_sec': 0.0,
-            'predicted_wake_at': None,
-            'predicted_phase': None,
-            'prediction_detail': '',
-        })
+        with _analysis_jobs_lock:
+            if room_id not in _continuous_tasks:
+                _continuous_tasks[room_id] = {}
+            # 规范化 valorant_profile（pov/broadcast 等旧别名一律映射为统一档）
+            _profile_name = 'valorant'
+            if _valorant_incremental_rounds:
+                from lsc.analyzer.phase_scheduler import get_profile as _get_profile_init
+                _profile_name = _get_profile_init(valorant_profile).name
+            _continuous_tasks[room_id].update({
+                'cancelled': False,
+                'scan_requested': False,
+                'scan_running': False,
+                'scan_done_event': scan_done_event,
+                'video_path': '',
+                'current_dur': 0.0,
+                'refine_with_ocr': False,
+                'scan_range': (0.0, 0.0),
+                'scan_timeout': 120,
+                'full_rescan': True,
+                'last_analyzed': 0.0,
+                'highlights': [],
+                'result_ready': False,
+                'shadow_mode': _valorant_vision_shadow_enabled() and _valorant_incremental_rounds,
+                'shadow_rounds_detected': 0,
+                'shadow_listable_rounds': 0,
+                'shadow_vision_confirmed': 0,
+                'hybrid_runtime_state': {},
+                # 相位调度状态
+                'round_phase': 'unknown',
+                'round_phase_detail': '',
+                'round_phase_entered_at': time.monotonic(),
+                'valorant_profile': _profile_name,
+                'pending_start': None,
+                'phase_anchor_sec': 0.0,
+                'predicted_wake_at': None,
+                'predicted_phase': None,
+                'prediction_detail': '',
+            })
 
         # 启动后台 Worker
         _worker_task = asyncio.create_task(
@@ -6331,21 +6434,26 @@ def register_room_handlers(server, bridge):
             ),
             name=f"continuous-worker-{room_id[:8]}",
         )
-        if room_id in _continuous_tasks:
-            _continuous_tasks[room_id]['worker_task'] = _worker_task
+        with _analysis_jobs_lock:
+            if room_id in _continuous_tasks:
+                _continuous_tasks[room_id]['worker_task'] = _worker_task
 
         _log.info("持续分析启动: room_id=%s, mode=%s, game=%s, interval=%ds, 增量回合窗口=%s",
                   room_id, mode, game, interval, _valorant_incremental_rounds)
 
         _scan_counter = 0  # tick 计数器，用于状态机与局部 OCR 预算
         try:
-            while not _continuous_tasks.get(room_id, {}).get('cancelled'):
+            while True:
+                with _analysis_jobs_lock:
+                    if _continuous_tasks.get(room_id, {}).get('cancelled'):
+                        break
                 pressure = get_resource_pressure()
                 interval_base = 5 if _valorant_incremental_rounds else max(interval, 20)
                 effective_interval, skip_for_pressure = _continuous_effective_interval(
                     interval_base, last_analyzed, _valorant_incremental_rounds, pressure,
                 )
-                state = _continuous_tasks.get(room_id)
+                with _analysis_jobs_lock:
+                    state = _continuous_tasks.get(room_id)
                 if state:
                     state['resource_pressure'] = pressure
                     state['effective_interval'] = effective_interval
@@ -6354,7 +6462,8 @@ def register_room_handlers(server, bridge):
                 _sleep_time = float(effective_interval)
                 if last_analyzed <= 0.0:
                     _sleep_time = min(_sleep_time, 10.0)
-                state = _continuous_tasks.get(room_id)
+                with _analysis_jobs_lock:
+                    state = _continuous_tasks.get(room_id)
                 if state and (state.get('scan_running') or state.get('scan_requested')):
                     _sleep_time = min(_sleep_time, 2.0)
 
@@ -6368,7 +6477,8 @@ def register_room_handlers(server, bridge):
                     except asyncio.CancelledError:
                         break
 
-                state = _continuous_tasks.get(room_id)
+                with _analysis_jobs_lock:
+                    state = _continuous_tasks.get(room_id)
                 if not state or state.get('cancelled'):
                     if state:
                         state['status'] = 'stopping'
@@ -6484,27 +6594,28 @@ def register_room_handlers(server, bridge):
                     last_consumed_at = worker_completed_at
                     scan_result['error'] = None
                     terminal_model_error = _is_model_contract_error(worker_error)
-                    if room_id in _continuous_tasks:
-                        _continuous_tasks[room_id]['last_scan_error'] = worker_error
-                        if terminal_model_error:
-                            _continuous_tasks[room_id]['analysis_stage'] = '视觉模型不可用'
-                            _continuous_tasks[room_id]['completed'] = True
-                            _continuous_tasks[room_id]['cancelled'] = True
-                        # 非收尾 OCR 超时：降级纯音频 + 缩小追赶，避免立刻再开 600s OCR
-                        if (
-                            _is_timeout_scan_error(worker_error)
-                            and not (_finalize_started or _finalize_pending)
-                        ):
-                            _apply_scan_timeout_backoff(_continuous_tasks[room_id])
-                            _log.warning(
-                                "持续分析 OCR 超时降级: room_id=%s, degrade_ticks=%s, max_catchup=%.0fs",
-                                room_id,
-                                _continuous_tasks[room_id].get("ocr_degraded_remaining"),
-                                _continuous_tasks[room_id].get(
-                                    "post_timeout_max_catchup_sec",
-                                    _POST_TIMEOUT_MAX_CATCHUP_SEC,
-                                ),
-                            )
+                    with _analysis_jobs_lock:
+                        if room_id in _continuous_tasks:
+                            _continuous_tasks[room_id]['last_scan_error'] = worker_error
+                            if terminal_model_error:
+                                _continuous_tasks[room_id]['analysis_stage'] = '视觉模型不可用'
+                                _continuous_tasks[room_id]['completed'] = True
+                                _continuous_tasks[room_id]['cancelled'] = True
+                            # 非收尾 OCR 超时：降级纯音频 + 缩小追赶，避免立刻再开 600s OCR
+                            if (
+                                _is_timeout_scan_error(worker_error)
+                                and not (_finalize_started or _finalize_pending)
+                            ):
+                                _apply_scan_timeout_backoff(_continuous_tasks[room_id])
+                                _log.warning(
+                                    "持续分析 OCR 超时降级: room_id=%s, degrade_ticks=%s, max_catchup=%.0fs",
+                                    room_id,
+                                    _continuous_tasks[room_id].get("ocr_degraded_remaining"),
+                                    _continuous_tasks[room_id].get(
+                                        "post_timeout_max_catchup_sec",
+                                        _POST_TIMEOUT_MAX_CATCHUP_SEC,
+                                    ),
+                                )
                     if terminal_model_error:
                         bridge.queue_broadcast({
                             'type': 'continuous_analysis_complete',
@@ -6519,9 +6630,10 @@ def register_room_handlers(server, bridge):
                         if _finalize_failures < _finalize_max_attempts:
                             _finalize_started = False
                             _finalize_pending = True
-                            if room_id in _continuous_tasks:
-                                _continuous_tasks[room_id]['finalizing'] = False
-                                _continuous_tasks[room_id]['analysis_stage'] = '收尾中'
+                            with _analysis_jobs_lock:
+                                if room_id in _continuous_tasks:
+                                    _continuous_tasks[room_id]['finalizing'] = False
+                                    _continuous_tasks[room_id]['analysis_stage'] = '收尾中'
                             _log.warning(
                                 "持续分析收尾失败，将重试 (%d/%d): room_id=%s, err=%s",
                                 _finalize_failures,
@@ -6539,11 +6651,12 @@ def register_room_handlers(server, bridge):
                                 worker_error,
                                 len(all_highlights),
                             )
-                            if room_id in _continuous_tasks:
-                                _continuous_tasks[room_id]['finalizing'] = False
-                                _continuous_tasks[room_id]['analysis_stage'] = '收尾失败'
-                                _continuous_tasks[room_id]['completed'] = True
-                                _continuous_tasks[room_id]['cancelled'] = True
+                            with _analysis_jobs_lock:
+                                if room_id in _continuous_tasks:
+                                    _continuous_tasks[room_id]['finalizing'] = False
+                                    _continuous_tasks[room_id]['analysis_stage'] = '收尾失败'
+                                    _continuous_tasks[room_id]['completed'] = True
+                                    _continuous_tasks[room_id]['cancelled'] = True
                             bridge.queue_broadcast({
                                 'type': 'continuous_analysis_complete',
                                 'data': {
@@ -6560,9 +6673,10 @@ def register_room_handlers(server, bridge):
                         )
                 elif can_consume:
                     last_consumed_at = worker_completed_at
-                    if room_id in _continuous_tasks:
-                        _continuous_tasks[room_id]['last_scan_error'] = None
-                        _note_successful_scan_after_degrade(_continuous_tasks[room_id])
+                    with _analysis_jobs_lock:
+                        if room_id in _continuous_tasks:
+                            _continuous_tasks[room_id]['last_scan_error'] = None
+                            _note_successful_scan_after_degrade(_continuous_tasks[room_id])
                     new_hl = _cleanup_segments(list(worker_result))
                     for h in new_hl:
                         h.setdefault("reason", "回合战斗阶段")
@@ -6685,26 +6799,27 @@ def register_room_handlers(server, bridge):
                     await _flush_deferred_exports(force=_finalize_started)
 
                     last_analyzed = worker_dur
-                    if room_id in _continuous_tasks:
-                        _continuous_tasks[room_id]['last_analyzed'] = last_analyzed
-                        _continuous_tasks[room_id]['recorded_duration'] = max(recorded_duration, worker_dur)
-                        if worker_result:
-                            _first_hybrid = next(
-                                (h for h in worker_result if h.get("model_version")),
-                                None,
+                    with _analysis_jobs_lock:
+                        if room_id in _continuous_tasks:
+                            _continuous_tasks[room_id]['last_analyzed'] = last_analyzed
+                            _continuous_tasks[room_id]['recorded_duration'] = max(recorded_duration, worker_dur)
+                            if worker_result:
+                                _first_hybrid = next(
+                                    (h for h in worker_result if h.get("model_version")),
+                                    None,
+                                )
+                                if _first_hybrid:
+                                    _continuous_tasks[room_id]['model_version'] = _first_hybrid.get("model_version")
+                            confirmed_total = sum(
+                                1 for item in all_highlights
+                                if _is_auto_exportable_valorant_round(item)
                             )
-                            if _first_hybrid:
-                                _continuous_tasks[room_id]['model_version'] = _first_hybrid.get("model_version")
-                        confirmed_total = sum(
-                            1 for item in all_highlights
-                            if _is_auto_exportable_valorant_round(item)
-                        )
-                        _continuous_tasks[room_id]['confirmed_rounds'] = confirmed_total
-                        _continuous_tasks[room_id]['pending_rounds'] = max(0, len(all_highlights) - confirmed_total)
-                        _continuous_tasks[room_id]['analysis_stage'] = '收尾中' if _finalize_started else '分析中'
-                        _continuous_tasks[room_id]['highlights'] = all_highlights
-                        _continuous_tasks[room_id]['result_ready'] = False
-                        _continuous_tasks[room_id]['full_rescan'] = False
+                            _continuous_tasks[room_id]['confirmed_rounds'] = confirmed_total
+                            _continuous_tasks[room_id]['pending_rounds'] = max(0, len(all_highlights) - confirmed_total)
+                            _continuous_tasks[room_id]['analysis_stage'] = '收尾中' if _finalize_started else '分析中'
+                            _continuous_tasks[room_id]['highlights'] = all_highlights
+                            _continuous_tasks[room_id]['result_ready'] = False
+                            _continuous_tasks[room_id]['full_rescan'] = False
 
                     _log.info("持续分析增量: room_id=%s, mode=%s, 新增 %d 段, 累计 %d 段 (已分析到 %.1fs)",
                               room_id, mode, len(new_hl), len(all_highlights), worker_dur)
@@ -6720,12 +6835,14 @@ def register_room_handlers(server, bridge):
                                 'total_highlights': len(all_highlights),
                             },
                         })
-                        if room_id in _continuous_tasks:
-                            _continuous_tasks[room_id]['completed'] = True
-                            _continuous_tasks[room_id]['finalizing'] = False
-                            _continuous_tasks[room_id]['cancelled'] = True
+                        with _analysis_jobs_lock:
+                            if room_id in _continuous_tasks:
+                                _continuous_tasks[room_id]['completed'] = True
+                                _continuous_tasks[room_id]['finalizing'] = False
+                                _continuous_tasks[room_id]['cancelled'] = True
 
-                state = _continuous_tasks.get(room_id)
+                with _analysis_jobs_lock:
+                    state = _continuous_tasks.get(room_id)
                 if not state or state.get('cancelled'):
                     if state:
                         state['status'] = 'stopping'
@@ -6742,8 +6859,9 @@ def register_room_handlers(server, bridge):
                     if _finalize_pending and not _finalize_started:
                         should_kick = True
                         _finalize_started = True
-                        if room_id in _continuous_tasks:
-                            _continuous_tasks[room_id]['finalizing'] = True
+                        with _analysis_jobs_lock:
+                            if room_id in _continuous_tasks:
+                                _continuous_tasks[room_id]['finalizing'] = True
                     elif _valorant_incremental_rounds:
                         # 文件时长可能滞后于墙钟录制时长；用二者较大值决定是否 kick
                         kick_dur = max(current_dur, float(state.get('recorded_duration', 0.0) or 0.0))
@@ -6759,10 +6877,20 @@ def register_room_handlers(server, bridge):
                         _pred = None
                         if _valorant_incremental_rounds and not (_finalize_started or _finalize_pending):
                             from lsc.analyzer.phase_scheduler import (
-                                RoundPhase as _RP, get_profile as _gp,
-                                next_round_phase as _nrp, PHASE_DETAIL_ZH as _PDZH,
+                                PHASE_DETAIL_ZH as _PDZH,
                             )
-                            from lsc.analyzer.round_clock_predictor import predict_round_clock as _prc
+                            from lsc.analyzer.phase_scheduler import (
+                                RoundPhase as _RP,
+                            )
+                            from lsc.analyzer.phase_scheduler import (
+                                get_profile as _gp,
+                            )
+                            from lsc.analyzer.phase_scheduler import (
+                                next_round_phase as _nrp,
+                            )
+                            from lsc.analyzer.round_clock_predictor import (
+                                predict_round_clock as _prc,
+                            )
                             _cfg = _gp(state.get('valorant_profile'))
                             try:
                                 _cur_phase = _RP(state.get('round_phase', 'unknown'))
@@ -6810,14 +6938,17 @@ def register_room_handlers(server, bridge):
                             # pending_start: 有起点未终点（用正赛起点，不含买枪）
                             if _transition.just_confirmed:
                                 state['pending_start'] = None
-                            elif _signals.get('has_start') and not _signals.get('has_end'):
-                                if all_highlights:
-                                    _ps = (
-                                        all_highlights[-1].get('round_start_sec')
-                                        or all_highlights[-1].get('ocr_start')
-                                        or all_highlights[-1].get('start', 0.0)
-                                    )
-                                    state['pending_start'] = float(_ps)
+                            elif (
+                                _signals.get('has_start')
+                                and not _signals.get('has_end')
+                                and all_highlights
+                            ):
+                                _ps = (
+                                    all_highlights[-1].get('round_start_sec')
+                                    or all_highlights[-1].get('ocr_start')
+                                    or all_highlights[-1].get('start', 0.0)
+                                )
+                                state['pending_start'] = float(_ps)
                             # 回合时钟预测（只调扫描密度，不入列）
                             _anchor = float(state.get('phase_anchor_sec') or 0.0)
                             _combat_start = None
@@ -6923,7 +7054,12 @@ def register_room_handlers(server, bridge):
                             _budget_ocr_iv = 2.0
                         if _valorant_incremental_rounds and _rp is not None:
                             from lsc.analyzer.phase_scheduler import (
-                                RoundPhase as _RP2, get_profile as _gp2,
+                                RoundPhase as _RP2,
+                            )
+                            from lsc.analyzer.phase_scheduler import (
+                                get_profile as _gp2,
+                            )
+                            from lsc.analyzer.phase_scheduler import (
                                 scan_budget_for_phase as _sbf,
                             )
                             _cfg2 = _gp2(_vp)
@@ -7016,8 +7152,9 @@ def register_room_handlers(server, bridge):
                     _finalize_started = False
                     _finalize_failures = 0
                     _recording_stop_ticks = 0
-                    if room_id in _continuous_tasks:
-                        _continuous_tasks[room_id]['finalizing'] = False
+                    with _analysis_jobs_lock:
+                        if room_id in _continuous_tasks:
+                            _continuous_tasks[room_id]['finalizing'] = False
                     _log.info("持续分析收尾取消: 录制已恢复 room_id=%s", room_id)
 
 
@@ -7026,9 +7163,12 @@ def register_room_handlers(server, bridge):
         except Exception as exc:
             _log.error("持续分析异常: room_id=%s, %s", room_id, exc, exc_info=True)
         finally:
-            stop_state = _continuous_tasks.get(room_id, {})
+            with _analysis_jobs_lock:
+                stop_state = _continuous_tasks.get(room_id, {})
             if stop_state.get('status') == 'stopping' or stop_state.get('cancelled'):
-                stop_state['scan_abort'] = True
+                with _analysis_jobs_lock:
+                    if room_id in _continuous_tasks:
+                        _continuous_tasks[room_id]['scan_abort'] = True
             # 让 worker 通过 cancel_check 自行退出；不得 cancel 协程后提前释放 semaphore。
             if _worker_task and not _worker_task.done():
                 try:
@@ -7055,7 +7195,8 @@ def register_room_handlers(server, bridge):
                     'updated_at': time.time(),
                 },
             })
-            _continuous_tasks.pop(room_id, None)
+            with _analysis_jobs_lock:
+                _continuous_tasks.pop(room_id, None)
             _log.info("持续分析已停止: room_id=%s, 累计 %d 段高光", room_id, len(all_highlights))
 
     async def _export_and_broadcast(
@@ -7133,7 +7274,17 @@ def register_room_handlers(server, bridge):
                 _log.warning("持续分析入列失败: %s", exc)
 
         if video_path:
-            save_analysis_results(video_path, room_id, mode, all_highlights)
+            with _analysis_jobs_lock:
+                stop_state = _continuous_tasks.get(room_id, {})
+            _t0 = float(
+                stop_state.get("_session_t0")
+                or stop_state.get("_scan_start_mono")
+                or time.monotonic()
+            )
+            save_analysis_results(
+                video_path, room_id, mode, all_highlights,
+                analysis_time_sec=max(0.0, time.monotonic() - _t0),
+            )
 
     @server.on('start_continuous_analysis')
     async def handle_start_continuous_analysis(data):
@@ -7159,23 +7310,28 @@ def register_room_handlers(server, bridge):
         _start_valorant_profile = (data.get('valorant_profile') or 'valorant')
         if not main_room_id:
             return {'error': 'room_id is required'}
-        if _continuous_tasks:
-            active_room_id = next(iter(_continuous_tasks))
-            return {
-                'success': False,
-                'error': '已有持续分析任务正在运行',
-                'active_room_id': active_room_id,
-            }
+        with _analysis_jobs_lock:
+            if _continuous_tasks:
+                active_room_id = next(iter(_continuous_tasks))
+                return {
+                    'success': False,
+                    'error': '已有持续分析任务正在运行',
+                    'active_room_id': active_room_id,
+                }
         if mode == 'valorant_round' and game == 'valorant':
             interval = 5
         elif interval < 10:
             interval = 10  # 最小 10s，避免过于频繁
 
-        ok, error, main_room, target_rooms = _validate_synced_analysis_targets(
-            manager,
-            main_room_id,
-            target_room_ids,
-            wait_for_file=True,
+        # wait_for_file 内含 time.sleep，必须移出 asyncio event loop
+        ok, error, main_room, target_rooms = await asyncio.get_running_loop().run_in_executor(
+            _bridge_executor,
+            lambda: _validate_synced_analysis_targets(
+                manager,
+                main_room_id,
+                target_room_ids,
+                wait_for_file=True,
+            ),
         )
         if not ok:
             return {'success': False, 'error': error}
@@ -7187,22 +7343,24 @@ def register_room_handlers(server, bridge):
             main_room_id, resolved_target_room_ids, interval, threshold, mode, game,
             valorant_profile=_start_valorant_profile,
         ))
-        _continuous_tasks[main_room_id] = {
-            'task': task,
-            'last_analyzed': 0.0,
-            'highlights': [],
-            'cancelled': False,
-            'completed': False,
-            'finalizing': False,
-            'mode': mode,
-            'main_room_id': main_room_id,
-            'target_room_ids': resolved_target_room_ids,
-            'recorded_duration': 0.0,
-            'confirmed_rounds': 0,
-            'pending_rounds': 0,
-            'analysis_stage': '等待新录制',
-            'session_id': uuid4().hex,
-        }
+        with _analysis_jobs_lock:
+            _continuous_tasks[main_room_id] = {
+                'task': task,
+                'last_analyzed': 0.0,
+                'highlights': [],
+                'cancelled': False,
+                'completed': False,
+                'finalizing': False,
+                'mode': mode,
+                'main_room_id': main_room_id,
+                'target_room_ids': resolved_target_room_ids,
+                'recorded_duration': 0.0,
+                'confirmed_rounds': 0,
+                'pending_rounds': 0,
+                'analysis_stage': '等待新录制',
+                'session_id': uuid4().hex,
+                '_session_t0': time.monotonic(),
+            }
         _log.info(
             "持续分析已启动: main_room_id=%s, targets=%s, mode=%s, interval=%ds, threshold=%.2f",
             main_room_id,
@@ -7247,24 +7405,28 @@ def register_room_handlers(server, bridge):
         data = data or {}
         requested_room_id = data.get('main_room_id') or data.get('room_id')
         room_id = requested_room_id
-        if not room_id and len(_continuous_tasks) == 1:
-            room_id = next(iter(_continuous_tasks))
-        if room_id and room_id not in _continuous_tasks:
-            for active_room_id, active_state in _continuous_tasks.items():
-                active_targets = active_state.get('target_room_ids') or []
-                if room_id == active_state.get('main_room_id') or room_id in active_targets:
-                    room_id = active_room_id
-                    break
+        with _analysis_jobs_lock:  # 保持现有锁保护
+            if not room_id and len(_continuous_tasks) == 1:
+                room_id = next(iter(_continuous_tasks))
+            if room_id and room_id not in _continuous_tasks:
+                for active_room_id, active_state in list(_continuous_tasks.items()):
+                    active_targets = active_state.get('target_room_ids') or []
+                    if room_id == active_state.get('main_room_id') or room_id in active_targets:
+                        room_id = active_room_id
+                        break
+            state = _continuous_tasks.get(room_id)
+            if state is not None:
+                state['cancelled'] = True
+                state['scan_abort'] = True
+                state['status'] = 'stopping'
+                state['analysis_stage'] = '停止中'
+                done_event = state.get('scan_done_event')
+            else:
+                done_event = None
         if not room_id:
             return {'error': 'room_id is required'}
-        state = _continuous_tasks.get(room_id)
         if not state:
             return {'success': False, 'error': '该房间没有持续分析任务'}
-        state['cancelled'] = True
-        state['scan_abort'] = True
-        state['status'] = 'stopping'
-        state['analysis_stage'] = '停止中'
-        done_event = state.get('scan_done_event')
         if done_event is not None and not state.get('scan_running'):
             done_event.set()
         bridge.queue_broadcast({
@@ -7278,7 +7440,7 @@ def register_room_handlers(server, bridge):
                 'updated_at': time.time(),
             },
         })
-        _log.info("持续分析停止请求: room_id=%s", room_id)
+        _log.info("持续分析停止请求：room_id=%s", room_id)
         return {
             'success': True,
             'status': 'stopping',
@@ -7289,9 +7451,10 @@ def register_room_handlers(server, bridge):
     @server.on('get_continuous_analysis_status')
     async def handle_get_continuous_analysis_status(data):
         """查询当前是否有正在运行的持续分析任务。"""
-        if _continuous_tasks:
-            active_room_id = next(iter(_continuous_tasks))
-            task = _continuous_tasks[active_room_id]
+        with _analysis_jobs_lock:
+            _ct_items = list(_continuous_tasks.items())
+        if _ct_items:
+            active_room_id, task = _ct_items[0]
             room = manager.get_room(active_room_id)
             recorded_duration = float(task.get('recorded_duration', task.get('last_analyzed', 0.0)) or 0.0)
             if room is not None and getattr(room, 'is_recording', False):

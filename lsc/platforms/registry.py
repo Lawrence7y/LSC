@@ -155,7 +155,8 @@ class _ParseCache:
             try:
                 self._cleanup()
             except Exception as exc:
-                _log.debug("cleanup worker error: %s", exc)
+                # 清理失败不能静默：持续失败会导致缓存无限增长（内存泄漏）
+                _log.warning("cleanup worker error (cache may grow unbounded): %s", exc)
 
     def get(self, url: str, platform: str) -> StreamInfo | None:
         with self._lock:

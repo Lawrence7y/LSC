@@ -5,6 +5,8 @@ export interface MsePlayerOptions {
   onStateChange?: (state: MsePlayerState) => void
   onError?: (error: string) => void
   onSourceOpen?: () => void
+  /** pending 过高/回落时通知（用于后端背压） */
+  onBackpressure?: (state: 'pause' | 'resume', pending: number) => void
   debug?: boolean
 }
 
@@ -77,6 +79,7 @@ export class MsePlayer {
   private _onStateChange?: (state: MsePlayerState) => void
   private _onError?: (error: string) => void
   private _onSourceOpen?: () => void
+  private _onBackpressure?: (state: 'pause' | 'resume', pending: number) => void
   private _debug: boolean
   private _pendingSegments: Uint8Array[] = []
   private _initReceived = false
@@ -92,6 +95,11 @@ export class MsePlayer {
   private _isTrimming = false
   // 最大待处理分段数：超出时丢弃最旧的，避免主线程卡顿时无限堆积
   private readonly _maxPendingSegments = 20
+  private readonly _backpressurePauseAt = 10
+  private readonly _backpressureResumeAt = 3
+  private _backpressurePaused = false
+  private _lastBackpressureSentAt = 0
+  private readonly _backpressureMinIntervalMs = 500
   // 卡顿检测：记录上次 currentTime 变化的时间和位置
   private _stallCheckTimer: ReturnType<typeof setInterval> | null = null
   private _lastStallTime = 0
@@ -109,6 +117,7 @@ export class MsePlayer {
     this._onStateChange = options.onStateChange
     this._onError = options.onError
     this._onSourceOpen = options.onSourceOpen
+    this._onBackpressure = options.onBackpressure
     this._debug = options.debug ?? false
   }
 
@@ -206,6 +215,7 @@ export class MsePlayer {
         this._pendingSegments.shift()
         this._log(`Dropping oldest segment (pending > ${this._maxPendingSegments})`)
       }
+      this._maybeEmitBackpressure()
       return
     }
 
@@ -215,11 +225,35 @@ export class MsePlayer {
         this._log(`Media segment appended (${data.byteLength} bytes)`)
         // 持续收到媒体分段说明流正在播放，确保状态为 playing。
         this._markPlaying()
+        this._maybeEmitBackpressure()
       } catch (e) {
         this._handleError(`Media segment append failed: ${e}`)
       }
     } else {
       this._pendingSegments.push(seg)
+      this._maybeEmitBackpressure()
+    }
+  }
+
+  private _maybeEmitBackpressure(): void {
+    if (!this._onBackpressure) return
+    const pending = this._pendingSegments.length
+    let next: 'pause' | 'resume' | null = null
+    if (!this._backpressurePaused && pending >= this._backpressurePauseAt) {
+      next = 'pause'
+      this._backpressurePaused = true
+    } else if (this._backpressurePaused && pending <= this._backpressureResumeAt) {
+      next = 'resume'
+      this._backpressurePaused = false
+    }
+    if (!next) return
+    const now = Date.now()
+    if (now - this._lastBackpressureSentAt < this._backpressureMinIntervalMs) return
+    this._lastBackpressureSentAt = now
+    try {
+      this._onBackpressure(next, pending)
+    } catch (e) {
+      this._log(`backpressure callback failed: ${e}`)
     }
   }
 
@@ -460,6 +494,7 @@ export class MsePlayer {
       try {
         this._sourceBuffer.appendBuffer(seg.buffer.slice(seg.byteOffset, seg.byteOffset + seg.byteLength) as ArrayBuffer)
         this._log(`Flushed pending segment (${seg.byteLength} bytes)`)
+        this._maybeEmitBackpressure()
       } catch (e) {
         this._handleError(`Pending segment append failed: ${e}`)
       }

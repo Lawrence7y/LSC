@@ -161,17 +161,19 @@
 .lsc-timeline__highlight {
   position: absolute;
   top: 50%;
-  height: 6px;
+  height: 13px;
   transform: translateY(-50%);
-  background: rgba(255, 159, 10, 0.55);
-  border-radius: 2px;
+  box-sizing: border-box;
+  background: rgba(255, 159, 10, 0.16);
+  border: 1px dashed rgba(245, 158, 11, 0.9);
+  border-radius: 3px;
   pointer-events: auto;
   cursor: pointer;
   z-index: 2;
 }
 
 .lsc-timeline__highlight:hover {
-  background: rgba(255, 159, 10, 0.8);
+  background: rgba(255, 159, 10, 0.28);
 }
 
 .lsc-timeline__buffered,
@@ -206,11 +208,13 @@
 .lsc-timeline__selection {
   position: absolute;
   top: 50%;
-  height: 8px;
+  height: 17px;
   transform: translateY(-50%);
-  background: rgba(0, 122, 255, 0.28);
-  border-radius: 2px;
-  z-index: 3;
+  box-sizing: border-box;
+  background: rgba(0, 122, 255, 0.12);
+  border: 1px solid rgba(0, 122, 255, 0.8);
+  border-radius: 4px;
+  z-index: 4;
   pointer-events: none;
 }
 
@@ -223,17 +227,17 @@
   border-left: 2px solid rgba(0, 122, 255, 0.85);
   border-right: 2px solid rgba(0, 122, 255, 0.85);
   border-radius: 2px;
-  z-index: 3;
+  z-index: 5;
   pointer-events: none;
 }
 
 .lsc-timeline__clip {
   position: absolute;
   top: 50%;
-  height: 6px;
+  height: 9px;
   transform: translateY(-50%);
-  border-radius: 2px;
-  z-index: 1;
+  border-radius: 3px;
+  z-index: 3;
   pointer-events: none;
 }
 
@@ -307,7 +311,7 @@
   color: var(--state-error, #ff3b30);
 }
 
-/* 播放头：主题青色圆点（对齐原生 video 控件），无竖线 */
+/* 播放头：主题青色圆点加短竖线，便于与刻度和选区对齐 */
 .lsc-timeline__playhead {
   position: absolute;
   top: 50%;
@@ -325,10 +329,17 @@
   transition: transform 0.1s ease, box-shadow 0.12s ease;
 }
 
-.lsc-timeline__playhead::before,
 .lsc-timeline__playhead::after {
-  content: none !important;
-  display: none !important;
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 50%;
+  width: 2px;
+  height: 24px;
+  transform: translateX(-50%);
+  border-radius: 1px;
+  background: var(--brand-500, #31B3AE);
+  z-index: -1;
 }
 
 .lsc-timeline__scroll:hover .lsc-timeline__playhead {

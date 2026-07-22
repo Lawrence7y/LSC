@@ -122,13 +122,16 @@ export function AnalysisProgress({ status, compact = false, exportSummary }: { s
     const updatedAt = current.updated_at ?? 0
     const liveAnalyzedDuration = current.analyzed_duration ?? 0
     const scanEnd = current.scan_range?.[1] ?? liveAnalyzedDuration
-     const rawPercent = scanEnd > 0 ? Math.min(100, Math.max(0, (liveAnalyzedDuration / scanEnd) * 100)) : 0
-     const livePercent = isWorkerActive ? Math.min(rawPercent, 95) : rawPercent
-     const isIdle = waitingForRecording || waitingForNextChunk || (waitingForFinalize && current.analysis_stage === '等待收尾')
+    const hasFixedScanRange = Boolean(scanEnd > 0 && (current.scan_running || current.phase === 'finalizing'))
+    const rawPercent = scanEnd > 0 ? Math.min(100, Math.max(0, (liveAnalyzedDuration / scanEnd) * 100)) : 0
+    const livePercent = isWorkerActive ? Math.min(rawPercent, 95) : rawPercent
+    const isIdle = waitingForRecording || waitingForNextChunk || (waitingForFinalize && current.analysis_stage === '等待收尾')
     const dotColor = isIdle ? 'var(--text-400, #888780)' : current.phase === 'completed' ? 'var(--state-success, #1D9E75)' : 'var(--brand-500, #378ADD)'
     const modeLabel = current.mode === 'scene' ? '场景' : current.mode === 'valorant_round' ? '回合' : (current.mode ?? '场景')
     const secondsAgo = updatedAt > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - updatedAt)) : 0
-    const showProgress = !isIdle && current.phase !== 'completed' && scanEnd > 0
+    const compactStatusText = statusText === '音频推进中' ? '分析中' : statusText
+    const showProgress = hasFixedScanRange && current.phase !== 'completed'
+    const showExportSummary = summary.queued > 0 || summary.exporting > 0 || summary.completed > 0 || summary.failed > 0
     const dividerStyle: CSSProperties = { borderLeft: '0.5px solid var(--border-default, rgba(128,128,128,0.15))', paddingLeft: 14 }
     const roomLabel = current.room_id
       ? (current.room_id.length > 10 ? `${current.room_id.slice(0, 8)}…` : current.room_id)
@@ -143,7 +146,7 @@ export function AnalysisProgress({ status, compact = false, exportSummary }: { s
             width: 8, height: 8, borderRadius: '50%', background: dotColor, flexShrink: 0,
             animation: isIdle ? 'none' : 'caPulse 1.8s ease-in-out infinite',
           }} />
-          <span style={{ fontWeight: 500, color: 'var(--text-50)' }}>{statusText}</span>
+          <span style={{ fontWeight: 500, color: 'var(--text-50)' }}>{compactStatusText}</span>
           {roomLabel && (
             <span style={{
               background: 'var(--background-700)',
@@ -165,6 +168,12 @@ export function AnalysisProgress({ status, compact = false, exportSummary }: { s
             </div>
             <span style={{ fontWeight: 500, color: 'var(--text-50)', minWidth: 32 }}>{Math.round(livePercent)}%</span>
             <span style={{ fontSize: 12, color: 'var(--text-400)' }}>{formatDuration(liveAnalyzedDuration)} / {formatDuration(scanEnd)}</span>
+          </div>
+        )}
+
+        {!showProgress && !isIdle && current.phase !== 'completed' && (
+          <div style={{ ...dividerStyle, fontSize: 12, color: 'var(--text-400)' }}>
+            已跟进至 {formatDuration(liveAnalyzedDuration)}
           </div>
         )}
 
@@ -208,19 +217,21 @@ export function AnalysisProgress({ status, compact = false, exportSummary }: { s
           )}
         </div>
 
-        <div
-          style={{ display: 'flex', alignItems: 'center', gap: 3, ...dividerStyle, fontSize: 12, color: 'var(--text-400)' }}
-          title="导出队列：排队 / 导出中 / 已完成 / 失败（不含待确认）"
-        >
-          <span>导出</span>
-          <span style={{ color: 'var(--text-200)', fontWeight: 500 }}>{summary.queued}</span>
-          <span>/</span>
-          <span style={{ color: 'var(--text-200)', fontWeight: 500 }}>{summary.exporting}</span>
-          <span>/</span>
-          <span style={{ color: 'var(--text-200)', fontWeight: 500 }}>{summary.completed}</span>
-          <span>/</span>
-          <span style={{ color: summary.failed > 0 ? 'var(--state-error, #c00)' : 'var(--text-200)', fontWeight: 500 }}>{summary.failed}</span>
-        </div>
+        {showExportSummary && (
+          <div
+            style={{ display: 'flex', alignItems: 'center', gap: 3, ...dividerStyle, fontSize: 12, color: 'var(--text-400)' }}
+            title="导出队列：排队 / 导出中 / 已完成 / 失败（不含待确认）"
+          >
+            <span>导出</span>
+            <span style={{ color: 'var(--text-200)', fontWeight: 500 }}>{summary.queued}</span>
+            <span>/</span>
+            <span style={{ color: 'var(--text-200)', fontWeight: 500 }}>{summary.exporting}</span>
+            <span>/</span>
+            <span style={{ color: 'var(--text-200)', fontWeight: 500 }}>{summary.completed}</span>
+            <span>/</span>
+            <span style={{ color: summary.failed > 0 ? 'var(--state-error, #c00)' : 'var(--text-200)', fontWeight: 500 }}>{summary.failed}</span>
+          </div>
+        )}
 
         {updatedAt > 0 && (
           <div style={{ ...dividerStyle, fontSize: 11, color: 'var(--text-400)' }}>

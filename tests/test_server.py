@@ -23,6 +23,7 @@ if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
 from server import _truncate_for_log, _NumpyJSONEncoder, _json_dumps, LSCWebSocketServer
+from ws_auth import is_origin_allowed
 
 
 class TestTruncateForLog:
@@ -161,13 +162,7 @@ class TestWebSocketOriginValidation:
 
     def _check_origin(self, origin: str) -> bool:
         """Simulate origin check from handle_client. Returns True if allowed."""
-        # Missing/empty Origin is rejected (#14): legitimate Electron
-        # renderers and browsers always send an Origin header.
-        if not origin:
-            return False
-        if origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
-            return False  # rejected
-        return True
+        return is_origin_allowed(origin)
 
     def test_null_origin_allowed(self):
         assert self._check_origin('null') is True
@@ -190,6 +185,10 @@ class TestWebSocketOriginValidation:
 
     def test_external_ip_rejected(self):
         assert self._check_origin('http://192.168.1.100') is False
+
+    def test_localhost_attacker_rejected(self):
+        assert self._check_origin('http://localhost.attacker.com') is False
+        assert self._check_origin('http://127.0.0.1.evil.com') is False
 
 
 class TestBroadcastQueue:
@@ -248,11 +247,12 @@ class _MockWebSocket:
     Yields the provided messages then raises ConnectionClosed to end the
     receive loop, mirroring a real client disconnect.
     """
-    def __init__(self, messages: list[str], origin: str = ''):
+    def __init__(self, messages: list[str], origin: str = '', path: str = '/'):
         self._messages = list(messages)
         self.sent: list[str] = []
         self.request_headers = MagicMock()
         self.request_headers.get = MagicMock(return_value=origin)
+        self.path = path
         self._closed = False
 
     def __aiter__(self):
@@ -278,6 +278,10 @@ class TestMessageOrdering:
     on (e.g. set_mark_in -> export_clip). Handlers must now run in arrival
     order.
     """
+
+    @pytest.fixture(autouse=True)
+    def _ws_token_not_required(self, monkeypatch):
+        monkeypatch.setenv("LSC_WS_TOKEN_REQUIRED", "0")
 
     def test_handlers_execute_in_arrival_order(self):
         srv = LSCWebSocketServer()
@@ -347,6 +351,10 @@ class TestMessageOrdering:
 class TestOriginRejectionInHandleClient:
     """Integration tests for origin rejection via handle_client (#14)."""
 
+    @pytest.fixture(autouse=True)
+    def _ws_token_not_required(self, monkeypatch):
+        monkeypatch.setenv("LSC_WS_TOKEN_REQUIRED", "0")
+
     def test_missing_origin_rejected(self):
         """handle_client must close the connection when Origin is missing (#14)."""
         srv = LSCWebSocketServer()
@@ -378,9 +386,43 @@ class TestOriginRejectionInHandleClient:
         finally:
             loop.close()
 
-        assert ws in srv.clients or ws not in srv.clients  # disconnected after msgs
-        # Should have received a response
+        assert ws._closed is False
         assert len(ws.sent) > 0
+
+
+class TestTokenRejectionInHandleClient:
+    """Integration tests for token rejection via handle_client."""
+
+    @pytest.fixture(autouse=True)
+    def _ws_token_required(self, monkeypatch):
+        monkeypatch.setenv("LSC_WS_TOKEN_REQUIRED", "1")
+        monkeypatch.setenv("LSC_WS_TOKEN", "secret")
+
+    def test_missing_token_rejected(self):
+        srv = LSCWebSocketServer()
+        ws = _MockWebSocket([], origin='http://localhost:5173', path='/')
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(srv.handle_client(ws))
+        finally:
+            loop.close()
+
+        assert ws._closed is True
+        assert ws not in srv.clients
+
+    def test_invalid_token_rejected(self):
+        srv = LSCWebSocketServer()
+        ws = _MockWebSocket([], origin='http://localhost:5173', path='/?token=wrong')
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(srv.handle_client(ws))
+        finally:
+            loop.close()
+
+        assert ws._closed is True
+        assert ws not in srv.clients
 
 
 class TestBroadcastNumpySerialization:

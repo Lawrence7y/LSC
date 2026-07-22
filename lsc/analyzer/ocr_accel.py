@@ -154,17 +154,20 @@ def save_probe_cache(
     selected: str,
     ort_version: str,
 ) -> None:
-    path = _probe_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "timings": timings,
-        "selected": selected,
-        "ort_version": ort_version,
-        "saved_at": time.time(),
-    }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    try:
+        path = _probe_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "timings": timings,
+            "selected": selected,
+            "ort_version": ort_version,
+            "saved_at": time.time(),
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        _log.warning("写 OCR 探针缓存失败（非致命）: %s", exc)
 
 
 def _ort_version() -> str:

@@ -157,6 +157,8 @@ class StreamCapture:
         self._stderr_future: Future[None] | None = None
         self._stderr_released = False
         self._last_error: str = ""
+        # Orphan process detection (prevent retry loops on termination failure)
+        self._terminated_with_orphan = False
 
     @property
     def status(self) -> CaptureStatus:
@@ -519,15 +521,18 @@ class StreamCapture:
                     _log.warning("FFmpeg kill failed: %s", exc)
                 if not _wait_with_deadline(5):
                     # Final safety net: do not block forever.
+                    orphaned_pid: int | str = "?"
                     try:
                         orphaned_pid = proc.pid
                     except Exception as exc:
                         _log.debug("操作异常（已忽略）: %s", exc)
                     _log.error(
                         "FFmpeg process %s refused to exit after kill; "
-                        "leaving it orphan and releasing capture resources",
+                        "marking as orphan and releasing resources",
                         orphaned_pid,
                     )
+                    # 标记孤儿进程，防止外部停止循环反复重试
+                    self._terminated_with_orphan = True
 
         duration = self.duration
         output_path = ""

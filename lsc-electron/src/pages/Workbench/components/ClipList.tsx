@@ -1,9 +1,19 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, List, Button, Space, Tag, Empty, Progress, Checkbox, Tooltip } from 'antd'
 import { DeleteOutlined, ExportOutlined, FolderOpenOutlined, FolderOutlined, CloseCircleOutlined, CheckOutlined } from '@ant-design/icons'
 import { ClipSegment, ClipConfirmStatus } from '@/types'
 import { formatTime } from '@/utils/time'
 import { formatClipHoverTitle } from '@/utils/clipNaming'
+
+/** 超过此数量启用窗口虚拟渲染（仍保留 content-visibility 兜底） */
+const VIRTUALIZE_THRESHOLD = 40
+const ROW_HEIGHT = 88
+const OVERSCAN = 6
+
+/** Stable list identity: clip_id preferred, then round_key, then composite fallback. */
+export function getClipStableId(clip: ClipSegment): string {
+  return clip.clip_id || clip.round_key || `${clip.room_id}-${clip.start}-${clip.end}`
+}
 
 export interface ExportProgressInfo {
   percent: number
@@ -13,19 +23,19 @@ export interface ExportProgressInfo {
 
 interface ClipListProps {
   clips: ClipSegment[]
-  onDelete: (index: number) => void
-  onExport: (clip: ClipSegment, index: number) => void
+  onDelete: (clipId: string) => void
+  onExport: (clip: ClipSegment) => void
   onExportMany?: (clips: ClipSegment[]) => void
   onOpenFile?: (path: string) => void
   onOpenFolder?: (path: string) => void
   onCancelExport?: (jobId: string) => void
   exportProgress?: Record<string, ExportProgressInfo>
-  onSelectClip?: (clip: ClipSegment, index: number) => void
-  onConfirmClip?: (clip: ClipSegment, index: number) => void
-  onConfirmAndExport?: (clip: ClipSegment, index: number) => void
+  onSelectClip?: (clip: ClipSegment) => void
+  onConfirmClip?: (clip: ClipSegment) => void
+  onConfirmAndExport?: (clip: ClipSegment) => void
   refiningClipId?: string | null
-  selectedIndices?: Set<number>
-  onSelectedIndicesChange?: (indices: Set<number>) => void
+  selectedClipIds?: Set<string>
+  onSelectedClipIdsChange?: (ids: Set<string>) => void
 }
 
 function formatDuration(seconds: number): string {
@@ -80,115 +90,68 @@ function primaryStatus(
   }
 }
 
-export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport, refiningClipId, selectedIndices: externalSelected, onSelectedIndicesChange }: ClipListProps) {
-  const [internalSelected, setInternalSelected] = useState<Set<number>>(new Set())
+export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange }: ClipListProps) {
+  const [internalSelected, setInternalSelected] = useState<Set<string>>(new Set())
   const controlled = externalSelected != null
-  const selectedIndices = controlled ? externalSelected : internalSelected
+  const selectedClipIds = controlled ? externalSelected : internalSelected
 
-  const setSelectedIndices = (updater: Set<number> | ((prev: Set<number>) => Set<number>)) => {
-    const next = typeof updater === 'function' ? updater(selectedIndices) : updater
+  const setSelectedClipIds = (updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    const next = typeof updater === 'function' ? updater(selectedClipIds) : updater
     if (!controlled) setInternalSelected(next)
-    onSelectedIndicesChange?.(next)
+    onSelectedClipIdsChange?.(next)
   }
 
   const hasConfirmAndExport = !!onConfirmAndExport
   const actionableClips = useMemo(
-    () => clips.filter(c => canExportClip(c)),
-    [clips],
+    () => clips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
+    [clips, hasConfirmAndExport],
   )
   const selectedClips = useMemo(
-    () => [...selectedIndices].sort((a, b) => a - b).map(i => clips[i]).filter(Boolean),
-    [selectedIndices, clips],
+    () => clips.filter(c => selectedClipIds.has(getClipStableId(c))),
+    [selectedClipIds, clips],
   )
   const selectedActionable = useMemo(
-    () => selectedClips.filter(c => canExportClip(c)),
-    [selectedClips],
+    () => selectedClips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
+    [selectedClips, hasConfirmAndExport],
   )
   const pendingCount = useMemo(() => clips.filter(needsConfirm).length, [clips])
 
-  const toggleSelected = (index: number, checked: boolean) => {
-    setSelectedIndices(prev => {
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportH, setViewportH] = useState(480)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const useVirtual = clips.length >= VIRTUALIZE_THRESHOLD
+  const visibleRange = useMemo(() => {
+    if (!useVirtual) return [0, clips.length] as const
+    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
+    const end = Math.min(clips.length, Math.ceil((scrollTop + viewportH) / ROW_HEIGHT) + OVERSCAN)
+    return [start, end] as const
+  }, [useVirtual, scrollTop, viewportH, clips.length])
+  const visibleClips = useMemo(
+    () => (useVirtual ? clips.slice(visibleRange[0], visibleRange[1]) : clips),
+    [clips, useVirtual, visibleRange],
+  )
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const update = () => setViewportH(el.clientHeight || 480)
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [clips.length])
+
+  const toggleSelected = (clipId: string, checked: boolean) => {
+    setSelectedClipIds(prev => {
       const next = new Set(prev)
-      if (checked) next.add(index)
-      else next.delete(index)
+      if (checked) next.add(clipId)
+      else next.delete(clipId)
       return next
     })
   }
 
-  return (
-    <Card
-      size="small"
-      title="切片列表"
-      style={{
-        margin: '8px 16px 16px',
-        flex: 1,
-        minHeight: 0,
-        overflow: 'hidden',
-        display: 'flex',
-        flexDirection: 'column',
-        background: 'var(--bg-secondary)',
-      }}
-      styles={{
-        body: {
-          flex: 1,
-          minHeight: 0,
-          overflow: 'auto',
-          padding: '0 6px 6px',
-        }
-      }}
-      extra={
-        <Space size={6}>
-          {clips.length > 0 && onExportMany && (
-            <>
-              <Tooltip
-                title={actionableClips.length === 0
-                  ? (pendingCount > 0 ? '请先确认待调整的切片' : '没有可导出的切片')
-                  : undefined}
-              >
-                <Button
-                  type="link"
-                  size="small"
-                  disabled={actionableClips.length === 0}
-                  onClick={() => onExportMany(actionableClips)}
-                >
-                  导出全部
-                </Button>
-              </Tooltip>
-              <Tooltip
-                title={selectedClips.length === 0
-                  ? '请先勾选切片'
-                  : selectedActionable.length === 0
-                    ? '所选切片需先确认或正在导出'
-                    : undefined}
-              >
-                <Button
-                  type="link"
-                  size="small"
-                  disabled={selectedActionable.length === 0}
-                  onClick={() => onExportMany(selectedActionable)}
-                >
-                  导出所选
-                </Button>
-              </Tooltip>
-            </>
-          )}
-          <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-            {clips.length}{pendingCount > 0 ? `/${pendingCount}待` : ''}
-          </span>
-        </Space>
-      }
-    >
-      {clips.length === 0 ? (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description="暂无切片"
-          style={{ margin: '16px 0' }}
-        />
-      ) : (
-        <List
-          dataSource={clips}
-          split={false}
-          renderItem={(clip, index) => {
+  const renderClipRow = (clip: ClipSegment, indexOffset = 0) => {
+            const clipId = getClipStableId(clip)
             const prog = clip.job_id ? exportProgress?.[clip.job_id] : undefined
             const isExporting = !!prog || clip.export_status === 'exporting'
             const isQueued = clip.export_status === 'queued'
@@ -220,13 +183,24 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                 : 'transparent'
 
             return (
-              <List.Item
-                onClick={() => !isRefining && onSelectClip?.(clip, index)}
+              <div
+                key={clipId}
+                onClick={() => !isRefining && onSelectClip?.(clip)}
                 style={{
                   padding: 0,
                   marginBottom: 4,
                   border: 'none',
                   cursor: onSelectClip ? 'pointer' : undefined,
+                  // 浏览器原生“虚拟滚动”：跳过屏外布局/绘制
+                  contentVisibility: 'auto',
+                  containIntrinsicSize: '0 72px',
+                  ...(useVirtual ? {
+                    position: 'absolute' as const,
+                    top: (visibleRange[0] + indexOffset) * ROW_HEIGHT,
+                    left: 0,
+                    right: 0,
+                    height: ROW_HEIGHT - 4,
+                  } : {}),
                 }}
               >
                 <div style={{
@@ -251,9 +225,9 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                     width: '100%',
                   }}>
                     <Checkbox
-                      checked={selectedIndices.has(index)}
+                      checked={selectedClipIds.has(clipId)}
                       onClick={e => e.stopPropagation()}
-                      onChange={e => toggleSelected(index, e.target.checked)}
+                      onChange={e => toggleSelected(clipId, e.target.checked)}
                       style={{ flexShrink: 0 }}
                     />
                     <Tooltip title={hoverTitle} placement="top" mouseEnterDelay={0.25}>
@@ -327,7 +301,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                             type={isRefining ? 'primary' : 'text'}
                             size="small"
                             icon={<CheckOutlined />}
-                            onClick={() => onConfirmClip(clip, index)}
+                            onClick={() => onConfirmClip(clip)}
                           />
                         </Tooltip>
                       )}
@@ -348,8 +322,8 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                             icon={<ExportOutlined />}
                             disabled={!confirmAndExportAllowed}
                             onClick={() => {
-                              if (awaitingConfirm && onConfirmAndExport) onConfirmAndExport(clip, index)
-                              else if (exportAllowed) onExport(clip, index)
+                              if (awaitingConfirm && onConfirmAndExport) onConfirmAndExport(clip)
+                              else if (exportAllowed) onExport(clip)
                             }}
                           />
                         </Tooltip>
@@ -391,7 +365,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                           size="small"
                           icon={<DeleteOutlined />}
                           danger
-                          onClick={() => onDelete(index)}
+                          onClick={() => onDelete(clipId)}
                         />
                       </Tooltip>
                     </Space>
@@ -407,10 +381,107 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                     />
                   )}
                 </div>
-              </List.Item>
+              </div>
             )
-          }}
+  }
+
+  return (
+    <Card
+      size="small"
+      title="切片列表"
+      style={{
+        margin: '8px 16px 16px',
+        flex: 1,
+        minHeight: 0,
+        overflow: 'hidden',
+        display: 'flex',
+        flexDirection: 'column',
+        background: 'var(--bg-secondary)',
+      }}
+      styles={{
+        body: {
+          flex: 1,
+          minHeight: 0,
+          overflow: 'hidden',
+          padding: '0 6px 6px',
+          display: 'flex',
+          flexDirection: 'column',
+        }
+      }}
+      extra={
+        <Space size={6}>
+          {clips.length > 0 && onExportMany && (
+            <>
+              <Tooltip
+                title={actionableClips.length === 0
+                  ? (pendingCount > 0 ? '请先确认待调整的切片' : '没有可导出的切片')
+                  : undefined}
+              >
+                <Button
+                  type="link"
+                  size="small"
+                  disabled={actionableClips.length === 0}
+                  onClick={() => onExportMany(actionableClips)}
+                >
+                  导出全部
+                </Button>
+              </Tooltip>
+              <Tooltip
+                title={selectedClips.length === 0
+                  ? '请先勾选切片'
+                  : selectedActionable.length === 0
+                    ? '所选切片需先确认或正在导出'
+                    : undefined}
+              >
+                <Button
+                  type="link"
+                  size="small"
+                  disabled={selectedActionable.length === 0}
+                  onClick={() => onExportMany(selectedActionable)}
+                >
+                  导出所选
+                </Button>
+              </Tooltip>
+            </>
+          )}
+          <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+            共 {clips.length}{pendingCount > 0 ? ` · 待确认 ${pendingCount}` : ''}
+          </span>
+        </Space>
+      }
+    >
+      {clips.length === 0 ? (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="暂无切片"
+          style={{ margin: '16px 0' }}
         />
+      ) : (
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            if (!useVirtual) return
+            setScrollTop((e.target as HTMLDivElement).scrollTop)
+          }}
+          style={{ flex: 1, minHeight: 0, overflow: 'auto', position: 'relative' }}
+        >
+          {useVirtual ? (
+            <div style={{ height: clips.length * ROW_HEIGHT, position: 'relative' }}>
+              {visibleClips.map((clip, i) => renderClipRow(clip, i))}
+            </div>
+          ) : (
+            <List
+              dataSource={clips}
+              split={false}
+              rowKey={clip => getClipStableId(clip)}
+              renderItem={(clip) => (
+                <List.Item style={{ padding: 0, marginBottom: 0, border: 'none' }}>
+                  {renderClipRow(clip)}
+                </List.Item>
+              )}
+            />
+          )}
+        </div>
       )}
     </Card>
   )

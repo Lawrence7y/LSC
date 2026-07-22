@@ -26,6 +26,7 @@ def _get_ffmpeg():
 
 def _probe_duration(ffmpeg, video_path):
     import subprocess
+
     from lsc.config import load_config
     cfg = load_config()
     ffprobe = cfg.ffprobe_path or "ffprobe"
@@ -39,7 +40,7 @@ def _probe_duration(ffmpeg, video_path):
 
 def profile_audio_extraction(ffmpeg, video_path, duration, offset=0.0, length=120.0):
     import subprocess
-    import numpy as np
+
 
     actual_len = min(length, duration - offset)
     if actual_len <= 0:

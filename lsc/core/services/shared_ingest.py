@@ -8,7 +8,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 from lsc import get_logger
 from lsc.config import ExportProfile, load_config, preferred_hw_video_codec
@@ -23,6 +23,8 @@ TS_PACKET_SIZE = 188
 _WRITE_TIMEOUT_SEC = 10.0
 # 预览 stdout 超过该秒数无数据视为挂死，触发 on_error / 进程恢复
 _PREVIEW_STDOUT_STALL_SEC = 15.0
+
+_FfmpegProcess = subprocess.Popen[Any]
 
 
 def _is_network_url(url: str) -> bool:
@@ -226,9 +228,9 @@ class SharedRoomIngest:
         self._preview_ts_queue: deque[bytes] = deque()
         self._preview_queued_bytes = 0
 
-        self._process: Any | None = None
-        self._recording_process: Any | None = None
-        self._preview_process: Any | None = None
+        self._process: _FfmpegProcess | None = None
+        self._recording_process: _FfmpegProcess | None = None
+        self._preview_process: _FfmpegProcess | None = None
         self._recording_path = ""
         self._last_command: list[str] = []
         self._last_recording_command: list[str] = []
@@ -251,6 +253,7 @@ class SharedRoomIngest:
         self._preview_input_thread: threading.Thread | None = None
         self._preview_thread: threading.Thread | None = None
         self._preview_watch_thread: threading.Thread | None = None
+        # _stderr_threads: clean up dead threads on stop() to prevent memory leak
         self._stderr_threads: list[threading.Thread] = []
         self._stderr_buffer: deque[str] = deque(maxlen=100)
         self._recording_stderr_buffer: deque[str] = deque(maxlen=100)
@@ -530,7 +533,7 @@ class SharedRoomIngest:
         del preview_pipe
         return self.build_recording_command(recording_path, profile)
 
-    def build_preview_only_command(self, preview_pipe: str = "pipe:1", **kwargs) -> list[str]:
+    def build_preview_only_command(self, preview_pipe: str = "pipe:1", **kwargs: Any) -> list[str]:
         return self.build_preview_command(preview_pipe=preview_pipe, **kwargs)
 
     def start_recording_and_preview(
@@ -636,7 +639,7 @@ class SharedRoomIngest:
             if self._preview_process is not None and self._poll(self._preview_process) is None:
                 return SharedIngestStartResult(ok=True)
             self.preview_error = ""
-        command = self.build_preview_command(**options)
+        command = self.build_preview_command(**cast(Any, options))
         try:
             proc = self._launch_process(command)
         except Exception as exc:
@@ -743,7 +746,7 @@ class SharedRoomIngest:
         )
         return ""
 
-    def _launch_process(self, command: list[str]):
+    def _launch_process(self, command: list[str]) -> _FfmpegProcess:
         from lsc.utils.process_launcher import set_stream_nonblocking
         ffmpeg_path = command[0]
         env, creation_flags, cwd = prepare_launch(ffmpeg_path)
@@ -762,21 +765,27 @@ class SharedRoomIngest:
         return proc
 
     @staticmethod
-    def _start_thread(target, args: tuple, name: str) -> threading.Thread:
+    def _start_thread(
+        target: Callable[..., Any],
+        args: tuple[Any, ...],
+        name: str,
+    ) -> threading.Thread:
         thread = threading.Thread(target=target, args=args, name=name, daemon=True)
         thread.start()
         return thread
 
-    def _start_stderr_reader(self, proc, buffer: deque[str], label: str) -> None:
+    def _start_stderr_reader(self, proc: _FfmpegProcess, buffer: deque[str], label: str) -> None:
         thread = self._start_thread(
             self._read_stderr_loop,
             (proc, buffer),
             f"shared-{label}-stderr-{self.room_id}",
         )
         with self._lock:
+            # 先清理已结束的 stderr 线程，防止长时间运行时列表无限增长
+            self._stderr_threads = [t for t in self._stderr_threads if t.is_alive()]
             self._stderr_threads.append(thread)
 
-    def _read_stderr_loop(self, proc, buffer: deque[str] | None = None) -> None:
+    def _read_stderr_loop(self, proc: _FfmpegProcess, buffer: deque[str] | None = None) -> None:
         stderr = getattr(proc, "stderr", None)
         if stderr is None:
             return
@@ -792,9 +801,10 @@ class SharedRoomIngest:
         except (OSError, ValueError):
             return
         except Exception as exc:
-            _log.debug("shared stderr reader error room=%s: %s", self.room_id, exc)
+            # 非预期异常升级为 warning：stderr 读取线程退出后管道可能写满阻塞 FFmpeg
+            _log.warning("shared stderr reader error room=%s: %s", self.room_id, exc)
 
-    def _read_upstream_stdout_loop(self, proc) -> None:
+    def _read_upstream_stdout_loop(self, proc: _FfmpegProcess) -> None:
         stdout = getattr(proc, "stdout", None)
         if stdout is None:
             self.handle_upstream_error("shared ingest upstream stdout unavailable", proc)
@@ -839,7 +849,7 @@ class SharedRoomIngest:
         self._enqueue_preview_ts(batch)
 
     @staticmethod
-    def _write_all(proc, data: bytes) -> None:
+    def _write_all(proc: _FfmpegProcess, data: bytes) -> None:
         stream = getattr(proc, "stdin", None)
         if stream is None:
             raise OSError("stdin unavailable")
@@ -889,7 +899,7 @@ class SharedRoomIngest:
         self.preview_dropped_bytes += size
         self.preview_dropped_batches += 1
 
-    def _write_preview_input_loop(self, proc) -> None:
+    def _write_preview_input_loop(self, proc: _FfmpegProcess) -> None:
         while True:
             with self._preview_condition:
                 while self._preview_process is proc and not self._preview_ts_queue:
@@ -904,7 +914,7 @@ class SharedRoomIngest:
                 self._handle_preview_process_exit(proc, f"preview ffmpeg input failed: {exc}")
                 return
 
-    def _read_preview_stdout_loop(self, proc) -> None:
+    def _read_preview_stdout_loop(self, proc: _FfmpegProcess) -> None:
         stdout = getattr(proc, "stdout", None)
         if stdout is None:
             self._handle_preview_process_exit(proc, "preview ffmpeg stdout unavailable")
@@ -969,7 +979,7 @@ class SharedRoomIngest:
             if watchdog.is_alive() and watchdog is not threading.current_thread():
                 watchdog.join(timeout=2)
 
-    def _watch_upstream_process_loop(self, proc) -> None:
+    def _watch_upstream_process_loop(self, proc: _FfmpegProcess) -> None:
         while True:
             with self._lock:
                 if self._process is not proc:
@@ -981,9 +991,9 @@ class SharedRoomIngest:
                     proc,
                 )
                 return
-            time.sleep(0.05)
+            time.sleep(0.25)
 
-    def _watch_recording_process_loop(self, proc) -> None:
+    def _watch_recording_process_loop(self, proc: _FfmpegProcess) -> None:
         while True:
             with self._lock:
                 if self._recording_process is not proc:
@@ -995,9 +1005,9 @@ class SharedRoomIngest:
                     f"recording ffmpeg exited: code={return_code}",
                 )
                 return
-            time.sleep(0.05)
+            time.sleep(0.25)
 
-    def _watch_preview_process_loop(self, proc) -> None:
+    def _watch_preview_process_loop(self, proc: _FfmpegProcess) -> None:
         while True:
             with self._lock:
                 if self._preview_process is not proc:
@@ -1009,9 +1019,9 @@ class SharedRoomIngest:
                     f"preview ffmpeg exited: code={return_code}",
                 )
                 return
-            time.sleep(0.05)
+            time.sleep(0.25)
 
-    def _handle_recording_process_exit(self, proc, error: str) -> None:
+    def _handle_recording_process_exit(self, proc: _FfmpegProcess, error: str) -> None:
         with self._lock:
             if self._recording_process is not proc:
                 return
@@ -1022,7 +1032,7 @@ class SharedRoomIngest:
         self._terminate_process_object(proc)
         self._stop_upstream_if_idle(reason=self.recording_error)
 
-    def _handle_preview_process_exit(self, proc, error: str) -> None:
+    def _handle_preview_process_exit(self, proc: _FfmpegProcess, error: str) -> None:
         with self._preview_condition:
             if self._preview_process is not proc:
                 return
@@ -1156,11 +1166,17 @@ class SharedRoomIngest:
             self._upstream_watch_thread,
         ):
             self._join_thread(thread)
+        # 回收 stderr 读取线程：进程已终止、管道已关闭，readline 会返回 EOF
+        with self._lock:
+            stderr_threads = list(self._stderr_threads)
+            self._stderr_threads.clear()
+        for thread in stderr_threads:
+            self._join_thread(thread)
 
     def _terminate_process(self) -> None:
         self._stop_upstream_process()
 
-    def _terminate_process_object(self, proc, graceful_stdin: bool = False) -> None:
+    def _terminate_process_object(self, proc: _FfmpegProcess, graceful_stdin: bool = False) -> None:
         try:
             if graceful_stdin:
                 self._close_pipe(getattr(proc, "stdin", None))
@@ -1182,14 +1198,14 @@ class SharedRoomIngest:
                 self._close_pipe(getattr(proc, pipe_name, None))
 
     @staticmethod
-    def _poll(proc) -> int | None:
+    def _poll(proc: _FfmpegProcess) -> int | None:
         try:
             return proc.poll()
         except Exception:
             return None
 
     @staticmethod
-    def _close_pipe(pipe) -> None:
+    def _close_pipe(pipe: Any) -> None:
         if pipe is None:
             return
         try:

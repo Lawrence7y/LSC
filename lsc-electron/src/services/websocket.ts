@@ -1,5 +1,6 @@
 import { type WSPayloadMap, type WSMessageType } from '@/types'
 import { resolveWebSocketUrl, type BackendElectronApi, type WebSocketEnv } from './websocketUrl'
+import { tryParseMseBinaryFrame } from '@/utils/mseBinary'
 
 type MessageHandler<T = unknown> = (data: T) => void
 
@@ -12,6 +13,24 @@ const DISCONNECTED_QUEUEABLE_TYPES = new Set([
 
 export function shouldQueueWhenDisconnected(type: string): boolean {
   return DISCONNECTED_QUEUEABLE_TYPES.has(type)
+}
+
+const isDev = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV)
+
+/** DEV 日志用：深拷贝并截断大字段，避免污染 console / 拖垮主线程。 */
+function truncateLogData(data: unknown): unknown {
+  const logData = JSON.parse(JSON.stringify(data || {}))
+  if (typeof logData === 'object' && logData !== null) {
+    for (const key of Object.keys(logData as Record<string, unknown>)) {
+      const value = (logData as Record<string, unknown>)[key]
+      if (typeof value === 'string' && value.length > 200) {
+        ;(logData as Record<string, unknown>)[key] = `<string length=${value.length}>`
+      } else if (Array.isArray(value) && value.length > 10) {
+        ;(logData as Record<string, unknown>)[key] = `<array length=${value.length}>`
+      }
+    }
+  }
+  return logData
 }
 
 /** 将 WebSocket 载荷规范为 UTF-8 文本（兼容误发为二进制帧的 JSON）。 */
@@ -169,22 +188,12 @@ class WebSocketClient {
           const handleText = (text: string) => {
             try {
               const message: { type: string; data: unknown } = JSON.parse(text)
-              if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
-                if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) {
+              if (isDev) {
+                if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
                   console.log(`[WebSocket] Received message type=${message.type} (length: ${text.length})`)
+                } else {
+                  console.log(`[WebSocket] Received message type=${message.type}, data=`, truncateLogData(message.data))
                 }
-              } else {
-                const logData = JSON.parse(JSON.stringify(message.data || {}))
-                if (typeof logData === 'object' && logData !== null) {
-                  for (const key of Object.keys(logData)) {
-                    if (typeof logData[key] === 'string' && logData[key].length > 200) {
-                      logData[key] = `<string length=${logData[key].length}>`
-                    } else if (Array.isArray(logData[key]) && logData[key].length > 10) {
-                      logData[key] = `<array length=${logData[key].length}>`
-                    }
-                  }
-                }
-                console.log(`[WebSocket] Received message type=${message.type}, data=`, logData)
               }
               this.emit(message.type, message.data)
             } catch (err) {
@@ -193,6 +202,14 @@ class WebSocketClient {
           }
 
           try {
+            // MSE 二进制帧优先：magic=MSE，避免把 fMP4 当 UTF-8 JSON
+            if (event.data instanceof ArrayBuffer) {
+              const mse = tryParseMseBinaryFrame(event.data)
+              if (mse) {
+                this.emit(mse.type, { room_id: mse.roomId, data: mse.payload })
+                return
+              }
+            }
             const normalized = normalizeWebSocketPayload(event.data)
             if (typeof normalized === 'string') {
               handleText(normalized)
@@ -279,22 +296,15 @@ class WebSocketClient {
    *
    * @param type - 消息类型标识，用于 on() 路由分发
    * @param data - 消息载荷
+   * @returns 已发送或已入队返回 true；断连且不可入队时返回 false
    */
-  send(type: string, data: unknown): void {
-    if (type === 'align_preview_audio') {
-      console.log(`[WebSocket] Sending message type=${type} (PCM base64 audio payload)`)
-    } else {
-      const logData = JSON.parse(JSON.stringify(data || {}))
-      if (typeof logData === 'object' && logData !== null) {
-        for (const key of Object.keys(logData)) {
-          if (typeof logData[key] === 'string' && logData[key].length > 200) {
-            logData[key] = `<string length=${logData[key].length}>`
-          } else if (Array.isArray(logData[key]) && logData[key].length > 10) {
-            logData[key] = `<array length=${logData[key].length}>`
-          }
-        }
+  send(type: string, data: unknown): boolean {
+    if (isDev) {
+      if (type === 'align_preview_audio') {
+        console.log(`[WebSocket] Sending message type=${type} (PCM base64 audio payload)`)
+      } else {
+        console.log(`[WebSocket] Sending message type=${type}, data=`, truncateLogData(data))
       }
-      console.log(`[WebSocket] Sending message type=${type}, data=`, logData)
     }
 
     const message = { type, data }
@@ -302,7 +312,7 @@ class WebSocketClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       if (!shouldQueueWhenDisconnected(type)) {
         console.warn(`[WebSocket] Dropping stale message while disconnected: ${type}`)
-        return
+        return false
       }
       // 断连时入队，超出上限丢弃最旧的消息
       if (this.messageQueue.length >= this.maxQueueSize) {
@@ -310,9 +320,10 @@ class WebSocketClient {
       }
       this.messageQueue.push(payload)
       console.warn('WebSocket not connected, queuing message')
-      return
+      return true
     }
     this.ws.send(payload)
+    return true
   }
 
   /**

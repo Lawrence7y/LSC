@@ -225,6 +225,9 @@ export function VideoPreview({
         hasReceivedDataRef.current = true  // 收到错误也算有回馈
         onErrorRef.current?.(msg)
       },
+      onBackpressure: (bpState, pending) => {
+        send('mse_backpressure', { room_id: roomId, state: bpState, pending })
+      },
       onSourceOpen: () => {
         // MediaSource.sourceopen 触发后 video.src 已绑定到新 MediaSource，
         // 此时创建 Web Audio 路由才安全。若在 player.start() 之前创建，

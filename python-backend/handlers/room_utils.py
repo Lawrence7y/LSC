@@ -119,7 +119,7 @@ def cleanup_segments(segments: list[dict], min_duration: float = 1.0) -> list[di
 def round_lists_changed(a: list[dict], b: list[dict]) -> bool:
     if len(a) != len(b):
         return True
-    for ra, rb in zip(a, b):
+    for ra, rb in zip(a, b, strict=True):
         if ra.get('start') != rb.get('start') or ra.get('end') != rb.get('end'):
             return True
     return False

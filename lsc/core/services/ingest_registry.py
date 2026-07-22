@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from lsc.config import load_config
@@ -37,9 +38,9 @@ class PreviewStreamRegistry:
         self,
         room_id: str,
         ingest: SharedRoomIngest,
-        on_init_segment,
-        on_media_segment,
-        on_error=None,
+        on_init_segment: Callable[[bytes], None],
+        on_media_segment: Callable[[bytes], None],
+        on_error: Callable[[str], None] | None = None,
         pump_interval_sec: float = 0.05,
     ) -> SharedPreviewHandle:
         handle = SharedPreviewHandle(
@@ -76,7 +77,7 @@ class PreviewStreamRegistry:
 
 
 class SharedIngestRegistry:
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.RLock()
         self._ingests: dict[str, SharedRoomIngest] = {}
 

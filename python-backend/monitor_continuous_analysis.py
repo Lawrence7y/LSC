@@ -2,7 +2,6 @@
 import os
 import sys
 import time
-import json
 import tracemalloc
 from datetime import datetime
 
@@ -68,11 +67,7 @@ def run_analysis_cycle(proc, video_path, duration, cycle_num, scan_start, scan_e
 
     # Before state
     mem_before = proc.memory_info().rss / 1e6
-    cpu_before = proc.cpu_percent()
     snap_before = tracemalloc.take_snapshot()
-
-    # Get children before
-    children_before = get_child_processes(proc)
 
     # Run detection
     t0 = time.perf_counter()
@@ -110,7 +105,7 @@ def run_analysis_cycle(proc, video_path, duration, cycle_num, scan_start, scan_e
     print(format_rounds(rounds))
 
     if top_growth:
-        print(f"\n  Top 3 memory growth:")
+        print("\n  Top 3 memory growth:")
         for stat in top_growth:
             if stat.size_diff > 0:
                 print(f"    {stat.traceback.format()[-1]}")
@@ -148,7 +143,6 @@ def main():
     # Get video duration
     from lsc.config import load_config
     cfg = load_config()
-    cfg_ffmpeg = cfg.ffmpeg_path or "ffmpeg"
 
     import subprocess
     ffprobe = cfg.ffprobe_path or "ffprobe"
@@ -161,7 +155,7 @@ def main():
         sys.exit(1)
 
     print("="*60)
-    print(f"Continuous Analysis Resource Monitor")
+    print("Continuous Analysis Resource Monitor")
     print(f"  Video: {os.path.basename(VIDEO_PATH)} ({duration:.0f}s)")
     print(f"  Cycles: {NUM_CYCLES}")
     print(f"  Python PID: {proc.pid}")
@@ -218,7 +212,7 @@ def main():
     # Final memory snapshot
     final_snap = tracemalloc.take_snapshot()
     final_stats = final_snap.statistics("lineno")[:5]
-    print(f"\n  Final memory top 5:")
+    print("\n  Final memory top 5:")
     for stat in final_stats:
         size = stat.size / 1024
         if size > 100:

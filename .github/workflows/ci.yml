@@ -22,14 +22,36 @@ jobs:
       - name: Install lint tools
         run: |
           python -m pip install --upgrade pip
-          pip install ruff mypy
+          pip install ruff mypy types-psutil
 
-      - name: Run ruff (core module - must pass)
-        run: ruff check lsc/core/
+      - name: Run ruff (lsc + python-backend)
+        run: ruff check lsc/ python-backend/
 
-      - name: Run ruff (full codebase - informational)
-        run: ruff check lsc/ --exit-zero
+      - name: Run mypy (configured scope)
+        run: mypy
+
+      - name: Ruff scripts informational
+        run: ruff check scripts/valorant_vision/ --exit-zero
         continue-on-error: true
+
+  electron-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: lsc-electron/package-lock.json
+
+      - name: Install npm dependencies
+        working-directory: lsc-electron
+        run: npm ci
+
+      - name: Typecheck Electron frontend
+        working-directory: lsc-electron
+        run: npx tsc --noEmit
 
   test:
     runs-on: ${{ matrix.os }}
@@ -82,7 +104,7 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
-    needs: [lint, test]
+    needs: [lint, electron-typecheck, test]
     permissions:
       contents: write
 

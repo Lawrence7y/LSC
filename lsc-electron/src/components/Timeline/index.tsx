@@ -1,5 +1,6 @@
 import { useRef, useState, useCallback, useMemo, useEffect } from 'react'
 import type { TimelineHighlightBand } from '@/types'
+import { subscribeDisplayPlayhead } from '@/utils/playheadStore'
 import './Timeline.css'
 
 export interface TimelineClip {
@@ -37,9 +38,13 @@ interface TimelineProps {
   dvrStart?: number | null
   /** @deprecated 保留兼容；紫标已改用 dvrStart */
   recordedEnd?: number | null
+  /** 跟随直播沿：播放头钉右；与 ControlBar displayCurrent 一致 */
+  followLive?: boolean
+  /** 父级 scrub 中（冻结窗）；订阅直写时跳过以免打架 */
+  isScrubbing?: boolean
 }
 
-const DEFAULT_CLIP_COLOR = 'rgba(52, 199, 89, 0.25)'
+const DEFAULT_CLIP_COLOR = 'rgba(63, 131, 248, 0.72)'
 const SNAP_THRESHOLD = 0.85
 const TICK_INTERVALS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600, 7200, 14400, 21600, 43200]
 /** 主刻度优先落在这些「关键阶段」上（秒）：1m / 2m / 5m / 10m / 15m / 30m / 1h … */
@@ -180,13 +185,18 @@ export function Timeline({
   activeRefine,
   dvrStart = null,
   recordedEnd = null,
+  followLive = false,
+  isScrubbing = false,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
+  const playheadRef = useRef<HTMLDivElement>(null)
+  const progressFillRef = useRef<HTMLDivElement>(null)
   const [, setIsDragging] = useState(false)
   const [, setDraggingMarker] = useState<'in' | 'out' | null>(null)
   /** 拖拽中本地乐观播放头（相对 windowStart），避免等父级重渲染才动 */
   const [dragTime, setDragTime] = useState<number | null>(null)
+  const dragTimeRef = useRef<number | null>(null)
   const [hoverTime, setHoverTime] = useState<number | null>(null)
   const [trackWidth, setTrackWidth] = useState(800)
   const [scrollWidth, setScrollWidth] = useState(800)
@@ -203,6 +213,9 @@ export function Timeline({
   const ws = windowStart
   const dvrStartRef = useRef<number | null>(null)
   const recordedEndRef = useRef<number | null>(null)
+  const followLiveRef = useRef(followLive)
+  const isScrubbingPropRef = useRef(isScrubbing)
+  const effectiveDurationRef = useRef(1)
 
   // 最新回调进 ref，window 监听始终读最新闭包
   const getTimeFromXRef = useRef<(clientX: number) => number>(() => 0)
@@ -216,6 +229,11 @@ export function Timeline({
 
   const zoom = zoomLevel
   const effectiveDuration = useMemo(() => Math.max(duration || 1, 1), [duration])
+  effectiveDurationRef.current = effectiveDuration
+  followLiveRef.current = followLive
+  isScrubbingPropRef.current = isScrubbing
+  dragTimeRef.current = dragTime
+  wsRef.current = ws
 
   useEffect(() => {
     const track = trackRef.current
@@ -446,6 +464,37 @@ export function Timeline({
   const progressPct = clamp((displayPlayhead / effectiveDuration) * 100, 0, 100)
   const bufferedPct = clamp((buffered / effectiveDuration) * 100, 0, 100)
 
+  const applyPlayheadPct = useCallback((pct: number) => {
+    const clampedPct = clamp(pct, 0, 100)
+    if (playheadRef.current) playheadRef.current.style.left = `${clampedPct}%`
+    if (progressFillRef.current) progressFillRef.current.style.width = `${clampedPct}%`
+  }, [])
+
+  // seek / props 对齐；拖拽中走 dragTime 本地态
+  useEffect(() => {
+    if (dragTime != null) {
+      applyPlayheadPct(progressPct)
+      return
+    }
+    applyPlayheadPct(progressPct)
+  }, [progressPct, dragTime, applyPlayheadPct])
+
+  // 播放头高频通道：display 轴绝对时间 → 直写 DOM（60fps），不触发 React render
+  useEffect(() => {
+    return subscribeDisplayPlayhead((abs) => {
+      if (dragTimeRef.current != null || isDraggingRef.current) return
+      const dur = effectiveDurationRef.current
+      const windowS = wsRef.current
+      let rel: number
+      if (followLiveRef.current && !isScrubbingPropRef.current) {
+        rel = dur
+      } else {
+        rel = Math.min(Math.max(0, abs - windowS), dur)
+      }
+      applyPlayheadPct((rel / dur) * 100)
+    })
+  }, [applyPlayheadPct])
+
   const selection = useMemo(() => {
     if (markIn === null || markOut === null) return null
     const left = clamp((markIn / effectiveDuration) * 100, 0, 100)
@@ -458,43 +507,51 @@ export function Timeline({
   const hoverPct = hoverTime !== null ? clamp((hoverTime / effectiveDuration) * 100, 0, 100) : null
   const dvrStartPct = dvrStart != null ? clamp(((dvrStart - ws) / effectiveDuration) * 100, 0, 100) : null
 
-  const ticks = useMemo(() => {
-    const result: { time: number; abs: number; isMajor: boolean; isKey: boolean }[] = []
+  const tickStep = Math.max(1, Math.round(tickInterval))
+  const quantizedWs = Math.floor(ws / tickStep) * tickStep
+  // 绝对刻度集合按量化窗缓存；相对 left 每帧用真实 ws 换算，避免 followLive 每秒重建+sort
+  const tickAbs = useMemo(() => {
+    const result: { abs: number; isMajor: boolean; isKey: boolean }[] = []
     const step = Math.max(1, Math.round(tickInterval))
     const majorInterval = chooseMajorInterval(step, effectiveDuration)
-    const absStart = ws
-    const absEnd = ws + effectiveDuration
-    // 按绝对时间对齐，保证 10m / 1h 等整点落在主刻度上（而非相对窗起点的 11m55s）
+    const absStart = quantizedWs
+    const absEnd = quantizedWs + effectiveDuration + step
     let abs = Math.ceil((absStart + 1e-9) / step) * step
     if (absStart <= 1e-9) abs = 0
     for (; abs <= absEnd + 1e-6; abs += step) {
-      const rel = abs - ws
-      if (rel < -1e-6 || rel > effectiveDuration + 1e-6) continue
       const absSec = Math.round(abs)
       const isMajor = absSec > 0 && absSec % majorInterval === 0
       result.push({
-        time: rel,
         abs: absSec,
         isMajor,
         isKey: isKeyStage(absSec),
       })
     }
-    // 若自适应主刻度漏掉窗内的 10m / 1h，补强关键阶段竖线（长窗只补整点小时，避免过密）
     for (const landmark of MAJOR_LANDMARKS) {
       if (!isKeyStage(landmark)) continue
       if (landmark <= absStart || landmark >= absEnd) continue
       if (landmark % 3600 !== 0 && effectiveDuration > 2400) continue
       if (result.some((t) => t.abs === landmark)) continue
       result.push({
-        time: landmark - ws,
         abs: landmark,
         isMajor: true,
         isKey: true,
       })
     }
-    result.sort((a, b) => a.time - b.time)
+    result.sort((a, b) => a.abs - b.abs)
     return result
-  }, [effectiveDuration, tickInterval, ws])
+  }, [effectiveDuration, tickInterval, quantizedWs])
+
+  const ticks = useMemo(() => {
+    return tickAbs
+      .map(({ abs, isMajor, isKey }) => ({
+        time: abs - ws,
+        abs,
+        isMajor,
+        isKey,
+      }))
+      .filter((t) => t.time >= -1e-6 && t.time <= effectiveDuration + 1e-6)
+  }, [tickAbs, ws, effectiveDuration])
 
   const innerWidth = `${zoom * 100}%`
 
@@ -551,6 +608,7 @@ export function Timeline({
             {/* 波形已去除（档 B） */}
             <div className="lsc-timeline__buffered" style={{ width: `${bufferedPct}%` }} />
             <div
+              ref={progressFillRef}
               className={`lsc-timeline__progress${snapFlash ? ' lsc-timeline__progress--snap' : ''}`}
               style={{ width: `${progressPct}%` }}
             />
@@ -653,6 +711,7 @@ export function Timeline({
             )}
 
             <div
+              ref={playheadRef}
               className={`lsc-timeline__playhead ${
                 snapFlash?.type === 'playhead' ? 'lsc-timeline__playhead--snap' : ''
               }`}

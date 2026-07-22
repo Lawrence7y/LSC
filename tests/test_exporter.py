@@ -95,3 +95,54 @@ def test_parse_ffmpeg_progress_line_extracts_out_time_ms() -> None:
     state = {}
     parse_ffmpeg_progress_line("out_time_ms=15000000", state)
     assert state["out_time_ms"] == 15000000
+
+
+class TestExportCpuFallback:
+    def test_export_cpu_fallback_uses_popen_and_on_process(
+        self, exporter, tmp_path, monkeypatch,
+    ) -> None:
+        import inspect
+
+        from lsc.config import ExportProfile
+
+        on_process_calls: list[object] = []
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = 0
+
+        def fake_popen(cmd, **kwargs):
+            return mock_proc
+
+        monkeypatch.setattr("lsc.exporter.clip.subprocess.Popen", fake_popen)
+        monkeypatch.setattr(exporter, "_probe_codec_name", lambda _p: "h264")
+        monkeypatch.setattr(exporter, "_probe_source_video", lambda _p: ((1920, 1080), 30.0))
+
+        tmp_out = tmp_path / "out_tmp.mp4"
+        tmp_out.write_bytes(b"mp4")
+
+        profile = ExportProfile(codec="libx264", preset="medium")
+        ok = exporter._export_cpu_fallback(
+            video_path=str(tmp_path / "src.mp4"),
+            start_sec=0.0,
+            duration=5.0,
+            effective_profile=profile,
+            tmp_output_path=str(tmp_out),
+            env={},
+            creation_flags=0,
+            cwd=None,
+            progress_callback=None,
+            on_process=lambda p: on_process_calls.append(p),
+        )
+
+        assert ok is True
+        assert on_process_calls == [mock_proc]
+        mock_proc.wait.assert_called_once()
+        source = inspect.getsource(exporter._export_cpu_fallback)
+        assert "subprocess.run" not in source
+
+    def test_export_cpu_fallback_source_guard_no_subprocess_run(self) -> None:
+        import inspect
+
+        from lsc.exporter.clip import ClipExporter
+
+        source = inspect.getsource(ClipExporter._export_cpu_fallback)
+        assert "subprocess.run" not in source

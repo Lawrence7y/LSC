@@ -88,13 +88,16 @@ class _FakeWebSocket:
 
 
 class TestSequentialDispatch:
-    def test_handlers_run_sequentially_preserving_order(self, server):
+    def test_handlers_run_sequentially_preserving_order(self, server, monkeypatch):
         """同一连接上的消息按序执行，保证依赖状态的命令不错乱。
 
         慢 handler 会挡住后续消息——这是有意设计（见 server.handle_client 注释）。
         长耗时工作必须在 handler 内入队后立刻返回，不得在 handler 里 await 阻塞。
         """
         import json
+
+        # 测试环境无 token，禁用 token 校验避免连接被拒
+        monkeypatch.setenv('LSC_WS_TOKEN_REQUIRED', '0')
 
         order: list[str] = []
 

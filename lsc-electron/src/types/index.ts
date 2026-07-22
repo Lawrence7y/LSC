@@ -167,8 +167,8 @@ export interface WSPayloadMap {
   rooms_updated: { rooms: RoomSession[] }
   rooms_loaded: { rooms: RoomSession[] }
   room_updated: { room_id: string; [key: string]: unknown }
-  mse_init: { room_id: string; data: string }
-  mse_segment: { room_id: string; data: string }
+  mse_init: { room_id: string; data: ArrayBuffer | string }
+  mse_segment: { room_id: string; data: ArrayBuffer | string }
   mse_error: { room_id: string; error: string; reason?: 'offline' | 'network' | 'disk_full' | 'unknown' }
   mse_reconnecting: { room_id: string; attempt: number; max_attempts: number }
   mse_reconnected: { room_id: string; degraded?: boolean; width?: number; height?: number; fps?: number; reason?: string }
@@ -212,6 +212,7 @@ export interface ElectronAPI {
   getAppVersion: () => Promise<string>
   getPlatform: () => string
   getBackendWsUrl: () => Promise<string | null>
+  getBackendWsToken?: () => Promise<string | null>
   minimizeWindow: () => Promise<void>
   maximizeWindow: () => Promise<void>
   closeWindow: () => Promise<void>

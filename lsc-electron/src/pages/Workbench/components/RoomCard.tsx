@@ -58,6 +58,8 @@ interface RoomCardProps {
   expandedRoomId?: string | null
   /** 退出区域放大 */
   onCollapse?: (roomId: string) => void
+  /** 父级共享录制计时 tick（秒级），避免每卡独立 setInterval */
+  recordingTick?: number
 }
 
 /**
@@ -80,6 +82,7 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
   if (prev.onFullscreen !== next.onFullscreen) return false
   if (prev.onToggleMultiSelect !== next.onToggleMultiSelect) return false
   if (prev.expandedRoomId !== next.expandedRoomId) return false
+  if (prev.recordingTick !== next.recordingTick) return false
 
   // room 字段级浅比较
   const a = prev.room
@@ -128,18 +131,13 @@ export const RoomCard = memo(function RoomCard({
   onToggleMultiSelect,
   expandedRoomId,
   onCollapse,
+  recordingTick = 0,
 }: RoomCardProps) {
-  const [tick, setTick] = useState(0)
+  const tick = recordingTick
   const [disconnecting, setDisconnecting] = useState(false)
   const [localMuted, setLocalMuted] = useState(room.preview_muted)
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isExpanded = expandedRoomId === room.room_id
-
-  useEffect(() => {
-    if (!room.is_recording) return
-    const id = setInterval(() => setTick((t) => t + 1), 1000)
-    return () => clearInterval(id)
-  }, [room.is_recording])
 
   // 同步后端广播的实际静音状态（覆盖乐观更新）
   useEffect(() => {

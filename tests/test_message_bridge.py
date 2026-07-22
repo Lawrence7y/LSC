@@ -124,15 +124,14 @@ class TestQtManagerBridge:
 
     def test_broadcast_queue_max_size(self):
         bridge, _ = self._make_bridge()
-        # Fill the queue to capacity
-        for i in range(1005):  # slightly over maxsize=1000
-            bridge.queue_broadcast({"type": f"msg_{i}"})
-        # Should not crash, queue should be at or below maxsize
+        maxsize = bridge._broadcast_queue.maxsize
+        # Droppable overflow is discarded instead of expanding the queue.
+        for i in range(maxsize + 5):
+            bridge.queue_broadcast({"type": "mse_segment", "data": {"i": i}})
         count = 0
         while bridge.get_broadcast(block=False) is not None:
             count += 1
-        assert count <= 1000
-        assert count >= 995  # should be close to maxsize
+        assert count == maxsize
 
     def test_signal_callbacks_do_not_block_when_broadcast_queue_is_full(self):
         bridge, _ = self._make_bridge()

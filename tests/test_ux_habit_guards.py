@@ -34,12 +34,13 @@ def test_can_export_for_shortcut_rejects_pending_and_refining() -> None:
 
 
 def test_handle_export_many_does_not_auto_confirm_pending_with_bounds_only() -> None:
-    """批量导出不得静默 boundsOnly 确认 pending/refining。"""
+    """批量导出可对 pending 走 boundsOnly 确认再导出，但不得改精修态/同步目标。"""
     body = _handle_export_many_body(_workbench_source())
 
-    assert "boundsOnly" not in body
-    assert "handleConfirmClip(clip, i, { syncTargets: false, boundsOnly: true })" not in body
-    assert "handleConfirmClip" not in body
+    assert "boundsOnly: true" in body
+    assert "syncTargets: false" in body
+    # 禁止无 boundsOnly 的静默 handleConfirmClip（会改 refining / 同步）
+    assert "handleConfirmClip(clip, { syncTargets: false, boundsOnly: true })" in body
 
 
 def test_can_export_clip_includes_vision_confirmed() -> None:
@@ -52,17 +53,15 @@ def test_can_export_clip_includes_vision_confirmed() -> None:
 
 
 def test_clip_list_batch_export_uses_can_export_clip_only() -> None:
-    """导出全部/所选仅包含已确认可导项，pending 不得进入 actionableClips。"""
+    """导出全部/所选包含可确认导出项（pending 经确认并导出路径），与单条一致。"""
     source = _clip_list_source()
 
-    assert "canExportClip" in source
+    assert "canExportOrConfirmExport" in source
     actionable_block = source.split("const actionableClips = useMemo", 1)[1].split("const selectedClips", 1)[0]
-    assert "canExportClip" in actionable_block
-    assert "canExportOrConfirmExport" not in actionable_block
+    assert "canExportOrConfirmExport" in actionable_block
 
     selected_block = source.split("const selectedActionable = useMemo", 1)[1].split("const pendingCount", 1)[0]
-    assert "canExportClip" in selected_block
-    assert "canExportOrConfirmExport" not in selected_block
+    assert "canExportOrConfirmExport" in selected_block
 
 
 def test_clip_list_batch_export_tooltip_warns_pending() -> None:

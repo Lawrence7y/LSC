@@ -153,7 +153,7 @@ def build_rounds_from_videos(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Valorant 视觉分类与盲测回合评估")
-    src = p.add_mutually_exclusive_group(required=True)
+    src = p.add_mutually_exclusive_group(required=False)
     src.add_argument("--report", type=Path, help="已计算的评估报告 JSON")
     src.add_argument("--predictions", type=Path, help="预测 JSONL（与 --labels 联用）")
     p.add_argument("--labels", type=Path, help="标签 JSONL")
@@ -177,12 +177,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if not args.report and not args.predictions and not args.rounds and not args.round_manifest:
+        print(
+            "错误: 需要提供 --report/--predictions 和/或 --rounds/--round-manifest",
+            file=sys.stderr,
+        )
+        return 2
+
     classification_dict: dict | None = None
     rounds_dict: dict | None = None
 
     if args.report:
         classification_dict, rounds_dict = load_report_json(args.report)
-    else:
+    elif args.predictions:
         if not args.labels:
             print("错误: --predictions 需要同时提供 --labels", file=sys.stderr)
             return 2

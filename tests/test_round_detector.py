@@ -542,6 +542,18 @@ class TestRoundValidation:
 
         assert result == [(112, 180), (192, 315)]
 
+    def test_overlong_round_kept_not_mid_split(self, caplog):
+        """超长段保留整段并告警，不做假中点对切。"""
+        import logging
+
+        cfg = ValorantRoundConfig(max_combat_duration=90.0)
+
+        with caplog.at_level(logging.WARNING):
+            result = _validate_rounds([(10, 150)], cfg, duration=200.0)
+
+        assert result == [(10, 150)], "超长回合应保留为单段，禁止中点硬切"
+        assert any("超长回合未分割" in r.message for r in caplog.records)
+
 
 class TestOcrRefineFallback:
     def test_phase_markers_build_complete_reference_rounds(self):

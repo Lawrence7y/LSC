@@ -13,6 +13,7 @@ RecordingService 是录制功能的统一入口（Facade），
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from collections.abc import Callable
@@ -29,6 +30,7 @@ from lsc.core.models import (
     StreamQuality,
 )
 from lsc.core.services.ingest_registry import get_shared_ingest_registry
+from lsc.core.services.shared_ingest import SharedRoomIngest
 from lsc.platforms.base import StreamInfo
 from lsc.platforms.registry import parse_stream
 from lsc.recorder.capture import CaptureResult, StreamCapture, validate_recording
@@ -649,8 +651,8 @@ class RecordingService:
 
         platform = re.sub(r"[^\w\-]", "_", (room.platform or "unknown")).strip("_")[:20]
         streamer = re.sub(r"[^\w\-]", "_", (room.streamer or "room")).strip("_")[:30]
-        # 用 room_url 的 hash 作为短 ID，避免依赖 uuid
-        short_id = hex(hash(room.room_url) & 0xFFFFFF)[2:].zfill(6)
+        # 用 room_url 的稳定 hash 作为短 ID，避免依赖 uuid / PYTHONHASHSEED
+        short_id = hashlib.sha1(room.room_url.encode("utf-8")).hexdigest()[:6]
         name = f"{platform}_{streamer}_{short_id}"
         name = re.sub(r"_+", "_", name).strip("_")
         if not name:
@@ -786,7 +788,7 @@ class _SharedCaptureAdapter:
 
     __slots__ = ("ingest", "room_id", "output_path", "last_error", "_started_mono")
 
-    def __init__(self, *, ingest, room_id: str, output_path: str) -> None:
+    def __init__(self, *, ingest: SharedRoomIngest, room_id: str, output_path: str) -> None:
         self.ingest = ingest
         self.room_id = room_id
         self.output_path = output_path
@@ -839,7 +841,7 @@ class _SessionHandle:
         self,
         *,
         session: RecordingSession,
-        capture: StreamCapture,
+        capture: StreamCapture | _SharedCaptureAdapter,
         config: RecordingConfig,
         room_headers: dict[str, str],
     ) -> None:

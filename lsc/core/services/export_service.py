@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Lock
+from typing import Any
 
 from lsc import get_logger
 from lsc.config import ExportProfile, LscConfig, load_config
@@ -71,7 +73,7 @@ class ExportService:
         self._executor: ThreadPoolExecutor | None = None
         self._futures: dict[str, Future[ExportResult]] = {}
         # clip_id -> 正在运行的 FFmpeg 进程，用于取消时终止
-        self._processes: dict[str, object] = {}
+        self._processes: dict[str, subprocess.Popen[Any]] = {}
         self._lock = Lock()
         self._on_progress: ExportProgressCallback | None = None
         self._on_done: ExportDoneCallback | None = None
@@ -179,7 +181,7 @@ class ExportService:
             self._futures[clip.clip_id] = future
 
         # 完成后自动清理，防止 _futures 字典无限增长
-        def _on_done(f, cid: str = clip.clip_id) -> None:
+        def _on_done(f: Future[ExportResult], cid: str = clip.clip_id) -> None:
             with self._lock:
                 # 仅在仍是同一个 future 时移除（避免移除重新提交的新 future）
                 if self._futures.get(cid) is f:
@@ -202,7 +204,7 @@ class ExportService:
 
         return _cb
 
-    def _register_process(self, clip_id: str, proc: object) -> None:
+    def _register_process(self, clip_id: str, proc: subprocess.Popen[Any]) -> None:
         """注册正在运行的 FFmpeg 进程，供 cancel_export 终止。"""
         with self._lock:
             self._processes[clip_id] = proc
@@ -341,7 +343,7 @@ class ExportService:
 
         try:
             env, creation_flags, cwd = prepare_launch(self._config.ffmpeg_path)
-            run_kwargs = {"capture_output": True, "timeout": 30, "env": env, "cwd": cwd}
+            run_kwargs: dict[str, Any] = {"capture_output": True, "timeout": 30, "env": env, "cwd": cwd}
             if creation_flags:
                 run_kwargs["creationflags"] = creation_flags
             result = subprocess.run(cmd, **run_kwargs)

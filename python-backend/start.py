@@ -35,12 +35,18 @@ def main():
     loop = asyncio.new_event_loop()
 
     async def _drain_broadcasts():
-        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。"""
+        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端（事件驱动）。"""
         from server import drain_merge_broadcasts
+        wake = asyncio.Event()
+        bridge.bind_async_wake(loop, wake)
         while True:
             merged = drain_merge_broadcasts(bridge)
             if not merged:
-                await asyncio.sleep(0.1)
+                wake.clear()
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
                 continue
             for msg in merged:
                 await server.broadcast(msg.get('type'), msg.get('data', {}))

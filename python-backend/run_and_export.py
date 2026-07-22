@@ -4,10 +4,10 @@ Pipeline:
     detect_valorant_rounds -> ClipExporter -> output clips to specified directory
     Monitor CPU/memory throughout.
 """
+import json
 import os
 import sys
 import time
-import json
 from datetime import datetime
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

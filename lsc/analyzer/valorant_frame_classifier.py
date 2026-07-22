@@ -9,7 +9,11 @@ from typing import Any
 
 import numpy as np
 
-from lsc.analyzer.ocr_accel import list_accel_candidates
+from lsc.analyzer.ocr_accel import (
+    list_accel_candidates,
+    normalize_ocr_accel,
+    read_settings_ocr_accel,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -37,6 +41,7 @@ class ValorantFrameClassifier:
         self._session: Any = None
         self._meta: dict[str, Any] | None = None
         self._provider: str | None = None
+        self._provider_warning: str | None = None
         self._lock = threading.Lock()
 
     @property
@@ -48,6 +53,10 @@ class ValorantFrameClassifier:
     @property
     def provider(self) -> str | None:
         return self._provider
+
+    @property
+    def provider_warning(self) -> str | None:
+        return self._provider_warning
 
     @property
     def thresholds(self) -> dict[str, float]:
@@ -106,14 +115,31 @@ class ValorantFrameClassifier:
         import onnxruntime as ort
 
         last_err: Exception | None = None
+        self._provider_warning = None
         for accel in list_accel_candidates():  # dml/cuda (if any) then cpu
             provider = _provider_for_accel(accel)
             try:
                 sess = ort.InferenceSession(
                     str(onnx_path), providers=[provider, "CPUExecutionProvider"]
                 )
-                self._provider = sess.get_providers()[0]
+                actual = sess.get_providers()[0]
+                if accel != "cpu" and actual == "CPUExecutionProvider":
+                    last_err = RuntimeError(f"{provider} unavailable (session on CPU)")
+                    _log.warning("provider %s unavailable (session on CPU), trying next", provider)
+                    continue
+                self._provider = actual
                 _log.info("valorant classifier provider=%s", self._provider)
+                if self._provider == "CPUExecutionProvider":
+                    mode = normalize_ocr_accel(read_settings_ocr_accel())
+                    if mode != "cpu":
+                        msg = (
+                            f"valorant classifier fell back to CPU "
+                            f"(ocr_accel={mode}, requested={provider}). "
+                            "Install onnxruntime-directml or onnxruntime-gpu "
+                            "(uninstall plain onnxruntime first)."
+                        )
+                        self._provider_warning = msg
+                        _log.warning(msg)
                 return sess
             except Exception as exc:  # noqa: BLE001 — 尝试下一 provider
                 last_err = exc

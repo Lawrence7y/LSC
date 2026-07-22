@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 import shutil
+import threading
 from dataclasses import dataclass, field
+from typing import Any
 
 _log = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class ExportProfile:
     fps: float = 0.0
     generate_thumbnail: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """验证参数范围。"""
         # CRF 范围验证 (0-51)
         if not 0 <= self.crf <= 51:
@@ -213,7 +214,7 @@ class LscConfig:
     shared_ingest_preview_preset: str = "veryfast"
     profile: Profile = field(default_factory=Profile)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.ffmpeg_path:
             self.ffmpeg_path = _find_executable("ffmpeg")
         if not self.ffprobe_path:
@@ -327,16 +328,12 @@ def export_decode_hwaccel_args(codec: str | None = None) -> list[str]:
     return []
 
 
-def load_config(force_reload: bool = False) -> LscConfig:
-    """加载 LSC 配置。
-
-    返回单例实例，避免多房间场景下反复创建 LscConfig。
-    """
+def _load_config_unlocked(force_reload: bool = False) -> LscConfig:
     global _config_instance
     if force_reload or _config_instance is None:
         from typing import get_type_hints
         overrides = _load_config_overrides()
-        validated = {}
+        validated: dict[str, Any] = {}
         field_map = get_type_hints(LscConfig)
         for key, val in overrides.items():
             expected = field_map.get(key)
@@ -357,15 +354,24 @@ def load_config(force_reload: bool = False) -> LscConfig:
     return _config_instance
 
 
+def load_config(force_reload: bool = False) -> LscConfig:
+    """加载 LSC 配置。
+
+    返回单例实例，避免多房间场景下反复创建 LscConfig。
+    """
+    with _config_lock:
+        return _load_config_unlocked(force_reload)
+
+
 def reload_config() -> LscConfig:
     """重新加载 LSC 配置。
 
     当 FFmpeg 路径或其他关键配置变化时调用，强制重新创建单例。
     """
-    global _config_instance
-    _config_instance = load_config(force_reload=True)
-    _log.info("LSC config reloaded")
-    return _config_instance
+    with _config_lock:
+        result = _load_config_unlocked(force_reload=True)
+        _log.info("LSC config reloaded")
+        return result
 
 
 def reset_config() -> None:
@@ -374,8 +380,9 @@ def reset_config() -> None:
     下次调用 load_config() 时会重新创建实例。
     """
     global _config_instance
-    _config_instance = None
-    _log.debug("LSC config singleton reset")
+    with _config_lock:
+        _config_instance = None
+        _log.debug("LSC config singleton reset")
 
 
 __all__ = ["LscConfig", "load_config", "reload_config", "reset_config", "Profile", "ExportProfile"]

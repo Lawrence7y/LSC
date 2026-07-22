@@ -111,6 +111,7 @@ def detect_kill_events(
     cancel_check: Callable[[], bool] | None = None,
     game: str = _DEFAULT_GAME,
     time_range: tuple[float, float] | None = None,
+    use_frame_diff: bool = False,
 ) -> list[dict[str, Any]]:
     """检测击杀提示框变化，返回击杀事件与回合标记列表。
 
@@ -127,6 +128,7 @@ def detect_kill_events(
         progress_callback: 进度回调
         cancel_check: 取消检查回调
         game: 游戏名称，支持 "valorant"（默认）、"cs2"、"apex"
+        use_frame_diff: 是否启用帧差预筛（默认关闭，仅减少 OCR 调用）
 
     返回:
         事件列表，每个事件包含:
@@ -143,7 +145,11 @@ def detect_kill_events(
         _log.warning("rapidocr-onnxruntime 未安装，跳过 OCR 检测")
         return []
 
-    width, height = _get_video_resolution(video_path, ffmpeg_path)
+    resolution = _get_video_resolution(video_path, ffmpeg_path)
+    if resolution is None:
+        _log.warning("ocr_unavailable: 无法探测视频分辨率，跳过 OCR 检测")
+        return []
+    width, height = resolution
     if width == 0 or height == 0:
         return []
 
@@ -219,7 +225,7 @@ def detect_kill_events(
                 prev_frame_gray = None
                 continue
 
-            if prev_frame_gray is not None:
+            if use_frame_diff and prev_frame_gray is not None:
                 if _has_cv2:
                     diff = cv2.absdiff(frame_gray, prev_frame_gray)
                     mean_diff = float(np.mean(diff))
@@ -292,9 +298,12 @@ def detect_kill_events(
         # 第二遍: 检测回合标记 (从视频中提取回合边界)
         round_marker_crop = game_config.get("round_marker_crop")
         if round_marker_crop is not None:
+            if cancel_check and cancel_check():
+                return events
             events = _detect_round_markers(
                 events, video_path, ffmpeg_path, width, height,
                 round_marker_crop, _SAMPLE_INTERVAL, game_config["name"],
+                cancel_check=cancel_check,
             )
 
         if progress_callback:
@@ -330,6 +339,7 @@ def _detect_round_markers(
     marker_crop_ratio: tuple[float, float, float, float],
     sample_interval: float,
     game_name: str,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """检测回合边界标记（Round X / Phase 文字变化）。
 
@@ -373,6 +383,8 @@ def _detect_round_markers(
         round_markers: list[dict[str, Any]] = []
 
         for i, fname in enumerate(frame_files):
+            if cancel_check and cancel_check():
+                break
             fpath = os.path.join(tmp_dir, fname)
             result_ocr, _ = ocr(fpath)
             # 只保留置信度足够的 OCR 结果
@@ -420,8 +432,8 @@ def _detect_round_markers(
 
 
 
-def _get_video_resolution(video_path: str, ffmpeg_path: str) -> tuple[int, int]:
-    """获取视频分辨率。"""
+def _get_video_resolution(video_path: str, ffmpeg_path: str) -> tuple[int, int] | None:
+    """获取视频分辨率。探测失败返回 None（禁止静默回退 1080p）。"""
     try:
         cmd = [ffmpeg_path, "-i", video_path, "-hide_banner"]
         result = run_hidden(
@@ -439,4 +451,4 @@ def _get_video_resolution(video_path: str, ffmpeg_path: str) -> tuple[int, int]:
                     return int(m.group(1)), int(m.group(2))
     except Exception as exc:
         _log.debug("操作异常（已忽略）: %s", exc)
-    return 1920, 1080
+    return None

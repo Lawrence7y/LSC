@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 from typing import Any
 
 from lsc.utils.process_launcher import run_hidden

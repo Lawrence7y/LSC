@@ -115,7 +115,7 @@ def aggregate_onsets_to_combat_segments(
             clusters.append([ts])
 
     segments = []
-    for idx, cluster in enumerate(clusters):
+    for _idx, cluster in enumerate(clusters):
         start = min(cluster) - padding_sec
         end = max(cluster) + padding_sec
         seg_dur = end - start

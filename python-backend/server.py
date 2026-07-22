@@ -7,6 +7,7 @@ from typing import Any
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+from ws_auth import extract_token_from_path, is_origin_allowed, validate_ws_token
 
 _log = logging.getLogger('lsc.server')
 
@@ -109,11 +110,22 @@ class LSCWebSocketServer:
             if callable(close_fn):
                 await close_fn(code=1008, reason='Origin required')
             return
-        if origin != 'null' and not origin.startswith(('http://localhost', 'http://127.0.0.1')):
+        if not is_origin_allowed(origin):
             _log.warning("Rejected WebSocket connection from origin: %s", origin)
             close_fn = getattr(websocket, 'close', None)
             if callable(close_fn):
                 await close_fn(code=1008, reason='Origin not allowed')
+            return
+
+        path = getattr(websocket, 'path', None)
+        if path is None and hasattr(websocket, 'request'):
+            path = getattr(websocket.request, 'path', None)
+        token = extract_token_from_path(path)
+        if not validate_ws_token(token):
+            _log.warning("Rejected WebSocket connection: invalid or missing token")
+            close_fn = getattr(websocket, 'close', None)
+            if callable(close_fn):
+                await close_fn(code=1008, reason='Token invalid')
             return
 
         self.clients.add(websocket)
@@ -232,6 +244,20 @@ class LSCWebSocketServer:
             log_data = _truncate_for_log(data)
             _log.debug(f"Broadcasted WS message: type={message_type}, data={log_data}")
 
+    async def broadcast_bytes(self, payload: bytes) -> None:
+        """广播原始二进制帧（用于 MSE fMP4，避免 base64）。"""
+        if not self.clients or not payload:
+            return
+        await asyncio.gather(
+            *[client.send(payload) for client in self.clients],
+            return_exceptions=True,
+        )
+
+    async def broadcast_mse(self, kind: str, room_id: str, payload: bytes) -> None:
+        """广播 MSE init/segment 为二进制帧。"""
+        from mse_ws_frames import pack_mse_frame
+        await self.broadcast_bytes(pack_mse_frame(kind, room_id, payload))
+
     async def start(self):
         """启动服务器，支持端口回退（主端口被占用时尝试备用端口）。"""
         ports_to_try = [self.port] + [p for p in self.fallback_ports if p != self.port]
@@ -284,6 +310,8 @@ def drain_merge_broadcasts(bridge):
 
     def _keyed(msg_type: str, data: dict[str, Any]) -> str | None:
         if msg_type == 'recording_stopped':
+            return f"{msg_type}:{data.get('room_id', '')}"
+        if msg_type == 'room_updated':
             return f"{msg_type}:{data.get('room_id', '')}"
         if msg_type in ('clip_completed', 'clip_failed', 'export_progress', 'clip_export_started'):
             return f"{msg_type}:{data.get('job_id') or data.get('clip_id', '')}"
@@ -349,11 +377,17 @@ def main():
     loop = asyncio.new_event_loop()
 
     async def _drain_broadcasts():
-        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端。"""
+        """从 bridge 队列消费广播消息并推送给 WebSocket 客户端（事件驱动）。"""
+        wake = asyncio.Event()
+        bridge.bind_async_wake(loop, wake)
         while True:
             merged = drain_merge_broadcasts(bridge)
             if not merged:
-                await asyncio.sleep(0.1)
+                wake.clear()
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
                 continue
             for msg in merged:
                 await server.broadcast(msg.get('type'), msg.get('data', {}))

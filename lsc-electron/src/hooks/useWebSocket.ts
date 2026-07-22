@@ -14,14 +14,14 @@ let _sharedHandlersCleanup: (() => void) | null = null
 const _mseInitRetryTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 
 // 模块级 MSE init 段缓存：消除 mse_init 早于 VideoPreview 挂载到达的竞态。
-// key = roomId, value = base64-encoded init segment data
-const _mseInitCache: Record<string, string> = {}
+// key = roomId, value = ArrayBuffer init segment
+const _mseInitCache: Record<string, ArrayBuffer> = {}
 const _mseInitCacheTime: Record<string, number> = {}
 
 // 模块级 MSE media 段缓存：消除 mse_segment 早于 VideoPreview 挂载到达的竞态。
-// key = roomId, value = base64-encoded media segment data 数组（最多 10 个，约 5 秒）。
+// key = roomId, value = ArrayBuffer media segments（最多 10 个，约 5 秒）。
 // player 注册时会回放缓存，避免初始几秒丢帧导致黑屏。
-const _mseSegmentCache: Record<string, string[]> = {}
+const _mseSegmentCache: Record<string, ArrayBuffer[]> = {}
 const _mseSegmentCacheTime: Record<string, number> = {}
 const _MSE_SEGMENT_CACHE_MAX = 10
 const _MSE_CACHE_TTL_MS = 5 * 60 * 1000
@@ -32,6 +32,9 @@ const _mseWatchdogFailCount: Record<string, number> = {}
 const _MSE_WATCHDOG_TIMEOUT_MS = 10000
 const _MSE_WATCHDOG_RECOVERY_COOLDOWN_MS = 15000
 let _mseWatchdogTimer: ReturnType<typeof setInterval> | null = null
+
+/** 断连时写操作被丢弃的用户可见提示（useWebSocket.send 统一弹出） */
+export const DISCONNECTED_SEND_WARNING = '未连接后端，操作未发送'
 
 /** system_stats 节流：避免高频推送触发全树重渲染 */
 const SYSTEM_STATS_MIN_INTERVAL_MS = 1000
@@ -70,9 +73,9 @@ function _pruneExpiredMseCache(): void {
   }
 }
 
-function _cacheMseInit(roomId: string, b64Data: string): void {
+function _cacheMseInit(roomId: string, buffer: ArrayBuffer): void {
   _pruneExpiredMseCache()
-  _mseInitCache[roomId] = b64Data
+  _mseInitCache[roomId] = buffer
   _mseInitCacheTime[roomId] = Date.now()
   // 最多缓存 20 个房间的 init 段，避免内存无限增长
   const keys = Object.keys(_mseInitCache)
@@ -82,14 +85,14 @@ function _cacheMseInit(roomId: string, b64Data: string): void {
   }
 }
 
-function _cacheMseSegment(roomId: string, b64Data: string): void {
+function _cacheMseSegment(roomId: string, buffer: ArrayBuffer): void {
   _pruneExpiredMseCache()
   if (!_mseSegmentCache[roomId]) {
     _mseSegmentCache[roomId] = []
   }
   _mseSegmentCacheTime[roomId] = Date.now()
   const arr = _mseSegmentCache[roomId]
-  arr.push(b64Data)
+  arr.push(buffer)
   // 超出上限丢弃最旧
   while (arr.length > _MSE_SEGMENT_CACHE_MAX) {
     arr.shift()
@@ -97,7 +100,7 @@ function _cacheMseSegment(roomId: string, b64Data: string): void {
 }
 
 /** 取出并清空某房间的 media 段缓存，供 player 注册时回放。 */
-function _drainMseSegmentCache(roomId: string): string[] {
+function _drainMseSegmentCache(roomId: string): ArrayBuffer[] {
   const arr = _mseSegmentCache[roomId]
   if (!arr || arr.length === 0) return []
   delete _mseSegmentCache[roomId]
@@ -110,17 +113,14 @@ function _drainMseSegmentCache(roomId: string): string[] {
  * 这是消除"mse_segment 早于 player 注册到达"竞态的关键路径。
  */
 export function drainPendingMseSegments(roomId: string): ArrayBuffer[] {
-  const b64Arr = _drainMseSegmentCache(roomId)
-  return b64Arr.map(b64 => _decodeBase64Segment(b64))
+  return _drainMseSegmentCache(roomId)
 }
 
 /** 获取某房间缓存的 init 段（不解码，返回 ArrayBuffer 或 null）。
  * 供 VideoPreview 创建 player 时优先用缓存 init 段 feedInit，
  * 避免等待 request_mse_init 往返。 */
 export function getMseInitCache(roomId: string): ArrayBuffer | null {
-  const b64 = _mseInitCache[roomId]
-  if (!b64) return null
-  return _decodeBase64Segment(b64)
+  return _mseInitCache[roomId] ?? null
 }
 
 function _decodeBase64Segment(b64Data: string): ArrayBuffer {
@@ -133,21 +133,28 @@ function _decodeBase64Segment(b64Data: string): ArrayBuffer {
   return bytes.buffer
 }
 
-function _feedMseSegment(roomId: string, b64Data: string, type: 'init' | 'segment'): void {
+function _coerceMsePayload(data: ArrayBuffer | string): ArrayBuffer {
+  if (typeof data === 'string') {
+    return _decodeBase64Segment(data)
+  }
+  return data
+}
+
+function _feedMseSegment(roomId: string, data: ArrayBuffer | string, type: 'init' | 'segment'): void {
   try {
+    const buffer = _coerceMsePayload(data)
     // 缓存 init 段，供后续 VideoPreview 挂载时直接取用
     if (type === 'init') {
-      _cacheMseInit(roomId, b64Data)
+      _cacheMseInit(roomId, buffer)
     }
 
-    const buffer = _decodeBase64Segment(b64Data)
     const registry = (window as any).__msePlayers as Record<string, any> | undefined
     const player = registry?.[roomId]
     if (!player) {
       // player 未注册时缓存 media 段，避免初始几秒丢帧。
       // init 段已通过 _cacheMseInit 缓存，此处只处理 media 段。
       if (type === 'segment') {
-        _cacheMseSegment(roomId, b64Data)
+        _cacheMseSegment(roomId, buffer)
       }
       return
     }
@@ -336,13 +343,13 @@ function _attachSharedWebSocketHandlers(): () => void {
     }
   })
 
-  const unsubMseInit = wsClient.on('mse_init', (data: { room_id: string; data: string }) => {
+  const unsubMseInit = wsClient.on('mse_init', (data: { room_id: string; data: ArrayBuffer | string }) => {
     if (data?.room_id && data?.data) {
       _feedMseSegment(data.room_id, data.data, 'init')
     }
   })
 
-  const unsubMseSegment = wsClient.on('mse_segment', (data: { room_id: string; data: string }) => {
+  const unsubMseSegment = wsClient.on('mse_segment', (data: { room_id: string; data: ArrayBuffer | string }) => {
     if (data?.room_id && data?.data) {
       _lastMseSegmentTimePerRoom.set(data.room_id, Date.now())
       _mseWatchdogFailCount[data.room_id] = 0
@@ -442,13 +449,13 @@ function _attachSharedWebSocketHandlers(): () => void {
       const roomId = data.room_id
 
       // 后端尚未就绪，但前端可能已通过 mse_init 广播收到了 init 段
-      const cachedB64 = _mseInitCache[roomId]
-      if (cachedB64) {
+      const cachedInit = _mseInitCache[roomId]
+      if (cachedInit) {
         try {
           const registry = (window as any).__msePlayers as Record<string, any> | undefined
           const player = registry?.[roomId]
           if (player) {
-            player.feedInit(_decodeBase64Segment(cachedB64))
+            player.feedInit(cachedInit)
             console.log(`MSE init delivered from frontend cache for ${roomId}`)
             return
           }
@@ -509,7 +516,7 @@ function _attachSharedWebSocketHandlers(): () => void {
       _mseWatchdogFailCount[r.room_id] = fails
       console.warn(`[WS] Stall detected for room ${r.room_id} (${(stall / 1000).toFixed(1)}s), recovering preview...`)
 
-      if (fails >= 2 || r.preview_phase === 'error') {
+      if (fails >= 2) {
         message.warning({ content: '预览恢复中', key: `mse-stall-${r.room_id}`, duration: 3 })
         wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
       } else if (_mseInitCache[r.room_id]) {
@@ -594,8 +601,12 @@ export function useWebSocket() {
     }
   }, [])
 
-  const send = useCallback((type: string, data: any) => {
-    wsClient.send(type, data)
+  const send = useCallback((type: string, data: any): boolean => {
+    const ok = wsClient.send(type, data)
+    if (!ok) {
+      message.warning(DISCONNECTED_SEND_WARNING)
+    }
+    return ok
   }, [])
 
   const on = useCallback((event: string, handler: (data: any) => void) => {

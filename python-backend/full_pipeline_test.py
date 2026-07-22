@@ -1,10 +1,15 @@
-import os, sys, time, json
+import json
+import os
+import sys
+import time
+
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-import psutil
 from datetime import datetime
+
+import psutil
 
 VIDEO_PATH = (
     r"D:\desktop\新建文件夹\新建文件夹\新建文件夹"
@@ -49,7 +54,7 @@ def export_clip(source_path, output_path, ffmpeg_path, start_sec, end_sec):
         proc2 = subprocess.run(cmd_re, capture_output=True, timeout=120)
         wall2 = time.perf_counter() - t1
         if proc2.returncode != 0:
-            return False, f"both failed", 0
+            return False, "both failed", 0
         size_mb = os.path.getsize(output_path) / 1e6 if os.path.isfile(output_path) else 0
         return True, f"{wall+wall2:.2f}s(re)", size_mb
 
@@ -102,7 +107,7 @@ def main():
     print(f"  548-688 region covered: {'YES' if covered_548_688 else 'NO'}")
 
     # Step 2: Filter and export
-    print(f"\n[2/3] Exporting clips...")
+    print("\n[2/3] Exporting clips...")
     valid_rounds = []
     for r in all_rounds:
         start = r.get('start', 0)
@@ -141,7 +146,7 @@ def main():
     total_export_time = time.perf_counter() - t_export_start
 
     # Step 3: Summary
-    print(f"\n[3/3] Summary")
+    print("\n[3/3] Summary")
     print("="*60)
     print(f"  Rounds detected: {len(all_rounds)}")
     print(f"  Valid rounds: {len(valid_rounds)}")
@@ -170,7 +175,7 @@ def main():
     print(f"  Manifest: {manifest_path}")
 
     # Verify output files exist
-    print(f"\n  Output dir contents:")
+    print("\n  Output dir contents:")
     for fn in sorted(os.listdir(OUTPUT_DIR)):
         if fn.startswith("clip_") and fn.endswith(".mp4"):
             fp = os.path.join(OUTPUT_DIR, fn)

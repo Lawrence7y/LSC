@@ -14,7 +14,6 @@
 """
 from __future__ import annotations
 
-import copy
 import logging
 import os
 import re
@@ -24,7 +23,10 @@ import wave
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from lsc.analyzer.valorant_round_fsm import FrameEvidence
 
 import numpy as np
 
@@ -309,9 +311,9 @@ def detect_valorant_rounds(
                   len(combat_segments), analysis_duration)
         try:
             from lsc.analyzer.onset_detector import (
+                aggregate_onsets_to_combat_segments,
                 compute_spectral_flux,
                 detect_onset_events,
-                aggregate_onsets_to_combat_segments,
             )
             flux, flux_rate = compute_spectral_flux(samples, int(framerate))
             onset_events = detect_onset_events(flux, flux_rate)
@@ -385,6 +387,18 @@ def detect_valorant_rounds(
         # 全回合模式：跳过钟声切分，仅用 RMS merge_gap 合并段
         # 防止假钟声（BGM/解说/技能音效）在回合中间硬切一刀
         round_boundaries = combat_segments
+        # 安全网：若合并后段超过 max_combat_duration，说明可能误合并了相邻回合，
+        # 回退使用钟声分割（真正的双回合误合并靠钟声处理）
+        has_oversized = any(
+            (e - s) > cfg.max_combat_duration for s, e in round_boundaries
+        )
+        if has_oversized and local_chime_timestamps:
+            _log.debug(
+                "全回合模式: 检测到超长段(>%.0fs)，回退钟声分割", cfg.max_combat_duration
+            )
+            round_boundaries = _split_by_round_end_chimes(
+                round_boundaries, local_chime_timestamps, cfg, rms_len=len(smoothed)
+            )
         trimmed_rounds = round_boundaries  # 也不裁买枪期（full_round 已在 Pass 4 中跳过）
         validated = _validate_rounds(trimmed_rounds, cfg, analysis_duration)
         _log.debug("全回合模式: 跳过钟声分割, %d 个战斗段, 验证后 %d 个回合",
@@ -784,9 +798,10 @@ def _ocr_round_has_combat_energy(
     head_mean = float(np.mean(head))
     rest_mean = float(np.mean(rest)) if len(rest) else head_mean
     # 纯买枪：全程远低于战斗阈值，且后半段无明显抬升
-    if peak < threshold * 0.5 and rest_mean < max(head_mean * 1.3, threshold * 0.35):
-        return False
-    return True
+    return not (
+        peak < threshold * 0.5
+        and rest_mean < max(head_mean * 1.3, threshold * 0.35)
+    )
 
 
 def _segment_energy_signals(
@@ -896,11 +911,11 @@ def _validate_rounds(
 
         # 过滤超长段：可能是两个回合误合并
         if combat_len > cfg.max_combat_duration:
-            # 尝试在中点附近找能量低谷进行分割
-            mid = (seg_start + seg_end) // 2
-            validated.append((seg_start, mid))
-            validated.append((mid, seg_end))
-            _log.debug("超长回合分割: [%d-%d] → 两段", seg_start, seg_end)
+            _log.warning(
+                "超长回合未分割（取消假中点切）: [%d-%d] len=%d > max=%d",
+                seg_start, seg_end, combat_len, cfg.max_combat_duration,
+            )
+            validated.append((seg_start, seg_end))
             continue
 
         # 过滤过短段（< min_combat_duration）
@@ -1201,7 +1216,11 @@ def _detect_round_phase_markers(
     import re
     import shutil
 
-    width, height = _get_video_resolution(video_path, ffmpeg_path)
+    resolution = _get_video_resolution(video_path, ffmpeg_path)
+    if resolution is None:
+        _log.warning("ocr_unavailable: 无法探测视频分辨率，跳过 HUD 相位 OCR")
+        return []
+    width, height = resolution
     if width <= 0 or height <= 0:
         return []
 
@@ -1430,7 +1449,11 @@ def _refine_rounds_with_ocr(
     if cancel_check and cancel_check():
         return rounds
 
-    width, height = _get_video_resolution(video_path, ffmpeg_path)
+    resolution = _get_video_resolution(video_path, ffmpeg_path)
+    if resolution is None:
+        _log.warning("ocr_unavailable: 无法探测视频分辨率，跳过边界校正")
+        return rounds
+    width, height = resolution
     # Valorant 回合标记 HUD 裁剪区域（与 ocr_detector._GAME_CONFIGS["valorant"] 一致）
     marker_crop = (0.35, 0.01, 0.30, 0.06)
     # 采样间隔取 1.0s：回合校正只需秒级精度，降低 OCR 帧数开销
@@ -1698,7 +1721,7 @@ def build_frame_evidence(
     left_score: int | None,
     right_score: int | None,
     model_version: str,
-) -> "FrameEvidence":
+) -> FrameEvidence:
     from lsc.analyzer.valorant_round_fsm import FrameEvidence
 
     return FrameEvidence(
@@ -1712,6 +1735,9 @@ def build_frame_evidence(
     )
 
 
+_HYBRID_EXTRACT_MAX_WIDTH = 640
+
+
 def extract_frames_cancellable(
     video_path: str,
     *,
@@ -1722,7 +1748,11 @@ def extract_frames_cancellable(
     cancel_check: Callable[[], bool] | None = None,
     overlap_sec: float = 2.0,
 ) -> list[tuple[float, np.ndarray]]:
-    """Extract full-frame JPEGs with CancellableFFmpeg; dedupe by showinfo pts."""
+    """Extract downscaled JPEGs with optional hwaccel; dedupe by showinfo pts.
+
+    Hybrid 分类只需 224×224，OCR 只要顶部条带；抽帧统一缩到 640 宽，
+    并复用 OCR 路径的硬解参数（失败自动回退软解）。
+    """
     from lsc.utils.cancellable_ffmpeg import CancellableFFmpeg, FFmpegCancelled
     from lsc.utils.process_launcher import prepare_launch
 
@@ -1741,7 +1771,11 @@ def extract_frames_cancellable(
     frames: list[tuple[float, np.ndarray]] = []
     try:
         output_pattern = os.path.join(tmp_dir, "frame_%05d.jpg")
-        cmd = [
+        vf = (
+            f"scale={_HYBRID_EXTRACT_MAX_WIDTH}:-2,"
+            f"fps={fps:.3f},showinfo"
+        )
+        base_cmd = [
             ffmpeg_path,
             "-y",
             "-loglevel",
@@ -1753,24 +1787,51 @@ def extract_frames_cancellable(
             "-i",
             video_path,
             "-vf",
-            f"fps={fps:.3f},showinfo",
+            vf,
             "-q:v",
             "2",
             output_pattern,
         ]
+        hwaccel_args = ffmpeg_hwaccel_args(read_settings_ocr_accel())
+        attempts: list[list[str]] = []
+        if hwaccel_args:
+            attempts.append([base_cmd[0], *hwaccel_args, *base_cmd[1:]])
+        attempts.append(list(base_cmd))
+
         env, _creation_flags, cwd = prepare_launch(ffmpeg_path)
-        runner = CancellableFFmpeg(cmd, cancel_check=cancel_check, env=env, cwd=cwd)
-        runner.start()
-        try:
-            completed = runner.wait(timeout_sec=360.0)
-        except FFmpegCancelled:
-            raise
-        if completed.returncode != 0:
-            err = (completed.stderr or b"").decode("utf-8", errors="replace")[-500:]
+        completed = None
+        last_err = ""
+        for attempt_i, cmd in enumerate(attempts):
+            # 硬解失败后清掉半成品，避免软解读到残帧
+            for stale in os.listdir(tmp_dir):
+                try:
+                    os.remove(os.path.join(tmp_dir, stale))
+                except OSError:
+                    pass
+            runner = CancellableFFmpeg(
+                cmd, cancel_check=cancel_check, env=env, cwd=cwd
+            )
+            runner.start()
+            try:
+                completed = runner.wait(timeout_sec=360.0)
+            except FFmpegCancelled:
+                raise
+            if completed.returncode == 0:
+                break
+            last_err = (completed.stderr or b"").decode(
+                "utf-8", errors="replace"
+            )[-500:]
+            if attempt_i + 1 < len(attempts):
+                _log.warning(
+                    "hybrid frame extract hwaccel 失败 (code=%s)，回退软解",
+                    completed.returncode,
+                )
+                continue
             raise RuntimeError(
-                f"hybrid frame extract failed rc={completed.returncode}: {err}"
+                f"hybrid frame extract failed rc={completed.returncode}: {last_err}"
             )
 
+        assert completed is not None
         frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
         precise_timestamps: list[float] = []
         for match in frame_ts_pattern.finditer(
@@ -1802,11 +1863,6 @@ def read_top_digit_anchors(
     frame_bgr: np.ndarray,
 ) -> tuple[float | None, int | None, int | None]:
     """OCR top HUD strip for timer and scores; returns None on failure (never 0)."""
-    try:
-        import cv2
-    except ImportError:
-        return None, None, None
-
     if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
         return None, None, None
 
@@ -1821,24 +1877,12 @@ def read_top_digit_anchors(
         _log.debug("read_top_digit_anchors: OCR unavailable: %s", exc)
         return None, None, None
 
-    tmp_path: str | None = None
     try:
-        ok, encoded = cv2.imencode(".jpg", top)
-        if not ok:
-            return None, None, None
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp.write(encoded.tobytes())
-            tmp_path = tmp.name
-        result_ocr, _ = ocr(tmp_path)
+        # RapidOCR 直接吃 ndarray，避免 JPEG 编解码 + 临时文件往返
+        result_ocr, _ = ocr(top)
     except Exception as exc:
         _log.debug("read_top_digit_anchors: OCR failed: %s", exc)
         return None, None, None
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
 
     confident_lines = [
         line for line in (result_ocr or []) if len(line) >= 3 and line[2] >= 0.40
@@ -1913,6 +1957,40 @@ def refine_boundary_from_sequence(
     return None
 
 
+def refine_combat_start_after_buy(
+    seq: list[tuple[float, str]],
+    *,
+    min_stable: int,
+    fps: float,
+) -> float | None:
+    """Prefer combat start after the last buy in-window (buy-exit), not earlier combat flicker."""
+    del fps
+    if min_stable <= 0:
+        return None
+    last_buy_ts: float | None = None
+    for ts, label in seq:
+        if label == "buy":
+            last_buy_ts = ts
+    run = 0
+    run_start: float | None = None
+    for ts, label in seq:
+        if last_buy_ts is not None and ts < last_buy_ts:
+            continue
+        if label == "combat":
+            if run == 0:
+                run_start = ts
+            run += 1
+            if run >= min_stable:
+                return run_start
+        else:
+            run = 0
+            run_start = None
+    # fallback: any combat run in window
+    return refine_boundary_from_sequence(
+        seq, target="combat", min_stable=min_stable, fps=1.0,
+    )
+
+
 def compute_clip_end(
     result_event_ts: float,
     next_states: list[tuple[float, str]],
@@ -1943,6 +2021,99 @@ def grade_round_confirmation(
     return "pending"
 
 
+def _row_interval(row: dict[str, Any]) -> tuple[float, float]:
+    start = float(row.get("start", row.get("start_sec", 0.0)))
+    end = float(row.get("end", row.get("end_sec", 0.0)))
+    return start, end
+
+
+def _interval_iou(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    inter_start = max(a_start, b_start)
+    inter_end = min(a_end, b_end)
+    if inter_end <= inter_start:
+        return 0.0
+    intersection = inter_end - inter_start
+    union = max(a_end, b_end) - min(a_start, b_start)
+    return intersection / union if union > 0 else 0.0
+
+
+def _is_listed_row(row: dict[str, Any]) -> bool:
+    listed = row.get("listed")
+    if listed is None:
+        return True
+    return bool(listed)
+
+
+def _should_merge_listed_rounds(
+    prev: dict[str, Any],
+    curr: dict[str, Any],
+    *,
+    iou_threshold: float,
+    max_gap_sec: float,
+) -> bool:
+    prev_start, prev_end = _row_interval(prev)
+    curr_start, curr_end = _row_interval(curr)
+    if _interval_iou(prev_start, prev_end, curr_start, curr_end) >= iou_threshold:
+        return True
+    inter_end = min(prev_end, curr_end)
+    if inter_end > max(prev_start, curr_start):
+        return True
+    gap = curr_start - prev_end
+    return 0.0 <= gap < max_gap_sec
+
+
+def _pick_confirm_status(a: str | None, b: str | None) -> str:
+    if a == "vision_confirmed" or b == "vision_confirmed":
+        return "vision_confirmed"
+    return a or b or "pending"
+
+
+def _merge_two_listed_rounds(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    a_start, a_end = _row_interval(a)
+    b_start, b_end = _row_interval(b)
+    merged = {**a, **b}
+    merged_start = min(a_start, b_start)
+    merged_end = max(a_end, b_end)
+    merged["start"] = merged_start
+    merged["end"] = merged_end
+    merged["confirm_status"] = _pick_confirm_status(
+        a.get("confirm_status"),
+        b.get("confirm_status"),
+    )
+    if merged_end - merged_start > 150.0:
+        merged["merge_audit"] = "long_duration"
+    return merged
+
+
+def merge_listed_rounds(
+    rows: list[dict[str, Any]],
+    *,
+    iou_threshold: float = 0.5,
+    max_gap_sec: float = 3.0,
+) -> list[dict[str, Any]]:
+    """Merge overlapping, nested, or near-adjacent listed hybrid rounds."""
+    if not rows:
+        return []
+
+    listed_rows = [row for row in rows if _is_listed_row(row)]
+    unlisted_rows = [row for row in rows if not _is_listed_row(row)]
+
+    merged: list[dict[str, Any]] = []
+    for row in sorted(listed_rows, key=lambda item: _row_interval(item)):
+        normalized = {**row, "start": _row_interval(row)[0], "end": _row_interval(row)[1]}
+        if merged and _should_merge_listed_rounds(
+            merged[-1],
+            normalized,
+            iou_threshold=iou_threshold,
+            max_gap_sec=max_gap_sec,
+        ):
+            merged[-1] = _merge_two_listed_rounds(merged[-1], normalized)
+        else:
+            merged.append(normalized)
+
+    return sorted(merged + unlisted_rows, key=lambda item: _row_interval(item))
+
+
 _HYBRID_CLASS_NAMES = ("non_game", "buy", "combat", "result", "replay")
 _COARSE_FPS = 1.0
 _DENSE_FPS = 9.0
@@ -1950,6 +2121,85 @@ _DENSE_REFINE_WINDOW_SEC = 5.0
 _DENSE_MIN_STABLE_FRAMES = 3
 _HYBRID_OVERLAP_SEC = 2.0
 _HYBRID_COARSE_BATCH = 16
+END_LOOKAHEAD_SEC = 45.0
+END_LOOKBACK_SEC = 8.0
+_END_TRANSITION_LABELS = frozenset({"buy", "non_game", "replay"})
+
+
+def find_last_stable_label_run(
+    seq: list[tuple[float, str]],
+    *,
+    target: str,
+    min_stable: int,
+) -> float | None:
+    """Return timestamp of the last run of min_stable consecutive target labels."""
+    if min_stable <= 0:
+        return None
+    last_start: float | None = None
+    run = 0
+    run_start: float | None = None
+    for ts, label in seq:
+        if label == target:
+            if run == 0:
+                run_start = ts
+            run += 1
+            if run >= min_stable:
+                last_start = run_start
+        else:
+            run = 0
+            run_start = None
+    return last_start
+
+
+def refine_end_with_next_buy_anchor(
+    seq: list[tuple[float, str]],
+    *,
+    coarse_end: float,
+    round_start: float,
+    lookahead_sec: float = END_LOOKAHEAD_SEC,
+    lookback_sec: float = END_LOOKBACK_SEC,
+    min_stable: int = _DENSE_MIN_STABLE_FRAMES,
+    tail_sec: float = 1.5,
+) -> tuple[float, bool]:
+    """Lock clip end to the last stable result before next buy/non_game.
+
+    Requires a following transition into buy/non_game/replay. On failure returns
+    ``(coarse_end, False)`` so the caller keeps a weak/pending end.
+    """
+    horizon = coarse_end + max(0.0, lookahead_sec)
+    lookback = max(float(round_start), coarse_end - max(0.0, lookback_sec), 0.0)
+    ordered = sorted(seq, key=lambda item: item[0])
+
+    buy_anchor: float | None = None
+    non_game_anchor: float | None = None
+    for ts, label in ordered:
+        if ts <= coarse_end:
+            continue
+        if ts > horizon:
+            break
+        if label == "buy" and buy_anchor is None:
+            buy_anchor = ts
+        elif label == "non_game" and non_game_anchor is None:
+            non_game_anchor = ts
+    anchor = buy_anchor if buy_anchor is not None else (
+        non_game_anchor if non_game_anchor is not None else horizon
+    )
+
+    window = [(ts, label) for ts, label in ordered if lookback <= ts <= anchor]
+    result_ts = find_last_stable_label_run(
+        window, target="result", min_stable=min_stable,
+    )
+    if result_ts is None:
+        return float(coarse_end), False
+
+    has_transition = any(
+        ts > result_ts and ts <= anchor and label in _END_TRANSITION_LABELS
+        for ts, label in ordered
+    )
+    if not has_transition:
+        return float(coarse_end), False
+
+    return compute_clip_end(result_ts, ordered, tail_sec=tail_sec), True
 
 
 def _make_hybrid_round_key(coarse_start: float, session_id: str) -> str:
@@ -1990,13 +2240,11 @@ def _predict_class_from_probs(
 
 
 def _needs_digit_anchors(predicted: str, prev_predicted: str | None) -> bool:
-    if predicted in ("buy", "result"):
-        return True
-    if prev_predicted == "buy" and predicted == "combat":
-        return True
-    if prev_predicted == "combat" and predicted == "result":
-        return True
-    return False
+    return (
+        predicted in ("buy", "result")
+        or (prev_predicted == "buy" and predicted == "combat")
+        or (prev_predicted == "combat" and predicted == "result")
+    )
 
 
 def _confidence_from_probs(
@@ -2015,8 +2263,19 @@ def _confidence_from_probs(
     return prob * 0.5
 
 
-def _is_strong_confidence(confidence: float, thresholds: dict[str, float]) -> bool:
-    return confidence >= float(thresholds.get("high_prob", 0.8))
+def _is_strong_confidence(
+    confidence: float,
+    thresholds: dict[str, float],
+    *,
+    label: str | None = None,
+) -> bool:
+    if label == "result":
+        cutoff = float(
+            thresholds.get("result_high_prob", thresholds.get("high_prob", 0.8))
+        )
+    else:
+        cutoff = float(thresholds.get("high_prob", 0.8))
+    return confidence >= cutoff
 
 
 def _build_hybrid_boundary_evidence(
@@ -2041,7 +2300,9 @@ def _build_hybrid_boundary_evidence(
 def _dense_classify_sequence(
     video_path: str,
     *,
-    center_ts: float,
+    center_ts: float | None = None,
+    scan_start: float | None = None,
+    scan_end: float | None = None,
     ffmpeg_path: str,
     cancel_check: Callable[[], bool] | None,
     extract_fn: Callable[..., list[tuple[float, np.ndarray]]] | None,
@@ -2050,8 +2311,17 @@ def _dense_classify_sequence(
 ) -> list[tuple[float, str, dict[str, float]]]:
     from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
 
-    scan_start = max(0.0, center_ts - _DENSE_REFINE_WINDOW_SEC)
-    scan_end = center_ts + _DENSE_REFINE_WINDOW_SEC
+    if scan_start is None or scan_end is None:
+        if center_ts is None:
+            raise ValueError("center_ts or scan_start/scan_end required")
+        scan_start = max(0.0, float(center_ts) - _DENSE_REFINE_WINDOW_SEC)
+        scan_end = float(center_ts) + _DENSE_REFINE_WINDOW_SEC
+    else:
+        scan_start = max(0.0, float(scan_start))
+        scan_end = float(scan_end)
+    if scan_end <= scan_start:
+        return []
+
     extractor = extract_fn or extract_frames_cancellable
     try:
         raw_frames = extractor(
@@ -2109,9 +2379,8 @@ def _refine_hybrid_start(
         raise
 
     label_seq = [(ts, label) for ts, label, _ in sequence]
-    refined = refine_boundary_from_sequence(
+    refined = refine_combat_start_after_buy(
         label_seq,
-        target="combat",
         min_stable=_DENSE_MIN_STABLE_FRAMES,
         fps=_DENSE_FPS,
     )
@@ -2123,7 +2392,7 @@ def _refine_hybrid_start(
         {},
     )
     if not combat_probs:
-        for ts, label, probs in sequence:
+        for _ts, label, probs in sequence:
             if label == "combat":
                 combat_probs = probs
                 break
@@ -2133,19 +2402,25 @@ def _refine_hybrid_start(
 def _refine_hybrid_end(
     video_path: str,
     *,
-    center_ts: float,
+    coarse_end: float,
+    round_start: float,
     ffmpeg_path: str,
     cancel_check: Callable[[], bool] | None,
     extract_fn: Callable[..., list[tuple[float, np.ndarray]]] | None,
     classifier: Any,
     thresholds: dict[str, float],
+    lookahead_sec: float = END_LOOKAHEAD_SEC,
+    lookback_sec: float = END_LOOKBACK_SEC,
 ) -> tuple[float | None, dict[str, float]]:
     from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
 
+    scan_start = max(0.0, float(round_start), float(coarse_end) - max(0.0, lookback_sec))
+    scan_end = float(coarse_end) + max(0.0, lookahead_sec)
     try:
         sequence = _dense_classify_sequence(
             video_path,
-            center_ts=center_ts,
+            scan_start=scan_start,
+            scan_end=scan_end,
             ffmpeg_path=ffmpeg_path,
             cancel_check=cancel_check,
             extract_fn=extract_fn,
@@ -2156,23 +2431,35 @@ def _refine_hybrid_end(
         raise
 
     label_seq = [(ts, label) for ts, label, _ in sequence]
-    result_ts = refine_boundary_from_sequence(
+    clip_end, ok = refine_end_with_next_buy_anchor(
         label_seq,
-        target="result",
+        coarse_end=float(coarse_end),
+        round_start=float(round_start),
+        lookahead_sec=lookahead_sec,
+        lookback_sec=lookback_sec,
         min_stable=_DENSE_MIN_STABLE_FRAMES,
-        fps=_DENSE_FPS,
     )
-    if result_ts is None:
-        result_ts = center_ts
+    if not ok:
+        return None, {}
 
-    clip_end = compute_clip_end(result_ts, label_seq)
-    result_probs = next(
-        (probs for ts, label, probs in sequence if ts == result_ts and label == "result"),
-        {},
+    lookback = max(float(round_start), float(coarse_end) - max(0.0, lookback_sec), 0.0)
+    window = [(ts, label) for ts, label in label_seq if lookback <= ts <= scan_end]
+    result_ts = find_last_stable_label_run(
+        window, target="result", min_stable=_DENSE_MIN_STABLE_FRAMES,
     )
+    result_probs: dict[str, float] = {}
+    if result_ts is not None:
+        result_probs = next(
+            (
+                probs
+                for ts, label, probs in sequence
+                if ts == result_ts and label == "result"
+            ),
+            {},
+        )
     if not result_probs:
-        for ts, label, probs in sequence:
-            if label == "result":
+        for ts, label, probs in reversed(sequence):
+            if label == "result" and ts <= clip_end:
                 result_probs = probs
                 break
     return clip_end, result_probs
@@ -2194,7 +2481,7 @@ def detect_valorant_rounds_hybrid(
 ) -> list[dict[str, Any]]:
     """1 FPS 粗扫 -> FSM -> 候选前后 5s @8-10FPS 密扫 -> 证据分级。"""
     from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
-    from lsc.analyzer.valorant_round_fsm import BOUNDARY_SOURCE, RESULT_TAIL_SEC, RoundFSM, RoundFSMConfig
+    from lsc.analyzer.valorant_round_fsm import BOUNDARY_SOURCE, RoundFSM, RoundFSMConfig
     from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
 
     if not os.path.isfile(video_path):
@@ -2221,6 +2508,7 @@ def detect_valorant_rounds_hybrid(
     model_version = clf.model_version
     state["model_version"] = model_version
     state["provider"] = getattr(clf, "provider", None)
+    state["provider_warning"] = getattr(clf, "provider_warning", None)
     anchors_reader = read_anchors_fn or read_top_digit_anchors
     extractor = extract_fn or extract_frames_cancellable
 
@@ -2255,8 +2543,13 @@ def detect_valorant_rounds_hybrid(
         coarse_probs.extend(probs)
 
     existing_fsm = state.get("fsm")
-    fsm = copy.deepcopy(existing_fsm) if existing_fsm is not None else RoundFSM(RoundFSMConfig())
+    # Clone (not deepcopy): feed() mutates FSM; runtime_state["fsm"] must stay intact
+    # if this pass returns early (e.g. FFmpegCancelled).
+    fsm = existing_fsm.clone() if existing_fsm is not None else RoundFSM(RoundFSMConfig())
     key_map: dict[str, str] = dict(state.get("key_map") or {})
+    start_refine_cache: dict[str, tuple[float | None, dict[str, float]]] = dict(
+        state.get("start_refine_cache") or {}
+    )
     closed_rounds: list[dict[str, Any]] = []
     prev_predicted: str | None = state.get("prev_predicted")
     total_frames = len(coarse_frames)
@@ -2300,6 +2593,7 @@ def detect_valorant_rounds_hybrid(
                     )
                 except FFmpegCancelled:
                     return []
+                start_refine_cache[event.round_key] = (refined_start, start_probs)
                 if refined_start is not None:
                     fsm.apply_refine(event.round_key, start=refined_start)
 
@@ -2310,23 +2604,25 @@ def detect_valorant_rounds_hybrid(
                 end_by = event.end_by or "model_result"
                 score_confirm = end_by == "model_score"
 
-                result_center = max(
-                    event.start,
-                    coarse_end - RESULT_TAIL_SEC,
-                )
+                cached_start = start_refine_cache.pop(event.round_key, None)
                 try:
-                    refined_start, start_probs = _refine_hybrid_start(
-                        video_path,
-                        center_ts=coarse_start,
-                        ffmpeg_path=ffmpeg_path,
-                        cancel_check=cancel_check,
-                        extract_fn=extract_fn,
-                        classifier=clf,
-                        thresholds=thresholds,
-                    )
+                    if cached_start is not None:
+                        refined_start, start_probs = cached_start
+                    else:
+                        # opened 未精修（跨会话/旧状态）时才补一次
+                        refined_start, start_probs = _refine_hybrid_start(
+                            video_path,
+                            center_ts=coarse_start,
+                            ffmpeg_path=ffmpeg_path,
+                            cancel_check=cancel_check,
+                            extract_fn=extract_fn,
+                            classifier=clf,
+                            thresholds=thresholds,
+                        )
                     refined_end, end_probs = _refine_hybrid_end(
                         video_path,
-                        center_ts=result_center,
+                        coarse_end=coarse_end,
+                        round_start=coarse_start,
                         ffmpeg_path=ffmpeg_path,
                         cancel_check=cancel_check,
                         extract_fn=extract_fn,
@@ -2345,6 +2641,7 @@ def detect_valorant_rounds_hybrid(
                     start_probs, "combat", thresholds=thresholds,
                 )
                 end_label = "result" if end_by == "model_result" else "combat"
+                # Failed next-buy refine keeps coarse_end with empty probs → weak end.
                 end_confidence = _confidence_from_probs(
                     end_probs, end_label, thresholds=thresholds,
                 )
@@ -2352,9 +2649,14 @@ def detect_valorant_rounds_hybrid(
                     ev.timer_seconds is not None and ev.timer_seconds <= 100.0
                     for ev in [evidence]
                 )
+                end_strong = _is_strong_confidence(
+                    end_confidence,
+                    thresholds,
+                    label="result" if end_by == "model_result" else None,
+                )
                 confirm_status = grade_round_confirmation(
                     start_strong=_is_strong_confidence(start_confidence, thresholds),
-                    end_strong=_is_strong_confidence(end_confidence, thresholds),
+                    end_strong=end_strong,
                     score_confirm=score_confirm,
                 )
                 boundary_confidence = (start_confidence + end_confidence) / 2.0
@@ -2394,16 +2696,21 @@ def detect_valorant_rounds_hybrid(
     if runtime_state is not None:
         state["fsm"] = fsm
         state["key_map"] = key_map
+        state["start_refine_cache"] = start_refine_cache
         state["last_processed_ts"] = coarse_frames[-1][0]
         state["prev_predicted"] = prev_predicted
         state["model_version"] = model_version
         state["provider"] = getattr(clf, "provider", None)
+        state["provider_warning"] = getattr(clf, "provider_warning", None)
 
-    return closed_rounds
+    return merge_listed_rounds(closed_rounds)
 
 
 __all__ = [
     "detect_valorant_rounds",
     "detect_valorant_rounds_hybrid",
+    "find_last_stable_label_run",
+    "merge_listed_rounds",
+    "refine_end_with_next_buy_anchor",
     "ValorantRoundConfig",
 ]

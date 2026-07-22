@@ -6,6 +6,22 @@ from enum import Enum
 RESULT_TAIL_SEC = 1.5
 NON_GAME_ABORT_SEC = 5.0
 BOUNDARY_SOURCE = "valorant_hybrid_v1"
+# 无畏契约买枪倒计时通常 ≤30s（手枪/半场首局可达 45s）；交战倒计时通常 >45。
+BUY_TIMER_MAX_SEC = 45.0
+
+
+def _is_buy_phase_timer(timer_seconds: float | None) -> bool:
+    """True when HUD timer clearly indicates buy / pre-round countdown."""
+    if timer_seconds is None:
+        return False
+    return 0.0 < float(timer_seconds) <= BUY_TIMER_MAX_SEC
+
+
+def _is_combat_phase_timer(timer_seconds: float | None) -> bool:
+    """True when HUD timer looks like in-round spike/combat clock (> buy max)."""
+    if timer_seconds is None:
+        return False
+    return float(timer_seconds) > BUY_TIMER_MAX_SEC
 
 
 class _State(Enum):
@@ -41,6 +57,7 @@ class RoundEvent:
 @dataclass
 class RoundFSMConfig:
     coarse_stable_frames: int = 2
+    result_stable_frames: int = 1  # 结算字常只有 1 粗扫帧，1 帧即可关局
     max_open_sec: float = 150.0
     result_tail_sec: float = RESULT_TAIL_SEC
     non_game_abort_sec: float = NON_GAME_ABORT_SEC
@@ -63,10 +80,35 @@ class RoundFSM:
         self._ocr_conflict = False
         self._non_game_start: float | None = None
         self._refined: dict[str, dict[str, float | None]] = {}
+        # 买枪倒计时粘性：combat 误检帧常不读 OCR，用最近一次 timer 外推挡住买枪内开局
+        self._last_timer: float | None = None
+        self._last_timer_ts: float | None = None
+
+    def clone(self) -> RoundFSM:
+        """Shallow copy for incremental hybrid passes; avoids deepcopy on each tick."""
+        other = RoundFSM(self._config)
+        other._state = self._state
+        other._stable_class = self._stable_class
+        other._stable_count = self._stable_count
+        other._stable_run_first_ts = self._stable_run_first_ts
+        other._open_start = self._open_start
+        other._round_key = self._round_key
+        other._baseline_left = self._baseline_left
+        other._baseline_right = self._baseline_right
+        other._score_increment_seen = self._score_increment_seen
+        other._ocr_conflict = self._ocr_conflict
+        other._non_game_start = self._non_game_start
+        other._refined = {k: dict(v) for k, v in self._refined.items()}
+        other._last_timer = self._last_timer
+        other._last_timer_ts = self._last_timer_ts
+        return other
 
     def feed(self, ev: FrameEvidence) -> list[RoundEvent]:
         events: list[RoundEvent] = []
         cls = ev.predicted_class
+        if ev.timer_seconds is not None:
+            self._last_timer = float(ev.timer_seconds)
+            self._last_timer_ts = float(ev.timestamp)
 
         if self._state == _State.ROUND_OPEN:
             if self._open_start is not None and ev.timestamp - self._open_start > self._config.max_open_sec:
@@ -83,15 +125,29 @@ class RoundFSM:
         if cls in ("non_game", "replay"):
             return events
 
-        if self._state == _State.ROUND_OPEN:
+        effective_timer = self._effective_timer(ev)
+
+        # 买枪 HUD 上的比分变化属于下一回合买枪，不能当成本回合终点。
+        if (
+            self._state == _State.ROUND_OPEN
+            and cls != "buy"
+            and not _is_buy_phase_timer(effective_timer)
+        ):
             score_close = self._try_close_on_score(ev)
             if score_close is not None:
                 events.append(score_close)
                 return events
 
         if self._state == _State.ROUND_OPEN and cls == "result":
+            # 仅当本帧读到交战钟时才判误检；不用粘性外推，避免关局被长期挡住。
+            if _is_combat_phase_timer(ev.timer_seconds):
+                return events
             self._note_score(ev)
-            if self._advance_stable(cls, ev.timestamp):
+            if self._advance_stable(
+                cls,
+                ev.timestamp,
+                need=int(self._config.result_stable_frames),
+            ):
                 close = self._close_round(
                     first_result_ts=self._stable_run_first_ts or ev.timestamp,
                     end_by="model_result",
@@ -102,9 +158,18 @@ class RoundFSM:
             return events
 
         if self._advance_stable(cls, ev.timestamp):
-            events.extend(self._on_stable_transition(cls))
+            events.extend(self._on_stable_transition(cls, timer_seconds=effective_timer))
 
         return events
+
+    def _effective_timer(self, ev: FrameEvidence) -> float | None:
+        if ev.timer_seconds is not None:
+            return float(ev.timer_seconds)
+        if self._last_timer is None or self._last_timer_ts is None:
+            return None
+        # 买枪/交战倒计时近似 1:1 走秒；外推到当前帧
+        extrapolated = float(self._last_timer) - (float(ev.timestamp) - float(self._last_timer_ts))
+        return extrapolated
 
     def apply_refine(
         self,
@@ -119,16 +184,22 @@ class RoundFSM:
         if end is not None:
             entry["end"] = end
 
-    def _advance_stable(self, cls: str, ts: float) -> bool:
+    def _advance_stable(self, cls: str, ts: float, *, need: int | None = None) -> bool:
         if cls == self._stable_class:
             self._stable_count += 1
         else:
             self._stable_class = cls
             self._stable_count = 1
             self._stable_run_first_ts = ts
-        return self._stable_count >= self._config.coarse_stable_frames
+        threshold = int(self._config.coarse_stable_frames if need is None else need)
+        return self._stable_count >= max(1, threshold)
 
-    def _on_stable_transition(self, cls: str) -> list[RoundEvent]:
+    def _on_stable_transition(
+        self,
+        cls: str,
+        *,
+        timer_seconds: float | None = None,
+    ) -> list[RoundEvent]:
         first_ts = self._stable_run_first_ts or 0.0
         self._reset_stable()
 
@@ -137,6 +208,9 @@ class RoundFSM:
             return []
 
         if self._state == _State.WAIT_COMBAT and cls == "combat":
+            # 买枪倒计时内的 combat 误检不得开局（否则起点落在买枪段）。
+            if _is_buy_phase_timer(timer_seconds):
+                return []
             self._state = _State.ROUND_OPEN
             self._open_start = first_ts
             self._round_key = f"hybrid-{int(first_ts)}"

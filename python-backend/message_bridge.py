@@ -16,6 +16,16 @@ from PySide6.QtCore import QObject, Signal
 
 _log = logging.getLogger(__name__)
 
+_TERMINAL_TYPES = frozenset({
+    "clip_completed", "clip_failed",
+    "recording_stopped", "recording_started",
+    "reconnect_failed", "continuous_highlights",
+})
+_DROPPABLE_TYPES = frozenset({
+    "rooms_updated", "mse_segment", "export_progress", "analysis_progress",
+    "continuous_analysis_status", "system_stats",
+})
+
 
 class _CallRequest:
     """一次跨线程函数调用的请求封装。"""
@@ -55,7 +65,28 @@ class QtManagerBridge(QObject):
         manager.recording_stopped.connect(self._on_recording_stopped)
 
         self._broadcast_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
+        # 事件驱动唤醒：queue_broadcast 后通知 asyncio broadcaster，避免 100ms 空转轮询
+        self._wake = threading.Event()
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_wake: Any = None  # asyncio.Event，由 WS 线程 bind
         _log.info("QtManagerBridge initialized (broadcast_queue maxsize=1000)")
+
+    def bind_async_wake(self, loop: Any, event: Any) -> None:
+        """绑定 asyncio 事件循环与 Event，供 queue_broadcast 跨线程唤醒。"""
+        self._async_loop = loop
+        self._async_wake = event
+
+    def notify_broadcast(self) -> None:
+        """唤醒等待中的 broadcaster（线程安全）。"""
+        self._wake.set()
+        loop = self._async_loop
+        event = self._async_wake
+        if loop is None or event is None:
+            return
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            _log.debug("notify_broadcast: event loop closed")
 
     def _on_execute(self, req: _CallRequest):
         """在 Qt 主线程执行请求函数并设置结果/异常。"""
@@ -161,17 +192,75 @@ class QtManagerBridge(QObject):
     def queue_broadcast(self, msg: dict[str, Any]) -> None:
         """线程安全地投递一条广播消息到队列，供 WebSocket 线程消费。"""
         msg_type = msg.get('type')
+        try:
+            self._broadcast_queue.put_nowait(msg)
+            _log.debug("queued broadcast: type=%s", msg_type or '?')
+            self.notify_broadcast()
+            return
+        except queue.Full:
+            pass
+
+        if msg_type in _DROPPABLE_TYPES:
+            _log.debug(
+                "broadcast queue full, dropping droppable message: type=%s",
+                msg_type or '?',
+            )
+            return
+
+        self._enqueue_preserving_terminal(msg)
+
+    def _enqueue_preserving_terminal(self, msg: dict[str, Any]) -> None:
+        """Evict droppable messages to make room; never discard terminal types."""
+        msg_type = msg.get('type')
+        survivors: list[dict[str, Any]] = []
         while True:
             try:
-                self._broadcast_queue.put_nowait(msg)
-                _log.debug("queued broadcast: type=%s", msg_type or '?')
+                item = self._broadcast_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item.get('type') not in _DROPPABLE_TYPES:
+                survivors.append(item)
+
+        for item in survivors:
+            self._broadcast_queue.put_nowait(item)
+
+        try:
+            self._broadcast_queue.put_nowait(msg)
+            _log.debug("queued broadcast after eviction: type=%s", msg_type or '?')
+            self.notify_broadcast()
+            return
+        except queue.Full:
+            pass
+
+        self._expand_broadcast_queue()
+        try:
+            self._broadcast_queue.put(msg, block=True, timeout=5.0)
+            _log.error(
+                "broadcast queue expanded and blocked to enqueue critical message: type=%s",
+                msg_type or '?',
+            )
+            self.notify_broadcast()
+        except queue.Full:
+            _log.error(
+                "broadcast queue still full after expansion, terminal message may be delayed: type=%s",
+                msg_type or '?',
+            )
+
+    def _expand_broadcast_queue(self) -> None:
+        """Replace the broadcast queue with a larger one, preserving queued items."""
+        old_queue = self._broadcast_queue
+        old_max = old_queue.maxsize
+        new_max = old_max + max(old_max // 4, 100)
+        new_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=new_max)
+        while True:
+            try:
+                new_queue.put_nowait(old_queue.get_nowait())
+            except queue.Empty:
                 break
             except queue.Full:
-                _log.warning("broadcast queue full, dropping oldest message")
-                try:
-                    self._broadcast_queue.get_nowait()
-                except queue.Empty:
-                    break
+                break
+        self._broadcast_queue = new_queue
+        _log.error("broadcast queue expanded: maxsize %d -> %d", old_max, new_max)
 
     @property
     def manager(self) -> Any:

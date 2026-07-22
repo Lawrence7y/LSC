@@ -7,16 +7,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
 _log = logging.getLogger(__name__)
+
+_persist_lock = threading.Lock()
 
 # 默认数据目录：项目根目录下的 data 文件夹
 # 使用项目内目录，避免沙箱外路径导致写入失败
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = _PROJECT_ROOT / "data"
 ROOMS_FILE = DEFAULT_DATA_DIR / "rooms.json"
+SETTINGS_FILE = _PROJECT_ROOT / "settings.json"
 
 
 def _ensure_dir(path: Path) -> None:
@@ -31,18 +35,15 @@ def load_rooms(path: Path | str | None = None) -> list[dict[str, Any]]:
     - {"rooms": [...]}
     - [...]
 
-    文件不存在或解析失败时返回空列表。
+    文件不存在时返回空列表；解析失败时尝试从 .bak 备份恢复。
     """
     file_path = Path(path) if path else ROOMS_FILE
     if not file_path.exists():
         _log.info("房间配置文件不存在，使用空列表: %s", file_path)
         return []
 
-    try:
-        with open(file_path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as exc:
-        _log.warning("加载房间配置失败，使用空列表: %s", exc)
+    data = _load_json_with_backup(file_path)
+    if data is None:
         return []
 
     if isinstance(data, dict):
@@ -59,30 +60,160 @@ def load_rooms(path: Path | str | None = None) -> list[dict[str, Any]]:
     return []
 
 
+def _backup_path(file_path: Path) -> Path:
+    """配置文件对应的备份路径：{name}.bak。"""
+    return file_path.with_suffix(file_path.suffix + ".bak")
+
+
+def _load_json_with_backup(file_path: Path) -> Any | None:
+    """读取 JSON；主文件损坏时尝试从 .bak 备份恢复。
+
+    Returns:
+        解析后的数据；主文件与备份均不可用时返回 None。
+    """
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        _log.warning("加载 %s 失败: %s，尝试从备份恢复", file_path.name, exc)
+
+    backup = _backup_path(file_path)
+    if not backup.exists():
+        _log.warning("无可用备份: %s", backup)
+        return None
+    try:
+        with open(backup, encoding="utf-8") as f:
+            data = json.load(f)
+        _log.info("已从备份恢复配置: %s", backup.name)
+        return data
+    except Exception as exc:
+        _log.error("备份文件也损坏，放弃恢复: %s", exc)
+        return None
+
+
+def _backup_existing(file_path: Path) -> None:
+    """覆盖前将当前文件备份为 .bak（best-effort，失败仅记日志）。"""
+    if not file_path.exists():
+        return
+    try:
+        import shutil
+        shutil.copy2(file_path, _backup_path(file_path))
+    except OSError as exc:
+        _log.warning("备份 %s 失败（继续保存）: %s", file_path.name, exc)
+
+
 def save_rooms(
     rooms: list[dict[str, Any]],
     path: Path | str | None = None,
+    *,
+    fsync: bool = False,
 ) -> bool:
     """将房间列表写入 JSON 文件。
 
-    使用临时文件 + 替换的方式尽量减少写坏文件的概率。
+    使用临时文件 + 替换的方式尽量减少写坏文件的概率；
+    替换前将上一版好文件备份为 .bak，供损坏时恢复。
+    默认不 fsync（高频写合并场景）；flush_pending_saves / 显式 fsync=True 才刷盘。
     """
     file_path = Path(path) if path else ROOMS_FILE
     try:
-        _ensure_dir(file_path.parent)
-        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-        payload = {"rooms": rooms}
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-            f.flush()
-            os.fsync(f.fileno())
-        tmp_path.replace(file_path)
+        with _persist_lock:
+            _ensure_dir(file_path.parent)
+            tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+            payload = {"rooms": rooms}
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                if fsync:
+                    os.fsync(f.fileno())
+            _backup_existing(file_path)
+            tmp_path.replace(file_path)
+            global _rooms_write_count
+            _rooms_write_count += 1
         _log.info("已保存 %d 个房间到 %s", len(rooms), file_path.name)
         return True
     except Exception as exc:
         _log.error("保存房间配置失败: %s", exc, exc_info=True)
+        return False
+
+
+_rooms_write_count = 0
+_FSYNC_EVERY_N_WRITES = 5
+_save_rooms_timer: threading.Timer | None = None
+_pending_rooms_payload: tuple[list[dict[str, Any]], Path] | None = None
+_schedule_lock = threading.Lock()
+
+
+def schedule_save_rooms(
+    rooms: list[dict[str, Any]],
+    path: Path | str | None = None,
+    *,
+    delay_sec: float = 1.0,
+) -> None:
+    """1 秒内多次保存合并为一次；到期后写入，每 N 次才 fsync。"""
+    global _save_rooms_timer, _pending_rooms_payload
+    file_path = Path(path) if path else ROOMS_FILE
+    # 拷贝列表，避免调用方后续原地改动污染待写快照
+    snapshot = [dict(r) for r in rooms]
+    with _schedule_lock:
+        _pending_rooms_payload = (snapshot, file_path)
+        if _save_rooms_timer is not None:
+            _save_rooms_timer.cancel()
+        timer = threading.Timer(delay_sec, _flush_scheduled_rooms)
+        timer.daemon = True
+        _save_rooms_timer = timer
+        timer.start()
+
+
+def _flush_scheduled_rooms() -> None:
+    global _save_rooms_timer, _pending_rooms_payload
+    with _schedule_lock:
+        pending = _pending_rooms_payload
+        _pending_rooms_payload = None
+        _save_rooms_timer = None
+    if pending is None:
+        return
+    rooms, file_path = pending
+    do_fsync = (_rooms_write_count + 1) % _FSYNC_EVERY_N_WRITES == 0
+    save_rooms(rooms, file_path, fsync=do_fsync)
+
+
+def flush_pending_room_saves(*, fsync: bool = True) -> bool:
+    """立即写出合并队列中的房间配置（关机/测试用）。"""
+    global _save_rooms_timer, _pending_rooms_payload
+    with _schedule_lock:
+        if _save_rooms_timer is not None:
+            _save_rooms_timer.cancel()
+            _save_rooms_timer = None
+        pending = _pending_rooms_payload
+        _pending_rooms_payload = None
+    if pending is None:
+        return True
+    rooms, file_path = pending
+    return save_rooms(rooms, file_path, fsync=fsync)
+
+
+def save_settings(
+    settings: dict[str, Any],
+    path: Path | str | None = None,
+    *,
+    fsync: bool = False,
+) -> bool:
+    """将应用设置写入 JSON 文件（原子写入，进程内互斥）。"""
+    file_path = Path(path) if path else SETTINGS_FILE
+    try:
+        with _persist_lock:
+            _ensure_dir(file_path.parent)
+            tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+                f.flush()
+                if fsync:
+                    os.fsync(f.fileno())
+            tmp_path.replace(file_path)
+        _log.info("已保存设置到 %s", file_path.name)
+        return True
+    except Exception as exc:
+        _log.error("保存设置失败: %s", exc, exc_info=True)
         return False
 
 
@@ -117,25 +248,26 @@ def save_analysis_results(
     """
     file_path = _analysis_json_path(video_path)
     try:
-        mtime = os.path.getmtime(video_path) if os.path.isfile(video_path) else 0.0
-        payload = {
-            "schema_version": _ANALYSIS_SCHEMA_VERSION,
-            "room_id": room_id,
-            "video_path": video_path,
-            "video_mtime": mtime,
-            "mode": mode,
-            "analyzed_at": _now_iso(),
-            "analysis_time_sec": round(analysis_time_sec, 2),
-            "weights": weights or {},
-            "highlights": highlights,
-        }
-        _ensure_dir(file_path.parent)
-        tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp_path.replace(file_path)
+        with _persist_lock:
+            mtime = os.path.getmtime(video_path) if os.path.isfile(video_path) else 0.0
+            payload = {
+                "schema_version": _ANALYSIS_SCHEMA_VERSION,
+                "room_id": room_id,
+                "video_path": video_path,
+                "video_mtime": mtime,
+                "mode": mode,
+                "analyzed_at": _now_iso(),
+                "analysis_time_sec": round(analysis_time_sec, 2),
+                "weights": weights or {},
+                "highlights": highlights,
+            }
+            _ensure_dir(file_path.parent)
+            tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(file_path)
         _log.info("分析结果已保存: %s (%d 段高光, 耗时=%.1fs)", file_path.name, len(highlights), analysis_time_sec)
         return True
     except Exception as exc:

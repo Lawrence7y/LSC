@@ -2,12 +2,19 @@ import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, No
 import path from 'path'
 import fs from 'fs'
 import https from 'https'
+import { randomBytes } from 'crypto'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { extractBackendWsUrl } from './backendUrl'
 
 // ===== 全局日志持久化 =====
 const _MAX_LOG_SIZE = 2 * 1024 * 1024 // 2MB
 const _MAX_LOG_BACKUPS = 5
+const _LOG_FLUSH_MS = 50
+const _LOG_ERROR_COOLDOWN_MS = 5000
+
+let _logBuffer: string[] = []
+let _logFlushTimer: ReturnType<typeof setTimeout> | null = null
+let _lastLogWriteErrorAt = 0
 
 function _rotateLogFile(logFile: string): void {
   try {
@@ -29,6 +36,22 @@ function _rotateLogFile(logFile: string): void {
   }
 }
 
+function _scheduleLogFlush(logFile: string): void {
+  if (_logFlushTimer) return
+  _logFlushTimer = setTimeout(() => {
+    _logFlushTimer = null
+    const batch = _logBuffer.splice(0)
+    if (!batch.length) return
+    fs.appendFile(logFile, batch.join(''), 'utf-8', (err) => {
+      if (!err) return
+      const now = Date.now()
+      if (now - _lastLogWriteErrorAt < _LOG_ERROR_COOLDOWN_MS) return
+      _lastLogWriteErrorAt = now
+      console.error('[appLog] 日志写入失败:', err)
+    })
+  }, _LOG_FLUSH_MS)
+}
+
 export function appLog(level: 'INFO' | 'WARN' | 'ERROR', module: string, msg: string): void {
   try {
     const logDir = path.join(app.getPath('userData'), 'logs')
@@ -37,7 +60,8 @@ export function appLog(level: 'INFO' | 'WARN' | 'ERROR', module: string, msg: st
     }
     const logFile = path.join(logDir, 'debug.log')
     const line = `${new Date().toISOString()} [${level}] [${module}] ${msg}\n`
-    fs.appendFileSync(logFile, line, 'utf-8')
+    _logBuffer.push(line)
+    _scheduleLogFlush(logFile)
     if (Math.random() < 0.01) {
       _rotateLogFile(logFile)
     }
@@ -63,6 +87,7 @@ let backendLogStream: fs.WriteStream | null = null
 let pythonDetectError: string | null = null
 let backendWsUrl: string | null = null
 let backendOutputBuffer = ''
+const backendWsToken = randomBytes(32).toString('base64url')
 
 interface AppSettings {
   autoLaunch: boolean
@@ -288,6 +313,8 @@ function spawnBackend(): void {
     PATHEXT: process.env.PATHEXT,
     PYTHONUNBUFFERED: '1',
     LSC_LOG_DIR: path.join(app.getPath('userData'), 'logs'),
+    LSC_WS_TOKEN: backendWsToken,
+    LSC_WS_TOKEN_REQUIRED: '1',
   }
   if (process.env.LSC_CONFIG_PATH) {
     safeEnv.LSC_CONFIG_PATH = process.env.LSC_CONFIG_PATH
@@ -342,12 +369,7 @@ function spawnBackend(): void {
   })
 }
 
-function killBackend(): void {
-  if (!backendProcess) {
-    return
-  }
-  const proc = backendProcess
-  backendProcess = null
+function sendBackendKillSignal(proc: ChildProcess): void {
   const pid = proc.pid
   if (!pid) {
     return
@@ -363,44 +385,102 @@ function killBackend(): void {
         appLog('ERROR', 'Backend', `taskkill 失败: ${err}`)
       }
     } else {
-      // POSIX：先 SIGTERM，再用 setTimeout 异步轮询进程是否存活
-      // 最多检测 30 次（间隔 100ms，共 3 秒），超时则 SIGKILL
-      // 采用 fire-and-forget 模式：before-quit / exit 钩子不需要等待子进程退出完成，
-      // 避免同步忙等待阻塞主进程导致 UI 冻结
       try {
         process.kill(pid, 'SIGTERM')
         appLog('INFO', 'Backend', `发送 SIGTERM 至后端进程 (PID: ${pid})`)
       } catch (err) {
         appLog('ERROR', 'Backend', `SIGTERM 失败: ${err}`)
-        return
       }
-      const maxAttempts = 30
-      let attempts = 0
-      const checkAlive = (): void => {
-        attempts++
-        try {
-          process.kill(pid, 0) // 检测进程是否存在
-        } catch (err) {
-          // 进程已退出
-          appLog('INFO', 'Backend', `后端进程 (PID: ${pid}) 已退出`)
-          return
-        }
-        if (attempts >= maxAttempts) {
-          // 超时强杀
-          try {
-            process.kill(pid, 'SIGKILL')
-            appLog('WARN', 'Backend', `超时，强杀进程 (PID: ${pid})`)
-          } catch (err) {
-            appLog('ERROR', 'Backend', `SIGKILL 失败: ${err}`)
-          }
-          return
-        }
-        setTimeout(checkAlive, 100)
-      }
-      setTimeout(checkAlive, 100)
     }
   } catch (err) {
     appLog('ERROR', 'Backend', `终止后端失败: ${err}`)
+  }
+}
+
+function killBackendAndWait(timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const proc = backendProcess
+    if (!proc) {
+      resolve()
+      return
+    }
+
+    const pid = proc.pid
+    if (!pid) {
+      backendProcess = null
+      resolve()
+      return
+    }
+
+    let settled = false
+    const finish = (): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      clearTimeout(timer)
+      backendProcess = null
+      resolve()
+    }
+
+    const timer = setTimeout(() => {
+      if (!settled && pid && process.platform !== 'win32') {
+        try {
+          process.kill(pid, 'SIGKILL')
+          appLog('WARN', 'Backend', `超时，强杀进程 (PID: ${pid})`)
+        } catch (err) {
+          appLog('ERROR', 'Backend', `SIGKILL 失败: ${err}`)
+        }
+      }
+      finish()
+    }, timeoutMs)
+
+    proc.once('exit', () => {
+      appLog('INFO', 'Backend', `后端进程 (PID: ${pid}) 已退出`)
+      finish()
+    })
+
+    sendBackendKillSignal(proc)
+  })
+}
+
+function killBackend(): void {
+  if (!backendProcess) {
+    return
+  }
+  const proc = backendProcess
+  backendProcess = null
+  const pid = proc.pid
+  if (!pid) {
+    return
+  }
+
+  sendBackendKillSignal(proc)
+
+  if (process.platform !== 'win32') {
+    // POSIX fire-and-forget：异步轮询进程是否存活，超时则 SIGKILL
+    const maxAttempts = 30
+    let attempts = 0
+    const checkAlive = (): void => {
+      attempts++
+      try {
+        process.kill(pid, 0) // 检测进程是否存在
+      } catch (err) {
+        appLog('INFO', 'Backend', `后端进程 (PID: ${pid}) 已退出`)
+        return
+      }
+      if (attempts >= maxAttempts) {
+        try {
+          process.kill(pid, 'SIGKILL')
+          appLog('WARN', 'Backend', `超时，强杀进程 (PID: ${pid})`)
+        } catch (err) {
+          appLog('ERROR', 'Backend', `SIGKILL 失败: ${err}`)
+        }
+        return
+      }
+      setTimeout(checkAlive, 100)
+    }
+    setTimeout(checkAlive, 100)
   }
 }
 
@@ -509,6 +589,7 @@ function registerWindowIpc(): void {
     appLog('INFO', 'IPC', `获取后端 WebSocket URL: ${backendWsUrl}`)
     return backendWsUrl
   })
+  ipcMain.handle('get-backend-ws-token', () => backendWsToken)
 
   ipcMain.handle('minimize-window', () => {
     appLog('INFO', 'IPC', '最小化窗口')
@@ -997,66 +1078,91 @@ function registerAppSettingsIpc(): void {
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 
-app.whenReady().then(() => {
-  // 启动时读取 app-settings.json 初始化缓存
-  settingsCache = loadSettings()
-  // 同步 autoLaunch 状态到系统
-  try {
-    app.setLoginItemSettings({ openAtLogin: settingsCache.autoLaunch })
-  } catch (err) {
-    appLog('ERROR', 'App', `同步开机启动设置失败: ${err}`)
-  }
-
-  if (process.platform === 'win32') {
-    app.setAppUserModelId('com.lsc.app')
-  }
-
-  // 注册应用设置 IPC（只注册一次）
-  registerAppSettingsIpc()
-
-  // 注册窗口 IPC（只注册一次）
-  registerWindowIpc()
-
-  // 并行启动后端 + 创建窗口 + 创建托盘
-  spawnBackend()
-  createWindow()
-  createTray()
-})
-
-app.on('before-quit', () => {
-  appLog('INFO', 'App', '应用即将退出，正在清理全部房间...')
-
-  // 通知渲染进程通过 WebSocket 清理所有房间（停止录制/预览/分析）
-  try {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('cleanup-all-rooms')
-      appLog('INFO', 'App', '已通知渲染进程清理全部房间')
+const gotLock = app.requestSingleInstanceLock()
+if (!gotLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore()
+      }
+      mainWindow.focus()
     }
-  } catch (err) {
-    appLog('ERROR', 'App', `通知渲染进程清理失败: ${err}`)
-  }
+  })
 
-  // 给后端 2 秒时间完成清理，然后强杀
-  setTimeout(() => {
-    killBackend()
-  }, 2000)
-})
+  let isQuitting = false
 
-process.on('exit', () => {
-  killBackend()
-})
+  app.whenReady().then(() => {
+    // 启动时读取 app-settings.json 初始化缓存
+    settingsCache = loadSettings()
+    // 同步 autoLaunch 状态到系统
+    try {
+      app.setLoginItemSettings({ openAtLogin: settingsCache.autoLaunch })
+    } catch (err) {
+      appLog('ERROR', 'App', `同步开机启动设置失败: ${err}`)
+    }
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
-})
+    if (process.platform === 'win32') {
+      app.setAppUserModelId('com.lsc.app')
+    }
 
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
+    // 注册应用设置 IPC（只注册一次）
+    registerAppSettingsIpc()
+
+    // 注册窗口 IPC（只注册一次）
+    registerWindowIpc()
+
+    // 并行启动后端 + 创建窗口 + 创建托盘
+    spawnBackend()
     createWindow()
-  } else if (mainWindow) {
-    mainWindow.show()
-    mainWindow.focus()
-  }
-})
+    createTray()
+  })
+
+  app.on('before-quit', (event) => {
+    if (isQuitting) {
+      return
+    }
+
+    appLog('INFO', 'App', '应用即将退出，正在清理全部房间...')
+
+    // 通知渲染进程通过 WebSocket 清理所有房间（停止录制/预览/分析）
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('cleanup-all-rooms')
+        appLog('INFO', 'App', '已通知渲染进程清理全部房间')
+      }
+    } catch (err) {
+      appLog('ERROR', 'App', `通知渲染进程清理失败: ${err}`)
+    }
+
+    if (!backendProcess) {
+      return
+    }
+
+    event.preventDefault()
+    isQuitting = true
+    new Promise<void>((resolve) => setTimeout(resolve, 1500))
+      .then(() => killBackendAndWait(5000))
+      .finally(() => app.quit())
+  })
+
+  process.on('exit', () => {
+    killBackend()
+  })
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+      app.quit()
+    }
+  })
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow()
+    } else if (mainWindow) {
+      mainWindow.show()
+      mainWindow.focus()
+    }
+  })
+}

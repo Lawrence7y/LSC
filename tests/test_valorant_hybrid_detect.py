@@ -80,7 +80,8 @@ class _EncodedClassifier:
 
 def _fake_anchors(frame_bgr: np.ndarray) -> tuple[float | None, int | None, int | None]:
     if int(frame_bgr[0, 0, 0]) == _CLASS_INDEX["result"]:
-        return 99.0, 1, 0
+        # 结算帧：有比分、无交战倒计时（交战钟会挡住 result 关局）
+        return None, 1, 0
     return None, None, None
 
 
@@ -190,6 +191,47 @@ def test_cancel_check_returns_empty(tmp_path, hybrid_deps) -> None:
             classifier=hybrid_deps["classifier"],
             read_anchors_fn=hybrid_deps["read_anchors_fn"],
         )
+
+
+def test_start_refine_runs_once_per_round(tmp_path, hybrid_deps) -> None:
+    video = tmp_path / "x.mp4"
+    video.write_bytes(b"fake")
+    dense_calls: list[tuple[float, float]] = []
+
+    def counting_extract(
+        video_path: str,
+        *,
+        start_sec: float,
+        end_sec: float,
+        fps: float,
+        ffmpeg_path: str,
+        cancel_check=None,
+        overlap_sec: float = 2.0,
+    ) -> list[tuple[float, np.ndarray]]:
+        if abs(fps - 9.0) < 0.01:
+            dense_calls.append((start_sec, end_sec))
+        return _fake_extract(
+            video_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            fps=fps,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            overlap_sec=overlap_sec,
+        )
+
+    rounds = detect_valorant_rounds_hybrid(
+        str(video),
+        time_range=(0.0, 60.0),
+        session_id="sess1",
+        classifier=hybrid_deps["classifier"],
+        extract_fn=counting_extract,
+        read_anchors_fn=hybrid_deps["read_anchors_fn"],
+    )
+
+    assert len(rounds) == 1
+    # opened 精修一次起点 + closed 精修终点；禁止 closed 再跑一遍起点密扫
+    assert len(dense_calls) == 2
 
 
 def test_incremental_runtime_state_keeps_open_round_across_windows(tmp_path) -> None:
