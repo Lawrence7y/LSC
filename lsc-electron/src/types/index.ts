@@ -141,6 +141,8 @@ export interface RecordSettings {
   ocr_accel?: 'auto' | 'dml' | 'cuda' | 'cpu'
   /** 最大并发导出数（1 或 2，默认 2） */
   export_max_concurrent?: number
+  /** 剪映草稿目录；空字符串表示自动探测 */
+  jianying_draft_dir?: string
 }
 
 // 导出预设

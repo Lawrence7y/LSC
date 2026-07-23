@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch } from 'antd'
-import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined } from '@ant-design/icons'
+import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch, Dropdown } from 'antd'
+import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined, MoreOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useExportProgressListeners } from '@/hooks/useExportProgressListeners'
 import { usePlayheadSampling } from '@/hooks/usePlayheadSampling'
@@ -2009,6 +2009,67 @@ export default function Workbench() {
     }
   }, [send, on])
 
+  const handleGenerateSessionDraft = useCallback(async (opts?: {
+    roomIds?: string[]
+    allowSingleFallback?: boolean
+  }) => {
+    if (!ensureNotAligning()) return
+
+    const roomIds = opts?.roomIds ?? (
+      timelineContext
+        ? Object.keys(timelineContext.room_snapshots || {})
+        : (selectedRoomIds.size > 0
+            ? Array.from(selectedRoomIds)
+            : rooms.map(r => r.room_id))
+    )
+
+    if (!opts?.roomIds && roomIds.length > 1 && !timelineContext) {
+      message.warning('多房草稿需先一键对齐；可降级为主房单房草稿')
+      Modal.confirm({
+        title: '未对齐',
+        content: '多房间尚未一键对齐。是否仅用当前主房生成单房草稿？',
+        okText: '主房单房草稿',
+        cancelText: '取消',
+        onOk: () => {
+          const mainId = selectedRoomId || roomIds[0]
+          if (!mainId) {
+            message.error('请先选择主房间')
+            return
+          }
+          void handleGenerateSessionDraft({ roomIds: [mainId], allowSingleFallback: true })
+        },
+      })
+      return
+    }
+
+    const confirmed = clips.filter(c => {
+      if (c.confirm_status === 'pending' || c.confirm_status === 'refining') return false
+      if (isApproximateClip(c)) return false
+      return true
+    })
+
+    const res = await requestJianyingDraft({
+      roomIds,
+      clips: confirmed,
+      includeClips: confirmed.length > 0,
+      allowSingleFallback: opts?.allowSingleFallback ?? roomIds.length <= 1,
+    })
+    if (res?.success) {
+      setJianyingResult(res)
+      ;(res.warnings || []).forEach(w => message.warning(w, 4))
+    } else if (res) {
+      message.error(res.error || '生成剪映草稿失败')
+    }
+  }, [
+    ensureNotAligning,
+    timelineContext,
+    selectedRoomIds,
+    rooms,
+    selectedRoomId,
+    clips,
+    requestJianyingDraft,
+  ])
+
   const handleExportMany = (targets: ClipSegment[]) => {
     if (!ensureNotAligning()) return
     if (targets.length === 0) {
@@ -3353,6 +3414,21 @@ export default function Workbench() {
             >
               {aligning ? '对齐中...' : '一键对齐'}
             </Button>
+
+            <Dropdown
+              menu={{
+                items: [
+                  {
+                    key: 'jianying',
+                    label: '生成剪映草稿',
+                    disabled: jianyingLoading,
+                    onClick: () => { void handleGenerateSessionDraft() },
+                  },
+                ],
+              }}
+            >
+              <Button size="small" icon={<MoreOutlined />} />
+            </Dropdown>
 
             <RefreshButton
               onShortClick={handleRefreshShortClick}

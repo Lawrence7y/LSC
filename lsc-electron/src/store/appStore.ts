@@ -70,6 +70,7 @@ const defaultSettings: RecordSettings = {
   preset: 'medium',
   ocr_accel: 'dml',
   export_max_concurrent: 2,
+  jianying_draft_dir: '',
 }
 
 const defaultAppSettings: AppSettings = {

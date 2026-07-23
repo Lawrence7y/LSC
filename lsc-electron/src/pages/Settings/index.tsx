@@ -38,6 +38,7 @@ export default function Settings() {
     keys?: string[]
   } | null>(null)
   const [savingBilibiliCookie, setSavingBilibiliCookie] = useState(false)
+  const [detectedJianyingDir, setDetectedJianyingDir] = useState('')
 
   useEffect(() => {
     // 获取应用版本号
@@ -60,6 +61,7 @@ export default function Settings() {
       send('check_dependencies', {})
       send('get_douyin_cookie_status', {})
       send('get_bilibili_cookie_status', {})
+      send('get_jianying_draft_dir', {})
     }
   }, [isConnected, send])
 
@@ -138,6 +140,19 @@ export default function Settings() {
         })
         setBilibiliCookieText('')
         message.success(`B站 Cookie 已保存（${data.count || 0} 项），请重新连接直播间`)
+      }),
+      on('get_jianying_draft_dir_response', (data: {
+        success?: boolean
+        draft_dir?: string
+        auto_detected?: boolean
+        exists?: boolean
+        error?: string
+      }) => {
+        if (data?.success === false && data.error) {
+          message.error(`读取剪映草稿目录失败：${data.error}`)
+          return
+        }
+        setDetectedJianyingDir(data?.draft_dir || '')
       }),
     ]
     return () => unsubs.forEach((u) => u())
@@ -218,6 +233,25 @@ export default function Settings() {
     } else {
       message.info('请在 Electron 桌面版中使用目录选择功能')
     }
+  }
+
+  const handleBrowseJianyingDir = async () => {
+    if (!window.electronAPI?.selectDirectory) {
+      message.info('请在 Electron 桌面版中使用目录选择功能')
+      return
+    }
+    const dir = await window.electronAPI.selectDirectory()
+    if (!dir) return
+    handleRecordChange('jianying_draft_dir', dir)
+    send('save_settings', { ...settings, jianying_draft_dir: dir, appSettings })
+    message.success('剪映草稿目录已保存')
+  }
+
+  const handleResetJianyingDir = () => {
+    handleRecordChange('jianying_draft_dir', '')
+    send('save_settings', { ...settings, jianying_draft_dir: '', appSettings })
+    send('get_jianying_draft_dir', {})
+    message.success('已恢复自动探测剪映草稿目录')
   }
 
   const handleCheckUpdate = async () => {
@@ -589,6 +623,41 @@ export default function Settings() {
                   <FolderOpenOutlined style={{ fontSize: 14 }} />
                   浏览
                 </button>
+              </div>
+            </SettingsRow>
+            <SettingsRow label="剪映草稿目录">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%', maxWidth: 360 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%' }}>
+                  <span style={{
+                    background: 'var(--background-700)',
+                    color: settings.jianying_draft_dir ? 'var(--text-300)' : 'var(--text-tertiary)',
+                    border: '1px solid var(--border-default)',
+                    borderRadius: 'var(--radius-sm)',
+                    padding: '6px 12px',
+                    fontSize: 12,
+                    fontFamily: 'var(--font-mono)',
+                    flex: 1,
+                    minWidth: 0,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {settings.jianying_draft_dir
+                      || detectedJianyingDir
+                      || '未检测到剪映，请手动选择'}
+                  </span>
+                  <button type="button" onClick={() => { void handleBrowseJianyingDir() }} className="browse-btn">
+                    更改
+                  </button>
+                  <button type="button" onClick={handleResetJianyingDir} className="browse-btn">
+                    恢复自动探测
+                  </button>
+                </div>
+                {!settings.jianying_draft_dir && !detectedJianyingDir && (
+                  <span style={{ fontSize: 11, color: 'var(--state-warning)', lineHeight: 1.5 }}>
+                    自动探测失败：请安装剪映专业版或手动指定草稿目录
+                  </span>
+                )}
               </div>
             </SettingsRow>
              <SettingsRow label="并发导出数">
