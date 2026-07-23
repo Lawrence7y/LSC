@@ -105,6 +105,7 @@ def test_manager_connect_and_disconnect_room_updates_session(monkeypatch) -> Non
         )
 
     monkeypatch.setattr("lsc.gui.multi_room.manager.parse_stream", fake_parse_stream)
+    monkeypatch.setattr("lsc.core.orchestrator.parse_stream", fake_parse_stream)
 
     assert manager.connect_room(room.room_id) is True
     assert room.platform == "bilibili"
@@ -138,6 +139,10 @@ def test_manager_start_and_stop_recording_uses_room_controller(monkeypatch, tmp_
 
     monkeypatch.setattr(
         "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
 
@@ -176,6 +181,10 @@ def test_manager_start_recording_refreshes_stream_url_before_ffmpeg_start(monkey
         "lsc.gui.multi_room.manager.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
 
     class FakeController:
         def __init__(self) -> None:
@@ -207,6 +216,7 @@ def test_manager_start_recording_refreshes_stream_url_before_ffmpeg_start(monkey
         return refreshed
 
     monkeypatch.setattr("lsc.gui.multi_room.manager.parse_stream", fake_parse_stream)
+    monkeypatch.setattr("lsc.core.orchestrator.parse_stream", fake_parse_stream)
 
     manager = MultiRoomManager(controller_factory=FakeController)
     room = manager.add_room("https://live.bilibili.com/35")
@@ -231,6 +241,10 @@ def test_manager_start_and_stop_recording_all_is_failure_isolated(monkeypatch, t
 
     monkeypatch.setattr(
         "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
 
@@ -326,6 +340,10 @@ def test_manager_start_recording_propagates_error_detail(monkeypatch, tmp_path) 
         "lsc.gui.multi_room.manager.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
 
     class FakeController:
         def __init__(self) -> None:
@@ -365,6 +383,10 @@ def test_manager_start_recording_uses_shared_ingest_when_enabled(monkeypatch, tm
 
     monkeypatch.setattr(
         "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
     )
     monkeypatch.setattr(
@@ -435,7 +457,12 @@ def test_manager_start_recording_updates_existing_preview_only_ingest(monkeypatc
         "lsc.gui.multi_room.manager.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
     )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
+    )
     monkeypatch.setattr("lsc.gui.multi_room.manager.parse_stream", fake_parse_stream)
+    monkeypatch.setattr("lsc.core.orchestrator.parse_stream", fake_parse_stream)
     monkeypatch.setattr(
         "lsc.core.services.shared_ingest.SharedRoomIngest.start_recording",
         successful_start,
@@ -498,6 +525,10 @@ def test_manager_stop_recording_stops_shared_ingest_when_used(monkeypatch, tmp_p
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
     )
     monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
+    )
+    monkeypatch.setattr(
         "lsc.core.services.shared_ingest.SharedRoomIngest.start_recording",
         successful_start,
     )
@@ -550,6 +581,10 @@ def test_manager_stop_recording_async_stops_shared_ingest_when_used(monkeypatch,
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
     )
     monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=True),
+    )
+    monkeypatch.setattr(
         "lsc.core.services.shared_ingest.SharedRoomIngest.start_recording",
         successful_start,
     )
@@ -586,6 +621,10 @@ def test_start_recording_heals_stale_is_connected_when_stream_cache_exists(monke
         "lsc.gui.multi_room.manager.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
 
     class FakeController:
         def __init__(self) -> None:
@@ -603,6 +642,7 @@ def test_start_recording_heals_stale_is_connected_when_stream_cache_exists(monke
         raise AssertionError("should reuse room stream cache, not parse")
 
     monkeypatch.setattr("lsc.gui.multi_room.manager.parse_stream", fake_parse_stream)
+    monkeypatch.setattr("lsc.core.orchestrator.parse_stream", fake_parse_stream)
 
     manager = MultiRoomManager(controller_factory=FakeController)
     room = manager.add_room("https://live.douyin.com/123")
@@ -631,11 +671,16 @@ def test_refresh_stream_url_reuses_fresh_room_cache(monkeypatch) -> None:
         "lsc.gui.multi_room.manager.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
 
     def boom(url: str, *, force_refresh: bool = False):
         raise AssertionError(f"unexpected parse_stream force_refresh={force_refresh}")
 
     monkeypatch.setattr("lsc.gui.multi_room.manager.parse_stream", boom)
+    monkeypatch.setattr("lsc.core.orchestrator.parse_stream", boom)
 
     manager = MultiRoomManager(controller_factory=lambda: SimpleNamespace(stream_url="", input_args=[], selected_quality=""))
     room = manager.add_room("https://live.bilibili.com/1")

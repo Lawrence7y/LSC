@@ -11,19 +11,10 @@ def test_global_tick_runs_due_recording_reconnect(monkeypatch, tmp_path) -> None
         "lsc.gui.multi_room.manager.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
-
-    class ImmediateThread:
-        def __init__(self, target, daemon=False):
-            self.target = target
-            self.daemon = daemon
-            self.started = False
-
-        def start(self):
-            self.started = True
-            self.target()
-
-        def is_alive(self):
-            return False
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
 
     class FakeController:
         def __init__(self) -> None:
@@ -49,8 +40,9 @@ def test_global_tick_runs_due_recording_reconnect(monkeypatch, tmp_path) -> None
             self.start_calls += 1
             return True, str(tmp_path / "new.mp4"), encoder, ""
 
-    monkeypatch.setattr("threading.Thread", ImmediateThread)
+    # Reconnect now runs on the orchestrator thread (no extra worker Thread).
     monkeypatch.setattr("lsc.gui.multi_room.manager.MultiRoomManager.save_rooms", lambda self: 0)
+    monkeypatch.setattr("lsc.core.orchestrator.RoomOrchestrator.save_rooms", lambda self: 0)
 
     manager = MultiRoomManager(controller_factory=FakeController)
     room = manager.add_room("https://example.com/live.m3u8")
@@ -65,6 +57,7 @@ def test_global_tick_runs_due_recording_reconnect(monkeypatch, tmp_path) -> None
     room.controller.stream_url = "https://example.com/live.m3u8"
 
     monkeypatch.setattr(manager, "_refresh_room_stream_for_recording", lambda room: True)
+    monkeypatch.setattr(manager._orch, "_refresh_room_stream_for_recording", lambda room: True)
     manager._tick_counter = manager_module._MEDIUM_FREQ_INTERVAL - 1
 
     manager._on_global_tick()
@@ -84,6 +77,10 @@ def test_recording_reconnect_stops_when_stream_is_offline(monkeypatch, tmp_path)
 
     monkeypatch.setattr(
         "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
         lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
     )
 
@@ -111,6 +108,10 @@ def test_recording_reconnect_stops_when_stream_is_offline(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(
         "lsc.gui.multi_room.manager.parse_stream",
+        lambda url, force_refresh=False: offline_info,
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.parse_stream",
         lambda url, force_refresh=False: offline_info,
     )
 

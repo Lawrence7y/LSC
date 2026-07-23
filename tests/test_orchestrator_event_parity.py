@@ -152,8 +152,11 @@ def _run_manager_scenario(monkeypatch, tmp_path, qtbot) -> EventCollector:
     from lsc.gui.multi_room.manager import MultiRoomManager
 
     _patch_parse(monkeypatch, "lsc.gui.multi_room.manager")
+    _patch_parse(monkeypatch, "lsc.core.orchestrator")
     _patch_recording_config(monkeypatch, "lsc.gui.multi_room.manager")
+    _patch_recording_config(monkeypatch, "lsc.core.orchestrator")
     monkeypatch.setattr("lsc.gui.multi_room.manager.MultiRoomManager.save_rooms", lambda self: 0)
+    monkeypatch.setattr("lsc.core.orchestrator.RoomOrchestrator.save_rooms", lambda self: 0)
 
     collector = EventCollector()
     manager = MultiRoomManager(controller_factory=FakeController)
@@ -178,6 +181,12 @@ def _run_manager_scenario(monkeypatch, tmp_path, qtbot) -> EventCollector:
 
     for _ in range(TICK_COUNT):
         manager._on_global_tick()
+
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is not None:
+        app.processEvents()
 
     return collector
 
