@@ -68,3 +68,38 @@ def test_is_stream_offline_error():
     from lsc.core.orchestrator import _is_stream_offline_error
     assert _is_stream_offline_error("直播间已结束")
     assert not _is_stream_offline_error("connection reset")
+
+
+def test_add_get_remove_room(orch):
+    r = orch.add_room("https://live.example/1")
+    assert r is not None
+    assert orch.room_count() == 1
+    assert orch.get_room(r.room_id) is r
+    assert orch.remove_room(r.room_id) is True
+    assert orch.room_count() == 0
+
+
+def test_max_rooms_cap(orch):
+    from lsc.core.orchestrator import MAX_ROOMS
+    for i in range(MAX_ROOMS):
+        assert orch.add_room(f"https://live.example/{i}") is not None
+    assert orch.add_room("https://live.example/extra") is None
+
+
+def test_tick_layers_emit(orch):
+    global_n = medium_n = low_n = 0
+    def g():
+        nonlocal global_n; global_n += 1
+    def m():
+        nonlocal medium_n; medium_n += 1
+    def l():
+        nonlocal low_n; low_n += 1
+    orch.bus.subscribe("global_tick", lambda: g())
+    orch.bus.subscribe("medium_tick", lambda: m())
+    orch.bus.subscribe("low_tick", lambda: l())
+    orch.add_room("https://live.example/tick")
+    for _ in range(4):
+        orch.call(orch._on_global_tick)
+    assert global_n == 4
+    assert medium_n == 4
+    assert low_n == 1
