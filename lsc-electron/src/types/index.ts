@@ -299,6 +299,28 @@ export interface TimelineHighlightBand {
   label?: string
 }
 
+export type ExportTarget = 'mp4' | 'draft' | 'both'
+
+export interface JianyingDraftOptions {
+  include_recordings?: boolean
+  include_clips?: boolean
+  text_labels?: boolean
+  vertical?: boolean
+  draft_name?: string
+  non_main_volume_zero?: boolean
+}
+
+export interface JianyingDraftResult {
+  success: boolean
+  draft_name?: string
+  draft_dir?: string
+  tracks?: number
+  segments?: number
+  warnings?: string[]
+  error?: string
+  error_code?: string
+}
+
 export interface ContinuousAnalysisStatus {
   running: boolean
   room_id?: string | null

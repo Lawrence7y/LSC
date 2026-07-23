@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Card, List, Button, Space, Tag, Empty, Progress, Checkbox, Tooltip } from 'antd'
+import { Card, List, Button, Space, Tag, Empty, Progress, Checkbox, Tooltip, Segmented } from 'antd'
 import { DeleteOutlined, ExportOutlined, FolderOpenOutlined, FolderOutlined, CloseCircleOutlined, CheckOutlined } from '@ant-design/icons'
-import { ClipSegment, ClipConfirmStatus } from '@/types'
+import { ClipSegment, ClipConfirmStatus, ExportTarget } from '@/types'
 import { formatTime } from '@/utils/time'
 import { formatClipHoverTitle } from '@/utils/clipNaming'
 
@@ -36,6 +36,8 @@ interface ClipListProps {
   refiningClipId?: string | null
   selectedClipIds?: Set<string>
   onSelectedClipIdsChange?: (ids: Set<string>) => void
+  exportTarget?: ExportTarget
+  onExportTargetChange?: (v: ExportTarget) => void
 }
 
 function formatDuration(seconds: number): string {
@@ -90,7 +92,7 @@ function primaryStatus(
   }
 }
 
-export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange }: ClipListProps) {
+export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange, exportTarget, onExportTargetChange }: ClipListProps) {
   const [internalSelected, setInternalSelected] = useState<Set<string>>(new Set())
   const controlled = externalSelected != null
   const selectedClipIds = controlled ? externalSelected : internalSelected
@@ -409,7 +411,19 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         }
       }}
       extra={
-        <Space size={6}>
+        <Space size={6} wrap>
+          {onExportTargetChange && (
+            <Segmented
+              size="small"
+              value={exportTarget || 'mp4'}
+              onChange={(v) => onExportTargetChange(v as ExportTarget)}
+              options={[
+                { value: 'mp4', label: 'MP4' },
+                { value: 'draft', label: '草稿' },
+                { value: 'both', label: '两者' },
+              ]}
+            />
+          )}
           {clips.length > 0 && onExportMany && (
             <>
               <Tooltip

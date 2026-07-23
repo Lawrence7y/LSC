@@ -11,7 +11,7 @@ import { RoomCard } from './components/RoomCard'
 import { ControlBar } from './components/ControlBar'
 import { ClipList, getClipStableId, type ExportProgressInfo } from './components/ClipList'
 import { RefreshButton } from './components/RefreshButton'
-import { ClipSegment, ContinuousAnalysisStatus, TimelineHighlightBand } from '@/types'
+import { ClipSegment, ContinuousAnalysisStatus, TimelineHighlightBand, ExportTarget, JianyingDraftResult } from '@/types'
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
 import { formatTime } from '@/utils/time'
 import { getAligner, type PreviewAudioCaptureDiagnostics } from '@/utils/previewAudioAligner'
@@ -34,6 +34,16 @@ import { useTimelineViewModel } from '@/hooks/useTimelineViewModel'
 const LIVE_EDGE_TOLERANCE_SEC = 1.0
 /** 越过紫标左沿此容差内视为回到 Live（秒） */
 const DVR_LEFT_TOLERANCE_SEC = 0.25
+
+const EXPORT_TARGET_KEY = 'lsc.exportTarget'
+
+function readExportTarget(): ExportTarget {
+  try {
+    const v = localStorage.getItem(EXPORT_TARGET_KEY)
+    if (v === 'mp4' || v === 'draft' || v === 'both') return v
+  } catch { /* ignore */ }
+  return 'mp4'
+}
 
 function getRoomBufferedRange(roomId: string): { start: number; end: number } | null {
   const registry = (window as any).__msePlayers
@@ -203,6 +213,13 @@ export default function Workbench() {
   const [url, setUrl] = useState('')
   const [previewClip, setPreviewClip] = useState<ClipSegment | null>(null)
   const [exportPresetId, setExportPresetId] = useState(appSettings.default_export_preset || getDefaultPreset().id)
+  const [exportTarget, setExportTarget] = useState<ExportTarget>(() => readExportTarget())
+  const persistExportTarget = useCallback((v: ExportTarget) => {
+    setExportTarget(v)
+    try { localStorage.setItem(EXPORT_TARGET_KEY, v) } catch { /* ignore */ }
+  }, [])
+  const [jianyingLoading, setJianyingLoading] = useState(false)
+  const [jianyingResult, setJianyingResult] = useState<JianyingDraftResult | null>(null)
   // 分析导出 Modal 状态（持续分析 + 同步分析导出合并）
   const [continuousModalOpen, setContinuousModalOpen] = useState(false)
   const [continuousMainRoom, setContinuousMainRoom] = useState<string | null>(null)
@@ -1948,6 +1965,50 @@ export default function Workbench() {
     setPreviewClip(confirmed)
   }
 
+  const requestJianyingDraft = useCallback(async (opts: {
+    roomIds: string[]
+    clips: ClipSegment[]
+    includeClips: boolean
+    allowSingleFallback?: boolean
+  }): Promise<JianyingDraftResult | null> => {
+    setJianyingLoading(true)
+    try {
+      const payload = {
+        room_ids: opts.roomIds,
+        clip_ids: opts.clips
+          .map(c => c.clip_snapshot_id || c.clip_id)
+          .filter(Boolean),
+        clips: opts.clips.map(c => ({
+          clip_id: c.clip_id,
+          clip_snapshot_id: c.clip_snapshot_id,
+          label: c.label,
+          common_start: c.common_start,
+          common_end: c.common_end,
+          mark_in_wallclock: c.mark_in_wallclock,
+          mark_out_wallclock: c.mark_out_wallclock,
+          mark_precision: c.mark_precision,
+          confirm_status: c.confirm_status,
+        })),
+        options: {
+          include_recordings: true,
+          include_clips: opts.includeClips,
+          text_labels: opts.includeClips,
+          vertical: false,
+          draft_name: '',
+        },
+        allow_single_fallback: opts.allowSingleFallback ?? false,
+      }
+      const res = await sendRequest({ send, on }, 'generate_jianying_draft', payload, 120000) as JianyingDraftResult
+      return res
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '生成剪映草稿失败'
+      message.error(msg)
+      return { success: false, error: msg }
+    } finally {
+      setJianyingLoading(false)
+    }
+  }, [send, on])
+
   const handleExportMany = (targets: ClipSegment[]) => {
     if (!ensureNotAligning()) return
     if (targets.length === 0) {
@@ -1973,6 +2034,38 @@ export default function Workbench() {
       return
     }
     const approxCount = prepared.filter(isApproximateClip).length
+
+    const runDraftBatch = () => {
+      const draftClips = prepared.filter(c => !isApproximateClip(c))
+      const skippedApprox = prepared.length - draftClips.length
+      if (skippedApprox > 0) {
+        message.warning(`${skippedApprox} 条近似定位切片已跳过（不进草稿）`)
+      }
+      if (draftClips.length === 0) return
+      const roomIds = timelineContext
+        ? Object.keys(timelineContext.room_snapshots || {})
+        : Array.from(new Set(draftClips.map(c => c.room_id).filter(Boolean) as string[]))
+      void (async () => {
+        const res = await requestJianyingDraft({
+          roomIds,
+          clips: draftClips,
+          includeClips: true,
+          allowSingleFallback: roomIds.length <= 1,
+        })
+        if (res?.success) {
+          setJianyingResult(res)
+          ;(res.warnings || []).forEach(w => message.warning(w, 4))
+        } else if (res) {
+          message.error(res.error || '生成剪映草稿失败')
+        }
+      })()
+    }
+
+    if (exportTarget === 'draft' || exportTarget === 'both') {
+      runDraftBatch()
+      if (exportTarget === 'draft') return
+    }
+
     const submitPrepared = () => {
       const store = useAppStore.getState()
       let queued = 0
@@ -2049,21 +2142,27 @@ export default function Workbench() {
     }
   }
 
-  const handleConfirmExport = () => {
+  const handleConfirmExport = async () => {
     if (!ensureNotAligning()) return
     if (!previewClip) return
-    console.log('[Workbench] 用户操作: 确认导出, roomId:', previewClip.room_id, 'start:', previewClip.start, 'end:', previewClip.end, 'preset:', exportPresetId)
-    // 检查该房间是否有可用的录制文件
+    console.log('[Workbench] 用户操作: 确认导出, roomId:', previewClip.room_id, 'start:', previewClip.start, 'end:', previewClip.end, 'preset:', exportPresetId, 'target:', exportTarget)
+
+    const doMp4 = exportTarget === 'mp4' || exportTarget === 'both'
+    const doDraft = exportTarget === 'draft' || exportTarget === 'both'
+
     const room = rooms.find(r => r.room_id === previewClip.room_id)
-    if (!room) {
-      message.error('房间不存在')
-      return
+    if (doMp4) {
+      if (!room) {
+        message.error('房间不存在')
+        return
+      }
+      if (!room.record_output_path) {
+        message.error('该房间没有录制文件，请先开始录制再导出切片')
+        return
+      }
     }
-    if (!room.record_output_path) {
-      message.error('该房间没有录制文件，请先开始录制再导出切片')
-      return
-    }
-    const submitExport = () => {
+
+    const submitMp4Export = () => {
       const jobId = previewClip.clip_snapshot_id
         ? clipSnapshotJobId(previewClip.clip_snapshot_id)
         : `export-${Date.now()}`
@@ -2092,7 +2191,6 @@ export default function Workbench() {
           use_room_marks: false,
         })
       }
-      // 将 job_id 写入对应 clip，使 ClipList 能关联导出进度
       pendingExportJobIdsRef.current.add(jobId)
       const store = useAppStore.getState()
       store.setClips(store.clips.map(c =>
@@ -2105,18 +2203,53 @@ export default function Workbench() {
       setPreviewClip(null)
       message.info('导出任务已提交')
     }
-    if (isApproximateClip(previewClip)) {
-      message.warning('该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
-      Modal.confirm({
-        title: '近似定位切片',
-        content: '该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记。仍要导出？',
-        okText: '仍要导出',
-        cancelText: '取消',
-        onOk: submitExport,
+
+    const submitDraftExport = async () => {
+      if (isApproximateClip(previewClip)) {
+        message.warning('近似定位切片不进入剪映草稿')
+        return
+      }
+      const roomIds = timelineContext
+        ? Object.keys(timelineContext.room_snapshots || {})
+        : [previewClip.room_id].filter(Boolean) as string[]
+      const res = await requestJianyingDraft({
+        roomIds,
+        clips: [previewClip],
+        includeClips: true,
+        allowSingleFallback: true,
       })
-      return
+      if (res?.success) {
+        setJianyingResult(res)
+        ;(res.warnings || []).forEach(w => message.warning(w, 4))
+      } else if (res) {
+        message.error(res.error || '生成剪映草稿失败')
+      }
     }
-    submitExport()
+
+    if (doMp4) {
+      if (isApproximateClip(previewClip)) {
+        message.warning('该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
+        Modal.confirm({
+          title: '近似定位切片',
+          content: '该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记。仍要导出？',
+          okText: '仍要导出',
+          cancelText: '取消',
+          onOk: () => {
+            submitMp4Export()
+            if (doDraft) void submitDraftExport()
+          },
+        })
+        return
+      }
+      submitMp4Export()
+    }
+
+    if (doDraft) {
+      await submitDraftExport()
+      if (exportTarget === 'draft') {
+        setPreviewClip(null)
+      }
+    }
   }
 
   const handleCancelExportModal = () => {
@@ -3426,6 +3559,8 @@ export default function Workbench() {
             refiningClipId={refiningClipId}
             selectedClipIds={clipSelectedIds}
             onSelectedClipIdsChange={setClipSelectedIds}
+            exportTarget={exportTarget}
+            onExportTargetChange={persistExportTarget}
           />
         </div>
       </div>
@@ -3437,7 +3572,16 @@ export default function Workbench() {
         onCancel={handleCancelExportModal}
         footer={[
           <Button key="cancel" onClick={handleCancelExportModal}>取消</Button>,
-          <Button key="export" type="primary" onClick={handleConfirmExport}>确认导出</Button>,
+          <Button
+            key="export"
+            type="primary"
+            loading={jianyingLoading}
+            onClick={() => { void handleConfirmExport() }}
+          >
+            {exportTarget === 'draft' ? '生成草稿'
+              : exportTarget === 'both' ? '导出并生成草稿'
+              : '确认导出'}
+          </Button>,
         ]}
       >
         {previewClip && (
@@ -3455,6 +3599,7 @@ export default function Workbench() {
                 value={exportPresetId}
                 onChange={setExportPresetId}
                 style={{ width: '100%', minWidth: 0 }}
+                disabled={exportTarget === 'draft'}
                 options={EXPORT_PRESETS.map(p => ({
                   value: p.id,
                   label: p.name,
@@ -3462,7 +3607,54 @@ export default function Workbench() {
                 }))}
               />
             </div>
+            <div style={{ marginTop: 4 }}>
+              <div style={{ marginBottom: 8 }}><strong>导出方式</strong></div>
+              <Radio.Group
+                value={exportTarget}
+                onChange={(e) => persistExportTarget(e.target.value)}
+                options={[
+                  { value: 'mp4', label: '仅 MP4 切片' },
+                  { value: 'draft', label: '仅剪映草稿' },
+                  { value: 'both', label: '两者都要' },
+                ]}
+              />
+            </div>
           </div>
+        )}
+      </Modal>
+
+      <Modal
+        title="剪映草稿已生成"
+        open={!!jianyingResult?.success}
+        onCancel={() => setJianyingResult(null)}
+        footer={[
+          <Button key="close" onClick={() => setJianyingResult(null)}>关闭</Button>,
+          <Button
+            key="open"
+            type="primary"
+            onClick={() => {
+              const dir = jianyingResult?.draft_dir
+              if (dir && window.electronAPI?.showItemInFolder) {
+                void window.electronAPI.showItemInFolder(dir)
+              }
+              setJianyingResult(null)
+            }}
+          >
+            打开草稿目录
+          </Button>,
+        ]}
+      >
+        {jianyingResult && (
+          <>
+            <p>草稿名：{jianyingResult.draft_name}</p>
+            <p>轨道：{jianyingResult.tracks}　片段：{jianyingResult.segments}</p>
+            {(jianyingResult.warnings || []).length > 0 && (
+              <ul>{jianyingResult.warnings!.map((w, i) => <li key={i}>{w}</li>)}</ul>
+            )}
+            <p style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>
+              剪映中需重启或进出一次草稿以刷新列表
+            </p>
+          </>
         )}
       </Modal>
 
