@@ -1827,6 +1827,7 @@ def load_settings():
         'default_export_preset': 'douyin_vertical',
         'export_max_concurrent': 2,
         'ocr_accel': 'dml',
+        'jianying_draft_dir': '',  # 空 = 自动探测 %LOCALAPPDATA%\JianyingPro\...
     }
     _settings_cache_time = now
     return _settings_cache
@@ -1872,6 +1873,25 @@ def _normalize_settings_ocr_accel(settings: dict) -> dict:
     return out
 
 
+def _normalize_jianying_draft_dir(settings: dict) -> dict:
+    from lsc.exporter.jianying_draft import validate_draft_dir
+
+    out = dict(settings)
+    raw = out.get('jianying_draft_dir', '')
+    if raw is None:
+        raw = ''
+    if not isinstance(raw, str):
+        raise ValueError("jianying_draft_dir 必须是字符串")
+    stripped = raw.strip()
+    if not stripped:
+        out['jianying_draft_dir'] = ''
+        return out
+    if not os.path.isdir(stripped) and not validate_draft_dir(stripped):
+        raise ValueError("剪映草稿目录无效或不可写")
+    out['jianying_draft_dir'] = stripped
+    return out
+
+
 def save_settings(settings: dict):
     output_dir = settings.get('output_dir')
     if isinstance(output_dir, str) and not _is_allowed_output_dir(output_dir):
@@ -1882,6 +1902,7 @@ def save_settings(settings: dict):
         previous = load_settings()
         prev_ocr_accel = normalize_ocr_accel(previous.get('ocr_accel', 'dml'))
         settings = _normalize_settings_ocr_accel(settings)
+        settings = _normalize_jianying_draft_dir(settings)
         new_ocr_accel = settings.get('ocr_accel', 'dml')
         os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
         _atomic_write_json(SETTINGS_FILE, settings)
@@ -3342,6 +3363,8 @@ def register_room_handlers(server, bridge):
             )
         if 'ocr_accel' not in settings:
             settings['ocr_accel'] = 'dml'
+        if 'jianying_draft_dir' not in settings:
+            settings['jianying_draft_dir'] = ''
         return settings
 
     @server.on('save_settings')
@@ -3356,8 +3379,15 @@ def register_room_handlers(server, bridge):
         if not _is_allowed_output_dir(data.get('output_dir', '')):
             _log.warning("save_settings 校验失败: output_dir 不在允许范围内")
             return {'success': False, 'error': '导出目录不在允许范围内'}
+        if 'jianying_draft_dir' in data and data.get('jianying_draft_dir') is not None:
+            if not isinstance(data.get('jianying_draft_dir'), str):
+                _log.warning("save_settings 校验失败: jianying_draft_dir 不是字符串")
+                return {'success': False, 'error': 'jianying_draft_dir 必须是字符串'}
         try:
             save_settings(data)
+        except ValueError as exc:
+            _log.warning("save_settings 校验失败: %s", exc)
+            return {'success': False, 'error': str(exc)}
         except OSError as exc:
             from lsc.utils.error_messages import humanize_error
             _log.error("保存设置失败: %s", exc)
