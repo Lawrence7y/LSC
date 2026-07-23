@@ -1,55 +1,44 @@
 #!/usr/bin/env python3
-"""Build unlabeled annotation queue + lightweight local keyboard labeler.
+"""Build a source-balanced labeling queue from session JSON and coarse frames.
 
 Usage:
-  python scripts/valorant_vision/build_label_queue.py
-  python scripts/valorant_vision/serve_label_ui.py
-Then open http://127.0.0.1:8765/
-Keys: 1=non_game 2=buy 3=combat 4=result 5=replay  s=skip  z=undo  ←/→ navigate
+  python scripts/valorant_vision/build_label_queue.py \\
+    --sessions sessions.json --frame-root annotations --output queue.json
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
-OUT_ROOT = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"
-INTERVAL_SEC = 4.0
+VALID_SOURCES = {"pov", "broadcast"}
 
-SESSIONS = [
-    {
-        "dir": "pov_ling",
-        "video_id": "pov_ling_20260720_134749",
-        "session_id": "douyin_ling_12eaf3_20260720",
-        "source_type": "pov",
-        "split": "train",
-        "video_path": r"D:\desktop\新建文件夹\新建文件夹\新建文件夹\douyin_从玲开始的异世界_12eaf3\recording_20260720_134749_493238.mp4",
-    },
-    {
-        "dir": "broadcast_yuezi",
-        "video_id": "broadcast_yuezi_20260720_202557",
-        "session_id": "douyin_yuezi_2aaacc_20260720",
-        "source_type": "broadcast",
-        "split": "val",
-        "video_path": r"D:\desktop\新建文件夹\新建文件夹\新建文件夹\douyin_月子_无畏契约解说_2aaacc\recording_20260720_202557_76e32f.mp4",
-    },
-    {
-        "dir": "pov_beilie",
-        "video_id": "pov_beilie_20260721_141303",
-        "session_id": "douyin_beilie_357308_20260721",
-        "source_type": "pov",
-        "split": "train",
-        "video_path": r"D:\desktop\新建文件夹\新建文件夹\新建文件夹\douyin_卑劣的凡_357308\recording_20260721_141303_c4d544.mp4",
-    },
-    {
-        "dir": "pov_tangqihua",
-        "video_id": "pov_tangqihua_20260721_141301",
-        "session_id": "douyin_tangqihua_ead22d_20260721",
-        "source_type": "pov",
-        "split": "train",
-        "video_path": r"D:\desktop\新建文件夹\新建文件夹\新建文件夹\douyin_唐启华_ead22d\recording_20260721_141301_8c8b34.mp4",
-    },
-]
+
+@dataclass(frozen=True)
+class VideoSession:
+    video_id: str
+    video_path: str
+    frame_dir: Path
+    source_type: str
+    session_id: str
+    timestamp_offset_sec: float = 0.0
+
+    @classmethod
+    def from_dict(cls, row: dict) -> VideoSession:
+        source = str(row["source_type"])
+        if source not in VALID_SOURCES:
+            raise ValueError(f"invalid source_type: {source}")
+        return cls(
+            video_id=str(row["video_id"]),
+            video_path=str(row["video_path"]),
+            frame_dir=Path(row["frame_dir"]),
+            source_type=source,
+            session_id=str(row["session_id"]),
+            timestamp_offset_sec=float(row.get("timestamp_offset_sec", 0.0)),
+        )
 
 
 def frame_index(path: Path) -> int:
@@ -59,35 +48,109 @@ def frame_index(path: Path) -> int:
     return int(m.group(1))
 
 
+def choose_split(timestamp_sec: float, duration_sec: float, *, gap_sec: float = 30.0) -> str | None:
+    if duration_sec <= 0 or not 0 <= timestamp_sec <= duration_sec:
+        raise ValueError("timestamp/duration out of range")
+    train_end = duration_sec * 0.65
+    val_end = duration_sec * 0.80
+    half_gap = gap_sec / 2.0
+    if abs(timestamp_sec - train_end) <= half_gap or abs(timestamp_sec - val_end) <= half_gap:
+        return None
+    if timestamp_sec < train_end:
+        return "train"
+    if timestamp_sec < val_end:
+        return "val"
+    return "test"
+
+
+def build_queue(
+    sessions: list[VideoSession],
+    durations: dict[str, float],
+    *,
+    frame_root: Path,
+    interval_sec: float,
+    gap_sec: float = 30.0,
+) -> list[dict]:
+    rows: list[dict] = []
+    for session in sessions:
+        duration = durations[session.video_id]
+        for frame in sorted(session.frame_dir.glob("frame_*.jpg")):
+            index = frame_index(frame)
+            timestamp = (index - 1) * interval_sec + session.timestamp_offset_sec
+            split = choose_split(timestamp, duration, gap_sec=gap_sec)
+            if split is None:
+                continue
+            rows.append({
+                "id": f"{session.video_id}_{int(round(timestamp * 1000)):010d}",
+                "rel_path": frame.resolve().relative_to(frame_root.resolve()).as_posix(),
+                "abs_path": str(frame.resolve()),
+                "video_id": session.video_id,
+                "video_path": session.video_path,
+                "timestamp_sec": timestamp,
+                "source_type": session.source_type,
+                "session_id": session.session_id,
+                "split": split,
+            })
+    return rows
+
+
+def _ensure_under_root(path: Path, root: Path) -> None:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"frame_dir outside frame_root: {path}") from exc
+
+
+def probe_duration(video_path: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            video_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    duration = float(result.stdout.strip())
+    if duration <= 0:
+        raise ValueError(f"non-positive duration for {video_path}")
+    return duration
+
+
 def main() -> None:
-    items: list[dict] = []
-    for sess in SESSIONS:
-        folder = OUT_ROOT / sess["dir"]
-        frames = sorted(folder.glob("frame_*.jpg"))
-        for fp in frames:
-            idx = frame_index(fp)
-            ts = (idx - 1) * INTERVAL_SEC
-            items.append(
-                {
-                    "id": f"{sess['video_id']}_{idx:06d}",
-                    "rel_path": f"{sess['dir']}/{fp.name}",
-                    "abs_path": str(fp),
-                    "video_id": sess["video_id"],
-                    "video_path": sess["video_path"],
-                    "timestamp_sec": ts,
-                    "source_type": sess["source_type"],
-                    "session_id": sess["session_id"],
-                    "split": sess["split"],
-                    "label": None,
-                    "notes": "",
-                }
-            )
-    queue_path = OUT_ROOT / "queue.json"
-    queue_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    labels_path = OUT_ROOT / "labels.json"
-    if not labels_path.exists():
-        labels_path.write_text("{}", encoding="utf-8")
-    print(f"wrote {len(items)} items -> {queue_path}")
+    parser = argparse.ArgumentParser(description="Build Valorant phase label queue")
+    parser.add_argument("--sessions", required=True, type=Path, help="JSON file listing video sessions")
+    parser.add_argument("--frame-root", required=True, type=Path, help="Root directory for frame images")
+    parser.add_argument("--output", required=True, type=Path, help="Output queue JSON path")
+    parser.add_argument("--interval", required=True, type=float, help="Seconds between extracted frames")
+    parser.add_argument("--gap-sec", type=float, default=30.0, help="Gap around split boundaries (seconds)")
+    args = parser.parse_args()
+
+    frame_root = args.frame_root.resolve()
+    raw_sessions = json.loads(args.sessions.read_text(encoding="utf-8"))
+    sessions = [VideoSession.from_dict(row) for row in raw_sessions]
+
+    for session in sessions:
+        _ensure_under_root(session.frame_dir, frame_root)
+
+    durations = {session.video_id: probe_duration(session.video_path) for session in sessions}
+    rows = build_queue(
+        sessions,
+        durations,
+        frame_root=frame_root,
+        interval_sec=args.interval,
+        gap_sec=args.gap_sec,
+    )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"wrote {len(rows)} items -> {args.output}")
 
 
 if __name__ == "__main__":

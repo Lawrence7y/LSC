@@ -66,6 +66,47 @@ def configure_paths(root: Path | None = None) -> LabelPaths:
     return paths
 
 
+VALID_LABELS = {"non_game", "buy", "combat", "result", "replay"}
+
+
+def resolve_frame_path(root: Path, relative: str) -> Path:
+    """Resolve a queue-relative frame path; reject path escape outside root."""
+    candidate = (root / relative).resolve()
+    if not candidate.is_relative_to(root.resolve()):
+        raise ValueError("outside frame root")
+    return candidate
+
+
+def validate_labels(labels: dict) -> dict:
+    """Validate label payload shape used by the local labeling UI / export."""
+    if not isinstance(labels, dict):
+        raise ValueError("labels must be an object")
+    for key, value in labels.items():
+        if not isinstance(value, dict) or value.get("label") not in VALID_LABELS:
+            raise ValueError(f"invalid label for {key}")
+    return labels
+
+
+def build_manifest_rows(queue: list[dict], labels: dict) -> list[dict]:
+    """Export only human-reviewed labels into training manifest rows."""
+    rows: list[dict] = []
+    for item in queue:
+        label = labels.get(item["id"])
+        if not label or label.get("annotator") != "human":
+            continue
+        rows.append({
+            "video_id": item["video_id"],
+            "video_path": item["video_path"],
+            "timestamp_sec": item["timestamp_sec"],
+            "label": label["label"],
+            "split": item["split"],
+            "source_type": item["source_type"],
+            "session_id": item["session_id"],
+            "notes": label.get("notes", ""),
+        })
+    return rows
+
+
 def _load_queue_frames() -> list[dict]:
     return json.loads(QUEUE.read_text(encoding="utf-8"))
 

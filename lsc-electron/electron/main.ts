@@ -319,6 +319,11 @@ function spawnBackend(): void {
   if (process.env.LSC_CONFIG_PATH) {
     safeEnv.LSC_CONFIG_PATH = process.env.LSC_CONFIG_PATH
   }
+  for (const key of ['LSC_VALORANT_MODEL_DIR', 'LSC_VALORANT_VISION_SHADOW'] as const) {
+    if (process.env[key]) {
+      safeEnv[key] = process.env[key]
+    }
+  }
   // 显式传递打包内 FFmpeg 目录,供 config.py 优先使用
   if (bundledFfmpegDir) {
     safeEnv.LSC_BUNDLED_FFMPEG_DIR = bundledFfmpegDir

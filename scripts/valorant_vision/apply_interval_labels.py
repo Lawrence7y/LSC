@@ -1,101 +1,103 @@
 #!/usr/bin/env python3
-"""Apply coarse interval labels then export manifest_labeled.jsonl.
+"""Apply coarse interval label candidates to a labeling queue.
 
-Intervals are inclusive frame indices (ffmpeg fps=1/4 → timestamp=(idx-1)*4).
-Refine with serve_label_ui.py for buy/result/replay boundaries.
+Intervals use half-open [start_sec, end_sec) semantics. Human labels
+(annotator == "human") are never overwritten. Refine boundaries with
+serve_label_ui.py before training export.
 """
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
-ROOT = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"
-QUEUE = ROOT / "queue.json"
-LABELS = ROOT / "labels.json"
-MANIFEST = ROOT / "manifest_labeled.jsonl"
-INTERVAL = 4.0
-
-# (start_idx, end_idx, label, notes) — 1-based frame indices matching frame_%06d.jpg
-BROADCAST_INTERVALS: list[tuple[int, int, str, str]] = [
-    (1, 3, "non_game", "stream interstitial / REPLAY cityscape"),
-    (4, 22, "non_game", "tactical timeout + stage camera"),
-    (23, 24, "non_game", "stage cam / monitor close-up transition"),
-    (25, 118, "combat", "VCT broadcast combat POV (coarse; refine buy/result)"),
-    (119, 125, "buy", "blue barrier / buy-phase markers around t~476s"),
-    (126, 250, "combat", "post-buy combat through mid-map (coarse)"),
-    (251, 276, "non_game", "HUG CAM / HALFTIME / arena crowd"),
-]
-
-# POV surveyed keyframes (every ~50–100 frames). Refine buy/result edges in UI.
-POV_INTERVALS: list[tuple[int, int, str, str]] = [
-    (1, 148, "combat", "early match combat (sampled)"),
-    (149, 210, "buy", "购买阶段 banner ~t=596–800s"),
-    (211, 380, "combat", "includes 赛点 late-round; refine result edges in UI"),
-    (381, 450, "non_game", "agent select / lobby (Sunset)"),
-    (451, 520, "buy", "new match buy phase score 0-0"),
-    (521, 585, "combat", "post-buy combat"),
-    (586, 615, "buy", "购买阶段 ~t=2340s"),
-    (616, 875, "combat", "mid match combat"),
-    (876, 930, "non_game", "settings menu overlay during stream"),
-    (931, 1025, "buy", "购买阶段 + combat report overlay"),
-    (1026, 1113, "combat", "late/OT combat (加时赛 sampled)"),
-]
+VALID_LABELS = {"non_game", "buy", "combat", "result", "replay"}
 
 
-def apply_intervals(video_id: str, intervals: list[tuple[int, int, str, str]], labels: dict) -> int:
-    n = 0
-    for start, end, label, notes in intervals:
-        for idx in range(start, end + 1):
-            key = f"{video_id}_{idx:06d}"
-            labels[key] = {
-                "label": label,
-                "notes": notes,
-                "timestamp_sec": (idx - 1) * INTERVAL,
-                "video_id": video_id,
-                "annotator": "agent_interval_v1",
-            }
-            n += 1
-    return n
+def label_at(intervals: list[dict], timestamp_sec: float) -> dict | None:
+    for interval in intervals:
+        label = str(interval["label"])
+        if label not in VALID_LABELS:
+            raise ValueError(f"invalid label: {label}")
+        if float(interval["start_sec"]) <= timestamp_sec < float(interval["end_sec"]):
+            return interval
+    return None
 
 
-def export_manifest(queue: list[dict], labels: dict) -> int:
+def apply_interval_candidates(queue: list[dict], labels: dict, intervals_by_video: dict) -> int:
+    written = 0
+    for item in queue:
+        current = labels.get(item["id"])
+        if current and current.get("annotator") == "human":
+            continue
+        interval = label_at(intervals_by_video.get(item["video_id"], []), item["timestamp_sec"])
+        if interval is None:
+            continue
+        labels[item["id"]] = {
+            "label": interval["label"],
+            "notes": interval.get("notes", ""),
+            "annotator": "interval_candidate_v1",
+        }
+        written += 1
+    return written
+
+
+def export_manifest(queue: list[dict], labels: dict, output_path: Path) -> int:
+    """Write human-reviewed rows only; candidates never enter training manifests."""
     lines: list[str] = []
     for item in queue:
         lab = labels.get(item["id"])
-        if not lab:
+        if not lab or lab.get("annotator") != "human":
             continue
         row = {
             "video_id": item["video_id"],
-            "video_path": item["video_path"],
+            "video_path": item.get("video_path", ""),
             "timestamp_sec": item["timestamp_sec"],
             "label": lab["label"],
-            "split": item["split"],
-            "source_type": item["source_type"],
-            "session_id": item["session_id"],
+            "split": item.get("split", ""),
+            "source_type": item.get("source_type", ""),
+            "session_id": item.get("session_id", ""),
             "notes": lab.get("notes") or "",
         }
         lines.append(json.dumps(row, ensure_ascii=False))
-    MANIFEST.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    text = "\n".join(lines) + ("\n" if lines else "")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(text, encoding="utf-8")
     return len(lines)
 
 
+def _atomic_write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
 def main() -> None:
-    queue = json.loads(QUEUE.read_text(encoding="utf-8"))
+    parser = argparse.ArgumentParser(description="Apply interval label candidates to a queue")
+    parser.add_argument("--queue", type=Path, required=True, help="Labeling queue JSON")
+    parser.add_argument("--intervals", type=Path, required=True, help="video_id -> intervals JSON")
+    parser.add_argument("--labels", type=Path, required=True, help="Labels JSON (read/write)")
+    parser.add_argument("--manifest", type=Path, help="Optional manifest_labeled.jsonl output")
+    args = parser.parse_args()
+
+    queue = json.loads(args.queue.read_text(encoding="utf-8"))
+    intervals_by_video = json.loads(args.intervals.read_text(encoding="utf-8"))
     labels: dict = {}
-    if LABELS.exists():
-        labels = json.loads(LABELS.read_text(encoding="utf-8"))
+    if args.labels.exists():
+        labels = json.loads(args.labels.read_text(encoding="utf-8"))
 
-    n1 = apply_intervals("broadcast_yuezi_20260720_202557", BROADCAST_INTERVALS, labels)
-    n2 = apply_intervals("pov_ling_20260720_134749", POV_INTERVALS, labels)
-    LABELS.write_text(json.dumps(labels, ensure_ascii=False, indent=2), encoding="utf-8")
-    count = export_manifest(queue, labels)
+    written = apply_interval_candidates(queue, labels, intervals_by_video)
+    _atomic_write_json(args.labels, labels)
 
-    from collections import Counter
+    manifest_rows = 0
+    if args.manifest is not None:
+        manifest_rows = export_manifest(queue, labels, args.manifest)
 
-    c = Counter(v["label"] for v in labels.values())
-    print(f"labeled keys: {len(labels)} (broadcast intervals wrote {n1}, pov {n2})")
-    print(f"class counts: {dict(c)}")
-    print(f"manifest rows: {count} -> {MANIFEST}")
+    print(f"interval candidates written: {written}")
+    print(f"total labeled items: {sum(1 for item in queue if item['id'] in labels)}")
+    if args.manifest is not None:
+        print(f"manifest rows: {manifest_rows} -> {args.manifest}")
 
 
 if __name__ == "__main__":
