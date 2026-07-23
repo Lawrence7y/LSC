@@ -278,12 +278,12 @@ export function AnalysisProgress({ status, compact = false, exportSummary }: { s
             type="info"
             showIcon
             message={current.phase === 'finalizing' ? '正在进行最终回合确认（首次约 1–2 分钟）' : '请先结束录制，并等待收尾完成'}
-            description="持续分析会在停录后做一次全文件 OCR 精修，把待确认回合升格为「AI可导」。升格后仍需你确认/导出；收尾完成前请勿关闭分析。"
+            description="停录后会做一次收尾扫描，把尾部回合补入列表（待确认）。当前版本以视觉边界模型为主，不会再跑全文件 OCR「升格」；入列后仍需你确认/导出。"
           />
         )}
         {current.running && !waitingForFinalize && current.phase === 'running' && (
           <Typography.Text type="secondary">
-            提示：结束时请先停录，再等分析收尾；回合入列后需确认再导出（OCR 升格不会自动导出）。
+            提示：结束时请先停录，再等分析收尾；回合入列后需确认再导出。
           </Typography.Text>
         )}
         <Typography.Text type="secondary">
@@ -294,7 +294,9 @@ export function AnalysisProgress({ status, compact = false, exportSummary }: { s
           <Typography.Text type="secondary">超时：{current.scan_timeout}s · OCR：{current.refine_with_ocr ? '启用' : '未启用'}</Typography.Text>
         )}
         {current.updated_at && (
-          <Typography.Text type="secondary">更新时间：{new Date(current.updated_at).toLocaleTimeString()}</Typography.Text>
+          <Typography.Text type="secondary">
+            更新时间：{new Date(current.updated_at > 1e12 ? current.updated_at : current.updated_at * 1000).toLocaleTimeString()}
+          </Typography.Text>
         )}
         {current.phase === 'completed' && (
           <Alert

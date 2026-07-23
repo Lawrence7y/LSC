@@ -137,6 +137,7 @@ _VALORANT_MAX_CATCHUP_SEC = 480.0  # 单次 tick 最多向前追赶的新内容�
 _OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 3
 _POST_TIMEOUT_MAX_CATCHUP_SEC = 120.0
 _SCAN_ABORT_GRACE_SEC = 3.0  # 停止目标：3 秒内终止 FFmpeg 并退出当前短推理批次
+_SCAN_ABORT_HARD_SEC = 30.0  # 超时后继续等待线程释放 semaphore 的硬上限，避免永久挂死任务槽
 _VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期
 _HYBRID_BOUNDARY_SOURCE = "valorant_hybrid_v1"
 _HYBRID_VALID_START_BY = frozenset({"model_buy_exit"})
@@ -1317,8 +1318,11 @@ def _build_continuous_status_payload(
     if "pending_rounds" not in task and highlights:
         pending = max(0, len(highlights) - confirmed)
     finalizing = bool(task.get("finalizing") or phase == "finalizing")
+    resolved_phase = phase or ("finalizing" if finalizing else "running")
+    # stopping/completed/idle/error 对前端均视为非「分析运行中」；stopping 另由 phase 驱动忙碌态。
+    running = resolved_phase in ("running", "finalizing")
     payload: dict[str, Any] = {
-        "running": True,
+        "running": running,
         "room_id": room_id,
         "target_room_ids": task.get("target_room_ids", []),
         "mode": task.get("mode", "scene"),
@@ -1328,7 +1332,7 @@ def _build_continuous_status_payload(
         "pending_rounds": pending,
         "analysis_stage": stage,
         "total_highlights": len(highlights) if highlights is not None else 0,
-        "phase": phase or ("finalizing" if finalizing else "running"),
+        "phase": resolved_phase,
         "updated_at": time.time(),
         "scan_mode": task.get("scan_phase", "incremental"),
         "scan_range": (
@@ -5672,8 +5676,17 @@ def register_room_handlers(server, bridge):
                                 room_id,
                                 scan_timeout,
                             )
-                            # 等待同一线程真实退出后才能离开 semaphore。
-                            await asyncio.shield(fut)
+                            # 等待同一线程真实退出后才能离开 semaphore；硬上限防止永久挂死。
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.shield(fut),
+                                    timeout=_SCAN_ABORT_HARD_SEC,
+                                )
+                            except TimeoutError:
+                                _log.error(
+                                    "扫描线程硬超时仍未退出，放弃等待以免占死任务槽: room_id=%s",
+                                    room_id,
+                                )
                             raise
                     runtime_state = task_state.get('hybrid_runtime_state') or {}
                     task_state['model_version'] = runtime_state.get('model_version')
@@ -6645,11 +6658,21 @@ def register_room_handlers(server, bridge):
                     )
                 except asyncio.TimeoutError:
                     _log.warning(
-                        "worker 未在 %.1fs 内退出，继续等待资源释放: room_id=%s",
+                        "worker 未在 %.1fs 内退出，继续等待至硬上限 %.1fs: room_id=%s",
                         _SCAN_ABORT_GRACE_SEC,
+                        _SCAN_ABORT_HARD_SEC,
                         room_id,
                     )
-                    await asyncio.shield(_worker_task)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(_worker_task),
+                            timeout=_SCAN_ABORT_HARD_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        _log.error(
+                            "worker 硬超时仍未退出，强制释放任务槽: room_id=%s",
+                            room_id,
+                        )
                 except asyncio.CancelledError:
                     pass
             bridge.queue_broadcast({
@@ -6780,6 +6803,14 @@ def register_room_handlers(server, bridge):
         with _analysis_jobs_lock:
             if _continuous_tasks:
                 active_room_id = next(iter(_continuous_tasks))
+                active_state = _continuous_tasks.get(active_room_id) or {}
+                if active_state.get('status') == 'stopping' or active_state.get('cancelled'):
+                    return {
+                        'success': False,
+                        'error': '持续分析正在停止，请稍后再试',
+                        'active_room_id': active_room_id,
+                        'phase': 'stopping',
+                    }
                 return {
                     'success': False,
                     'error': '已有持续分析任务正在运行',
@@ -6896,10 +6927,12 @@ def register_room_handlers(server, bridge):
             return {'success': False, 'error': '该房间没有持续分析任务'}
         if done_event is not None and not state.get('scan_running'):
             done_event.set()
+        # running=False：前端按钮可离开「分析中」；phase=stopping：禁止立刻再启动，
+        # 等 finally 广播 idle 并 pop 任务槽后再允许启动。
         bridge.queue_broadcast({
             'type': 'continuous_analysis_status',
             'data': {
-                'running': True,
+                'running': False,
                 'phase': 'stopping',
                 'status': 'stopping',
                 'room_id': room_id,
@@ -6911,6 +6944,7 @@ def register_room_handlers(server, bridge):
         return {
             'success': True,
             'status': 'stopping',
+            'phase': 'stopping',
             'room_id': room_id,
             'requested_room_id': requested_room_id,
         }
@@ -6931,7 +6965,16 @@ def register_room_handlers(server, bridge):
             analysis_stage = task.get('analysis_stage', '分析中')
             if room is not None and getattr(room, 'is_recording', False) and analysis_stage == '等待新录制':
                 analysis_stage = '等待可分析片段'
-            phase = 'finalizing' if task.get('finalizing') else 'running'
+            if task.get('status') == 'stopping' or (
+                task.get('cancelled') and not task.get('completed') and not task.get('finalizing')
+            ):
+                phase = 'stopping'
+            elif task.get('completed'):
+                phase = 'completed'
+            elif task.get('finalizing'):
+                phase = 'finalizing'
+            else:
+                phase = 'running'
             return _build_continuous_status_payload(
                 task,
                 room_id=active_room_id,

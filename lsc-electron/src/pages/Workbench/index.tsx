@@ -542,16 +542,35 @@ export default function Workbench() {
     const unsubs: (() => void)[] = []
     const applyContinuousStatus = (data: ContinuousAnalysisStatus) => {
       const previous = useAppStore.getState().continuousAnalysisStatus
-      const merged = previous?.room_id === data?.room_id
-        ? { ...previous, ...data }
-        : data
+      const rawUpdated = data?.updated_at
+      // 后端 time.time() 为秒；前端 Date.now() 为毫秒。统一存秒。
+      const normalizedUpdated =
+        typeof rawUpdated === 'number' && Number.isFinite(rawUpdated)
+          ? (rawUpdated > 1e12 ? Math.floor(rawUpdated / 1000) : Math.floor(rawUpdated))
+          : rawUpdated
+      const normalized = {
+        ...data,
+        ...(normalizedUpdated != null ? { updated_at: normalizedUpdated } : {}),
+      }
+      const merged = previous?.room_id === normalized?.room_id
+        ? { ...previous, ...normalized }
+        : normalized
       setContinuousAnalysisStatus(merged)
-      if (data?.running && data?.room_id) {
+
+      const phase = merged?.phase
+      // stopping：任务槽未释放，保持忙碌，禁止立刻再启动（避免「点两次」）
+      const busy =
+        phase === 'stopping'
+        || phase === 'running'
+        || phase === 'finalizing'
+        || (merged?.running === true && phase !== 'idle' && phase !== 'completed' && phase !== 'error')
+
+      if (busy && merged?.room_id) {
         setContinuousAnalyzing(true)
-        setContinuousRoomId(data.room_id)
-        continuousActiveRoomRef.current = data.room_id
-        if (Array.isArray(data.target_room_ids)) {
-          setContinuousTargetRoomIds(data.target_room_ids)
+        setContinuousRoomId(merged.room_id)
+        continuousActiveRoomRef.current = merged.room_id
+        if (Array.isArray(merged.target_room_ids)) {
+          setContinuousTargetRoomIds(merged.target_room_ids)
         }
       } else {
         setContinuousAnalyzing(false)
@@ -2500,11 +2519,17 @@ export default function Workbench() {
         message.error('持续分析需要至少两间目标房间，请再选中一间')
         return
       }
+      if (continuousAnalysisStatus?.phase === 'stopping' || continuousAnalyzing) {
+        message.warning('持续分析仍在停止中或运行中，请稍后再试')
+        return
+      }
       const mainRoomPreviewEnabled = rooms.find(r => r.room_id === continuousMainRoom)?.preview_enabled ?? false
       if (!mainRoomPreviewEnabled) {
-        message.info('主房未开启预览：持续分析间隔约 45 秒', 4)
+        // 后端 valorant 强制 interval=5；此处仅提示未开预览时观感更依赖状态面板
+        message.info('主房未开启预览：请以状态面板中的有效间隔为准', 4)
       }
-      send('start_continuous_analysis', {
+      setContinuousSubmitting(true)
+      const queued = send('start_continuous_analysis', {
         main_room_id: continuousMainRoom,
         target_room_ids: targetRoomIds,
         mode: isValorantRoundCutting ? 'valorant_round' : 'scene',
@@ -2513,6 +2538,10 @@ export default function Workbench() {
         threshold: 0.3,
         game: isValorantRoundCutting ? 'valorant' : 'generic',
       })
+      if (!queued) {
+        setContinuousSubmitting(false)
+        return
+      }
       setContinuousModalOpen(false)
       message.info('持续分析启动请求已发送')
     } else {
@@ -2524,7 +2553,7 @@ export default function Workbench() {
       const analysisMode = isValorantRoundCutting ? 'valorant_round' : 'scene'
       console.log('[Workbench] 用户操作: 多房间同步分析导出, main:', continuousMainRoom,
         'targets:', targetRoomIds, 'mode:', analysisMode)
-      send('start_analysis_export', {
+      const queued = send('start_analysis_export', {
         main_room_id: continuousMainRoom,
         target_room_ids: targetRoomIds,
         mode: analysisMode,
@@ -2534,8 +2563,13 @@ export default function Workbench() {
         job_prefix: jobPrefix,
         game: isValorantRoundCutting ? 'valorant' : 'generic',
       })
+      if (!queued) {
+        setContinuousSubmitting(false)
+        isSyncExportModeRef.current = false
+        return
+      }
       setContinuousModalOpen(false)
-      setContinuousSubmitting(false)
+      // continuousSubmitting 在 start_analysis_export_response 中清除
     }
   }
 
@@ -2546,6 +2580,7 @@ export default function Workbench() {
     unsubs.push(on('start_analysis_export_response', (data: any) => {
       isSyncExportModeRef.current = false
       syncTargetRoomIdsRef.current = []
+      setContinuousSubmitting(false)
       if (data?.success && data?.highlights) {
         // 与持续分析一致：切片通过 clip_queued 事件入列（confirm_status=pending），不自动导出
         message.success(`已分析 ${data.highlights.length} 个高光（${data.submitted_count} 个已入列待确认，确认后再导出）`)
@@ -2554,6 +2589,7 @@ export default function Workbench() {
       }
     }))
     unsubs.push(on('start_continuous_analysis_response', (data: any) => {
+      setContinuousSubmitting(false)
       if (data?.success) {
         const roomId = data.main_room_id || continuousMainRoom
         const targetRoomIds = Array.isArray(data.target_room_ids) ? data.target_room_ids : continuousTargetRoomIds
@@ -2571,7 +2607,7 @@ export default function Workbench() {
           analyzed_duration: 0,
           total_highlights: 0,
           phase: 'running',
-          updated_at: Date.now(),
+          updated_at: Math.floor(Date.now() / 1000),
         })
         message.success(
           data.mode === 'valorant_round'
@@ -2588,17 +2624,26 @@ export default function Workbench() {
           room_id: null,
           phase: 'error',
           error: data?.error || '持续分析启动失败',
-          updated_at: Date.now(),
+          updated_at: Math.floor(Date.now() / 1000),
         })
         message.error(data?.error || '持续分析启动失败')
       }
     }))
     unsubs.push(on('stop_continuous_analysis_response', (data: any) => {
       if (data?.success) {
-        setContinuousAnalyzing(false)
-        setContinuousRoomId(null)
-        continuousActiveRoomRef.current = null
-        message.success('持续分析已停止')
+        // 不立即宣告已停止：保持忙碌直到 idle 广播（任务槽释放）
+        const previous = useAppStore.getState().continuousAnalysisStatus
+        setContinuousAnalysisStatus({
+          ...(previous || {}),
+          running: false,
+          phase: 'stopping',
+          status: 'stopping',
+          analysis_stage: '停止中',
+          room_id: data?.room_id ?? previous?.room_id ?? null,
+          updated_at: Math.floor(Date.now() / 1000),
+        })
+        setContinuousAnalyzing(true)
+        message.info('正在停止持续分析…')
       } else {
         message.error(data?.error || '持续分析停止失败')
       }
@@ -2619,7 +2664,7 @@ export default function Workbench() {
         pending_rounds: previous?.pending_rounds ?? 0,
         phase: 'completed',
         analysis_stage: '已完成',
-        updated_at: Date.now(),
+        updated_at: Math.floor(Date.now() / 1000),
       })
     }))
     // 刷新房间状态响应
@@ -3325,8 +3370,11 @@ export default function Workbench() {
                       || ca?.room_id
                       || continuousRoomId
                       || '当前主房'
+                    if (ca?.phase === 'stopping') {
+                      return `正在停止持续分析（主房：${mainName}）`
+                    }
                     if (ca?.phase === 'finalizing' || ca?.analysis_stage === '收尾中') {
-                      return `正在收尾精修（主房：${mainName}），此时停止可能丢升格`
+                      return `正在收尾确认回合（主房：${mainName}），此时停止可能中断收尾扫描`
                     }
                     return `停止持续分析（主房：${mainName}）`
                   })()
@@ -3335,8 +3383,13 @@ export default function Workbench() {
               <span>
                 <Button
                   size="small"
-                  danger={continuousAnalyzing}
-                  disabled={!continuousAnalyzing && !analysisEnabled}
+                  danger={continuousAnalyzing && continuousAnalysisStatus?.phase !== 'stopping'}
+                  loading={continuousSubmitting || continuousAnalysisStatus?.phase === 'stopping'}
+                  disabled={
+                    continuousAnalysisStatus?.phase === 'stopping'
+                    || continuousSubmitting
+                    || (!continuousAnalyzing && !analysisEnabled)
+                  }
                   onClick={() => {
                     if (!continuousAnalyzing && !analysisEnabled) {
                       if (currentTargetRoomList.length < 1) return
@@ -3353,6 +3406,10 @@ export default function Workbench() {
                     if (continuousAnalyzing) {
                       const activeRoomId = continuousActiveRoomRef.current || continuousRoomId || undefined
                       const ca = useAppStore.getState().continuousAnalysisStatus
+                      if (ca?.phase === 'stopping') {
+                        message.info('持续分析正在停止，请稍候')
+                        return
+                      }
                       const doStop = () => {
                         send('stop_continuous_analysis', { main_room_id: activeRoomId })
                         setContinuousModalOpen(false)
@@ -3360,7 +3417,7 @@ export default function Workbench() {
                       if (ca?.phase === 'finalizing' || ca?.analysis_stage === '收尾中' || ca?.analysis_stage === '等待收尾') {
                         Modal.confirm({
                           title: '收尾尚未完成',
-                          content: '停止后待确认回合可能无法完成 OCR 升格。确定停止持续分析？',
+                          content: '停止后未完成的收尾扫描可能中断，待确认回合仍会保留在列表中。确定停止持续分析？',
                           okText: '仍要停止',
                           okButtonProps: { danger: true },
                           cancelText: '继续等待',
@@ -3376,12 +3433,16 @@ export default function Workbench() {
                       openedWithMultiRef.current = targetRoomIds.length >= 2
                       setContinuousTargetRoomIds(targetRoomIds)
                       setContinuousMainRoom(targetRoomIds[0])
-                      setAnalysisIsContinuous(false)
+                      // 保留上次持续/单次模式，避免每次打开都变回单次导致「点两次」
                       setContinuousModalOpen(true)
                     }
                   }}
                 >
-                  {continuousAnalyzing ? '停止持续分析' : '分析导出'}
+                  {continuousAnalysisStatus?.phase === 'stopping'
+                    ? '停止中…'
+                    : continuousAnalyzing
+                      ? '停止持续分析'
+                      : '分析导出'}
                 </Button>
               </span>
             </Tooltip>
@@ -3819,7 +3880,7 @@ export default function Workbench() {
             />
             <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
               {analysisIsContinuous
-                ? '边录边分析。结束时请先停录，再等状态变为「收尾中/已完成」；回合入列后需确认再导出，收尾 OCR 只会升格状态不会自动导出。'
+                ? '边录边分析。结束时请先停录，再等状态变为「收尾中/已完成」；回合入列后需确认再导出。收尾会补扫尾部片段，当前不会做全文件 OCR 升格。'
                 : '关闭则为单次分析：高光入列待确认，确认后再导出'}
             </span>
           </div>

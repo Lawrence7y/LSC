@@ -864,7 +864,56 @@ def test_stop_handler_sets_stopping_not_stopped() -> None:
     assert "'status': 'stopping'" in stop_fn or '"status": "stopping"' in stop_fn
     assert "'phase': 'stopping'" in stop_fn or '"phase": "stopping"' in stop_fn
     assert "scan_abort" in stop_fn
+    # 停止中不得广播 running=True，否则前端会把按钮弹回「分析中」
+    assert "'running': False" in stop_fn or '"running": False' in stop_fn
 
+
+def test_worker_stop_has_hard_timeout_constant() -> None:
+    """worker 停止等待须有硬上限，避免 shield 永久挂死任务槽。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_SCAN_ABORT_HARD_SEC" in src
+    assert "_SCAN_ABORT_GRACE_SEC" in src
+    finally_block = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _export_and_broadcast", 1
+    )[0]
+    assert "_SCAN_ABORT_HARD_SEC" in finally_block
+    # 不得在 finally 里裸 await shield(worker) 无超时
+    assert "强制释放任务槽" in finally_block
+
+
+def test_start_rejects_while_stopping() -> None:
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    start_fn = src.split("async def handle_start_continuous_analysis", 1)[1].split(
+        "@server.on('stop_continuous_analysis')", 1
+    )[0]
+    assert "持续分析正在停止，请稍后再试" in start_fn
+
+
+def test_frontend_stop_keeps_busy_until_idle() -> None:
+    """stop_response 不得立刻 continuousAnalyzing=false；须等 idle。"""
+    wb = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    stop_handler = wb.split("on('stop_continuous_analysis_response'", 1)[1].split(
+        "on('continuous_analysis_complete'", 1
+    )[0]
+    assert "正在停止持续分析" in stop_handler
+    assert "setContinuousAnalyzing(true)" in stop_handler
+    assert "phase: 'stopping'" in stop_handler
+    # 打开 Modal 不得强制重置为单次模式
+    assert "setAnalysisIsContinuous(false)\n                      setContinuousModalOpen(true)" not in wb
+
+
+def test_frontend_continuous_start_checks_send_and_pending() -> None:
+    wb = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    confirm = wb.split("const handleConfirmAnalysisExport", 1)[1].split(
+        "// 监听分析结果与进度", 1
+    )[0]
+    assert "setContinuousSubmitting(true)" in confirm
+    assert "if (!queued)" in confirm
+    assert "start_continuous_analysis" in confirm
+    # 单次路径：send 后关 Modal，但不得立刻清除 submitting（留给 response）
+    one_shot = confirm.split("} else {", 1)[1]
+    after_modal_close = one_shot.split("setContinuousModalOpen(false)", 1)[1]
+    assert "setContinuousSubmitting(false)" not in after_modal_close
 
 def test_finalize_continues_from_cursor_not_full_rescan() -> None:
     """停录收尾从游标继续，不默认全文件重扫。"""

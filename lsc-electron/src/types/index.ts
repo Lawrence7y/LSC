@@ -334,7 +334,8 @@ export interface ContinuousAnalysisStatus {
   pending_rounds?: number
   analysis_stage?: string
   total_highlights?: number
-  phase?: 'idle' | 'running' | 'finalizing' | 'completed' | 'error'
+  phase?: 'idle' | 'running' | 'stopping' | 'finalizing' | 'completed' | 'error'
+  status?: string
   updated_at?: number
   scan_mode?: 'full' | 'incremental'
   scan_phase?: 'full' | 'incremental'
