@@ -588,7 +588,7 @@ def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording(
     progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
 
     assert "const previous = useAppStore.getState().continuousAnalysisStatus" in workbench
-    assert "{ ...previous, ...data }" in workbench
+    assert "{ ...previous, ...normalized }" in workbench
     assert "等待新录制" in progress
     assert "等待录制" in progress
 
@@ -628,8 +628,8 @@ def test_workbench_optimistically_updates_connect_record_and_mute() -> None:
 def test_room_handler_mute_awaits_before_broadcast_and_exposes_recording_starting() -> None:
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     mute_body = source.split("async def handle_set_preview_muted(data):", 1)[1].split("@server.on(", 1)[0]
-    assert "bridge.call(manager.set_preview_muted" in mute_body
-    assert "bridge.submit(manager.set_preview_muted" not in mute_body
+    assert "bridge.manager.call(manager.set_preview_muted" in mute_body
+    assert "bridge.manager.submit(manager.set_preview_muted" not in mute_body
     assert "_broadcast_rooms(force=True)" in mute_body
     assert "'is_recording_starting': room_id in _recording_starting" in source
     start_body = source.split("async def handle_start_recording(data):", 1)[1].split("@server.on('stop_recording')", 1)[0]
@@ -1487,9 +1487,9 @@ def test_backend_mse_broadcast_uses_binary_helper() -> None:
 def test_broadcaster_is_event_driven() -> None:
     """broadcast 循环须绑定 wake event，禁止空队列固定 sleep(0.1)。"""
     main = (ROOT / "python-backend/main.py").read_text(encoding="utf-8")
-    bridge = (ROOT / "python-backend/message_bridge.py").read_text(encoding="utf-8")
-    assert "bind_async_wake" in main and "bind_async_wake" in bridge
-    assert "notify_broadcast" in bridge
+    hub = (ROOT / "python-backend/broadcast_hub.py").read_text(encoding="utf-8")
+    assert "bind_async_wake" in main and "bind_async_wake" in hub
+    assert "notify_broadcast" in hub
     assert "wait_for(wake.wait()" in main or "wait_for(wake.wait(), timeout=0.5)" in main
     assert "await asyncio.sleep(0.1)" not in main.split("async def _broadcast_coroutine", 1)[1].split(
         "def start", 1
@@ -1500,15 +1500,15 @@ def test_medium_tick_emits_room_updated_patches() -> None:
     """中频 tick 须增量 room_updated；低频 tick 保留全量 rooms_updated。"""
     handler = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     assert "_queue_recording_size_patches" in handler
-    assert "manager.medium_tick.connect(_queue_recording_size_patches)" in handler
-    assert "manager.low_tick.connect(_queue_rooms_update)" in handler
-    assert "manager.medium_tick.connect(_queue_rooms_update)" not in handler
+    assert 'bus.subscribe("medium_tick", lambda: _queue_recording_size_patches())' in handler
+    assert 'bus.subscribe("low_tick", lambda: _queue_rooms_update())' in handler
+    assert 'bus.subscribe("medium_tick", lambda: _queue_rooms_update())' not in handler
 
 
 def test_qt_global_tick_is_3s_with_stagger() -> None:
-    """Qt 全局 tick 须 3s 间隔 + 交错轮询。"""
-    mgr = (ROOT / "lsc/gui/multi_room/manager.py").read_text(encoding="utf-8")
-    assert "_TICK_INTERVAL_MS = 3000" in mgr
-    assert "_STAGGER_GROUPS = 3" in mgr
-    assert "setInterval(_TICK_INTERVAL_MS)" in mgr
-    assert "room_idx % _STAGGER_GROUPS" in mgr
+    """全局 tick 须 3s 间隔 + 交错轮询（orchestrator deadline 驱动）。"""
+    orch = (ROOT / "lsc/core/orchestrator.py").read_text(encoding="utf-8")
+    assert "_TICK_INTERVAL_MS = 3000" in orch
+    assert "_STAGGER_GROUPS = 3" in orch
+    assert "_TICK_INTERVAL_MS / 1000.0" in orch
+    assert "room_idx % _STAGGER_GROUPS" in orch

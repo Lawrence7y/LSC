@@ -138,7 +138,8 @@ _OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 3
 _POST_TIMEOUT_MAX_CATCHUP_SEC = 120.0
 _SCAN_ABORT_GRACE_SEC = 3.0  # 停止目标：3 秒内终止 FFmpeg 并退出当前短推理批次
 _SCAN_ABORT_HARD_SEC = 30.0  # 超时后继续等待线程释放 semaphore 的硬上限，避免永久挂死任务槽
-_VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期
+_VALORANT_MIN_LIST_DURATION_SEC = 5.0  # list_only 入列下限（短 spike 回合也须进列表待确认）
+_VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期（真正导出路径）
 _HYBRID_BOUNDARY_SOURCE = "valorant_hybrid_v1"
 _HYBRID_VALID_START_BY = frozenset({"model_buy_exit"})
 _HYBRID_VALID_END_BY = frozenset({"model_result", "model_score"})
@@ -1029,6 +1030,13 @@ def _hybrid_clip_metadata(round_data: dict[str, Any]) -> dict[str, Any]:
     return {key: round_data[key] for key in keys if key in round_data}
 
 
+def _min_highlight_duration_for_queue(*, list_only: bool) -> float:
+    """list_only 用低门槛入列；真正导出仍用 35s 过滤假买枪段。"""
+    if list_only:
+        return _VALORANT_MIN_LIST_DURATION_SEC
+    return _VALORANT_MIN_EXPORT_DURATION_SEC
+
+
 def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
     """Hybrid rounds listable when boundary_source + confirm_status + valid bounds."""
     if not _is_hybrid_round(round_data):
@@ -1175,8 +1183,8 @@ def _should_broadcast_clip_list_update(
     end: float,
     confirm_status: str,
     *,
-    listed_ids: set[str],
-    exported_ids: set[str],
+    listed_ids: dict[str, None],
+    exported_ids: dict[str, None],
     refined_keys: set[str],
     listed_bounds: dict[str, tuple[float, float, str]],
 ) -> str:
@@ -4739,6 +4747,17 @@ def register_room_handlers(server, bridge):
 
         if not room_id:
             return {'error': 'room_id is required'}
+        with _analysis_jobs_lock:
+            _existing_job = _analysis_jobs.get(room_id)
+            if _existing_job and not _existing_job.get('completed_at') and not _existing_job.get('cancelled'):
+                return {'success': False, 'error': '该房间已有分析任务进行中'}
+            _continuous_conflict = any(
+                room_id == (st.get('main_room_id') or '')
+                or room_id in (st.get('target_room_ids') or [])
+                for st in _continuous_tasks.values()
+            )
+        if _continuous_conflict:
+            return {'success': False, 'error': '该房间正在持续分析中，请先停止持续分析'}
         _log.info("启动分析: room_id=%s, mode=%s, threshold=%.2f", room_id, mode, threshold)
 
         def _do_analysis():
@@ -4840,6 +4859,19 @@ def register_room_handlers(server, bridge):
             return {'error': 'main_room_id is required'}
         if not target_room_ids:
             target_room_ids = [main_room_id]
+
+        with _analysis_jobs_lock:
+            _existing_job = _analysis_jobs.get(main_room_id)
+            if _existing_job and not _existing_job.get('completed_at') and not _existing_job.get('cancelled'):
+                return {'success': False, 'error': '该房间已有分析任务进行中'}
+            _target_id_set = set(target_room_ids)
+            _continuous_conflict = any(
+                (st.get('main_room_id') or '') in _target_id_set
+                or bool(_target_id_set.intersection(st.get('target_room_ids') or []))
+                for st in _continuous_tasks.values()
+            )
+        if _continuous_conflict:
+            return {'success': False, 'error': '目标房间正在持续分析中，请先停止持续分析'}
 
         _log.info("分析并导出: main=%s, targets=%s, mode=%s", main_room_id, target_room_ids, mode)
         loop = asyncio.get_running_loop()
@@ -5007,8 +5039,17 @@ def register_room_handlers(server, bridge):
         from lsc.analyzer.pipeline import _deduplicate_highlights
         return _deduplicate_highlights(existing + new_hl, iou_threshold=0.6)
 
-    _exported_clip_ids: set[str] = set()  # 已真正导出 / 入导出队列
-    _listed_clip_ids: set[str] = set()  # 已向切片列表广播过的 room:round_key
+    _CLIP_KEY_CACHE_MAX = 20000  # clip key 缓存上限：超限裁掉最旧一半，防长期运行无限增长
+
+    def _bounded_clip_key_add(cache: dict, key: str, value: Any = None) -> None:
+        """向保序 dict 缓存写入 key；超上限时裁掉最旧一半（近似 LRU）。"""
+        if len(cache) >= _CLIP_KEY_CACHE_MAX:
+            for _old_key in list(cache)[: _CLIP_KEY_CACHE_MAX // 2]:
+                cache.pop(_old_key, None)
+        cache[key] = value
+
+    _exported_clip_ids: dict[str, None] = {}  # 已真正导出 / 入导出队列（保序、有界）
+    _listed_clip_ids: dict[str, None] = {}  # 已向切片列表广播过的 room:round_key（保序、有界）
     _listed_clip_bounds: dict[str, tuple[float, float, str]] = {}  # listed_key -> (start, end, status)
     _refined_round_keys: set[str] = set()  # 精修中或已确认的 round_key（OCR 不得改边界）
     # 保护 _refined_round_keys 的锁：asyncio handler 与分析 executor 线程
@@ -5039,13 +5080,17 @@ def register_room_handlers(server, bridge):
 
         submitted_jobs = set()
 
+        min_dur = _min_highlight_duration_for_queue(list_only=list_only)
         for idx, hl in enumerate(highlights):
             source_start = float(hl.get('start', 0) or 0)
             source_end = float(hl.get('end', 0) or 0)
             if source_start >= source_end:
                 continue
-            if source_end - source_start < _VALORANT_MIN_EXPORT_DURATION_SEC:
-                _log.info("跳过过短高光 %.1f-%.1f", source_start, source_end)
+            if source_end - source_start < min_dur:
+                _log.info(
+                    "跳过过短高光 %.1f-%.1f (min=%.1fs, list_only=%s)",
+                    source_start, source_end, min_dur, list_only,
+                )
                 continue
 
             round_idx = int(hl.get('round_index', idx + 1))
@@ -5064,7 +5109,7 @@ def register_room_handlers(server, bridge):
                 export_end = max(0.0, source_end + delta)
                 if export_start >= export_end:
                     continue
-                if export_end - export_start < _VALORANT_MIN_EXPORT_DURATION_SEC:
+                if export_end - export_start < min_dur:
                     continue
 
                 room_name = getattr(target_room, 'streamer_name', '') or rid
@@ -5097,8 +5142,8 @@ def register_room_handlers(server, bridge):
                     )
                     job_id = f"auto-{job_prefix}-{round_key}-{rid}"
                     clip_id = _clip_id(rid, export_start, export_end)
-                    _listed_clip_ids.add(listed_key)
-                    _listed_clip_bounds[listed_key] = (start_r, end_r, confirm_status)
+                    _bounded_clip_key_add(_listed_clip_ids, listed_key)
+                    _bounded_clip_key_add(_listed_clip_bounds, listed_key, (start_r, end_r, confirm_status))
                     submitted_jobs.add((round_key, rid))
                     bridge.queue_broadcast({
                         'type': 'clip_queued',
@@ -5142,9 +5187,9 @@ def register_room_handlers(server, bridge):
                         'clip_id': clip_id,
                         'room_name': room_name,
                     })
-                    _exported_clip_ids.add(listed_key)
-                    _listed_clip_ids.add(listed_key)
-                    _listed_clip_bounds[listed_key] = (start_r, end_r, confirm_status)
+                    _bounded_clip_key_add(_exported_clip_ids, listed_key)
+                    _bounded_clip_key_add(_listed_clip_ids, listed_key)
+                    _bounded_clip_key_add(_listed_clip_bounds, listed_key, (start_r, end_r, confirm_status))
                     submitted_jobs.add((round_key, rid))
                     bridge.queue_broadcast({
                         'type': 'clip_queued',
@@ -5171,9 +5216,9 @@ def register_room_handlers(server, bridge):
                     source='ai_highlight', job_id=job_id,
                 )
                 if result.get('success'):
-                    _exported_clip_ids.add(listed_key)
-                    _listed_clip_ids.add(listed_key)
-                    _listed_clip_bounds[listed_key] = (start_r, end_r, confirm_status)
+                    _bounded_clip_key_add(_exported_clip_ids, listed_key)
+                    _bounded_clip_key_add(_listed_clip_ids, listed_key)
+                    _bounded_clip_key_add(_listed_clip_bounds, listed_key, (start_r, end_r, confirm_status))
                     submitted_jobs.add((round_key, rid))
                     bridge.queue_broadcast({
                         'type': 'clip_queued',
@@ -5931,7 +5976,18 @@ def register_room_handlers(server, bridge):
                 if not _pending_result:
                     try:
                         scan_done_event.clear()
-                        await asyncio.wait_for(scan_done_event.wait(), timeout=_sleep_time)
+                        # 复查：stop / worker 完成可能在 clear 前已 set event
+                        # （同一事件循环内的连续同步区段，set 会被 clear 吞掉），
+                        # 避免停止 / 结果消费被无谓延迟一整个 sleep 周期。
+                        with _analysis_jobs_lock:
+                            _pre_sleep_state = _continuous_tasks.get(room_id)
+                        _skip_wait = bool(
+                            _pre_sleep_state is None
+                            or _pre_sleep_state.get('cancelled')
+                            or float(scan_result.get('completed_at', 0.0) or 0.0) > last_consumed_at
+                        )
+                        if not _skip_wait:
+                            await asyncio.wait_for(scan_done_event.wait(), timeout=_sleep_time)
                     except asyncio.TimeoutError:
                         pass
                     except asyncio.CancelledError:
@@ -6816,23 +6872,52 @@ def register_room_handlers(server, bridge):
                     'error': '已有持续分析任务正在运行',
                     'active_room_id': active_room_id,
                 }
+            # 占位防双启动：validate 含磁盘等待（每房最多 8s），期间其他连接的
+            # 启动请求会在上方看到任务槽非空而被拒绝。
+            _continuous_tasks[main_room_id] = {
+                'status': 'starting',
+                'cancelled': False,
+                'main_room_id': main_room_id,
+                'target_room_ids': list(target_room_ids or []),
+            }
         if mode == 'valorant_round' and game == 'valorant':
             interval = 5
         elif interval < 10:
             interval = 10  # 最小 10s，避免过于频繁
 
+        def _discard_starting_placeholder() -> None:
+            with _analysis_jobs_lock:
+                if (_continuous_tasks.get(main_room_id) or {}).get('status') == 'starting':
+                    _continuous_tasks.pop(main_room_id, None)
+
         # wait_for_file 内含 time.sleep，必须移出 asyncio event loop
-        ok, error, main_room, target_rooms = await asyncio.get_running_loop().run_in_executor(
-            _bridge_executor,
-            lambda: _validate_synced_analysis_targets(
-                manager,
-                main_room_id,
-                target_room_ids,
-                wait_for_file=True,
-            ),
-        )
+        try:
+            ok, error, main_room, target_rooms = await asyncio.get_running_loop().run_in_executor(
+                _bridge_executor,
+                lambda: _validate_synced_analysis_targets(
+                    manager,
+                    main_room_id,
+                    target_room_ids,
+                    wait_for_file=True,
+                ),
+            )
+        except Exception:
+            _discard_starting_placeholder()
+            raise
         if not ok:
+            _discard_starting_placeholder()
             return {'success': False, 'error': error}
+        with _analysis_jobs_lock:
+            _placeholder = _continuous_tasks.get(main_room_id) or {}
+            _start_aborted = bool(
+                _placeholder.get('cancelled') or _placeholder.get('status') == 'stopping'
+            )
+        if _start_aborted:
+            # validate 期间用户已请求停止：尊重取消，不得继续创建分析循环
+            with _analysis_jobs_lock:
+                _continuous_tasks.pop(main_room_id, None)
+            _log.info("持续分析启动被中止（validate 期间收到停止）: main_room_id=%s", main_room_id)
+            return {'success': False, 'error': '持续分析已在启动前被取消', 'cancelled': True}
         resolved_target_room_ids = [
             getattr(room, "room_id", "") for room in target_rooms if getattr(room, "room_id", "")
         ]

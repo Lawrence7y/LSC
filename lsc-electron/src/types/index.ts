@@ -186,7 +186,7 @@ export interface WSPayloadMap {
   clip_confirm_status: { room_id: string; round_key: string; confirm_status: string; start?: number; end?: number; label?: string }
   timeline_ready: { timeline: unknown }
   timeline_invalidated: { timeline_id: string; reason: string }
-  continuous_analysis_status: { room_id: string; stage: string; progress: number; detail?: string; recorded_duration: number; analyzed_duration: number; analysis_stage: string }
+  continuous_analysis_status: ContinuousAnalysisStatus
   clip_queued: { clip_id: string; room_id: string; round_key?: string; start: number; end: number; duration: number; score: number; label?: string; deferred?: boolean }
   analysis_progress: { room_id: string; stage: string; progress: number; detail?: string }
   highlight_stream: { room_id: string; highlights: unknown[] }

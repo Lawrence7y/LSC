@@ -16,9 +16,12 @@ _TERMINAL_TYPES = frozenset({
     "recording_stopped", "recording_started",
     "reconnect_failed", "continuous_highlights",
 })
+# continuous_analysis_status 不列入：phase 迁移（stopping/idle）属关键状态，
+# 丢弃会导致前端按钮状态与后端任务槽脱节（启动被拒/「点两次」）。
+# drain 端对该类型做 last-value coalesce，不丢也不会积压。
 _DROPPABLE_TYPES = frozenset({
     "rooms_updated", "mse_segment", "export_progress", "analysis_progress",
-    "continuous_analysis_status", "system_stats",
+    "system_stats",
 })
 
 

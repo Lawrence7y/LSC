@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Card, List, Button, Space, Tag, Empty, Progress, Checkbox, Tooltip, Segmented } from 'antd'
+import { Card, List, Button, Space, Tag, Empty, Progress, Checkbox, Tooltip } from 'antd'
 import { DeleteOutlined, ExportOutlined, FolderOpenOutlined, FolderOutlined, CloseCircleOutlined, CheckOutlined } from '@ant-design/icons'
-import { ClipSegment, ClipConfirmStatus, ExportTarget } from '@/types'
+import { ClipSegment, ClipConfirmStatus } from '@/types'
 import { formatTime } from '@/utils/time'
 import { formatClipHoverTitle } from '@/utils/clipNaming'
 
@@ -36,8 +36,6 @@ interface ClipListProps {
   refiningClipId?: string | null
   selectedClipIds?: Set<string>
   onSelectedClipIdsChange?: (ids: Set<string>) => void
-  exportTarget?: ExportTarget
-  onExportTargetChange?: (v: ExportTarget) => void
 }
 
 function formatDuration(seconds: number): string {
@@ -92,7 +90,7 @@ function primaryStatus(
   }
 }
 
-export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange, exportTarget, onExportTargetChange }: ClipListProps) {
+export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange }: ClipListProps) {
   const [internalSelected, setInternalSelected] = useState<Set<string>>(new Set())
   const controlled = externalSelected != null
   const selectedClipIds = controlled ? externalSelected : internalSelected
@@ -239,9 +237,8 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                         fontWeight: 560,
                         fontSize: 13,
                         color: 'var(--text-primary)',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
+                        whiteSpace: 'normal',
+                        wordBreak: 'break-word',
                       }}>
                         {clip.label}
                       </span>
@@ -266,6 +263,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'space-between',
+                    flexWrap: 'wrap',
                     gap: 8,
                     marginTop: 6,
                     marginLeft: 24,
@@ -412,18 +410,6 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
       }}
       extra={
         <Space size={6} wrap>
-          {onExportTargetChange && (
-            <Segmented
-              size="small"
-              value={exportTarget || 'mp4'}
-              onChange={(v) => onExportTargetChange(v as ExportTarget)}
-              options={[
-                { value: 'mp4', label: 'MP4' },
-                { value: 'draft', label: '草稿' },
-                { value: 'both', label: '两者' },
-              ]}
-            />
-          )}
           {clips.length > 0 && onExportMany && (
             <>
               <Tooltip
@@ -477,7 +463,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
             if (!useVirtual) return
             setScrollTop((e.target as HTMLDivElement).scrollTop)
           }}
-          style={{ flex: 1, minHeight: 0, overflow: 'auto', position: 'relative' }}
+          style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', position: 'relative' }}
         >
           {useVirtual ? (
             <div style={{ height: clips.length * ROW_HEIGHT, position: 'relative' }}>

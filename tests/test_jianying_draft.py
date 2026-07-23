@@ -11,6 +11,7 @@ def test_draft_options_defaults():
     assert opt.vertical is False
     assert opt.draft_name == ""
     assert opt.non_main_volume_zero is False
+    assert opt.include_pending is False
 
 
 def test_draft_result_fields():
@@ -91,6 +92,25 @@ def test_clip_allowed_for_draft_matches_export_policy():
     assert clip_allowed_for_draft({"confirm_status": "refining"}) is False
     assert clip_allowed_for_draft({"mark_precision": "approximate"}) is False
     assert clip_allowed_for_draft({"confirm_status": "ocr_confirmed"}) is True
+
+
+def test_clip_allowed_for_draft_include_pending():
+    pending = {"confirm_status": "pending"}
+    refining = {"confirm_status": "refining"}
+    assert clip_allowed_for_draft(pending) is False
+    assert clip_allowed_for_draft(pending, include_pending=True) is True
+    assert clip_allowed_for_draft(refining, include_pending=True) is True
+    assert clip_allowed_for_draft(
+        {"confirm_status": "pending", "mark_precision": "approximate"},
+        include_pending=True,
+    ) is False
+
+
+def test_clip_source_usable_include_pending():
+    assert clip_source_usable(precision="exact", confirm_status="pending") is False
+    assert clip_source_usable(
+        precision="exact", confirm_status="pending", include_pending=True,
+    ) is True
 
 
 def test_resolve_common_range_exact_fields():

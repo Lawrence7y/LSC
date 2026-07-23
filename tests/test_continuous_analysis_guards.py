@@ -855,6 +855,25 @@ def test_non_hybrid_not_listable_as_hybrid() -> None:
     assert room_handler._is_listable_hybrid_round(rd) is False
 
 
+def test_list_only_min_duration_allows_short_hybrid_rounds() -> None:
+    """现场：34.8s hybrid 回合 toast 了但被 35s 导出门槛挡住入列。
+
+    list_only 须用更低门槛（≥5s），真正导出路径仍可保留 35s。
+    """
+    assert hasattr(room_handler, "_min_highlight_duration_for_queue")
+    assert room_handler._min_highlight_duration_for_queue(list_only=True) <= 5.0
+    assert room_handler._min_highlight_duration_for_queue(list_only=False) >= 35.0
+    # 现场短回合应过 list_only 门、不过导出门外
+    short = 187.3 - 152.5  # 34.8
+    assert short >= room_handler._min_highlight_duration_for_queue(list_only=True)
+    assert short < room_handler._min_highlight_duration_for_queue(list_only=False)
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    auto_fn = src.split("async def _auto_export_highlights", 1)[1].split(
+        "async def queue_export", 1
+    )[0]
+    assert "_min_highlight_duration_for_queue" in auto_fn
+
+
 def test_stop_handler_sets_stopping_not_stopped() -> None:
     """stop 响应须返回 stopping，并在 handler 内广播 stopping 阶段。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")

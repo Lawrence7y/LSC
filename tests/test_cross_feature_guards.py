@@ -10,6 +10,10 @@ def _workbench_source() -> str:
     return (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
 
 
+def _room_actions_source() -> str:
+    return (ROOT / "lsc-electron/src/hooks/useRoomActions.ts").read_text(encoding="utf-8")
+
+
 def _handle_refresh_short_click_body(source: str) -> str:
     return source.split("const handleRefreshShortClick = useCallback", 1)[1].split(
         "const handleRefreshLongPress", 1
@@ -17,6 +21,7 @@ def _handle_refresh_short_click_body(source: str) -> str:
 
 
 def _handle_disconnect_body(source: str) -> str:
+    # handleDisconnect 已迁移至 useRoomActions.ts
     return source.split("const handleDisconnect = useCallback", 1)[1].split("}, [send])", 1)[0]
 
 
@@ -29,7 +34,10 @@ def _timeline_ready_body(source: str) -> str:
 
 
 def _handle_remove_body(source: str) -> str:
-    return source.split("const handleRemove = useCallback", 1)[1].split("}, [send, expandedRoomId])", 1)[0]
+    # handleRemove 已迁移至 useRoomActions.ts
+    return source.split("const handleRemove = useCallback", 1)[1].split(
+        "}, [send, setExpandedRoomId, setSelectedRoomIds, pendingRoomSavesRef])", 1
+    )[0]
 
 
 def _apply_select_clip_body(source: str) -> str:
@@ -62,7 +70,7 @@ def _clip_confirm_status_body(source: str) -> str:
 
 def test_handle_remove_stops_continuous_analysis_when_involved() -> None:
     """Task 1: 删房时若房间在持续分析中须先 stop_continuous_analysis。"""
-    body = _handle_remove_body(_workbench_source())
+    body = _handle_remove_body(_room_actions_source())
 
     assert "stop_continuous_analysis" in body
     assert "continuousStatus?.running" in body or "continuousStatus.running" in body
@@ -90,7 +98,7 @@ def test_short_refresh_confirms_when_analyzing_or_aligned() -> None:
 
 def test_disconnect_warns_secondary_room_leaves_analysis_mapping() -> None:
     """Task 4: 副房断连时提示已退出持续分析映射，主房仍停分析。"""
-    body = _handle_disconnect_body(_workbench_source())
+    body = _handle_disconnect_body(_room_actions_source())
 
     assert "该房间已退出持续分析映射，后续回合可能仅入列主房" in body
     assert "target_room_ids" in body
@@ -132,11 +140,11 @@ def _enter_timeline_live_body(source: str) -> str:
 
 
 def test_continuous_analysis_warns_when_main_room_preview_disabled() -> None:
-    """Task 10: 主房无预览时提示持续分析间隔约 45 秒。"""
+    """Task 10: 主房无预览时提示以状态面板有效间隔为准（后端 valorant 强制 interval=5）。"""
     body = _handle_confirm_analysis_export_body(_workbench_source())
 
     assert "mainRoomPreviewEnabled" in body
-    assert "主房未开启预览：持续分析间隔约 45 秒" in body
+    assert "主房未开启预览：请以状态面板中的有效间隔为准" in body
     assert "message.info" in body
 
 
@@ -176,7 +184,7 @@ def test_aligning_mutex_blocks_mark_add_and_export() -> None:
         "const handleControlMarkOut = useCallback",
         "const handleControlAddClip = useCallback",
         "const handleExportMany = (targets: ClipSegment[])",
-        "const handleConfirmExport = () =>",
+        "const handleConfirmExport = async () =>",
         "const handleExportClip = (clip: ClipSegment",
     ):
         fn_body = source.split(marker, 1)[1].split("\n  const ", 1)[0]

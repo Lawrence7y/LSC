@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from handlers import room_handler
+from lsc.core.events import EventBus
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,8 @@ class _FakeManager:
         self.medium_tick = _FakeSignal()
         self.low_tick = _FakeSignal()
         self.recording_stopped = _FakeSignal()
+        # 新架构：register_room_handlers 经 manager.bus (EventBus) 订阅事件
+        self.bus = EventBus()
 
     def get_room(self, room_id: str):
         return self._rooms.get(room_id)

@@ -32,6 +32,11 @@ def test_register_exports_expected_message_names():
         assert code in text
 
 
+def test_handler_reads_include_pending_flag() -> None:
+    src = Path("python-backend/handlers/jianying_handlers.py").read_text(encoding="utf-8")
+    assert "include_pending" in src
+
+
 def test_clip_allowed_rejects_pending_and_approx():
     assert clip_allowed_for_draft({"confirm_status": "pending"}) is False
     assert clip_allowed_for_draft({"mark_precision": "approximate"}) is False

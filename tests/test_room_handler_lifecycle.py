@@ -61,6 +61,13 @@ class _FakeSignal:
         self.callbacks.append(callback)
 
 
+class _FakeBus:
+    """新架构 EventBus 的测试替身：register_room_handlers 仅调用 subscribe。"""
+
+    def subscribe(self, *_args, **_kwargs) -> None:
+        return None
+
+
 class _FakeServer:
     def __init__(self) -> None:
         self.handlers = {}
@@ -81,6 +88,10 @@ class _FakeServer:
     async def broadcast(self, name, data):
         self.broadcasts.append((name, data))
 
+    async def broadcast_mse(self, kind, room_id, payload):
+        """MSE 二进制广播替身（shared ingest 路径使用）。"""
+        self.broadcasts.append((f"mse_{kind}", {"room_id": room_id, "bytes": len(payload or b"")}))
+
 
 class _FakeBridge:
     def __init__(self, manager) -> None:
@@ -97,6 +108,7 @@ class _FakeBridge:
 class _FakeManager:
     def __init__(self, rooms) -> None:
         self._rooms = {room.room_id: room for room in rooms}
+        self.bus = _FakeBus()
         self.room_connect_finished = _FakeSignal()
         self.batch_record_progress = _FakeSignal()
         self.batch_record_finished = _FakeSignal()
@@ -110,6 +122,11 @@ class _FakeManager:
 
     def list_rooms(self):
         return list(self._rooms.values())
+
+    def call(self, func, *args, **kwargs):
+        """新架构跨线程调用替身：同步执行（忽略 timeout kwarg）。"""
+        kwargs.pop("timeout", None)
+        return func(*args, **kwargs)
 
     def refresh_stream_url(self, room_id: str, force: bool = False) -> bool:
         self.refresh_calls.append((room_id, force))

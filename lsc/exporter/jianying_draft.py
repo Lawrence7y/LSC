@@ -91,18 +91,23 @@ def map_clip_timeranges(
     return (t_start, s_dur, s_start, s_dur)
 
 
-def clip_source_usable(*, precision: str, confirm_status: str | None) -> bool:
+def clip_source_usable(
+    *,
+    precision: str,
+    confirm_status: str | None,
+    include_pending: bool = False,
+) -> bool:
     if precision == "approximate":
         return False
-    if confirm_status in ("pending", "refining"):
+    if confirm_status in ("pending", "refining") and not include_pending:
         return False
     return True
 
 
-def clip_allowed_for_draft(clip: dict) -> bool:
+def clip_allowed_for_draft(clip: dict, *, include_pending: bool = False) -> bool:
     """WS/前端切片 dict 是否允许进入草稿（与导出口径一致）。"""
     status = clip.get("confirm_status")
-    if status in ("pending", "refining"):
+    if status in ("pending", "refining") and not include_pending:
         return False
     if clip.get("mark_precision") == "approximate":
         return False
@@ -314,7 +319,11 @@ def build_session_draft(
     usable_clips = [
         c
         for c in clips
-        if clip_source_usable(precision=c.precision, confirm_status=c.confirm_status)
+        if clip_source_usable(
+            precision=c.precision,
+            confirm_status=c.confirm_status,
+            include_pending=options.include_pending,
+        )
     ]
     skipped = len(clips) - len(usable_clips)
     if skipped:

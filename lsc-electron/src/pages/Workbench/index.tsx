@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch, Dropdown } from 'antd'
-import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined, MoreOutlined } from '@ant-design/icons'
+import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch } from 'antd'
+import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useExportProgressListeners } from '@/hooks/useExportProgressListeners'
 import { usePlayheadSampling } from '@/hooks/usePlayheadSampling'
@@ -11,7 +11,7 @@ import { RoomCard } from './components/RoomCard'
 import { ControlBar } from './components/ControlBar'
 import { ClipList, getClipStableId, type ExportProgressInfo } from './components/ClipList'
 import { RefreshButton } from './components/RefreshButton'
-import { ClipSegment, ContinuousAnalysisStatus, TimelineHighlightBand, ExportTarget, JianyingDraftResult } from '@/types'
+import { ClipSegment, ContinuousAnalysisStatus, TimelineHighlightBand, JianyingDraftResult } from '@/types'
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
 import { formatTime } from '@/utils/time'
 import { getAligner, type PreviewAudioCaptureDiagnostics } from '@/utils/previewAudioAligner'
@@ -34,16 +34,6 @@ import { useTimelineViewModel } from '@/hooks/useTimelineViewModel'
 const LIVE_EDGE_TOLERANCE_SEC = 1.0
 /** 越过紫标左沿此容差内视为回到 Live（秒） */
 const DVR_LEFT_TOLERANCE_SEC = 0.25
-
-const EXPORT_TARGET_KEY = 'lsc.exportTarget'
-
-function readExportTarget(): ExportTarget {
-  try {
-    const v = localStorage.getItem(EXPORT_TARGET_KEY)
-    if (v === 'mp4' || v === 'draft' || v === 'both') return v
-  } catch { /* ignore */ }
-  return 'mp4'
-}
 
 function getRoomBufferedRange(roomId: string): { start: number; end: number } | null {
   const registry = (window as any).__msePlayers
@@ -100,6 +90,20 @@ import { AnalysisProgress } from '@/components/AnalysisProgress'
 import './Workbench.css'
 /** 分析模式 */
 type AnalysisMode = 'valorant_round' | 'generic'
+
+type DraftSessionStatus = 'idle' | 'armed' | 'generating' | 'done' | 'failed'
+
+type AnalysisDraftSession = {
+  wantDraft: boolean
+  mainRoomId: string
+  targetRoomIds: string[]
+  sessionId: string
+  clipKeys: Set<string>
+  status: DraftSessionStatus
+  sawRunning: boolean
+  lastError?: string
+  autoFired: boolean
+}
 
 type CaptureFailure = {
   roomId: string
@@ -213,11 +217,6 @@ export default function Workbench() {
   const [url, setUrl] = useState('')
   const [previewClip, setPreviewClip] = useState<ClipSegment | null>(null)
   const [exportPresetId, setExportPresetId] = useState(appSettings.default_export_preset || getDefaultPreset().id)
-  const [exportTarget, setExportTarget] = useState<ExportTarget>(() => readExportTarget())
-  const persistExportTarget = useCallback((v: ExportTarget) => {
-    setExportTarget(v)
-    try { localStorage.setItem(EXPORT_TARGET_KEY, v) } catch { /* ignore */ }
-  }, [])
   const [jianyingLoading, setJianyingLoading] = useState(false)
   const [jianyingResult, setJianyingResult] = useState<JianyingDraftResult | null>(null)
   // 分析导出 Modal 状态（持续分析 + 同步分析导出合并）
@@ -230,6 +229,18 @@ export default function Workbench() {
   // 本地拖拽 marker 的即时显示值（拖拽中覆盖 room mark，松手清除）
   const [localDragMark, setLocalDragMark] = useState<{ type: 'in' | 'out'; time: number } | null>(null)
 
+  const [wantAnalysisDraft, setWantAnalysisDraft] = useState(false)
+  const [draftSessionStatus, setDraftSessionStatus] = useState<DraftSessionStatus>('idle')
+  const draftSessionRef = useRef<AnalysisDraftSession>({
+    wantDraft: false,
+    mainRoomId: '',
+    targetRoomIds: [],
+    sessionId: '',
+    clipKeys: new Set(),
+    status: 'idle',
+    sawRunning: false,
+    autoFired: false,
+  })
   const [analysisIsContinuous, setAnalysisIsContinuous] = useState(false)
   const [continuousSubmitting, setContinuousSubmitting] = useState(false)
   // 运行中的持续分析状态
@@ -1989,18 +2000,25 @@ export default function Workbench() {
     clips: ClipSegment[]
     includeClips: boolean
     allowSingleFallback?: boolean
+    includePending?: boolean
+    mainRoomId?: string
   }): Promise<JianyingDraftResult | null> => {
     setJianyingLoading(true)
     try {
       const payload = {
         room_ids: opts.roomIds,
+        ...(opts.mainRoomId ? { main_room_id: opts.mainRoomId } : {}),
+        include_pending: opts.includePending ?? false,
         clip_ids: opts.clips
           .map(c => c.clip_snapshot_id || c.clip_id)
           .filter(Boolean),
         clips: opts.clips.map(c => ({
           clip_id: c.clip_id,
           clip_snapshot_id: c.clip_snapshot_id,
+          round_key: c.round_key,
           label: c.label,
+          start: c.start,
+          end: c.end,
           common_start: c.common_start,
           common_end: c.common_end,
           mark_in_wallclock: c.mark_in_wallclock,
@@ -2020,7 +2038,7 @@ export default function Workbench() {
       const res = await sendRequest({ send, on }, 'generate_jianying_draft', payload, 120000) as JianyingDraftResult
       return res
     } catch (err) {
-      const msg = err instanceof Error ? err.message : '生成剪映草稿失败'
+      const msg = err instanceof Error ? err.message : '剪映草稿生成失败'
       message.error(msg)
       return { success: false, error: msg }
     } finally {
@@ -2028,66 +2046,95 @@ export default function Workbench() {
     }
   }, [send, on])
 
-  const handleGenerateSessionDraft = useCallback(async (opts?: {
-    roomIds?: string[]
-    allowSingleFallback?: boolean
-  }) => {
-    if (!ensureNotAligning()) return
+  const syncDraftSessionUi = useCallback((status?: DraftSessionStatus) => {
+    setDraftSessionStatus(status ?? draftSessionRef.current.status)
+  }, [])
 
-    const roomIds = opts?.roomIds ?? (
-      timelineContext
-        ? Object.keys(timelineContext.room_snapshots || {})
-        : (selectedRoomIds.size > 0
-            ? Array.from(selectedRoomIds)
-            : rooms.map(r => r.room_id))
+  const armDraftSession = useCallback((mainRoomId: string, targetRoomIds: string[]) => {
+    const s = draftSessionRef.current
+    if (!wantAnalysisDraft) {
+      s.wantDraft = false
+      s.status = 'idle'
+      s.clipKeys = new Set()
+      s.sawRunning = false
+      s.autoFired = false
+      s.lastError = undefined
+      syncDraftSessionUi('idle')
+      return
+    }
+    s.wantDraft = true
+    s.mainRoomId = mainRoomId
+    s.targetRoomIds = [...targetRoomIds]
+    s.sessionId = `draft-${Date.now()}`
+    s.clipKeys = new Set()
+    s.sawRunning = false
+    s.autoFired = false
+    s.lastError = undefined
+    s.status = 'armed'
+    syncDraftSessionUi('armed')
+  }, [wantAnalysisDraft, syncDraftSessionUi])
+
+  const clearDraftSession = useCallback(() => {
+    const s = draftSessionRef.current
+    s.wantDraft = false
+    s.status = 'idle'
+    s.clipKeys = new Set()
+    s.sawRunning = false
+    s.autoFired = false
+    s.lastError = undefined
+    syncDraftSessionUi('idle')
+  }, [syncDraftSessionUi])
+
+  const trackDraftClipKey = useCallback((clipId?: string, roundKey?: string) => {
+    const s = draftSessionRef.current
+    if (!s.wantDraft) return
+    if (s.status !== 'armed' && s.status !== 'generating' && s.status !== 'failed') return
+    if (clipId) s.clipKeys.add(clipId)
+    if (roundKey) s.clipKeys.add(roundKey)
+  }, [])
+
+  const runAnalysisDraftIfNeeded = useCallback(async (reason: 'auto' | 'retry') => {
+    const s = draftSessionRef.current
+    if (!s.wantDraft || s.status === 'generating' || s.status === 'done') return
+    if (reason === 'auto' && s.status !== 'armed' && s.status !== 'failed') return
+    if (reason === 'auto' && s.autoFired && s.status !== 'failed') return
+
+    const sessionClips = useAppStore.getState().clips.filter(c =>
+      (c.clip_id && s.clipKeys.has(c.clip_id))
+      || (c.round_key && s.clipKeys.has(c.round_key)),
     )
-
-    if (!opts?.roomIds && roomIds.length > 1 && !timelineContext) {
-      message.warning('多房草稿需先一键对齐；可降级为主房单房草稿')
-      Modal.confirm({
-        title: '未对齐',
-        content: '多房间尚未一键对齐。是否仅用当前主房生成单房草稿？',
-        okText: '主房单房草稿',
-        cancelText: '取消',
-        onOk: () => {
-          const mainId = selectedRoomId || roomIds[0]
-          if (!mainId) {
-            message.error('请先选择主房间')
-            return
-          }
-          void handleGenerateSessionDraft({ roomIds: [mainId], allowSingleFallback: true })
-        },
-      })
+    if (sessionClips.length === 0) {
+      message.info('无切片，跳过草稿')
+      s.status = 'done'
+      syncDraftSessionUi('done')
       return
     }
 
-    const confirmed = clips.filter(c => {
-      if (c.confirm_status === 'pending' || c.confirm_status === 'refining') return false
-      if (isApproximateClip(c)) return false
-      return true
-    })
+    if (reason === 'auto') s.autoFired = true
+    s.status = 'generating'
+    syncDraftSessionUi('generating')
 
     const res = await requestJianyingDraft({
-      roomIds,
-      clips: confirmed,
-      includeClips: confirmed.length > 0,
-      allowSingleFallback: opts?.allowSingleFallback ?? roomIds.length <= 1,
+      roomIds: s.targetRoomIds,
+      mainRoomId: s.mainRoomId,
+      clips: sessionClips,
+      includeClips: true,
+      includePending: true,
+      allowSingleFallback: false,
     })
     if (res?.success) {
+      s.status = 'done'
+      s.lastError = undefined
+      syncDraftSessionUi('done')
       setJianyingResult(res)
       ;(res.warnings || []).forEach(w => message.warning(w, 4))
-    } else if (res) {
-      message.error(res.error || '生成剪映草稿失败')
+    } else {
+      s.status = 'failed'
+      s.lastError = res?.error || '剪映草稿生成失败'
+      syncDraftSessionUi('failed')
+      message.error(s.lastError)
     }
-  }, [
-    ensureNotAligning,
-    timelineContext,
-    selectedRoomIds,
-    rooms,
-    selectedRoomId,
-    clips,
-    requestJianyingDraft,
-  ])
+  }, [requestJianyingDraft, syncDraftSessionUi])
 
   const handleExportMany = (targets: ClipSegment[]) => {
     if (!ensureNotAligning()) return
@@ -2114,37 +2161,6 @@ export default function Workbench() {
       return
     }
     const approxCount = prepared.filter(isApproximateClip).length
-
-    const runDraftBatch = () => {
-      const draftClips = prepared.filter(c => !isApproximateClip(c))
-      const skippedApprox = prepared.length - draftClips.length
-      if (skippedApprox > 0) {
-        message.warning(`${skippedApprox} 条近似定位切片已跳过（不进草稿）`)
-      }
-      if (draftClips.length === 0) return
-      const roomIds = timelineContext
-        ? Object.keys(timelineContext.room_snapshots || {})
-        : Array.from(new Set(draftClips.map(c => c.room_id).filter(Boolean) as string[]))
-      void (async () => {
-        const res = await requestJianyingDraft({
-          roomIds,
-          clips: draftClips,
-          includeClips: true,
-          allowSingleFallback: roomIds.length <= 1,
-        })
-        if (res?.success) {
-          setJianyingResult(res)
-          ;(res.warnings || []).forEach(w => message.warning(w, 4))
-        } else if (res) {
-          message.error(res.error || '生成剪映草稿失败')
-        }
-      })()
-    }
-
-    if (exportTarget === 'draft' || exportTarget === 'both') {
-      runDraftBatch()
-      if (exportTarget === 'draft') return
-    }
 
     const submitPrepared = () => {
       const store = useAppStore.getState()
@@ -2222,24 +2238,19 @@ export default function Workbench() {
     }
   }
 
-  const handleConfirmExport = async () => {
+  const handleConfirmExport = () => {
     if (!ensureNotAligning()) return
     if (!previewClip) return
-    console.log('[Workbench] 用户操作: 确认导出, roomId:', previewClip.room_id, 'start:', previewClip.start, 'end:', previewClip.end, 'preset:', exportPresetId, 'target:', exportTarget)
-
-    const doMp4 = exportTarget === 'mp4' || exportTarget === 'both'
-    const doDraft = exportTarget === 'draft' || exportTarget === 'both'
+    console.log('[Workbench] 用户操作: 确认导出, roomId:', previewClip.room_id, 'start:', previewClip.start, 'end:', previewClip.end, 'preset:', exportPresetId)
 
     const room = rooms.find(r => r.room_id === previewClip.room_id)
-    if (doMp4) {
-      if (!room) {
-        message.error('房间不存在')
-        return
-      }
-      if (!room.record_output_path) {
-        message.error('该房间没有录制文件，请先开始录制再导出切片')
-        return
-      }
+    if (!room) {
+      message.error('房间不存在')
+      return
+    }
+    if (!room.record_output_path) {
+      message.error('该房间没有录制文件，请先开始录制再导出切片')
+      return
     }
 
     const submitMp4Export = () => {
@@ -2284,52 +2295,18 @@ export default function Workbench() {
       message.info('导出任务已提交')
     }
 
-    const submitDraftExport = async () => {
-      if (isApproximateClip(previewClip)) {
-        message.warning('近似定位切片不进入剪映草稿')
-        return
-      }
-      const roomIds = timelineContext
-        ? Object.keys(timelineContext.room_snapshots || {})
-        : [previewClip.room_id].filter(Boolean) as string[]
-      const res = await requestJianyingDraft({
-        roomIds,
-        clips: [previewClip],
-        includeClips: true,
-        allowSingleFallback: true,
+    if (isApproximateClip(previewClip)) {
+      message.warning('该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
+      Modal.confirm({
+        title: '近似定位切片',
+        content: '该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记。仍要导出？',
+        okText: '仍要导出',
+        cancelText: '取消',
+        onOk: submitMp4Export,
       })
-      if (res?.success) {
-        setJianyingResult(res)
-        ;(res.warnings || []).forEach(w => message.warning(w, 4))
-      } else if (res) {
-        message.error(res.error || '生成剪映草稿失败')
-      }
+      return
     }
-
-    if (doMp4) {
-      if (isApproximateClip(previewClip)) {
-        message.warning('该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记')
-        Modal.confirm({
-          title: '近似定位切片',
-          content: '该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记。仍要导出？',
-          okText: '仍要导出',
-          cancelText: '取消',
-          onOk: () => {
-            submitMp4Export()
-            if (doDraft) void submitDraftExport()
-          },
-        })
-        return
-      }
-      submitMp4Export()
-    }
-
-    if (doDraft) {
-      await submitDraftExport()
-      if (exportTarget === 'draft') {
-        setPreviewClip(null)
-      }
-    }
+    submitMp4Export()
   }
 
   const handleCancelExportModal = () => {
@@ -2542,6 +2519,7 @@ export default function Workbench() {
         setContinuousSubmitting(false)
         return
       }
+      armDraftSession(continuousMainRoom, targetRoomIds)
       setContinuousModalOpen(false)
       message.info('持续分析启动请求已发送')
     } else {
@@ -2568,6 +2546,7 @@ export default function Workbench() {
         isSyncExportModeRef.current = false
         return
       }
+      armDraftSession(continuousMainRoom, targetRoomIds)
       setContinuousModalOpen(false)
       // continuousSubmitting 在 start_analysis_export_response 中清除
     }
@@ -2584,7 +2563,14 @@ export default function Workbench() {
       if (data?.success && data?.highlights) {
         // 与持续分析一致：切片通过 clip_queued 事件入列（confirm_status=pending），不自动导出
         message.success(`已分析 ${data.highlights.length} 个高光（${data.submitted_count} 个已入列待确认，确认后再导出）`)
+        const s = draftSessionRef.current
+        if (s.wantDraft && s.status === 'armed') {
+          setTimeout(() => void runAnalysisDraftIfNeeded('auto'), 400)
+        }
       } else {
+        if (draftSessionRef.current.wantDraft) {
+          clearDraftSession()
+        }
         message.error(data?.error || '同步分析失败')
       }
     }))
@@ -2618,6 +2604,9 @@ export default function Workbench() {
         setContinuousAnalyzing(false)
         setContinuousRoomId(null)
         continuousActiveRoomRef.current = null
+        if (draftSessionRef.current.wantDraft) {
+          clearDraftSession()
+        }
         // 保留目标房，便于停析后确认切片仍同步到原分析集
         setContinuousAnalysisStatus({
           running: false,
@@ -2717,13 +2706,14 @@ export default function Workbench() {
       }
     }))
     return () => unsubs.forEach(u => u())
-  }, [on])
+  }, [on, runAnalysisDraftIfNeeded, clearDraftSession])
 
   // ── 后端自动导出入队通知：切片添加到列表 ──
   useEffect(() => {
     const unsubs: Array<() => void> = []
     unsubs.push(on('clip_queued', (data: any) => {
       if (!data?.clip_id || !data?.room_id) return
+      trackDraftClipKey(data.clip_id, data.round_key)
       const st = useAppStore.getState()
       const ctx = st.timelineContext
       const commonReady = getAlignStatus(ctx, st.timelineInvalidated) === 'ready' && !!ctx
@@ -2903,7 +2893,27 @@ export default function Workbench() {
       }))
     }))
     return () => unsubs.forEach(u => u())
-  }, [on])
+  }, [on, trackDraftClipKey])
+
+  // 持续分析终态 → 自动触发草稿
+  useEffect(() => {
+    const s = draftSessionRef.current
+    const status = continuousAnalysisStatus
+    if (!status) return
+
+    const phase = status.phase
+    if (status.running || phase === 'running' || phase === 'finalizing' || phase === 'stopping') {
+      s.sawRunning = true
+    }
+
+    if (!s.wantDraft || s.status !== 'armed' || s.autoFired) return
+    if (!s.sawRunning) return
+    if (status.running) return
+    if (phase !== 'idle' && phase !== 'completed') return
+
+    // autoFired 仅由 runAnalysisDraftIfNeeded 置位；此处预置会导致函数内立即 return
+    void runAnalysisDraftIfNeeded('auto')
+  }, [continuousAnalysisStatus, runAnalysisDraftIfNeeded])
 
   // ── 导出文件操作 ──
   const handleOpenExportFolder = (outputPath: string) => {
@@ -3289,11 +3299,11 @@ export default function Workbench() {
           if (r.preview_enabled) send('enable_preview', { room_id: r.room_id, enabled: false, mode: 'mse' })
         })
         const currentAnalysisStatus = useAppStore.getState().continuousAnalysisStatus
-        if (currentAnalysisStatus?.running && currentAnalysisStatus.room_id) {
+        const analysisActive = Boolean(currentAnalysisStatus?.running && currentAnalysisStatus.room_id)
+        if (analysisActive && currentAnalysisStatus?.room_id) {
           send('stop_continuous_analysis', { main_room_id: currentAnalysisStatus.room_id })
         }
-        // 1.5 秒后重启连接和预览
-        setTimeout(() => {
+        const restartAllPreviews = () => {
           send('refresh_room_status', {})
           const freshRooms = useAppStore.getState().rooms
           freshRooms.forEach(r => {
@@ -3304,7 +3314,33 @@ export default function Workbench() {
             }
           })
           message.success('刷新全部完成：所有房间已重启')
-        }, 1500)
+        }
+        if (!analysisActive) {
+          // 无持续分析：保持原 1.5s 延迟重启
+          setTimeout(restartAllPreviews, 1500)
+          return
+        }
+        // 有持续分析：等任务槽真正释放（idle/completed）再重启预览，
+        // 避免重启的预览与收尾扫描争抢资源导致回合丢失
+        const waitDeadline = Date.now() + 40000
+        const waitAnalysisIdle = () => {
+          const st = useAppStore.getState().continuousAnalysisStatus
+          const busy = Boolean(
+            st && (
+              st.phase === 'stopping' || st.phase === 'running' || st.phase === 'finalizing'
+              || (st.running === true && st.phase !== 'idle' && st.phase !== 'completed' && st.phase !== 'error')
+            )
+          )
+          if (!busy) {
+            restartAllPreviews()
+          } else if (Date.now() > waitDeadline) {
+            message.warning('等待持续分析停止超时，已强制刷新')
+            restartAllPreviews()
+          } else {
+            setTimeout(waitAnalysisIdle, 500)
+          }
+        }
+        setTimeout(waitAnalysisIdle, 500)
       },
     })
   }, [send])
@@ -3476,21 +3512,6 @@ export default function Workbench() {
               {aligning ? '对齐中...' : '一键对齐'}
             </Button>
 
-            <Dropdown
-              menu={{
-                items: [
-                  {
-                    key: 'jianying',
-                    label: '生成剪映草稿',
-                    disabled: jianyingLoading,
-                    onClick: () => { void handleGenerateSessionDraft() },
-                  },
-                ],
-              }}
-            >
-              <Button size="small" icon={<MoreOutlined />} />
-            </Dropdown>
-
             <RefreshButton
               onShortClick={handleRefreshShortClick}
               onLongPress={handleRefreshLongPress}
@@ -3541,6 +3562,16 @@ export default function Workbench() {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <AnalysisProgress status={continuousAnalysisStatus} compact exportSummary={exportSummary} />
+          {draftSessionStatus === 'failed' && (
+            <Button
+              size="small"
+              loading={jianyingLoading}
+              disabled={jianyingLoading}
+              onClick={() => void runAnalysisDraftIfNeeded('retry')}
+            >
+              重试生成草稿
+            </Button>
+          )}
         </div>
       </div>
 
@@ -3696,8 +3727,6 @@ export default function Workbench() {
             refiningClipId={refiningClipId}
             selectedClipIds={clipSelectedIds}
             onSelectedClipIdsChange={setClipSelectedIds}
-            exportTarget={exportTarget}
-            onExportTargetChange={persistExportTarget}
           />
         </div>
       </div>
@@ -3712,12 +3741,9 @@ export default function Workbench() {
           <Button
             key="export"
             type="primary"
-            loading={jianyingLoading}
-            onClick={() => { void handleConfirmExport() }}
+            onClick={handleConfirmExport}
           >
-            {exportTarget === 'draft' ? '生成草稿'
-              : exportTarget === 'both' ? '导出并生成草稿'
-              : '确认导出'}
+            确认导出
           </Button>,
         ]}
       >
@@ -3736,24 +3762,11 @@ export default function Workbench() {
                 value={exportPresetId}
                 onChange={setExportPresetId}
                 style={{ width: '100%', minWidth: 0 }}
-                disabled={exportTarget === 'draft'}
                 options={EXPORT_PRESETS.map(p => ({
                   value: p.id,
                   label: p.name,
                   title: `${p.name} — ${p.description}`,
                 }))}
-              />
-            </div>
-            <div style={{ marginTop: 4 }}>
-              <div style={{ marginBottom: 8 }}><strong>导出方式</strong></div>
-              <Radio.Group
-                value={exportTarget}
-                onChange={(e) => persistExportTarget(e.target.value)}
-                options={[
-                  { value: 'mp4', label: '仅 MP4 切片' },
-                  { value: 'draft', label: '仅剪映草稿' },
-                  { value: 'both', label: '两者都要' },
-                ]}
               />
             </div>
           </div>
@@ -3882,6 +3895,22 @@ export default function Workbench() {
               {analysisIsContinuous
                 ? '边录边分析。结束时请先停录，再等状态变为「收尾中/已完成」；回合入列后需确认再导出。收尾会补扫尾部片段，当前不会做全文件 OCR 升格。'
                 : '关闭则为单次分析：高光入列待确认，确认后再导出'}
+            </span>
+          </div>
+
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '8px 12px', borderRadius: 'var(--radius-xs)',
+            background: 'var(--bg-tertiary)',
+          }}>
+            <strong>完成后生成剪映草稿</strong>
+            <Switch
+              checked={wantAnalysisDraft}
+              onChange={setWantAnalysisDraft}
+              disabled={continuousAnalyzing || continuousSubmitting}
+            />
+            <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+              多房间须已一键对齐；结束后自动生成一份草稿（含本场全部回合，含待确认）。
             </span>
           </div>
         </div>

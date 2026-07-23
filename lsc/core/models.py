@@ -247,6 +247,7 @@ class JianyingDraftOptions:
     vertical: bool = False
     draft_name: str = ""
     non_main_volume_zero: bool = False  # 预留，v1 不暴露 UI
+    include_pending: bool = False
 
 
 @dataclass(slots=True)

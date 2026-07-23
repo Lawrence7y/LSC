@@ -1,9 +1,12 @@
 # tests/test_jianying_frontend_guards.py
+"""Jianying draft frontend guards (post analysis-auto-draft UX).
+
+Draft entry is no longer ClipList Segmented / exportTarget / nav menu.
+Settings dir + generate_jianying_draft API + safe path remain required.
+"""
 from __future__ import annotations
 
 from pathlib import Path
-
-import pytest
 
 TYPES = Path("lsc-electron/src/types/index.ts")
 WORKBENCH = Path("lsc-electron/src/pages/Workbench/index.tsx")
@@ -12,28 +15,27 @@ SETTINGS = Path("lsc-electron/src/pages/Settings/index.tsx")
 MAIN = Path("lsc-electron/electron/main.ts")
 
 
-def test_types_export_export_target_and_jianying_result():
+def test_types_export_jianying_result():
     text = TYPES.read_text(encoding="utf-8")
-    assert "ExportTarget" in text
     assert "JianyingDraftResult" in text
     assert "JianyingDraftOptions" in text
 
 
-def test_workbench_has_export_target_radio():
+def test_workbench_keeps_generate_jianying_draft_hook():
     text = WORKBENCH.read_text(encoding="utf-8")
-    assert "exportTarget" in text
     assert "generate_jianying_draft" in text
+    assert "requestJianyingDraft" in text
+    # D1: no UI draft target radio / segmented; D2 Modal uses「完成后生成剪映草稿」
+    stripped = text.replace("完成后生成剪映草稿", "")
+    assert "仅剪映草稿" not in text
+    assert "生成剪映草稿" not in stripped
 
 
-def test_cliplist_batch_draft_sends_once_guard_comment_or_code():
+def test_cliplist_has_no_draft_segmented():
     text = CLIPLIST.read_text(encoding="utf-8")
-    assert "exportTarget" in text or "Segmented" in text
-
-
-def test_handle_export_many_draft_path_single_generate():
-    text = WORKBENCH.read_text(encoding="utf-8")
-    assert "generate_jianying_draft" in text
-    assert "exportTarget === 'draft'" in text or 'exportTarget === "draft"' in text
+    assert "onExportTargetChange" not in text
+    assert "value: 'draft'" not in text
+    assert "label: '草稿'" not in text
 
 
 def test_settings_jianying_draft_dir_row():

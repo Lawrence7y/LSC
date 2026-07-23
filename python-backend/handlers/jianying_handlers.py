@@ -54,6 +54,7 @@ def _collect_draft_inputs(
     room_ids = list(data.get("room_ids") or [])
     clip_ids = list(data.get("clip_ids") or [])
     raw_opt = data.get("options") or {}
+    include_pending = bool(data.get("include_pending", False))
     options = JianyingDraftOptions(
         include_recordings=bool(raw_opt.get("include_recordings", True)),
         include_clips=bool(raw_opt.get("include_clips", True)),
@@ -61,6 +62,7 @@ def _collect_draft_inputs(
         vertical=bool(raw_opt.get("vertical", False)),
         draft_name=str(raw_opt.get("draft_name") or ""),
         non_main_volume_zero=bool(raw_opt.get("non_main_volume_zero", False)),
+        include_pending=include_pending,
     )
     labels = data.get("labels") or {}
     allow_single_fallback = bool(data.get("allow_single_fallback", False))
@@ -160,7 +162,7 @@ def _collect_draft_inputs(
             cid = c.get("clip_id") or c.get("clip_snapshot_id")
             if clip_ids and cid not in clip_ids:
                 continue
-            if not clip_allowed_for_draft(c):
+            if not clip_allowed_for_draft(c, include_pending=include_pending):
                 label = c.get("label") or cid or "切片"
                 warnings.append(f"切片 {label} 未确认或为近似定位，已跳过")
                 continue
