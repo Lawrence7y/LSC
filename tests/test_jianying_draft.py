@@ -83,3 +83,125 @@ def test_clip_source_usable_rejects_approx_pending():
     assert clip_source_usable(precision="exact", confirm_status="pending") is False
     assert clip_source_usable(precision="exact", confirm_status="refining") is False
     assert clip_source_usable(precision="exact", confirm_status=None) is True
+
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from lsc.exporter.jianying_draft import (
+    ClipDraftSource,
+    RoomDraftSource,
+    build_session_draft,
+)
+
+
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def _make_color_mp4(path: Path, duration: float = 3.0, color: str = "red") -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c={color}:s=320x240:d={duration}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=f=440:d={duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg required")
+def test_build_session_draft_e2e_two_rooms(tmp_path: Path):
+    a = tmp_path / "a.mp4"
+    b = tmp_path / "b.mp4"
+    _make_color_mp4(a, 4.0, "red")
+    _make_color_mp4(b, 4.0, "blue")
+    draft_root = tmp_path / "drafts"
+    draft_root.mkdir()
+
+    rooms = [
+        RoomDraftSource("r1", "主房", str(a), 0.0, is_main=True),
+        RoomDraftSource("r2", "副房", str(b), 1.5, is_main=False),
+    ]
+    clips = [
+        ClipDraftSource(
+            "c1",
+            1.5,
+            3.0,
+            "R1 测试",
+            precision="exact",
+            confirm_status="user_confirmed",
+        ),
+    ]
+    result = build_session_draft(
+        rooms=rooms,
+        clips=clips,
+        options=JianyingDraftOptions(draft_name="LSC_test_e2e", text_labels=True),
+        draft_root=str(draft_root),
+    )
+    assert result.success, result.error
+    assert result.tracks >= 5  # 2 rec + 2 clip + 1 text
+    content = Path(result.draft_dir) / "draft_content.json"
+    assert content.is_file()
+    data = json.loads(content.read_text(encoding="utf-8"))
+    track_names = [
+        t.get("name", "")
+        for t in data.get("tracks", data.get("materials", {}).get("tracks", []))
+        if isinstance(t, dict)
+    ]
+    assert track_names or result.segments >= 3
+    assert result.segments >= 3
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg required")
+def test_build_overwrite_same_name(tmp_path: Path):
+    a = tmp_path / "a.mp4"
+    _make_color_mp4(a, 2.0, "green")
+    draft_root = tmp_path / "drafts"
+    draft_root.mkdir()
+    rooms = [RoomDraftSource("r1", "nobody", str(a), 0.0, is_main=True)]
+    opt = JianyingDraftOptions(
+        draft_name="LSC_overwrite", include_clips=False, text_labels=False
+    )
+    r1 = build_session_draft(rooms=rooms, clips=[], options=opt, draft_root=str(draft_root))
+    assert r1.success
+    r2 = build_session_draft(rooms=rooms, clips=[], options=opt, draft_root=str(draft_root))
+    assert r2.success
+    assert any("覆盖" in w or "同名" in w for w in r2.warnings)
+
+
+def test_build_rejects_missing_library(monkeypatch, tmp_path: Path):
+    import lsc.exporter.jianying_draft as mod
+
+    def boom(*_a, **_k):
+        raise ImportError("nope")
+
+    monkeypatch.setattr(mod, "_import_draft_lib", boom)
+    r = build_session_draft(
+        rooms=[RoomDraftSource("r1", "x", str(tmp_path / "no.mp4"), 0.0, True)],
+        clips=[],
+        options=JianyingDraftOptions(include_recordings=False, include_clips=False),
+        draft_root=str(tmp_path),
+    )
+    assert r.success is False
+    assert r.error_code == "library_missing"

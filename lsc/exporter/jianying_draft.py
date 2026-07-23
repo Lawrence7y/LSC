@@ -4,6 +4,8 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 from lsc.core.models import JianyingDraftOptions, JianyingDraftResult
 
@@ -149,3 +151,195 @@ def validate_draft_dir(path: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _import_draft_lib():
+    import pyJianYingDraft as draft
+
+    return draft
+
+
+def _default_draft_name(main_name: str) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    return sanitize_draft_token(f"LSC_{main_name}_{stamp}")
+
+
+def _track_label(room: RoomDraftSource, suffix: str) -> str:
+    return f"{sanitize_draft_token(room.name)}·{suffix}"
+
+
+def build_session_draft(
+    *,
+    rooms: list[RoomDraftSource],
+    clips: list[ClipDraftSource],
+    options: JianyingDraftOptions,
+    draft_root: str,
+) -> JianyingDraftResult:
+    warnings: list[str] = []
+    try:
+        draft = _import_draft_lib()
+    except ImportError:
+        return JianyingDraftResult(
+            success=False,
+            error="未安装 pyJianYingDraft，请检查依赖",
+            error_code="library_missing",
+        )
+
+    if not validate_draft_dir(draft_root):
+        return JianyingDraftResult(
+            success=False,
+            error="剪映草稿目录不可写或不存在",
+            error_code="write_failed" if draft_root else "draft_dir_missing",
+        )
+
+    usable: list[RoomDraftSource] = []
+    for room in rooms:
+        if options.include_recordings or options.include_clips:
+            if not room.record_output_path or not os.path.isfile(room.record_output_path):
+                warnings.append(f"房间 {room.name} 无录制文件，已跳过")
+                continue
+        usable.append(room)
+    if not usable:
+        return JianyingDraftResult(
+            success=False,
+            error="没有可用的录制房间",
+            error_code="no_rooms",
+            warnings=warnings,
+        )
+
+    deltas = {r.room_id: r.recording_to_common_delta for r in usable}
+    origin = compute_draft_origin(deltas)
+    main = next((r for r in usable if r.is_main), usable[0])
+    name = (
+        sanitize_draft_token(options.draft_name)
+        if options.draft_name
+        else _default_draft_name(main.name)
+    )
+
+    width, height = (1080, 1920) if options.vertical else (1920, 1080)
+    folder = draft.DraftFolder(draft_root)
+    existed = folder.has_draft(name)
+    script = folder.create_draft(name, width, height, allow_replace=True)
+    if existed:
+        warnings.append("已覆盖同名草稿，若剪映中已打开请先关闭")
+
+    non_main = [r for r in usable if not r.is_main]
+    ordered_rec = list(reversed(non_main)) + [main]
+    specs = []
+    TrackSpec = draft.TrackSpec
+    TrackType = draft.TrackType
+    if options.include_recordings:
+        for r in ordered_rec:
+            specs.append(TrackSpec(TrackType.video, _track_label(r, "录制")))
+    if options.include_clips:
+        for r in ordered_rec:
+            specs.append(TrackSpec(TrackType.video, _track_label(r, "切片")))
+    if options.text_labels and options.include_clips:
+        specs.append(TrackSpec(TrackType.text, "回合标签"))
+    if not specs:
+        return JianyingDraftResult(
+            success=False,
+            error="没有可生成的轨道",
+            error_code="invalid_state",
+            warnings=warnings,
+        )
+    script.append_tracks(specs)
+
+    SEC = draft.SEC
+    segments = 0
+    materials: dict[str, Any] = {}
+
+    def _material_for(room: RoomDraftSource):
+        if room.room_id in materials:
+            return materials[room.room_id]
+        if options.vertical:
+            raw = draft.VideoMaterial(room.record_output_path)
+            crop = center_crop_9_16(width=raw.width, height=raw.height)
+            mat = draft.VideoMaterial(room.record_output_path, crop_settings=crop)
+        else:
+            mat = draft.VideoMaterial(room.record_output_path)
+        materials[room.room_id] = mat
+        return mat
+
+    if options.include_recordings:
+        for r in ordered_rec:
+            mat = _material_for(r)
+            dur_sec = mat.duration / SEC
+            t0, td, s0, sd = map_recording_timeranges(
+                recording_to_common_delta=r.recording_to_common_delta,
+                draft_origin=origin,
+                dur_sec=dur_sec,
+            )
+            vol = 0.0 if (options.non_main_volume_zero and not r.is_main) else 1.0
+            seg = draft.VideoSegment(
+                mat,
+                seconds_trange(t0, td),
+                source_timerange=seconds_trange(s0, sd),
+                volume=vol,
+            )
+            script.add_segment(seg, _track_label(r, "录制"))
+            segments += 1
+
+    usable_clips = [
+        c
+        for c in clips
+        if clip_source_usable(precision=c.precision, confirm_status=c.confirm_status)
+    ]
+    skipped = len(clips) - len(usable_clips)
+    if skipped:
+        warnings.append(f"已排除 {skipped} 条 pending/approximate 切片")
+
+    if options.include_clips:
+        for r in ordered_rec:
+            mat = _material_for(r)
+            dur_sec = mat.duration / SEC
+            for c in usable_clips:
+                mapped = map_clip_timeranges(
+                    c.common_start,
+                    c.common_end,
+                    r.recording_to_common_delta,
+                    origin,
+                    dur_sec=dur_sec,
+                )
+                if mapped is None:
+                    warnings.append(
+                        f"房间 {r.name} 无此时段素材或片段过短，已跳过「{c.label}」"
+                    )
+                    continue
+                t0, td, s0, sd, clamped = mapped
+                if clamped:
+                    warnings.append(
+                        f"房间 {r.name} 片段「{c.label}」已按当前文件时长裁剪"
+                    )
+                vol = 0.0 if (options.non_main_volume_zero and not r.is_main) else 1.0
+                seg = draft.VideoSegment(
+                    mat,
+                    seconds_trange(t0, td),
+                    source_timerange=seconds_trange(s0, sd),
+                    volume=vol,
+                )
+                script.add_segment(seg, _track_label(r, "切片"))
+                segments += 1
+
+        if options.text_labels:
+            for c in usable_clips:
+                t0 = c.common_start - origin
+                td = c.common_end - c.common_start
+                if td <= _MIN_SEG_SEC:
+                    continue
+                script.add_segment(
+                    draft.TextSegment(c.label or "回合", seconds_trange(t0, td)),
+                    "回合标签",
+                )
+                segments += 1
+
+    script.save()
+    draft_dir = os.path.join(draft_root, name)
+    return JianyingDraftResult(
+        success=True,
+        draft_name=name,
+        draft_dir=draft_dir,
+        tracks=len(specs),
+        segments=segments,
+        warnings=warnings,
+    )
