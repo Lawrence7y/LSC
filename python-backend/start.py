@@ -14,25 +14,23 @@ if _ROOT not in sys.path:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from broadcast_hub import BroadcastHub
 from handlers.room_handler import register_room_handlers
-from message_bridge import QtManagerBridge
-from PySide6.QtWidgets import QApplication
 from server import server
 
-from lsc.gui.multi_room.manager import MultiRoomManager
+from lsc.core.orchestrator import RoomOrchestrator
 
 
 def main():
     _log.info("Starting LSC WebSocket server...")
 
-    # MultiRoomManager 是 Qt 对象，需要 QApplication 与 Qt 事件循环。
-    # 初始化顺序：QApplication -> manager -> bridge
-    # 注意：MultiRoomManager 没有 set_bridge 方法，bridge 通过构造函数接收 manager 引用
-    app = QApplication.instance() or QApplication(sys.argv)
-    manager = MultiRoomManager()
-    bridge = QtManagerBridge(manager)
+    # 初始化顺序：RoomOrchestrator -> BroadcastHub
+    manager = RoomOrchestrator()
+    manager.start()
+    bridge = BroadcastHub(manager)
 
     loop = asyncio.new_event_loop()
+    stop_event = threading.Event()
 
     async def _drain_broadcasts():
         """从 bridge 队列消费广播消息并推送给 WebSocket 客户端（事件驱动）。"""
@@ -70,11 +68,18 @@ def main():
     ws_thread.start()
 
     try:
-        app.exec()
+        stop_event.wait()
     except KeyboardInterrupt:
         _log.info("Shutting down...")
     finally:
-        loop.call_soon_threadsafe(loop.stop)
+        try:
+            manager.shutdown(timeout_sec=10.0)
+        except Exception as exc:
+            _log.warning("manager shutdown failed: %s", exc)
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception as exc:
+            _log.debug("loop stop failed: %s", exc)
 
 
 if __name__ == '__main__':

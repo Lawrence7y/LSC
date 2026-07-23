@@ -357,24 +357,22 @@ def drain_merge_broadcasts(bridge):
 def main():
     """独立入口：参考 main.py 的两线程模型启动后端。
 
-    Qt 事件循环运行于主线程（MultiRoomManager 是 Qt 对象），
-    WebSocket 服务器运行于工作线程，通过 QtManagerBridge 跨线程调用。
+    RoomOrchestrator 在独立编排线程运行；WebSocket 在工作线程；
+    BroadcastHub 负责事件→WS 广播队列。
     """
     import threading
 
+    from broadcast_hub import BroadcastHub
     from handlers.room_handler import register_room_handlers
-    from message_bridge import QtManagerBridge
-    from PySide6.QtWidgets import QApplication
 
-    from lsc.gui.multi_room.manager import MultiRoomManager
+    from lsc.core.orchestrator import RoomOrchestrator
 
-    # 初始化顺序：QApplication -> manager -> bridge
-    # 注意：MultiRoomManager 没有 set_bridge 方法，bridge 通过构造函数接收 manager 引用
-    app = QApplication.instance() or QApplication([])
-    manager = MultiRoomManager()
-    bridge = QtManagerBridge(manager)
+    manager = RoomOrchestrator()
+    manager.start()
+    bridge = BroadcastHub(manager)
 
     loop = asyncio.new_event_loop()
+    stop_event = threading.Event()
 
     async def _drain_broadcasts():
         """从 bridge 队列消费广播消息并推送给 WebSocket 客户端（事件驱动）。"""
@@ -411,11 +409,18 @@ def main():
     ws_thread.start()
 
     try:
-        app.exec()
+        stop_event.wait()
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        loop.call_soon_threadsafe(loop.stop)
+        try:
+            manager.shutdown(timeout_sec=10.0)
+        except Exception:
+            pass
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

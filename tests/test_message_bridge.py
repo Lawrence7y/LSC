@@ -1,15 +1,13 @@
-"""Message bridge unit tests.
+"""BroadcastHub unit tests.
 
-Tests QtManagerBridge cross-thread call mechanism, broadcast queue,
-and timeout handling. Uses mock objects to avoid Qt dependency.
+Tests broadcast queue, droppable overflow, and EventBus subscription payloads.
+Cross-thread call/timeout lives on RoomOrchestrator (see test_orchestrator.py).
 """
 from __future__ import annotations
 
 import os
 import sys
 import threading
-import time
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,162 +16,111 @@ _backend_dir = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-from message_bridge import _CallRequest, QtManagerBridge
+from broadcast_hub import BroadcastHub
+from lsc.core.events import EventBus
 
 
-class TestCallRequest:
-    """Test _CallRequest data container."""
-
-    def test_init_stores_fn_and_args(self):
-        def dummy(a, b):
-            return a + b
-
-        req = _CallRequest(dummy, (1, 2), {})
-        assert req.fn is dummy
-        assert req.args == (1, 2)
-        assert req.kwargs == {}
-        assert req.result is None
-        assert req.exception is None
-        assert req.traceback is None
-
-    def test_event_is_threading_event(self):
-        req = _CallRequest(lambda: None, (), {})
-        assert isinstance(req.event, threading.Event)
-
-    def test_result_settable(self):
-        req = _CallRequest(lambda: None, (), {})
-        req.result = 42
-        assert req.result == 42
-
-    def test_exception_settable(self):
-        req = _CallRequest(lambda: None, (), {})
-        exc = ValueError("test")
-        req.exception = exc
-        assert req.exception is exc
+class _FakeOrch:
+    def __init__(self):
+        self.bus = EventBus()
 
 
-class TestQtManagerBridge:
-    """Test QtManagerBridge with mocked manager."""
+class TestBroadcastHub:
+    """Test BroadcastHub with a fake orchestrator EventBus."""
 
-    def _make_bridge(self):
-        """Create a bridge with a mock manager (no Qt signals)."""
-        mock_manager = MagicMock()
-        mock_manager.room_connect_finished = MagicMock()
-        mock_manager.batch_record_progress = MagicMock()
-        # Mock signal connect to avoid Qt signal binding
-        mock_manager.room_connect_finished.connect = MagicMock()
-        mock_manager.batch_record_progress.connect = MagicMock()
-        return QtManagerBridge(mock_manager), mock_manager
+    def _make_hub(self):
+        orch = _FakeOrch()
+        return BroadcastHub(orch), orch
 
-    def test_init_binds_signals(self):
-        bridge, mock_manager = self._make_bridge()
-        mock_manager.room_connect_finished.connect.assert_called_once()
-        mock_manager.batch_record_progress.connect.assert_called_once()
-
-    def test_manager_property_returns_manager(self):
-        bridge, mock_manager = self._make_bridge()
-        assert bridge.manager is mock_manager
-
-    def test_call_on_main_thread_executes_directly(self):
-        """When called from main thread, should execute fn directly without signal."""
-        bridge, _ = self._make_bridge()
-        result = bridge.call(lambda x: x * 2, 5)
-        assert result == 10
-
-    def test_call_with_kwargs(self):
-        bridge, _ = self._make_bridge()
-        result = bridge.call(lambda a, b=10: a + b, 5, b=20)
-        assert result == 25
+    def test_manager_property_returns_orchestrator(self):
+        hub, orch = self._make_hub()
+        assert hub.manager is orch
 
     def test_queue_broadcast_and_get(self):
-        bridge, _ = self._make_bridge()
+        hub, _ = self._make_hub()
         msg = {"type": "test", "data": {"key": "value"}}
-        bridge.queue_broadcast(msg)
-        result = bridge.get_broadcast(block=False)
+        hub.queue_broadcast(msg)
+        result = hub.get_broadcast(block=False)
         assert result == msg
 
     def test_get_broadcast_empty_returns_none(self):
-        bridge, _ = self._make_bridge()
-        result = bridge.get_broadcast(block=False)
+        hub, _ = self._make_hub()
+        result = hub.get_broadcast(block=False)
         assert result is None
 
     def test_queue_broadcast_multiple_messages(self):
-        bridge, _ = self._make_bridge()
+        hub, _ = self._make_hub()
         msgs = [{"type": f"msg_{i}"} for i in range(5)]
         for m in msgs:
-            bridge.queue_broadcast(m)
+            hub.queue_broadcast(m)
         for expected in msgs:
-            result = bridge.get_broadcast(block=False)
+            result = hub.get_broadcast(block=False)
             assert result == expected
 
     def test_on_connect_finished_queues_broadcast(self):
-        bridge, _ = self._make_bridge()
-        bridge._on_connect_finished("room1", True, "")
-        result = bridge.get_broadcast(block=False)
+        hub, _ = self._make_hub()
+        hub._on_connect_finished("room1", True, "")
+        result = hub.get_broadcast(block=False)
+        assert result["type"] == "room_connect_finished"
+        assert result["data"]["room_id"] == "room1"
+        assert result["data"]["success"] is True
+
+    def test_bus_emit_connect_finished_queues_broadcast(self):
+        hub, orch = self._make_hub()
+        orch.bus.emit("room_connect_finished", "room1", True, "")
+        result = hub.get_broadcast(block=False)
         assert result["type"] == "room_connect_finished"
         assert result["data"]["room_id"] == "room1"
         assert result["data"]["success"] is True
 
     def test_on_batch_record_progress_queues_broadcast(self):
-        bridge, _ = self._make_bridge()
-        bridge._on_batch_record_progress("room2", False)
-        result = bridge.get_broadcast(block=False)
+        hub, _ = self._make_hub()
+        hub._on_batch_record_progress("room2", False)
+        result = hub.get_broadcast(block=False)
         assert result["type"] == "recording_started"
         assert result["data"]["room_id"] == "room2"
         assert result["data"]["success"] is False
 
+    def test_bus_emit_batch_record_progress_queues_broadcast(self):
+        hub, orch = self._make_hub()
+        orch.bus.emit("batch_record_progress", "room2", False)
+        result = hub.get_broadcast(block=False)
+        assert result["type"] == "recording_started"
+        assert result["data"]["success"] is False
+
+    def test_bus_emit_recording_stopped_queues_broadcast(self):
+        hub, orch = self._make_hub()
+        orch.bus.emit("recording_stopped", "room3", "offline", "下播")
+        result = hub.get_broadcast(block=False)
+        assert result["type"] == "recording_stopped"
+        assert result["data"]["room_id"] == "room3"
+        assert result["data"]["reason"] == "offline"
+        assert result["data"]["message"] == "下播"
+
     def test_broadcast_queue_max_size(self):
-        bridge, _ = self._make_bridge()
-        maxsize = bridge._broadcast_queue.maxsize
+        hub, _ = self._make_hub()
+        maxsize = hub._broadcast_queue.maxsize
         # Droppable overflow is discarded instead of expanding the queue.
         for i in range(maxsize + 5):
-            bridge.queue_broadcast({"type": "mse_segment", "data": {"i": i}})
+            hub.queue_broadcast({"type": "mse_segment", "data": {"i": i}})
         count = 0
-        while bridge.get_broadcast(block=False) is not None:
+        while hub.get_broadcast(block=False) is not None:
             count += 1
         assert count == maxsize
 
     def test_signal_callbacks_do_not_block_when_broadcast_queue_is_full(self):
-        bridge, _ = self._make_bridge()
+        hub, _ = self._make_hub()
         for i in range(1000):
-            bridge.queue_broadcast({"type": "rooms_updated", "data": {"i": i}})
+            hub.queue_broadcast({"type": "rooms_updated", "data": {"i": i}})
 
         finished = threading.Event()
 
-        def invoke_signal_callback():
-            bridge._on_connect_finished("room-full", True, "")
+        def invoke_callback():
+            hub._on_connect_finished("room-full", True, "")
             finished.set()
 
-        t = threading.Thread(target=invoke_signal_callback, daemon=True)
+        t = threading.Thread(target=invoke_callback, daemon=True)
         t.start()
 
         assert finished.wait(timeout=0.5) is True
-        assert bridge._broadcast_queue.qsize() <= 1000
-
-    def test_call_timeout_raises(self):
-        """Test that call with a slow function raises TimeoutError."""
-        bridge, _ = self._make_bridge()
-
-        def slow_fn():
-            time.sleep(5)
-            return "done"
-
-        # Call from a non-main thread with short timeout
-        result_holder = {}
-
-        def thread_target():
-            try:
-                result_holder["result"] = bridge.call(slow_fn, timeout=0.1)
-            except TimeoutError:
-                result_holder["timeout"] = True
-            except Exception as e:
-                result_holder["error"] = e
-
-        t = threading.Thread(target=thread_target)
-        t.start()
-        t.join(timeout=5)
-
-        # Should have timed out (or the call mechanism may differ in test env)
-        # In test environment without Qt event loop, the signal won't fire,
-        # so the call will timeout as expected
-        assert result_holder.get("timeout") is True or "error" in result_holder
+        assert hub._broadcast_queue.qsize() <= 1000

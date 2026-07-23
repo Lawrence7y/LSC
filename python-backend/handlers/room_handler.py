@@ -1,6 +1,6 @@
-"""WebSocket 消息路由器：处理前端请求并与 Qt 主线程的 MultiRoomManager 交互。
+"""WebSocket 消息路由器：处理前端请求并与 RoomOrchestrator 交互。
 
-将前端的房间管理、录制、导出、预览、分析等操作路由到 Qt 主线程执行，
+将前端的房间管理、录制、导出、预览、分析等操作路由到编排线程执行，
 并通过广播将房间状态变更实时推送给前端。
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
     get_timeline_service,
 )
-from lsc.gui.multi_room.manager import MultiRoomManager, _is_stream_offline_error
+from lsc.core.orchestrator import RoomOrchestrator, _is_stream_offline_error
 from lsc.platforms.registry import select_quality
 from lsc.utils.error_messages import humanize_error
 from lsc.utils.process_launcher import prepare_launch, run_hidden, set_stream_nonblocking
@@ -370,7 +370,7 @@ def _mse_offline_error_message(raw: str = '') -> str:
     return '主播已下线'
 
 
-def _probe_stream_offline(mgr: MultiRoomManager, room_id: str) -> tuple[bool, str]:
+def _probe_stream_offline(mgr: RoomOrchestrator, room_id: str) -> tuple[bool, str]:
     """确认直播间已下播，必要时强制解析。返回 (is_offline, friendly_message)。"""
     room = mgr.get_room(room_id)
     if room is None:
@@ -433,7 +433,7 @@ def _is_normal_file_playback_end(error_text: str) -> bool:
 
 async def _start_recording_file_mse(
     srv,
-    mgr: MultiRoomManager,
+    mgr: RoomOrchestrator,
     bridge,
     room_id: str,
     loop,
@@ -458,7 +458,7 @@ async def _start_recording_file_mse(
 
         try:
             state = await loop.run_in_executor(
-                _bridge_executor, lambda: bridge.call(_read_preview_state)
+                _bridge_executor, lambda: bridge.manager.call(_read_preview_state)
             )
         except Exception as exc:
             _log.error("offline file review state read failed: %s", exc)
@@ -476,7 +476,7 @@ async def _start_recording_file_mse(
 
             try:
                 await loop.run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_stop_recording, timeout=10.0)
+                    _bridge_executor, lambda: bridge.manager.call(_stop_recording, timeout=10.0)
                 )
             except Exception as exc:
                 _log.warning("offline file review stop recording failed: %s", exc)
@@ -486,7 +486,7 @@ async def _start_recording_file_mse(
             _stop_live_preview_streamer(room_id)
             return True
 
-        await loop.run_in_executor(_bridge_executor, lambda: bridge.call(_stop_live))
+        await loop.run_in_executor(_bridge_executor, lambda: bridge.manager.call(_stop_live))
 
         def _validate_recording_path():
             from lsc.recorder.capture import validate_recording
@@ -500,7 +500,7 @@ async def _start_recording_file_mse(
 
         try:
             valid, path, validation_err = await loop.run_in_executor(
-                _recording_executor, lambda: bridge.call(_validate_recording_path)
+                _recording_executor, lambda: bridge.manager.call(_validate_recording_path)
             )
         except Exception as exc:
             _log.error("offline file review validate failed: %s", exc)
@@ -525,7 +525,7 @@ async def _start_recording_file_mse(
 
             try:
                 await loop.run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_set_degraded)
+                    _bridge_executor, lambda: bridge.manager.call(_set_degraded)
                 )
             except Exception as exc:
                 _log.error("offline degraded state update failed: %s", exc)
@@ -565,7 +565,7 @@ async def _start_recording_file_mse(
 
             try:
                 await loop.run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_set_degraded)
+                    _bridge_executor, lambda: bridge.manager.call(_set_degraded)
                 )
             except Exception as exc:
                 _log.debug("file review degraded update failed: %s", exc)
@@ -633,7 +633,7 @@ async def _start_recording_file_mse(
 
             try:
                 await loop.run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_set_degraded)
+                    _bridge_executor, lambda: bridge.manager.call(_set_degraded)
                 )
             except Exception as exc:
                 _log.debug("file review start degraded update failed: %s", exc)
@@ -657,7 +657,7 @@ async def _start_recording_file_mse(
 
         try:
             await loop.run_in_executor(
-                _bridge_executor, lambda: bridge.call(_set_review_mode)
+                _bridge_executor, lambda: bridge.manager.call(_set_review_mode)
             )
         except Exception as exc:
             leak = _preview_stream_registry().pop(room_id)
@@ -2612,12 +2612,12 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
 # _timeline_to_dict 已迁移至 handlers.timeline_handlers.timeline_to_dict
 
 
-def _rooms_list(manager: MultiRoomManager):
+def _rooms_list(manager: RoomOrchestrator):
     """将 manager 中的所有房间序列化为字典列表。"""
     return [_room_to_dict(r) for r in manager.list_rooms()]
 
 
-def _persist_current_rooms(manager: MultiRoomManager) -> bool:
+def _persist_current_rooms(manager: RoomOrchestrator) -> bool:
     """将当前 manager 中的房间列表持久化到 JSON（1s 写合并）。"""
     from persistence import schedule_save_rooms
     schedule_save_rooms(_rooms_list(manager))
@@ -2741,7 +2741,7 @@ def _purge_stale_analysis_jobs() -> None:
 
 
 def register_room_handlers(server, bridge):
-    manager: MultiRoomManager = bridge.manager
+    manager: RoomOrchestrator = bridge.manager
 
     # 启动时把 settings.json 的共享进样开关灌入运行时配置
     try:
@@ -2831,7 +2831,7 @@ def register_room_handlers(server, bridge):
 
             try:
                 await loop.run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_clear_preview)
+                    _bridge_executor, lambda: bridge.manager.call(_clear_preview)
                 )
             except Exception as exc:
                 _log.error("Shared MSE error cleanup failed: %s", exc)
@@ -2849,7 +2849,7 @@ def register_room_handlers(server, bridge):
 
             try:
                 still_previewing = await loop.run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_check_preview)
+                    _bridge_executor, lambda: bridge.manager.call(_check_preview)
                 )
             except Exception:
                 still_previewing = False
@@ -2896,7 +2896,7 @@ def register_room_handlers(server, bridge):
 
             try:
                 still_previewing = await loop.run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_check_preview)
+                    _bridge_executor, lambda: bridge.manager.call(_check_preview)
                 )
             except Exception:
                 still_previewing = False
@@ -2957,7 +2957,7 @@ def register_room_handlers(server, bridge):
 
                 try:
                     await loop.run_in_executor(
-                        _bridge_executor, lambda: bridge.call(_rotate_shared_epoch_on_reconnect)
+                        _bridge_executor, lambda: bridge.manager.call(_rotate_shared_epoch_on_reconnect)
                     )
                 except Exception as exc:
                     _log.debug("Shared MSE reconnect epoch rotate failed: %s", exc)
@@ -3050,7 +3050,7 @@ def register_room_handlers(server, bridge):
 
         try:
             await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_set_preview_on)
+                _bridge_executor, lambda: bridge.manager.call(_set_preview_on)
             )
         except Exception as exc:
             _log.debug("preview state sync failed after shared reattach: %s", exc)
@@ -3110,18 +3110,18 @@ def register_room_handlers(server, bridge):
                 _log.debug("schedule room_updated patches failed: %s", exc)
         _emit()
 
-    # 连接/录制均通过后台 worker 异步完成，状态变更发生在信号发射时，
+    # 连接/录制均通过后台 worker 异步完成，状态变更发生在 EventBus emit 时，
     # 必须在此补充 rooms_updated 广播，否则前端房间卡片状态永远停留在旧值。
-    # 注意：MultiRoomManager 只有 room_connect_finished / batch_record_progress /
-    # batch_record_finished / global_tick 信号，没有 recording_started/recording_stopped。
-    # room_connect_finished 覆盖单房间连接完成；batch_record_progress 覆盖批量录制启动结果。
-    # 单房间 start_recording / stop_recording 是同步调用，调用方 handler 会直接广播 rooms_updated。
-    manager.room_connect_finished.connect(_queue_rooms_update)
-    manager.batch_record_progress.connect(_queue_rooms_update)
-    manager.batch_record_finished.connect(_queue_rooms_update)
+    # BroadcastHub 已订阅 room_connect_finished / batch_record_progress / recording_stopped
+    # 做 WS 专用 payload；此处再订同一事件做 rooms_updated（与旧 bridge+handler 双 connect 同构）。
+    # 纪律：订阅回调在编排线程同步执行，禁止再 orch.call 写操作（重入死锁风险）。
+    bus = manager.bus
+    bus.subscribe("room_connect_finished", lambda *_a: _queue_rooms_update())
+    bus.subscribe("batch_record_progress", lambda *_a: _queue_rooms_update())
+    bus.subscribe("batch_record_finished", lambda *_a: _queue_rooms_update())
     # 中频 tick：增量刷新录制文件大小；低频 tick：全量 snapshot 愈合漂移
-    manager.medium_tick.connect(_queue_recording_size_patches)
-    manager.low_tick.connect(_queue_rooms_update)
+    bus.subscribe("medium_tick", lambda: _queue_recording_size_patches())
+    bus.subscribe("low_tick", lambda: _queue_rooms_update())
 
     def _capture_ws_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.AbstractEventLoop | None:
         if loop is not None and not loop.is_closed():
@@ -3163,7 +3163,7 @@ def register_room_handlers(server, bridge):
             loop,
         )
 
-    manager.recording_stopped.connect(_on_manager_recording_stopped_offline)
+    bus.subscribe("recording_stopped", _on_manager_recording_stopped_offline)
 
     def _broadcast_system_stats():
         """广播系统资源快照到前端。"""
@@ -3175,7 +3175,7 @@ def register_room_handlers(server, bridge):
         except Exception as exc:
             _log.debug("System stats broadcast failed: %s", exc)
 
-    manager.low_tick.connect(lambda: _broadcast_system_stats())
+    bus.subscribe("low_tick", lambda: _broadcast_system_stats())
 
     @server.on_connect
     async def handle_connect(websocket):
@@ -3246,7 +3246,7 @@ def register_room_handlers(server, bridge):
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
-            _bridge_executor, lambda: bridge.call(_do_get)
+            _bridge_executor, lambda: bridge.manager.call(_do_get)
         )
         _log.debug("获取房间列表: %d 个", len(result['rooms']))
         return result
@@ -3283,7 +3283,7 @@ def register_room_handlers(server, bridge):
 
         loop = asyncio.get_running_loop()
         refreshed = await loop.run_in_executor(
-            _bridge_executor, lambda: bridge.call(_do_refresh)
+            _bridge_executor, lambda: bridge.manager.call(_do_refresh)
         )
         _broadcast_rooms()
         _log.info("刷新房间状态: %d 个房间错误已清除", refreshed)
@@ -3323,7 +3323,7 @@ def register_room_handlers(server, bridge):
 
         try:
             room = await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_add, timeout=30.0)
+                _bridge_executor, lambda: bridge.manager.call(_add, timeout=30.0)
             )
         except TimeoutError:
             _log.warning("添加房间超时: url=%s", url)
@@ -3361,7 +3361,7 @@ def register_room_handlers(server, bridge):
 
         try:
             accepted = await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_connect)
+                _bridge_executor, lambda: bridge.manager.call(_connect)
             )
         except Exception as exc:
             _log.error("连接房间异常: room_id=%s, error=%s", room_id, exc)
@@ -3440,7 +3440,7 @@ def register_room_handlers(server, bridge):
 
         try:
             result = await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_soft_disconnect),
+                _bridge_executor, lambda: bridge.manager.call(_soft_disconnect),
             )
             if result.get('invalidated'):
                 _invalidate_msg = (
@@ -3483,7 +3483,7 @@ def register_room_handlers(server, bridge):
         try:
             await asyncio.get_running_loop().run_in_executor(
                 _bridge_executor,
-                lambda: bridge.call(manager.set_preview_muted, room_id, muted),
+                lambda: bridge.manager.call(manager.set_preview_muted, room_id, muted),
             )
         except Exception as exc:
             _log.warning("设置静音失败: room_id=%s, error=%s", room_id, exc)
@@ -3519,7 +3519,7 @@ def register_room_handlers(server, bridge):
             return room is not None
         try:
             await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_set_room_quality)
+                _bridge_executor, lambda: bridge.manager.call(_set_room_quality)
             )
         except Exception as exc:
             _log.warning("更新 room.preview_quality 失败: room_id=%s, error=%s", room_id, exc)
@@ -3532,7 +3532,7 @@ def register_room_handlers(server, bridge):
             return False
         try:
             was_preview_enabled = await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_check_preview)
+                _bridge_executor, lambda: bridge.manager.call(_check_preview)
             )
         except Exception:
             was_preview_enabled = False
@@ -3639,7 +3639,7 @@ def register_room_handlers(server, bridge):
             return r, r.last_error if r else None
 
         room, last_err = await asyncio.get_running_loop().run_in_executor(
-            _bridge_executor, lambda: bridge.call(_get_room_and_error)
+            _bridge_executor, lambda: bridge.manager.call(_get_room_and_error)
         )
         if room and room.is_recording:
             with _recording_history_lock:
@@ -3678,7 +3678,7 @@ def register_room_handlers(server, bridge):
 
         try:
             success = await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_stop_async, timeout=5.0)
+                _bridge_executor, lambda: bridge.manager.call(_stop_async, timeout=5.0)
             )
         except Exception as exc:
             _log.error("停止录制异常: room_id=%s, error=%s", room_id, exc)
@@ -3740,7 +3740,7 @@ def register_room_handlers(server, bridge):
 
         try:
             result = await asyncio.get_running_loop().run_in_executor(
-                _bridge_executor, lambda: bridge.call(_soft_remove),
+                _bridge_executor, lambda: bridge.manager.call(_soft_remove),
             )
             if result.get('invalidated'):
                 _invalidate_msg = (
@@ -3765,7 +3765,7 @@ def register_room_handlers(server, bridge):
             _invalidate_room_timeline(room_id, reason=f"room_removed_fallback:{room_id}")
 
         await asyncio.get_running_loop().run_in_executor(
-            _bridge_executor, lambda: bridge.call(manager.remove_room, room_id)
+            _bridge_executor, lambda: bridge.manager.call(manager.remove_room, room_id)
         )
         _broadcast_rooms()
         _persist_current_rooms(manager)
@@ -3798,7 +3798,7 @@ def register_room_handlers(server, bridge):
                         _log.debug("操作异常（已忽略）: %s", exc)
             return True
 
-        success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_seek))
+        success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_seek))
         return {'success': bool(success)}
 
     @server.on('set_mark_in')
@@ -3838,7 +3838,7 @@ def register_room_handlers(server, bridge):
             room.mark_in_wallclock = captured_wallclock
             return room.mark_in
 
-        value = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_mark))
+        value = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_mark))
         _broadcast_rooms()
         return {'success': True, 'mark_in': value}
 
@@ -3877,7 +3877,7 @@ def register_room_handlers(server, bridge):
             room.mark_out_wallclock = captured_wallclock
             return room.mark_out
 
-        value = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_mark))
+        value = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_mark))
         _broadcast_rooms()
         return {'success': True, 'mark_out': value}
 
@@ -3906,7 +3906,7 @@ def register_room_handlers(server, bridge):
                         _log.debug("操作异常（已忽略）: %s", exc)
             return True
 
-        success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_toggle))
+        success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_toggle))
         _broadcast_rooms()
         return {'success': bool(success)}
 
@@ -4045,7 +4045,7 @@ def register_room_handlers(server, bridge):
             room = manager.get_room(room_id)
             if room is not None:
                 room.content_offset = offset
-        await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_set))
+        await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_set))
         return {'success': True}
 
     @server.on('align_preview_audio')
@@ -4141,7 +4141,7 @@ def register_room_handlers(server, bridge):
 
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        _bridge_executor, lambda: bridge.call(_clear_on_align_fail)
+                        _bridge_executor, lambda: bridge.manager.call(_clear_on_align_fail)
                     )
                     _broadcast_rooms(force=True)
                 except Exception as exc:
@@ -4182,7 +4182,7 @@ def register_room_handlers(server, bridge):
 
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        _bridge_executor, lambda: bridge.call(_clear_stale_align_groups)
+                        _bridge_executor, lambda: bridge.manager.call(_clear_stale_align_groups)
                     )
                     _broadcast_rooms(force=True)
                 except Exception as exc:
@@ -4258,7 +4258,7 @@ def register_room_handlers(server, bridge):
             timeline_payload = None
             try:
                 ctx = await asyncio.get_running_loop().run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_apply_alignment_and_create_timeline)
+                    _bridge_executor, lambda: bridge.manager.call(_apply_alignment_and_create_timeline)
                 )
                 if ctx is not None:
                     timeline_payload = timeline_to_dict(ctx)
@@ -4283,7 +4283,7 @@ def register_room_handlers(server, bridge):
 
                     try:
                         await asyncio.get_running_loop().run_in_executor(
-                            _bridge_executor, lambda: bridge.call(_clear_on_timeline_fail)
+                            _bridge_executor, lambda: bridge.manager.call(_clear_on_timeline_fail)
                         )
                         _broadcast_rooms(force=True)
                     except Exception as clear_exc:
@@ -4444,7 +4444,7 @@ def register_room_handlers(server, bridge):
                 return manager.cancel_export(clip_id)
             try:
                 cancelled = await asyncio.get_running_loop().run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_cancel)
+                    _bridge_executor, lambda: bridge.manager.call(_cancel)
                 )
             except Exception as exc:
                 _log.error("取消导出异常: job_id=%s, error=%s", job_id, exc)
@@ -4481,7 +4481,7 @@ def register_room_handlers(server, bridge):
             manager.stop_preview(room_id)
             return True
 
-        success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_preview))
+        success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_preview))
         _broadcast_rooms()
         return {'success': bool(success)}
 
@@ -4505,7 +4505,7 @@ def register_room_handlers(server, bridge):
                         return True
                     try:
                         await asyncio.get_running_loop().run_in_executor(
-                            _bridge_executor, lambda: bridge.call(_set_preview_on)
+                            _bridge_executor, lambda: bridge.manager.call(_set_preview_on)
                         )
                     except Exception as exc:
                         _log.error("设置 preview_enabled 失败: room_id=%s, error=%s", room_id, exc)
@@ -4580,7 +4580,7 @@ def register_room_handlers(server, bridge):
                             return True
 
                         await asyncio.get_running_loop().run_in_executor(
-                            _bridge_executor, lambda: bridge.call(_set_shared_preview_on)
+                            _bridge_executor, lambda: bridge.manager.call(_set_shared_preview_on)
                         )
                         _mse_reconnect_state.pop(room_id, None)
                         _broadcast_rooms()
@@ -4621,7 +4621,7 @@ def register_room_handlers(server, bridge):
                                 }
 
                             snapshot = await asyncio.get_running_loop().run_in_executor(
-                                _bridge_executor, lambda: bridge.call(_read_shared_snapshot)
+                                _bridge_executor, lambda: bridge.manager.call(_read_shared_snapshot)
                             )
                             if snapshot is None or not snapshot['is_connected'] or not snapshot['stream_url']:
                                 raise RuntimeError("room is not connected or has no stream url")
@@ -4667,7 +4667,7 @@ def register_room_handlers(server, bridge):
                             return True
 
                         await asyncio.get_running_loop().run_in_executor(
-                            _bridge_executor, lambda: bridge.call(_set_shared_preview_on)
+                            _bridge_executor, lambda: bridge.manager.call(_set_shared_preview_on)
                         )
                         _mse_reconnect_state.pop(room_id, None)
                         _broadcast_rooms()
@@ -4722,7 +4722,7 @@ def register_room_handlers(server, bridge):
                         room.is_connected = False
                         room.stream_info = None
                     await asyncio.get_running_loop().run_in_executor(
-                        _bridge_executor, lambda: bridge.call(_mark_disconnected_if_no_stream)
+                        _bridge_executor, lambda: bridge.manager.call(_mark_disconnected_if_no_stream)
                     )
 
                 # 在 Qt 主线程读取刷新后的房间状态
@@ -4744,7 +4744,7 @@ def register_room_handlers(server, bridge):
                     }
 
                 snapshot = await asyncio.get_running_loop().run_in_executor(
-                    _bridge_executor, lambda: bridge.call(_read_snapshot)
+                    _bridge_executor, lambda: bridge.manager.call(_read_snapshot)
                 )
                 if snapshot is None:
                     await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'error'})
@@ -4835,7 +4835,7 @@ def register_room_handlers(server, bridge):
 
                         try:
                             await loop.run_in_executor(
-                                _bridge_executor, lambda: bridge.call(_clear_preview)
+                                _bridge_executor, lambda: bridge.manager.call(_clear_preview)
                             )
                         except Exception as exc:
                             _log.error("MSE error cleanup failed: %s", exc)
@@ -4854,7 +4854,7 @@ def register_room_handlers(server, bridge):
 
                         try:
                             still_previewing = await loop.run_in_executor(
-                                _bridge_executor, lambda: bridge.call(_check_preview)
+                                _bridge_executor, lambda: bridge.manager.call(_check_preview)
                             )
                         except Exception:
                             still_previewing = False
@@ -4909,7 +4909,7 @@ def register_room_handlers(server, bridge):
                         # 7. 再次检查是否仍在预览
                         try:
                             still_previewing = await loop.run_in_executor(
-                                _bridge_executor, lambda: bridge.call(_check_preview)
+                                _bridge_executor, lambda: bridge.manager.call(_check_preview)
                             )
                         except Exception:
                             still_previewing = False
@@ -4965,7 +4965,7 @@ def register_room_handlers(server, bridge):
 
                         try:
                             snapshot = await loop.run_in_executor(
-                                _bridge_executor, lambda: bridge.call(_read_snapshot)
+                                _bridge_executor, lambda: bridge.manager.call(_read_snapshot)
                             )
                         except Exception:
                             snapshot = None
@@ -5074,7 +5074,7 @@ def register_room_handlers(server, bridge):
 
                             try:
                                 await loop.run_in_executor(
-                                    _bridge_executor, lambda: bridge.call(_rotate_epoch_on_reconnect)
+                                    _bridge_executor, lambda: bridge.manager.call(_rotate_epoch_on_reconnect)
                                 )
                             except Exception as exc:
                                 _log.debug("MSE reconnect epoch rotate failed: %s", exc)
@@ -5177,7 +5177,7 @@ def register_room_handlers(server, bridge):
 
                 try:
                     await asyncio.get_running_loop().run_in_executor(
-                        _bridge_executor, lambda: bridge.call(_set_preview_enabled)
+                        _bridge_executor, lambda: bridge.manager.call(_set_preview_enabled)
                     )
                 except Exception as exc:
                     # bridge.call 失败：清理已注册的 streamer，避免进程泄漏
@@ -5215,7 +5215,7 @@ def register_room_handlers(server, bridge):
                     room.preview_mode = 'live_mse'
                 return True
 
-            await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.call(_disable))
+            await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_disable))
             _mse_reconnect_state.pop(room_id, None)
             _clear_mse_push_paused(room_id)
             _broadcast_rooms()
@@ -5917,7 +5917,7 @@ def register_room_handlers(server, bridge):
                 result['error'] = str(exc)
                 loop.call_soon_threadsafe(done_event.set)
 
-        await loop.run_in_executor(_bridge_executor, lambda: bridge.call(_run_export))
+        await loop.run_in_executor(_bridge_executor, lambda: bridge.manager.call(_run_export))
 
         if result['error']:
             _log.error("导出任务失败: room=%s, job=%s, error=%s", room_id, job_id, result['error'])

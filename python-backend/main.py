@@ -1,13 +1,12 @@
 """LSC Electron 后端入口。
 
 同时启动：
-- Qt 事件循环（运行 MultiRoomManager）
+- RoomOrchestrator（编排线程，无 Qt）
 - WebSocket 服务器（运行在工作线程，与前端通信）
 
 全局异常处理（项目记忆硬约束）：
 - sys.excepthook 捕获未处理异常
 - RotatingFileHandler 滚动文件日志
-- qInstallMessageHandler 捕获 Qt 警告/错误
 """
 from __future__ import annotations
 
@@ -104,52 +103,21 @@ def _install_exception_hook(log: logging.Logger) -> None:
     threading.excepthook = _thread_hook
 
 
-def _install_qt_message_handler(log: logging.Logger) -> None:
-    """安装 qInstallMessageHandler，将 Qt 警告/错误转入 Python logging。"""
-    try:
-        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
-    except ImportError:
-        log.warning("PySide6.QtCore not available, skipping Qt message handler")
-        return
-
-    def _handler(msg_type, context, message):
-        level_map = {
-            QtMsgType.QtDebugMsg: logging.DEBUG,
-            QtMsgType.QtInfoMsg: logging.INFO,
-            QtMsgType.QtWarningMsg: logging.WARNING,
-            QtMsgType.QtCriticalMsg: logging.ERROR,
-            QtMsgType.QtFatalMsg: logging.CRITICAL,
-        }
-        level = level_map.get(msg_type, logging.INFO)
-        # Qt fatal 默认会让进程 abort，这里仅记录日志，不调用 abort
-        log.log(level, "[Qt] %s", message)
-
-    try:
-        qInstallMessageHandler(_handler)
-    except Exception as exc:
-        log.warning("Failed to install Qt message handler: %s", exc)
-
-
 _log = _setup_logging()
 _install_exception_hook(_log)
-# Qt message handler 需要 QCoreApplication 存在才能完整生效，但安装本身可以提前。
-_install_qt_message_handler(_log)
 
 
-from message_bridge import QtManagerBridge
-from PySide6.QtWidgets import QApplication
+from broadcast_hub import BroadcastHub
 from server import LSCWebSocketServer
 
-from lsc.gui.multi_room.manager import MultiRoomManager
+from lsc.core.orchestrator import RoomOrchestrator
 
 
 class LSCWebSocketBackend:
     def __init__(self):
-        self.app = QApplication(sys.argv)
-        self.manager = MultiRoomManager()
-        self.bridge = QtManagerBridge(self.manager)
-        # 注意：MultiRoomManager 没有 set_bridge 方法。
-        # bridge 通过构造函数接收 manager 引用，反向注册非必需。
+        self.manager = RoomOrchestrator()
+        self.manager.start()
+        self.bridge = BroadcastHub(self.manager)
         self.server = LSCWebSocketServer(host="127.0.0.1", port=9876)
         self._ws_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -157,6 +125,7 @@ class LSCWebSocketBackend:
         # 用于解除 server.start() 中 `await asyncio.Future()` 的阻塞。
         # stop() 时 set 此 event，run_until_complete 会正常返回。
         self._stop_event: asyncio.Event | None = None
+        self._main_stop = threading.Event()
 
     def _run_ws_server(self):
         """在工作线程中运行 WebSocket 服务器。"""
@@ -253,7 +222,8 @@ class LSCWebSocketBackend:
                 break
             time.sleep(0.1)
 
-        self.app.exec()
+        # 主线程阻塞等待停止信号（不再使用 QApplication.exec）
+        self._main_stop.wait()
 
     def stop(self):
         """优雅停止后端。
@@ -284,11 +254,8 @@ class LSCWebSocketBackend:
                 self._loop.call_soon_threadsafe(self._stop_event.set)
             except RuntimeError:
                 pass
-        # 3) 退出 Qt 事件循环
-        try:
-            self.app.quit()
-        except Exception as exc:
-            _log.debug("操作异常（已忽略）: %s", exc)
+        # 3) 解除主线程 wait
+        self._main_stop.set()
         # 4) 等待 ws 线程结束（最多 3 秒）
         if self._ws_thread is not None:
             self._ws_thread.join(timeout=3.0)

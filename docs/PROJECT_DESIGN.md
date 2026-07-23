@@ -94,10 +94,10 @@ LSC（Live Stream Clipper）是一个**多直播间录制与切片工具**，核
                            │ WebSocket (localhost:19876~19880)
 ┌──────────────────────────┴──────────────────────────────────┐
 │ 2. 桥接与服务层 (python-backend/)                           │
-│    Qt 主线程 (MultiRoomManager) + 工作线程 (WebSocket)        │
+│    RoomOrchestrator 编排线程 + 工作线程 (WebSocket)           │
 │    职责：跨线程消息桥接、生命周期管理、状态广播               │
 └──────────────────────────┬──────────────────────────────────┘
-                           │ Qt 信号槽 (_execute)
+                           │ orchestrator.call / EventBus
 ┌──────────────────────────┴──────────────────────────────────┐
 │ 3. 核心业务层 (lsc/)                                        │
 │    平台解析、FFmpeg 录制/导出、MSE 转码、音频对齐             │
@@ -106,46 +106,46 @@ LSC（Live Stream Clipper）是一个**多直播间录制与切片工具**，核
 
 ### 2.2 为什么需要三层分离
 
-**核心矛盾**：PySide6 的 GUI 对象和 `MultiRoomManager` 必须运行在 **Qt 主线程**（否则控件崩溃），但 WebSocket 服务器需要处理网络 I/O，如果在 Qt 主线程会阻塞 UI。
+**核心矛盾**：编排状态与 FFmpeg 生命周期需要串行化在单一编排线程，但 WebSocket 服务器需要处理网络 I/O，不能阻塞编排。
 
 **解决方案**：
 - WebSocket 服务器运行在**工作线程**（asyncio 事件循环）
-- `MultiRoomManager` 运行在 **Qt 主线程**
-- 两者通过 `QtManagerBridge` 通信
+- `RoomOrchestrator` 运行在**独立编排线程**（actor 模型，无 Qt）
+- 两者通过 `orchestrator.call` + `BroadcastHub` 通信
 
 ---
 
 ## 第三部分：跨线程通信机制
 
-### 3.1 QtManagerBridge 双层桥接
+### 3.1 RoomOrchestrator + BroadcastHub
 
-**位置**：`python-backend/message_bridge.py`
+**位置**：`lsc/core/orchestrator.py`、`python-backend/broadcast_hub.py`
 
-#### 同步调用原语 `bridge.call(fn, *args)`
+#### 同步调用原语 `orchestrator.call(fn, *args)`（经 `bridge.manager.call`）
 
-工作线程发起调用 → Qt 信号派发到主线程执行 → `threading.Event` 阻塞等待结果：
+工作线程发起调用 → 命令入编排线程队列执行 → `threading.Event` 阻塞等待结果：
 
 ```
-[WebSocket Handler 线程]                                    [Qt 主线程]
+[WebSocket Handler 线程]                                    [编排线程]
           │                                                    │
-    1. bridge.call(fn, *args)                                  │
-          │ ─── 2. 发射 Qt 信号 _execute ───────────────────> │
+    1. orch.call(fn, *args)                                    │
+          │ ─── 2. 入队 Command ───────────────────────────> │
           │                                                    │ 3. 执行 fn
           │ <── 5. event.set() 唤醒 ───────────────────────── │ 4. 完成/异常
     6. 返回结果/抛出异常                                       │
 ```
 
 - 默认超时 **10 秒**
-- 超时后工作线程恢复，但主线程可能仍在执行（造成命令乱序风险）
+- 超时后请求标记 `cancelled`；编排线程完成后丢弃结果（不再有 Qt 主线程乱序堆积的根因）
 
 #### 状态广播队列 `queue_broadcast(msg)`
 
-主线程状态更新（房间连接、录制进度）不能直接调用 asyncio，写入线程安全 FIFO 队列：
+编排线程状态更新（房间连接、录制进度）经 `EventBus` 订阅回调写入线程安全 FIFO；`BroadcastHub` 订阅 `room_connect_finished` / `batch_record_progress` / `recording_stopped` 构造与历史一致的 WS payload：
 
 ```
-[Qt 主线程]                     [WebSocket 工作线程]
-   queue_broadcast(msg) ──> FIFO 队列 ──> _broadcast_coroutine
-                                              │ 100ms 轮询
+[编排线程]                     [WebSocket 工作线程]
+   bus.emit / queue_broadcast ──> FIFO 队列 ──> _broadcast_coroutine
+                                              │ 事件驱动唤醒
                                               ▼
                                           合并 rooms_updated
                                               │
@@ -155,9 +155,9 @@ LSC（Live Stream Clipper）是一个**多直播间录制与切片工具**，核
 
 ### 3.2 消息合并优化
 
-**位置**：`python-backend/main.py:197-234`
+**位置**：`python-backend/main.py`（`_broadcast_coroutine`）+ `server.drain_merge_broadcasts`
 
-`_broadcast_coroutine` 每 100ms 消费队列，对连续的 `rooms_updated` 消息做**合并**：多条只广播最新一条，避免前端 JSON.parse + React 重渲染爆炸。
+`_broadcast_coroutine` 事件驱动消费队列，对连续的 `rooms_updated` 等消息做**合并**：多条只广播最新一条，避免前端 JSON.parse + React 重渲染爆炸。
 
 ### 3.3 高频消息日志降级
 
@@ -1157,7 +1157,7 @@ npx tsc --noEmit
 | # | 问题 | 影响 |
 |---|------|------|
 | 1 | 音频对齐低置信度仍应用偏移 | "同内容不同解说"场景下错误 seek，比不对齐更糟 |
-| 2 | `bridge.call` 超时后主线程可能仍在执行 | 命令乱序风险 |
+| 2 | ~~`bridge.call` 超时后主线程可能仍在执行~~ **已消除（M3 / 2026-07-23）** | 架构改为 `RoomOrchestrator` actor + `BroadcastHub`，移除 Qt 信号桥根因 |
 | 3 | `_mse_streamers` 共享结构需线程安全访问 | 并发删除房间可能崩溃 |
 
 ### 18.2 中优先级问题
@@ -1202,7 +1202,7 @@ npx tsc --noEmit
 
 | 场景 | 超时 |
 |------|------|
-| `bridge.call` | 10s |
+| `orchestrator.call` / `bridge.manager.call` | 10s |
 | FFmpeg 启动探测 | 5s |
 | FFmpeg 优雅退出 | 5s + 3s + 5s |
 | 录制文件验证 | - |
