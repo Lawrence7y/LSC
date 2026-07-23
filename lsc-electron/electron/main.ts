@@ -554,9 +554,12 @@ function createTray(): void {
 
 function _readJianyingDraftDirFromSettings(): string | null {
   try {
+    const backendDir = getBackendDir()
     const candidates = [
       path.join(process.cwd(), 'settings.json'),
       path.join(app.getPath('userData'), 'settings.json'),
+      path.join(backendDir, 'settings.json'),
+      path.join(backendDir, '..', 'settings.json'),
     ]
     for (const fp of candidates) {
       if (!fs.existsSync(fp)) continue
