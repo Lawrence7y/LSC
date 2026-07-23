@@ -718,9 +718,9 @@ class RoomOrchestrator:
     # ── Room CRUD ────────────────────────────────────────────
 
     def add_room(self, url: str) -> RoomSession | None:
+        """Add a room. Returns None if MAX_ROOMS limit is reached."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).add_room(self, url=url))
-        """Add a room. Returns None if MAX_ROOMS limit is reached."""
         with self._lock:
             if len(self._rooms) >= MAX_ROOMS:
                 _log.warning("Room limit reached (%d), cannot add more", MAX_ROOMS)
@@ -758,35 +758,33 @@ class RoomOrchestrator:
         return room
 
     def get_room(self, room_id: str) -> RoomSession | None:
+        """Return the ``RoomSession`` for ``room_id``, or ``None`` if not found."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).get_room(self, room_id=room_id))
-        """Return the ``RoomSession`` for ``room_id``, or ``None`` if not found."""
         with self._lock:
             return self._rooms.get(room_id)
 
     def list_rooms(self) -> list[RoomSession]:
+        """Return all currently managed ``RoomSession`` objects."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).list_rooms(self))
-        """Return all currently managed ``RoomSession`` objects."""
         with self._lock:
             return list(self._rooms.values())
 
     def room_count(self) -> int:
+        """Return the number of rooms currently managed."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).room_count(self))
-        """Return the number of rooms currently managed."""
         with self._lock:
             return len(self._rooms)
 
     def max_rooms(self) -> int:
+        """Return the hard upper limit on concurrently managed rooms."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).max_rooms(self))
-        """Return the hard upper limit on concurrently managed rooms."""
         return MAX_ROOMS
 
     def remove_room(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).remove_room(self, room_id=room_id))
         """Remove a room and clean up all associated resources.
 
         Stops any active preview or recording, cancels pending async workers
@@ -797,6 +795,8 @@ class RoomOrchestrator:
         Returns:
             True if the room was found and removed; False otherwise.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).remove_room(self, room_id=room_id))
         with self._lock:
             room = self._rooms.pop(room_id, None)
         if room is None:
@@ -899,8 +899,6 @@ class RoomOrchestrator:
         return entry
 
     def save_rooms(self) -> int:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).save_rooms(self))
         """Persist the current room list atomically (debounced 1s, fsync every N writes).
 
         Writes to a temporary file first, then renames it into place.
@@ -909,6 +907,8 @@ class RoomOrchestrator:
 
         Returns number of rooms queued for save.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).save_rooms(self))
         data = {
             "version": 2,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -930,9 +930,9 @@ class RoomOrchestrator:
         return count
 
     def flush_save_rooms(self) -> int:
+        """Cancel debounce and flush immediately (tests / shutdown)."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).flush_save_rooms(self))
-        """Cancel debounce and flush immediately (tests / shutdown)."""
         timer = getattr(self, "_save_rooms_timer", None)
         if timer is not None:
             try:
@@ -992,13 +992,13 @@ class RoomOrchestrator:
             return None
 
     def load_rooms(self) -> int:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).load_rooms(self))
         """Load rooms from the persisted config.
 
         If the primary config file is missing or corrupt, attempts to fall
         back to the .bak copy. Returns number of loaded rooms.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).load_rooms(self))
         path = self._config_file_path()
         bak_path = self._backup_config_path()
 
@@ -1055,8 +1055,6 @@ class RoomOrchestrator:
 
     def connect_room(self, room_id: str, *, async_mode: bool = False,
                      quality_preset: str = "原画") -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).connect_room(self, room_id=room_id, async_mode=async_mode, quality_preset=quality_preset))
         """Connect a room to its live stream.
 
         Args:
@@ -1068,6 +1066,8 @@ class RoomOrchestrator:
             For sync mode: True if connected successfully.
             For async mode: True if the background job was launched.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).connect_room(self, room_id=room_id, async_mode=async_mode, quality_preset=quality_preset))
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -1191,8 +1191,6 @@ class RoomOrchestrator:
         room._reconnect_thread = None
 
     def disconnect_room(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).disconnect_room(self, room_id=room_id))
         """Disconnect a room from its live stream.
 
         Cancels any pending async connection, stops the preview if active,
@@ -1203,6 +1201,8 @@ class RoomOrchestrator:
         Returns:
             True if the room was found and disconnected.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).disconnect_room(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -1235,15 +1235,13 @@ class RoomOrchestrator:
     # ── Preview ──────────────────────────────────────────────
 
     def get_active_preview_count(self) -> int:
+        """Return the number of rooms with an enabled, un-paused preview."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).get_active_preview_count(self))
-        """Return the number of rooms with an enabled, un-paused preview."""
         return sum(1 for r in self._rooms.values()
                    if r.preview_enabled and not r.preview_paused)
 
     def start_preview(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).start_preview(self, room_id=room_id))
         """Enable preview playback for a connected room.
 
         A preview widget is created lazily on first use. The method enforces
@@ -1255,6 +1253,8 @@ class RoomOrchestrator:
             connected, the widget could not be created, or the concurrency
             limit was reached.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).start_preview(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None or not room.is_connected:
             return False
@@ -1291,8 +1291,6 @@ class RoomOrchestrator:
         return True
 
     def play_preview_stream(self, room_id: str) -> None:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).play_preview_stream(self, room_id=room_id))
         """在 widget 嵌入卡片并完成 rebind 后播放直播流。
 
         ``start_preview`` 仅创建 widget 并置状态，真正的 ``mpv.play`` 必须在
@@ -1300,6 +1298,8 @@ class RoomOrchestrator:
         绑定到旧句柄的播放请求失效，表现为预览黑屏。本方法封装了
         ``_play_stream``，供 ``MultiRoomPage._on_preview`` 在延迟回调中调用。
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).play_preview_stream(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None:
             return
@@ -1308,14 +1308,14 @@ class RoomOrchestrator:
         self._play_stream(room)
 
     def pause_preview(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).pause_preview(self, room_id=room_id))
         """Pause the preview widget without tearing down the mpv instance.
 
         Returns:
             True if the room's preview was paused; False if the room or
             preview does not exist.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).pause_preview(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None or not room.preview_enabled:
             return False
@@ -1327,14 +1327,14 @@ class RoomOrchestrator:
         return True
 
     def resume_preview(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).resume_preview(self, room_id=room_id))
         """Resume a previously paused preview widget.
 
         Returns:
             True if the room's preview was resumed; False if the room or
             preview does not exist.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).resume_preview(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None or not room.preview_enabled:
             return False
@@ -1346,8 +1346,6 @@ class RoomOrchestrator:
         return True
 
     def stop_preview(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).stop_preview(self, room_id=room_id))
         """Stop preview playback and release the preview widget.
 
         The underlying mpv instance is stopped but retained on the room so
@@ -1358,6 +1356,8 @@ class RoomOrchestrator:
             True if the room's preview was stopped; False if the room does
             not exist.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).stop_preview(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -1370,13 +1370,13 @@ class RoomOrchestrator:
         return True
 
     def set_preview_muted(self, room_id: str, muted: bool) -> None:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).set_preview_muted(self, room_id=room_id, muted=muted))
         """Set the mute state of the room's preview widget.
 
         The preference is also persisted on ``RoomSession.preview_muted`` so
         it survives across preview stop/start cycles.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).set_preview_muted(self, room_id=room_id, muted=muted))
         room = self.get_room(room_id)
         if room is None:
             return
@@ -1388,14 +1388,14 @@ class RoomOrchestrator:
             widget.set_muted(muted)
 
     def seek_preview(self, room_id: str, seconds: float) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).seek_preview(self, room_id=room_id, seconds=seconds))
         """Seek the room's preview widget to an absolute position.
 
         Also updates ``controller.current_sec`` so the timeline reflects
         the new position immediately even before the next widget callback.
         Returns False if the room or preview widget does not exist.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).seek_preview(self, room_id=room_id, seconds=seconds))
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -1411,13 +1411,13 @@ class RoomOrchestrator:
         return True
 
     def get_preview_position(self, room_id: str) -> float:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).get_preview_position(self, room_id=room_id))
         """Return the current playback position of the room's preview widget.
 
         Falls back to ``controller.current_sec`` when the widget is not
         available or reports no position (e.g. live streams).
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).get_preview_position(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None:
             return 0.0
@@ -1437,13 +1437,13 @@ class RoomOrchestrator:
         return 0.0
 
     def get_preview_duration(self, room_id: str) -> float:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).get_preview_duration(self, room_id=room_id))
         """Return the duration reported by the preview widget.
 
         For live streams mpv may report 0; callers should fall back to
         ``controller.total_sec`` in that case.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).get_preview_duration(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None:
             return 0.0
@@ -1458,8 +1458,6 @@ class RoomOrchestrator:
         return 0.0
 
     def align_previews_to_live(self) -> int:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).align_previews_to_live(self))
         """Seek every active preview to its live edge (latest position).
 
         This gives users a one-click way to re-synchronise all multi-room
@@ -1470,6 +1468,8 @@ class RoomOrchestrator:
         the maximum current playback position across all selected previews as
         the live edge target instead.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).align_previews_to_live(self))
         candidate_positions: list[float] = []
         active_rooms: list[RoomSession] = []
         for room in list(self._rooms.values()):
@@ -1499,13 +1499,13 @@ class RoomOrchestrator:
     # ── Range loop preview ─────────────────────────────────
 
     def start_range_loop(self, room_id: str, start: float, end: float) -> None:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).start_range_loop(self, room_id=room_id, start=start, end=end))
         """循环播放 [start, end]。
 
         优先使用 mpv 原生 A-B 循环（精度高、无 polling 开销）；
         若预览组件不支持，则回退到 50ms 轮询检查位置并手动 seek。
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).start_range_loop(self, room_id=room_id, start=start, end=end))
         self.stop_range_loop()
         self._loop_room_id = room_id
         self._loop_start = start
@@ -1522,9 +1522,9 @@ class RoomOrchestrator:
             self._loop_deadline = time.monotonic() + 0.05
 
     def stop_range_loop(self) -> None:
+        """停止选区循环播放。"""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).stop_range_loop(self))
-        """停止选区循环播放。"""
         if self._loop_native:
             room = self.get_room(self._loop_room_id or "")
             widget = room.preview_widget if room else None
@@ -1538,9 +1538,9 @@ class RoomOrchestrator:
         self._loop_room_id = None
 
     def is_range_loop_active(self) -> bool:
+        """返回当前是否正在循环试听。"""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).is_range_loop_active(self))
-        """返回当前是否正在循环试听。"""
         return self._loop_room_id is not None
 
     def _on_preview_loop_tick(self) -> None:
@@ -1552,13 +1552,13 @@ class RoomOrchestrator:
             self.seek_preview(self._loop_room_id, self._loop_start)
 
     def seek_selected_previews(self, room_ids: list[str], seconds: float) -> None:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).seek_selected_previews(self, room_ids=room_ids, seconds=seconds))
         """Seek the previews of every room in ``room_ids`` to ``seconds``.
 
         Used by the multi-room page when multiple cards are selected so a
         single timeline drag moves all selected previews at once.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).seek_selected_previews(self, room_ids=room_ids, seconds=seconds))
         for room_id in room_ids:
             self.seek_preview(room_id, seconds)
 
@@ -1589,8 +1589,6 @@ class RoomOrchestrator:
         widget.set_muted(room.preview_muted)
 
     def refresh_stream_url(self, room_id: str, *, force: bool = False) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).refresh_stream_url(self, room_id=room_id, force=force))
         """Re-parse the stream to get a fresh CDN URL. Returns True on success.
 
         Args:
@@ -1598,6 +1596,8 @@ class RoomOrchestrator:
                    HTTP request. Used by MSE reconnect to avoid getting
                    a cached (possibly expired) stream URL.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).refresh_stream_url(self, room_id=room_id, force=force))
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -1632,9 +1632,9 @@ class RoomOrchestrator:
         return True
 
     def refresh_stream_url_async(self, room_id: str, callback: Callable[[str, bool], None]) -> None:
+        """Refresh stream URL in a background thread, then call callback(room_id, success)."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).refresh_stream_url_async(self, room_id=room_id, callback=callback))
-        """Refresh stream URL in a background thread, then call callback(room_id, success)."""
         room = self.get_room(room_id)
         if room is None:
             callback(room_id, False)
@@ -1727,8 +1727,6 @@ class RoomOrchestrator:
                         resolution: str | None = None,
                         framerate: str | None = None,
                         audio_bitrate: str | None = None) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).start_recording(self, room_id=room_id, output_dir=output_dir, encoder=encoder, crf=crf, param_mode=param_mode, bitrate=bitrate, bitrate_unit=bitrate_unit, resolution=resolution, framerate=framerate, audio_bitrate=audio_bitrate))
         """Start FFmpeg recording for a single connected room.
 
         The method performs a pre-flight disk-space check, refreshes the
@@ -1753,6 +1751,8 @@ class RoomOrchestrator:
         Returns:
             True if recording started successfully.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).start_recording(self, room_id=room_id, output_dir=output_dir, encoder=encoder, crf=crf, param_mode=param_mode, bitrate=bitrate, bitrate_unit=bitrate_unit, resolution=resolution, framerate=framerate, audio_bitrate=audio_bitrate))
         _log.info("[录制诊断] start_recording called for room_id=%s", room_id)
         room = self.get_room(room_id)
         if room is None:
@@ -2001,8 +2001,6 @@ class RoomOrchestrator:
         return "", 0.0, result.error
 
     def stop_recording(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).stop_recording(self, room_id=room_id))
         """Stop FFmpeg recording for a room and reset reconnect state.
 
         Delegates to ``RecordingController.stop_recording``, clears the
@@ -2012,6 +2010,8 @@ class RoomOrchestrator:
         Returns:
             True if the controller accepted the stop request.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).stop_recording(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -2054,13 +2054,13 @@ class RoomOrchestrator:
         return ok
 
     def stop_recording_async(self, room_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).stop_recording_async(self, room_id=room_id))
         """Non-blocking stop: marks state immediately, FFmpeg cleaned up in background.
 
         Avoids blocking the Qt main thread for up to 13 seconds (5+3+5 three-level stop).
         The caller can continue immediately; FFmpeg is cleaned up in a background thread.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).stop_recording_async(self, room_id=room_id))
         room = self.get_room(room_id)
         if room is None:
             return False
@@ -2104,9 +2104,9 @@ class RoomOrchestrator:
     def start_recording_all(self, output_dir: str, encoder: str, crf: int,
                             param_mode: str = "CRF 质量", bitrate: str | None = None,
                             bitrate_unit: str = "kbps") -> dict[str, bool]:
+        """Start recording on every managed room (synchronous, blocking)."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).start_recording_all(self, output_dir=output_dir, encoder=encoder, crf=crf, param_mode=param_mode, bitrate=bitrate, bitrate_unit=bitrate_unit))
-        """Start recording on every managed room (synchronous, blocking)."""
         rooms = self.list_rooms()
         # Pre-flight: ensure disk space scales with concurrent stream count.
         if rooms:
@@ -2132,8 +2132,6 @@ class RoomOrchestrator:
     def start_recording_all_async(self, output_dir: str, encoder: str, crf: int,
                                   param_mode: str = "CRF 质量", bitrate: str | None = None,
                                   bitrate_unit: str = "kbps") -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).start_recording_all_async(self, output_dir=output_dir, encoder=encoder, crf=crf, param_mode=param_mode, bitrate=bitrate, bitrate_unit=bitrate_unit))
         """Start recording on all connected rooms without blocking the caller thread.
 
         Pre-flight disk space check runs synchronously on the caller thread;
@@ -2145,6 +2143,8 @@ class RoomOrchestrator:
         Returns True if the worker was started, False on pre-flight failure
         or if a batch is already running.
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).start_recording_all_async(self, output_dir=output_dir, encoder=encoder, crf=crf, param_mode=param_mode, bitrate=bitrate, bitrate_unit=bitrate_unit))
         if self._batch_record_job is not None:
             _log.warning("批量录制已在进行中，忽略重复请求")
             return False
@@ -2177,9 +2177,9 @@ class RoomOrchestrator:
         return True
 
     def stop_recording_all(self) -> dict[str, bool]:
+        """Stop recording on every managed room and return per-room results."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).stop_recording_all(self))
-        """Stop recording on every managed room and return per-room results."""
         return {r.room_id: self.stop_recording(r.room_id) for r in self.list_rooms()}
 
     def shutdown(self, timeout_sec: float = 10.0) -> dict[str, int]:
@@ -2317,8 +2317,6 @@ class RoomOrchestrator:
                      on_done: Callable[[bool, str, str, float, str], None] | None = None,
                      on_progress: Callable[[float, float, float], None] | None = None,
                      profile: ExportProfile | None = None) -> str:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).start_export(self, room_id=room_id, start_sec=start_sec, end_sec=end_sec, output_dir=output_dir, title=title, on_done=on_done, on_progress=on_progress, profile=profile))
         """Start async clip export for a room's recording.
 
         Parameters
@@ -2336,6 +2334,8 @@ class RoomOrchestrator:
             export_id（非空字符串）表示已启动；空字符串表示启动失败。
             可传给 :meth:`cancel_export` 取消该任务。
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).start_export(self, room_id=room_id, start_sec=start_sec, end_sec=end_sec, output_dir=output_dir, title=title, on_done=on_done, on_progress=on_progress, profile=profile))
         room = self.get_room(room_id)
         if room is None:
             return ""
@@ -2350,8 +2350,6 @@ class RoomOrchestrator:
         return export_id
 
     def cancel_export(self, export_id: str) -> bool:
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).cancel_export(self, export_id=export_id))
         """取消指定 export_id 的导出任务。
 
         Returns
@@ -2359,6 +2357,8 @@ class RoomOrchestrator:
         bool
             True 表示已发送 kill 信号；False 表示任务不存在或已结束。
         """
+        if self._thread is not None and threading.current_thread() is not self._thread:
+            return self.call(lambda: type(self).cancel_export(self, export_id=export_id))
         # export_id 可能注册在任意房间的 controller 上，需要遍历查找
         for room in self._rooms.values():
             controller = room.controller
@@ -2377,15 +2377,15 @@ class RoomOrchestrator:
     # ── Cut ──────────────────────────────────────────────────
 
     def get_rooms_for_cut(self) -> list[RoomSession]:
+        """Return rooms that have opted in to the cut/export pipeline."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).get_rooms_for_cut(self))
-        """Return rooms that have opted in to the cut/export pipeline."""
         return [r for r in self.list_rooms() if r.include_in_cut]
 
     def get_total_recording_size_mb(self) -> float:
+        """返回所有房间当前录制文件的总大小（MB）。"""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).get_total_recording_size_mb(self))
-        """返回所有房间当前录制文件的总大小（MB）。"""
         return sum(r.record_size_mb for r in self._rooms.values() if r.is_recording)
 
     # ── Global heartbeat ─────────────────────────────────────
