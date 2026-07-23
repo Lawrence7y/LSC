@@ -901,247 +901,16 @@ def _map_highlights_by_room(highlights, main_room, target_rooms) -> dict[str, li
     return mapped_by_room
 
 
-def _detect_audio_energy_peaks(
-    video_path: str,
-    duration: float,
-    ffmpeg_path: str = "ffmpeg",
-    time_range: tuple[float, float] | None = None,
-    cancel_check: Callable[[], bool] | None = None,
-) -> list[dict[str, Any]]:
-    """音频 RMS 能量峰值检测，作为 scene 检测的回退方案。
-
-    当 FFmpeg scene 检测对所有阈值都返回 0 结果时（如游戏直播画面过于连续），
-    提取音频 RMS 包络，找到音量峰值段作为高光候选。
-    """
-    import tempfile
-    import wave
-
-    import numpy as np
-
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.wav')
-    os.close(tmp_fd)
-
-    cmd = [ffmpeg_path, '-y', '-loglevel', 'error']
-    if time_range:
-        cmd += ['-ss', f'{time_range[0]:.3f}', '-t', f'{time_range[1] - time_range[0]:.3f}']
-    cmd += ['-i', video_path, '-ar', '8000', '-ac', '1', '-f', 'wav', tmp_path]
-
-    try:
-        run_hidden(cmd, capture_output=True, timeout=60)
-        if cancel_check and cancel_check():
-            return []
-        with wave.open(tmp_path, 'rb') as wf:
-            n_frames = wf.getnframes()
-            framerate = wf.getframerate()
-            raw = wf.readframes(n_frames)
-        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-        if len(samples) == 0:
-            return []
-        window = framerate // 2
-        n_windows = len(samples) // window
-        if n_windows == 0:
-            return []
-        trimmed = samples[:n_windows * window].reshape(n_windows, window)
-        rms = np.sqrt(np.mean(trimmed ** 2, axis=1))
-        if rms.max() == 0:
-            return []
-        percentile_threshold = float(np.percentile(rms, 85))
-        mean_rms = float(np.mean(rms))
-        std_rms = float(np.std(rms))
-        statistical_threshold = mean_rms + 2.0 * std_rms
-        threshold = max(percentile_threshold, statistical_threshold)
-        if threshold == 0:
-            return []
-        is_peak = rms > threshold
-        seg_offset = time_range[0] if time_range else 0.0
-        highlights: list[dict[str, Any]] = []
-        i = 0
-        while i < n_windows:
-            if is_peak[i]:
-                start = i
-                while i < n_windows and is_peak[i]:
-                    i += 1
-                end = i
-                start_sec = (start * 0.5) + seg_offset
-                end_sec = (end * 0.5) + seg_offset
-                if end_sec - start_sec >= 3.0:
-                    score = min(1.0, float(np.mean(rms[start:end]) / threshold))
-                    highlights.append({
-                        'start': max(0, start_sec - 2),
-                        'end': min(duration, end_sec + 5),
-                        'score': max(0.3, score),
-                        'reason': '音频能量峰值',
-                        'phase': 'unknown',
-                    })
-            else:
-                i += 1
-        return highlights
-    except Exception as exc:
-        _log.warning("音频能量检测失败: %s", exc)
-        return []
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+def _detect_audio_energy_peaks(*args, **kwargs):
+    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
+    from lsc.analyzer.scene_analysis import detect_audio_energy_peaks
+    return detect_audio_energy_peaks(*args, **kwargs)
 
 
-def _detect_rounds_by_audio_rhythm(
-    video_path: str,
-    duration: float,
-    ffmpeg_path: str = "ffmpeg",
-    time_range: tuple[float, float] | None = None,
-    cancel_check: Callable[[], bool] | None = None,
-) -> list[dict[str, Any]]:
-    """音频回合节奏检测：通过 RMS 能量包络识别 Valorant 回合边界。
-
-    Valorant 回合的音频特征：
-    - 买枪阶段 (~20-30s)：中低能量（语音、商店音效）
-    - 战斗阶段 (~20-50s)：高能量（枪声、技能）
-    - 回合过渡 (~3-5s)：能量回落
-
-    算法：找高能量段（战斗）→ 合并间距 < 10s 的段 → 每段前后加短暂 padding（剔除买枪期）→ 过滤
-
-    持续分析专用：录制中文件只能可靠提取音频，视频方法全部失效。
-    """
-    import tempfile
-    import wave
-
-    import numpy as np
-
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.wav')
-    os.close(tmp_fd)
-
-    seg_offset = time_range[0] if time_range else 0.0
-    seg_end = time_range[1] if time_range else duration
-
-    cmd = [ffmpeg_path, '-y', '-loglevel', 'error']
-    if time_range:
-        cmd += ['-ss', f'{time_range[0]:.3f}', '-t', f'{time_range[1] - time_range[0]:.3f}']
-    cmd += ['-i', video_path, '-ar', '8000', '-ac', '1', '-f', 'wav', tmp_path]
-
-    try:
-        run_hidden(cmd, capture_output=True, timeout=120)
-        if cancel_check and cancel_check():
-            return []
-
-        with wave.open(tmp_path, 'rb') as wf:
-            n_frames = wf.getnframes()
-            framerate = wf.getframerate()
-            raw = wf.readframes(n_frames)
-
-        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-        if len(samples) == 0:
-            return []
-
-        # 1s 窗口 RMS
-        window = framerate  # 1 秒
-        n_windows = len(samples) // window
-        if n_windows < 10:
-            return []
-        trimmed = samples[:n_windows * window].reshape(n_windows, window)
-        rms = np.sqrt(np.mean(trimmed ** 2, axis=1))
-
-        if rms.max() == 0:
-            return []
-
-        # 7s 居中移动平均平滑
-        kernel = np.ones(7) / 7.0
-        smoothed = np.convolve(rms, kernel, mode='same')
-
-        # 动态阈值：顶部 45% = 高能量（战斗阶段）
-        threshold = float(np.percentile(smoothed, 55))
-        if threshold == 0:
-            threshold = float(np.mean(smoothed))
-        if threshold == 0:
-            return []
-
-        is_high = smoothed > threshold
-
-        # 找连续高能量段
-        combat_periods: list[tuple[int, int]] = []
-        i = 0
-        while i < n_windows:
-            if is_high[i]:
-                start = i
-                while i < n_windows and is_high[i]:
-                    i += 1
-                end = i
-                combat_periods.append((start, end))
-            else:
-                i += 1
-
-        if not combat_periods:
-            return []
-
-        # 合并间距 < 10s 的高能量段（同一回合内的短暂安静）
-        merged: list[tuple[int, int]] = [combat_periods[0]]
-        for s, e in combat_periods[1:]:
-            if s - merged[-1][1] < 10:
-                merged[-1] = (merged[-1][0], e)
-            else:
-                merged.append((s, e))
-
-        # 过滤：合并后高能量段 >= 5s（真实战斗，非噪声）
-        merged = [(s, e) for s, e in merged if e - s >= 5]
-
-        if not merged:
-            return []
-
-        # 每个战斗段 → 回合片段
-        highlights: list[dict[str, Any]] = []
-        for combat_start, combat_end in merged:
-            # 起点: 战斗段开始处（剔除买枪期，仅保留 2s 安全缓冲），后 5s（回合结束反应）
-            round_start = max(0.0, combat_start - 2 + seg_offset)
-            round_end = min(duration, combat_end + 5 + seg_offset)
-            seg_duration = round_end - round_start
-
-            # 过滤：回合片段时长 15-150s
-            if seg_duration < 15 or seg_duration > 150:  # 去掉买枪期后，纯战斗段可能更短
-                continue
-
-            # score: 战斗峰值强度 / 阈值（越高=越激烈）
-            peak_rms = float(np.max(smoothed[combat_start:combat_end]))
-            score = min(1.0, peak_rms / (threshold * 2.0))
-            score = max(0.3, score)
-
-            highlights.append({
-                'start': round(round_start, 3),
-                'end': round(round_end, 3),
-                'score': round(score, 3),
-                'reason': '回合战斗阶段',
-                'phase': 'combat',
-            })
-
-        if not highlights:
-            return []
-
-        # 移除重叠
-        highlights.sort(key=lambda h: h['start'])
-        cleaned: list[dict[str, Any]] = []
-        for h in highlights:
-            if cleaned and h['start'] < cleaned[-1]['end']:
-                # 裁剪前一片段
-                cleaned[-1]['end'] = h['start']
-                if cleaned[-1]['end'] - cleaned[-1]['start'] < 10:
-                    cleaned.pop()
-            cleaned.append(h)
-
-        _log.info(
-            "音频回合检测: %d 回合 (duration=%.0fs, threshold=%.1f, combat_periods=%d→%d)",
-            len(cleaned), seg_end - seg_offset, threshold,
-            len(combat_periods), len(merged),
-        )
-        return cleaned
-
-    except Exception as exc:
-        _log.warning("音频回合检测失败: %s", exc)
-        return []
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+def _detect_rounds_by_audio_rhythm(*args, **kwargs):
+    """兼容包装：逻辑已迁至 lsc.analyzer.valorant_plugin。"""
+    from lsc.analyzer.valorant_plugin import detect_rounds_by_audio_rhythm
+    return detect_rounds_by_audio_rhythm(*args, **kwargs)
 
 
 def _new_rounds(
@@ -1734,15 +1503,10 @@ def _round_lists_changed(
     return False
 
 
-def _continuous_valorant_refine_with_ocr(
-    mode: str,
-    pressure: dict[str, Any] | None = None,
-) -> bool:
-    """Return whether continuous Valorant analysis may use legacy OCR refine.
-
-    valorant_round 已切换为混合视觉边界，不再通过 refine_with_ocr 升格旧 OCR 路径。
-    """
-    return False
+def _continuous_valorant_refine_with_ocr(*args, **kwargs):
+    """兼容 tests/test_continuous_analysis_guards.py。"""
+    from lsc.analyzer.valorant_plugin import valorant_refine_with_ocr
+    return valorant_refine_with_ocr(*args, **kwargs)
 
 
 def _finalize_scan_timeout(duration_sec: float, attempt: int = 1) -> int:
@@ -1761,92 +1525,16 @@ def _finalize_scan_timeout(duration_sec: float, attempt: int = 1) -> int:
     return int(min(1800, max(300, base)))
 
 
-def _window_scan_timeout(scan_duration_sec: float, *, use_ocr: bool) -> int:
-    """单窗扫描超时（秒）。
-
-    纯音频可近实时；OCR 帧抽检在负载下常需 1.5–2× 窗长。
-    对照实测：相位短窗旧公式 ``dur/180*12+45`` 对 80–117s 窗只给 ~49–52s，
-    OCR TimeoutError 后降级纯音频，待确认永远无法升格。
-    """
-    dur = max(1.0, float(scan_duration_sec))
-    if not use_ocr:
-        return int(max(45, int(dur / 180.0 * 12) + 45))
-    # 2× 窗长 + 90s 余量；夹在 2–15 分钟（收尾另走 _finalize_scan_timeout）
-    return int(min(900, max(120, int(dur * 2.0) + 90)))
+def _window_scan_timeout(*args, **kwargs):
+    """兼容 tests/test_continuous_analysis_guards.py。"""
+    from lsc.analyzer.valorant_plugin import window_scan_timeout
+    return window_scan_timeout(*args, **kwargs)
 
 
-def _continuous_valorant_scan_budget(
-    mode: str,
-    last_analyzed: float,
-    current_dur: float,
-    pressure: dict[str, Any] | None = None,
-    tick_count: int = 0,
-    round_phase: str | None = None,
-    valorant_profile: str | None = None,
-    pending_start: float | None = None,
-    prediction=None,
-) -> tuple[tuple[float, float], bool, int, bool]:
-    """Return scan range, OCR flag, timeout, and whether this is the first scan.
-
-    Incremental scans catch up from last_analyzed (with lookback overlap), never
-    jump to a trailing tip window that would skip the middle of the recording.
-
-    当 mode == "valorant_round" 且 round_phase 提供时，走相位调度器的短窗预算；
-    否则保留旧的 lookback 追赶行为（向后兼容）。
-    prediction 为可选 RoundClockPrediction，仅影响 OCR 密度，不改变确认门。
-    """
-    pressure = pressure or {}
-
-    # 相位调度路径（新主路径）
-    if mode == "valorant_round" and round_phase is not None:
-        from lsc.analyzer.phase_scheduler import (
-            RoundPhase,
-            get_profile,
-            scan_budget_for_phase,
-        )
-        cfg = get_profile(valorant_profile)
-        try:
-            phase = RoundPhase(round_phase)
-        except ValueError:
-            phase = RoundPhase.UNKNOWN
-        budget = scan_budget_for_phase(
-            phase, cfg,
-            last_analyzed=last_analyzed,
-            current_dur=current_dur,
-            pending_start=pending_start,
-            prediction=prediction,
-        )
-        # OCR 还要过压力门控
-        use_ocr = budget.need_ocr and _continuous_valorant_refine_with_ocr(mode, pressure)
-        scan_range = (budget.scan_start, budget.scan_end)
-        scan_duration = max(1.0, scan_range[1] - scan_range[0])
-        timeout = _window_scan_timeout(scan_duration, use_ocr=use_ocr)
-        full_rescan = last_analyzed <= 0.0
-        return scan_range, use_ocr, timeout, full_rescan
-
-    # 旧路径（向后兼容：未传 round_phase 时保留 240s lookback 追赶行为）
-    try:
-        lookback = float(pressure.get("analysis_window_sec", _VALORANT_INCREMENTAL_LOOKBACK_SEC))
-    except (TypeError, ValueError):
-        lookback = _VALORANT_INCREMENTAL_LOOKBACK_SEC
-    lookback = max(20.0, lookback)
-
-    full_rescan = last_analyzed <= 0.0
-    if full_rescan:
-        scan_start = 0.0
-        scan_end = float(current_dur)
-    else:
-        # 从已分析点回看 lookback，再向前追赶；禁止 current_dur - lookback 跳窗漏扫
-        scan_start = max(0.0, float(last_analyzed) - lookback)
-        scan_end = min(float(current_dur), float(last_analyzed) + _VALORANT_MAX_CATCHUP_SEC)
-        if scan_end < scan_start:
-            scan_end = float(current_dur)
-    use_ocr = _continuous_valorant_refine_with_ocr(mode, pressure)
-
-    scan_range = (round(scan_start, 3), round(float(scan_end), 3))
-    scan_duration = max(1.0, scan_range[1] - scan_range[0])
-    timeout = _window_scan_timeout(scan_duration, use_ocr=use_ocr)
-    return scan_range, use_ocr, timeout, full_rescan
+def _continuous_valorant_scan_budget(*args, **kwargs):
+    """兼容 tests/test_continuous_analysis_guards.py。"""
+    from lsc.analyzer.valorant_plugin import compute_valorant_scan_budget
+    return compute_valorant_scan_budget(*args, **kwargs)
 
 
 def _continuous_effective_interval(
@@ -1901,315 +1589,22 @@ def _cleanup_segments(segments: list[dict[str, Any]], min_duration: float = 5.0)
     return cleaned
 
 
-def _scene_ocr_detection(
-    video_path: str,
-    ffmpeg_path: str,
-    duration: float,
-    progress_callback: Callable[[str, float, str], None] | None,
-    cancel_check: Callable[[], bool] | None,
-    time_range: tuple[float, float] | None = None,
-    enabled: bool = True,
-) -> list[dict[str, Any]]:
-    """Scene 模式的轻量 OCR 检测：仅 Kill Feed + 回合标记，不跑 Whisper/CLIP。
-
-    rapidocr 未安装或 enabled=False 时返回空列表。
-    持续分析时录制文件仍在写入，OCR 帧提取不完整，应设 enabled=False 跳过。
-    """
-    if not enabled:
-        return []
-
-    try:
-        from lsc.analyzer.ocr_detector import detect_kill_events
-    except ImportError:
-        _log.debug("rapidocr 未安装，scene 模式跳过 OCR 检测")
-        return []
-
-    if progress_callback:
-        progress_callback("scene", 85.0, "OCR 击杀检测中...")
-    try:
-        ocr_events = detect_kill_events(
-            video_path, ffmpeg_path=ffmpeg_path,
-            duration=duration,
-            cancel_check=cancel_check,
-            game="valorant",
-        )
-    except Exception as exc:
-        _log.warning("scene 模式 OCR 检测失败: %s", exc)
-        return []
-
-    ocr_highlights: list[dict[str, Any]] = []
-    for evt in ocr_events:
-        if evt.get("type") == "kill":
-            ts = evt.get("timestamp", 0.0)
-            if time_range and (ts < time_range[0] or ts > time_range[1]):
-                continue
-            score = evt.get("score", 0.5)
-            pre_pad = 1.0 if score >= 0.7 else 2.0
-            post_pad = 4.0 if score >= 0.7 else 6.0
-            ocr_highlights.append({
-                "start": max(0.0, ts - pre_pad),
-                "end": ts + post_pad,
-                "score": score,
-                "reason": f"击杀: {evt.get('text', '')[:30]}",
-                "source": "ocr",
-                "type": "kill",
-                "timestamp": ts,
-            })
-        elif evt.get("type") == "round_marker":
-            ts = evt.get("timestamp", 0.0)
-            highlight = {
-                "start": max(0.0, ts - 1.0),
-                "end": ts + 1.0,
-                "score": 0.5,
-                "reason": "回合标记",
-                "source": "ocr",
-                "type": "round_marker",
-                "timestamp": ts,
-            }
-            if evt.get("phase"):
-                highlight["phase"] = evt["phase"]
-            ocr_highlights.append(highlight)
-    return ocr_highlights
+def _scene_ocr_detection(*args, **kwargs):
+    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
+    from lsc.analyzer.scene_analysis import scene_ocr_detection
+    return scene_ocr_detection(*args, **kwargs)
 
 
-def _merge_scene_and_ocr(
-    scene_highlights: list[dict[str, Any]],
-    ocr_highlights: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """合并 scene 检测结果与 OCR 检测结果。
-
-    OCR 击杀事件参与回合分组，与 scene 高光去重后合并。
-    """
-    from lsc.analyzer.pipeline import (
-        _deduplicate_highlights,
-        _group_events_by_round,
-        _merge_close_segments,
-    )
-
-    all_highlights = list(scene_highlights) + list(ocr_highlights)
-
-    if ocr_highlights:
-        all_highlights = _group_events_by_round(all_highlights)
-
-    all_highlights = _deduplicate_highlights(all_highlights, iou_threshold=0.5)
-    all_highlights = _merge_close_segments(all_highlights, max_gap=15.0)
-    return all_highlights
+def _merge_scene_and_ocr(*args, **kwargs):
+    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
+    from lsc.analyzer.scene_analysis import merge_scene_and_ocr
+    return merge_scene_and_ocr(*args, **kwargs)
 
 
-def _run_scene_analysis(
-    video_path: str,
-    threshold: float = 0.3,
-    min_duration: float = 3.0,
-    progress_callback: Callable[[str, float, str], None] | None = None,
-    cancel_check: Callable[[], bool] | None = None,
-    time_range: tuple[float, float] | None = None,
-    enable_ocr: bool = True,
-) -> list[dict[str, Any]] | None:
-    """FFmpeg 场景检测，支持流式进度回调、取消、自适应阈值与时间范围。
-
-    游戏直播（如 Valorant 第一人称）画面连续，固定阈值 0.3 常检测不到足够
-    场景切换点导致空高光。本函数在给定阈值无结果时，自动降低阈值重试
-    （0.3 → 0.15 → 0.05），并输出诊断日志。
-
-    参数:
-        time_range: 可选 ``(start_sec, end_sec)``，仅分析该时间段（用于增量
-            持续分析）。返回的高光时间戳已还原为视频全局时间轴。
-
-    Returns:
-        高光段列表 ``[{"start", "end", "score"}, ...]``；被取消时返回 None。
-    """
-    from lsc.config import load_config as _load_cfg
-    _cfg = _load_cfg()
-    _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
-
-    duration = _get_video_duration(video_path)
-    if duration <= 0:
-        _log.warning("场景检测: 无法获取视频时长 (path=%s)", video_path)
-        return []
-
-    env, creation_flags, cwd = prepare_launch(_ffmpeg)
-    pattern = re.compile(r"pts_time:(\d+\.?\d*)")
-
-    # 增量分析时的时间偏移：input seek 后 pts_time 是相对 seek 点的，需加回 seg_offset 还原全局
-    seg_offset = time_range[0] if time_range else 0.0
-
-    def _detect(ts_threshold: float) -> list[float] | None:
-        """在给定阈值下跑 FFmpeg scene 检测，返回场景切换时间戳列表（已还原全局）。
-
-        返回 None 表示被取消；返回 list（可能为空）表示正常完成。
-        """
-        cmd = [_ffmpeg, "-y", "-loglevel", "info"]
-        # 硬解卸 CPU；select/scene 仍须 CPU，先降到 640 宽降低滤镜代价
-        try:
-            from lsc.utils.gpu_ffmpeg import nvenc_available
-            if nvenc_available():
-                cmd += ["-hwaccel", "cuda"]
-        except Exception as exc:
-            _log.debug("scene detect: nvenc probe skipped: %s", exc)
-        if time_range is not None:
-            tr_start, tr_end = time_range
-            # -ss input seek（快速）+ -t duration，限定增量分析范围
-            cmd += ["-ss", f"{tr_start:.3f}", "-t", f"{tr_end - tr_start:.3f}"]
-        cmd += [
-            "-i", video_path,
-            "-vf", f"scale=640:-2,select='gt(scene\\\\,{ts_threshold})',showinfo",
-            "-vsync", "vfr", "-f", "null", "-",
-        ]
-        popen_kwargs: dict[str, Any] = {
-            "stdout": subprocess.DEVNULL, "stderr": subprocess.PIPE,
-            "text": True, "bufsize": 0, "encoding": "utf-8",
-            "errors": "replace", "env": env, "cwd": cwd,
-        }
-        if creation_flags:
-            popen_kwargs["creationflags"] = creation_flags
-        try:
-            proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603
-            set_stream_nonblocking(proc.stderr)
-        except FileNotFoundError:
-            _log.warning("场景检测: FFmpeg 未找到")
-            return []
-        ts_list: list[float] = []
-        try:
-            if proc.stderr is None:
-                _log.error("FFmpeg 场景检测: stderr 管道未创建")
-                return []
-            for line in proc.stderr:
-                if cancel_check and cancel_check():
-                    _log.info("场景检测被取消")
-                    _safe_terminate(proc)
-                    return None
-                m = pattern.search(line)
-                if m:
-                    # input seek 后 pts_time 相对 seek 点，加 seg_offset 还原全局时间轴
-                    ts_list.append(float(m.group(1)) + seg_offset)
-                    if progress_callback and duration > 0:
-                        pct = min(95.0, ts_list[-1] / duration * 100.0)
-                        progress_callback("scene", pct, f"已检测 {len(ts_list)} 个场景切换")
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            _log.warning("场景检测: wait 超时 (threshold=%.2f)", ts_threshold)
-            _safe_terminate(proc)
-            return []
-        finally:
-            if proc.poll() is None:
-                _safe_terminate(proc)
-        return ts_list
-
-    # 自适应阈值：游戏直播画面连续，高阈值可能 0 结果，逐步降低重试
-    # 阈值下限收紧到 0.15 — 0.05 在 Valorant 第一人称视角下会把视角晃动误判为场景切换
-    thresholds_to_try = [threshold]
-    if threshold > 0.15:
-        thresholds_to_try.append(max(0.15, threshold / 2))
-    if threshold > 0.25:
-        thresholds_to_try.append(0.15)
-
-    timestamps: list[float] = []
-    for th in thresholds_to_try:
-        if cancel_check and cancel_check():
-            return None
-        detected = _detect(th)
-        if detected is None:
-            return None  # 取消
-        _log.info("场景检测: threshold=%.2f → %d 个切换点 (duration=%.1fs)",
-                  th, len(detected), duration)
-        if detected:
-            timestamps = detected
-            break  # 检测到就不再降阈值
-
-    if not timestamps:
-        _log.info("场景检测: 所有阈值均未检测到场景切换，回退到音频能量检测 (path=%s)", video_path)
-        if progress_callback:
-            progress_callback("scene", 80.0, "场景检测无结果，尝试音频能量检测...")
-        audio_highlights = _detect_audio_energy_peaks(
-            video_path, duration, ffmpeg_path=_ffmpeg,
-            time_range=time_range, cancel_check=cancel_check,
-        )
-        if audio_highlights:
-            _log.info("音频能量检测: 发现 %d 段高光 (path=%s)", len(audio_highlights), video_path)
-        else:
-            _log.warning("音频能量检测也无结果 (path=%s)", video_path)
-
-        # 尝试 OCR 检测补充信号
-        ocr_highlights = _scene_ocr_detection(
-            video_path, _ffmpeg, duration, progress_callback, cancel_check, time_range,
-            enabled=enable_ocr,
-        )
-        if ocr_highlights:
-            _log.info("OCR 检测补充: 发现 %d 段高光 (path=%s)", len(ocr_highlights), video_path)
-            if progress_callback:
-                progress_callback("scene", 100.0, f"检测完成：{len(audio_highlights) + len(ocr_highlights)} 段")
-            return _merge_scene_and_ocr(audio_highlights, ocr_highlights)
-
-        if audio_highlights:
-            if progress_callback:
-                progress_callback("scene", 100.0, f"音频检测完成：{len(audio_highlights)} 段")
-            return audio_highlights
-        if progress_callback:
-            progress_callback("scene", 100.0, "未检测到高光（画面和音频均无显著变化）")
-        return []
-
-    # 分组连续场景切换为高光段
-    # 针对 Valorant 回合制游戏: 手枪局/eco 局回合 30-40s, 长枪局 60-80s, 加时赛 80-100s
-    # 动态间隔：根据场景切换间距分布自适应确定回合边界
-    if len(timestamps) > 1:
-        gaps = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
-        median_gap = sorted(gaps)[len(gaps) // 2]
-        _ROUND_MIN_GAP = min(max(35.0, median_gap * 2.0), 80.0)
-    else:
-        _ROUND_MIN_GAP = 35.0
-    _log.info("场景分组: 动态回合间隔=%.1fs (中位间距=%.1fs)", _ROUND_MIN_GAP,
-              median_gap if len(timestamps) > 1 else 0.0)
-    _ROUND_PRE_PAD = 2.0   # 前缓冲: 战斗开始前短暂走位缓冲（不含买枪期）
-    _ROUND_POST_PAD = 5.0  # 后缓冲: 保留击杀后的反应 / 回合结算
-    highlights: list[dict[str, Any]] = []
-    segment_start = timestamps[0]
-    prev_ts = timestamps[0]
-    for ts in timestamps[1:]:
-        gap = ts - prev_ts
-        if gap > _ROUND_MIN_GAP:  # 间隔 > 动态阈值 → 新回合边界
-            highlights.append({
-                "start": max(0.0, segment_start - _ROUND_PRE_PAD),
-                "end": min(duration, prev_ts + _ROUND_POST_PAD),
-                "score": max(0.3, min(1.0, 1.5 - gap / 60.0)),
-                "reason": "场景切换检测",
-                "phase": "unknown",
-            })
-            segment_start = ts
-        prev_ts = ts
-    last_gap = prev_ts - segment_start
-    highlights.append({
-        "start": max(0.0, segment_start - _ROUND_PRE_PAD),
-        "end": min(duration, prev_ts + _ROUND_POST_PAD),
-        "score": max(0.5, min(1.0, 1.5 - last_gap / 60.0)),
-        "reason": "场景切换检测",
-        "phase": "unknown",
-    })
-
-    # 按最短时长过滤 + 去重重叠（确保片段互不重叠）
-    result: list[dict[str, Any]] = []
-    last_end = 0.0
-    for h in highlights:
-        seg_len = h["end"] - h["start"]
-        if seg_len >= min_duration or seg_len >= 15.0:
-            h["start"] = max(h["start"], last_end)
-            if h["end"] > h["start"]:
-                result.append(h)
-                last_end = h["end"]
-
-    # OCR 检测补充信号
-    ocr_highlights = _scene_ocr_detection(
-        video_path, _ffmpeg, duration, progress_callback, cancel_check, time_range,
-        enabled=enable_ocr,
-    )
-    if ocr_highlights:
-        _log.info("OCR 补充检测: %d 段高光 (path=%s)", len(ocr_highlights), video_path)
-        result = _merge_scene_and_ocr(result, ocr_highlights)
-
-    _log.info("场景检测完成: %d 段高光 (from %d 切换点, threshold=%.2f)",
-              len(result), len(timestamps), threshold)
-    if progress_callback:
-        progress_callback("scene", 100.0, f"场景检测完成：{len(result)} 段")
-    return result
+def _run_scene_analysis(*args, **kwargs):
+    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
+    from lsc.analyzer.scene_analysis import run_scene_analysis
+    return run_scene_analysis(*args, **kwargs)
 
 
 def _analyze_scene_or_rounds(
@@ -2222,37 +1617,45 @@ def _analyze_scene_or_rounds(
     """scene 模式的统一分析入口：Valorant 优先回合分割，其余走场景检测。
 
     对一次性分析（录制已结束的完整文件）：
-    - game="valorant" 时先用 detect_valorant_rounds 全量回合分割（按完整回合切，
-      不受固定时间间隔切断），并启用 OCR 边界校正（refine_with_ocr=True）；
-    - 无结果或非 valorant，回退到 _run_scene_analysis 场景检测。
-
-    统一 handle_start_analysis / handle_start_analysis_export 两个 handler 的 scene
-    行为，消除重复的快速路径代码。
+    - game="valorant" 时经 AnalyzerRegistry → detect_valorant_rounds_hybrid；
+    - 无结果或非 valorant，回退到 generic scene 分析。
 
     Returns:
         高光段列表；被取消时返回 None（与 _run_scene_analysis 语义一致）。
     """
-    if game == 'valorant':
+    from lsc.analyzer.registry import get as get_analyzer
+    from lsc.config import load_config as _load_cfg_r
+
+    _cfg = _load_cfg_r()
+    _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+    options = {
+        "threshold": threshold,
+        "ffmpeg_path": _ffmpeg,
+        "model_dir": _resolve_valorant_model_dir() if game == "valorant" else None,
+    }
+
+    if game == "valorant":
         try:
-            from lsc.analyzer.round_detector import detect_valorant_rounds_hybrid
             from lsc.analyzer.valorant_frame_classifier import ModelContractError
-            from lsc.config import load_config as _load_cfg_r
-            _cfg = _load_cfg_r()
-            _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+
             if progress_callback:
                 progress_callback("round_detect", 0.0, "Valorant 混合视觉回合检测中...")
-            highlights = detect_valorant_rounds_hybrid(
+            plugin = get_analyzer("valorant")
+            # Production path: detect_valorant_rounds_hybrid (via ValorantAnalyzerPlugin)
+            highlights = plugin.analyze_file(
                 video_path,
-                ffmpeg_path=_ffmpeg,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
-                model_dir=_resolve_valorant_model_dir(),
+                options=options,
             )
             if cancel_check and cancel_check():
                 return None
             if highlights:
-                _log.info("Valorant 混合视觉回合检测: %d 回合 (path=%s)",
-                          len(highlights), os.path.basename(video_path))
+                _log.info(
+                    "Valorant 混合视觉回合检测: %d 回合 (path=%s)",
+                    len(highlights),
+                    os.path.basename(video_path),
+                )
                 return highlights
             _log.info("Valorant 混合视觉检测无结果，回退到场景检测")
         except ModelContractError as exc:
@@ -2260,9 +1663,11 @@ def _analyze_scene_or_rounds(
         except Exception as exc:
             _log.warning("Valorant 混合视觉检测失败，回退到场景检测: %s", exc)
 
-    return _run_scene_analysis(
-        video_path, threshold=threshold,
-        progress_callback=progress_callback, cancel_check=cancel_check,
+    return get_analyzer("generic").analyze_file(
+        video_path,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        options={"threshold": threshold},
     )
 
 
@@ -6179,23 +5584,35 @@ def register_room_handlers(server, bridge):
                         return bool(st.get('cancelled') or st.get('scan_abort'))
 
                 def _do_scan(_vp=_vp, _dur=current_dur, _ocr=refine_with_ocr, _range=scan_range, _mode=mode):
+                    from lsc.analyzer.base import ScanWindow
+                    from lsc.analyzer.registry import get as get_analyzer
                     from lsc.config import load_config as _load_cfg_r
                     _cfg = _load_cfg_r()
                     _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
                     _cancel = _scan_cancel_check
+                    plugin = get_analyzer(game)
                     if game == 'valorant' and _mode == 'valorant_round':
-                        from lsc.analyzer.round_detector import detect_valorant_rounds_hybrid
                         from lsc.analyzer.valorant_frame_classifier import ModelContractError
-
+                        # Production path: detect_valorant_rounds_hybrid via plugin.scan_window
                         try:
-                            return detect_valorant_rounds_hybrid(
-                                _vp,
-                                ffmpeg_path=_ffmpeg,
-                                time_range=_range,
-                                model_dir=_resolve_valorant_model_dir(),
-                                cancel_check=_cancel,
-                                session_id=str(task_state.get('session_id', '') or ''),
-                                runtime_state=task_state.setdefault('hybrid_runtime_state', {}),
+                            _window = ScanWindow(
+                                start_sec=float(_range[0]),
+                                end_sec=float(_range[1]),
+                                timeout_sec=float(scan_timeout),
+                                use_ocr=bool(_ocr),
+                            )
+                            _scan_state = {
+                                'mode': _mode,
+                                'game': game,
+                                'ffmpeg_path': _ffmpeg,
+                                'model_dir': _resolve_valorant_model_dir(),
+                                'session_id': str(task_state.get('session_id', '') or ''),
+                                'runtime_state': task_state.setdefault('hybrid_runtime_state', {}),
+                                'classifier': task_state.get('classifier'),
+                                'current_dur': _dur,
+                            }
+                            return plugin.scan_window(
+                                _vp, _window, _scan_state, cancel_check=_cancel,
                             )
                         except ModelContractError as exc:
                             raise RuntimeError(f"ModelContractError: {exc}") from exc
@@ -7004,13 +6421,33 @@ def register_room_handlers(server, bridge):
                         _rp = state.get('round_phase') if _valorant_incremental_rounds else None
                         _vp = state.get('valorant_profile') if _valorant_incremental_rounds else None
                         _ps = state.get('pending_start') if _valorant_incremental_rounds else None
-                        scan_range, use_ocr_this_tick, _scan_timeout, full_rescan = _continuous_valorant_scan_budget(
-                            mode, last_analyzed, current_dur, pressure, _scan_counter,
-                            round_phase=_rp,
-                            valorant_profile=_vp,
-                            pending_start=_ps,
-                            prediction=_pred,
-                        )
+                        from lsc.analyzer.registry import get as get_analyzer
+                        _analyzer = get_analyzer(game)
+                        if _analyzer.capabilities().realtime_continuous:
+                            _plan_state = {
+                                'mode': mode,
+                                'last_analyzed': last_analyzed,
+                                'tick_count': _scan_counter,
+                                'round_phase': _rp,
+                                'valorant_profile': _vp,
+                                'pending_start': _ps,
+                                'prediction': _pred,
+                            }
+                            _window = _analyzer.plan_scan_window(
+                                _plan_state, current_dur, pressure or {},
+                            )
+                            scan_range = (_window.start_sec, _window.end_sec)
+                            use_ocr_this_tick = bool(_window.use_ocr)
+                            _scan_timeout = int(_window.timeout_sec)
+                            full_rescan = bool(_plan_state.get('full_rescan', last_analyzed <= 0.0))
+                        else:
+                            scan_range, use_ocr_this_tick, _scan_timeout, full_rescan = _continuous_valorant_scan_budget(
+                                mode, last_analyzed, current_dur, pressure, _scan_counter,
+                                round_phase=_rp,
+                                valorant_profile=_vp,
+                                pending_start=_ps,
+                                prediction=_pred,
+                            )
                         # 停录收尾：从游标继续处理尾部（保留重叠），禁止默认全文件重扫
                         if _finalize_started or _finalize_pending:
                             scan_range = (

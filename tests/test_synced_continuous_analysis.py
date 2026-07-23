@@ -22,9 +22,15 @@ def _start_analysis_export_handler_source() -> str:
     return source[start:end]
 
 
+class _FakeBus:
+    def subscribe(self, *_args, **_kwargs) -> None:
+        return None
+
+
 class _FakeManager:
     def __init__(self, rooms):
         self._rooms = {room.room_id: room for room in rooms}
+        self.bus = _FakeBus()
         self.room_connect_finished = _FakeSignal()
         self.batch_record_progress = _FakeSignal()
         self.batch_record_finished = _FakeSignal()

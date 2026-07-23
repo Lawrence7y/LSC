@@ -40,6 +40,10 @@ def _ensure_builtins() -> None:
     with _lock:
         if _default_game not in _plugins:
             register(GenericAnalyzerPlugin())
+        if "valorant" not in _plugins:
+            from lsc.analyzer.valorant_plugin import ValorantAnalyzerPlugin
+
+            register(ValorantAnalyzerPlugin())
 
 
 _ensure_builtins()

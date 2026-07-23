@@ -26,10 +26,20 @@ class GenericAnalyzerPlugin:
         cancel_check=None,
         options: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]] | None:
-        # B1: 占位返回 []；B2 迁入 _run_scene_analysis
         if cancel_check and cancel_check():
             return None
-        return []
+        from lsc.analyzer.scene_analysis import run_scene_analysis
+
+        opts = options or {}
+        return run_scene_analysis(
+            video_path,
+            threshold=float(opts.get("threshold", 0.3)),
+            min_duration=float(opts.get("min_duration", 3.0)),
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            time_range=opts.get("time_range"),
+            enable_ocr=bool(opts.get("enable_ocr", True)),
+        )
 
     def plan_scan_window(
         self,
@@ -54,6 +64,6 @@ class GenericAnalyzerPlugin:
         *,
         cancel_check=None,
     ) -> list[dict[str, Any]]:
-        # B1 占位；B2 接音频节奏 / scene 增量
+        # Continuous scene still uses handler audio-rhythm path until explicitly migrated.
         state["last_analyzed"] = window.end_sec
         return []

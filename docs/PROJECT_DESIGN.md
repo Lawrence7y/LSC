@@ -930,6 +930,19 @@ Toast：`已精确对齐 N 个直播间（置信度 X%），已静音 M 个快�
 
 ## 第十二部分：高光分析功能设计
 
+### 12.0 AnalyzerRegistry 插件架构
+
+分析能力经 `lsc.analyzer.registry`（`get` / `get_analyzer`）按 `game` 分发：
+
+| 插件 | `game` | 职责 |
+|------|--------|------|
+| `GenericAnalyzerPlugin` | `generic` | one-shot 场景检测（`scene_analysis.run_scene_analysis`） |
+| `ValorantAnalyzerPlugin` | `valorant` | hybrid 回合检测 + 持续扫描预算/`scan_window` |
+
+`room_handler` 只保留编排：线程与 `_analysis_semaphore`、压力门控、取消、广播 payload、多房间映射、相位 FSM tick。游戏检测分支经插件调用，底层 `round_detector.py` 等**不物理搬家**。
+
+持续分析仍为**录制文件 pull 扫描**（边录边增量读磁盘文件），不是预览流实时推理。
+
 ### 12.1 按钮位置
 
 **位置**：`lsc-electron/src/pages/Workbench/index.tsx:1071-1079`
@@ -941,17 +954,21 @@ onClick={() => send('start_analysis', { room_id: selectedRoomId, threshold: 0.3 
 
 ### 12.2 后端处理
 
-**位置**：`python-backend/handlers/room_handler.py:89-171` `_run_scene_analysis`
+**位置**：
+
+- one-shot：`room_handler._analyze_scene_or_rounds` → `get_analyzer(game).analyze_file`
+- scene 实现：`lsc/analyzer/scene_analysis.py` `run_scene_analysis`
+- Valorant：`detect_valorant_rounds_hybrid`（经 `ValorantAnalyzerPlugin`）
 
 ```bash
 ffmpeg -i video.mp4 -vf "select='gt(scene\,0.3)',showinfo" -vsync vfr -f null -
 ```
 
 解析 stderr 中 `pts_time:数字` 提取场景切换时间戳：
-- 按时间间隔 >15s 切分为多段高光
+- 按时间间隔动态切分为多段高光
 - 前后各加 2s/5s padding
 - 过滤 duration < 3s
-- 去重重叠
+- 去重重叠；无场景点时回退音频能量 / 可选 OCR
 
 ### 12.3 结果展示
 
