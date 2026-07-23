@@ -27,11 +27,13 @@ def test_draft_result_fields():
 
 
 from lsc.exporter.jianying_draft import (
-    compute_draft_origin,
-    map_recording_timeranges,
-    map_clip_timeranges,
-    sanitize_draft_token,
+    clip_allowed_for_draft,
     clip_source_usable,
+    compute_draft_origin,
+    map_clip_timeranges,
+    map_recording_timeranges,
+    resolve_common_range,
+    sanitize_draft_token,
 )
 
 
@@ -83,6 +85,20 @@ def test_clip_source_usable_rejects_approx_pending():
     assert clip_source_usable(precision="exact", confirm_status="pending") is False
     assert clip_source_usable(precision="exact", confirm_status="refining") is False
     assert clip_source_usable(precision="exact", confirm_status=None) is True
+
+
+def test_clip_allowed_for_draft_matches_export_policy():
+    assert clip_allowed_for_draft({"confirm_status": "refining"}) is False
+    assert clip_allowed_for_draft({"mark_precision": "approximate"}) is False
+    assert clip_allowed_for_draft({"confirm_status": "ocr_confirmed"}) is True
+
+
+def test_resolve_common_range_exact_fields():
+    assert resolve_common_range({"common_start": 0.5, "common_end": 3.0}, None) == (
+        0.5,
+        3.0,
+        "exact",
+    )
 
 
 import json

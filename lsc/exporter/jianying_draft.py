@@ -99,6 +99,37 @@ def clip_source_usable(*, precision: str, confirm_status: str | None) -> bool:
     return True
 
 
+def clip_allowed_for_draft(clip: dict) -> bool:
+    """WS/前端切片 dict 是否允许进入草稿（与导出口径一致）。"""
+    status = clip.get("confirm_status")
+    if status in ("pending", "refining"):
+        return False
+    if clip.get("mark_precision") == "approximate":
+        return False
+    return True
+
+
+def resolve_common_range(clip: dict, ctx) -> tuple[float, float, str] | None:
+    """返回 (common_start, common_end, precision) 或 None（无法映射）。"""
+    cs = clip.get("common_start")
+    ce = clip.get("common_end")
+    if cs is not None and ce is not None:
+        return float(cs), float(ce), "exact"
+    mark_in = clip.get("mark_in_wallclock")
+    mark_out = clip.get("mark_out_wallclock")
+    media_starts: list[float] = []
+    if ctx is not None:
+        media_starts = [
+            float(s.media_start_mono)
+            for s in ctx.room_snapshots.values()
+            if s.media_start_mono
+        ]
+    if mark_in is not None and mark_out is not None and media_starts:
+        origin = min(media_starts)
+        return float(mark_in) - origin, float(mark_out) - origin, "exact"
+    return None
+
+
 def seconds_trange(start_sec: float, dur_sec: float):
     """构造 pyJianYingDraft Timerange（秒 → 带单位字符串，避免微秒陷阱）。"""
     from pyJianYingDraft import trange
