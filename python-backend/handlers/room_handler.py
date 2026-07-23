@@ -7080,4 +7080,12 @@ def register_room_handlers(server, bridge):
     # ── TimelineContext 集成（已抽离至 handlers.timeline_handlers）──
     register_timeline_handlers(server, bridge=bridge, manager=manager, queue_export=queue_export)
 
+    from handlers.jianying_handlers import register_jianying_handlers
+    register_jianying_handlers(
+        server,
+        bridge=bridge,
+        manager=manager,
+        load_settings=load_settings,
+    )
+
     # 新客户端连接时由 on_connect 推送当前内存房间（不再从磁盘恢复）
