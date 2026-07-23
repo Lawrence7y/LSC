@@ -15,5 +15,8 @@ numpy>=1.24,<3
 # System resource monitoring (CPU, memory, disk)
 psutil>=5.9,<7
 
+# 剪映草稿生成（仅生成草稿，不做自动导出）
+pyJianYingDraft==0.3.0
+
 # Test dependencies (uncomment if running the test suite)
 # pytest>=7.4,<9
