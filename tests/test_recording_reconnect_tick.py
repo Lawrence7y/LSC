@@ -50,6 +50,7 @@ def test_global_tick_runs_due_recording_reconnect(monkeypatch, tmp_path) -> None
             return True, str(tmp_path / "new.mp4"), encoder, ""
 
     monkeypatch.setattr("threading.Thread", ImmediateThread)
+    monkeypatch.setattr("lsc.gui.multi_room.manager.MultiRoomManager.save_rooms", lambda self: 0)
 
     manager = MultiRoomManager(controller_factory=FakeController)
     room = manager.add_room("https://example.com/live.m3u8")
