@@ -158,7 +158,11 @@ def test_approximate_export_requires_modal_confirm() -> None:
 
     assert "近似定位切片" in source
     assert "仍要导出" in source
-    confirm_body = source.split("const handleConfirmExport = () => {", 1)[1].split(
+    # handleConfirmExport 可能为 sync 或 async（剪映草稿导出后改为 async）
+    marker = "const handleConfirmExport = async () => {"
+    if marker not in source:
+        marker = "const handleConfirmExport = () => {"
+    confirm_body = source.split(marker, 1)[1].split(
         "const handleCancelExportModal", 1
     )[0]
     assert "Modal.confirm" in confirm_body
