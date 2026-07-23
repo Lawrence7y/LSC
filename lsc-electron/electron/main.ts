@@ -552,6 +552,29 @@ function createTray(): void {
 
 // ===== 窗口 =====
 
+function _readJianyingDraftDirFromSettings(): string | null {
+  try {
+    const candidates = [
+      path.join(process.cwd(), 'settings.json'),
+      path.join(app.getPath('userData'), 'settings.json'),
+    ]
+    for (const fp of candidates) {
+      if (!fs.existsSync(fp)) continue
+      const raw = JSON.parse(fs.readFileSync(fp, 'utf-8'))
+      const dir = (raw.jianying_draft_dir || '').trim()
+      if (dir) return path.resolve(dir)
+    }
+    const local = process.env.LOCALAPPDATA
+    if (local) {
+      const auto = path.join(local, 'JianyingPro', 'User Data', 'Projects', 'com.lveditor.draft')
+      if (fs.existsSync(auto)) return path.resolve(auto)
+    }
+  } catch (e) {
+    appLog('WARN', 'SafePath', `read jianying draft dir failed: ${e}`)
+  }
+  return null
+}
+
 // 判断 openPath 目标是否安全：必须在允许目录内且扩展名不在可执行文件黑名单
 function _isSafePath(p: string): boolean {
   if (!p || typeof p !== 'string') {
@@ -562,10 +585,13 @@ function _isSafePath(p: string): boolean {
   const allowedRoots = [
     app.getPath('userData'),
     path.join(app.getPath('home'), 'LSC'),
-  ].map((dir) => path.resolve(dir) + path.sep)
+  ]
+  const jy = _readJianyingDraftDirFromSettings()
+  if (jy) allowedRoots.push(jy)
+  const allowedRootsNorm = allowedRoots.map((dir) => path.resolve(dir) + path.sep)
   // Windows 路径大小写不敏感，比较时统一小写；POSIX 保持原样
   const norm = (s: string) => (process.platform === 'win32' ? s.toLowerCase() : s)
-  const isAllowed = allowedRoots.some((root) => norm(resolved + path.sep).startsWith(norm(root)))
+  const isAllowed = allowedRootsNorm.some((root) => norm(resolved + path.sep).startsWith(norm(root)))
   if (!isAllowed) {
     return false
   }

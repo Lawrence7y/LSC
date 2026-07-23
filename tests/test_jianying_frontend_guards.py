@@ -36,13 +36,11 @@ def test_handle_export_many_draft_path_single_generate():
     assert "exportTarget === 'draft'" in text or 'exportTarget === "draft"' in text
 
 
-@pytest.mark.skip(reason="J3 Task 5: settings page jianying_draft_dir row not yet implemented")
 def test_settings_jianying_draft_dir_row():
     text = SETTINGS.read_text(encoding="utf-8")
     assert "jianying_draft_dir" in text or "剪映草稿" in text
 
 
-@pytest.mark.skip(reason="J3 Task 6: _isSafePath jianying whitelist not yet implemented")
 def test_issafe_path_mentions_jianying():
     text = MAIN.read_text(encoding="utf-8")
     assert "jianying" in text.lower() or "Jianying" in text

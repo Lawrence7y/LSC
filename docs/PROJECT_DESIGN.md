@@ -719,6 +719,16 @@ crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920
 2. 每个房间用各自的 `content_offset` 调整 `-ss`
 3. 所有房间并行提交，受 `_DEFAULT_MAX_CONCURRENT = 2` 限制排队
 
+### 8.7 剪映草稿导出
+
+一场直播可生成一个剪映专业版草稿（`pyJianYingDraft`）：每房录制轨 + 每房切片轨 + 可选回合文本轨，时间轴为公共对齐轴。
+
+- 模块：`lsc/exporter/jianying_draft.py`
+- WS：`generate_jianying_draft` / `get_jianying_draft_dir`
+- 导出目标三选一：MP4 / 草稿 / 两者（默认 MP4）
+- 不做剪映 UI 自动导出；用户在剪映内手动导出成片
+- 详见 `docs/spec-jianying-draft-export.md`
+
 ---
 
 ## 第九部分：错误友好化系统
