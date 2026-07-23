@@ -62,3 +62,9 @@ def test_call_rejects_when_pending_full(orch):
     release.set()
     for t in threads:
         t.join(5)
+
+
+def test_is_stream_offline_error():
+    from lsc.core.orchestrator import _is_stream_offline_error
+    assert _is_stream_offline_error("直播间已结束")
+    assert not _is_stream_offline_error("connection reset")
