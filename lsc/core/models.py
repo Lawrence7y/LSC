@@ -235,3 +235,29 @@ class ExportResult:
     duration_sec: float = 0.0  # 导出片段的时长（秒）
     file_size_mb: float = 0.0  # 输出文件大小（MB）
     error: str = ""  # 错误信息（失败时有效）
+
+
+@dataclass(slots=True)
+class JianyingDraftOptions:
+    """剪映草稿生成选项。"""
+
+    include_recordings: bool = True
+    include_clips: bool = True
+    text_labels: bool = True
+    vertical: bool = False
+    draft_name: str = ""
+    non_main_volume_zero: bool = False  # 预留，v1 不暴露 UI
+
+
+@dataclass(slots=True)
+class JianyingDraftResult:
+    """剪映草稿生成结果。"""
+
+    success: bool
+    draft_name: str = ""
+    draft_dir: str = ""
+    tracks: int = 0
+    segments: int = 0
+    warnings: list[str] = field(default_factory=list)
+    error: str = ""
+    error_code: str = ""
