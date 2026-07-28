@@ -133,10 +133,16 @@ socket.ts
 ws-relay.js
 ws-server.js
 
-# Debug dump/log/profiling throwaway artifacts
+# Debug dump/log/profiling throwaway artifacts（根目录 _ 开头临时文件通配）
+_*
+!__init__.py
+!__main__.py
+!__version__.py
+!_*.md
 _dump_*.txt
 _dump_*.py
 _log_now.txt
+_log_part*.txt
 *.pstats
 
 # Brainstorm visual companion sessions
