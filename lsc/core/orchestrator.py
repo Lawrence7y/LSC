@@ -488,7 +488,7 @@ class _MetadataProbeJob:
 class _BatchRecordJob:
     """Background job for parallel batch recording start."""
 
-    def __init__(self, orchestrator: "RoomOrchestrator", room_ids: list[str],
+    def __init__(self, orchestrator: RoomOrchestrator, room_ids: list[str],
                  output_dir: str, encoder: str, crf: int,
                  param_mode: str = "CRF 质量", bitrate: str | None = None,
                  bitrate_unit: str = "kbps"):
@@ -2690,13 +2690,13 @@ class RoomOrchestrator:
                             if stall_msg:
                                 _log.warning("Room %s shared ingest stall: %s", room.room_id, stall_msg)
                                 self._start_recording_reconnect_thread(room, stall_msg)
-                    if room.is_reconnecting:
-                        if (room.reconnect_next_attempt_at > 0
-                                and _time.monotonic() >= room.reconnect_next_attempt_at):
-                            self._start_recording_reconnect_thread(
-                                room,
-                                room.last_error or "录制恢复到期",
-                            )
+                    if (room.is_reconnecting
+                            and room.reconnect_next_attempt_at > 0
+                            and _time.monotonic() >= room.reconnect_next_attempt_at):
+                        self._start_recording_reconnect_thread(
+                            room,
+                            room.last_error or "录制恢复到期",
+                        )
                 continue
 
             # ── High-frequency: lightweight operations ──
@@ -2750,13 +2750,13 @@ class RoomOrchestrator:
                         self._start_recording_reconnect_thread(room, error_msg)
 
             # 重连到期必须每 tick 检查，不得被交错轮询推迟
-            if room.is_recording and room.is_reconnecting:
-                if (room.reconnect_next_attempt_at > 0
-                        and _time.monotonic() >= room.reconnect_next_attempt_at):
-                    self._start_recording_reconnect_thread(
-                        room,
-                        room.last_error or "录制恢复到期",
-                    )
+            if (room.is_recording and room.is_reconnecting
+                    and room.reconnect_next_attempt_at > 0
+                    and _time.monotonic() >= room.reconnect_next_attempt_at):
+                self._start_recording_reconnect_thread(
+                    room,
+                    room.last_error or "录制恢复到期",
+                )
 
             # ── Low-frequency (~12s): disk space check ──
             if is_low_tick and room.is_recording:
@@ -2780,7 +2780,7 @@ class RoomOrchestrator:
                             room.last_error = disk_msg
                             self._dirty_recording = True
                             try:
-                                self.bus.emit("recording_stopped", 
+                                self.bus.emit("recording_stopped",
                                     room.room_id, 'disk_full', disk_msg,
                                 )
                             except Exception as exc:

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -42,16 +41,16 @@ from persistence import (
 )
 
 from lsc.config import ExportProfile, load_config
+from lsc.core.orchestrator import RoomOrchestrator, _is_stream_offline_error
 from lsc.core.services.ingest_registry import PreviewStreamRegistry, get_shared_ingest_registry
 from lsc.core.services.resource_monitor import collect_system_stats, get_resource_pressure
 from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
     get_timeline_service,
 )
-from lsc.core.orchestrator import RoomOrchestrator, _is_stream_offline_error
 from lsc.platforms.registry import select_quality
 from lsc.utils.error_messages import humanize_error
-from lsc.utils.process_launcher import prepare_launch, run_hidden, set_stream_nonblocking
+from lsc.utils.process_launcher import run_hidden
 
 _log = logging.getLogger('lsc.handlers')
 
@@ -95,7 +94,7 @@ _MAX_RECORDING_HISTORY = 500
 
 recording_history: list[dict[str, Any]] = _load_recording_history()
 # 保护 recording_history 的锁：start_handler（asyncio 线程）与 stop_handler
-# （Qt 线程 via bridge.call）并发读写，无锁可丢记录或损坏列表（#17）
+# （编排线程 via orchestrator.call）并发读写，无锁可丢记录或损坏列表（#17）
 _recording_history_lock = threading.Lock()
 
 # ── 切片命名工具（与前端 clipNaming.ts 保持同步）──
@@ -693,7 +692,7 @@ def _invalidate_room_timeline(room_id: str, reason: str = "") -> None:
 
 # 专用线程池：录制操作（HTTP 刷新 + FFmpeg 启动）可阻塞 30s+，独立线程池避免饿死快操作
 _recording_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix='rec')
-# 快操作线程池：disconnect/mute/seek 等 bridge.call 操作，预期 <1s 完成
+# 快操作线程池：disconnect/mute/seek 等 orchestrator.call 操作，预期 <1s 完成
 _bridge_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix='bridge')
 # AI 分析专用线程池：CPU/GPU 密集型，独立线程池避免与录制/导出竞争
 _ai_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ai')
@@ -1720,13 +1719,34 @@ def _expand_user_path(path: str) -> str:
 
 
 def _is_allowed_output_dir(path: str) -> bool:
-    real = os.path.realpath(os.path.expanduser(path))
-    home = os.path.realpath(os.path.expanduser("~"))
-    allowed_roots = [
-        home,
-        os.path.join(home, "LSC"),
+    """导出目录合法性：拒绝系统关键路径，允许用户数据目录（含非系统盘）。
+
+    历史策略「仅允许 home」会误伤 D 盘等合法导出目录；且 save_settings 被
+    所有设置操作共用（如画质切换），历史 output_dir 一旦被判非法会阻塞
+    一切设置保存。改为黑名单：仅拒绝操作系统关键目录。
+    """
+    if not isinstance(path, str) or not path.strip():
+        return False
+    stripped = path.strip()
+    # POSIX 系统路径须在 realpath 前判断：Windows 会把 /etc 解析到当前盘符下
+    posix_like = stripped.replace("\\", "/")
+    for root in ("/etc", "/boot", "/sys", "/proc", "/dev", "/sbin", "/bin", "/usr"):
+        if posix_like == root or posix_like.startswith(root + "/"):
+            return False
+    try:
+        real = os.path.normcase(os.path.realpath(os.path.expanduser(stripped)))
+    except (OSError, ValueError):
+        return False
+    system_roots = [
+        os.environ.get("SYSTEMROOT", r"C:\Windows"),
+        os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+        os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
     ]
-    return any(real == root or real.startswith(root + os.sep) for root in allowed_roots)
+    for root in system_roots:
+        root_norm = os.path.normcase(os.path.realpath(root))
+        if real == root_norm or real.startswith(root_norm + os.sep):
+            return False
+    return True
 
 
 def _parse_fps(framerate: str) -> float:
@@ -2500,7 +2520,7 @@ def register_room_handlers(server, bridge):
     _ws_loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {'loop': None}
 
     def _queue_rooms_update(*_args, **_kwargs):
-        """Qt 主线程槽：走 _broadcast_rooms 节流/coalesce，避免高频 tick 绕过 300ms 合并。"""
+        """编排线程 tick 回调：走 _broadcast_rooms 节流/coalesce，避免高频 tick 绕过 300ms 合并。"""
         loop = _ws_loop_holder.get('loop')
         if loop is not None and not loop.is_closed():
             try:
@@ -2903,7 +2923,7 @@ def register_room_handlers(server, bridge):
             _log.warning("软断房判断失败，回退全组失效: room_id=%s, error=%s", room_id, exc)
             _invalidate_room_timeline(room_id, reason=f"room_disconnected_fallback:{room_id}")
 
-        bridge.submit(manager.disconnect_room, room_id)
+        manager.submit(manager.disconnect_room, room_id)
         _broadcast_rooms(force=True)
         _log.info("断开连接指令已提交: room_id=%s", room_id)
         return {'success': True}
@@ -2917,7 +2937,7 @@ def register_room_handlers(server, bridge):
             return {'error': 'room_id is required'}
         _log.debug("设置静音: room_id=%s, muted=%s", room_id, muted)
 
-        # 必须等 Qt 写完 preview_muted 再广播，否则会用旧值覆盖前端乐观更新
+        # 必须等编排线程写完 preview_muted 再广播，否则会用旧值覆盖前端乐观更新
         try:
             await asyncio.get_running_loop().run_in_executor(
                 _bridge_executor,
@@ -3012,11 +3032,11 @@ def register_room_handlers(server, bridge):
         audio_bitrate = settings.get('audio_bitrate', '128k')
 
         def _start():
-            # 注意：不通过 bridge.call 切回 Qt 主线程，而是在 executor 线程中
+            # 注意：不通过 orchestrator.call 切回编排线程，而是在 executor 线程中
             # 直接调用 manager.start_recording。这与 _BatchRecordWorker 的模式
-            # 一致（manager 仅做属性读写 + subprocess 启动，不依赖 Qt 事件循环），
+            # 一致（manager 仅做属性读写 + subprocess 启动，无需编排线程串行化），
             # 避免刷新流 URL（HTTP 请求最长 36s）和 FFmpeg 首帧探测（最长 5s）
-            # 阻塞 Qt 主线程导致预览/心跳冻结。项目记忆硬约束：
+            # 阻塞编排线程导致预览/心跳冻结。项目记忆硬约束：
             # "Recording start/preview reconnect operations must be executed in
             #  background threads to prevent main thread blocking"。
             return manager.start_recording(
@@ -3391,10 +3411,9 @@ def register_room_handlers(server, bridge):
         if not _is_allowed_output_dir(data.get('output_dir', '')):
             _log.warning("save_settings 校验失败: output_dir 不在允许范围内")
             return {'success': False, 'error': '导出目录不在允许范围内'}
-        if 'jianying_draft_dir' in data and data.get('jianying_draft_dir') is not None:
-            if not isinstance(data.get('jianying_draft_dir'), str):
-                _log.warning("save_settings 校验失败: jianying_draft_dir 不是字符串")
-                return {'success': False, 'error': 'jianying_draft_dir 必须是字符串'}
+        if data.get('jianying_draft_dir') is not None and not isinstance(data.get('jianying_draft_dir'), str):
+            _log.warning("save_settings 校验失败: jianying_draft_dir 不是字符串")
+            return {'success': False, 'error': 'jianying_draft_dir 必须是字符串'}
         try:
             save_settings(data)
         except ValueError as exc:
@@ -4143,7 +4162,7 @@ def register_room_handlers(server, bridge):
                     _mse_starting.add(room_id)
 
             try:
-                # 先在后台线程刷新流 URL，避免阻塞 Qt 主线程（B站等平台耗时 10+ 秒）
+                # 先在后台线程刷新流 URL，避免阻塞编排线程（B站等平台耗时 10+ 秒）
                 # force=False：连接后 120s 内复用房间流缓存，显著加快预览启动
                 await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'refreshing_url'})
                 refresh_ok = await asyncio.get_running_loop().run_in_executor(
@@ -4172,7 +4191,7 @@ def register_room_handlers(server, bridge):
                         _bridge_executor, lambda: bridge.manager.call(_mark_disconnected_if_no_stream)
                     )
 
-                # 在 Qt 主线程读取刷新后的房间状态
+                # 在编排线程读取刷新后的房间状态
                 def _read_snapshot():
                     room = mgr.get_room(room_id)
                     if room is None:
@@ -4608,7 +4627,7 @@ def register_room_handlers(server, bridge):
                     await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'error'})
                     return {'success': False, 'room_id': room_id, 'error': error_msg}
 
-                # 启动成功：通过 bridge.call 在 Qt 主线程更新 preview_enabled
+                # 启动成功：通过 orchestrator.call 在编排线程更新 preview_enabled
                 # 若此处抛异常，streamer 已在 _mse_streamers 中但前端不知需要 stop，
                 # 需主动清理避免进程泄漏
                 def _set_preview_enabled():
@@ -4627,7 +4646,7 @@ def register_room_handlers(server, bridge):
                         _bridge_executor, lambda: bridge.manager.call(_set_preview_enabled)
                     )
                 except Exception as exc:
-                    # bridge.call 失败：清理已注册的 streamer，避免进程泄漏
+                    # orchestrator.call 失败：清理已注册的 streamer，避免进程泄漏
                     _log.error("MSE preview_enabled 设置失败，清理 streamer: %s", exc)
                     leak_streamer = _preview_stream_registry().pop(room_id)
                     if leak_streamer is not None:
@@ -5333,7 +5352,7 @@ def register_room_handlers(server, bridge):
         )
 
     async def _process_export_job(job):
-        """处理单个导出任务 — bridge.call 提交到 Qt 主线程，等待 FFmpeg 完成后才返回。
+        """处理单个导出任务 — orchestrator.call 提交到编排线程，等待 FFmpeg 完成后才返回。
 
         done_event 在两种情况下被 set：
         1. manager.start_export 启动失败（无 clip_id）→ 立即 set，不启动 FFmpeg
@@ -5353,7 +5372,7 @@ def register_room_handlers(server, bridge):
         result = {'success': False, 'clip_id': '', 'error': ''}
 
         def on_done(success, output_path, error, size_mb, thumbnail_path):
-            """FFmpeg 导出完成的回调（Qt 主线程）。"""
+            """FFmpeg 导出完成的回调（编排线程）。"""
             with _export_jobs_lock:
                 export_jobs.pop(job_id, None)
             if success:
@@ -5377,7 +5396,7 @@ def register_room_handlers(server, bridge):
             }), loop)
 
         def _run_export():
-            """在 Qt 主线程提交导出（通过 bridge.call 调用）。"""
+            """在编排线程提交导出（通过 orchestrator.call 调用）。"""
             try:
                 clip_id = manager.start_export(
                     room_id, export_start, export_end,
@@ -5393,7 +5412,7 @@ def register_room_handlers(server, bridge):
                     loop.call_soon_threadsafe(done_event.set)
                 else:
                     result['success'] = True
-                    # 在 Qt 线程内立即注册，缩小 cancel 窗口期
+                    # 在编排线程内立即注册，缩小 cancel 窗口期
                     with _export_jobs_lock:
                         export_jobs[job_id] = clip_id
                     # 成功启动：等待 on_done 回调中 set event

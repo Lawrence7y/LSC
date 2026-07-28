@@ -99,9 +99,7 @@ def clip_source_usable(
 ) -> bool:
     if precision == "approximate":
         return False
-    if confirm_status in ("pending", "refining") and not include_pending:
-        return False
-    return True
+    return not (confirm_status in ("pending", "refining") and not include_pending)
 
 
 def clip_allowed_for_draft(clip: dict, *, include_pending: bool = False) -> bool:
@@ -109,9 +107,7 @@ def clip_allowed_for_draft(clip: dict, *, include_pending: bool = False) -> bool
     status = clip.get("confirm_status")
     if status in ("pending", "refining") and not include_pending:
         return False
-    if clip.get("mark_precision") == "approximate":
-        return False
-    return True
+    return clip.get("mark_precision") != "approximate"
 
 
 def resolve_common_range(clip: dict, ctx) -> tuple[float, float, str] | None:
@@ -120,6 +116,22 @@ def resolve_common_range(clip: dict, ctx) -> tuple[float, float, str] | None:
     ce = clip.get("common_end")
     if cs is not None and ce is not None:
         return float(cs), float(ce), "exact"
+    # H8 回退：切片 recording 本地时间 + 该房 timeline 快照 delta 换算公共轴。
+    # AI 切片在 clip_queued 时若公共轴未就绪会缺 common 坐标，此处补救。
+    if ctx is not None:
+        room_id = clip.get("room_id")
+        snapshots = getattr(ctx, "room_snapshots", None) or {}
+        snap = snapshots.get(room_id) if room_id else None
+        if snap is not None:
+            try:
+                s = float(clip.get("start"))
+                e = float(clip.get("end"))
+                delta = float(snap.recording_to_common_delta)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if e > s:
+                    return s + delta, e + delta, "exact"
     mark_in = clip.get("mark_in_wallclock")
     mark_out = clip.get("mark_out_wallclock")
     media_starts: list[float] = []
@@ -132,6 +144,16 @@ def resolve_common_range(clip: dict, ctx) -> tuple[float, float, str] | None:
     if mark_in is not None and mark_out is not None and media_starts:
         origin = min(media_starts)
         return float(mark_in) - origin, float(mark_out) - origin, "exact"
+    if ctx is None:
+        # 单房降级兜底：无 timeline ctx 时该房 delta=0，recording 时间即公共坐标。
+        # 多房未对齐已被 handler 前置拦截（allow_single_fallback=False）；
+        # 单房场景房间从不对齐，clip_queued 也不会写 common 坐标，必须在此恒等映射。
+        try:
+            s = float(clip.get("start"))
+            e = float(clip.get("end"))
+        except (TypeError, ValueError):
+            return None
+        return (s, e, "exact") if e > s else None
     return None
 
 
@@ -230,10 +252,11 @@ def build_session_draft(
 
     usable: list[RoomDraftSource] = []
     for room in rooms:
-        if options.include_recordings or options.include_clips:
-            if not room.record_output_path or not os.path.isfile(room.record_output_path):
-                warnings.append(f"房间 {room.name} 无录制文件，已跳过")
-                continue
+        if (options.include_recordings or options.include_clips) and (
+            not room.record_output_path or not os.path.isfile(room.record_output_path)
+        ):
+            warnings.append(f"房间 {room.name} 无录制文件，已跳过")
+            continue
         usable.append(room)
     if not usable:
         return JianyingDraftResult(
