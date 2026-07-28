@@ -26,7 +26,7 @@ from lsc.core.events import EventBus
 from lsc.core.services.ingest_registry import get_shared_ingest_registry
 from lsc.core.services.recording_service import RecordingService
 from lsc.core.services.timeline_service import get_timeline_service
-from lsc.gui.multi_room.session import RoomSession
+from lsc.core.session import RoomSession
 from lsc.platforms.base import StreamInfo
 from lsc.platforms.registry import parse_stream, select_quality
 
