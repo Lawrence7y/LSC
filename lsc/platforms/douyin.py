@@ -320,9 +320,9 @@ class DouyinAdapter(BasePlatformAdapter):
             _log.debug("获取抖音Cookie失败: %s", exc)
             return {}
 
-    def _failed(self, url: str, error: str, code: str, raw: dict | None = None) -> StreamInfo:
+    def _failed(self, url: str, error: str, error_code: str = "parse_failed", *, raw: dict[str, Any] | None = None) -> StreamInfo:
         """Failed result always carries Douyin request headers."""
-        return super()._failed(url, error, code, headers=dict(DOUYIN_HEADERS), raw=raw)
+        return super()._failed(url, error, error_code, headers=dict(DOUYIN_HEADERS), raw=raw)
 
     def _load_script_module(self) -> ModuleType:
         if self._cached_module is not None:

@@ -73,7 +73,7 @@ disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 follow_imports = "silent"
-files = ["lsc/core", "lsc/config.py"]
+files = ["lsc"]
 exclude = [
     "tests/",
     "docs/",
@@ -81,7 +81,11 @@ exclude = [
     ".mimocode/",
     "lsc-electron/",
     "scripts/",
+    "lsc/gui/",  # PySide6 dead code, excluded from type checking
 ]
+# python-backend 含连字符，非合法 Python 包名，mypy 无法直接检查
+# 通过 MYPYPATH 环境变量或 namespace_packages 配置可后续接入
+namespace_packages = true
 
 [[tool.mypy.overrides]]
 module = "PySide6.*"

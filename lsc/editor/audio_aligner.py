@@ -142,9 +142,9 @@ def _parabolic_interpolation(correlation: np.ndarray, peak: int) -> float:
     """在相关性峰值两侧做抛物线拟合，返回亚样本精度的峰值位置。"""
     if peak <= 0 or peak >= len(correlation) - 1:
         return float(peak)
-    y_prev = correlation[peak - 1]
-    y_peak = correlation[peak]
-    y_next = correlation[peak + 1]
+    y_prev = float(correlation[peak - 1])
+    y_peak = float(correlation[peak])
+    y_next = float(correlation[peak + 1])
     denom = y_prev - 2.0 * y_peak + y_next
     if abs(denom) < 1e-10:
         return float(peak)
@@ -158,7 +158,7 @@ def _normalize_signal(audio: np.ndarray) -> np.ndarray:
     std = float(np.std(signal))
     if std > 1e-10:
         signal = signal / std
-    return signal
+    return signal  # type: ignore[no-any-return]
 
 
 def _compute_waveform_offset(
@@ -512,10 +512,10 @@ def align_audio_map(
     # 2 路时即使置信度低，也返回直接结果，由调用方根据 score 决定是否降级。
     if len(room_ids) == 2:
         edge = pair_edges[0]
-        raw_offsets = {edge.left: 0.0, edge.right: edge.offset}
-        slowest_offset = min(raw_offsets.values())
-        offsets = {rid: max(0.0, raw_offsets[rid] - slowest_offset) for rid in room_ids}
-        reference_room_id = min(raw_offsets, key=raw_offsets.get)
+        pair_offsets = {edge.left: 0.0, edge.right: edge.offset}
+        slowest_offset = min(pair_offsets.values())
+        offsets = {rid: max(0.0, pair_offsets[rid] - slowest_offset) for rid in room_ids}
+        reference_room_id = min(pair_offsets, key=lambda k: pair_offsets[k])
         scores = {rid: edge.score for rid in room_ids}
         return AlignResult(
             success=True,
@@ -547,7 +547,7 @@ def align_audio_map(
             correlation_scores={rid: 0.0 for rid in room_ids},
         )
 
-    offsets: dict[str, float] = {rid: 0.0 for rid in room_ids}
+    raw_offsets: dict[str, float] = {rid: 0.0 for rid in room_ids}
     raw_by_room: dict[str, float] = {}
     components = _connected_components(room_ids, reliable_edges)
     for component in components:
@@ -557,20 +557,20 @@ def align_audio_map(
         ]
         if len(component) < 2 or not component_edges:
             raw_by_room[component[0]] = 0.0
-            offsets[component[0]] = 0.0
+            raw_offsets[component[0]] = 0.0
             continue
         raw_component = _solve_component_offsets(component, component_edges)
         slowest = min(raw_component.values())
         for rid, raw in raw_component.items():
             raw_by_room[rid] = raw
-            offsets[rid] = max(0.0, raw - slowest)
+            raw_offsets[rid] = max(0.0, raw - slowest)
 
     scores = _room_alignment_scores(room_ids, strict_reliable_edges, bridge_edges)
     reference_candidates = [rid for rid in room_ids if scores[rid] > 0]
     if reference_candidates:
         reference_room_id = min(
             reference_candidates,
-            key=lambda rid: (offsets.get(rid, 0.0), -scores[rid]),
+            key=lambda rid: (raw_offsets.get(rid, 0.0), -scores[rid]),
         )
     else:
         reference_room_id = room_ids[0]
@@ -578,12 +578,12 @@ def align_audio_map(
     _log.info(
         "全局两两对齐完成: reference=%s, offsets=%s, scores=%s",
         reference_room_id,
-        {k: f"{v:.4f}" for k, v in offsets.items()},
+        {k: f"{v:.4f}" for k, v in raw_offsets.items()},
         {k: f"{v:.3f}" for k, v in scores.items()},
     )
     return AlignResult(
         success=True,
-        offsets=offsets,
+        offsets=raw_offsets,
         reference_room_id=reference_room_id,
         method=method,
         correlation_scores=scores,
@@ -658,11 +658,11 @@ def align_rooms(
         return AlignResult(success=False, error="有效音频不足 2 路，无法互相关对齐")
 
     method = "recording" if all(rd.get("is_recording") for rd in rooms_data) else "stream"
-    result = align_audio_map(audio_data, SAMPLE_RATE, method=method)
+    align_result = align_audio_map(audio_data, SAMPLE_RATE, method=method)
     _log.info(
         "对齐完成: reference=%s, method=%s, offsets=%s, scores=%s",
-        result.reference_room_id, method,
-        {k: f"{v:.4f}" for k, v in result.offsets.items()},
-        {k: f"{v:.3f}" for k, v in result.correlation_scores.items()},
+        align_result.reference_room_id, method,
+        {k: f"{v:.4f}" for k, v in align_result.offsets.items()},
+        {k: f"{v:.3f}" for k, v in align_result.correlation_scores.items()},
     )
-    return result
+    return align_result

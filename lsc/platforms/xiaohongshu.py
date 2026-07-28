@@ -152,5 +152,5 @@ class XiaohongshuAdapter(BasePlatformAdapter):
         match = re.search(pattern, html)
         return match.group(1) if match else ""
 
-    def _failed(self, url: str, error: str, code: str, raw: Any = None) -> StreamInfo:
-        return super()._failed(url, error, code, headers=dict(XHS_HEADERS), raw=raw or {})
+    def _failed(self, url: str, error: str, error_code: str = "parse_failed", *, raw: dict[str, Any] | None = None) -> StreamInfo:
+        return super()._failed(url, error, error_code, headers=dict(XHS_HEADERS), raw=raw or {})

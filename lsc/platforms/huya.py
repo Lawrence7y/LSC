@@ -301,6 +301,6 @@ class HuyaAdapter(BasePlatformAdapter):
             quality_urls = {"source": quality_urls[preferred], **quality_urls}
         return quality_urls
 
-    def _failed(self, url: str, error: str, code: str, raw: dict[str, Any] | None = None) -> StreamInfo:
+    def _failed(self, url: str, error: str, error_code: str = "parse_failed", *, raw: dict[str, Any] | None = None) -> StreamInfo:
         """Failed result always carries Huya request headers."""
-        return super()._failed(url, error, code, headers=dict(HUYA_HEADERS), raw=raw)
+        return super()._failed(url, error, error_code, headers=dict(HUYA_HEADERS), raw=raw)

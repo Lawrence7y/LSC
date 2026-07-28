@@ -66,9 +66,9 @@ def map_clip_timeranges(
     recording_to_common_delta: float,
     draft_origin: float,
     dur_sec: float | None = None,
-) -> tuple[float, float, float, float, bool] | tuple[float, float, float, float] | None:
+) -> tuple[float, float, float, float, bool] | None:
     """
-    成功时返回 (t_start, t_dur, s_start, s_dur[, clamped])。
+    成功时返回 (t_start, t_dur, s_start, s_dur, clamped)。
     当传入 dur_sec 时始终返回 5 元组（含 clamped）；跳过/过短返回 None。
     """
     dur = common_end - common_start
@@ -85,10 +85,7 @@ def map_clip_timeranges(
         clamped = True
         if s_dur <= _MIN_SEG_SEC:
             return None
-        return (t_start, s_dur, s_start, s_dur, clamped)
-    if dur_sec is not None:
-        return (t_start, s_dur, s_start, s_dur, clamped)
-    return (t_start, s_dur, s_start, s_dur)
+    return (t_start, s_dur, s_start, s_dur, clamped)
 
 
 def clip_source_usable(
@@ -110,7 +107,7 @@ def clip_allowed_for_draft(clip: dict, *, include_pending: bool = False) -> bool
     return clip.get("mark_precision") != "approximate"
 
 
-def resolve_common_range(clip: dict, ctx) -> tuple[float, float, str] | None:
+def resolve_common_range(clip: dict[str, Any], ctx: Any) -> tuple[float, float, str] | None:
     """返回 (common_start, common_end, precision) 或 None（无法映射）。"""
     cs = clip.get("common_start")
     ce = clip.get("common_end")
@@ -124,8 +121,8 @@ def resolve_common_range(clip: dict, ctx) -> tuple[float, float, str] | None:
         snap = snapshots.get(room_id) if room_id else None
         if snap is not None:
             try:
-                s = float(clip.get("start"))
-                e = float(clip.get("end"))
+                s = float(clip.get("start", 0))
+                e = float(clip.get("end", 0))
                 delta = float(snap.recording_to_common_delta)
             except (TypeError, ValueError):
                 pass
@@ -149,24 +146,24 @@ def resolve_common_range(clip: dict, ctx) -> tuple[float, float, str] | None:
         # 多房未对齐已被 handler 前置拦截（allow_single_fallback=False）；
         # 单房场景房间从不对齐，clip_queued 也不会写 common 坐标，必须在此恒等映射。
         try:
-            s = float(clip.get("start"))
-            e = float(clip.get("end"))
+            s = float(clip.get("start", 0))
+            e = float(clip.get("end", 0))
         except (TypeError, ValueError):
             return None
         return (s, e, "exact") if e > s else None
     return None
 
 
-def seconds_trange(start_sec: float, dur_sec: float):
+def seconds_trange(start_sec: float, dur_sec: float) -> Any:
     """构造 pyJianYingDraft Timerange（秒 → 带单位字符串，避免微秒陷阱）。"""
-    from pyJianYingDraft import trange
+    from pyJianYingDraft import trange  # type: ignore[import-untyped]
 
     return trange(f"{start_sec}s", f"{dur_sec}s")
 
 
-def center_crop_9_16(*, width: int, height: int):
+def center_crop_9_16(*, width: int, height: int) -> Any:
     """16:9（或任意横屏）居中裁成 9:16 的 CropSettings（归一化 0~1）。"""
-    from pyJianYingDraft import CropSettings
+    from pyJianYingDraft import CropSettings  # type: ignore[import-untyped]
 
     if width <= 0 or height <= 0:
         return CropSettings()
@@ -211,8 +208,8 @@ def validate_draft_dir(path: str) -> bool:
         return False
 
 
-def _import_draft_lib():
-    import pyJianYingDraft as draft
+def _import_draft_lib() -> Any:
+    import pyJianYingDraft as draft  # type: ignore[import-untyped]
 
     return draft
 
@@ -308,7 +305,7 @@ def build_session_draft(
     segments = 0
     materials: dict[str, Any] = {}
 
-    def _material_for(room: RoomDraftSource):
+    def _material_for(room: RoomDraftSource) -> Any:
         if room.room_id in materials:
             return materials[room.room_id]
         if options.vertical:

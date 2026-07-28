@@ -11,6 +11,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from threading import Event
+from typing import Any
 
 from lsc.platforms.base import StreamInfo
 from lsc.platforms.registry import get_display_name
@@ -44,8 +45,8 @@ class RoomSession:
     record_output_path: str = ""
     record_started_at: datetime | None = None
     last_error: str = ""
-    controller: object | None = None
-    preview_widget: object | None = None
+    controller: Any | None = None
+    preview_widget: Any | None = None
     # 每房间独立的时间线选区（秒），避免切房间时选区"串房"
     mark_in: float | None = None
     mark_out: float | None = None
