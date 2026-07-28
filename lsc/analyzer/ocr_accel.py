@@ -49,7 +49,7 @@ def normalize_ocr_accel(value: Any) -> str:
 
 def _onnx_providers() -> list[str]:
     try:
-        import onnxruntime as ort
+        import onnxruntime as ort  # type: ignore[import-untyped]
         return list(ort.get_available_providers())
     except Exception as exc:
         _log.debug("onnxruntime providers 不可用: %s", exc)
@@ -99,7 +99,7 @@ def resolve_ocr_accel(
                 if k in candidates and isinstance(v, (int, float)) and v > 0
             }
             if usable:
-                return min(usable, key=usable.get)
+                return min(usable, key=lambda k: usable[k])
         # 无探针时偏好顺序：dml → cuda → cpu
         for pref in ("dml", "cuda", "cpu"):
             if pref in candidates:
@@ -145,7 +145,7 @@ def load_probe_cache() -> dict[str, Any] | None:
     saved_at = float(data.get("saved_at", 0))
     if time.time() - saved_at > _PROBE_CACHE_TTL_SEC:
         return None
-    return data
+    return data  # type: ignore[no-any-return]
 
 
 def save_probe_cache(
@@ -200,7 +200,7 @@ def _make_probe_image() -> Path:
             try:
                 font = ImageFont.truetype("arial.ttf", 28)
             except OSError:
-                font = ImageFont.load_default()
+                font = ImageFont.load_default()  # type: ignore[assignment]
         draw.text((12, 24), text, fill="black", font=font)
         img.save(path, format="PNG")
         return path
@@ -211,10 +211,10 @@ def _make_probe_image() -> Path:
         import cv2
         import numpy as np
 
-        img = np.full((80, 320, 3), 255, dtype=np.uint8)
+        img = np.full((80, 320, 3), 255, dtype=np.uint8)  # type: ignore[assignment]
         text = "BUY PHASE"
         try:
-            cv2.putText(
+            cv2.putText(  # type: ignore[call-overload]
                 img,
                 text,
                 (12, 52),
@@ -226,7 +226,7 @@ def _make_probe_image() -> Path:
             )
         except Exception as exc:
             _log.debug("cv2 putText for OCR probe skipped: %s", exc)
-        cv2.imwrite(str(path), img)
+        cv2.imwrite(str(path), img)  # type: ignore[call-overload]
         return path
     except Exception as exc:
         _log.debug("cv2 probe image failed: %s", exc)
@@ -237,7 +237,7 @@ def _make_probe_image() -> Path:
 
 def run_micro_benchmark() -> dict[str, float]:
     """Warm-up + timed OCR on probe image per candidate; return ms timings."""
-    from rapidocr_onnxruntime import RapidOCR
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-untyped]
 
     image_path = _make_probe_image()
     timings: dict[str, float] = {}
@@ -310,7 +310,7 @@ def run_probe_if_needed(mode: str | None) -> str:
 
 
 def create_ocr(mode: str | None = None) -> Any:
-    from rapidocr_onnxruntime import RapidOCR
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-untyped]
 
     effective = run_probe_if_needed(mode)
     kwargs = rapidocr_kwargs_for(effective)

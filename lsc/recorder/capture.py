@@ -182,11 +182,11 @@ class StreamCapture:
                 return 0.0
             return time.time() - self._start_time
 
-    def set_status_callback(self, cb: Callable[[CaptureStatus], None]):
+    def set_status_callback(self, cb: Callable[[CaptureStatus], None]) -> None:
         """Set callback for status changes."""
         self._on_status_change = cb
 
-    def _set_status(self, status: CaptureStatus):
+    def _set_status(self, status: CaptureStatus) -> None:
         with self._lock:
             self._status = status
         if self._on_status_change:
@@ -212,7 +212,10 @@ class StreamCapture:
     def _stderr_reader_loop(self, proc: subprocess.Popen) -> None:
         """Read lines from proc.stderr until the pipe closes."""
         try:
-            for line in proc.stderr:
+            stderr = proc.stderr
+            if stderr is None:
+                return
+            for line in stderr:
                 self._stderr_tail.append(line.rstrip())
         except Exception:
             # Pipe closed or process already gone; reader exits cleanly.
@@ -453,7 +456,7 @@ class StreamCapture:
                 return
             self._status = CaptureStatus.STOPPING
 
-        def _stop_in_background():
+        def _stop_in_background() -> None:
             try:
                 self.stop()
             except Exception as exc:
@@ -521,15 +524,15 @@ class StreamCapture:
                     _log.warning("FFmpeg kill failed: %s", exc)
                 if not _wait_with_deadline(5):
                     # Final safety net: do not block forever.
-                    orphaned_pid: int | str = "?"
+                    orphaned_pid_final: int | str = "?"
                     try:
-                        orphaned_pid = proc.pid
+                        orphaned_pid_final = proc.pid
                     except Exception as exc:
                         _log.debug("操作异常（已忽略）: %s", exc)
                     _log.error(
                         "FFmpeg process %s refused to exit after kill; "
                         "marking as orphan and releasing resources",
-                        orphaned_pid,
+                        orphaned_pid_final,
                     )
                     # 标记孤儿进程，防止外部停止循环反复重试
                     self._terminated_with_orphan = True
@@ -612,7 +615,7 @@ class StreamCapture:
         """
         self._force_kill()
 
-    def _force_kill(self):
+    def _force_kill(self) -> None:
         """Force-kill the FFmpeg process if it's still running.
 
         Uses terminate() before kill() to allow FFmpeg to flush output.

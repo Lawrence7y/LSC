@@ -34,9 +34,11 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Thread
+from typing import Any
 from uuid import uuid4
 
 from lsc import get_logger
@@ -181,11 +183,11 @@ class ClipExporter:
         duration: float,
         effective_profile: ExportProfile,
         tmp_output_path: str,
-        env: dict,
+        env: dict[str, str],
         creation_flags: int,
         cwd: str | None,
-        progress_callback,
-        on_process,
+        progress_callback: Callable[[float, float], bool] | None,
+        on_process: Callable[[subprocess.Popen], None] | None,
     ) -> bool:
         """GPU 滤镜失败后：CUVID 硬解 + CPU crop/scale + NVENC/软编。"""
         cpu_vf = build_cpu_vf(
@@ -325,8 +327,8 @@ class ClipExporter:
                     vertical_crop: bool = False,
                     codec: str = "",
                     profile: ExportProfile | None = None,
-                    progress_callback=None,
-                    on_process=None) -> ExportResult:
+                    progress_callback: Callable[..., Any] | None = None,
+                    on_process: Callable[[subprocess.Popen], None] | None = None) -> ExportResult:
         """从视频中导出单个片段。
 
         FFmpeg 切片命令结构
@@ -571,7 +573,7 @@ class ClipExporter:
                 # 同时后台线程收集 stderr 尾部用于错误诊断，
                 # 并启动 watchdog 线程在 300 秒无响应时强制终止进程。
                 # 调用方可通过 on_process 获取 Popen 对象以追踪或取消任务。
-                proc = subprocess.Popen(cmd, **popen_kwargs)
+                proc = subprocess.Popen(cmd, **popen_kwargs)  # type: ignore[call-overload]
                 set_stream_nonblocking(proc.stderr)
                 # 通知调用方进程已启动，便于追踪并取消该 FFmpeg 进程
                 if on_process is not None:
@@ -642,7 +644,8 @@ class ClipExporter:
                                 last_reported_percent = percent
                                 last_reported_time = now
                                 try:
-                                    progress_callback(percent, elapsed_sec, duration)
+                                    if progress_callback is not None:
+                                        progress_callback(percent, elapsed_sec, duration)
                                 except Exception as exc:
                                     _log.warning("导出进度回调异常: %s", exc)
                     # stdout 已关闭，等待进程退出（不会阻塞太久）
@@ -687,7 +690,7 @@ class ClipExporter:
             else:
                 # 无进度回调时使用 subprocess.run 简化执行，统一 300 秒超时；
                 # 错误信息截取 stderr 尾部 500 字符返回。
-                result = subprocess.run(
+                result = subprocess.run(  # type: ignore[call-overload]
                     cmd, capture_output=True, text=True, timeout=300,
                     encoding="utf-8", errors="replace",
                     env=env, cwd=cwd,
@@ -772,7 +775,7 @@ class ClipExporter:
         )
 
     def export_all(self, video_path: str, highlights: list, output_dir: str, *,
-                   vertical_crop: bool = False):
+                   vertical_crop: bool = False) -> Generator[ExportResult, None, None]:
         """批量导出所有高光片段。
 
         以生成器逐个产出 :class:`ExportResult`，便于上游流式处理
@@ -863,7 +866,7 @@ class ClipExporter:
         run_kwargs = {"capture_output": True, "timeout": 30, "env": env, "cwd": cwd}
         if creation_flags:
             run_kwargs["creationflags"] = creation_flags
-        result = subprocess.run(cmd, **run_kwargs)
+        result = subprocess.run(cmd, **run_kwargs)  # type: ignore[call-overload]
         if result.returncode == 0 and os.path.isfile(thumb_path):
             return thumb_path
         return ""
