@@ -212,6 +212,9 @@ class LscConfig:
     shared_ingest_preview_drop_policy: str = "drop_oldest"
     shared_ingest_preview_crf: int = 23
     shared_ingest_preview_preset: str = "veryfast"
+    # 资源限制（可通过 settings.json 覆盖）
+    max_rooms: int = 12
+    max_concurrent_previews: int = 4
     profile: Profile = field(default_factory=Profile)
 
     def __post_init__(self) -> None:
@@ -285,6 +288,8 @@ def _load_config_overrides() -> dict:
         "shared_ingest_preview_drop_policy",
         "shared_ingest_preview_crf",
         "shared_ingest_preview_preset",
+        "max_rooms",
+        "max_concurrent_previews",
     }
     return {key: data[key] for key in allowed if key in data}
 

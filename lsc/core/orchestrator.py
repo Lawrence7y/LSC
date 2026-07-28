@@ -18,7 +18,7 @@ import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from lsc.config import ExportProfile, load_config
@@ -32,14 +32,35 @@ from lsc.platforms.registry import parse_stream, select_quality
 
 _log = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
 ControllerFactory = Callable[[], object]
 PreviewFactory = Callable[[], object]
 
 # ── Resource limits ──────────────────────────────────────────
+# 可通过 settings.json 的 max_rooms / max_concurrent_previews 覆盖
 MAX_ROOMS = 12
 MAX_CONCURRENT_PREVIEWS = 4
 # 录制过程中磁盘剩余空间低于此阈值时停止录制（2 GB）
 _MIN_FREE_BYTES_WHILE_RECORDING = 2 * 1024 * 1024 * 1024
+
+
+def _get_configured_max_rooms() -> int:
+    """从 settings.json 读取最大房间数，默认 MAX_ROOMS。"""
+    try:
+        cfg = load_config()
+        return int(getattr(cfg, "max_rooms", MAX_ROOMS))
+    except Exception:
+        return MAX_ROOMS
+
+
+def _get_configured_max_previews() -> int:
+    """从 settings.json 读取最大并发预览数，默认 MAX_CONCURRENT_PREVIEWS。"""
+    try:
+        cfg = load_config()
+        return int(getattr(cfg, "max_concurrent_previews", MAX_CONCURRENT_PREVIEWS))
+    except Exception:
+        return MAX_CONCURRENT_PREVIEWS
 
 # ── Reconnect strategy ───────────────────────────────────────
 _MAX_RECONNECT_ATTEMPTS = 3
@@ -222,7 +243,7 @@ class SizeUpdateJob:
         self.room = room
         self.path = path
 
-    def run(self):
+    def run(self) -> None:
         try:
             import time as _time
             now = _time.time()
@@ -652,7 +673,7 @@ class RoomOrchestrator:
                 self._pending_count -= 1
             req.event.set()
 
-    def call(self, fn: Callable, *args, timeout: float = 10.0, **kwargs) -> Any:
+    def call(self, fn: Callable[..., _T], *args: Any, timeout: float = 10.0, **kwargs: Any) -> _T:
         if self._thread and threading.current_thread() is self._thread:
             return fn(*args, **kwargs)
         with self._pending_lock:
@@ -671,7 +692,7 @@ class RoomOrchestrator:
             raise req.exception
         return req.result
 
-    def submit(self, fn: Callable, *args, **kwargs) -> None:
+    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         if self._thread and threading.current_thread() is self._thread:
             try:
                 fn(*args, **kwargs)
@@ -718,12 +739,13 @@ class RoomOrchestrator:
     # ── Room CRUD ────────────────────────────────────────────
 
     def add_room(self, url: str) -> RoomSession | None:
-        """Add a room. Returns None if MAX_ROOMS limit is reached."""
+        """Add a room. Returns None if max_rooms limit is reached."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).add_room(self, url=url))
+        max_rooms = _get_configured_max_rooms()
         with self._lock:
-            if len(self._rooms) >= MAX_ROOMS:
-                _log.warning("Room limit reached (%d), cannot add more", MAX_ROOMS)
+            if len(self._rooms) >= max_rooms:
+                _log.warning("Room limit reached (%d), cannot add more", max_rooms)
                 return None
 
             # #27: duplicate URL detection
@@ -779,10 +801,10 @@ class RoomOrchestrator:
             return len(self._rooms)
 
     def max_rooms(self) -> int:
-        """Return the hard upper limit on concurrently managed rooms."""
+        """Return the configured upper limit on concurrently managed rooms."""
         if self._thread is not None and threading.current_thread() is not self._thread:
             return self.call(lambda: type(self).max_rooms(self))
-        return MAX_ROOMS
+        return _get_configured_max_rooms()
 
     def remove_room(self, room_id: str) -> bool:
         """Remove a room and clean up all associated resources.
@@ -1095,7 +1117,7 @@ class RoomOrchestrator:
         job = _ConnectJob(room.room_id, room.room_url, quality_preset)
         self._connect_jobs[room.room_id] = job
 
-        def _run():
+        def _run() -> None:
             result = job.run()
             self.submit(self._on_connect_finished, *result)
 
@@ -1132,7 +1154,7 @@ class RoomOrchestrator:
         job = _MetadataProbeJob(room_id, stream_url, room.controller)
         self._metadata_probe_jobs[room_id] = job
 
-        def _run():
+        def _run() -> None:
             result = job.run()
             if result is not None:
                 self.submit(self._on_probe_finished, *result)
@@ -1260,9 +1282,10 @@ class RoomOrchestrator:
             return False
 
         # Enforce preview concurrency limit
-        if self.get_active_preview_count() >= MAX_CONCURRENT_PREVIEWS:
-            _log.warning("Preview limit reached (%d), cannot start more", MAX_CONCURRENT_PREVIEWS)
-            room.preview_error = f"预览数已达上限 ({MAX_CONCURRENT_PREVIEWS})"
+        max_previews = _get_configured_max_previews()
+        if self.get_active_preview_count() >= max_previews:
+            _log.warning("Preview limit reached (%d), cannot start more", max_previews)
+            room.preview_error = f"预览数已达上限 ({max_previews})"
             return False
 
         # Lazy creation: only create the mpv widget when the user actually
@@ -1644,7 +1667,7 @@ class RoomOrchestrator:
         key = f"_refresh_{room_id}"
         self._refresh_cancels[key] = cancel
 
-        def _run():
+        def _run() -> None:
             try:
                 if cancel.is_set():
                     return
@@ -2047,7 +2070,7 @@ class RoomOrchestrator:
         if output_path:
             probe_fn = getattr(controller, "probe_video_duration", None)
             if callable(probe_fn):
-                def _on_probed(duration):
+                def _on_probed(duration: float) -> None:
                     if duration > 0:
                         controller.total_sec = int(duration)
                 probe_fn(on_probed=_on_probed)
@@ -2095,7 +2118,7 @@ class RoomOrchestrator:
             room.record_output_path = output_path
             probe_fn = getattr(controller, "probe_video_duration", None)
             if callable(probe_fn):
-                def _on_probed(duration):
+                def _on_probed(duration: float) -> None:
                     if duration > 0:
                         controller.total_sec = int(duration)
                 probe_fn(on_probed=_on_probed)
