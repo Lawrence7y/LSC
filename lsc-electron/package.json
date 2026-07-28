@@ -16,7 +16,10 @@
     "electron:build": "tsc --noEmit && vite build && electron-builder",
     "release": "vite build && electron-builder --publish always",
     "prep-bundle": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1",
-    "build:full": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1 && tsc --noEmit && vite build && electron-builder"
+    "build:full": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1 && tsc --noEmit && vite build && electron-builder",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@ant-design/icons": "^5.2.6",
@@ -28,16 +31,22 @@
     "zustand": "^4.4.7"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^14.3.1",
+    "@testing-library/user-event": "^14.6.1",
     "@types/node": "^20.0.0",
     "@types/react": "^18.2.43",
     "@types/react-dom": "^18.2.17",
     "@vitejs/plugin-react": "^4.2.1",
+    "@vitest/coverage-v8": "^1.6.1",
     "electron": "^28.0.0",
     "electron-builder": "^24.9.1",
+    "happy-dom": "^13.10.1",
     "sharp-ico": "^0.1.5",
     "typescript": "^5.3.3",
     "vite": "^5.0.8",
-    "vite-plugin-electron": "^1.1.0"
+    "vite-plugin-electron": "^1.1.0",
+    "vitest": "^1.6.1"
   },
   "build": {
     "appId": "com.lsc.app",
