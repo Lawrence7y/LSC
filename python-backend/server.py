@@ -231,7 +231,7 @@ class LSCWebSocketServer:
         })
 
         await asyncio.gather(
-            *[client.send(message) for client in self.clients],
+            *[asyncio.wait_for(client.send(message), timeout=1.0) for client in self.clients],
             return_exceptions=True,
         )
 
@@ -249,7 +249,7 @@ class LSCWebSocketServer:
         if not self.clients or not payload:
             return
         await asyncio.gather(
-            *[client.send(payload) for client in self.clients],
+            *[asyncio.wait_for(client.send(payload), timeout=1.0) for client in self.clients],
             return_exceptions=True,
         )
 
