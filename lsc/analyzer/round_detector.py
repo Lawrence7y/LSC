@@ -551,7 +551,7 @@ def _compute_rms_envelope(
     if n_windows < 10:
         return np.array([])
     trimmed = samples[: n_windows * window].reshape(n_windows, window)
-    return np.sqrt(np.mean(trimmed**2, axis=1))
+    return np.sqrt(np.mean(trimmed**2, axis=1))  # type: ignore[no-any-return]
 
 
 def _detect_chimes_from_samples(
@@ -773,7 +773,7 @@ def _split_by_round_end_chimes(
 
 
 def _ocr_round_has_combat_energy(
-    smoothed,
+    smoothed: np.ndarray,
     start_i: int,
     end_i: int,
     threshold: float,
@@ -805,7 +805,7 @@ def _ocr_round_has_combat_energy(
 
 
 def _segment_energy_signals(
-    smoothed,
+    smoothed: np.ndarray,
     start_i: int,
     end_i: int,
     threshold: float,
@@ -1120,8 +1120,8 @@ def _format_output(
             end_sec = min(duration, float(seg_end) + cfg.post_combat_pad)
             tail_reason = "audio"
         if idx + 1 < len(rounds):
-            next_start = float(rounds[idx + 1][0])
-            end_sec = min(end_sec, next_start - 1.0)
+            next_start_float = float(rounds[idx + 1][0])
+            end_sec = min(end_sec, next_start_float - 1.0)
 
         # 钟声裁尾本身就是能量塌陷的强信号
         if tail_reason == "chime":
@@ -1634,7 +1634,7 @@ def _build_round_segments_from_phase_markers(
             and (next_prep is None or e <= next_prep + 1.0)
             and e <= duration
         ]
-        victory = explicit_ends[0] if explicit_ends else None
+        victory_end: float | None = explicit_ends[0] if explicit_ends else None
 
         # 终点优先级（用户语义：录到「下回合准备阶段开始」之前的全部内容）：
         #   1) next_prep（购买/准备首帧）
@@ -1643,27 +1643,27 @@ def _build_round_segments_from_phase_markers(
         # 禁止：有下一买枪时仍用胜利字当终点（会丢掉结算后～准备前）
         glue_limit = max(cfg.max_combat_duration, cfg.min_ocr_round_duration + 40.0)
         if next_prep is not None:
-            if (next_prep - start) > glue_limit and victory is not None:
+            if (next_prep - start) > glue_limit and victory_end is not None:
                 # 漏检中间回合：先在胜利后留一段结算过渡，避免整段糊到很远的 prep
-                end = min(next_prep, max(victory + 12.0, start + min_span))
+                end = min(next_prep, max(victory_end + 12.0, start + min_span))
                 end_by = "next_buy"
                 tail_by = "ocr_phase"
-                ocr_end = victory
+                ocr_end = victory_end if victory_end is not None else 0.0
             else:
                 end = next_prep
                 end_by = "next_buy"
                 tail_by = "ocr_phase"
-                ocr_end = victory
+                ocr_end = victory_end if victory_end is not None else 0.0
         elif next_exit is not None:
             estimated = max(start + min_span, next_exit - typical_buy_sec)
             if estimated - start > glue_limit:
-                if victory is not None:
-                    end = min(estimated, max(victory + 12.0, start + min_span))
+                if victory_end is not None:
+                    end = min(estimated, max(victory_end + 12.0, start + min_span))
                 else:
                     end = start + cfg.max_combat_duration
                 end_by = "next_buy"
                 tail_by = "ocr_phase"
-                ocr_end = victory
+                ocr_end = victory_end if victory_end is not None else 0.0
             else:
                 end = estimated
                 end_by = "next_buy"

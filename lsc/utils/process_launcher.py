@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import sys
+from typing import Any
 
 _log = logging.getLogger(__name__)
 
@@ -137,10 +138,10 @@ def run_hidden(cmd: list[str] | tuple[str, ...], /, **kwargs: object) -> subproc
     Continuous analysis fires many short FFmpeg/ffprobe calls; without this flag
     each invocation pops a console and steals focus / causes UI stutter.
     """
-    return subprocess.run(cmd, **hidden_run_kwargs(**kwargs))  # type: ignore[arg-type]  # noqa: S603
+    return subprocess.run(cmd, **hidden_run_kwargs(**kwargs))  # type: ignore[arg-type, call-overload, no-any-return]  # noqa: S603
 
 
-def set_stream_nonblocking(pipe) -> None:
+def set_stream_nonblocking(pipe: Any) -> None:
     """Set a subprocess pipe (stdout/stderr) to non-blocking mode.
 
     Prevents pipe-buffer deadlock when the reader thread is temporarily
