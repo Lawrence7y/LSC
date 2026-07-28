@@ -6,7 +6,7 @@ import logging
 import re
 from pathlib import Path
 from types import ModuleType
-from typing import ClassVar
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 from .base import (
@@ -320,7 +320,15 @@ class DouyinAdapter(BasePlatformAdapter):
             _log.debug("获取抖音Cookie失败: %s", exc)
             return {}
 
-    def _failed(self, url: str, error: str, error_code: str = "parse_failed", *, raw: dict[str, Any] | None = None) -> StreamInfo:
+    def _failed(
+        self,
+        url: str,
+        error: str,
+        error_code: str = "parse_failed",
+        *,
+        headers: dict[str, str] | None = None,
+        raw: dict[str, Any] | None = None,
+    ) -> StreamInfo:
         """Failed result always carries Douyin request headers."""
         return super()._failed(url, error, error_code, headers=dict(DOUYIN_HEADERS), raw=raw)
 
@@ -338,5 +346,5 @@ class DouyinAdapter(BasePlatformAdapter):
 
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        self._cached_module = module
+        DouyinAdapter._cached_module = module
         return module

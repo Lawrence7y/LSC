@@ -332,12 +332,12 @@ def select_quality(info: StreamInfo | Mapping[str, object], quality_preset: str)
         (stream_url, quality_key) 元组
     """
     if isinstance(info, StreamInfo):
-        quality_urls = info.quality_urls
+        quality_urls: dict[str, str] = info.quality_urls
         stream_url = info.stream_url
         selected_quality = info.selected_quality
     else:
         raw_quality_urls = info.get("qualityUrls") or {}
-        quality_urls = raw_quality_urls if isinstance(raw_quality_urls, Mapping) else {}
+        quality_urls = dict(raw_quality_urls) if isinstance(raw_quality_urls, Mapping) else {}
         stream_url = str(info.get("streamUrl", "") or "")
         selected_quality = str(info.get("selectedQuality", "") or "")
 

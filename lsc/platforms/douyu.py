@@ -106,7 +106,8 @@ class DouyuAdapter(BasePlatformAdapter):
             api_url = f"https://m.douyu.com/html5/live?roomId={room_id}"
             api_html = fetch_url(api_url, headers=DOUYU_HEADERS)
             data = json.loads(api_html)
-            hls = data.get("data", {}).get("hls_url", "")
+            hls_raw = data.get("data", {}).get("hls_url", "")
+            hls: str = str(hls_raw) if hls_raw else ""
             if hls:
                 return hls
         except Exception as exc:
@@ -117,7 +118,15 @@ class DouyuAdapter(BasePlatformAdapter):
     @staticmethod
     def _extract_field(html: str, pattern: str) -> str:
         match = re.search(pattern, html)
-        return match.group(1) if match else ""
+        return str(match.group(1)) if match else ""
 
-    def _failed(self, url: str, error: str, error_code: str = "parse_failed", *, raw: dict[str, Any] | None = None) -> StreamInfo:
+    def _failed(
+        self,
+        url: str,
+        error: str,
+        error_code: str = "parse_failed",
+        *,
+        headers: dict[str, str] | None = None,
+        raw: dict[str, Any] | None = None,
+    ) -> StreamInfo:
         return super()._failed(url, error, error_code, headers=dict(DOUYU_HEADERS), raw=raw or {})

@@ -295,7 +295,15 @@ class BilibiliAdapter(BasePlatformAdapter):
         query["qn"] = quality
         return urlunparse(parsed._replace(query=urlencode(query)))
 
-    def _failed(self, url: str, error: str, error_code: str = "parse_failed", *, raw: dict[str, Any] | None = None) -> StreamInfo:
+    def _failed(
+        self,
+        url: str,
+        error: str,
+        error_code: str = "parse_failed",
+        *,
+        headers: dict[str, str] | None = None,
+        raw: dict[str, Any] | None = None,
+    ) -> StreamInfo:
         """Failed result always carries Bilibili request headers (cookies)."""
         return super()._failed(url, error, error_code, headers=_build_headers_with_cookies(), raw=raw)
 

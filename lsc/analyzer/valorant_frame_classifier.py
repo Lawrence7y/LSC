@@ -112,7 +112,7 @@ class ValorantFrameClassifier:
             raise ModelContractError("threshold contract invalid")
 
     def _create_session(self, onnx_path: Path) -> Any:
-        import onnxruntime as ort
+        import onnxruntime as ort  # type: ignore[import-untyped]
 
         last_err: Exception | None = None
         self._provider_warning = None

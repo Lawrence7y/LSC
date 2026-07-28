@@ -218,6 +218,7 @@ class KuaishouAdapter(BasePlatformAdapter):
         error: str,
         error_code: str = "parse_failed",
         *,
+        headers: dict[str, str] | None = None,
         raw: dict[str, Any] | None = None,
     ) -> StreamInfo:
         """Failed result always carries Kuaishou request headers."""

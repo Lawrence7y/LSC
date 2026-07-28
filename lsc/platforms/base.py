@@ -40,7 +40,8 @@ def fetch_url(url: str, *, headers: dict[str, str] | None = None,
         try:
             request = Request(url, headers=headers or {})
             with urlopen(request, timeout=timeout) as response:
-                return response.read().decode("utf-8", errors="replace")
+                raw_bytes: bytes = response.read()
+                return raw_bytes.decode("utf-8", errors="replace")
         except Exception as exc:
             last_exc = exc
             if attempt < retries:

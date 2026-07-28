@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
+from typing import Any
 
 from lsc import get_logger
 
@@ -128,7 +129,7 @@ def _create_highlights(segments: list[tuple[float, float]],
                        buffer: float = _HIGHLIGHT_BUFFER,
                        min_duration: float = _MIN_HIGHLIGHT_DURATION) -> list[HighlightSegment]:
     """从时间段创建高光片段，添加缓冲区并过滤过短的片段。"""
-    highlights = []
+    highlights: list[HighlightSegment] = []
 
     for start, end in segments:
         # 添加缓冲区
@@ -158,7 +159,7 @@ def _create_highlights(segments: list[tuple[float, float]],
     return highlights
 
 
-def cmd_analyze(args) -> dict:
+def cmd_analyze(args: object) -> dict[str, Any]:
     """分析视频高光片段。
 
     使用 FFmpeg 场景变化检测来识别视频中的高光时刻。
@@ -172,7 +173,7 @@ def cmd_analyze(args) -> dict:
     profile = getattr(args, "profile", "generic")
 
     if not video or not os.path.isfile(video):
-        result = {
+        result: dict[str, Any] = {
             "video": video,
             "profile": profile,
             "highlights": [],

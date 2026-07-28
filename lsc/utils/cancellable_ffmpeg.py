@@ -93,7 +93,7 @@ class CancellableFFmpeg:
                 ["taskkill", "/T", "/PID", str(self._proc.pid)],
                 capture_output=True,
                 **hidden_run_kwargs(),
-            )
+            )  # type: ignore[call-overload]
         else:
             self._proc.terminate()
 
@@ -104,6 +104,6 @@ class CancellableFFmpeg:
                 ["taskkill", "/T", "/F", "/PID", str(self._proc.pid)],
                 capture_output=True,
                 **hidden_run_kwargs(),
-            )
+            )  # type: ignore[call-overload]
         else:
             self._proc.kill()

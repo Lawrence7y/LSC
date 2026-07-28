@@ -56,7 +56,7 @@ def _decrypt_chrome_value(encrypted_value: bytes) -> str:
     # 检测 Chrome 加密前缀 (v10/v11/v20 等 vNN 格式)
     if len(encrypted_value) > 3 and encrypted_value[:1] == b"v" and encrypted_value[1:3].isdigit():
         try:
-            import win32crypt
+            import win32crypt  # type: ignore[import-untyped]
             # 旧版 Chrome 可能整段走 DPAPI；新版 v20 通常会失败，交由上层回退到文件 Cookie
             decrypted = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)
             if decrypted and decrypted[1]:
@@ -176,7 +176,7 @@ def load_cookies_from_file(cookie_file: str) -> dict[str, str]:
     - Netscape/Mozilla cookie jar格式
     - JSON格式
     """
-    cookies = {}
+    cookies: dict[str, str] = {}
 
     if not os.path.exists(cookie_file):
         return cookies
@@ -446,7 +446,7 @@ def cookies_to_header(cookies: dict[str, str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in cleaned.items())
 
 
-def save_cookies(cookies: dict[str, str], platform: str = "bilibili"):
+def save_cookies(cookies: dict[str, str], platform: str = "bilibili") -> None:
     """保存cookies到配置文件（原子写入）。"""
     config_dir = os.path.expanduser("~/.lsc/cookies")
     os.makedirs(config_dir, exist_ok=True)

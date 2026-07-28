@@ -53,7 +53,7 @@ def compute_valorant_scan_budget(
     round_phase: str | None = None,
     valorant_profile: str | None = None,
     pending_start: float | None = None,
-    prediction=None,
+    prediction: Any = None,
 ) -> tuple[tuple[float, float], bool, int, bool]:
     """Return scan range, OCR flag, timeout, and whether this is the first scan.
 
@@ -138,10 +138,7 @@ def detect_rounds_by_audio_rhythm(
 
     持续分析专用：录制中文件只能可靠提取音频，视频方法全部失效。
     """
-    import tempfile
-    import wave
 
-    import numpy as np
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix='.wav')
     os.close(tmp_fd)
@@ -298,8 +295,8 @@ class ValorantAnalyzerPlugin:
         self,
         video_path: str,
         *,
-        progress_callback=None,
-        cancel_check=None,
+        progress_callback: Callable[[str, float, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
         options: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]] | None:
         """对齐 _analyze_scene_or_rounds 的 valorant 分支（hybrid）。"""

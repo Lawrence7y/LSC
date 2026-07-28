@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from lsc.analyzer.base import AnalyzerCapabilities, ScanWindow
@@ -22,8 +23,8 @@ class GenericAnalyzerPlugin:
         self,
         video_path: str,
         *,
-        progress_callback=None,
-        cancel_check=None,
+        progress_callback: Callable[[str, float, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
         options: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]] | None:
         if cancel_check and cancel_check():
@@ -62,7 +63,7 @@ class GenericAnalyzerPlugin:
         window: ScanWindow,
         state: dict[str, Any],
         *,
-        cancel_check=None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         # Continuous scene still uses handler audio-rhythm path until explicitly migrated.
         state["last_analyzed"] = window.end_sec

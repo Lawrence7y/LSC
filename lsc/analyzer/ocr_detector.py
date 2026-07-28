@@ -140,7 +140,7 @@ def detect_kill_events(
         - score: 置信度 (0.3-1.0)
     """
     try:
-        from rapidocr_onnxruntime import RapidOCR  # noqa: F401 - 检查模块可用性
+        from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-untyped] # noqa: F401 - 检查模块可用性
     except ImportError:
         _log.warning("rapidocr-onnxruntime 未安装，跳过 OCR 检测")
         return []
@@ -347,7 +347,7 @@ def _detect_round_markers(
     回合变化点 = 新的回合开始边界。
     """
     try:
-        from rapidocr_onnxruntime import RapidOCR  # noqa: F401 - 检查模块可用性
+        from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-untyped] # noqa: F401 - 检查模块可用性
     except ImportError:
         return events
 

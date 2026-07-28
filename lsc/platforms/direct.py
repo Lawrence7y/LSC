@@ -5,7 +5,7 @@ import logging
 
 _log = logging.getLogger(__name__)
 
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import ParseResult, parse_qsl, urlparse
 
 from .base import BasePlatformAdapter, StreamInfo
 
@@ -42,7 +42,7 @@ class DirectAdapter(BasePlatformAdapter):
             selected_quality="origin",
         )
 
-    def _has_direct_query_hint(self, parsed) -> bool:
+    def _has_direct_query_hint(self, parsed: ParseResult) -> bool:
         for key, value in parse_qsl(parsed.query, keep_blank_values=True):
             key_lower = key.lower()
             value_lower = value.lower()
