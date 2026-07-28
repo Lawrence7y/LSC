@@ -1,14 +1,15 @@
 """Common background worker threads for LSC GUI.
 
-This module houses worker threads that are shared across different pages
-or managers, resolving cross-layer dependency violations.
+.. deprecated::
+    PySide6 原生 GUI 已弃用，Electron 为唯一前端。
+    此类保留供历史参考，不再维护。
 """
 from __future__ import annotations
 
 import os
 from argparse import Namespace
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal  # noqa: F401  # kept for backward compat
 
 from lsc.exporter.clip import ClipExporter
 

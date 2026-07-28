@@ -1,7 +1,8 @@
 """Recording controller - business logic extracted from RecordPage.
 
-Separates recording concerns (FFmpeg capture, timer, NVENC probe, URL parsing)
-from pure UI rendering, following the ViewModel / Controller pattern.
+.. deprecated::
+    PySide6 原生 GUI 已弃用，Electron 为唯一前端。
+    此类保留供历史参考，不再维护。
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import QThread, QTimer, Signal  # noqa: F401  # kept for backward compat
 
 try:
     from lsc import get_logger

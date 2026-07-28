@@ -1,4 +1,9 @@
-"""Multi-room manager — thin Qt shell over RoomOrchestrator."""
+"""Multi-room manager — thin Qt shell over RoomOrchestrator.
+
+.. deprecated::
+    PySide6 原生 GUI 已弃用，Electron 为唯一前端。
+    此类保留供历史参考，不再维护。新代码请使用 lsc.core.orchestrator.RoomOrchestrator。
+"""
 from __future__ import annotations
 
 import logging
@@ -6,13 +11,10 @@ import time as _time
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication, QObject, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Signal  # noqa: F401  # kept for backward compat
 
 from lsc.config import ExportProfile, load_config
 from lsc.core.orchestrator import (
-    MAX_CONCURRENT_PREVIEWS,
-    MAX_ROOMS,
-    RoomOrchestrator,
     _HIGH_FREQ_INTERVAL,
     _LOW_FREQ_INTERVAL,
     _MEDIUM_FREQ_INTERVAL,
@@ -20,10 +22,13 @@ from lsc.core.orchestrator import (
     _SHARED_INGEST_STALL_CHECKS,
     _STAGGER_GROUPS,
     _TICK_INTERVAL_MS,
+    MAX_CONCURRENT_PREVIEWS,
+    MAX_ROOMS,
+    RoomOrchestrator,
     _is_stream_offline_error,
     _offline_stream_error_message,
 )
-from lsc.gui.multi_room.session import RoomSession
+from lsc.core.session import RoomSession  # noqa: F401  # re-export for backward compat
 from lsc.platforms.registry import parse_stream, select_quality
 
 _log = logging.getLogger(__name__)
