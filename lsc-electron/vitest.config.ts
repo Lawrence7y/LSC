@@ -14,6 +14,7 @@ export default defineConfig({
     environment: 'happy-dom',
     setupFiles: ['./tests/setup.ts'],
     include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    exclude: ['node_modules', '**/.worktrees/**', 'tests/**/*.cjs'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
