@@ -150,9 +150,28 @@ class LSCWebSocketServer:
 
         pending: set[asyncio.Task] = set()
 
+        # 令牌桶速率限制：每连接每秒最多 100 条消息
+        _rate_limit_tokens = 100
+        _rate_limit_refill_at = time.monotonic() + 1.0
+
+        async def _check_rate_limit() -> bool:
+            nonlocal _rate_limit_tokens, _rate_limit_refill_at
+            now = time.monotonic()
+            if now >= _rate_limit_refill_at:
+                _rate_limit_tokens = 100
+                _rate_limit_refill_at = now + 1.0
+            if _rate_limit_tokens > 0:
+                _rate_limit_tokens -= 1
+                return True
+            return False
+
         async def dispatch(message: str):
             msg_type = None
             request_id = None
+            # 速率限制检查
+            if not await _check_rate_limit():
+                _log.warning("Rate limit exceeded, dropping message")
+                return
             try:
                 data = json.loads(message)
                 msg_type = data.get('type')
@@ -305,7 +324,7 @@ class LSCWebSocketServer:
                     _log.warning(f"Port {self.port} unavailable, trying fallback port {port}...")
                 async with websockets.serve(
                     self.handle_client, self.host, port,
-                    max_size=16 * 1024 * 1024,
+                    max_size=1 * 1024 * 1024,  # 1MB 消息体上限（JSON 消息通常 < 100KB）
                     # Detect silent TCP drops (network partition, killed
                     # client). Without keepalive pings, a half-open socket
                     # stays in self.clients indefinitely (#98).

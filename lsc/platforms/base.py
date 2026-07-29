@@ -24,6 +24,22 @@ DEFAULT_HTTP_RETRIES = 2   # extra attempts after the first
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
+def _is_private_ip(hostname: str) -> bool:
+    """检查主机名是否解析为私有/内网 IP（SSRF 防护）。"""
+    import socket
+    import ipaddress
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+        for family, _, _, _, sockaddr in addr_info:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return True
+    except Exception:
+        # 解析失败时保守处理，拒绝访问
+        return True
+    return False
+
+
 def fetch_url(url: str, *, headers: dict[str, str] | None = None,
               timeout: int = DEFAULT_HTTP_TIMEOUT,
               retries: int = DEFAULT_HTTP_RETRIES) -> str:
@@ -34,6 +50,13 @@ def fetch_url(url: str, *, headers: dict[str, str] | None = None,
     # 安全检查：只允许 HTTP/HTTPS 协议
     if not url.startswith(("http://", "https://")):
         raise ValueError(f"Only HTTP/HTTPS URLs are supported, got: {url}")
+
+    # SSRF 防护：拒绝访问私有/内网 IP
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    if _is_private_ip(hostname):
+        raise ValueError(f"Access to private/internal IP is forbidden: {hostname}")
 
     last_exc: Exception | None = None
     for attempt in range(retries + 1):

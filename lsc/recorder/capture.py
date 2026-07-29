@@ -90,7 +90,9 @@ def validate_recording(output_path: str, min_size_mb: float = 0.1) -> tuple[bool
         return False, "输出路径为空"
 
     if not os.path.isfile(output_path):
-        return False, f"文件不存在: {output_path}"
+        # 错误信息只显示文件名，完整路径仅记录到日志（防止泄露用户目录结构）
+        _log.debug("录制文件不存在: %s", output_path)
+        return False, f"文件不存在: {os.path.basename(output_path)}"
 
     file_size = os.path.getsize(output_path)
     file_size_mb = file_size / (1024 * 1024)

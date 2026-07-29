@@ -161,14 +161,21 @@ class BroadcastHub:
         """Replace the broadcast queue with a larger one, preserving queued items."""
         old_queue = self._broadcast_queue
         old_max = old_queue.maxsize
-        new_max = old_max + max(old_max // 4, 100)
+        # 限制最大队列大小为 5000，防止无界增长导致 OOM
+        new_max = min(old_max + max(old_max // 4, 100), 5000)
         new_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=new_max)
+        dropped = 0
         while True:
             try:
                 new_queue.put_nowait(old_queue.get_nowait())
             except queue.Empty:
                 break
             except queue.Full:
-                break
+                # 新队列已满，丢弃最旧的消息
+                try:
+                    old_queue.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
         self._broadcast_queue = new_queue
-        _log.error("broadcast queue expanded: maxsize %d -> %d", old_max, new_max)
+        _log.error("broadcast queue expanded: maxsize %d -> %d (dropped %d)", old_max, new_max, dropped)

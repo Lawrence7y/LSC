@@ -82,6 +82,9 @@ function _pruneExpiredMseCache(): void {
   }
 }
 
+// 定期清理过期 MSE 缓存，避免 segment 缓存先过期时需等待下次 cache 调用才清理
+const _mseCacheCleanupInterval = setInterval(_pruneExpiredMseCache, 60_000)
+
 function _cacheMseInit(roomId: string, buffer: ArrayBuffer): void {
   _pruneExpiredMseCache()
   _mseInitCache[roomId] = buffer

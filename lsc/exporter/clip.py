@@ -383,8 +383,10 @@ class ClipExporter:
             用于追踪并可选取消 FFmpeg 进程。
         """
         if not os.path.isfile(video_path):
+            # 错误信息只显示文件名，完整路径仅记录到日志（防止泄露用户目录结构）
+            _log.debug("录制文件不存在: %s", video_path)
             return ExportResult(False, "", clip_index, title or f"clip_{clip_index}",
-                                error=f"录制文件不存在 / video not found: {video_path}")
+                                error=f"录制文件不存在 / video not found: {os.path.basename(video_path)}")
 
         os.makedirs(output_dir, exist_ok=True)
 
