@@ -174,13 +174,24 @@ class WebSocketClient {
 
         this.ws.onopen = () => {
           clearTimeout(connectTimeout)
-          console.log('WebSocket connected')
+          console.log('WebSocket connected, sending auth...')
+          // 握手后首帧认证：发送 auth 消息（Token 不再通过 URL 传递）
           this.isConnected = true
           this.reconnectAttempts = 0
-          this.emit('connected', null)
-          // 重连成功后 flush 队列
-          this.flushQueue()
           this.pendingConnect = null
+          // 获取 Token 并发送 auth 消息
+          const electronAPI = typeof window !== 'undefined'
+            ? (window.electronAPI as BackendElectronApi | undefined)
+            : undefined
+          if (electronAPI?.getBackendWsToken) {
+            electronAPI.getBackendWsToken().then((token) => {
+              if (token?.trim()) {
+                this.ws?.send(JSON.stringify({ type: 'auth', token }))
+              }
+            }).catch(() => {})
+          }
+          this.emit('connected', null)
+          this.flushQueue()
           resolve()
         }
 

@@ -34,14 +34,7 @@ export async function resolveWebSocketUrl(
     resolvedUrl = DEFAULT_WS_URL
   }
 
-  if (electronAPI?.getBackendWsToken) {
-    const token = await electronAPI.getBackendWsToken()
-    if (token?.trim()) {
-      const url = new URL(resolvedUrl)
-      url.searchParams.set('token', token)
-      return url.toString()
-    }
-  }
-
+  // Token 不再通过 URL 传递（安全修复：避免 Token 泄露到代理/网关日志）
+  // 改为 WebSocket 握手后首帧认证（wsClient.connect 后发送 auth 消息）
   return resolvedUrl
 }

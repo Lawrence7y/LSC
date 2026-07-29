@@ -91,16 +91,13 @@ class LSCWebSocketServer:
         return decorator(handler)
 
     async def handle_client(self, websocket):
-        """处理客户端连接"""
+        """处理客户端连接 — 握手后首帧认证（Token 不再通过 URL 传递）"""
         # S-4: Origin 校验 - 仅允许 Electron (file://) 和本地开发服务器
-        # 缺失/空 Origin 一律拒绝：合法的 Electron 渲染进程和浏览器都会
-        # 发送 Origin 头，缺失通常意味着非浏览器客户端或 CSRF 尝试。
         origin = ''
         if hasattr(websocket, 'request_headers'):
             headers = websocket.request_headers
             getter = getattr(headers, 'get', None)
             if callable(getter):
-                # websockets Headers 大小写不敏感；普通 dict 测试桩兼容 Origin/origin
                 origin = getter('origin') or getter('Origin') or ''
             elif isinstance(headers, dict):
                 origin = headers.get('origin') or headers.get('Origin') or ''
@@ -117,19 +114,30 @@ class LSCWebSocketServer:
                 await close_fn(code=1008, reason='Origin not allowed')
             return
 
-        path = getattr(websocket, 'path', None)
-        if path is None and hasattr(websocket, 'request'):
-            path = getattr(websocket.request, 'path', None)
-        token = extract_token_from_path(path)
-        if not validate_ws_token(token):
-            _log.warning("Rejected WebSocket connection: invalid or missing token")
+        # 握手后首帧认证：等待客户端发送 auth 消息，Token 不再出现在 URL 中
+        authenticated = False
+        try:
+            raw = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else {}
+            except Exception:
+                data = {}
+            if data.get('type') == 'auth' and validate_ws_token(data.get('token')):
+                authenticated = True
+        except asyncio.TimeoutError:
+            pass
+        except websockets.ConnectionClosed:
+            return
+
+        if not authenticated:
+            _log.warning("Rejected WebSocket connection: auth failed or timeout")
             close_fn = getattr(websocket, 'close', None)
             if callable(close_fn):
-                await close_fn(code=1008, reason='Token invalid')
+                await close_fn(code=1008, reason='Auth required')
             return
 
         self.clients.add(websocket)
-        _log.info(f"Client connected. Total: {len(self.clients)}")
+        _log.info(f"Client connected (auth OK). Total: {len(self.clients)}")
 
         for handler in self.connect_handlers:
             try:
