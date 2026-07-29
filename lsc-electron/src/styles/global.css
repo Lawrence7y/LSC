@@ -87,7 +87,7 @@ body {
 }
 
 .ant-menu-item-selected {
-  background: rgba(0, 122, 255, 0.12) !important;
+  background: rgba(77, 196, 191, 0.12) !important;
   color: var(--text-50) !important;
   border-left: 3px solid var(--brand-500) !important;
 }
@@ -169,6 +169,17 @@ body {
 
 .ant-typography {
   color: var(--text-50) !important;
+}
+
+/* Focus visible — 键盘导航焦点指示 */
+:focus-visible {
+  outline: 2px solid var(--brand-400, #4DC4BF);
+  outline-offset: 2px;
+}
+
+/* 鼠标点击时不显示焦点框 */
+:focus:not(:focus-visible) {
+  outline: none;
 }
 
 .ant-typography.ant-typography-secondary {

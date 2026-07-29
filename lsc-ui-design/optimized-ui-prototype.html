@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LSC 优化版 · 工作台</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --brand: #31b3ae;
+      --brand-hover: #43c6c0;
+      --brand-soft: rgba(49, 179, 174, 0.12);
+      --bg: #0d0f11;
+      --surface-1: #15181b;
+      --surface-2: #1c2024;
+      --surface-3: #252a2f;
+      --border: rgba(255, 255, 255, 0.09);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --text-primary: #f2f4f5;
+      --text-secondary: #b6bcc2;
+      --text-tertiary: #777f87;
+      --success: #45c779;
+      --warning: #e7a049;
+      --error: #f0645c;
+      --info: #559ce8;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.32);
+      --radius-sm: 6px;
+      --radius-md: 8px;
+      --radius-lg: 12px;
+      --sidebar-width: 200px;
+      --right-panel-width: 320px;
+      --timeline-height: 80px;
+      --toolbar-height: 64px;
+    }
+
+    html[data-theme="light"] {
+      color-scheme: light;
+      --bg: #f0f2f5;
+      --surface-1: #ffffff;
+      --surface-2: #f5f7f8;
+      --surface-3: #e8ecef;
+      --border: rgba(21, 27, 32, 0.1);
+      --border-strong: rgba(21, 27, 32, 0.18);
+      --text-primary: #171b1f;
+      --text-secondary: #4c555d;
+      --text-tertiary: #7e8790;
+      --brand-soft: rgba(49, 179, 174, 0.12);
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--text-primary);
+      overflow: hidden;
+    }
+
+    button {
+      font-family: inherit;
+      cursor: pointer;
+      border: none;
+      background: none;
+      color: inherit;
+    }
+
+    /* ===== 主布局 ===== */
+    .app-container {
+      display: grid;
+      grid-template-columns: var(--sidebar-width) 1fr;
+      height: 100vh;
+    }
+
+    /* ===== 左侧边栏 ===== */
+    .sidebar {
+      background: var(--surface-1);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+
+    .brand {
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 16px;
+    }
+
+    .brand-icon {
+      width: 32px;
+      height: 32px;
+      background: var(--brand);
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #062b2a;
+      font-size: 18px;
+    }
+
+    .brand-subtitle {
+      font-size: 10px;
+      color: var(--text-tertiary);
+      margin-top: 4px;
+    }
+
+    .nav-menu {
+      flex: 1;
+      padding: 12px 8px;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      margin-bottom: 4px;
+      border-radius: var(--radius-md);
+      color: var(--text-secondary);
+      font-size: 13px;
+      transition: all 0.2s;
+      cursor: pointer;
+    }
+
+    .nav-item:hover {
+      background: var(--surface-2);
+      color: var(--text-primary);
+    }
+
+    .nav-item.active {
+      background: var(--brand-soft);
+      color: var(--brand);
+    }
+
+    .nav-icon {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+
+    .system-monitor {
+      padding: 12px;
+      border-top: 1px solid var(--border);
+    }
+
+    .monitor-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 11px;
+    }
+
+    .monitor-label {
+      color: var(--text-tertiary);
+    }
+
+    .monitor-value {
+      color: var(--text-secondary);
+      font-family: "SF Mono", Consolas, monospace;
+    }
+
+    .monitor-bar {
+      height: 3px;
+      background: var(--surface-2);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+
+    .monitor-fill {
+      height: 100%;
+      background: var(--brand);
+      transition: width 0.3s;
+    }
+
+    /* ===== 主工作区 ===== */
+    .workspace {
+      display: grid;
+      grid-template-rows: var(--toolbar-height) 1fr var(--timeline-height);
+      min-width: 0;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ===== 顶部工具栏 ===== */
+    .toolbar {
+      background: var(--surface-1);
+      border-bottom: 1px solid var(--border);
+      padding: 0 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .toolbar-title {
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .toolbar-stats {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-tertiary);
+      font-size: 11px;
+    }
+
+    .stat-badge {
+      padding: 2px 8px;
+      background: var(--surface-2);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+
+    .toolbar-actions {
+      margin-left: auto;
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: var(--radius-md);
+      font-size: 12px;
+      border: 1px solid var(--border);
+      background: var(--surface-2);
+      color: var(--text-secondary);
+      transition: all 0.2s;
+    }
+
+    .btn:hover {
+      background: var(--surface-3);
+      color: var(--text-primary);
+      border-color: var(--border-strong);
+    }
+
+    .btn-primary {
+      background: var(--brand);
+      border-color: var(--brand);
+      color: #062b2a;
+      font-weight: 600;
+    }
+
+    .btn-primary:hover {
+      background: var(--brand-hover);
+      border-color: var(--brand-hover);
+      color: #062b2a;
+    }
+
+    .btn-danger {
+      background: var(--error);
+      border-color: var(--error);
+      color: white;
+    }
+
+    .btn-sm {
+      padding: 4px 8px;
+      font-size: 11px;
+    }
+
+    .btn-icon {
+      width: 32px;
+      height: 32px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ===== 中央内容区 ===== */
+    .main-content {
+      display: grid;
+      grid-template-columns: 1fr var(--right-panel-width);
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    /* ===== 房间网格区 ===== */
+    .room-grid-container {
+      overflow-y: auto;
+      padding: 16px;
+      background: var(--bg);
+    }
+
+    .room-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 12px;
+    }
+
+    .room-card {
+      background: var(--surface-1);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      transition: all 0.2s;
+    }
+
+    .room-card:hover {
+      border-color: var(--border-strong);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+
+    .room-card.selected {
+      border-color: var(--brand);
+    }
+
+    .room-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .room-checkbox {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--brand);
+    }
+
+    .room-name {
+      flex: 1;
+      font-weight: 600;
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .room-status {
+      display: flex;
+      gap: 6px;
+      font-size: 10px;
+    }
+
+    .status-badge {
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--surface-2);
+      color: var(--text-tertiary);
+    }
+
+    .status-badge.live {
+      background: rgba(240, 100, 92, 0.15);
+      color: var(--error);
+    }
+
+    .status-badge.recording {
+      background: rgba(69, 199, 121, 0.15);
+      color: var(--success);
+    }
+
+    .room-preview {
+      position: relative;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      overflow: hidden;
+    }
+
+    .room-preview-placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: var(--text-tertiary);
+    }
+
+    .preview-icon {
+      width: 48px;
+      height: 48px;
+      opacity: 0.5;
+    }
+
+    .preview-info {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      padding: 4px 8px;
+      background: rgba(0, 0, 0, 0.7);
+      border-radius: 4px;
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.8);
+    }
+
+    .room-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: var(--text-tertiary);
+      border-top: 1px solid var(--border);
+    }
+
+    .room-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    /* ===== 右侧面板 ===== */
+    .right-panel {
+      background: var(--surface-1);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .panel-tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-tab {
+      padding: 8px 12px;
+      font-size: 12px;
+      color: var(--text-tertiary);
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .panel-tab:hover {
+      color: var(--text-secondary);
+    }
+
+    .panel-tab.active {
+      color: var(--brand);
+      border-bottom-color: var(--brand);
+    }
+
+    .panel-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+    }
+
+    .clip-item {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--warning);
+      border-radius: var(--radius-md);
+      padding: 10px;
+      margin-bottom: 8px;
+    }
+
+    .clip-item.ready {
+      border-left-color: var(--success);
+    }
+
+    .clip-item.exporting {
+      border-left-color: var(--brand);
+    }
+
+    .clip-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    .clip-name {
+      font-weight: 600;
+      font-size: 12px;
+    }
+
+    .clip-status {
+      font-size: 10px;
+      color: var(--text-tertiary);
+    }
+
+    .clip-meta {
+      display: flex;
+      gap: 12px;
+      font-size: 10px;
+      color: var(--text-tertiary);
+      margin-bottom: 8px;
+    }
+
+    .clip-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    /* ===== 底部时间线 ===== */
+    .timeline-container {
+      background: var(--surface-1);
+      border-top: 1px solid var(--border);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .timeline-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .time-display {
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .timeline-track {
+      flex: 1;
+      height: 48px;
+      background: var(--surface-2);
+      border-radius: var(--radius-md);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .timeline-ruler {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 20px;
+      border-bottom: 1px solid var(--border);
+      background: repeating-linear-gradient(
+        to right,
+        transparent 0 49px,
+        var(--border) 49px 50px
+      );
+    }
+
+    .timeline-clip {
+      position: absolute;
+      top: 24px;
+      height: 12px;
+      background: var(--info);
+      border-radius: 3px;
+    }
+
+    .timeline-selection {
+      position: absolute;
+      top: 20px;
+      bottom: 8px;
+      background: rgba(85, 156, 232, 0.15);
+      border: 1px solid var(--info);
+      border-radius: 4px;
+    }
+
+    .playhead {
+      position: absolute;
+      top: 20px;
+      bottom: 8px;
+      width: 2px;
+      background: var(--brand);
+    }
+
+    .timeline-actions {
+      display: flex;
+      gap: 6px;
+    }
+
+    /* ===== 设置抽屉 ===== */
+    .settings-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 100;
+      opacity: 0;
+      visibility: hidden;
+      transition: all 0.3s;
+    }
+
+    .settings-overlay.show {
+      opacity: 1;
+      visibility: visible;
+    }
+
+    .settings-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 520px;
+      max-width: 90vw;
+      background: var(--surface-1);
+      box-shadow: var(--shadow);
+      z-index: 101;
+      transform: translateX(100%);
+      transition: transform 0.3s;
+      display: grid;
+      grid-template-columns: 140px 1fr;
+    }
+
+    .settings-overlay.show .settings-panel {
+      transform: translateX(0);
+    }
+
+    .settings-nav {
+      background: var(--surface-2);
+      border-right: 1px solid var(--border);
+      padding: 16px 8px;
+      overflow-y: auto;
+    }
+
+    .settings-nav-item {
+      padding: 8px 12px;
+      margin-bottom: 4px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
+      color: var(--text-tertiary);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .settings-nav-item:hover {
+      background: var(--surface-3);
+      color: var(--text-secondary);
+    }
+
+    .settings-nav-item.active {
+      background: var(--brand-soft);
+      color: var(--brand);
+    }
+
+    .settings-content {
+      overflow-y: auto;
+      padding: 24px;
+    }
+
+    .settings-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+    }
+
+    .settings-title {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .settings-close {
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: var(--radius-sm);
+      color: var(--text-tertiary);
+      font-size: 20px;
+    }
+
+    .settings-close:hover {
+      background: var(--surface-2);
+      color: var(--text-primary);
+    }
+
+    .settings-section {
+      margin-bottom: 24px;
+    }
+
+    .settings-section-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: var(--text-primary);
+    }
+
+    .settings-row {
+      display: grid;
+      grid-template-columns: 1fr 200px;
+      gap: 16px;
+      align-items: center;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .settings-label {
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .settings-desc {
+      font-size: 11px;
+      color: var(--text-tertiary);
+      margin-top: 4px;
+    }
+
+    .settings-control {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .form-select,
+    .form-input {
+      width: 100%;
+      padding: 6px 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 12px;
+    }
+
+    .form-textarea {
+      width: 100%;
+      min-height: 80px;
+      padding: 8px 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-size: 12px;
+      font-family: inherit;
+      resize: vertical;
+    }
+
+    .toggle {
+      position: relative;
+      width: 40px;
+      height: 22px;
+      background: var(--surface-3);
+      border-radius: 22px;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+
+    .toggle.active {
+      background: var(--brand);
+    }
+
+    .toggle::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 18px;
+      height: 18px;
+      background: white;
+      border-radius: 50%;
+      transition: transform 0.3s;
+    }
+
+    .toggle.active::after {
+      transform: translateX(18px);
+    }
+
+    /* ===== 全屏预览弹窗 ===== */
+    .fullscreen-preview {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.95);
+      z-index: 200;
+      display: none;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .fullscreen-preview.show {
+      display: flex;
+    }
+
+    .preview-container {
+      width: 90vw;
+      height: 90vh;
+      max-width: 1920px;
+      max-height: 1080px;
+      background: #000;
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .preview-video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .preview-controls {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 16px;
+      background: linear-gradient(to top, rgba(0, 0, 0, 0.8), transparent);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .preview-close {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      width: 40px;
+      height: 40px;
+      background: rgba(0, 0, 0, 0.6);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 24px;
+      z-index: 10;
+    }
+
+    .preview-close:hover {
+      background: rgba(0, 0, 0, 0.8);
+    }
+
+    /* ===== Toast 提示 ===== */
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: var(--surface-3);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-md);
+      padding: 12px 20px;
+      box-shadow: var(--shadow);
+      z-index: 300;
+      opacity: 0;
+      transition: all 0.3s;
+    }
+
+    .toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+
+    /* ===== 响应式 ===== */
+    @media (max-width: 1200px) {
+      :root {
+        --right-panel-width: 280px;
+      }
+    }
+
+    @media (max-width: 968px) {
+      .main-content {
+        grid-template-columns: 1fr;
+      }
+      .right-panel {
+        position: fixed;
+        right: 0;
+        top: var(--toolbar-height);
+        bottom: var(--timeline-height);
+        width: var(--right-panel-width);
+        z-index: 50;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <!-- 左侧边栏 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo">
+          <div class="brand-icon">L</div>
+          <div>
+            <div>LSC</div>
+            <div class="brand-subtitle">直播切片工具</div>
+          </div>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <div class="nav-item active">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7" rx="1"/>
+            <rect x="14" y="3" width="7" height="7" rx="1"/>
+            <rect x="3" y="14" width="7" height="7" rx="1"/>
+            <rect x="14" y="14" width="7" height="7" rx="1"/>
+          </svg>
+          多房间管理
+        </div>
+        <div class="nav-item" id="settingsBtn">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 1v6m0 6v6m5.2-13.2l-4.2 4.2m-4.2 4.2l-4.2 4.2M23 12h-6m-6 0H1m18.2 5.2l-4.2-4.2m-4.2-4.2L4.8 4.8"/>
+          </svg>
+          设置
+        </div>
+      </nav>
+
+      <div class="system-monitor">
+        <div class="monitor-item">
+          <span class="monitor-label">CPU</span>
+          <span class="monitor-value">28%</span>
+        </div>
+        <div class="monitor-bar">
+          <div class="monitor-fill" style="width: 28%"></div>
+        </div>
+        <div class="monitor-item">
+          <span class="monitor-label">内存</span>
+          <span class="monitor-value">85%</span>
+        </div>
+        <div class="monitor-bar">
+          <div class="monitor-fill" style="width: 85%; background: var(--warning)"></div>
+        </div>
+        <div class="monitor-item">
+          <span class="monitor-label">磁盘</span>
+          <span class="monitor-value">53%</span>
+        </div>
+        <div class="monitor-bar">
+          <div class="monitor-fill" style="width: 53%"></div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 主工作区 -->
+    <main class="workspace">
+      <!-- 顶部工具栏 -->
+      <header class="toolbar">
+        <h1 class="toolbar-title">多房间工作台</h1>
+        <div class="toolbar-stats">
+          <span class="stat-badge">1 个房间</span>
+          <span class="stat-badge">运行中</span>
+        </div>
+        <div class="toolbar-actions">
+          <button class="btn btn-sm">停止持续分析</button>
+          <button class="btn btn-sm">全选</button>
+          <button class="btn btn-sm">一键对齐</button>
+          <button class="btn btn-sm">刷新</button>
+          <button class="btn btn-sm">静音</button>
+          <button class="btn btn-sm btn-primary">批量录制</button>
+          <button class="btn btn-sm btn-danger">批量停止</button>
+        </div>
+      </header>
+
+      <!-- 中央内容区 -->
+      <div class="main-content">
+        <!-- 房间网格 -->
+        <div class="room-grid-container">
+          <div class="room-grid">
+            <article class="room-card selected">
+              <div class="room-header">
+                <input type="checkbox" class="room-checkbox" checked>
+                <div class="room-name">小小乐 (无畏契约)</div>
+                <div class="room-status">
+                  <span class="status-badge recording">录制中</span>
+                </div>
+              </div>
+              <div class="room-preview">
+                <div class="room-preview-placeholder">
+                  <svg class="preview-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5v14l11-7z"/>
+                  </svg>
+                  <span>启用预览</span>
+                </div>
+                <div class="preview-info">1080P · 已录 00:05:38 · 232 MB</div>
+              </div>
+              <div class="room-footer">
+                <span>02赋能最强之人,清算赋能局,人才市场力工王</span>
+                <div class="room-actions">
+                  <button class="btn btn-sm btn-danger">停止录制</button>
+                  <button class="btn btn-sm">断开</button>
+                </div>
+              </div>
+            </article>
+
+            <!-- 更多房间卡片占位 -->
+            <article class="room-card">
+              <div class="room-header">
+                <input type="checkbox" class="room-checkbox">
+                <div class="room-name">房间示例 2</div>
+                <div class="room-status">
+                  <span class="status-badge live">LIVE</span>
+                </div>
+              </div>
+              <div class="room-preview">
+                <div class="room-preview-placeholder">
+                  <svg class="preview-icon" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5v14l11-7z"/>
+                  </svg>
+                  <span>启用预览</span>
+                </div>
+              </div>
+              <div class="room-footer">
+                <span>房间描述信息...</span>
+                <div class="room-actions">
+                  <button class="btn btn-sm btn-primary">开始录制</button>
+                  <button class="btn btn-sm">断开</button>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <!-- 右侧面板 -->
+        <aside class="right-panel">
+          <div class="panel-header">
+            <h3 class="panel-title">切片管理</h3>
+          </div>
+          <div class="panel-tabs">
+            <div class="panel-tab active">待处理</div>
+            <div class="panel-tab">已完成</div>
+          </div>
+          <div class="panel-content">
+            <div class="clip-item">
+              <div class="clip-header">
+                <span class="clip-name">小小乐 (无畏_R01</span>
+                <span class="clip-status">待调</span>
+              </div>
+              <div class="clip-meta">
+                <span>00:00:25 - 00:00:35</span>
+                <span>0:10</span>
+              </div>
+              <div class="clip-actions">
+                <button class="btn btn-sm btn-primary">确认</button>
+                <button class="btn btn-sm">编辑</button>
+                <button class="btn btn-sm btn-danger">删除</button>
+              </div>
+            </div>
+
+            <div class="clip-item ready">
+              <div class="clip-header">
+                <span class="clip-name">小小乐 (无畏_R02</span>
+                <span class="clip-status">可导</span>
+              </div>
+              <div class="clip-meta">
+                <span>00:02:28 - 00:03:35</span>
+                <span>1:07</span>
+              </div>
+              <div class="clip-actions">
+                <button class="btn btn-sm btn-primary">导出</button>
+                <button class="btn btn-sm">剪映</button>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <!-- 底部时间线 -->
+      <div class="timeline-container">
+        <div class="timeline-controls">
+          <button class="btn-icon btn-sm">⏮</button>
+          <button class="btn-icon btn-sm">▶</button>
+          <button class="btn-icon btn-sm">⏭</button>
+          <select class="form-select" style="width: 60px;">
+            <option>1×</option>
+            <option>1.5×</option>
+            <option>2×</option>
+          </select>
+        </div>
+        <div class="time-display">00:05:38 / 00:05:38</div>
+        <div class="timeline-track">
+          <div class="timeline-ruler"></div>
+          <div class="timeline-clip" style="left: 10%; width: 15%"></div>
+          <div class="timeline-clip" style="left: 30%; width: 20%"></div>
+          <div class="timeline-clip" style="left: 55%; width: 10%"></div>
+          <div class="timeline-selection" style="left: 30%; width: 20%"></div>
+          <div class="playhead" style="left: 42%"></div>
+        </div>
+        <div class="timeline-actions">
+          <button class="btn btn-sm">入点</button>
+          <button class="btn btn-sm">出点</button>
+          <button class="btn btn-sm">添加切片</button>
+          <button class="btn btn-sm">直播</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- 设置抽屉 -->
+  <div class="settings-overlay" id="settingsOverlay">
+    <div class="settings-panel">
+      <nav class="settings-nav">
+        <div class="settings-nav-item active">通用</div>
+        <div class="settings-nav-item">预览体验</div>
+        <div class="settings-nav-item">系统环境</div>
+        <div class="settings-nav-item">录制与编码</div>
+        <div class="settings-nav-item">AI 分析</div>
+        <div class="settings-nav-item">存储与草稿</div>
+        <div class="settings-nav-item">平台账号</div>
+        <div class="settings-nav-item">快捷键</div>
+        <div class="settings-nav-item">关于与更新</div>
+        <div class="settings-nav-item">日志</div>
+      </nav>
+      <div class="settings-content">
+        <div class="settings-header">
+          <h2 class="settings-title">设置</h2>
+          <button class="settings-close" id="closeSettings">×</button>
+        </div>
+
+        <section class="settings-section">
+          <h3 class="settings-section-title">通用</h3>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">主题</div>
+              <div class="settings-desc">选择界面显示主题</div>
+            </div>
+            <div class="settings-control">
+              <select class="form-select">
+                <option>深色</option>
+                <option>浅色</option>
+              </select>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">开机自启</div>
+              <div class="settings-desc">系统启动时自动运行</div>
+            </div>
+            <div class="settings-control">
+              <div class="toggle"></div>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">最小化到托盘</div>
+              <div class="settings-desc">关闭窗口时最小化到系统托盘</div>
+            </div>
+            <div class="settings-control">
+              <div class="toggle active"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h3 class="settings-section-title">录制与编码</h3>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">默认画质</div>
+            </div>
+            <div class="settings-control">
+              <select class="form-select">
+                <option>原画</option>
+                <option>蓝光</option>
+                <option>超清</option>
+                <option>高清</option>
+                <option>流畅</option>
+              </select>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div>
+              <div class="settings-label">CRF 质量</div>
+              <div class="settings-desc">18(高质量) - 28(低质量)</div>
+            </div>
+            <div class="settings-control">
+              <input type="range" min="18" max="28" value="26" style="width: 100%">
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全屏预览弹窗 -->
+  <div class="fullscreen-preview" id="fullscreenPreview">
+    <div class="preview-container">
+      <button class="preview-close" id="closePreview">×</button>
+      <video class="preview-video" controls></video>
+      <div class="preview-controls">
+        <button class="btn btn-sm">播放/暂停</button>
+        <span class="time-display">00:08 / 00:35</span>
+        <select class="form-select" style="width: 80px;">
+          <option>高清</option>
+          <option>标清</option>
+        </select>
+        <div style="flex: 1"></div>
+        <button class="btn-icon btn-sm">🔇</button>
+        <button class="btn-icon btn-sm">⛶</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 提示 -->
+  <div class="toast" id="toast">操作成功</div>
+
+  <script>
+    // 设置面板控制
+    const settingsBtn = document.getElementById('settingsBtn');
+    const settingsOverlay = document.getElementById('settingsOverlay');
+    const closeSettings = document.getElementById('closeSettings');
+
+    settingsBtn.addEventListener('click', () => {
+      settingsOverlay.classList.add('show');
+    });
+
+    closeSettings.addEventListener('click', () => {
+      settingsOverlay.classList.remove('show');
+    });
+
+    settingsOverlay.addEventListener('click', (e) => {
+      if (e.target === settingsOverlay) {
+        settingsOverlay.classList.remove('show');
+      }
+    });
+
+    // Toast 提示
+    function showToast(message) {
+      const toast = document.getElementById('toast');
+      toast.textContent = message;
+      toast.classList.add('show');
+      setTimeout(() => {
+        toast.classList.remove('show');
+      }, 2000);
+    }
+
+    // 示例：点击按钮显示提示
+    document.querySelectorAll('.btn-primary').forEach(btn => {
+      btn.addEventListener('click', () => {
+        showToast('操作成功');
+      });
+    });
+
+    // ESC 关闭设置
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        settingsOverlay.classList.remove('show');
+        document.getElementById('fullscreenPreview').classList.remove('show');
+      }
+    });
+
+    // URL 参数支持直接打开设置
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('settings') === '1') {
+      settingsOverlay.classList.add('show');
+    }
+    if (urlParams.get('preview') === '1') {
+      document.getElementById('fullscreenPreview').classList.add('show');
+    }
+  </script>
+</body>
+</html>

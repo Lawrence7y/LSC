@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Warm · 温暖现代风格</title>
+<style>
+  :root {
+    --bg: #fdf8f3;
+    --surface: #ffffff;
+    --surface-warm: #fef9f3;
+    --surface-hover: #f7f0e8;
+    --border: #e8ddd0;
+    --border-warm: #d4c4b0;
+    --text: #3d2c1e;
+    --text-muted: #8b7355;
+    --text-subtle: #b09a7a;
+    --accent: #e07a5f;
+    --accent-2: #81b29a;
+    --accent-3: #f2cc8f;
+    --success: #52b788;
+    --warning: #e9a73f;
+    --error: #e76f51;
+    --shadow-sm: 0 1px 3px rgba(61,44,30,0.06);
+    --shadow-md: 0 4px 16px rgba(61,44,30,0.08);
+    --shadow-lg: 0 12px 40px rgba(61,44,30,0.12);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Pro Rounded', 'PingFang SC', 'Nunito', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 28px;
+    height: 64px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    box-shadow: var(--shadow-sm);
+    position: sticky; top: 0; z-index: 100;
+  }
+  .logo {
+    font-size: 20px; font-weight: 800; letter-spacing: -0.5px;
+    color: var(--accent);
+  }
+  .logo span { color: var(--text); font-weight: 400; font-size: 14px; margin-left: 8px; }
+  .nav { display: flex; gap: 4px; }
+  .nav span {
+    padding: 8px 16px; border-radius: 20px; font-size: 13px; color: var(--text-muted);
+    cursor: pointer; transition: all 0.2s; font-weight: 600;
+  }
+  .nav span:hover { background: var(--surface-hover); color: var(--text); }
+  .nav span.active {
+    background: var(--accent); color: white;
+  }
+  .topbar-right { display: flex; align-items: center; gap: 14px; }
+  .icon-btn {
+    width: 36px; height: 36px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; color: var(--text-muted); font-size: 16px;
+    transition: all 0.2s; background: var(--surface-warm);
+  }
+  .icon-btn:hover { background: var(--surface-hover); color: var(--text); }
+  .avatar {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent-3), var(--accent));
+    border: 2px solid white;
+    box-shadow: var(--shadow-sm);
+  }
+
+  .main {
+    padding: 28px;
+    display: grid;
+    grid-template-columns: 260px 1fr 300px;
+    gap: 24px;
+    max-width: 1600px; margin: 0 auto;
+  }
+
+  /* 左侧栏 */
+  .sidebar {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 20px;
+    box-shadow: var(--shadow-sm);
+    height: fit-content;
+  }
+  .sidebar h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-subtle); margin-bottom: 14px; font-weight: 700;
+  }
+  .room-item {
+    padding: 12px 14px; border-radius: 14px; margin-bottom: 8px;
+    cursor: pointer; transition: all 0.2s;
+    border: 1px solid transparent;
+  }
+  .room-item:hover { background: var(--surface-hover); }
+  .room-item.active {
+    background: linear-gradient(135deg, rgba(224,122,95,0.08), rgba(242,204,143,0.1));
+    border-color: rgba(224,122,95,0.2);
+  }
+  .room-item .name { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .room-item .meta { font-size: 11px; color: var(--text-subtle); display: flex; gap: 6px; align-items: center; }
+  .live-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 0 3px rgba(82,183,136,0.2);
+  }
+
+  /* 中间 */
+  .preview-area { display: flex; flex-direction: column; gap: 18px; }
+  .preview-header { display: flex; justify-content: space-between; align-items: center; }
+  .preview-header h2 { font-size: 17px; font-weight: 700; }
+  .btn-group { display: flex; gap: 10px; }
+  .btn {
+    padding: 9px 18px; border-radius: 20px; font-size: 13px; font-weight: 600;
+    border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); cursor: pointer;
+    transition: all 0.2s; box-shadow: var(--shadow-sm);
+  }
+  .btn:hover { background: var(--surface-hover); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), #e8896d);
+    color: white; border: none;
+    box-shadow: 0 4px 14px rgba(224,122,95,0.3);
+  }
+  .btn-primary:hover { box-shadow: 0 6px 20px rgba(224,122,95,0.4); }
+
+  .preview-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  .preview-card {
+    aspect-ratio: 16/9;
+    background: linear-gradient(135deg, #2d1f15, #3d2c1e);
+    border-radius: 16px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: var(--shadow-md);
+    transition: all 0.3s;
+  }
+  .preview-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-lg); }
+  .preview-card::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(224,122,95,0.15), rgba(242,204,143,0.1));
+  }
+  .preview-card .info {
+    position: absolute; bottom: 12px; left: 14px;
+    font-size: 12px; color: rgba(255,255,255,0.7); font-weight: 500;
+  }
+  .preview-card .badge-live {
+    position: absolute; top: 12px; left: 14px;
+    padding: 4px 10px; border-radius: 20px;
+    background: rgba(231,111,81,0.9); color: white;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.3px;
+  }
+
+  /* 时间线 */
+  .timeline {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 18px;
+    box-shadow: var(--shadow-sm);
+  }
+  .timeline h3 { font-size: 13px; color: var(--text-muted); margin-bottom: 14px; font-weight: 600; }
+  .timeline-track {
+    height: 56px; border-radius: 14px;
+    background: var(--surface-warm);
+    border: 1px solid var(--border);
+    position: relative; overflow: hidden;
+  }
+  .timeline-segment {
+    position: absolute; top: 8px; height: 40px;
+    background: linear-gradient(135deg, rgba(224,122,95,0.25), rgba(242,204,143,0.3));
+    border-radius: 10px;
+    border: 1px solid rgba(224,122,95,0.3);
+  }
+  .timeline-cursor {
+    position: absolute; top: 0; bottom: 0; width: 2px;
+    background: var(--accent);
+    box-shadow: 0 0 12px rgba(224,122,95,0.5);
+  }
+
+  /* 右侧 */
+  .right-panel { display: flex; flex-direction: column; gap: 18px; }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 20px;
+    box-shadow: var(--shadow-sm);
+  }
+  .stat-card .label { font-size: 12px; color: var(--text-subtle); margin-bottom: 6px; font-weight: 600; }
+  .stat-card .value { font-size: 30px; font-weight: 800; letter-spacing: -1px; }
+  .stat-card .trend { font-size: 12px; color: var(--success); margin-top: 6px; font-weight: 600; }
+
+  .clip-list {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 18px;
+    box-shadow: var(--shadow-sm);
+  }
+  .clip-list h3 { font-size: 13px; color: var(--text-muted); margin-bottom: 14px; font-weight: 600; }
+  .clip-item {
+    padding: 12px 14px; border-radius: 12px; margin-bottom: 6px;
+    font-size: 13px; cursor: pointer; transition: all 0.2s;
+    border: 1px solid transparent; font-weight: 500;
+  }
+  .clip-item:hover { background: var(--surface-hover); border-color: var(--border); }
+
+  .back-btn {
+    position: fixed; top: 16px; right: 20px; z-index: 200;
+    padding: 8px 16px; border-radius: 20px;
+    background: var(--surface); color: var(--text); text-decoration: none; font-size: 12px;
+    border: 1px solid var(--border); font-weight: 600;
+    box-shadow: var(--shadow-sm);
+  }
+  .back-btn:hover { background: var(--surface-hover); }
+</style>
+</head>
+<body>
+<a href="index.html" class="back-btn">← 返回</a>
+
+<div class="topbar">
+  <div class="logo">LSC<span>直播切片工作台</span></div>
+  <div class="nav">
+    <span>Dashboard</span>
+    <span class="active">工作台</span>
+    <span>设置</span>
+  </div>
+  <div class="topbar-right">
+    <div class="icon-btn">🔔</div>
+    <div class="icon-btn">⚙️</div>
+    <div class="avatar"></div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- 左侧 -->
+  <div class="sidebar">
+    <h3>直播间列表</h3>
+    <div class="room-item active">
+      <div class="name">🎮 主播A · 无畏契约</div>
+      <div class="meta"><span class="live-dot"></span> 直播中 · 12.3万观看</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎤 主播B · 聊天电台</div>
+      <div class="meta"><span class="live-dot"></span> 直播中 · 8.1万观看</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎯 主播C · CS2</div>
+      <div class="meta"><span class="live-dot" style="background:var(--warning);box-shadow:0 0 0 3px rgba(233,167,63,0.2)"></span> 录像中</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎪 主播D</div>
+      <div class="meta" style="color:var(--text-subtle)">离线</div>
+    </div>
+  </div>
+
+  <!-- 中间 -->
+  <div class="preview-area">
+    <div class="preview-header">
+      <h2>多房间预览</h2>
+      <div class="btn-group">
+        <button class="btn">一键对齐</button>
+        <button class="btn btn-primary">开始录制</button>
+      </div>
+    </div>
+    <div class="preview-grid">
+      <div class="preview-card">
+        <span class="badge-live">● LIVE</span>
+        <div class="info">主播A · 00:14:32</div>
+      </div>
+      <div class="preview-card">
+        <span class="badge-live">● LIVE</span>
+        <div class="info">主播B · 00:08:15</div>
+      </div>
+      <div class="preview-card">
+        <div class="info">主播C · 00:22:41</div>
+      </div>
+      <div class="preview-card" style="background:var(--surface-warm);display:flex;align-items:center;justify-content:center;color:var(--text-subtle);font-size:13px;border:2px dashed var(--border-warm);">
+        + 添加房间
+      </div>
+    </div>
+    <div class="timeline">
+      <h3>时间轴 · 按 I/O 标记入出点</h3>
+      <div class="timeline-track">
+        <div class="timeline-segment" style="left:10%;width:15%"></div>
+        <div class="timeline-segment" style="left:40%;width:20%"></div>
+        <div class="timeline-segment" style="left:75%;width:12%"></div>
+        <div class="timeline-cursor" style="left:55%"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右侧 -->
+  <div class="right-panel">
+    <div class="stat-card">
+      <div class="label">录制时长</div>
+      <div class="value">14<span style="font-size:16px;color:var(--text-subtle);font-weight:600">h</span> 32<span style="font-size:16px;color:var(--text-subtle);font-weight:600">m</span></div>
+      <div class="trend">↑ 较昨日 +23%</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">今日切片</div>
+      <div class="value">47</div>
+      <div class="trend">↑ 已导出 38 个</div>
+    </div>
+    <div class="clip-list">
+      <h3>最近切片</h3>
+      <div class="clip-item">🎬 主播A · 五杀集锦 · 02:14</div>
+      <div class="clip-item">🎬 主播A · 残局1v3 · 01:08</div>
+      <div class="clip-item">🎬 主播B · 名场面 · 00:45</div>
+      <div class="clip-item">🎬 主播C · 翻盘局 · 03:22</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1920">
+<title>LSC - Full UI Prototype for Figma Export</title>
+<style>
+:root {
+  --background-900: #000000;
+  --background-800: #1c1c1e;
+  --background-700: #2c2c2e;
+  --bg-primary: #000000;
+  --bg-secondary: #1c1c1e;
+  --bg-tertiary: #2c2c2e;
+  --text-50: #f5f5f7;
+  --text-primary: #f5f5f7;
+  --text-secondary: #8e8e93;
+  --text-tertiary: #636366;
+  --text-400: #8e8e93;
+  --border-default: #3a3a3c;
+  --accent-primary: #31B3AE;
+  --brand-400: #31B3AE;
+  --brand-500: #007aff;
+  --state-success: #34c759;
+  --state-warning: #ff9500;
+  --state-warning-dark: #ff9f0a;
+  --state-error: #ff3b30;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --font-mono: 'SF Mono', 'Cascadia Code', monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'SF Pro Display', 'PingFang SC', system-ui, -apple-system, sans-serif; background: var(--background-900); color: var(--text-50); width: 1920px; height: 1080px; overflow: hidden; }
+.app { display: flex; height: 100vh; }
+
+/* Sidebar */
+.sider { width: 200px; background: var(--background-800); border-right: 1px solid var(--border-default); display: flex; flex-direction: column; height: 100vh; }
+.logo-area { display: flex; align-items: center; gap: 10px; padding: 20px 16px 24px; border-bottom: 1px solid var(--border-default); }
+.logo-icon { width: 32px; height: 32px; border-radius: 8px; background: linear-gradient(135deg, #31B3AE, #007aff); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; color: #fff; }
+.logo-text .name { font-size: 15px; font-weight: 700; letter-spacing: 0.02em; color: var(--text-50); line-height: 1; }
+.logo-text .sub { font-size: 10px; color: var(--text-400); margin-top: 2px; }
+.nav-menu { flex: 1; padding: 12px 0; }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 24px; font-size: 14px; color: var(--text-secondary); cursor: pointer; }
+.nav-item.active { color: var(--text-50); background: rgba(49,179,174,0.08); border-right: 2px solid var(--accent-primary); }
+.sider-footer { padding: 10px 12px 14px; border-top: 1px solid var(--border-default); display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.conn-status { display: flex; align-items: center; gap: 8px; padding: 4px 10px; border-radius: 6px; background: var(--bg-tertiary); border: 1px solid var(--border-default); width: 100%; justify-content: center; }
+.conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--state-success); box-shadow: 0 0 8px var(--state-success); }
+.conn-label { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.sys-monitor { font-size: 10px; color: var(--text-tertiary); text-align: center; }
+.theme-btn { font-size: 12px; color: var(--text-50); background: none; border: none; cursor: pointer; padding: 4px 8px; }
+
+/* Main content */
+.main-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.content-area { flex: 1; display: flex; overflow: hidden; }
+
+/* Top toolbar */
+.toolbar { padding: 16px 24px; background: var(--bg-secondary); border-bottom: 1px solid var(--border-default); display: flex; flex-direction: column; gap: 12px; }
+.toolbar-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.toolbar-left { display: flex; align-items: center; gap: 12px; }
+.toolbar-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.page-title { font-size: 18px; font-weight: 600; }
+.room-count { color: var(--text-tertiary); font-size: 13px; }
+
+/* Buttons */
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 6px; font-size: 13px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-50); cursor: pointer; white-space: nowrap; }
+.btn-primary { background: var(--accent-primary); border-color: var(--accent-primary); color: #fff; }
+.btn-danger { background: rgba(255,59,48,0.12); border-color: rgba(255,59,48,0.3); color: var(--state-error); }
+.btn-text { background: transparent; border: none; color: var(--text-secondary); padding: 4px 8px; }
+.btn-sm { padding: 3px 8px; font-size: 12px; }
+.btn-link { background: none; border: none; color: var(--accent-primary); font-size: 12px; cursor: pointer; }
+.btn:disabled, .btn.disabled { opacity: 0.4; }
+
+/* Select */
+.select { padding: 4px 8px; border-radius: 6px; background: var(--bg-tertiary); border: 1px solid var(--border-default); color: var(--text-50); font-size: 12px; }
+
+/* Room cards */
+.room-grid { flex: 1; overflow-y: auto; padding: 16px 24px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; align-content: start; }
+.room-card { background: var(--bg-secondary); border: 1px solid var(--accent-primary); border-radius: 10px; padding: 12px; box-shadow: 0 0 0 3px rgba(0,122,255,0.12), 0 0 16px rgba(0,122,255,0.22); }
+.room-card.normal { border-color: transparent; box-shadow: none; }
+.room-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.room-checkbox { width: 22px; height: 22px; border-radius: 6px; border: 2px solid var(--accent-primary); background: var(--accent-primary); display: flex; align-items: center; justify-content: center; color: #fff; font-size: 13px; font-weight: 700; }
+.room-checkbox.unchecked { background: var(--bg-primary); border-color: var(--text-primary); color: transparent; }
+.room-name { flex: 1; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-badge { display: flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 6px; background: rgba(48,209,88,0.12); border: 1px solid rgba(48,209,88,0.25); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: #30d158; }
+.live-text { font-size: 10px; font-weight: 700; letter-spacing: 0.8px; color: #30d158; }
+.review-badge { display: flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 6px; background: rgba(175,82,222,0.12); border: 1px solid rgba(175,82,222,0.25); }
+.review-dot { width: 6px; height: 6px; border-radius: 50%; background: #af52de; }
+.review-text { font-size: 10px; font-weight: 700; color: #af52de; }
+.room-preview { width: 100%; height: 180px; background: #0a0a0a; border-radius: 8px; margin-bottom: 8px; position: relative; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.preview-placeholder { color: rgba(255,255,255,0.3); font-size: 36px; }
+.preview-controls { position: absolute; bottom: 0; left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; background: linear-gradient(transparent, rgba(0,0,0,0.7)); }
+.preview-btns { display: flex; gap: 4px; }
+.preview-btn { width: 28px; height: 28px; border-radius: 6px; background: rgba(0,0,0,0.5); border: none; color: #fff; font-size: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.recording-bar { position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: var(--accent-primary); }
+.recording-meta { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 12px; color: var(--text-secondary); }
+.rec-label { color: var(--state-success); font-weight: 500; }
+.room-title { font-size: 12px; color: var(--text-tertiary); margin-bottom: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-actions { display: flex; align-items: center; gap: 6px; }
+.room-actions .btn { flex: 1; justify-content: center; }
+.btn-del { width: 36px; height: 32px; flex: none !important; display: flex; align-items: center; justify-content: center; color: var(--state-error); background: transparent; border: none; }
+
+/* Control bar */
+.control-bar { padding: 12px 24px; background: var(--bg-secondary); border-top: 1px solid var(--border-default); display: flex; flex-direction: column; gap: 12px; }
+.timeline-track { height: 96px; background: var(--bg-tertiary); border-radius: 8px; position: relative; overflow: hidden; }
+.timeline-wave { position: absolute; bottom: 0; left: 0; right: 0; height: 40px; background: repeating-linear-gradient(90deg, rgba(49,179,174,0.3) 0px, rgba(49,179,174,0.3) 2px, transparent 2px, transparent 5px); }
+.timeline-playhead { position: absolute; top: 0; bottom: 0; right: 0; width: 2px; background: #fff; }
+.timeline-mark-in { position: absolute; top: 0; bottom: 0; left: 25%; width: 2px; background: var(--state-success); }
+.timeline-mark-out { position: absolute; top: 0; bottom: 0; left: 65%; width: 2px; background: var(--state-error); }
+.timeline-selection { position: absolute; top: 0; bottom: 0; left: 25%; width: 40%; background: rgba(49,179,174,0.1); }
+.timeline-ruler { position: absolute; top: 4px; left: 8px; right: 8px; display: flex; justify-content: space-between; font-size: 9px; color: var(--text-tertiary); }
+.controls-row { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; flex-wrap: wrap; gap: 8px; }
+.ctrl-group { display: flex; align-items: center; gap: 2px; }
+.ctrl-btn { width: 28px; height: 28px; border-radius: 6px; background: transparent; border: none; color: var(--text-secondary); font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.ctrl-btn:hover { color: var(--text-50); }
+.ctrl-btn.active { color: var(--state-success); }
+.ctrl-btn.active-red { color: var(--state-error); }
+.timecode { font-family: var(--font-mono); font-size: 14px; color: var(--text-primary); }
+.timecode-sep { color: var(--text-tertiary); margin: 0 2px; }
+.zoom-label { font-size: 11px; color: var(--text-tertiary); min-width: 32px; text-align: center; }
+
+/* Right panel */
+.right-panel { width: 320px; border-left: 1px solid var(--border-default); display: flex; flex-direction: column; overflow: hidden; }
+.add-room-card { margin: 16px; margin-bottom: 8px; background: var(--bg-secondary); border-radius: 10px; padding: 12px; }
+.add-room-title { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+.add-room-input { display: flex; gap: 0; }
+.add-room-input input { flex: 1; padding: 6px 12px; border-radius: 6px 0 0 6px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-50); font-size: 13px; }
+.add-room-input .btn { border-radius: 0 6px 6px 0; }
+
+/* Clip list */
+.clip-panel { flex: 1; overflow-y: auto; padding: 0 16px 16px; }
+.clip-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border-default); margin-bottom: 8px; }
+.clip-header-title { font-size: 14px; font-weight: 600; }
+.clip-header-actions { display: flex; gap: 6px; }
+.clip-item { padding: 10px 12px; border-radius: 8px; background: var(--bg-secondary); margin-bottom: 6px; border-left: 3px solid var(--state-warning-dark); }
+.clip-item.confirmed { border-left-color: var(--accent-primary); }
+.clip-item-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.clip-name { font-size: 13px; font-weight: 500; }
+.clip-tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; }
+.clip-tag.pending { background: rgba(255,159,10,0.15); color: var(--state-warning-dark); }
+.clip-tag.ready { background: rgba(49,179,174,0.15); color: var(--accent-primary); }
+.clip-tag.exported { background: rgba(52,199,89,0.15); color: var(--state-success); }
+.clip-meta { font-size: 11px; color: var(--text-tertiary); margin-bottom: 6px; font-family: var(--font-mono); }
+.clip-actions { display: flex; gap: 4px; }
+.clip-btn { padding: 2px 8px; border-radius: 4px; font-size: 11px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-secondary); cursor: pointer; }
+.clip-btn.export { color: var(--accent-primary); border-color: rgba(49,179,174,0.3); }
+.clip-btn.confirm { color: var(--state-warning-dark); border-color: rgba(255,159,10,0.3); }
+.clip-btn.delete { color: var(--state-error); border-color: rgba(255,59,48,0.3); }
+
+/* Settings drawer */
+.settings-overlay { position: fixed; top: 0; right: 0; bottom: 0; width: 520px; background: var(--background-900); border-left: 1px solid var(--border-default); z-index: 1000; display: none; flex-direction: column; }
+.settings-overlay.open { display: flex; }
+.settings-header { padding: 16px 20px; border-bottom: 1px solid var(--border-default); font-size: 16px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+.settings-close { background: none; border: none; color: var(--text-secondary); font-size: 18px; cursor: pointer; }
+.settings-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; gap: 16px; }
+.settings-nav { width: 90px; flex-shrink: 0; display: flex; flex-direction: column; gap: 2px; }
+.settings-nav-item { padding: 6px 10px; font-size: 12px; color: var(--text-secondary); border-radius: 6px; cursor: pointer; text-align: left; background: none; border: none; }
+.settings-nav-item.active { color: var(--text-50); background: var(--bg-tertiary); }
+.settings-main { flex: 1; }
+.settings-section { margin-bottom: 20px; }
+.settings-section-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border-default); display: flex; justify-content: space-between; align-items: center; }
+.settings-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; min-height: 36px; }
+.settings-label { font-size: 13px; color: var(--text-secondary); }
+.toggle { width: 40px; height: 22px; border-radius: 11px; background: var(--state-success); position: relative; }
+.toggle::after { content: ''; position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; }
+.toggle.off { background: var(--bg-tertiary); }
+.toggle.off::after { right: auto; left: 2px; }
+.dep-ok { font-size: 12px; color: var(--state-success); }
+.dep-badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(52,199,89,0.1); color: var(--state-success); }
+.kbd { display: inline-flex; align-items: center; gap: 4px; background: var(--background-700); border: 1px solid var(--border-default); border-radius: 4px; padding: 3px 10px; font-family: var(--font-mono); font-size: 12px; color: var(--text-50); }
+.path-text { font-size: 12px; color: var(--text-400); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+.browse-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-secondary); font-size: 12px; cursor: pointer; }
+.cookie-area { background: var(--background-800); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.cookie-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.cookie-desc { font-size: 12px; color: var(--text-400); line-height: 1.6; margin-bottom: 10px; }
+.cookie-status { font-size: 12px; margin-bottom: 10px; }
+.cookie-status.ok { color: var(--state-success); }
+.cookie-status.warn { color: var(--state-warning); }
+.cookie-textarea { width: 100%; height: 72px; border-radius: 6px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-50); padding: 8px; font-size: 12px; resize: none; margin-bottom: 10px; }
+
+/* Modals */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 2000; }
+.modal-overlay.open { display: flex; }
+.modal { background: var(--background-800); border-radius: 14px; width: 480px; max-height: 80vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+.modal-header { padding: 16px 20px; font-size: 16px; font-weight: 600; border-bottom: 1px solid var(--border-default); }
+.modal-body { padding: 20px; }
+.modal-footer { padding: 12px 20px; border-top: 1px solid var(--border-default); display: flex; justify-content: flex-end; gap: 8px; }
+.modal-row { margin-bottom: 12px; font-size: 13px; }
+.modal-row strong { margin-right: 8px; }
+.radio-group { display: flex; flex-direction: column; gap: 6px; }
+.radio-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.radio-dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--border-default); }
+.radio-dot.checked { border-color: var(--accent-primary); background: var(--accent-primary); box-shadow: inset 0 0 0 3px var(--background-800); }
+.radio-btns { display: flex; gap: 0; }
+.radio-btn { padding: 5px 14px; font-size: 13px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-secondary); cursor: pointer; }
+.radio-btn:first-child { border-radius: 6px 0 0 6px; }
+.radio-btn:last-child { border-radius: 0 6px 6px 0; }
+.radio-btn.active { background: var(--accent-primary); border-color: var(--accent-primary); color: #fff; }
+.switch-row { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 6px; background: var(--bg-tertiary); margin-bottom: 8px; }
+.switch-row strong { font-size: 13px; }
+.switch-desc { font-size: 12px; color: var(--text-secondary); }
+.warn-box { padding: 8px 12px; border-radius: 4px; background: rgba(255,153,10,0.15); font-size: 12px; color: var(--state-warning-dark); border: 1px solid var(--state-warning-dark); margin-bottom: 12px; }
+.info-box { padding: 8px 12px; border-radius: 4px; background: var(--bg-tertiary); font-size: 12px; color: var(--text-secondary); margin-bottom: 12px; }
+
+/* Page visibility */
+.page { display: none; }
+.page.active { display: flex; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ===== SIDEBAR ===== -->
+  <div class="sider">
+    <div class="logo-area">
+      <div class="logo-icon">LSC</div>
+      <div class="logo-text">
+        <div class="name">LSC</div>
+        <div class="sub">Live Stream Clipper</div>
+      </div>
+    </div>
+    <div class="nav-menu">
+      <div class="nav-item active">🖥 多房间管理</div>
+      <div class="nav-item">⚙ 设置</div>
+    </div>
+    <div class="sider-footer">
+      <div class="conn-status">
+        <div class="conn-dot"></div>
+        <span class="conn-label">已连接</span>
+      </div>
+      <div class="sys-monitor">CPU 12% · GPU 34% · 12.4 Mbps</div>
+      <button class="theme-btn">💡 浅色</button>
+    </div>
+  </div>
+
+  <!-- ===== MAIN ===== -->
+  <div class="main-area">
+    <!-- PAGE: WORKBENCH -->
+    <div class="page active" id="page-workbench" data-page="workbench" style="flex-direction:column; height:100%;">
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <div class="toolbar-row">
+          <div class="toolbar-left">
+            <h2 class="page-title">多房间工作台</h2>
+            <span class="room-count">3 个房间</span>
+            <select class="select"><option>默认排序</option><option>按状态</option><option>按平台</option><option>按名称</option></select>
+            <button class="btn btn-sm">分析导出</button>
+            <button class="btn-link">去对齐</button>
+          </div>
+          <div class="toolbar-right">
+            <button class="btn btn-sm">全选</button>
+            <button class="btn btn-sm">🔄 一键对齐</button>
+            <button class="btn btn-sm">↻ 刷新</button>
+            <button class="btn btn-sm">🔊 静音</button>
+            <button class="btn btn-primary">📹 批量录制</button>
+            <button class="btn btn-danger">批量停止</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary);">
+          <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--state-success);"></span>
+          持续分析运行中 · 主房：选手A · 已发现 5 个高光回合
+        </div>
+      </div>
+
+      <!-- Content -->
+      <div class="content-area">
+        <!-- Left: rooms + control bar -->
+        <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+          <div class="room-grid">
+            <!-- Room 1: Recording + LIVE -->
+            <div class="room-card">
+              <div class="room-header">
+                <div class="room-checkbox">✓</div>
+                <span class="room-name">选手A</span>
+                <div class="live-badge"><div class="live-dot"></div><span class="live-text">LIVE</span></div>
+              </div>
+              <div class="room-preview">
+                <div style="color:rgba(255,255,255,0.15);font-size:48px;">▶</div>
+                <div class="preview-controls">
+                  <select class="select" style="width:88px;font-size:11px;"><option>高清 720p</option><option>原画</option><option>标清 480p</option><option>流畅 360p</option></select>
+                  <div class="preview-btns">
+                    <button class="preview-btn">🔊</button>
+                    <button class="preview-btn">⛶</button>
+                    <button class="preview-btn">■</button>
+                  </div>
+                </div>
+                <div class="recording-bar"></div>
+              </div>
+              <div class="recording-meta">
+                <span class="rec-label">录制中</span>
+                <span style="color:var(--text-tertiary)">·</span>
+                <span style="font-family:monospace">已录 01:23:45</span>
+                <span style="color:var(--text-tertiary)">·</span>
+                <span style="font-family:monospace">2.3 GB</span>
+              </div>
+              <div class="room-title">无畏契约 排位赛 冲分中</div>
+              <div class="room-actions">
+                <button class="btn btn-danger btn-sm" style="flex:1;justify-content:center;">■ 停止录制</button>
+                <button class="btn btn-sm" style="flex:1;justify-content:center;">断开</button>
+                <button class="btn-del">🗑</button>
+              </div>
+            </div>
+
+            <!-- Room 2: Connected not recording -->
+            <div class="room-card normal">
+              <div class="room-header">
+                <div class="room-checkbox unchecked">✓</div>
+                <span class="room-name">选手B</span>
+                <div class="live-badge"><div class="live-dot"></div><span class="live-text">LIVE</span></div>
+              </div>
+              <div class="room-preview">
+                <div style="color:rgba(255,255,255,0.15);font-size:48px;">▶</div>
+                <div class="preview-controls">
+                  <select class="select" style="width:88px;font-size:11px;"><option>高清 720p</option></select>
+                  <div class="preview-btns">
+                    <button class="preview-btn">🔇</button>
+                    <button class="preview-btn">⛶</button>
+                    <button class="preview-btn">■</button>
+                  </div>
+                </div>
+              </div>
+              <div class="room-title">VALORANT 竞技模式</div>
+              <div class="room-actions">
+                <button class="btn btn-primary btn-sm" style="flex:1;justify-content:center;">▶ 开始录制</button>
+                <button class="btn btn-sm" style="flex:1;justify-content:center;">断开</button>
+                <button class="btn-del">🗑</button>
+              </div>
+            </div>
+
+            <!-- Room 3: Not connected -->
+            <div class="room-card normal">
+              <div class="room-header">
+                <div class="room-checkbox unchecked">✓</div>
+                <span class="room-name">选手C</span>
+                <div class="review-badge"><div class="review-dot"></div><span class="review-text">回看</span></div>
+              </div>
+              <div class="room-preview">
+                <div style="text-align:center;">
+                  <div style="font-size:36px;color:rgba(255,255,255,0.3);">📷</div>
+                  <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-top:6px;">未连接</div>
+                </div>
+              </div>
+              <div class="room-title">暂无标题</div>
+              <div class="room-actions">
+                <button class="btn btn-primary btn-sm" style="flex:1;justify-content:center;">🔗 连接</button>
+                <button class="btn-del">🗑</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Control Bar -->
+          <div class="control-bar">
+            <div class="timeline-track">
+              <div class="timeline-ruler"><span>0:00:00</span><span>0:02:00</span><span>0:04:00</span><span>0:06:00</span><span>0:08:00</span><span>0:10:00</span></div>
+              <div class="timeline-selection"></div>
+              <div class="timeline-wave"></div>
+              <div class="timeline-mark-in"></div>
+              <div class="timeline-mark-out"></div>
+              <div class="timeline-playhead"></div>
+            </div>
+            <div class="controls-row">
+              <div class="ctrl-group">
+                <button class="ctrl-btn" title="后退10秒">⏮</button>
+                <button class="ctrl-btn" title="播放/暂停" style="font-size:18px;">⏸</button>
+                <button class="ctrl-btn" title="前进10秒">⏭</button>
+                <select class="select" style="width:60px;margin-left:4px;"><option>1×</option><option>0.5×</option><option>1.5×</option><option>2×</option></select>
+                <button class="ctrl-btn active" title="设置入点 (I)">🎯 入点</button>
+                <button class="ctrl-btn active-red" title="设置出点 (O)">🎯 出点</button>
+              </div>
+              <div class="ctrl-group">
+                <span class="timecode">01:23:45</span>
+                <span class="timecode-sep">/</span>
+                <span class="timecode">01:30:00</span>
+              </div>
+              <div class="ctrl-group">
+                <button class="ctrl-btn" title="跳转到直播最新位置">⚡ 直播</button>
+                <button class="ctrl-btn" title="添加到切片列表">✂ 添加切片</button>
+                <button class="ctrl-btn" title="试听选区">🔁</button>
+                <button class="ctrl-btn" title="缩小时间线">➖</button>
+                <span class="zoom-label">1.0x</span>
+                <button class="ctrl-btn" title="放大时间线">➕</button>
+                <button class="ctrl-btn" title="重置缩放">⊡</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Panel -->
+        <div class="right-panel">
+          <div class="add-room-card">
+            <div class="add-room-title">添加直播间</div>
+            <div class="add-room-input">
+              <input type="text" placeholder="粘贴直播间链接...">
+              <button class="btn btn-primary">＋ 添加</button>
+            </div>
+          </div>
+          <div class="clip-panel">
+            <div class="clip-header">
+              <span class="clip-header-title">切片列表 (5)</span>
+              <div class="clip-header-actions">
+                <button class="btn btn-sm">全部确认</button>
+                <button class="btn btn-primary btn-sm">批量导出</button>
+              </div>
+            </div>
+            <!-- Clip items -->
+            <div class="clip-item">
+              <div class="clip-item-top">
+                <span class="clip-name">回合 1 - 选手A</span>
+                <span class="clip-tag pending">待调</span>
+              </div>
+              <div class="clip-meta">00:12:30 → 00:13:15 · 0:45</div>
+              <div class="clip-actions">
+                <button class="clip-btn confirm">确认</button>
+                <button class="clip-btn export">确认并导出</button>
+                <button class="clip-btn delete">删除</button>
+              </div>
+            </div>
+            <div class="clip-item confirmed">
+              <div class="clip-item-top">
+                <span class="clip-name">回合 2 - 选手A</span>
+                <span class="clip-tag ready">可导</span>
+              </div>
+              <div class="clip-meta">00:25:10 → 00:26:02 · 0:52</div>
+              <div class="clip-actions">
+                <button class="clip-btn export">导出</button>
+                <button class="clip-btn">打开文件</button>
+                <button class="clip-btn delete">删除</button>
+              </div>
+            </div>
+            <div class="clip-item confirmed">
+              <div class="clip-item-top">
+                <span class="clip-name">回合 3 - 选手B</span>
+                <span class="clip-tag exported">已导</span>
+              </div>
+              <div class="clip-meta">00:38:44 → 00:39:30 · 0:46</div>
+              <div class="clip-actions">
+                <button class="clip-btn">打开文件</button>
+                <button class="clip-btn">打开目录</button>
+                <button class="clip-btn delete">删除</button>
+              </div>
+            </div>
+            <div class="clip-item">
+              <div class="clip-item-top">
+                <span class="clip-name">回合 4 - 选手A</span>
+                <span class="clip-tag pending">待调</span>
+              </div>
+              <div class="clip-meta">00:51:20 → 00:52:08 · 0:48</div>
+              <div class="clip-actions">
+                <button class="clip-btn confirm">确认</button>
+                <button class="clip-btn export">确认并导出</button>
+                <button class="clip-btn delete">删除</button>
+              </div>
+            </div>
+            <div class="clip-item confirmed">
+              <div class="clip-item-top">
+                <span class="clip-name">回合 5 - 选手B</span>
+                <span class="clip-tag ready">AI可导</span>
+              </div>
+              <div class="clip-meta">01:05:33 → 01:06:21 · 0:48</div>
+              <div class="clip-actions">
+                <button class="clip-btn export">导出</button>
+                <button class="clip-btn delete">删除</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== SETTINGS DRAWER ===== -->
+<div class="settings-overlay open" id="settingsPage" data-page="settings">
+  <div class="settings-header">
+    <span>设置</span>
+    <button class="settings-close">✕</button>
+  </div>
+  <div class="settings-body">
+    <nav class="settings-nav">
+      <button class="settings-nav-item active">通用</button>
+      <button class="settings-nav-item">预览体验</button>
+      <button class="settings-nav-item">系统环境</button>
+      <button class="settings-nav-item">录制与编码</button>
+      <button class="settings-nav-item">AI 分析</button>
+      <button class="settings-nav-item">存储与草稿</button>
+      <button class="settings-nav-item">平台账号</button>
+      <button class="settings-nav-item">快捷键</button>
+      <button class="settings-nav-item">关于与更新</button>
+      <button class="settings-nav-item">日志</button>
+    </nav>
+    <div class="settings-main">
+      <!-- 通用 -->
+      <div class="settings-section">
+        <div class="settings-section-title">通用</div>
+        <div class="settings-row"><span class="settings-label">主题</span><select class="select"><option>深色</option><option>浅色</option></select></div>
+        <div class="settings-row"><span class="settings-label">开机自启</span><div class="toggle"></div></div>
+        <div class="settings-row"><span class="settings-label">最小化到托盘</span><div class="toggle"></div></div>
+      </div>
+      <!-- 预览体验 -->
+      <div class="settings-section">
+        <div class="settings-section-title">预览体验</div>
+        <div class="settings-row"><span class="settings-label">预览画质</span><select class="select"><option>高清 720p</option><option>原画（不缩放）</option><option>标清 480p</option><option>流畅 360p</option></select></div>
+      </div>
+      <!-- 系统环境 -->
+      <div class="settings-section">
+        <div class="settings-section-title">系统环境 <button class="btn btn-text btn-sm">🔄 重新检测</button></div>
+        <div class="settings-row"><span class="settings-label">FFmpeg</span><span class="dep-badge">✓ 6.1.1</span></div>
+        <div class="settings-row"><span class="settings-label">FFprobe</span><span class="dep-badge">✓ 6.1.1</span></div>
+        <div class="settings-row"><span class="settings-label">NVENC 硬件编码</span><span class="dep-badge">✓ h264_nvenc 可用</span></div>
+        <div class="settings-row"><span class="settings-label">Python</span><span class="dep-badge">✓ 3.11.5</span></div>
+      </div>
+      <!-- 录制与编码 -->
+      <div class="settings-section">
+        <div class="settings-section-title">录制与编码</div>
+        <div class="settings-row"><span class="settings-label">默认画质</span><select class="select"><option>原画</option><option>蓝光</option><option>超清</option><option>高清</option><option>流畅</option></select></div>
+        <div class="settings-row"><span class="settings-label">默认编码器</span><select class="select"><option>h264_nvenc (NVIDIA，推荐)</option><option>hevc_nvenc (NVIDIA)</option><option>h264_qsv (Intel)</option><option>h264_amf (AMD)</option><option>copy（直拷，最省）</option><option>libx264（CPU）</option></select></div>
+        <div class="settings-row"><span class="settings-label">编码参数</span><select class="select"><option>CRF 质量</option><option>自定义码率</option><option>不限制</option></select></div>
+        <div class="settings-row"><span class="settings-label">编码预设</span><select class="select"><option>medium（均衡）</option><option>ultrafast（最快）</option><option>fast（快速）</option><option>slow（慢速）</option></select></div>
+        <div class="settings-row"><span class="settings-label">CRF</span><span style="font-size:12px;color:var(--brand-400);font-weight:600;">CRF 23</span></div>
+        <div class="settings-row"><span class="settings-label">录制分辨率</span><select class="select"><option>原画</option><option>1080p</option><option>720p</option><option>480p</option></select></div>
+        <div class="settings-row"><span class="settings-label">录制帧率</span><select class="select"><option>原画</option><option>60 fps</option><option>30 fps</option><option>24 fps</option></select></div>
+        <div class="settings-row"><span class="settings-label">音频编码</span><select class="select"><option>AAC 128k</option><option>AAC 192k</option><option>AAC 256k</option></select></div>
+      </div>
+      <!-- AI 分析 -->
+      <div class="settings-section">
+        <div class="settings-section-title">AI 分析</div>
+        <div class="settings-row"><span class="settings-label">OCR 加速</span><select class="select"><option>DirectML（Windows GPU，推荐）</option><option>自动</option><option>CUDA（NVIDIA）</option><option>仅 CPU</option></select></div>
+        <div class="settings-row"><span class="settings-label">共享进样</span><div class="toggle off"></div></div>
+        <div class="settings-row"><span class="settings-label">并发导出数</span><select class="select"><option>2 路（默认）</option><option>1 路（低负载）</option></select></div>
+        <div class="settings-row"><span class="settings-label">默认导出预设</span><select class="select" style="width:260px;"><option>抖音竖屏 — 1080×1920 竖屏裁切</option><option>横屏原画 — 保持原始分辨率</option><option>B站横屏 — 1920×1080</option></select></div>
+      </div>
+      <!-- 存储与草稿 -->
+      <div class="settings-section">
+        <div class="settings-section-title">存储与草稿</div>
+        <div class="settings-row"><span class="settings-label">存储路径</span><div style="display:flex;align-items:center;gap:8px;"><span class="path-text">D:\Recordings</span><button class="browse-btn">📂 浏览</button></div></div>
+        <div class="settings-row"><span class="settings-label">剪映草稿目录</span><div style="display:flex;align-items:center;gap:8px;"><span class="path-text">C:\JianyingPro\User Data\Projects\com.lveditor.draft</span><button class="browse-btn">更改</button><button class="browse-btn">恢复自动探测</button></div></div>
+      </div>
+      <!-- 平台账号 -->
+      <div class="settings-section">
+        <div class="settings-section-title">平台账号</div>
+        <div class="cookie-area">
+          <div class="cookie-title">抖音 Cookie</div>
+          <div class="cookie-desc">Chrome 新版无法自动读取 Cookie。请在浏览器登录抖音后，用 Cookie-Editor 等插件导出 JSON，粘贴到下方并保存。</div>
+          <div class="cookie-status ok">已配置 12 项（ttwid, sessionid, msToken...）</div>
+          <textarea class="cookie-textarea" placeholder="支持 JSON 对象/数组，或 ttwid=...; sessionid=... 格式"></textarea>
+          <button class="btn btn-primary btn-sm">保存抖音 Cookie</button>
+        </div>
+        <div class="cookie-area">
+          <div class="cookie-title">B站 Cookie</div>
+          <div class="cookie-desc">Windows 下浏览器 Cookie 常无法自动读取。请在浏览器登录 B 站后，用 Cookie-Editor 等插件导出 JSON（需含 SESSDATA）。</div>
+          <div class="cookie-status warn">尚未配置有效 Cookie</div>
+          <textarea class="cookie-textarea" placeholder="支持 JSON 对象/数组，或 SESSDATA=...; bili_jct=... 格式"></textarea>
+          <button class="btn btn-primary btn-sm">保存 B站 Cookie</button>
+        </div>
+      </div>
+      <!-- 快捷键 -->
+      <div class="settings-section">
+        <div class="settings-section-title">快捷键</div>
+        <div class="settings-row"><span class="settings-label">页面：工作台</span><span class="kbd">Ctrl + 1</span></div>
+        <div class="settings-row"><span class="settings-label">页面：设置</span><span class="kbd">Ctrl + 2</span></div>
+        <div class="settings-row"><span class="settings-label">刷新页面</span><span class="kbd">F5</span></div>
+        <div class="settings-row"><span class="settings-label">播放/暂停</span><span class="kbd">Space</span></div>
+        <div class="settings-row"><span class="settings-label">标记入点</span><span class="kbd">I</span></div>
+        <div class="settings-row"><span class="settings-label">标记出点</span><span class="kbd">O</span></div>
+        <div class="settings-row"><span class="settings-label">切换录制</span><span class="kbd">R</span></div>
+        <div class="settings-row"><span class="settings-label">静音/取消静音</span><span class="kbd">M</span></div>
+        <div class="settings-row"><span class="settings-label">放大预览</span><span class="kbd">F</span></div>
+        <div class="settings-row"><span class="settings-label">批量开始录制</span><span class="kbd">Ctrl + R</span></div>
+        <div class="settings-row"><span class="settings-label">批量停止录制</span><span class="kbd">Ctrl + Shift + R</span></div>
+        <div class="settings-row"><span class="settings-label">全选房间</span><span class="kbd">Ctrl + Shift + A</span></div>
+        <div class="settings-row"><span class="settings-label">导出切片</span><span class="kbd">Ctrl + E</span></div>
+      </div>
+      <!-- 关于与更新 -->
+      <div class="settings-section">
+        <div class="settings-section-title">关于与更新</div>
+        <div class="settings-row"><span class="settings-label">版本</span><span style="font-size:13px;color:var(--text-400);">v3.2.0</span></div>
+        <div class="settings-row"><span class="settings-label"></span><div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;"><span style="font-size:12px;color:var(--state-success);">✓ 已是最新版本 v3.2.0</span><button class="btn btn-sm">检查更新</button></div></div>
+      </div>
+      <!-- 日志 -->
+      <div class="settings-section">
+        <div class="settings-section-title">日志 <button class="btn btn-text btn-sm">📂 打开日志目录</button></div>
+        <div style="background:var(--bg-tertiary);border-radius:8px;padding:12px;font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);height:120px;overflow:hidden;">
+          [2026-07-27 14:32:01] INFO  录制已启动 - 选手A<br>
+          [2026-07-27 14:32:03] INFO  预览已启用 - 选手A (720p)<br>
+          [2026-07-27 14:32:05] INFO  持续分析已启动 - 主房: 选手A<br>
+          [2026-07-27 14:33:12] INFO  发现高光回合 #1 (00:12:30-00:13:15)<br>
+          [2026-07-27 14:35:44] INFO  发现高光回合 #2 (00:25:10-00:26:02)<br>
+          [2026-07-27 14:36:01] WARN  预览降为 480p 以保流畅
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== MODAL: 分析导出 ===== -->
+<div class="modal-overlay open" id="modal-analysis" data-page="analysis-modal">
+  <div class="modal">
+    <div class="modal-header">持续分析设置</div>
+    <div class="modal-body">
+      <div class="info-box">边录边分析主直播间高光，自动同步导入所有目标房间的切片列表（目标 3 间）。切片入列后需确认再导出。</div>
+      <div style="margin-bottom:14px;">
+        <div style="font-weight:600;margin-bottom:8px;">主直播间（用于高光分析）</div>
+        <div class="radio-group">
+          <div class="radio-item"><div class="radio-dot checked"></div>选手A</div>
+          <div class="radio-item"><div class="radio-dot"></div>选手B</div>
+          <div class="radio-item"><div class="radio-dot"></div>选手C <span style="color:var(--state-error);margin-left:8px;">（无录制文件）</span></div>
+        </div>
+      </div>
+      <div style="margin-bottom:14px;">
+        <div style="font-weight:600;margin-bottom:8px;">直播类型</div>
+        <div class="radio-btns">
+          <button class="radio-btn active">无畏契约</button>
+          <button class="radio-btn">通用直播</button>
+        </div>
+        <div style="margin-top:6px;font-size:12px;color:var(--text-secondary);">自动适配游戏视角与赛事解说画面，回合入列后需确认再导出</div>
+      </div>
+      <div class="switch-row">
+        <strong>持续分析</strong>
+        <div class="toggle"></div>
+        <span class="switch-desc">边录边分析。结束时请先停录，再等状态变为「收尾中/已完成」</span>
+      </div>
+      <div class="switch-row">
+        <strong>完成后生成剪映草稿</strong>
+        <div class="toggle off"></div>
+        <span class="switch-desc">多房间须已一键对齐；结束后自动生成一份草稿</span>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn">取消</button>
+      <button class="btn btn-primary">开始持续分析</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== MODAL: 导出切片预览 ===== -->
+<div class="modal-overlay" id="modal-export" data-page="export-modal">
+  <div class="modal" style="width:420px;">
+    <div class="modal-header">导出切片预览</div>
+    <div class="modal-body">
+      <div class="modal-row"><strong>房间：</strong>选手A</div>
+      <div class="modal-row"><strong>入点：</strong>00:12:30</div>
+      <div class="modal-row"><strong>出点：</strong>00:13:15</div>
+      <div class="modal-row"><strong>时长：</strong>0:45</div>
+      <div style="margin-top:12px;">
+        <strong style="font-size:13px;">导出预设</strong>
+        <select class="select" style="width:100%;margin-top:6px;"><option>抖音竖屏 — 1080×1920</option><option>横屏原画</option><option>B站横屏 — 1920×1080</option></select>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn">取消</button>
+      <button class="btn btn-primary">确认导出</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== MODAL: 剪映草稿已生成 ===== -->
+<div class="modal-overlay" id="modal-jianying" data-page="jianying-modal">
+  <div class="modal" style="width:420px;">
+    <div class="modal-header">剪映草稿已生成</div>
+    <div class="modal-body">
+      <div class="modal-row">草稿名：LSC_选手A_20260727</div>
+      <div class="modal-row">轨道：3 片段：5</div>
+      <div style="color:var(--text-tertiary);font-size:12px;margin-top:8px;">剪映中需重启或进出一次草稿以刷新列表</div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn">关闭</button>
+      <button class="btn btn-primary">打开草稿目录</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

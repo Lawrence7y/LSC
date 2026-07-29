@@ -7,7 +7,7 @@ from typing import Any
 
 import websockets
 from websockets.exceptions import ConnectionClosed
-from ws_auth import extract_token_from_path, is_origin_allowed, validate_ws_token
+from ws_auth import is_origin_allowed, validate_ws_token
 
 _log = logging.getLogger('lsc.server')
 

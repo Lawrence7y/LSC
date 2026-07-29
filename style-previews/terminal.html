@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Terminal · 赛博终端风格</title>
+<style>
+  :root {
+    --bg: #0a0e0a;
+    --surface: #0d1f0d;
+    --border: #1a3a1a;
+    --text: #00ff41;
+    --text-dim: #00b32d;
+    --text-muted: #0d8a25;
+    --accent: #00ff41;
+    --warning: #ffb000;
+    --error: #ff3333;
+    --info: #00bfff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Consolas', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    position: relative;
+  }
+  /* 扫描线效果 */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.1) 2px,
+      rgba(0,0,0,0.1) 4px
+    );
+    pointer-events: none;
+    z-index: 1000;
+  }
+  /* 屏幕发光 */
+  body::after {
+    content: '';
+    position: fixed; inset: 0;
+    box-shadow: inset 0 0 150px rgba(0,255,65,0.03);
+    pointer-events: none;
+    z-index: 999;
+  }
+
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 16px;
+    height: 40px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .logo { font-weight: 700; font-size: 14px; }
+  .logo::before { content: 'λ '; opacity: 0.6; }
+  .nav { display: flex; gap: 2px; }
+  .nav span {
+    padding: 4px 10px; font-size: 11px; color: var(--text-muted);
+    cursor: pointer; border: 1px solid transparent;
+  }
+  .nav span:hover { color: var(--text); }
+  .nav span.active {
+    color: var(--bg); background: var(--text);
+  }
+  .topbar-right { font-size: 11px; color: var(--text-muted); }
+  .topbar-right .blink::after {
+    content: '█';
+    animation: blink 1s step-end infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .main {
+    padding: 16px;
+    display: grid;
+    grid-template-columns: 220px 1fr 260px;
+    gap: 12px;
+    max-width: 1600px; margin: 0 auto;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .panel-header {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .panel-header::before { content: '[ '; opacity: 0.5; }
+  .panel-header::after { content: ' ]'; opacity: 0.5; }
+  .panel-body { padding: 12px; }
+
+  /* 左侧栏 */
+  .room-item {
+    padding: 8px 10px; margin-bottom: 4px;
+    cursor: pointer; transition: all 0.15s;
+    border-left: 2px solid transparent;
+    font-size: 12px;
+  }
+  .room-item:hover { background: rgba(0,255,65,0.05); }
+  .room-item.active {
+    border-left-color: var(--accent);
+    background: rgba(0,255,65,0.08);
+  }
+  .room-item .name { margin-bottom: 2px; }
+  .room-item .meta { font-size: 10px; color: var(--text-muted); }
+  .status-live { color: var(--accent); }
+  .status-rec { color: var(--warning); }
+  .status-off { color: var(--text-muted); }
+
+  /* 中间 */
+  .preview-area { display: flex; flex-direction: column; gap: 12px; }
+  .preview-header { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; }
+  .preview-header h2 { font-size: 13px; font-weight: 600; }
+  .preview-header h2::before { content: '$ ./'; opacity: 0.5; }
+  .btn-group { display: flex; gap: 8px; }
+  .btn {
+    padding: 5px 12px; font-size: 11px;
+    border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer;
+    font-family: inherit; text-transform: uppercase; letter-spacing: 0.5px;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: rgba(0,255,65,0.1); border-color: var(--text-muted); }
+  .btn-primary {
+    background: var(--text); color: var(--bg); border-color: var(--text);
+  }
+  .btn-primary:hover { background: var(--text-dim); }
+
+  .preview-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .preview-card {
+    aspect-ratio: 16/9;
+    background: #000;
+    border: 1px solid var(--border);
+    position: relative;
+    overflow: hidden;
+  }
+  .preview-card::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      rgba(0,255,65,0.03) 0px,
+      rgba(0,255,65,0.03) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+  }
+  .preview-card .info {
+    position: absolute; bottom: 6px; left: 8px;
+    font-size: 10px; color: var(--text-muted);
+  }
+  .preview-card .badge-live {
+    position: absolute; top: 6px; left: 8px;
+    font-size: 9px; color: var(--error);
+    animation: blink 1.5s step-end infinite;
+  }
+
+  /* 时间线 */
+  .timeline-track {
+    height: 40px;
+    background: #000;
+    border: 1px solid var(--border);
+    position: relative; overflow: hidden;
+  }
+  .timeline-segment {
+    position: absolute; top: 4px; height: 32px;
+    background: rgba(0,255,65,0.2);
+    border: 1px solid var(--text-dim);
+  }
+  .timeline-cursor {
+    position: absolute; top: 0; bottom: 0; width: 1px;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+  }
+
+  /* 右侧 */
+  .stat-row {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 8px 0; border-bottom: 1px dashed var(--border);
+  }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-row .label { font-size: 11px; color: var(--text-muted); }
+  .stat-row .value { font-size: 16px; font-weight: 700; }
+
+  .clip-item {
+    padding: 6px 0;
+    font-size: 11px; cursor: pointer;
+    border-bottom: 1px dashed var(--border);
+    color: var(--text-dim);
+  }
+  .clip-item:hover { color: var(--text); }
+  .clip-item::before { content: '> '; opacity: 0.4; }
+
+  .log-area {
+    margin-top: 12px;
+    padding: 10px;
+    background: #000;
+    border: 1px solid var(--border);
+    font-size: 10px;
+    max-height: 120px;
+    overflow: hidden;
+    color: var(--text-muted);
+  }
+  .log-line { margin-bottom: 2px; }
+  .log-line .time { color: var(--text-muted); opacity: 0.6; }
+  .log-line .msg-ok { color: var(--accent); }
+  .log-line .msg-warn { color: var(--warning); }
+  .log-line .msg-err { color: var(--error); }
+
+  .back-btn {
+    position: fixed; top: 50px; right: 16px; z-index: 2000;
+    padding: 4px 10px; font-size: 10px;
+    background: var(--surface); color: var(--text);
+    text-decoration: none;
+    border: 1px solid var(--border);
+    font-family: inherit; text-transform: uppercase;
+  }
+  .back-btn:hover { background: rgba(0,255,65,0.1); }
+</style>
+</head>
+<body>
+<a href="index.html" class="back-btn">[ 返回 ]</a>
+
+<div class="topbar">
+  <div class="logo">LSC_TERMINAL v2.4.1</div>
+  <div class="nav">
+    <span>DASHBOARD</span>
+    <span class="active">WORKBENCH</span>
+    <span>CONFIG</span>
+  </div>
+  <div class="topbar-right">
+    <span>PID:8842</span>
+    <span style="margin-left:12px" class="blink"></span>
+  </div>
+</div>
+
+<div class="main">
+  <!-- 左侧 -->
+  <div class="panel">
+    <div class="panel-header">ROOMS</div>
+    <div class="panel-body">
+      <div class="room-item active">
+        <div class="name">01. STREAMER_A · VALORANT</div>
+        <div class="meta"><span class="status-live">● LIVE</span> · 123K · 8.2Mbps</div>
+      </div>
+      <div class="room-item">
+        <div class="name">02. STREAMER_B · CHAT</div>
+        <div class="meta"><span class="status-live">● LIVE</span> · 81K · 6.1Mbps</div>
+      </div>
+      <div class="room-item">
+        <div class="name">03. STREAMER_C · CS2</div>
+        <div class="meta"><span class="status-rec">● REC</span> · 45K · 7.8Mbps</div>
+      </div>
+      <div class="room-item">
+        <div class="name">04. STREAMER_D</div>
+        <div class="meta"><span class="status-off">○ OFFLINE</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 中间 -->
+  <div class="preview-area">
+    <div class="preview-header">
+      <h2>multi_room_preview</h2>
+      <div class="btn-group">
+        <button class="btn">ALIGN</button>
+        <button class="btn btn-primary">RECORD</button>
+      </div>
+    </div>
+    <div class="preview-grid">
+      <div class="preview-card">
+        <span class="badge-live">● LIVE</span>
+        <div class="info">CAM_01 · 00:14:32 · 1080p60</div>
+      </div>
+      <div class="preview-card">
+        <span class="badge-live">● LIVE</span>
+        <div class="info">CAM_02 · 00:08:15 · 1080p60</div>
+      </div>
+      <div class="preview-card">
+        <div class="info">CAM_03 · 00:22:41 · 720p60</div>
+      </div>
+      <div class="preview-card" style="display:flex;align-items:center;justify-content:center;color:var(--border);font-size:11px;">
+        [ ADD ROOM ]
+      </div>
+    </div>
+    <div class="panel" style="margin-top:0">
+      <div class="panel-header">TIMELINE · MARK_IN=I / MARK_OUT=O</div>
+      <div class="panel-body">
+        <div class="timeline-track">
+          <div class="timeline-segment" style="left:10%;width:15%"></div>
+          <div class="timeline-segment" style="left:40%;width:20%"></div>
+          <div class="timeline-segment" style="left:75%;width:12%"></div>
+          <div class="timeline-cursor" style="left:55%"></div>
+        </div>
+      </div>
+    </div>
+    <div class="log-area">
+      <div class="log-line"><span class="time">[14:32:01]</span> <span class="msg-ok">OK</span> room_01 stream connected</div>
+      <div class="log-line"><span class="time">[14:32:03]</span> <span class="msg-ok">OK</span> room_02 stream connected</div>
+      <div class="log-line"><span class="time">[14:32:05]</span> <span class="msg-warn">WARN</span> room_03 bitrate drop 8.2→6.1Mbps</div>
+      <div class="log-line"><span class="time">[14:32:08]</span> <span class="msg-ok">OK</span> align_offset computed: +0.34s</div>
+      <div class="log-line"><span class="time">[14:32:11]</span> <span class="msg-err">ERR</span> room_04 connection timeout</div>
+    </div>
+  </div>
+
+  <!-- 右侧 -->
+  <div>
+    <div class="panel" style="margin-bottom:12px">
+      <div class="panel-header">STATUS</div>
+      <div class="panel-body">
+        <div class="stat-row">
+          <span class="label">UPTIME</span>
+          <span class="value">14:32:08</span>
+        </div>
+        <div class="stat-row">
+          <span class="label">CLIPS TODAY</span>
+          <span class="value">47</span>
+        </div>
+        <div class="stat-row">
+          <span class="label">DISK FREE</span>
+          <span class="value" style="color:var(--warning)">182GB</span>
+        </div>
+        <div class="stat-row">
+          <span class="label">CPU / GPU</span>
+          <span class="value">34% / 67%</span>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-header">RECENT_CLIPS</div>
+      <div class="panel-body">
+        <div class="clip-item">CLIP_2847 · ACE · 02:14</div>
+        <div class="clip-item">CLIP_2846 · 1V3 · 01:08</div>
+        <div class="clip-item">CLIP_2845 · MOMENT · 00:45</div>
+        <div class="clip-item">CLIP_2844 · COMEBACK · 03:22</div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

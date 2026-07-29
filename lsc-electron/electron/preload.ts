@@ -2,8 +2,9 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 let _updateStatusCallback: ((status: any) => void) | null = null
 let _updateStatusWrapper: ((_event: any, status: any) => void) | null = null
-let _backendErrorCallback: ((error: string) => void) | null = null
-let _backendErrorWrapper: ((_event: any, error: any) => void) | null = null
+// backend-error 改为多注册安全：每次 on 独立 wrapper，返回单条注销函数；
+// removeBackendErrorListeners 通过集合全量清除（兼容旧调用方）
+const _backendErrorWrappers = new Set<(_event: any, error: any) => void>()
 let _appSettingsWrapper: ((_event: any, settings: any) => void) | null = null
 
 export interface AppAPI {
@@ -68,19 +69,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBackendError: () =>
     ipcRenderer.invoke('get-backend-error'),
   onBackendError: (callback: (error: string) => void) => {
-    if (_backendErrorWrapper) {
-      ipcRenderer.removeListener('backend-error', _backendErrorWrapper)
+    const wrapper = (_event: any, error: any) => callback(error)
+    _backendErrorWrappers.add(wrapper)
+    ipcRenderer.on('backend-error', wrapper)
+    // 返回单条注销函数：调用方卸载时只注销自己，不误删其他模块的监听
+    return () => {
+      _backendErrorWrappers.delete(wrapper)
+      ipcRenderer.removeListener('backend-error', wrapper)
     }
-    _backendErrorWrapper = (_event: any, error: any) => callback(error)
-    _backendErrorCallback = callback
-    ipcRenderer.on('backend-error', _backendErrorWrapper)
   },
   removeBackendErrorListeners: () => {
-    if (_backendErrorWrapper) {
-      ipcRenderer.removeListener('backend-error', _backendErrorWrapper)
-      _backendErrorWrapper = null
-      _backendErrorCallback = null
+    for (const wrapper of _backendErrorWrappers) {
+      ipcRenderer.removeListener('backend-error', wrapper)
     }
+    _backendErrorWrappers.clear()
   },
 
   // 日志查看

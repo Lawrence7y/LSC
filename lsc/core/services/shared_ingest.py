@@ -17,8 +17,10 @@ from lsc.platforms.base import headers_to_ffmpeg_input_args
 from lsc.utils.process_launcher import prepare_launch
 
 _log = get_logger(__name__)
-STARTUP_PROBE_TIMEOUT_SEC = 10.0
+STARTUP_PROBE_TIMEOUT_SEC = 15.0
 STARTUP_PROBE_INTERVAL_SEC = 0.2
+# 上游连接超时后仍无数据则快速失败（上游 -timeout 为 10s，加 3s 缓冲）
+_UPSTREAM_NO_DATA_FAST_FAIL_SEC = 13.0
 TS_PACKET_SIZE = 188
 _WRITE_TIMEOUT_SEC = 10.0
 # 预览 stdout 超过该秒数无数据视为挂死，触发 on_error / 进程恢复
@@ -258,6 +260,7 @@ class SharedRoomIngest:
         self._stderr_buffer: deque[str] = deque(maxlen=100)
         self._recording_stderr_buffer: deque[str] = deque(maxlen=100)
         self._preview_stderr_buffer: deque[str] = deque(maxlen=100)
+        self._upstream_has_produced_data = False
 
     @property
     def preview_subscribers(self) -> int:
@@ -587,9 +590,24 @@ class SharedRoomIngest:
             return self._recording_start_failed(upstream_error)
         if not self._wait_for_startup_data(recording_path):
             tail = self._stderr_tail(self._recording_stderr_buffer)
-            error = "recording ffmpeg startup probe failed"
-            if tail:
-                error = f"{error} | stderr: {tail}"
+            upstream_tail = self._stderr_tail(self._stderr_buffer)
+            # 优先使用上游 stderr 诊断（包含真实连接错误）
+            if upstream_tail and ("Connection refused" in upstream_tail
+                                  or "timed out" in upstream_tail
+                                  or "403" in upstream_tail
+                                  or "404" in upstream_tail
+                                  or "Connection reset" in upstream_tail
+                                  or "End of file" in upstream_tail
+                                  or "could not find codec" in upstream_tail):
+                error = f"录制启动失败：直播流连接异常（流地址可能已过期，请重新连接房间）| upstream: {upstream_tail}"
+            elif not self._upstream_has_produced_data:
+                error = "录制启动失败：直播流无数据返回（流地址可能已过期或主播已下播）"
+                if upstream_tail:
+                    error = f"{error} | upstream: {upstream_tail}"
+            else:
+                error = "recording ffmpeg startup probe failed"
+                if tail:
+                    error = f"{error} | stderr: {tail}"
             self._stop_recording_process()
             self._stop_upstream_if_idle(reason=error)
             return self._recording_start_failed(error)
@@ -733,6 +751,7 @@ class SharedRoomIngest:
             self.upstream_error = ""
             self.is_stopped = False
             self.stop_reason = ""
+        self._upstream_has_produced_data = False
         self._start_stderr_reader(proc, self._stderr_buffer, "upstream")
         self._upstream_thread = self._start_thread(
             self._read_upstream_stdout_loop,
@@ -836,6 +855,8 @@ class SharedRoomIngest:
                 self.handle_upstream_error(f"shared ingest upstream read failed: {exc}", proc)
 
     def _dispatch_ts_batch(self, batch: bytes) -> None:
+        if not self._upstream_has_produced_data:
+            self._upstream_has_produced_data = True
         with self._lock:
             recording = self._recording_process if self.recording_active else None
         if recording is not None:
@@ -1047,6 +1068,7 @@ class SharedRoomIngest:
 
     def _wait_for_startup_data(self, recording_path: str) -> bool:
         deadline = time.monotonic() + STARTUP_PROBE_TIMEOUT_SEC
+        fast_fail_at = time.monotonic() + _UPSTREAM_NO_DATA_FAST_FAIL_SEC
         while True:
             if self._recording_output_has_started(recording_path):
                 if self.recording_media_start_mono <= 0:
@@ -1062,6 +1084,16 @@ class SharedRoomIngest:
                 if started and self.recording_media_start_mono <= 0:
                     self.recording_media_start_mono = time.monotonic()
                 return started
+            # 快速失败：上游超时仍无数据，检查上游 stderr 诊断原因
+            if not self._upstream_has_produced_data and time.monotonic() >= fast_fail_at:
+                upstream_tail = self._stderr_tail(self._stderr_buffer)
+                _log.warning(
+                    "shared ingest upstream no data after %.0fs room=%s upstream_stderr: %s",
+                    _UPSTREAM_NO_DATA_FAST_FAIL_SEC,
+                    self.room_id,
+                    upstream_tail or "(empty)",
+                )
+                return False
             if time.monotonic() >= deadline:
                 return False
             time.sleep(STARTUP_PROBE_INTERVAL_SEC)

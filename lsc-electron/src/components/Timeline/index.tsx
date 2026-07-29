@@ -42,6 +42,8 @@ interface TimelineProps {
   followLive?: boolean
   /** 父级 scrub 中（冻结窗）；订阅直写时跳过以免打架 */
   isScrubbing?: boolean
+  /** 回直播浮动按钮回调（仅 followLive=false 时显示） */
+  onGoLive?: () => void
 }
 
 const DEFAULT_CLIP_COLOR = 'rgba(63, 131, 248, 0.72)'
@@ -187,6 +189,7 @@ export function Timeline({
   recordedEnd = null,
   followLive = false,
   isScrubbing = false,
+  onGoLive,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
@@ -250,11 +253,15 @@ export function Timeline({
     return () => observer.disconnect()
   }, [])
 
-  // 卸载时清掉可能残留的 window 监听
+  // 卸载时清掉可能残留的 window 监听 + snapFlash 定时器
   useEffect(() => {
     return () => {
       windowDragCleanupRef.current?.()
       windowDragCleanupRef.current = null
+      if (snapFlashTimer.current) {
+        clearTimeout(snapFlashTimer.current)
+        snapFlashTimer.current = null
+      }
     }
   }, [])
 
@@ -616,18 +623,37 @@ export function Timeline({
             {highlights.map((h) => {
               const left = clamp((h.start / effectiveDuration) * 100, 0, 100)
               const width = clamp(((h.end - h.start) / effectiveDuration) * 100, 0, 100 - left)
-              const title = [h.reason || h.label || 'AI 高光', h.score != null ? `score ${h.score.toFixed(2)}` : ''].filter(Boolean).join(' · ')
+              const dur = h.end - h.start
+              const isPending = h.confirm_status === 'pending' || h.confirm_status === 'refining'
+              const statusLabel = h.confirm_status === 'pending' ? '待确认'
+                : h.confirm_status === 'refining' ? '调整中'
+                : h.confirm_status === 'user_confirmed' ? '已确认'
+                : h.confirm_status === 'ocr_confirmed' ? 'AI可导'
+                : h.confirm_status === 'vision_confirmed' ? '视觉确认'
+                : ''
+              const title = [
+                h.reason || h.label || 'AI 高光',
+                h.score != null ? `score ${h.score.toFixed(2)}` : '',
+                `${formatTickTime(h.start)}–${formatTickTime(h.end)}（${formatTickTime(dur)}）`,
+                statusLabel,
+              ].filter(Boolean).join(' · ')
               return (
                 <div
                   key={h.id}
-                  className="lsc-timeline__highlight"
+                  className={`lsc-timeline__highlight${isPending ? '' : ' lsc-timeline__highlight--confirmed'}`}
                   style={{ left: `${left}%`, width: `${width}%` }}
                   title={title}
                   onClick={(e) => {
                     e.stopPropagation()
                     onHighlightClick?.(h)
                   }}
-                />
+                >
+                  {width >= 4 && h.label && (
+                    <span className="lsc-timeline__highlight-label">
+                      {h.label}{width >= 7 ? ` · ${formatTickTime(dur)}` : ''}
+                    </span>
+                  )}
+                </div>
               )
             })}
 
@@ -650,12 +676,13 @@ export function Timeline({
               )
             })()}
 
-            {clips.map((clip, index) => {
+            {clips.map((clip) => {
               const left = clamp((clip.start / effectiveDuration) * 100, 0, 100)
               const width = clamp(((clip.end - clip.start) / effectiveDuration) * 100, 0, 100 - left)
+              const clipKey = clip.color ? `${clip.start}-${clip.end}-${clip.color}` : `${clip.start}-${clip.end}`
               return (
                 <div
-                  key={index}
+                  key={clipKey}
                   className="lsc-timeline__clip"
                   style={{
                     left: `${left}%`,
@@ -714,7 +741,7 @@ export function Timeline({
               ref={playheadRef}
               className={`lsc-timeline__playhead ${
                 snapFlash?.type === 'playhead' ? 'lsc-timeline__playhead--snap' : ''
-              }`}
+              }${dragTime != null ? ' lsc-timeline__playhead--dragging' : ''}`}
               style={{ left: `${progressPct}%` }}
             />
 
@@ -726,10 +753,19 @@ export function Timeline({
           </div>
         </div>
       </div>
-      <div className="lsc-timeline__timecode">
-        <span>{formatTime(ws)}</span>
-        <span>{formatTime(ws + effectiveDuration)}</span>
-      </div>
+      {!followLive && onGoLive && (
+        <button
+          type="button"
+          className="lsc-timeline__go-live"
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation()
+            onGoLive()
+          }}
+        >
+          回直播
+        </button>
+      )}
     </div>
   )
 }

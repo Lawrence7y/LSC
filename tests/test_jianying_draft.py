@@ -121,6 +121,16 @@ def test_resolve_common_range_exact_fields():
     )
 
 
+def test_resolve_common_range_single_room_identity_fallback():
+    """单房无 timeline ctx：recording 时间恒等映射为 common 坐标（delta=0）。"""
+    clip = {"start": 1445.1, "end": 1510.0, "room_id": "r1", "confirm_status": "pending"}
+    assert resolve_common_range(clip, None) == (1445.1, 1510.0, "exact")
+    # start/end 无效时仍返回 None
+    assert resolve_common_range({"start": "x", "end": 1.0}, None) is None
+    assert resolve_common_range({"start": 5.0, "end": 5.0}, None) is None
+    assert resolve_common_range({}, None) is None
+
+
 import json
 import shutil
 import subprocess

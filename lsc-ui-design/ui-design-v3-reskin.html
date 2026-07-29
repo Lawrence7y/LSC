@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSC 工作台 · v3 体系内换肤原型</title>
+<style>
+/* ============================================================
+   LSC v3 原型 — 方案A：体系内换肤
+   保留：#31B3AE 品牌色 / SF Pro / 圆角规范 / CSS变量架构
+   调整：纯黑底座 → 深灰三层抬升；teal 对比度提升；卡片描边层次
+   ============================================================ */
+:root {
+  /* brand (不变) */
+  --brand-400: #4DC4BF;
+  --brand-500: #31B3AE;
+  --brand-600: #279E99;
+
+  /* 表面三层抬升（原 #000/#1c1c1e/#2c2c2e → 深灰分层） */
+  --surface-0: #0d0d0f;   /* 底座 */
+  --surface-1: #161618;   /* 面板/卡片 */
+  --surface-2: #1e1e20;   /* 浮起层/控件底 */
+  --surface-3: #262628;   /* hover/更强分层 */
+
+  /* 描边层次（原单一 0.08 → 三档） */
+  --border-subtle: rgba(255,255,255,0.05);
+  --border-default: rgba(255,255,255,0.09);
+  --border-strong: rgba(255,255,255,0.14);
+
+  /* 文本（不变） */
+  --text-50: #f5f5f7;
+  --text-200: #c7c7cc;
+  --text-400: #8e8e93;
+  --text-500: #6e6e73;
+
+  /* 状态（不变） */
+  --state-success: #30d158;
+  --state-error: #ff453a;
+  --state-warning: #ff9f0a;
+  --state-live: #ff453a;
+  --state-dvr: #bf5af2;   /* DVR 紫标（冻结） */
+
+  /* 圆角（不变：控件6/默认8/卡片小10/分区14/大面板18） */
+  --radius-xs: 6px;
+  --radius-md: 8px;
+  --radius-sm: 10px;
+  --radius: 14px;
+  --radius-lg: 18px;
+
+  --font-sans: 'SF Pro Display', 'PingFang SC', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SF Mono', 'JetBrains Mono', 'Menlo', monospace;
+
+  /* 组件高度规范（不变） */
+  --h-control-sm: 26px;
+  --h-control: 32px;
+  --h-header: 52px;       /* 原两行 ~100px → 单行 52px */
+  --h-controlbar: 148px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  font-family: var(--font-sans);
+  background: var(--surface-0);
+  color: var(--text-50);
+  font-size: 13px;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app { display: flex; height: 100vh; }
+
+/* ================= 左侧 Sider（结构不变，仅换表面色） ================= */
+.sider {
+  width: 200px; flex-shrink: 0;
+  background: var(--surface-1);
+  border-right: 1px solid var(--border-subtle);
+  display: flex; flex-direction: column;
+}
+.sider-logo {
+  display: flex; align-items: center; gap: 10px;
+  padding: 18px 16px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.sider-logo .logo-mark {
+  width: 32px; height: 32px; border-radius: var(--radius-md);
+  background: linear-gradient(135deg, var(--brand-500), var(--brand-600));
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 13px; color: #fff; flex-shrink: 0;
+}
+.sider-logo .name { font-size: 15px; font-weight: 700; letter-spacing: .02em; line-height: 1; }
+.sider-logo .sub { font-size: 10px; color: var(--text-400); margin-top: 3px; letter-spacing: .01em; }
+
+.nav { flex: 1; padding: 12px 8px; }
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-radius: var(--radius-md);
+  color: var(--text-200); font-size: 13px; cursor: pointer;
+  transition: background .15s;
+}
+.nav-item:hover { background: var(--surface-2); }
+.nav-item.active {
+  background: rgba(77,196,191,0.12);
+  color: var(--brand-400);
+  font-weight: 500;
+}
+.nav-item .ico { width: 16px; text-align: center; opacity: .9; }
+
+.sider-footer {
+  padding: 10px 12px 14px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.conn-pill {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px; width: 100%; justify-content: center;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xs);
+  font-size: 12px; color: var(--text-200);
+}
+.conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--state-success); box-shadow: 0 0 8px var(--state-success); }
+.sys-stats { display: flex; gap: 10px; font-size: 10px; color: var(--text-500); font-family: var(--font-mono); }
+.theme-btn {
+  border: none; background: none; color: var(--text-400);
+  font-size: 12px; cursor: pointer; font-family: inherit;
+  display: flex; align-items: center; gap: 5px; padding: 4px 8px;
+  border-radius: var(--radius-xs);
+}
+.theme-btn:hover { background: var(--surface-2); color: var(--text-200); }
+
+/* ================= 主区 ================= */
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+/* ---------- 头部：两行 → 单行 52px ---------- */
+.header {
+  height: var(--h-header); flex-shrink: 0;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 20px;
+}
+.header-title { display: flex; align-items: baseline; gap: 8px; flex-shrink: 0; }
+.header-title h1 { font-size: 15px; font-weight: 600; }
+.room-count {
+  font-size: 11px; color: var(--text-400);
+  background: var(--surface-2); border: 1px solid var(--border-subtle);
+  padding: 2px 8px; border-radius: 99px; font-family: var(--font-mono);
+}
+
+/* 三步流水线（核心新增：对齐 → 分析 → 导出 引导线） */
+.pipeline {
+  display: flex; align-items: center; gap: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 99px; padding: 3px;
+  margin: 0 auto;
+}
+.pipe-step {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 14px; border-radius: 99px;
+  font-size: 12px; color: var(--text-400);
+  cursor: pointer; border: none; background: none;
+  font-family: inherit; white-space: nowrap;
+  transition: all .18s;
+}
+.pipe-step .num {
+  width: 17px; height: 17px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 600; font-family: var(--font-mono);
+  background: var(--surface-3); color: var(--text-400);
+  transition: all .18s;
+}
+.pipe-step.done { color: var(--text-200); }
+.pipe-step.done .num { background: rgba(48,209,88,0.18); color: var(--state-success); }
+.pipe-step.active {
+  background: rgba(77,196,191,0.14); color: var(--brand-400); font-weight: 500;
+}
+.pipe-step.active .num { background: var(--brand-500); color: #fff; }
+.pipe-step.attention { color: var(--state-warning); }
+.pipe-step.attention .num { background: rgba(255,159,10,0.18); color: var(--state-warning); }
+.pipe-step:disabled { cursor: default; opacity: .55; }
+.pipe-arrow { color: var(--text-500); font-size: 10px; padding: 0 2px; user-select: none; }
+.pipe-analysis-meta {
+  font-size: 10px; font-family: var(--font-mono);
+  color: var(--brand-400); opacity: .85; margin-left: 2px;
+}
+
+/* 头部右侧操作组 */
+.header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: auto; }
+
+.btn {
+  height: var(--h-control); padding: 0 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--surface-2); color: var(--text-50);
+  font-size: 12px; font-weight: 500; font-family: inherit;
+  cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+  transition: all .15s; white-space: nowrap;
+}
+.btn:hover { background: var(--surface-3); border-color: var(--border-strong); }
+.btn-primary {
+  background: var(--brand-500); border-color: transparent; color: #fff;
+}
+.btn-primary:hover { background: var(--brand-400); }
+.btn-danger-ghost {
+  background: rgba(255,69,58,0.10); border-color: rgba(255,69,58,0.25); color: var(--state-error);
+}
+.btn-danger-ghost:hover { background: rgba(255,69,58,0.18); border-color: rgba(255,69,58,0.4); }
+.btn-sm { height: var(--h-control-sm); padding: 0 10px; font-size: 11px; }
+
+/* 图标按钮（全选/全静音/更多 收纳处） */
+.icon-btn {
+  width: var(--h-control); height: var(--h-control);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--surface-2); color: var(--text-200);
+  cursor: pointer; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 14px; transition: all .15s; position: relative;
+}
+.icon-btn:hover { background: var(--surface-3); color: var(--text-50); border-color: var(--border-strong); }
+.icon-btn.on { color: var(--brand-400); border-color: rgba(77,196,191,0.4); background: rgba(77,196,191,0.10); }
+
+/* 下拉（刷新按钮改 Dropdown：刷新预览 / 全部重启） */
+.dropdown { position: relative; }
+.dropdown-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 200;
+  min-width: 168px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+  padding: 5px; display: none;
+}
+.dropdown.open .dropdown-menu { display: block; }
+.dropdown-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 10px; border: none; background: none; border-radius: var(--radius-xs);
+  color: var(--text-200); font-size: 12px; font-family: inherit; cursor: pointer;
+  text-align: left;
+}
+.dropdown-item:hover { background: var(--surface-3); color: var(--text-50); }
+.dropdown-item.danger { color: var(--state-error); }
+.dropdown-item.danger:hover { background: rgba(255,69,58,0.12); }
+.dropdown-item .hint { margin-left: auto; font-size: 10px; color: var(--text-500); }
+
+/* ---------- 内容区 ---------- */
+.content { flex: 1; display: flex; min-height: 0; }
+.center { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+/* 房间网格：垂直空间还给网格 */
+.room-scroll { flex: 1; overflow-y: auto; padding: 16px 20px; }
+.room-grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+}
+
+/* 房间卡片：surface-1 + 描边层次（原与黑底融为一体） */
+.room-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: border-color .18s, box-shadow .18s;
+}
+.room-card:hover { border-color: var(--border-default); box-shadow: 0 4px 16px rgba(0,0,0,0.35); }
+.room-card.selected { border-color: rgba(77,196,191,0.45); }
+.room-card.recording { border-color: rgba(48,209,88,0.25); }
+
+.room-video {
+  position: relative; aspect-ratio: 16/9; background: #000;
+  display: flex; align-items: center; justify-content: center;
+}
+.room-video .placeholder { color: var(--text-500); font-size: 12px; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.room-video .placeholder .big { font-size: 28px; opacity: .6; }
+
+/* 视频角标 */
+.live-badge {
+  position: absolute; top: 8px; left: 8px;
+  display: flex; align-items: center; gap: 5px;
+  background: rgba(0,0,0,0.6); backdrop-filter: blur(6px);
+  padding: 3px 8px; border-radius: var(--radius-xs);
+  font-size: 10px; font-weight: 600; letter-spacing: .04em;
+}
+.live-badge.rec { color: var(--state-live); }
+.live-badge.rec .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--state-live); animation: pulse 1.6s infinite; }
+.live-badge.analysis { color: var(--brand-400); top: 8px; left: auto; right: 8px; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* 视频底部控制条 */
+.video-controls {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 8px;
+  background: linear-gradient(transparent, rgba(0,0,0,0.72));
+}
+.quality-select {
+  height: 22px; padding: 0 6px; font-size: 11px;
+  background: rgba(0,0,0,0.5); color: #fff;
+  border: 1px solid rgba(255,255,255,0.15); border-radius: var(--radius-xs);
+  font-family: inherit; cursor: pointer;
+}
+.video-btns { display: flex; gap: 4px; }
+.video-btn {
+  width: 26px; height: 26px; border: none; cursor: pointer;
+  background: rgba(0,0,0,0.5); backdrop-filter: blur(6px);
+  color: #fff; border-radius: var(--radius-xs); font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.video-btn:hover { background: rgba(255,255,255,0.18); }
+
+/* 录制脉冲条（保留） */
+.rec-bar { height: 2px; background: var(--brand-500); animation: recpulse 2s infinite; }
+@keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+
+.room-body { padding: 10px 12px 12px; }
+.room-meta {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--text-200); margin-bottom: 4px;
+}
+.room-meta .rec-dot { color: var(--state-success); font-weight: 500; }
+.room-meta .mono { font-family: var(--font-mono); color: var(--text-400); font-size: 11px; }
+.room-title {
+  font-size: 11px; color: var(--text-400);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-bottom: 10px;
+}
+
+/* 卡片操作行：断开 flex:1 文字按钮 → 图标化（与删除并列角落） */
+.room-actions { display: flex; align-items: center; gap: 6px; }
+.room-actions .primary { flex: 1; }
+.room-icon-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.room-icon-btn {
+  width: 32px; height: 32px; border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle); background: var(--surface-2);
+  color: var(--text-400); cursor: pointer; font-size: 13px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all .15s;
+}
+.room-icon-btn:hover { color: var(--text-50); border-color: var(--border-default); background: var(--surface-3); }
+.room-icon-btn.danger:hover { color: var(--state-error); border-color: rgba(255,69,58,0.35); background: rgba(255,69,58,0.10); }
+
+/* ================= 底部控制栏 ================= */
+.controlbar {
+  flex-shrink: 0;
+  height: var(--h-controlbar);
+  background: var(--surface-1);
+  border-top: 1px solid var(--border-subtle);
+  padding: 10px 20px 12px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+
+/* 时间线（冻结交互全部保留：拖拽松手seek/Shift打标/磁吸/Live/DVR紫标） */
+.timeline {
+  position: relative; height: 88px;
+  background: var(--surface-0);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.tl-track { position: absolute; inset: 0; }
+.tl-window {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(77,196,191,0.05);
+  border-left: 1px solid rgba(77,196,191,0.25);
+  border-right: 1px solid rgba(77,196,191,0.25);
+}
+/* 已录区间 */
+.tl-recorded { position: absolute; top: 0; bottom: 0; background: rgba(255,255,255,0.03); }
+/* 波形 */
+.tl-wave { position: absolute; bottom: 22px; left: 0; right: 0; height: 34px; display: flex; align-items: flex-end; gap: 1px; padding: 0 2px; }
+.tl-wave i { flex: 1; background: rgba(77,196,191,0.30); border-radius: 1px 1px 0 0; min-height: 2px; }
+/* 高光段（分析产出） */
+.tl-highlight {
+  position: absolute; bottom: 22px; height: 34px;
+  background: rgba(77,196,191,0.16);
+  border: 1px solid rgba(77,196,191,0.4);
+  border-radius: 4px; cursor: pointer;
+}
+.tl-highlight:hover { background: rgba(77,196,191,0.28); }
+.tl-highlight .tag {
+  position: absolute; top: -16px; left: 0;
+  font-size: 9px; color: var(--brand-400); white-space: nowrap;
+  font-family: var(--font-mono);
+}
+/* 入出点选区 */
+.tl-selection {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(48,209,88,0.10);
+  border-left: 2px solid var(--state-success);
+  border-right: 2px solid var(--state-error);
+}
+/* DVR 紫标（冻结） */
+.tl-dvr { position: absolute; top: 0; width: 2px; height: 12px; background: var(--state-dvr); border-radius: 0 0 2px 2px; }
+/* Live 状态机标（冻结） */
+.tl-live-edge {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: var(--state-live);
+  box-shadow: 0 0 8px rgba(255,69,58,0.6);
+}
+.tl-live-edge::after {
+  content: 'LIVE'; position: absolute; top: 3px; left: 5px;
+  font-size: 9px; font-weight: 700; color: var(--state-live); letter-spacing: .06em;
+}
+/* 播放头 */
+.tl-playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: #fff; box-shadow: 0 0 6px rgba(255,255,255,0.5);
+}
+.tl-playhead::before {
+  content: ''; position: absolute; top: 0; left: -4px;
+  border: 5px solid transparent; border-top: 6px solid #fff;
+}
+/* 时间刻度 */
+.tl-timescale { position: absolute; bottom: 2px; left: 0; right: 0; display: flex; justify-content: space-between; padding: 0 8px; font-size: 9px; color: var(--text-500); font-family: var(--font-mono); }
+
+/* 控制按钮行 */
+.transport { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.transport-group { display: flex; align-items: center; gap: 2px; }
+.t-btn {
+  height: 28px; min-width: 28px; padding: 0 6px;
+  border: none; background: none; cursor: pointer;
+  color: var(--text-200); font-size: 13px; border-radius: var(--radius-xs);
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  font-family: inherit; transition: all .12s;
+}
+.t-btn:hover { background: var(--surface-2); color: var(--text-50); }
+.t-btn.play { font-size: 19px; }
+.t-btn.mark-in.on { color: var(--state-success); }
+.t-btn.mark-out.on { color: var(--state-error); }
+.t-btn.txt { font-size: 12px; padding: 0 9px; }
+.t-btn.brand { color: var(--brand-400); }
+.t-btn:disabled { opacity: .35; cursor: default; }
+.t-btn:disabled:hover { background: none; color: var(--text-200); }
+
+.timecode { font-family: var(--font-mono); font-size: 14px; color: var(--text-50); }
+.timecode .sep, .timecode .dur { color: var(--text-400); }
+.timecode .wall { font-size: 11px; color: var(--text-500); margin-left: 8px; }
+
+.rate-select {
+  height: 24px; background: var(--surface-2); color: var(--text-200);
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-xs);
+  font-size: 11px; font-family: inherit; padding: 0 4px; cursor: pointer;
+}
+
+/* 缩放压缩：三个按钮+百分比 → 点百分比即重置（删除独立重置按钮） */
+.zoom-group { display: flex; align-items: center; gap: 2px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--border-subtle); }
+.zoom-val {
+  font-size: 11px; color: var(--text-400); font-family: var(--font-mono);
+  min-width: 34px; text-align: center; cursor: pointer; user-select: none;
+  padding: 3px 2px; border-radius: var(--radius-xs);
+}
+.zoom-val:hover { background: var(--surface-2); color: var(--brand-400); }
+
+/* ================= 右侧面板 ================= */
+.right-panel {
+  width: 320px; flex-shrink: 0;
+  background: var(--surface-1);
+  border-left: 1px solid var(--border-subtle);
+  display: flex; flex-direction: column;
+  padding: 14px; gap: 12px; overflow: hidden;
+}
+.add-room-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+}
+.add-room-card .label { font-size: 11px; color: var(--text-400); margin-bottom: 7px; }
+.add-room-row { display: flex; gap: 6px; }
+.add-room-row input {
+  flex: 1; height: var(--h-control); min-width: 0;
+  background: var(--surface-0); color: var(--text-50);
+  border: 1px solid var(--border-default); border-radius: var(--radius-md);
+  padding: 0 10px; font-size: 12px; font-family: inherit; outline: none;
+}
+.add-room-row input:focus { border-color: var(--brand-500); }
+.add-room-row input::placeholder { color: var(--text-500); }
+
+/* 切片列表 */
+.clip-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.clip-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.clip-head .t { font-size: 12px; font-weight: 600; color: var(--text-200); }
+.clip-head .n { font-size: 10px; color: var(--text-500); font-family: var(--font-mono); }
+.clip-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 2px; }
+
+.clip-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  transition: border-color .15s;
+}
+.clip-card:hover { border-color: var(--border-default); }
+.clip-card.exported { border-left: 3px solid var(--state-success); }
+.clip-card.pending { border-left: 3px solid var(--state-warning); }
+.clip-card.auto { border-left: 3px solid var(--brand-500); }
+.clip-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+.clip-title { font-size: 12px; font-weight: 500; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.clip-title .src-badge {
+  font-size: 9px; padding: 1px 5px; border-radius: 4px; flex-shrink: 0;
+  background: rgba(77,196,191,0.14); color: var(--brand-400);
+}
+.clip-title .src-badge.manual { background: rgba(255,255,255,0.08); color: var(--text-400); }
+.clip-time { font-size: 10px; color: var(--text-500); font-family: var(--font-mono); flex-shrink: 0; }
+.clip-rooms { font-size: 10px; color: var(--text-400); margin-bottom: 8px; }
+.clip-actions { display: flex; gap: 4px; align-items: center; }
+.clip-btn {
+  height: 24px; padding: 0 9px; font-size: 11px;
+  border-radius: var(--radius-xs); border: 1px solid var(--border-subtle);
+  background: var(--surface-3); color: var(--text-200);
+  cursor: pointer; font-family: inherit; transition: all .12s;
+}
+.clip-btn:hover { border-color: var(--border-default); color: var(--text-50); }
+.clip-btn.primary { background: var(--brand-500); border-color: transparent; color: #fff; }
+.clip-btn.primary:hover { background: var(--brand-400); }
+.clip-btn.done { background: none; border: none; color: var(--state-success); cursor: default; padding: 0 4px; }
+.clip-progress { height: 3px; border-radius: 2px; background: var(--surface-0); overflow: hidden; margin-top: 7px; }
+.clip-progress i { display: block; height: 100%; background: var(--brand-500); border-radius: 2px; }
+
+.clip-foot { display: flex; gap: 6px; margin-top: 10px; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ================= 改动标注层（审查用开关） ================= */
+.annotate-toggle {
+  position: fixed; bottom: 16px; right: 336px; z-index: 500;
+  height: 30px; padding: 0 12px;
+  background: var(--surface-2); border: 1px solid var(--border-default);
+  border-radius: 99px; color: var(--text-200); font-size: 11px;
+  cursor: pointer; font-family: inherit;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+}
+.annotate-toggle.on { color: var(--brand-400); border-color: rgba(77,196,191,0.5); }
+.change-marker {
+  position: absolute; z-index: 300;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: var(--brand-500); color: #fff;
+  font-size: 10px; font-weight: 700; font-family: var(--font-mono);
+  display: none; align-items: center; justify-content: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5); cursor: default;
+}
+body.annotated .change-marker { display: flex; }
+.change-tip {
+  position: fixed; z-index: 600; max-width: 300px;
+  background: var(--surface-2); border: 1px solid rgba(77,196,191,0.4);
+  border-radius: var(--radius-sm); padding: 10px 12px;
+  font-size: 11px; color: var(--text-200); line-height: 1.6;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.6);
+  display: none; pointer-events: none;
+}
+.change-tip b { color: var(--brand-400); display: block; margin-bottom: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- ============ Sider（结构不变） ============ -->
+  <aside class="sider">
+    <div class="sider-logo">
+      <div class="logo-mark">L</div>
+      <div>
+        <div class="name">LSC</div>
+        <div class="sub">Live Stream Clipper</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <div class="nav-item active"><span class="ico">▦</span>多房间管理</div>
+      <div class="nav-item"><span class="ico">⚙</span>设置</div>
+    </nav>
+    <div class="sider-footer">
+      <div class="conn-pill"><span class="conn-dot"></span>已连接</div>
+      <div class="sys-stats"><span>CPU 23%</span><span>MEM 1.2G</span><span>磁盘 41G</span></div>
+      <button class="theme-btn">☾ 浅色</button>
+    </div>
+  </aside>
+
+  <!-- ============ 主区 ============ -->
+  <div class="main">
+    <!-- 头部：单行 52px -->
+    <header class="header" style="position:relative">
+      <div class="header-title">
+        <h1>多房间工作台</h1>
+        <span class="room-count">4 房间</span>
+      </div>
+
+      <!-- 改动①：三步流水线（替代孤立的对齐/分析/去对齐三个按钮） -->
+      <div class="pipeline" id="pipeline">
+        <button class="pipe-step done" title="4 个房间已选中">
+          <span class="num">✓</span>选择房间
+        </button>
+        <span class="pipe-arrow">›</span>
+        <button class="pipe-step done" title="已于 14:32 完成对齐，置信度 96%">
+          <span class="num">✓</span>一键对齐
+        </button>
+        <span class="pipe-arrow">›</span>
+        <button class="pipe-step active" title="持续分析运行中：主房「EDG nobody」">
+          <span class="num">3</span>持续分析
+          <span class="pipe-analysis-meta">R9 · 12 回合</span>
+        </button>
+        <span class="pipe-arrow">›</span>
+        <button class="pipe-step" title="切片列表中 5 段待导出">
+          <span class="num">4</span>导出切片
+        </button>
+      </div>
+
+      <div class="header-actions">
+        <!-- 改动②：刷新 → Dropdown（短按刷新预览 / 全部重启显式分离，消灭长按隐藏交互） -->
+        <div class="dropdown" id="refreshDropdown">
+          <button class="btn btn-sm" onclick="toggleDropdown(event)">⟳ 刷新 ▾</button>
+          <div class="dropdown-menu">
+            <button class="dropdown-item">⟳ 刷新预览<span class="hint">不断录制</span></button>
+            <button class="dropdown-item danger">⚠ 全部重启<span class="hint">停录+预览</span></button>
+          </div>
+        </div>
+        <div class="change-marker" style="top:-9px;right:190px" data-tip="刷新按钮|长按「全部重启」是不可发现的危险交互 → 改为下拉显式分离：刷新预览（轻）/ 全部重启（重，危险色）。">2</div>
+
+        <!-- 改动③：全选/全局静音/排序 → 收进更多菜单 -->
+        <button class="icon-btn" title="全部静音" style="width:32px;height:32px">🔇</button>
+        <div class="dropdown" id="moreDropdown">
+          <button class="icon-btn" title="更多" style="width:32px;height:32px" onclick="toggleDropdown2(event)">⋯</button>
+          <div class="dropdown-menu">
+            <button class="dropdown-item">☑ 全选房间<span class="hint">Ctrl+A</span></button>
+            <button class="dropdown-item">⇅ 排序方式</button>
+          </div>
+        </div>
+
+        <button class="btn btn-danger-ghost">■ 批量停止</button>
+        <button class="btn btn-primary">● 批量录制</button>
+      </div>
+      <div class="change-marker" style="top:-9px;left:46%" data-tip="三步流水线|原来「一键对齐」「分析导出」「去对齐」是三个平级孤立按钮，用户要自己记住先后顺序 → 合并为引导线，状态一眼可见（已完成✓/进行中/待办），点击可跳转对应步骤。">1</div>
+      <div class="change-marker" style="top:-9px;right:8px" data-tip="头部两行→一行|排序Select删除、全选/全局静音收纳，头部从 ~100px 压到 52px，垂直空间还给房间网格。">3</div>
+    </header>
+
+    <div class="content">
+      <div class="center">
+        <!-- ============ 房间网格 ============ -->
+        <div class="room-scroll">
+          <div class="room-grid">
+
+            <!-- 卡片1：录制中 + 分析中 -->
+            <div class="room-card recording selected">
+              <div class="room-video">
+                <div class="placeholder"><span class="big">▶</span>MSE 预览 720p</div>
+                <div class="live-badge rec"><span class="dot"></span>REC 01:23:45</div>
+                <div class="live-badge analysis">分析中 R9</div>
+                <div class="video-controls">
+                  <select class="quality-select"><option>高清 720p</option><option>原画</option><option>标清 480p</option><option>流畅 360p</option></select>
+                  <div class="video-btns">
+                    <button class="video-btn" title="静音">🔊</button>
+                    <button class="video-btn" title="放大">⛶</button>
+                    <button class="video-btn" title="取消预览">✕</button>
+                  </div>
+                </div>
+              </div>
+              <div class="rec-bar"></div>
+              <div class="room-body">
+                <div class="room-meta">
+                  <span class="rec-dot">录制中</span>
+                  <span class="mono">已录 1:23:45</span>
+                  <span class="mono">· 4.2 GB</span>
+                </div>
+                <div class="room-title">EDG nobody — 国服排位冲分 | 无畏契约</div>
+                <div class="room-actions">
+                  <button class="btn btn-danger-ghost btn-sm primary">■ 停止录制</button>
+                  <div class="room-icon-actions">
+                    <button class="room-icon-btn" title="断开连接">⛓</button>
+                    <button class="room-icon-btn danger" title="删除房间">🗑</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 卡片2：录制中 -->
+            <div class="room-card recording selected" style="position:relative">
+              <div class="room-video">
+                <div class="placeholder"><span class="big">▶</span>MSE 预览 720p</div>
+                <div class="live-badge rec"><span class="dot"></span>REC 01:23:44</div>
+                <div class="video-controls">
+                  <select class="quality-select"><option>高清 720p</option><option>原画</option></select>
+                  <div class="video-btns">
+                    <button class="video-btn">🔇</button>
+                    <button class="video-btn">⛶</button>
+                    <button class="video-btn">✕</button>
+                  </div>
+                </div>
+              </div>
+              <div class="rec-bar"></div>
+              <div class="room-body">
+                <div class="room-meta">
+                  <span class="rec-dot">录制中</span>
+                  <span class="mono">已录 1:23:44</span>
+                  <span class="mono">· 3.9 GB</span>
+                </div>
+                <div class="room-title">BLG whzy — 训练赛 | 无畏契约</div>
+                <div class="room-actions">
+                  <button class="btn btn-danger-ghost btn-sm primary">■ 停止录制</button>
+                  <div class="room-icon-actions">
+                    <button class="room-icon-btn" title="断开连接">⛓</button>
+                    <button class="room-icon-btn danger" title="删除房间">🗑</button>
+                  </div>
+                </div>
+              </div>
+              <div class="change-marker" style="bottom:14px;right:44px" data-tip="断开按钮图标化|原「断开」是与「开始录制」等宽(flex:1)的文字按钮，破坏性操作过度显眼 → 与删除一起收为角落图标按钮。">4</div>
+            </div>
+
+            <!-- 卡片3：已连接未录制 -->
+            <div class="room-card">
+              <div class="room-video">
+                <div class="placeholder"><span class="big">▶</span>MSE 预览 720p</div>
+                <div class="video-controls">
+                  <select class="quality-select"><option>高清 720p</option><option>原画</option></select>
+                  <div class="video-btns">
+                    <button class="video-btn">🔊</button>
+                    <button class="video-btn">⛶</button>
+                    <button class="video-btn">✕</button>
+                  </div>
+                </div>
+              </div>
+              <div class="room-body" style="padding-top:12px">
+                <div class="room-title" style="margin-bottom:10px">FPX Life — 晚上好 | 无畏契约</div>
+                <div class="room-actions">
+                  <button class="btn btn-primary btn-sm primary">● 开始录制</button>
+                  <div class="room-icon-actions">
+                    <button class="room-icon-btn" title="断开连接">⛓</button>
+                    <button class="room-icon-btn danger" title="删除房间">🗑</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 卡片4：未连接 -->
+            <div class="room-card" style="opacity:.75">
+              <div class="room-video">
+                <div class="placeholder"><span class="big">▶</span>预览未启用</div>
+              </div>
+              <div class="room-body" style="padding-top:12px">
+                <div class="room-title" style="margin-bottom:10px">TE FengF — 复盘 | 无畏契约</div>
+                <div class="room-actions">
+                  <button class="btn btn-sm primary">⛓ 连接</button>
+                  <div class="room-icon-actions">
+                    <button class="room-icon-btn danger" title="删除房间">🗑</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- ============ 底部控制栏（冻结交互全部保留） ============ -->
+        <div class="controlbar" style="position:relative">
+          <div class="timeline">
+            <div class="tl-track">
+              <div class="tl-recorded" style="left:0;width:78%"></div>
+              <div class="tl-wave" id="wave"></div>
+              <!-- 分析产出的高光段 -->
+              <div class="tl-highlight" style="left:12%;width:5%"><span class="tag">R5</span></div>
+              <div class="tl-highlight" style="left:24%;width:4.5%"><span class="tag">R6</span></div>
+              <div class="tl-highlight" style="left:41%;width:5.5%"><span class="tag">R7</span></div>
+              <div class="tl-highlight" style="left:58%;width:5%"><span class="tag">R8</span></div>
+              <!-- DVR 紫标（冻结） -->
+              <div class="tl-dvr" style="left:8%"></div>
+              <div class="tl-dvr" style="left:33%"></div>
+              <div class="tl-dvr" style="left:52%"></div>
+              <!-- 入出点选区 -->
+              <div class="tl-selection" style="left:41%;width:5.5%"></div>
+              <!-- 播放头（拖拽松手才 seek —— 冻结） -->
+              <div class="tl-playhead" style="left:44%"></div>
+              <!-- Live 边缘（冻结） -->
+              <div class="tl-live-edge" style="left:78%"></div>
+              <div class="tl-timescale">
+                <span>20:00</span><span>20:20</span><span>20:40</span><span>21:00</span><span>21:20</span><span>21:23:45</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="transport">
+            <div class="transport-group">
+              <button class="t-btn" title="后退 10 秒">⏮</button>
+              <button class="t-btn play" title="暂停">⏸</button>
+              <button class="t-btn" title="前进 10 秒">⏭</button>
+              <select class="rate-select" title="播放速率">
+                <option>0.5×</option><option selected>1.0×</option><option>1.5×</option><option>2.0×</option>
+              </select>
+              <button class="t-btn txt mark-in on" title="设置入点 (I)">⌖ 入点</button>
+              <button class="t-btn txt mark-out on" title="设置出点 (O)">⌖ 出点</button>
+            </div>
+
+            <div class="timecode">
+              21:07:32<span class="sep"> / </span><span class="dur">1:23:45</span><span class="wall">已录 1:23:45</span>
+            </div>
+
+            <div class="transport-group">
+              <button class="t-btn txt brand" title="跳转直播最新位置">⚡ 直播</button>
+              <button class="t-btn txt" title="添加到切片列表">✂ 添加切片</button>
+              <button class="t-btn" title="试听选区（循环播放入/出点）">🔁</button>
+              <!-- 改动⑤：缩放 4 元素 → 3 元素，点百分比重置 -->
+              <div class="zoom-group">
+                <button class="t-btn" title="缩小 (Ctrl+滚轮)">−</button>
+                <span class="zoom-val" title="点击重置缩放">2.3×</span>
+                <button class="t-btn" title="放大 (Ctrl+滚轮)">＋</button>
+              </div>
+              <div class="change-marker" style="bottom:2px;right:2px" data-tip="缩放控制压缩|原「缩小/百分比/放大/重置」4 个元素 → 删除独立重置按钮，点击百分比即重置（Ctrl+滚轮缩放为冻结交互，保留）。">5</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 右侧面板 ============ -->
+      <aside class="right-panel">
+        <div class="add-room-card">
+          <div class="label">添加直播间</div>
+          <div class="add-room-row">
+            <input placeholder="粘贴直播间链接...">
+            <button class="btn btn-primary" style="height:32px">添加</button>
+          </div>
+        </div>
+
+        <div class="clip-panel">
+          <div class="clip-head">
+            <span class="t">切片列表</span>
+            <span class="n">5 段 · 3 段来自分析</span>
+          </div>
+          <div class="clip-list">
+
+            <div class="clip-card auto">
+              <div class="clip-top">
+                <div class="clip-title">R7 三杀残局 <span class="src-badge">分析</span></div>
+                <span class="clip-time">00:41</span>
+              </div>
+              <div class="clip-rooms">主房 nobody + 2 个同步视角</div>
+              <div class="clip-actions">
+                <button class="clip-btn primary">导出</button>
+                <button class="clip-btn">精修</button>
+                <button class="clip-btn">确认</button>
+              </div>
+            </div>
+
+            <div class="clip-card auto">
+              <div class="clip-top">
+                <div class="clip-title">R5 开局快攻 <span class="src-badge">分析</span></div>
+                <span class="clip-time">00:38</span>
+              </div>
+              <div class="clip-rooms">主房 nobody + 2 个同步视角</div>
+              <div class="clip-actions">
+                <button class="clip-btn primary">导出</button>
+                <button class="clip-btn">精修</button>
+                <button class="clip-btn">确认</button>
+              </div>
+            </div>
+
+            <div class="clip-card pending">
+              <div class="clip-top">
+                <div class="clip-title">R8 ACE 尝试 <span class="src-badge">分析</span></div>
+                <span class="clip-time">00:52</span>
+              </div>
+              <div class="clip-rooms">待确认边界 · 3 视角</div>
+              <div class="clip-actions">
+                <button class="clip-btn">确认并导出</button>
+                <button class="clip-btn">精修</button>
+              </div>
+              <div class="clip-progress"><i style="width:62%"></i></div>
+            </div>
+
+            <div class="clip-card exported">
+              <div class="clip-top">
+                <div class="clip-title">手枪局集锦 <span class="src-badge manual">手动</span></div>
+                <span class="clip-time">01:12</span>
+              </div>
+              <div class="clip-rooms">已导出 · R5_clutch_nobody.mp4</div>
+              <div class="clip-actions">
+                <button class="clip-btn done">✓ 已导出</button>
+                <button class="clip-btn">打开</button>
+                <button class="clip-btn">目录</button>
+              </div>
+            </div>
+
+            <div class="clip-card">
+              <div class="clip-top">
+                <div class="clip-title">eco 翻盘 <span class="src-badge manual">手动</span></div>
+                <span class="clip-time">00:47</span>
+              </div>
+              <div class="clip-rooms">导出中… 62%</div>
+              <div class="clip-actions">
+                <button class="clip-btn">取消导出</button>
+              </div>
+              <div class="clip-progress"><i style="width:62%"></i></div>
+            </div>
+
+          </div>
+
+          <div class="clip-foot">
+            <button class="btn" style="flex:1">导出所选</button>
+            <button class="btn btn-primary" style="flex:1">导出全部</button>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<!-- 审查辅助 -->
+<button class="annotate-toggle" id="annotateToggle" onclick="toggleAnnotate()">① 显示改动标注</button>
+<div class="change-tip" id="changeTip"></div>
+
+<script>
+// 生成伪波形
+(function(){
+  const wave = document.getElementById('wave');
+  let html = '';
+  for (let i = 0; i < 220; i++) {
+    const h = 3 + Math.abs(Math.sin(i * 0.35) * 18 + Math.sin(i * 0.11) * 10 + Math.random() * 5);
+    html += `<i style="height:${h.toFixed(0)}px"></i>`;
+  }
+  wave.innerHTML = html;
+})();
+
+// 改动标注开关
+const tip = document.getElementById('changeTip');
+const toggleBtn = document.getElementById('annotateToggle');
+function toggleAnnotate(){
+  document.body.classList.toggle('annotated');
+  const on = document.body.classList.contains('annotated');
+  toggleBtn.classList.toggle('on', on);
+  toggleBtn.textContent = on ? '① 隐藏改动标注' : '① 显示改动标注';
+  if (!on) tip.style.display = 'none';
+}
+document.querySelectorAll('.change-marker').forEach(m => {
+  m.addEventListener('mouseenter', e => {
+    const [title, body] = m.dataset.tip.split('|');
+    tip.innerHTML = `<b>改动 ${m.textContent} · ${title}</b>${body}`;
+    tip.style.display = 'block';
+    const r = m.getBoundingClientRect();
+    let x = r.left - 310, y = r.top - 10;
+    if (x < 8) x = r.right + 12;
+    if (y + 120 > innerHeight) y = innerHeight - 130;
+    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  });
+  m.addEventListener('mouseleave', () => tip.style.display = 'none');
+});
+
+// 下拉
+function toggleDropdown(e){
+  e.stopPropagation();
+  document.getElementById('moreDropdown').classList.remove('open');
+  document.getElementById('refreshDropdown').classList.toggle('open');
+}
+function toggleDropdown2(e){
+  e.stopPropagation();
+  document.getElementById('refreshDropdown').classList.remove('open');
+  document.getElementById('moreDropdown').classList.toggle('open');
+}
+document.addEventListener('click', () => {
+  document.querySelectorAll('.dropdown').forEach(d => d.classList.remove('open'));
+});
+
+// 流水线步骤演示：点击「导出切片」滚动提示（静态原型仅做视觉态）
+document.querySelectorAll('.pipe-step').forEach(s => {
+  if (!s.disabled) s.addEventListener('click', () => {
+    document.querySelectorAll('.pipe-step').forEach(x => x.classList.remove('active'));
+  });
+});
+</script>
+</body>
+</html>

@@ -2,6 +2,9 @@ import { useState, useEffect, useMemo, memo, useRef } from 'react'
 import { Card, Button, Tooltip, Modal, Select } from 'antd'
 import {
   PlayCircleOutlined,
+  PauseCircleOutlined,
+  StepBackwardOutlined,
+  StepForwardOutlined,
   DeleteOutlined,
   LinkOutlined,
   DisconnectOutlined,
@@ -10,7 +13,7 @@ import {
   SoundOutlined,
   MutedOutlined,
   FullscreenOutlined,
-  CloseOutlined,
+  ShrinkOutlined,
 } from '@ant-design/icons'
 import { RoomSession } from '@/types'
 import { VideoPreview } from '@/components/VideoPreview'
@@ -60,6 +63,11 @@ interface RoomCardProps {
   onCollapse?: (roomId: string) => void
   /** 父级共享录制计时 tick（秒级），避免每卡独立 setInterval */
   recordingTick?: number
+  /** 放大态播放器控制：预览播放位置（秒，仅放大房间传入实时值） */
+  previewPos?: number
+  onPlayPause?: () => void
+  onSeekBack?: () => void
+  onSeekFwd?: () => void
 }
 
 /**
@@ -82,7 +90,13 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
   if (prev.onFullscreen !== next.onFullscreen) return false
   if (prev.onToggleMultiSelect !== next.onToggleMultiSelect) return false
   if (prev.expandedRoomId !== next.expandedRoomId) return false
+  if (prev.onCollapse !== next.onCollapse) return false
   if (prev.recordingTick !== next.recordingTick) return false
+  if (prev.onPlayPause !== next.onPlayPause) return false
+  if (prev.onSeekBack !== next.onSeekBack) return false
+  if (prev.onSeekFwd !== next.onSeekFwd) return false
+  // previewPos 高频变化：仅当本卡处于放大态才参与比较，避免普通卡片每秒重渲染
+  if (prev.previewPos !== next.previewPos && next.expandedRoomId != null && next.expandedRoomId === next.room.room_id) return false
 
   // room 字段级浅比较
   const a = prev.room
@@ -132,6 +146,10 @@ export const RoomCard = memo(function RoomCard({
   expandedRoomId,
   onCollapse,
   recordingTick = 0,
+  previewPos = 0,
+  onPlayPause,
+  onSeekBack,
+  onSeekFwd,
 }: RoomCardProps) {
   const tick = recordingTick
   const [disconnecting, setDisconnecting] = useState(false)
@@ -182,6 +200,67 @@ export const RoomCard = memo(function RoomCard({
     return (Date.now() - new Date(room.record_started_at).getTime()) / 1000
   }, [room.is_recording, room.record_started_at, tick])
 
+  /** 放大态播放控制所需派生量 */
+  const isPreviewPlaying = room.preview_enabled && !room.preview_paused
+  const expDurHint = Math.max(previewPos, recordingElapsedSeconds, room.mark_in ?? 0, room.mark_out ?? 0, 1)
+  const expProgressPct = Math.min(100, (previewPos / expDurHint) * 100)
+  const overlayBtnStyle: React.CSSProperties = {
+    color: 'var(--overlay-text, #f5f5f7)',
+    background: 'var(--overlay-btn-bg, rgba(0,0,0,0.5))',
+    backdropFilter: 'blur(8px)',
+    borderRadius: 'var(--radius-md)',
+  }
+  /** 画质选择 / 静音 / 取消预览：放大与普通态共用，保证原有按键一个不少 */
+  const qualitySelect = (
+    <Select
+      size="small"
+      value={room.preview_quality || '高清'}
+      onChange={(val) => {
+        // 只发 set_preview_quality，后端负责保存 + 重启预览（避免前端 disable/enable 竞态）
+        send('set_preview_quality', { room_id: room.room_id, quality: val })
+      }}
+      onClick={(e) => e.stopPropagation()}
+      getPopupContainer={() => document.body}
+      style={{ width: 88, fontSize: 11 }}
+      options={[
+        { value: '原画', label: '原画' },
+        { value: '高清', label: '高清 720p' },
+        { value: '标清', label: '标清 480p' },
+        { value: '流畅', label: '流畅 360p' },
+      ]}
+    />
+  )
+  const muteBtn = (
+    <Tooltip title={localMuted ? '取消静音' : '静音'}>
+      <Button
+        type="text"
+        size="small"
+        icon={localMuted ? <MutedOutlined /> : <SoundOutlined />}
+        style={overlayBtnStyle}
+        onClick={(e) => {
+          e.stopPropagation()
+          // 本地图标即时翻转；store/后端由 onToggleMute 乐观更新
+          setLocalMuted(!localMuted)
+          onToggleMute(room.room_id)
+        }}
+      />
+    </Tooltip>
+  )
+  const stopPreviewBtn = (
+    <Tooltip title="取消预览">
+      <Button
+        type="text"
+        size="small"
+        icon={<StopOutlined />}
+        style={overlayBtnStyle}
+        onClick={(e) => {
+          e.stopPropagation()
+          onTogglePreview(room.room_id, false)
+        }}
+      />
+    </Tooltip>
+  )
+
   return (
     <Card
       hoverable
@@ -194,9 +273,9 @@ export const RoomCard = memo(function RoomCard({
             ? '1px solid var(--accent-primary)'
             : '1px solid transparent',
         boxShadow: multiSelected
-          ? '0 0 0 2px rgba(0, 122, 255, 0.15), 0 0 12px rgba(0, 122, 255, 0.12)'
+          ? '0 0 0 2px rgba(77, 196, 191, 0.15), 0 0 12px rgba(77, 196, 191, 0.12)'
           : selected
-          ? '0 0 0 3px rgba(0, 122, 255, 0.12), 0 0 16px rgba(0, 122, 255, 0.22)'
+          ? '0 0 0 3px rgba(77, 196, 191, 0.12), 0 0 16px rgba(77, 196, 191, 0.22)'
           : 'none',
         cursor: 'pointer',
       }}
@@ -216,9 +295,17 @@ export const RoomCard = memo(function RoomCard({
           <div
             role="checkbox"
             aria-checked={multiSelected || selected}
+            tabIndex={0}
             onClick={(e) => {
               e.stopPropagation()
               onToggleMultiSelect(room.room_id, e)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === ' ' || e.key === 'Enter') {
+                e.preventDefault()
+                e.stopPropagation()
+                onToggleMultiSelect(room.room_id, e as unknown as React.MouseEvent)
+              }
             }}
             title={multiSelected || selected ? '取消选择' : '选择此房间'}
             style={{
@@ -240,7 +327,7 @@ export const RoomCard = memo(function RoomCard({
               alignItems: 'center',
               justifyContent: 'center',
               transition: 'all .15s ease',
-              color: multiSelected || selected ? '#fff' : 'var(--text-primary, #1a1d23)',
+              color: multiSelected || selected ? 'var(--overlay-text, #f5f5f7)' : 'var(--text-primary, #1a1d23)',
               fontSize: 13,
               fontWeight: 700,
               lineHeight: 1,
@@ -276,9 +363,9 @@ export const RoomCard = memo(function RoomCard({
               borderRadius: 4,
               fontSize: 9,
               fontWeight: 600,
-              background: 'rgba(0, 122, 255, 0.12)',
+              background: 'rgba(77, 196, 191, 0.12)',
               color: 'var(--accent-primary)',
-              border: '1px solid rgba(0, 122, 255, 0.25)',
+              border: '1px solid rgba(77, 196, 191, 0.25)',
               flexShrink: 0,
             }}
           >
@@ -430,7 +517,7 @@ export const RoomCard = memo(function RoomCard({
                 roomId={room.room_id}
                 active={true}
                 send={send}
-                controls={isExpanded}
+                controls={false}
                 style={
                   isExpanded
                     ? {
@@ -445,106 +532,72 @@ export const RoomCard = memo(function RoomCard({
                 }
                 muted={localMuted}
               />
-              {/* 放大时的退出按钮 */}
-              {isExpanded && (
-                <Button
-                  icon={<CloseOutlined />}
-                  size="small"
-                  style={{
-                    position: 'absolute',
-                    top: 12,
-                    right: 12,
-                    zIndex: 10000,
-                    background: 'rgba(0, 0, 0, 0.65)',
-                    backdropFilter: 'blur(8px)',
-                    color: '#fff',
-                    border: '1px solid rgba(255,255,255,0.15)',
-                    borderRadius: 6,
-                    boxShadow: '0 2px 12px rgba(0, 0, 0, 0.3)',
-                  }}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    onCollapse?.(room.room_id)
-                  }}
-                >
-                  缩小
-                </Button>
-              )}
             </div>
-            {/* 底部渐变栏：预览控制（放大时须高于 VideoPreview zIndex:8） */}
-            <div
-              style={{
-                position: 'absolute',
-                bottom: 0,
-                left: 0,
-                right: 0,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                padding: '6px 8px',
-                background: 'linear-gradient(transparent, rgba(0,0,0,0.7))',
-                zIndex: isExpanded ? 9 : 3,
-              }}
-            >
-              {/* 预览画质选择 */}
-              <Select
-                size="small"
-                value={room.preview_quality || '高清'}
-                onChange={(val) => {
-                  // 只发 set_preview_quality，后端负责保存 + 重启预览（避免前端 disable/enable 竞态）
-                  send('set_preview_quality', { room_id: room.room_id, quality: val })
-                }}
-                onClick={(e) => e.stopPropagation()}
-                getPopupContainer={() => document.body}
-                style={{ width: 88, fontSize: 11 }}
-                options={[
-                  { value: '原画', label: '原画' },
-                  { value: '高清', label: '高清 720p' },
-                  { value: '标清', label: '标清 480p' },
-                  { value: '流畅', label: '流畅 360p' },
-                ]}
-              />
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <Tooltip title={localMuted ? '取消静音' : '静音'}>
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={localMuted ? <MutedOutlined /> : <SoundOutlined />}
-                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 'var(--radius-md)' }}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      // 本地图标即时翻转；store/后端由 onToggleMute 乐观更新
-                      setLocalMuted(!localMuted)
-                      onToggleMute(room.room_id)
-                    }}
-                  />
-                </Tooltip>
-                <Tooltip title={isExpanded ? '缩小' : '放大'}>
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<FullscreenOutlined />}
-                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 'var(--radius-md)' }}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onFullscreen(room.room_id)
-                    }}
-                  />
-                </Tooltip>
-                <Tooltip title="取消预览">
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<StopOutlined />}
-                    style={{ color: '#fff', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(8px)', borderRadius: 'var(--radius-md)' }}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onTogglePreview(room.room_id, false)
-                    }}
-                  />
-                </Tooltip>
+            {/* 底部控制区：普通态单行；放大态 = 动态进度条 + 播放控制行（原有按键全部保留、不被遮挡） */}
+            {isExpanded ? (
+              <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, display: 'flex', flexDirection: 'column', background: 'linear-gradient(transparent, rgba(0,0,0,0.78))', zIndex: 9 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px 2px' }}>
+                  <span className="pbar-line" style={{ flex: 1, height: 6 }}>
+                    <span className="pbar-fill" style={{ width: `${expProgressPct}%` }} />
+                  </span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'rgba(255,255,255,0.85)' }}>{formatTime(previewPos)}</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 8px 6px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <Tooltip title={isPreviewPlaying ? '暂停' : '播放'}>
+                      <Button type="text" size="small" icon={isPreviewPlaying ? <PauseCircleOutlined /> : <PlayCircleOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onPlayPause?.() }} />
+                    </Tooltip>
+                    <Tooltip title="后退 10 秒">
+                      <Button type="text" size="small" icon={<StepBackwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekBack?.() }} />
+                    </Tooltip>
+                    <Tooltip title="前进 10 秒">
+                      <Button type="text" size="small" icon={<StepForwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekFwd?.() }} />
+                    </Tooltip>
+                    {qualitySelect}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    {muteBtn}
+                    <Tooltip title="缩小">
+                      <Button type="text" size="small" icon={<ShrinkOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onCollapse?.(room.room_id) }} />
+                    </Tooltip>
+                    {stopPreviewBtn}
+                  </div>
+                </div>
               </div>
-            </div>
+            ) : (
+              <div
+                style={{
+                  position: 'absolute',
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '6px 8px',
+                  background: 'linear-gradient(transparent, rgba(0,0,0,0.7))',
+                  zIndex: 3,
+                }}
+              >
+                {qualitySelect}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  {muteBtn}
+                  <Tooltip title="放大">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<FullscreenOutlined />}
+                      style={overlayBtnStyle}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onFullscreen(room.room_id)
+                      }}
+                    />
+                  </Tooltip>
+                  {stopPreviewBtn}
+                </div>
+              </div>
+            )}
           </>
         ) : (
           <div style={{ textAlign: 'center' }}>

@@ -1,0 +1,41 @@
+{
+  "rooms": [
+    {
+      "room_id": "ff34b5dfac4d49bd8ce49ebf151d7124",
+      "room_url": "https://live.douyin.com/746660339934?enter_from_merge=link_share&enter_method=copy_link_share&action_type=click&from=web_code_link",
+      "platform": "",
+      "platform_name": "",
+      "streamer_name": "",
+      "stream_title": "",
+      "stream_url": "",
+      "is_connecting": false,
+      "is_connected": false,
+      "is_recording": false,
+      "is_recording_starting": false,
+      "is_recording_queued": false,
+      "recording_queue_position": 0,
+      "is_reconnecting": false,
+      "record_output_path": "",
+      "record_started_at": null,
+      "record_size_mb": 0.0,
+      "last_error": "",
+      "preview_enabled": false,
+      "preview_paused": false,
+      "preview_muted": true,
+      "preview_mode": "live_mse",
+      "preview_quality": "",
+      "mark_in": null,
+      "mark_out": null,
+      "mark_in_wallclock": null,
+      "mark_out_wallclock": null,
+      "recording_start_mono": null,
+      "recording_media_start_mono": null,
+      "preview_latency": 2.0,
+      "content_offset": 0.0,
+      "align_group_id": "",
+      "category": "",
+      "preview_epoch_id": "",
+      "recording_id": ""
+    }
+  ]
+}

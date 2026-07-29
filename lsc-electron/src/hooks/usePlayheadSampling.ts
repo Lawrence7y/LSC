@@ -3,6 +3,9 @@ import { useAppStore } from '@/store/appStore'
 import { getAlignStatus, pickReferenceRoomId, previewToCommon } from '@/utils/timelineCoords'
 import { writeDisplayPlayhead, writePlayhead } from '@/utils/playheadStore'
 
+// 轴换算降级告警节流（200ms 采样循环内，避免刷屏）
+let _lastAxisFallbackWarnAt = 0
+
 /**
  * 预览播放头采样：200ms 读 MSE currentTime → playheadStore 直写；
  * setPreviewPositions 降频 500ms，仅驱动 contentEnd 等低频逻辑。
@@ -28,7 +31,7 @@ export function usePlayheadSampling(opts: {
     const id = setInterval(() => {
       // scrub 中跳过：光标走 Timeline 本地 dragTime，避免父级轮询重渲染抢帧
       if (timelineScrubbingRef.current) return
-      const registry = (window as any).__msePlayers
+      const registry = window.__msePlayers
       if (!registry) return
       const next: Record<string, number> = { ...lastPreviewPositionsRef.current }
       let changed = false
@@ -83,7 +86,14 @@ export function usePlayheadSampling(opts: {
         if (status === 'ready' && ctx?.room_snapshots[refId]) {
           try {
             writeDisplayPlayhead(previewToCommon(ctx, refId, t))
-          } catch {
+          } catch (err) {
+            // preview→common 轴换算失败（对齐快照瞬时不可用）：降级为 preview 轴，
+            // 两轴数值含义不同会导致播放头瞬时跳变，节流记录日志便于排查
+            const now = Date.now()
+            if (now - _lastAxisFallbackWarnAt > 5000) {
+              _lastAxisFallbackWarnAt = now
+              console.warn('[usePlayheadSampling] previewToCommon failed, fallback to preview axis:', err)
+            }
             writeDisplayPlayhead(t)
           }
         } else {

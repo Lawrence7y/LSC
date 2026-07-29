@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react'
 import { Button, message } from 'antd'
-import { ReloadOutlined, FolderOpenOutlined } from '@ant-design/icons'
+import { ReloadOutlined } from '@ant-design/icons'
 
 const MAX_DISPLAY_LINES = 500
 
@@ -31,16 +31,9 @@ export default function LogViewer() {
     }
   }, [])
 
-  const handleOpenFolder = useCallback(async () => {
-    const result = await window.electronAPI?.openLogFolder?.()
-    if (!result?.success) {
-      message.error(result?.error || '打开目录失败')
-    }
-  }, [])
-
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap', minWidth: 0 }}>
         <select
           value={logFile}
           onChange={e => {
@@ -49,7 +42,7 @@ export default function LogViewer() {
             fetchLog(val)
           }}
           className="settings-select"
-          style={{ minWidth: 180 }}
+          style={{ flex: '1 1 180px', minWidth: 0, maxWidth: '100%' }}
         >
           <option value="debug.log">debug.log (主进程)</option>
           <option value="backend.log">backend.log (Python)</option>
@@ -60,18 +53,12 @@ export default function LogViewer() {
           icon={<ReloadOutlined />}
           loading={loading}
           onClick={() => fetchLog(logFile)}
+          style={{ flexShrink: 0 }}
         >
           刷新
         </Button>
-        <Button
-          size="small"
-          icon={<FolderOpenOutlined />}
-          onClick={handleOpenFolder}
-        >
-          打开目录
-        </Button>
         {size > 0 && (
-          <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+          <span style={{ fontSize: 11, color: 'var(--text-tertiary)', flexShrink: 0 }}>
             {(size / 1024).toFixed(0)} KB
           </span>
         )}

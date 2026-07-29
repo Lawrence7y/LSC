@@ -1,0 +1,338 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" style="background-color: #0b0d0f;">
+  <g id="Layer_LSC_Full_UI">
+    <rect id="rect_sider" x="0.00" y="0.00" width="200.00" height="1080.00" fill="rgb(28, 28, 30)"   />
+    <text id="text_logo-icon" x="20.00" y="40.90" fill="rgb(255, 255, 255)" font-size="14" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">LSC</text>
+    <text id="text_name" x="62.00" y="33.75" fill="rgb(245, 245, 247)" font-size="15" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">LSC</text>
+    <text id="text_sub" x="62.00" y="48.00" fill="rgb(142, 142, 147)" font-size="10" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">Live Stream Clipper</text>
+    <rect id="rect_nav-item_active" x="0.00" y="89.00" width="199.00" height="39.00" fill="rgba(49, 179, 174, 0.08)"   />
+    <text id="text_nav-item_active" x="4.00" y="113.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">🖥 多房间管理</text>
+    <text id="text_nav-item" x="4.00" y="152.40" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">⚙ 设置</text>
+    <rect id="rect_sider-footer" x="0.00" y="976.00" width="199.00" height="104.00" fill="none" stroke="rgb(58, 58, 60) rgb(245, 245, 247) rgb(245, 245, 247)" stroke-width="1"  />
+    <rect id="rect_conn-status" x="12.00" y="987.00" width="175.00" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <rect id="rect_conn-dot" x="73.50" y="995.50" width="8.00" height="8.00" fill="rgb(52, 199, 89)"  rx="4" />
+    <text id="text_conn-label" x="93.50" y="1003.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="500" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">已连接</text>
+    <text id="text_sys-monitor" x="99.50" y="1030.00" fill="rgb(99, 99, 102)" font-size="10" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="middle">CPU 12% · GPU 34% · 12.4 Mbps</text>
+    <text id="text_theme-btn" x="99.50" y="1057.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">💡 浅色</text>
+    <rect id="rect_toolbar" x="200.00" y="0.00" width="1720.00" height="91.00" fill="rgb(28, 28, 30)"   />
+    <text id="text_page-title" x="228.00" y="37.80" fill="rgb(245, 245, 247)" font-size="18" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">多房间工作台</text>
+    <text id="text_room-count" x="348.00" y="36.05" fill="rgb(99, 99, 102)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">3 个房间</text>
+    <rect id="rect_select" x="406.48" y="18.50" width="86.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <rect id="rect_btn_btn-sm" x="504.48" y="19.00" width="66.00" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="537.48" y="35.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">分析导出</text>
+    <text id="text_btn-link" x="600.48" y="35.70" fill="rgb(49, 179, 174)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">去对齐</text>
+    <rect id="rect_btn_btn-sm" x="1434.56" y="19.00" width="42.00" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="1455.56" y="35.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">全选</text>
+    <rect id="rect_btn_btn-sm" x="1484.56" y="19.00" width="85.81" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="1527.47" y="35.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">🔄 一键对齐</text>
+    <rect id="rect_btn_btn-sm" x="1578.38" y="18.50" width="54.34" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="1605.55" y="35.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">↻ 刷新</text>
+    <rect id="rect_btn_btn-sm" x="1640.72" y="19.00" width="61.81" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="1671.63" y="35.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">🔊 静音</text>
+    <rect id="rect_btn_btn-primary" x="1710.53" y="16.00" width="99.47" height="31.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-primary" x="1760.27" y="36.05" fill="rgb(255, 255, 255)" font-size="13" font-weight="400" font-family="Arial" text-anchor="middle">📹 批量录制</text>
+    <rect id="rect_btn_btn-danger" x="1818.00" y="16.00" width="78.00" height="31.00" fill="rgba(255, 59, 48, 0.12)" stroke="rgba(255, 59, 48, 0.3)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-danger" x="1857.00" y="36.05" fill="rgb(255, 59, 48)" font-size="13" font-weight="400" font-family="Arial" text-anchor="middle">批量停止</text>
+    <text id="text_div" x="228.00" y="70.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">持续分析运行中 · 主房：选手A · 已发现 5 个高光回合</text>
+    <rect id="rect_span" x="224.00" y="62.50" width="8.00" height="8.00" fill="rgb(52, 199, 89)"  rx="4" />
+    <rect id="rect_room-card" x="224.00" y="107.00" width="440.00" height="322.00" fill="rgb(28, 28, 30)" stroke="rgb(49, 179, 174)" stroke-width="1" rx="10" />
+    <rect id="rect_room-checkbox" x="237.00" y="120.00" width="22.00" height="22.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="2" rx="6" />
+    <text id="text_room-checkbox" x="241.00" y="135.55" fill="rgb(255, 255, 255)" font-size="13" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓</text>
+    <text id="text_room-name" x="271.00" y="135.90" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">选手A</text>
+    <rect id="rect_live-badge" x="598.11" y="121.50" width="52.89" height="19.00" fill="rgba(48, 209, 88, 0.12)" stroke="rgba(48, 209, 88, 0.25)" stroke-width="1" rx="6" />
+    <rect id="rect_live-dot" x="607.11" y="128.00" width="6.00" height="6.00" fill="rgb(48, 209, 88)"  rx="3" />
+    <text id="text_live-text" x="621.11" y="134.50" fill="rgb(48, 209, 88)" font-size="10" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">LIVE</text>
+    <rect id="rect_room-preview" x="237.00" y="150.00" width="414.00" height="180.00" fill="rgb(10, 10, 10)"  rx="8" />
+    <text id="text_div" x="424.00" y="256.80" fill="rgba(255, 255, 255, 0.15)" font-size="48" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">▶</text>
+    <rect id="rect_select" x="245.00" y="298.00" width="88.00" height="24.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <rect id="rect_preview-btn" x="551.00" y="296.00" width="28.00" height="28.00" fill="rgba(0, 0, 0, 0.5)"  rx="6" />
+    <text id="text_preview-btn" x="565.00" y="314.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">🔊</text>
+    <rect id="rect_preview-btn" x="583.00" y="296.00" width="28.00" height="28.00" fill="rgba(0, 0, 0, 0.5)"  rx="6" />
+    <text id="text_preview-btn" x="597.00" y="314.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">⛶</text>
+    <rect id="rect_preview-btn" x="615.00" y="296.00" width="28.00" height="28.00" fill="rgba(0, 0, 0, 0.5)"  rx="6" />
+    <text id="text_preview-btn" x="629.00" y="314.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">■</text>
+    <rect id="rect_recording-bar" x="237.00" y="328.00" width="414.00" height="2.00" fill="rgb(49, 179, 174)"   />
+    <text id="text_rec-label" x="241.00" y="349.70" fill="rgb(52, 199, 89)" font-size="12" font-weight="500" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">录制中</text>
+    <text id="text_span" x="283.00" y="349.70" fill="rgb(99, 99, 102)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">·</text>
+    <text id="text_span" x="291.89" y="349.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="monospace" text-anchor="start">已录 01:23:45</text>
+    <text id="text_span" x="375.89" y="349.70" fill="rgb(99, 99, 102)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">·</text>
+    <text id="text_span" x="384.78" y="349.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="monospace" text-anchor="start">2.3 GB</text>
+    <text id="text_room-title" x="241.00" y="370.70" fill="rgb(99, 99, 102)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">无畏契约 排位赛 冲分中</text>
+    <rect id="rect_btn_btn-danger_btn-sm" x="237.00" y="387.50" width="183.00" height="25.00" fill="rgba(255, 59, 48, 0.12)" stroke="rgba(255, 59, 48, 0.3)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-danger_btn-sm" x="328.50" y="404.20" fill="rgb(255, 59, 48)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">■ 停止录制</text>
+    <rect id="rect_btn_btn-sm" x="426.00" y="387.50" width="183.00" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="517.50" y="404.20" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">断开</text>
+    <text id="text_btn-del" x="633.00" y="404.67" fill="rgb(255, 59, 48)" font-size="13.3333" font-weight="400" font-family="Arial" text-anchor="middle">🗑</text>
+    <rect id="rect_room-card_normal" x="680.00" y="107.00" width="440.00" height="322.00" fill="rgb(28, 28, 30)"  rx="10" />
+    <rect id="rect_room-checkbox_unchecked" x="693.00" y="120.00" width="22.00" height="22.00" fill="rgb(0, 0, 0)" stroke="rgb(245, 245, 247)" stroke-width="2" rx="6" />
+    <text id="text_room-checkbox_unchecked" x="697.00" y="135.55" fill="rgba(0, 0, 0, 0)" font-size="13" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓</text>
+    <text id="text_room-name" x="727.00" y="135.90" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">选手B</text>
+    <rect id="rect_live-badge" x="1054.11" y="121.50" width="52.89" height="19.00" fill="rgba(48, 209, 88, 0.12)" stroke="rgba(48, 209, 88, 0.25)" stroke-width="1" rx="6" />
+    <rect id="rect_live-dot" x="1063.11" y="128.00" width="6.00" height="6.00" fill="rgb(48, 209, 88)"  rx="3" />
+    <text id="text_live-text" x="1077.11" y="134.50" fill="rgb(48, 209, 88)" font-size="10" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">LIVE</text>
+    <rect id="rect_room-preview" x="693.00" y="150.00" width="414.00" height="180.00" fill="rgb(10, 10, 10)"  rx="8" />
+    <text id="text_div" x="880.00" y="256.80" fill="rgba(255, 255, 255, 0.15)" font-size="48" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">▶</text>
+    <rect id="rect_select" x="701.00" y="298.00" width="88.00" height="24.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <rect id="rect_preview-btn" x="1007.00" y="296.00" width="28.00" height="28.00" fill="rgba(0, 0, 0, 0.5)"  rx="6" />
+    <text id="text_preview-btn" x="1021.00" y="314.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">🔇</text>
+    <rect id="rect_preview-btn" x="1039.00" y="296.00" width="28.00" height="28.00" fill="rgba(0, 0, 0, 0.5)"  rx="6" />
+    <text id="text_preview-btn" x="1053.00" y="314.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">⛶</text>
+    <rect id="rect_preview-btn" x="1071.00" y="296.00" width="28.00" height="28.00" fill="rgba(0, 0, 0, 0.5)"  rx="6" />
+    <text id="text_preview-btn" x="1085.00" y="314.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">■</text>
+    <text id="text_room-title" x="697.00" y="349.70" fill="rgb(99, 99, 102)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">VALORANT 竞技模式</text>
+    <rect id="rect_btn_btn-primary_btn-sm" x="693.00" y="366.50" width="183.00" height="25.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-primary_btn-sm" x="784.50" y="383.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">▶ 开始录制</text>
+    <rect id="rect_btn_btn-sm" x="882.00" y="366.50" width="183.00" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="973.50" y="383.20" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">断开</text>
+    <text id="text_btn-del" x="1089.00" y="383.67" fill="rgb(255, 59, 48)" font-size="13.3333" font-weight="400" font-family="Arial" text-anchor="middle">🗑</text>
+    <rect id="rect_room-card_normal" x="1136.00" y="107.00" width="440.00" height="322.00" fill="rgb(28, 28, 30)"  rx="10" />
+    <rect id="rect_room-checkbox_unchecked" x="1149.00" y="120.00" width="22.00" height="22.00" fill="rgb(0, 0, 0)" stroke="rgb(245, 245, 247)" stroke-width="2" rx="6" />
+    <text id="text_room-checkbox_unchecked" x="1153.00" y="135.55" fill="rgba(0, 0, 0, 0)" font-size="13" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓</text>
+    <text id="text_room-name" x="1183.00" y="135.90" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">选手C</text>
+    <rect id="rect_review-badge" x="1515.00" y="121.50" width="48.00" height="19.00" fill="rgba(175, 82, 222, 0.12)" stroke="rgba(175, 82, 222, 0.25)" stroke-width="1" rx="6" />
+    <rect id="rect_review-dot" x="1524.00" y="128.00" width="6.00" height="6.00" fill="rgb(175, 82, 222)"  rx="3" />
+    <text id="text_review-text" x="1538.00" y="134.50" fill="rgb(175, 82, 222)" font-size="10" font-weight="700" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">回看</text>
+    <rect id="rect_room-preview" x="1149.00" y="150.00" width="414.00" height="180.00" fill="rgb(10, 10, 10)"  rx="8" />
+    <text id="text_div" x="1356.00" y="242.60" fill="rgba(255, 255, 255, 0.3)" font-size="36" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="middle">📷</text>
+    <text id="text_div" x="1356.00" y="270.85" fill="rgba(255, 255, 255, 0.45)" font-size="11" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="middle">未连接</text>
+    <text id="text_room-title" x="1153.00" y="349.70" fill="rgb(99, 99, 102)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">暂无标题</text>
+    <rect id="rect_btn_btn-primary_btn-sm" x="1149.00" y="366.50" width="372.00" height="25.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-primary_btn-sm" x="1335.00" y="383.20" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">🔗 连接</text>
+    <text id="text_btn-del" x="1545.00" y="383.67" fill="rgb(255, 59, 48)" font-size="13.3333" font-weight="400" font-family="Arial" text-anchor="middle">🗑</text>
+    <rect id="rect_control-bar" x="200.00" y="915.00" width="1400.00" height="165.00" fill="rgb(28, 28, 30)" stroke="rgb(58, 58, 60) rgb(245, 245, 247) rgb(245, 245, 247)" stroke-width="1"  />
+    <rect id="rect_timeline-track" x="224.00" y="928.00" width="1352.00" height="96.00" fill="rgb(44, 44, 46)"  rx="8" />
+    <text id="text_span" x="236.00" y="940.65" fill="rgb(99, 99, 102)" font-size="9" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">0:00:00</text>
+    <text id="text_span" x="497.05" y="940.65" fill="rgb(99, 99, 102)" font-size="9" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">0:02:00</text>
+    <text id="text_span" x="758.11" y="940.65" fill="rgb(99, 99, 102)" font-size="9" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">0:04:00</text>
+    <text id="text_span" x="1019.16" y="940.65" fill="rgb(99, 99, 102)" font-size="9" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">0:06:00</text>
+    <text id="text_span" x="1280.22" y="940.65" fill="rgb(99, 99, 102)" font-size="9" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">0:08:00</text>
+    <text id="text_span" x="1541.27" y="940.65" fill="rgb(99, 99, 102)" font-size="9" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">0:10:00</text>
+    <rect id="rect_timeline-selection" x="562.00" y="928.00" width="540.80" height="96.00" fill="rgba(49, 179, 174, 0.1)"   />
+    <rect id="rect_timeline-mark-in" x="562.00" y="928.00" width="2.00" height="96.00" fill="rgb(52, 199, 89)"   />
+    <rect id="rect_timeline-mark-out" x="1102.80" y="928.00" width="2.00" height="96.00" fill="rgb(255, 59, 48)"   />
+    <rect id="rect_timeline-playhead" x="1574.00" y="928.00" width="2.00" height="96.00" fill="rgb(255, 255, 255)"   />
+    <text id="text_ctrl-btn" x="238.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">⏮</text>
+    <text id="text_ctrl-btn" x="268.00" y="1060.30" fill="rgb(142, 142, 147)" font-size="18" font-weight="400" font-family="Arial" text-anchor="middle">⏸</text>
+    <text id="text_ctrl-btn" x="298.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">⏭</text>
+    <rect id="rect_select" x="318.00" y="1041.00" width="60.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_ctrl-btn_active" x="394.00" y="1058.90" fill="rgb(52, 199, 89)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">🎯 入点</text>
+    <text id="text_ctrl-btn_active-red" x="424.00" y="1058.90" fill="rgb(255, 59, 48)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">🎯 出点</text>
+    <text id="text_timecode" x="831.95" y="1058.90" fill="rgb(245, 245, 247)" font-size="14" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">01:23:45</text>
+    <text id="text_timecode-sep" x="901.58" y="1059.60" fill="rgb(99, 99, 102)" font-size="16" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">/</text>
+    <text id="text_timecode" x="912.42" y="1058.90" fill="rgb(245, 245, 247)" font-size="14" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">01:30:00</text>
+    <text id="text_ctrl-btn" x="1378.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">⚡ 直播</text>
+    <text id="text_ctrl-btn" x="1408.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">✂ 添加切片</text>
+    <text id="text_ctrl-btn" x="1438.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">🔁</text>
+    <text id="text_ctrl-btn" x="1468.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">➖</text>
+    <text id="text_zoom-label" x="1500.00" y="1057.85" fill="rgb(99, 99, 102)" font-size="11" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="middle">1.0x</text>
+    <text id="text_ctrl-btn" x="1532.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">➕</text>
+    <text id="text_ctrl-btn" x="1562.00" y="1058.90" fill="rgb(142, 142, 147)" font-size="14" font-weight="400" font-family="Arial" text-anchor="middle">⊡</text>
+    <rect id="rect_add-room-card" x="1617.00" y="107.00" width="287.00" height="83.00" fill="rgb(28, 28, 30)"  rx="10" />
+    <text id="text_add-room-title" x="1633.00" y="132.90" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">添加直播间</text>
+    <rect id="rect_input" x="1629.00" y="147.00" width="194.38" height="31.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <rect id="rect_btn_btn-primary" x="1823.38" y="147.00" width="68.63" height="31.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="1"  />
+    <text id="text_btn_btn-primary" x="1857.69" y="167.05" fill="rgb(255, 255, 255)" font-size="13" font-weight="400" font-family="Arial" text-anchor="middle">＋ 添加</text>
+    <text id="text_clip-header-title" x="1621.00" y="223.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">切片列表 (5)</text>
+    <rect id="rect_btn_btn-sm" x="1766.00" y="206.00" width="66.00" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="1799.00" y="222.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">全部确认</text>
+    <rect id="rect_btn_btn-primary_btn-sm" x="1838.00" y="206.00" width="66.00" height="25.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-primary_btn-sm" x="1871.00" y="222.70" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">批量导出</text>
+    <rect id="rect_clip-item" x="1617.00" y="248.00" width="287.00" height="81.00" fill="rgb(28, 28, 30)"  rx="8" />
+    <text id="text_clip-name" x="1636.00" y="270.55" fill="rgb(245, 245, 247)" font-size="13" font-weight="500" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">回合 1 - 选手A</text>
+    <rect id="rect_clip-tag_pending" x="1860.00" y="258.50" width="32.00" height="15.00" fill="rgba(255, 159, 10, 0.15)"  rx="4" />
+    <text id="text_clip-tag_pending" x="1864.00" y="269.50" fill="rgb(255, 159, 10)" font-size="10" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">待调</text>
+    <text id="text_clip-meta" x="1636.00" y="288.35" fill="rgb(99, 99, 102)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">00:12:30 → 00:13:15 · 0:45</text>
+    <rect id="rect_clip-btn_confirm" x="1632.00" y="297.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(255, 159, 10, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_confirm" x="1652.00" y="311.85" fill="rgb(255, 159, 10)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">确认</text>
+    <rect id="rect_clip-btn_export" x="1676.00" y="297.00" width="73.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(49, 179, 174, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_export" x="1712.50" y="311.85" fill="rgb(49, 179, 174)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">确认并导出</text>
+    <rect id="rect_clip-btn_delete" x="1753.00" y="297.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(255, 59, 48, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_delete" x="1773.00" y="311.85" fill="rgb(255, 59, 48)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">删除</text>
+    <rect id="rect_clip-item_confirmed" x="1617.00" y="335.00" width="287.00" height="81.00" fill="rgb(28, 28, 30)"  rx="8" />
+    <text id="text_clip-name" x="1636.00" y="357.55" fill="rgb(245, 245, 247)" font-size="13" font-weight="500" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">回合 2 - 选手A</text>
+    <rect id="rect_clip-tag_ready" x="1860.00" y="345.50" width="32.00" height="15.00" fill="rgba(49, 179, 174, 0.15)"  rx="4" />
+    <text id="text_clip-tag_ready" x="1864.00" y="356.50" fill="rgb(49, 179, 174)" font-size="10" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">可导</text>
+    <text id="text_clip-meta" x="1636.00" y="375.35" fill="rgb(99, 99, 102)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">00:25:10 → 00:26:02 · 0:52</text>
+    <rect id="rect_clip-btn_export" x="1632.00" y="384.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(49, 179, 174, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_export" x="1652.00" y="398.85" fill="rgb(49, 179, 174)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">导出</text>
+    <rect id="rect_clip-btn" x="1676.00" y="384.00" width="62.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn" x="1707.00" y="398.85" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">打开文件</text>
+    <rect id="rect_clip-btn_delete" x="1742.00" y="384.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(255, 59, 48, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_delete" x="1762.00" y="398.85" fill="rgb(255, 59, 48)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">删除</text>
+    <rect id="rect_clip-item_confirmed" x="1617.00" y="422.00" width="287.00" height="81.00" fill="rgb(28, 28, 30)"  rx="8" />
+    <text id="text_clip-name" x="1636.00" y="444.55" fill="rgb(245, 245, 247)" font-size="13" font-weight="500" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">回合 3 - 选手B</text>
+    <rect id="rect_clip-tag_exported" x="1860.00" y="432.50" width="32.00" height="15.00" fill="rgba(52, 199, 89, 0.15)"  rx="4" />
+    <text id="text_clip-tag_exported" x="1864.00" y="443.50" fill="rgb(52, 199, 89)" font-size="10" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">已导</text>
+    <text id="text_clip-meta" x="1636.00" y="462.35" fill="rgb(99, 99, 102)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">00:38:44 → 00:39:30 · 0:46</text>
+    <rect id="rect_clip-btn" x="1632.00" y="471.00" width="62.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn" x="1663.00" y="485.85" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">打开文件</text>
+    <rect id="rect_clip-btn" x="1698.00" y="471.00" width="62.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn" x="1729.00" y="485.85" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">打开目录</text>
+    <rect id="rect_clip-btn_delete" x="1764.00" y="471.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(255, 59, 48, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_delete" x="1784.00" y="485.85" fill="rgb(255, 59, 48)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">删除</text>
+    <rect id="rect_clip-item" x="1617.00" y="509.00" width="287.00" height="81.00" fill="rgb(28, 28, 30)"  rx="8" />
+    <text id="text_clip-name" x="1636.00" y="531.55" fill="rgb(245, 245, 247)" font-size="13" font-weight="500" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">回合 4 - 选手A</text>
+    <rect id="rect_clip-tag_pending" x="1860.00" y="519.50" width="32.00" height="15.00" fill="rgba(255, 159, 10, 0.15)"  rx="4" />
+    <text id="text_clip-tag_pending" x="1864.00" y="530.50" fill="rgb(255, 159, 10)" font-size="10" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">待调</text>
+    <text id="text_clip-meta" x="1636.00" y="549.35" fill="rgb(99, 99, 102)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">00:51:20 → 00:52:08 · 0:48</text>
+    <rect id="rect_clip-btn_confirm" x="1632.00" y="558.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(255, 159, 10, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_confirm" x="1652.00" y="572.85" fill="rgb(255, 159, 10)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">确认</text>
+    <rect id="rect_clip-btn_export" x="1676.00" y="558.00" width="73.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(49, 179, 174, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_export" x="1712.50" y="572.85" fill="rgb(49, 179, 174)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">确认并导出</text>
+    <rect id="rect_clip-btn_delete" x="1753.00" y="558.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(255, 59, 48, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_delete" x="1773.00" y="572.85" fill="rgb(255, 59, 48)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">删除</text>
+    <rect id="rect_clip-item_confirmed" x="1617.00" y="596.00" width="287.00" height="81.00" fill="rgb(28, 28, 30)"  rx="8" />
+    <text id="text_clip-name" x="1636.00" y="618.55" fill="rgb(245, 245, 247)" font-size="13" font-weight="500" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">回合 5 - 选手B</text>
+    <rect id="rect_clip-tag_ready" x="1850.02" y="606.50" width="41.98" height="15.00" fill="rgba(49, 179, 174, 0.15)"  rx="4" />
+    <text id="text_clip-tag_ready" x="1854.02" y="617.50" fill="rgb(49, 179, 174)" font-size="10" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">AI可导</text>
+    <text id="text_clip-meta" x="1636.00" y="636.35" fill="rgb(99, 99, 102)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">01:05:33 → 01:06:21 · 0:48</text>
+    <rect id="rect_clip-btn_export" x="1632.00" y="645.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(49, 179, 174, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_export" x="1652.00" y="659.85" fill="rgb(49, 179, 174)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">导出</text>
+    <rect id="rect_clip-btn_delete" x="1676.00" y="645.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)" stroke="rgba(255, 59, 48, 0.3)" stroke-width="1" rx="4" />
+    <text id="text_clip-btn_delete" x="1696.00" y="659.85" fill="rgb(255, 59, 48)" font-size="11" font-weight="400" font-family="Arial" text-anchor="middle">删除</text>
+    <rect id="rect_settingsPage" x="1400.00" y="0.00" width="520.00" height="1080.00" fill="rgb(0, 0, 0)"   />
+    <text id="text_span" x="1425.00" y="33.60" fill="rgb(245, 245, 247)" font-size="16" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">设置</text>
+    <text id="text_settings-close" x="1892.64" y="34.30" fill="rgb(142, 142, 147)" font-size="18" font-weight="400" font-family="Arial" text-anchor="middle">✕</text>
+    <rect id="rect_settings-nav-item_active" x="1417.00" y="73.00" width="90.00" height="29.00" fill="rgb(44, 44, 46)"  rx="6" />
+    <text id="text_settings-nav-item_active" x="1421.00" y="91.70" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">通用</text>
+    <text id="text_settings-nav-item" x="1421.00" y="122.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">预览体验</text>
+    <text id="text_settings-nav-item" x="1421.00" y="153.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">系统环境</text>
+    <text id="text_settings-nav-item" x="1421.00" y="184.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">录制与编码</text>
+    <text id="text_settings-nav-item" x="1421.00" y="215.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">AI 分析</text>
+    <text id="text_settings-nav-item" x="1421.00" y="246.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">存储与草稿</text>
+    <text id="text_settings-nav-item" x="1421.00" y="277.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">平台账号</text>
+    <text id="text_settings-nav-item" x="1421.00" y="308.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">快捷键</text>
+    <text id="text_settings-nav-item" x="1421.00" y="339.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">关于与更新</text>
+    <text id="text_settings-nav-item" x="1421.00" y="370.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="start">日志</text>
+    <text id="text_settings-section-title" x="1527.00" y="91.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">通用</text>
+    <text id="text_settings-label" x="1527.00" y="137.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">主题</text>
+    <rect id="rect_select" x="1842.00" y="120.00" width="62.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="177.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">开机自启</text>
+    <rect id="rect_toggle" x="1864.00" y="162.00" width="40.00" height="22.00" fill="rgb(52, 199, 89)"  rx="11" />
+    <text id="text_settings-label" x="1527.00" y="215.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">最小化到托盘</text>
+    <rect id="rect_toggle" x="1864.00" y="200.00" width="40.00" height="22.00" fill="rgb(52, 199, 89)"  rx="11" />
+    <text id="text_settings-section-title" x="1527.00" y="268.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">预览体验</text>
+    <text id="text_settings-label" x="1527.00" y="314.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">预览画质</text>
+    <rect id="rect_select" x="1782.00" y="297.00" width="122.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-section-title" x="1527.00" y="371.90" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">系统环境</text>
+    <text id="text_btn_btn-text_btn-sm" x="1862.09" y="366.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">🔄 重新检测</text>
+    <text id="text_settings-label" x="1527.00" y="417.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">FFmpeg</text>
+    <rect id="rect_dep-badge" x="1852.58" y="403.00" width="51.42" height="20.00" fill="rgba(52, 199, 89, 0.1)"  rx="4" />
+    <text id="text_dep-badge" x="1856.58" y="416.85" fill="rgb(52, 199, 89)" font-size="11" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓ 6.1.1</text>
+    <text id="text_settings-label" x="1527.00" y="453.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">FFprobe</text>
+    <rect id="rect_dep-badge" x="1852.58" y="439.00" width="51.42" height="20.00" fill="rgba(52, 199, 89, 0.1)"  rx="4" />
+    <text id="text_dep-badge" x="1856.58" y="452.85" fill="rgb(52, 199, 89)" font-size="11" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓ 6.1.1</text>
+    <text id="text_settings-label" x="1527.00" y="489.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">NVENC 硬件编码</text>
+    <rect id="rect_dep-badge" x="1789.89" y="475.00" width="114.11" height="20.00" fill="rgba(52, 199, 89, 0.1)"  rx="4" />
+    <text id="text_dep-badge" x="1793.89" y="488.85" fill="rgb(52, 199, 89)" font-size="11" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓ h264_nvenc 可用</text>
+    <text id="text_settings-label" x="1527.00" y="525.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">Python</text>
+    <rect id="rect_dep-badge" x="1846.13" y="511.00" width="57.88" height="20.00" fill="rgba(52, 199, 89, 0.1)"  rx="4" />
+    <text id="text_dep-badge" x="1850.13" y="524.85" fill="rgb(52, 199, 89)" font-size="11" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓ 3.11.5</text>
+    <text id="text_settings-section-title" x="1527.00" y="577.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">录制与编码</text>
+    <text id="text_settings-label" x="1527.00" y="623.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">默认画质</text>
+    <rect id="rect_select" x="1842.00" y="606.00" width="62.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="665.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">默认编码器</text>
+    <rect id="rect_select" x="1713.00" y="648.00" width="191.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="707.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">编码参数</text>
+    <rect id="rect_select" x="1806.00" y="690.00" width="98.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="749.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">编码预设</text>
+    <rect id="rect_select" x="1775.00" y="732.00" width="129.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="788.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">CRF</text>
+    <text id="text_span" x="1866.47" y="788.20" fill="rgb(49, 179, 174)" font-size="12" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">CRF 23</text>
+    <text id="text_settings-label" x="1527.00" y="827.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">录制分辨率</text>
+    <rect id="rect_select" x="1832.00" y="810.00" width="72.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="869.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">录制帧率</text>
+    <rect id="rect_select" x="1833.00" y="852.00" width="71.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="911.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">音频编码</text>
+    <rect id="rect_select" x="1811.00" y="894.00" width="93.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-section-title" x="1527.00" y="966.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">AI 分析</text>
+    <text id="text_settings-label" x="1527.00" y="1012.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">OCR 加速</text>
+    <rect id="rect_select" x="1679.00" y="995.00" width="225.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="1052.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">共享进样</text>
+    <rect id="rect_toggle_off" x="1864.00" y="1037.00" width="40.00" height="22.00" fill="rgb(44, 44, 46)"  rx="11" />
+    <text id="text_settings-label" x="1527.00" y="1092.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">并发导出数</text>
+    <rect id="rect_select" x="1783.00" y="1075.00" width="121.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-label" x="1527.00" y="1134.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">默认导出预设</text>
+    <rect id="rect_select" x="1644.00" y="1117.00" width="260.00" height="26.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_settings-section-title" x="1527.00" y="1189.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">存储与草稿</text>
+    <text id="text_settings-label" x="1527.00" y="1235.05" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">存储路径</text>
+    <text id="text_path-text" x="1742.78" y="1234.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">D:\Recordings</text>
+    <rect id="rect_browse-btn" x="1838.19" y="1218.00" width="65.81" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_browse-btn" x="1871.09" y="1234.70" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">📂 浏览</text>
+    <text id="text_settings-label" x="1527.00" y="1284.55" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">剪映草稿目录</text>
+    <text id="text_path-text" x="1595.47" y="1284.20" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">C:\JianyingPro\User Data\Projects\com.lveditor.draft</text>
+    <rect id="rect_browse-btn" x="1799.47" y="1259.00" width="35.14" height="42.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_browse-btn" x="1817.04" y="1284.20" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">更改</text>
+    <rect id="rect_browse-btn" x="1842.61" y="1259.00" width="61.39" height="42.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_browse-btn" x="1873.30" y="1284.20" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">恢复自动探测</text>
+    <text id="text_settings-section-title" x="1527.00" y="1347.40" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">平台账号</text>
+    <rect id="rect_cookie-area" x="1523.00" y="1368.00" width="381.00" height="240.38" fill="rgb(28, 28, 30)"  rx="10" />
+    <text id="text_cookie-title" x="1543.00" y="1396.55" fill="rgb(245, 245, 247)" font-size="13" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">抖音 Cookie</text>
+    <text id="text_cookie-desc" x="1543.00" y="1431.39" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">Chrome 新版无法自动读取 Cookie。请在浏览器登录抖音后，用 Cookie-Editor 等插件导出 JSON，粘贴到下方并保存。</text>
+    <text id="text_cookie-status_ok" x="1543.00" y="1468.08" fill="rgb(52, 199, 89)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">已配置 12 项（ttwid, sessionid, msToken...）</text>
+    <rect id="rect_cookie-textarea" x="1539.00" y="1481.38" width="349.00" height="72.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <rect id="rect_btn_btn-primary_btn-sm" x="1539.00" y="1567.38" width="106.69" height="25.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-primary_btn-sm" x="1592.34" y="1584.08" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">保存抖音 Cookie</text>
+    <rect id="rect_cookie-area" x="1523.00" y="1624.38" width="381.00" height="259.56" fill="rgb(28, 28, 30)"  rx="10" />
+    <text id="text_cookie-title" x="1543.00" y="1652.92" fill="rgb(245, 245, 247)" font-size="13" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">B站 Cookie</text>
+    <text id="text_cookie-desc" x="1543.00" y="1697.36" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">Windows 下浏览器 Cookie 常无法自动读取。请在浏览器登录 B 站后，用 Cookie-Editor 等插件导出 JSON（需含 SESSDATA）。</text>
+    <text id="text_cookie-status_warn" x="1543.00" y="1743.64" fill="rgb(255, 149, 0)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">尚未配置有效 Cookie</text>
+    <rect id="rect_cookie-textarea" x="1539.00" y="1756.94" width="349.00" height="72.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <rect id="rect_btn_btn-primary_btn-sm" x="1539.00" y="1842.94" width="106.03" height="25.00" fill="rgb(49, 179, 174)" stroke="rgb(49, 179, 174)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-primary_btn-sm" x="1592.02" y="1859.64" fill="rgb(255, 255, 255)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">保存 B站 Cookie</text>
+    <text id="text_settings-section-title" x="1527.00" y="1922.34" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">快捷键</text>
+    <text id="text_settings-label" x="1527.00" y="1966.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">页面：工作台</text>
+    <rect id="rect_kbd" x="1825.75" y="1950.94" width="78.25" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1829.75" y="1966.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">Ctrl + 1</text>
+    <text id="text_settings-label" x="1527.00" y="2004.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">页面：设置</text>
+    <rect id="rect_kbd" x="1825.75" y="1988.94" width="78.25" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1829.75" y="2004.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">Ctrl + 2</text>
+    <text id="text_settings-label" x="1527.00" y="2042.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">刷新页面</text>
+    <rect id="rect_kbd" x="1867.94" y="2026.94" width="36.06" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1871.94" y="2042.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">F5</text>
+    <text id="text_settings-label" x="1527.00" y="2080.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">播放/暂停</text>
+    <rect id="rect_kbd" x="1846.84" y="2064.94" width="57.16" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1850.84" y="2080.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">Space</text>
+    <text id="text_settings-label" x="1527.00" y="2118.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">标记入点</text>
+    <rect id="rect_kbd" x="1874.97" y="2102.94" width="29.03" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1878.97" y="2118.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">I</text>
+    <text id="text_settings-label" x="1527.00" y="2156.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">标记出点</text>
+    <rect id="rect_kbd" x="1874.97" y="2140.94" width="29.03" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1878.97" y="2156.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">O</text>
+    <text id="text_settings-label" x="1527.00" y="2194.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">切换录制</text>
+    <rect id="rect_kbd" x="1874.97" y="2178.94" width="29.03" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1878.97" y="2194.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">R</text>
+    <text id="text_settings-label" x="1527.00" y="2232.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">静音/取消静音</text>
+    <rect id="rect_kbd" x="1874.97" y="2216.94" width="29.03" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1878.97" y="2232.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">M</text>
+    <text id="text_settings-label" x="1527.00" y="2270.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">放大预览</text>
+    <rect id="rect_kbd" x="1874.97" y="2254.94" width="29.03" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1878.97" y="2270.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">F</text>
+    <text id="text_settings-label" x="1527.00" y="2308.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">批量开始录制</text>
+    <rect id="rect_kbd" x="1825.75" y="2292.94" width="78.25" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1829.75" y="2308.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">Ctrl + R</text>
+    <text id="text_settings-label" x="1527.00" y="2346.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">批量停止录制</text>
+    <rect id="rect_kbd" x="1769.50" y="2330.94" width="134.50" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1773.50" y="2346.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">Ctrl + Shift + R</text>
+    <text id="text_settings-label" x="1527.00" y="2384.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">全选房间</text>
+    <rect id="rect_kbd" x="1769.50" y="2368.94" width="134.50" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1773.50" y="2384.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">Ctrl + Shift + A</text>
+    <text id="text_settings-label" x="1527.00" y="2422.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">导出切片</text>
+    <rect id="rect_kbd" x="1825.75" y="2406.94" width="78.25" height="22.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="4" />
+    <text id="text_kbd" x="1829.75" y="2422.14" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">Ctrl + E</text>
+    <text id="text_settings-section-title" x="1527.00" y="2475.34" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">关于与更新</text>
+    <text id="text_settings-label" x="1527.00" y="2518.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">版本</text>
+    <text id="text_span" x="1872.05" y="2518.49" fill="rgb(142, 142, 147)" font-size="13" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">v3.2.0</text>
+    <text id="text_span" x="1787.50" y="2552.64" fill="rgb(52, 199, 89)" font-size="12" font-weight="400" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">✓ 已是最新版本 v3.2.0</text>
+    <rect id="rect_btn_btn-sm" x="1838.00" y="2562.94" width="66.00" height="25.00" fill="rgb(44, 44, 46)" stroke="rgb(58, 58, 60)" stroke-width="1" rx="6" />
+    <text id="text_btn_btn-sm" x="1871.00" y="2579.64" fill="rgb(245, 245, 247)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">检查更新</text>
+    <text id="text_settings-section-title" x="1527.00" y="2636.84" fill="rgb(245, 245, 247)" font-size="14" font-weight="600" font-family="SF Pro Display, PingFang SC, system-ui, -apple-system, sans-serif" text-anchor="start">日志</text>
+    <text id="text_btn_btn-text_btn-sm" x="1850.09" y="2631.64" fill="rgb(142, 142, 147)" font-size="12" font-weight="400" font-family="Arial" text-anchor="middle">📂 打开日志目录</text>
+    <rect id="rect_div" x="1523.00" y="2659.94" width="381.00" height="120.00" fill="rgb(44, 44, 46)"  rx="8" />
+    <text id="text_div" x="1527.00" y="2723.79" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">[2026-07-27 14:32:01] INFO  录制已启动 - 选手A</text>
+    <text id="text_div" x="1527.00" y="2723.79" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">[2026-07-27 14:32:03] INFO  预览已启用 - 选手A (720p)</text>
+    <text id="text_div" x="1527.00" y="2723.79" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">[2026-07-27 14:32:05] INFO  持续分析已启动 - 主房: 选手A</text>
+    <text id="text_div" x="1527.00" y="2723.79" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">[2026-07-27 14:33:12] INFO  发现高光回合 #1 (00:12:30-00:13:15)</text>
+    <text id="text_div" x="1527.00" y="2723.79" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">[2026-07-27 14:35:44] INFO  发现高光回合 #2 (00:25:10-00:26:02)</text>
+    <text id="text_div" x="1527.00" y="2723.79" fill="rgb(142, 142, 147)" font-size="11" font-weight="400" font-family="SF Mono, Cascadia Code, monospace" text-anchor="start">[2026-07-27 14:36:01] WARN  预览降为 480p 以保流畅</text>
+  </g>
+</svg>

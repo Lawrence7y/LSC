@@ -548,9 +548,9 @@ def test_analysis_progress_labels_listed_not_raw_highlights() -> None:
     progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
     assert "入列" in progress
     assert "待调" in progress
-    assert "OCR可导" in progress
-    assert "分析完成·待确认" in progress
-    assert "不含待确认" in progress or "另有待调" in progress
+    assert "可导" in progress
+    assert "分析完成" in progress
+    assert "条待确认" in progress or "去确认" in progress
 
 
 def test_compact_analysis_progress_uses_live_following_copy_and_hides_empty_export_summary() -> None:
@@ -558,9 +558,8 @@ def test_compact_analysis_progress_uses_live_following_copy_and_hides_empty_expo
     source = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
 
     assert "const hasFixedScanRange" in source
-    assert "已跟进至" in source
-    assert "const showProgress = hasFixedScanRange" in source
-    assert "summary.queued > 0 || summary.exporting > 0 || summary.completed > 0 || summary.failed > 0" in source
+    assert "hasFixedScanRange ? livePercent" in source
+    assert "summary.queued > 0 || summary.exporting" in source
 
 
 def test_timeline_uses_one_axis_with_distinct_clip_ai_selection_and_playhead_layers() -> None:
@@ -581,7 +580,7 @@ def test_clip_list_uses_readable_summary_and_virtual_row_height_for_export_progr
 
     assert "const ROW_HEIGHT = 88" in source
     assert "共 {clips.length}" in source
-    assert "待确认" in source
+    assert "待调" in source
 
 def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording() -> None:
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")

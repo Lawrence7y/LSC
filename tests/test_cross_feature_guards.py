@@ -184,7 +184,7 @@ def test_aligning_mutex_blocks_mark_add_and_export() -> None:
         "const handleControlMarkOut = useCallback",
         "const handleControlAddClip = useCallback",
         "const handleExportMany = (targets: ClipSegment[])",
-        "const handleConfirmExport = async () =>",
+        "const handleConfirmExport = () =>",
         "const handleExportClip = (clip: ClipSegment",
     ):
         fn_body = source.split(marker, 1)[1].split("\n  const ", 1)[0]

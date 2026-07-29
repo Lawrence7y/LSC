@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Aura · 玻璃拟态风格</title>
+<style>
+  :root {
+    --bg: #0c0c18;
+    --glass-bg: rgba(255,255,255,0.04);
+    --glass-border: rgba(255,255,255,0.08);
+    --text: #e8e8f0;
+    --text-muted: #8b8ba0;
+    --accent-1: #60a5fa;
+    --accent-2: #a78bfa;
+    --accent-3: #f472b6;
+    --success: #34d399;
+    --warning: #fbbf24;
+    --error: #f87171;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Pro Display', 'PingFang SC', system-ui, sans-serif;
+    overflow-x: hidden;
+    position: relative;
+  }
+  /* 背景光晕 */
+  body::before {
+    content: '';
+    position: fixed;
+    top: -20%; left: -10%;
+    width: 60vw; height: 60vw;
+    background: radial-gradient(circle, rgba(96,165,250,0.15), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  body::after {
+    content: '';
+    position: fixed;
+    bottom: -20%; right: -10%;
+    width: 50vw; height: 50vw;
+    background: radial-gradient(circle, rgba(167,139,250,0.12), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .topbar {
+    position: relative; z-index: 10;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px;
+    background: rgba(255,255,255,0.02);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-bottom: 1px solid var(--glass-border);
+  }
+  .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px;
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .nav { display: flex; gap: 4px; }
+  .nav span {
+    padding: 8px 16px; border-radius: 10px; font-size: 13px; color: var(--text-muted);
+    cursor: pointer; transition: all 0.2s;
+  }
+  .nav span:hover, .nav span.active {
+    background: rgba(255,255,255,0.06); color: var(--text);
+  }
+  .topbar-right { display: flex; align-items: center; gap: 12px; }
+  .avatar {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+  }
+
+  .main {
+    position: relative; z-index: 1;
+    padding: 24px;
+    display: grid;
+    grid-template-columns: 260px 1fr 300px;
+    gap: 20px;
+    max-width: 1600px; margin: 0 auto;
+  }
+
+  /* 玻璃面板通用 */
+  .glass {
+    background: var(--glass-bg);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid var(--glass-border);
+    border-radius: 18px;
+  }
+
+  /* 左侧栏 */
+  .sidebar { padding: 20px; }
+  .sidebar h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 12px; }
+  .room-item {
+    padding: 12px; border-radius: 12px; margin-bottom: 8px;
+    cursor: pointer; transition: all 0.2s;
+    border: 1px solid transparent;
+  }
+  .room-item:hover { background: rgba(255,255,255,0.04); }
+  .room-item.active {
+    background: rgba(96,165,250,0.08);
+    border-color: rgba(96,165,250,0.25);
+  }
+  .room-item .name { font-size: 14px; font-weight: 500; margin-bottom: 4px; }
+  .room-item .meta { font-size: 11px; color: var(--text-muted); display: flex; gap: 8px; }
+  .live-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  /* 中间预览区 */
+  .preview-area { display: flex; flex-direction: column; gap: 16px; }
+  .preview-header { display: flex; justify-content: space-between; align-items: center; }
+  .preview-header h2 { font-size: 16px; font-weight: 600; }
+  .preview-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  .preview-card {
+    aspect-ratio: 16/9;
+    background: rgba(0,0,0,0.4);
+    border-radius: 14px;
+    border: 1px solid var(--glass-border);
+    position: relative;
+    overflow: hidden;
+  }
+  .preview-card::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(135deg, rgba(96,165,250,0.1), rgba(167,139,250,0.1));
+  }
+  .preview-card .info {
+    position: absolute; bottom: 12px; left: 12px;
+    font-size: 12px; color: var(--text-muted);
+  }
+  .preview-card .badge-live {
+    position: absolute; top: 12px; left: 12px;
+    padding: 3px 10px; border-radius: 999px;
+    background: rgba(248,113,113,0.2); color: var(--error);
+    font-size: 11px; font-weight: 600;
+    border: 1px solid rgba(248,113,113,0.3);
+  }
+  .btn-group { display: flex; gap: 8px; }
+  .btn {
+    padding: 8px 16px; border-radius: 10px; font-size: 13px;
+    border: 1px solid var(--glass-border);
+    background: rgba(255,255,255,0.04);
+    color: var(--text); cursor: pointer; transition: all 0.2s;
+  }
+  .btn:hover { background: rgba(255,255,255,0.08); }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    border: none; color: white; font-weight: 600;
+  }
+  .btn-primary:hover { opacity: 0.9; }
+
+  /* 时间线 */
+  .timeline { padding: 16px; }
+  .timeline h3 { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
+  .timeline-track {
+    height: 60px; border-radius: 10px;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid var(--glass-border);
+    position: relative; overflow: hidden;
+  }
+  .timeline-segment {
+    position: absolute; top: 8px; height: 44px;
+    background: linear-gradient(135deg, rgba(96,165,250,0.3), rgba(167,139,250,0.3));
+    border-radius: 6px;
+    border: 1px solid rgba(96,165,250,0.4);
+  }
+  .timeline-cursor {
+    position: absolute; top: 0; bottom: 0; width: 2px;
+    background: var(--accent-3);
+    box-shadow: 0 0 10px var(--accent-3);
+  }
+
+  /* 右侧面板 */
+  .right-panel { display: flex; flex-direction: column; gap: 16px; }
+  .stat-card { padding: 18px; }
+  .stat-card .label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; }
+  .stat-card .trend { font-size: 12px; color: var(--success); margin-top: 4px; }
+
+  .clip-list { padding: 16px; }
+  .clip-list h3 { font-size: 13px; color: var(--text-muted); margin-bottom: 12px; }
+  .clip-item {
+    padding: 10px; border-radius: 10px; margin-bottom: 6px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid transparent;
+    font-size: 13px; cursor: pointer; transition: all 0.2s;
+  }
+  .clip-item:hover { background: rgba(255,255,255,0.05); border-color: var(--glass-border); }
+
+  .back-btn {
+    position: fixed; top: 20px; right: 20px; z-index: 100;
+    padding: 8px 16px; border-radius: 10px;
+    background: rgba(255,255,255,0.1);
+    backdrop-filter: blur(10px);
+    color: var(--text); text-decoration: none; font-size: 13px;
+    border: 1px solid var(--glass-border);
+  }
+  .back-btn:hover { background: rgba(255,255,255,0.15); }
+</style>
+</head>
+<body>
+<a href="index.html" class="back-btn">← 返回风格列表</a>
+
+<div class="topbar">
+  <div class="logo">LSC</div>
+  <div class="nav">
+    <span>Dashboard</span>
+    <span class="active">工作台</span>
+    <span>设置</span>
+  </div>
+  <div class="topbar-right">
+    <span style="font-size:13px;color:var(--text-muted)">12 路录制中</span>
+    <div class="avatar"></div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- 左侧栏 -->
+  <div class="glass sidebar">
+    <h3>直播间列表</h3>
+    <div class="room-item active">
+      <div class="name">🎮 主播A · 无畏契约</div>
+      <div class="meta"><span class="live-dot"></span> 直播中 · 12.3万观看</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎤 主播B · 聊天电台</div>
+      <div class="meta"><span class="live-dot"></span> 直播中 · 8.1万观看</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎯 主播C · CS2</div>
+      <div class="meta"><span class="live-dot" style="background:var(--warning);box-shadow:0 0 8px var(--warning)"></span> 录像中</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎪 主播D · 已断流</div>
+      <div class="meta"><span style="color:var(--text-muted)">离线</span></div>
+    </div>
+  </div>
+
+  <!-- 中间 -->
+  <div class="preview-area">
+    <div class="preview-header">
+      <h2>多房间预览</h2>
+      <div class="btn-group">
+        <button class="btn">一键对齐</button>
+        <button class="btn btn-primary">开始录制</button>
+      </div>
+    </div>
+    <div class="preview-grid">
+      <div class="preview-card">
+        <span class="badge-live">● LIVE</span>
+        <div class="info">主播A · 00:14:32</div>
+      </div>
+      <div class="preview-card">
+        <span class="badge-live">● LIVE</span>
+        <div class="info">主播B · 00:08:15</div>
+      </div>
+      <div class="preview-card">
+        <div class="info">主播C · 00:22:41</div>
+      </div>
+      <div class="preview-card" style="display:flex;align-items:center;justify-content:center;color:var(--text-muted);">
+        + 添加房间
+      </div>
+    </div>
+    <div class="glass timeline">
+      <h3>时间轴 · 按 I/O 标记入出点</h3>
+      <div class="timeline-track">
+        <div class="timeline-segment" style="left:10%;width:15%"></div>
+        <div class="timeline-segment" style="left:40%;width:20%"></div>
+        <div class="timeline-segment" style="left:75%;width:12%"></div>
+        <div class="timeline-cursor" style="left:55%"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右侧 -->
+  <div class="right-panel">
+    <div class="glass stat-card">
+      <div class="label">录制时长</div>
+      <div class="value">14<span style="font-size:16px;color:var(--text-muted)">h</span> 32<span style="font-size:16px;color:var(--text-muted)">m</span></div>
+      <div class="trend">↑ 较昨日 +23%</div>
+    </div>
+    <div class="glass stat-card">
+      <div class="label">今日切片</div>
+      <div class="value">47</div>
+      <div class="trend">↑ 已导出 38 个</div>
+    </div>
+    <div class="glass clip-list">
+      <h3>最近切片</h3>
+      <div class="clip-item">🎬 主播A · 五杀集锦 · 02:14</div>
+      <div class="clip-item">🎬 主播A · 残局1v3 · 01:08</div>
+      <div class="clip-item">🎬 主播B · 名场面 · 00:45</div>
+      <div class="clip-item">🎬 主播C · 翻盘局 · 03:22</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

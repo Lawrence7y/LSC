@@ -1,4 +1,4 @@
-import type { TimelineContext } from '@/types'
+import type { TimelineContext, TimelineProgressSummary, ContinuousAnalysisStatus } from '@/types'
 
 export type TimelineAlignStatus = 'ready' | 'local' | 'invalidated'
 
@@ -104,6 +104,30 @@ export function computeRecordedDurationHint(
     hint = Math.max(hint, (nowMs - new Date(room.record_started_at).getTime()) / 1000)
   }
   return hint
+}
+
+/**
+ * 组装三轴进度展示摘要（仅用于 UI 展示，不改变三轴换算规则）。
+ * 复用 computeRecordedDurationHint + continuousStatus.analyzed_duration。
+ */
+export function summarizeTimelineProgress(opts: {
+  previewPosition: number
+  room: { is_recording?: boolean; record_started_at?: string | null } | null | undefined
+  continuousRecorded?: number
+  continuousStatus: ContinuousAnalysisStatus | null
+  axis: TimelineProgressSummary['axis']
+  nowMs?: number
+}): TimelineProgressSummary {
+  const recordedDuration = computeRecordedDurationHint(opts.room, opts.continuousRecorded, opts.nowMs)
+  const analysisScannedDuration = opts.continuousStatus?.analyzed_duration ?? 0
+  const previewDelay = Math.max(0, recordedDuration - opts.previewPosition)
+  return {
+    previewPosition: opts.previewPosition,
+    recordedDuration,
+    analysisScannedDuration,
+    previewDelay,
+    axis: opts.axis,
+  }
 }
 
 /**

@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from lsc.core.models import JianyingDraftOptions
 from lsc.core.services.timeline_service import get_timeline_service

@@ -32,10 +32,17 @@ type ShortcutEntry = ShortcutDef & {
 
 /**
  * 判断是否存在可见的 Modal / 对话框
+ *
+ * `[role="dialog"]` 必须检查可见性：常驻 DOM 但隐藏的 dialog（Drawer、
+ * 未销毁的 Modal 容器）若没有布局矩形，不应拦截全局快捷键。
  */
 function hasVisibleModal(): boolean {
-  return !!document.querySelector('.ant-modal-wrap:not([style*="display: none"])')
-    || !!document.querySelector('[role="dialog"]')
+  if (document.querySelector('.ant-modal-wrap:not([style*="display: none"])')) return true
+  const dialogs = document.querySelectorAll('[role="dialog"]')
+  for (const el of Array.from(dialogs)) {
+    if ((el as HTMLElement).getClientRects().length > 0) return true
+  }
+  return false
 }
 
 /**
@@ -81,18 +88,20 @@ export function useKeyboardShortcuts(
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      const isNav = e.key === '1' || e.key === '2' || e.key === '3' || e.key === 'F5'
+      // 导航快捷键（page:*）在输入框聚焦时也放行；从 SHORTCUTS 表派生，单一真相
+      const isNav = NAV_SHORTCUT_KEYS.has(e.key.toLowerCase())
       if (isInputFocused() && !isNav) return
 
       for (const s of shortcutsRef.current) {
         if (!matchesShortcut(e, s)) continue
-        // 步进/微调允许连按；其它快捷键忽略 key repeat
-        if (e.repeat && !s.id.startsWith('seek:') && !s.id.startsWith('mark:nudge')) {
-          return
-        }
         if (s.preventDefault !== false) {
           e.preventDefault()
           e.stopPropagation()
+        }
+        // 步进/微调允许连按；其它快捷键忽略 key repeat
+        // （已 preventDefault，避免长按空格/方向键触发页面滚动等默认行为）
+        if (e.repeat && !s.id.startsWith('seek:') && !s.id.startsWith('mark:nudge')) {
+          break
         }
         onShortcutRef.current(s.id, e)
         break // 只触发第一个匹配的快捷键
@@ -136,6 +145,15 @@ export const WORKBENCH_SHORTCUTS = {
   SELECT_ALL:        { key: 'a', ctrl: true, shift: true, id: 'select:all' },
   EXPORT_CLIP:       { key: 'e', ctrl: true,     id: 'export:clip' },
 } as const
+
+/** 导航类快捷键（id 以 page: 开头）的按键集合，输入聚焦时仍放行。
+ * 从 WORKBENCH_SHORTCUTS 派生，避免两处维护同一按键清单。
+ * 注意：必须定义在 WORKBENCH_SHORTCUTS 之后（const TDZ）。 */
+const NAV_SHORTCUT_KEYS: ReadonlySet<string> = new Set(
+  Object.values(WORKBENCH_SHORTCUTS)
+    .filter((s) => s.id.startsWith('page:'))
+    .map((s) => s.key.toLowerCase()),
+)
 
 /** 播放速率档位（ControlBar / 快捷键共用） */
 export const PLAYBACK_RATE_STEPS = [0.5, 1, 1.5, 2] as const

@@ -1,9 +1,10 @@
 import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
-import { message, Modal } from 'antd'
+import { App, message } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
 
-type SendFn = (type: string, data?: any) => void
+// send 返回 boolean：false 表示断连且消息被丢弃（useWebSocket.send 已统一弹提示）
+type SendFn = (type: string, data?: any) => boolean
 
 /**
  * 房间卡操作回调（录制/预览/静音/删除等）。
@@ -31,12 +32,14 @@ export function useRoomActions(opts: {
     setSelectedRoomIds,
     pendingRoomSavesRef,
   } = opts
+  // context 版 modal：消费 ConfigProvider 主题/locale，避免静态 Modal.confirm 的
+  // antd v5 deprecation 警告与上下文丢失
+  const { modal } = App.useApp()
 
   const handleToggleMute = useCallback((roomId: string) => {
     const room = useAppStore.getState().rooms.find((r) => r.room_id === roomId)
     if (!room) return
     const newMuted = !room.preview_muted
-    console.log('[Workbench] 用户操作: 切换静音状态, roomId:', roomId, 'newMuted:', newMuted)
     useAppStore.getState().updateRoom(roomId, { preview_muted: newMuted })
     if (!newMuted) {
       const ctx = getAligner().getContextSync()
@@ -50,13 +53,11 @@ export function useRoomActions(opts: {
   }, [send])
 
   const handleStartRecord = useCallback((roomId: string) => {
-    console.log('[Workbench] 用户操作: 开始录制, roomId:', roomId)
     useAppStore.getState().updateRoom(roomId, { is_recording_starting: true, last_error: '' })
     send('start_recording', { room_id: roomId })
   }, [send])
 
   const handleStopRecord = useCallback((roomId: string) => {
-    console.log('[Workbench] 用户操作: 停止录制, roomId:', roomId)
     const ca = useAppStore.getState().continuousAnalysisStatus
     const analyzingThisRoom = Boolean(
       ca?.running && (ca.room_id === roomId || (ca.target_room_ids || []).includes(roomId)),
@@ -68,7 +69,6 @@ export function useRoomActions(opts: {
   }, [send])
 
   const handleTogglePreview = useCallback((roomId: string, enabled: boolean) => {
-    console.log('[Workbench] 用户操作: 切换预览状态, roomId:', roomId, 'enabled:', enabled)
     if (enabled) {
       const activePreviews = useAppStore.getState().rooms
         .filter(r => r.preview_enabled && r.room_id !== roomId).length
@@ -92,7 +92,6 @@ export function useRoomActions(opts: {
   }, [setExpandedRoomId])
 
   const handleRemove = useCallback((roomId: string) => {
-    console.log('[Workbench] 用户操作: 删除房间, roomId:', roomId)
     setExpandedRoomId(prev => (prev === roomId ? null : prev))
     const continuousStatus = useAppStore.getState().continuousAnalysisStatus
     if (continuousStatus?.running) {
@@ -111,13 +110,11 @@ export function useRoomActions(opts: {
   }, [send, setExpandedRoomId, setSelectedRoomIds, pendingRoomSavesRef])
 
   const handleConnect = useCallback((roomId: string) => {
-    console.log('[Workbench] 用户操作: 连接房间, roomId:', roomId)
     useAppStore.getState().updateRoom(roomId, { is_connecting: true, last_error: '' })
     send('connect_room', { room_id: roomId })
   }, [send])
 
   const handleDisconnect = useCallback((roomId: string) => {
-    console.log('[Workbench] 用户操作: 断开房间连接, roomId:', roomId)
     const doDisconnect = () => {
       const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
       if (room?.is_recording) {
@@ -139,7 +136,7 @@ export function useRoomActions(opts: {
     }
     const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
     if (room?.is_recording) {
-      Modal.confirm({
+      modal.confirm({
         title: '确认断开',
         content: `断开将停止录制「${room.streamer_name || '未知主播'}」`,
         okText: '确认',
@@ -150,7 +147,7 @@ export function useRoomActions(opts: {
       return
     }
     doDisconnect()
-  }, [send])
+  }, [send, modal])
 
   return {
     handleToggleMute,

@@ -20,3 +20,50 @@
 .workbench-room-scroll::-webkit-scrollbar-thumb:hover {
   background: rgba(142, 142, 147, 0.7);
 }
+
+/* ===== 共享动态进度条（品牌青渐变 + 流动条纹 + 辉光） ===== */
+.pbar-line {
+  position: relative;
+  overflow: hidden;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.18);
+  display: block;
+}
+.pbar-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--brand-600, #279e99), var(--brand-400, #4dc4bf));
+  box-shadow: 0 0 8px rgba(77, 196, 191, 0.45);
+  transition: width 0.45s ease;
+  overflow: hidden;
+}
+.pbar-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(-45deg, rgba(255, 255, 255, 0.25) 0 6px, transparent 6px 12px);
+  animation: pbarSlide 1s linear infinite;
+}
+@keyframes pbarSlide {
+  from { background-position: 0 0; }
+  to { background-position: 17px 0; }
+}
+.pbar-ind {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 35%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, transparent, var(--brand-400, #4dc4bf), transparent);
+  animation: pbarInd 1.2s ease-in-out infinite;
+}
+@keyframes pbarInd {
+  from { left: -35%; }
+  to { left: 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pbar-fill::after, .pbar-ind { animation: none; }
+}

@@ -4,6 +4,7 @@
  * 每次捕获从当前流创建新 source，video.src 变化（MSE 重连）后依然有效。
  * 类为模块级单例，AudioWorklet 模块只加载一次。
  */
+import { withMuteSyncSuppressed } from '@/utils/muteSyncGuard'
 
 // ── AudioWorklet 处理器代码（内联 Blob） ──────────────────
 const WORKLET_CODE = `
@@ -110,13 +111,29 @@ class PreviewAudioAligner {
   ): Promise<Float32Array | null> {
     const previousMuted = video.muted
     let mutedOverridden = false
+    // 捕获期间覆盖成的目标值（取消静音）。restore 前据此判断用户是否手动改过静音：
+    // 若当前值已被外部改变，尊重用户操作，不回写。
+    const overriddenMutedValue = false
 
     const restoreMutedOverride = () => {
       if (!mutedOverridden) return
-      ;(video as any).__lscSuppressMuteSync = true
-      video.muted = previousMuted
-      ;(video as any).__lscSuppressMuteSync = false
+      if (video.muted === overriddenMutedValue) {
+        withMuteSyncSuppressed(video, () => {
+          video.muted = previousMuted
+        })
+      }
       mutedOverridden = false
+    }
+
+    // 捕获路径上可能已建立连接的节点，异常退出时统一断开，避免泄漏
+    let connectedSource: AudioNode | null = null
+    let workletNode: AudioWorkletNode | null = null
+    let zeroGainNode: GainNode | null = null
+
+    const disconnectPartial = () => {
+      try { if (connectedSource && workletNode) connectedSource.disconnect(workletNode) } catch {}
+      try { workletNode?.disconnect() } catch {}
+      try { zeroGainNode?.disconnect() } catch {}
     }
 
     try {
@@ -130,7 +147,7 @@ class PreviewAudioAligner {
 
       // 优先使用 VideoPreview 创建的共享 MediaElementSourceNode
       // 这样不受 video.muted 影响（音频已通过 Web Audio 路由，绕过 video 原生管线）
-      const registry = (window as any).__msePlayers
+      const registry = window.__msePlayers
       const sharedSource = registry?.[roomId]?.audioSource as MediaElementAudioSourceNode | undefined
 
       let source: AudioNode
@@ -140,12 +157,14 @@ class PreviewAudioAligner {
         // Chromium 下 video.muted=true 时 MediaElementSource 可能输出近静音，捕获期临时取消静音。
         // GainNode 在 source 之后，不改扬声器增益，避免对齐时突然外放。
         if (video.muted) {
-          ;(video as any).__lscSuppressMuteSync = true
-          video.muted = false
+          withMuteSyncSuppressed(video, () => {
+            video.muted = overriddenMutedValue
+          })
           mutedOverridden = true
-          ;(video as any).__lscSuppressMuteSync = false
         }
-        video.play().catch(() => {})
+        video.play().catch((e) => {
+          console.warn(`[PreviewAudioAligner] video.play() failed for room ${roomId}:`, e)
+        })
         console.log(`[PreviewAudioAligner] Using shared MediaElementSource for room ${roomId}`)
       } else {
         // 回退：captureStream（video.muted=true 时会产出全零数据）
@@ -178,6 +197,10 @@ class PreviewAudioAligner {
       source.connect(node)
       node.connect(zeroGain)
       zeroGain.connect(ctx.destination)
+      // 记录已建立连接的节点，供异常路径对称断开
+      connectedSource = source
+      workletNode = node
+      zeroGainNode = zeroGain
 
       console.log(`[PreviewAudioAligner] Capture started: room=${roomId}, target=${targetSamples} samples (${duration}s @ ${sampleRate}Hz)`)
 
@@ -187,9 +210,10 @@ class PreviewAudioAligner {
       const cleanup = () => {
         restoreMutedOverride()
         // 共享 MediaElementSource 只断开当前 recorder，保留扬声器路由
-        try { source.disconnect(node) } catch {}
-        try { node.disconnect() } catch {}
-        try { zeroGain.disconnect() } catch {}
+        disconnectPartial()
+        connectedSource = null
+        workletNode = null
+        zeroGainNode = null
       }
 
         const timeout = setTimeout(() => {
@@ -260,6 +284,8 @@ class PreviewAudioAligner {
       })
     } catch (e) {
       restoreMutedOverride()
+      // 异常路径：断开已建立的音频节点连接（source→node→zeroGain→destination），避免泄漏
+      disconnectPartial()
       console.error(`[PreviewAudioAligner] captureAudio failed for room ${roomId}:`, e)
       return null
     }
@@ -318,8 +344,9 @@ export function getAligner(): PreviewAudioAligner {
 }
 
 // ── 漂移修正 ──────────────────────────────────────────────────────
-// 模块级可取消定时器，防止多次对齐堆叠
- let _driftCorrectionTimers: Map<HTMLVideoElement, ReturnType<typeof setTimeout>> = new Map()
+// 模块级可取消定时器，防止多次对齐堆叠。
+// WeakMap：video 元素销毁后键自动释放，避免短生命周期元素被 Map 持有泄漏。
+const _driftCorrectionTimers: WeakMap<HTMLVideoElement, ReturnType<typeof setTimeout>> = new WeakMap()
 
 export function cancelDriftCorrection(video: HTMLVideoElement): void {
   const timer = _driftCorrectionTimers.get(video)
@@ -328,14 +355,6 @@ export function cancelDriftCorrection(video: HTMLVideoElement): void {
     _driftCorrectionTimers.delete(video)
     video.playbackRate = 1.0
   }
-}
-
-export function cancelAllDriftCorrections(): void {
-  _driftCorrectionTimers.forEach((timer, video) => {
-    clearTimeout(timer)
-    video.playbackRate = 1.0
-  })
-  _driftCorrectionTimers.clear()
 }
 
 export function applyOffsetWithDriftCorrection(video: HTMLVideoElement, offset: number): void {
@@ -378,5 +397,7 @@ export function applyOffsetWithDriftCorrection(video: HTMLVideoElement, offset: 
   } catch {
     video.removeEventListener('seeked', onSeeked)
   }
-  video.play().catch(() => {})
+  video.play().catch((e) => {
+    console.warn('[PreviewAudioAligner] video.play() failed after drift seek:', e)
+  })
 }

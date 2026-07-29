@@ -1,9 +1,14 @@
-import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
+import { useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 import { message } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import type { ExportProgressInfo } from '@/pages/Workbench/components/ClipList'
 
 type OnFn = (type: string, handler: (data: any) => void) => () => void
+
+/** 进度条目超时：超过该时长无任何 export_progress 更新，判定终态事件丢失并清扫 */
+const EXPORT_PROGRESS_STALE_MS = 120_000
+/** 超时清扫巡检间隔 */
+const EXPORT_PROGRESS_SWEEP_INTERVAL_MS = 30_000
 
 /**
  * 导出进度 / 完成 / 失败 WebSocket 监听（从 Workbench 拆出，降低巨型组件体积）。
@@ -24,6 +29,8 @@ export function useExportProgressListeners(opts: {
     exportProgressStatusPendingRef,
     pendingExportJobIdsRef,
   } = opts
+  // 各 job 最近一次进度时间戳：用于终态事件（clip_completed/clip_failed）丢失时的兜底清扫
+  const lastProgressAtRef = useRef<Record<string, number>>({})
 
   useEffect(() => {
     const unsubs: (() => void)[] = []
@@ -60,6 +67,7 @@ export function useExportProgressListeners(opts: {
           elapsed: data.elapsed ?? 0,
           total: data.total ?? 0,
         }
+        lastProgressAtRef.current[data.job_id] = Date.now()
         exportProgressStatusPendingRef.current.add(data.job_id)
         scheduleExportProgressFlush()
       }
@@ -74,6 +82,7 @@ export function useExportProgressListeners(opts: {
         )
         store.setClips(updatedClips)
         delete exportProgressPendingRef.current[data.job_id]
+        delete lastProgressAtRef.current[data.job_id]
         exportProgressStatusPendingRef.current.delete(data.job_id)
         setExportProgressMap(prev => {
           if (!prev[data.job_id]) return prev
@@ -81,7 +90,8 @@ export function useExportProgressListeners(opts: {
           delete next[data.job_id]
           return next
         })
-        if (!document.hasFocus()) {
+        // 聚焦时弹应用内 toast；失焦时由 useNotifications 的 OS 通知覆盖
+        if (document.hasFocus()) {
           message.success('切片导出完成')
         }
       }
@@ -96,6 +106,7 @@ export function useExportProgressListeners(opts: {
       if (data?.job_id) {
         const jid = data.job_id
         delete exportProgressPendingRef.current[jid]
+        delete lastProgressAtRef.current[jid]
         exportProgressStatusPendingRef.current.delete(jid)
         setExportProgressMap(prev => {
           if (!prev[jid]) return prev
@@ -155,7 +166,38 @@ export function useExportProgressListeners(opts: {
         message.warning(`取消导出失败：${data.error || '任务可能已结束'}`)
       }
     }))
+    // 超时清扫：后端若漏发终态事件（进程崩溃/消息丢失），进度条目不会永久残留
+    const sweepTimer = setInterval(() => {
+      const now = Date.now()
+      const staleJobIds = Object.keys(lastProgressAtRef.current).filter(
+        (jid) => now - lastProgressAtRef.current[jid] > EXPORT_PROGRESS_STALE_MS,
+      )
+      if (staleJobIds.length === 0) return
+      const staleSet = new Set(staleJobIds)
+      for (const jid of staleJobIds) {
+        delete lastProgressAtRef.current[jid]
+        delete exportProgressPendingRef.current[jid]
+        exportProgressStatusPendingRef.current.delete(jid)
+      }
+      setExportProgressMap(prev => {
+        let next = prev
+        for (const jid of staleJobIds) {
+          if (next[jid]) {
+            if (next === prev) next = { ...prev }
+            delete next[jid]
+          }
+        }
+        return next
+      })
+      const store = useAppStore.getState()
+      store.setClips(store.clips.map(c =>
+        c.job_id && staleSet.has(c.job_id) && c.export_status === 'exporting'
+          ? { ...c, export_status: 'failed' as const, export_error: '导出进度超时，请检查产物或重试' }
+          : c
+      ))
+    }, EXPORT_PROGRESS_SWEEP_INTERVAL_MS)
     return () => {
+      clearInterval(sweepTimer)
       if (exportProgressFlushTimerRef.current != null) {
         clearTimeout(exportProgressFlushTimerRef.current)
         exportProgressFlushTimerRef.current = null

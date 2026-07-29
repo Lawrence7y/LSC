@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Studio · 极简纯白风格</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --surface: #ffffff;
+    --surface-hover: #f5f5f5;
+    --border: #e5e5e5;
+    --border-strong: #d4d4d4;
+    --text: #171717;
+    --text-muted: #737373;
+    --text-subtle: #a3a3a3;
+    --accent: #007aff;
+    --success: #22c55e;
+    --warning: #f59e0b;
+    --error: #ef4444;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Pro Display', 'PingFang SC', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 24px;
+    height: 56px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100;
+  }
+  .logo { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
+  .nav { display: flex; gap: 2px; }
+  .nav span {
+    padding: 6px 14px; border-radius: 8px; font-size: 13px; color: var(--text-muted);
+    cursor: pointer; transition: all 0.15s; font-weight: 500;
+  }
+  .nav span:hover { background: var(--surface-hover); color: var(--text); }
+  .nav span.active { background: var(--text); color: var(--surface); }
+  .topbar-right { display: flex; align-items: center; gap: 14px; }
+  .icon-btn {
+    width: 32px; height: 32px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; color: var(--text-muted); font-size: 16px;
+    transition: all 0.15s;
+  }
+  .icon-btn:hover { background: var(--surface-hover); color: var(--text); }
+  .avatar {
+    width: 30px; height: 30px; border-radius: 50%;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+  }
+
+  .main {
+    padding: 24px;
+    display: grid;
+    grid-template-columns: 240px 1fr 280px;
+    gap: 20px;
+    max-width: 1600px; margin: 0 auto;
+  }
+
+  /* 左侧栏 */
+  .sidebar { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; height: fit-content; }
+  .sidebar h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-subtle); margin-bottom: 12px; font-weight: 600; }
+  .room-item {
+    padding: 10px 12px; border-radius: 8px; margin-bottom: 4px;
+    cursor: pointer; transition: all 0.15s;
+    border: 1px solid transparent;
+  }
+  .room-item:hover { background: var(--surface-hover); }
+  .room-item.active {
+    background: var(--text); color: var(--surface);
+  }
+  .room-item.active .meta { color: rgba(255,255,255,0.6); }
+  .room-item .name { font-size: 13px; font-weight: 500; margin-bottom: 2px; }
+  .room-item .meta { font-size: 11px; color: var(--text-subtle); display: flex; gap: 6px; align-items: center; }
+  .live-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--success);
+  }
+
+  /* 中间 */
+  .preview-area { display: flex; flex-direction: column; gap: 16px; }
+  .preview-header { display: flex; justify-content: space-between; align-items: center; }
+  .preview-header h2 { font-size: 15px; font-weight: 600; }
+  .btn-group { display: flex; gap: 8px; }
+  .btn {
+    padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 500;
+    border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+  .btn-primary {
+    background: var(--text); color: var(--surface); border-color: var(--text);
+  }
+  .btn-primary:hover { background: #333; }
+
+  .preview-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .preview-card {
+    aspect-ratio: 16/9;
+    background: #171717;
+    border-radius: 10px;
+    position: relative;
+    overflow: hidden;
+  }
+  .preview-card::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: linear-gradient(135deg, #1a1a2e, #16213e);
+  }
+  .preview-card .info {
+    position: absolute; bottom: 10px; left: 12px;
+    font-size: 12px; color: rgba(255,255,255,0.6);
+  }
+  .preview-card .badge-live {
+    position: absolute; top: 10px; left: 12px;
+    padding: 3px 8px; border-radius: 4px;
+    background: var(--error); color: white;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+  }
+
+  /* 时间线 */
+  .timeline { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .timeline h3 { font-size: 12px; color: var(--text-muted); margin-bottom: 12px; font-weight: 500; }
+  .timeline-track {
+    height: 48px; border-radius: 8px;
+    background: var(--surface-hover);
+    border: 1px solid var(--border);
+    position: relative; overflow: hidden;
+  }
+  .timeline-segment {
+    position: absolute; top: 6px; height: 36px;
+    background: var(--text);
+    border-radius: 4px; opacity: 0.85;
+  }
+  .timeline-cursor {
+    position: absolute; top: 0; bottom: 0; width: 2px;
+    background: var(--accent);
+  }
+
+  /* 右侧 */
+  .right-panel { display: flex; flex-direction: column; gap: 16px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .stat-card .label { font-size: 12px; color: var(--text-subtle); margin-bottom: 4px; font-weight: 500; }
+  .stat-card .value { font-size: 28px; font-weight: 700; letter-spacing: -1px; }
+  .stat-card .trend { font-size: 12px; color: var(--success); margin-top: 4px; font-weight: 500; }
+
+  .clip-list { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .clip-list h3 { font-size: 12px; color: var(--text-muted); margin-bottom: 12px; font-weight: 500; }
+  .clip-item {
+    padding: 10px; border-radius: 8px; margin-bottom: 4px;
+    font-size: 13px; cursor: pointer; transition: all 0.15s;
+    border: 1px solid transparent;
+  }
+  .clip-item:hover { background: var(--surface-hover); }
+
+  .back-btn {
+    position: fixed; top: 14px; right: 20px; z-index: 200;
+    padding: 6px 14px; border-radius: 8px;
+    background: var(--surface); color: var(--text); text-decoration: none; font-size: 12px;
+    border: 1px solid var(--border); font-weight: 500;
+  }
+  .back-btn:hover { background: var(--surface-hover); }
+</style>
+</head>
+<body>
+<a href="index.html" class="back-btn">← 返回</a>
+
+<div class="topbar">
+  <div class="logo">LSC</div>
+  <div class="nav">
+    <span>Dashboard</span>
+    <span class="active">工作台</span>
+    <span>设置</span>
+  </div>
+  <div class="topbar-right">
+    <div class="icon-btn">🔔</div>
+    <div class="icon-btn">⚙️</div>
+    <div class="avatar"></div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="sidebar">
+    <h3>直播间</h3>
+    <div class="room-item active">
+      <div class="name">🎮 主播A · 无畏契约</div>
+      <div class="meta"><span class="live-dot"></span> 12.3万观看</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎤 主播B · 聊天电台</div>
+      <div class="meta"><span class="live-dot"></span> 8.1万观看</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎯 主播C · CS2</div>
+      <div class="meta"><span class="live-dot" style="background:var(--warning)"></span> 录像中</div>
+    </div>
+    <div class="room-item">
+      <div class="name">🎪 主播D</div>
+      <div class="meta" style="color:var(--text-subtle)">离线</div>
+    </div>
+  </div>
+
+  <div class="preview-area">
+    <div class="preview-header">
+      <h2>多房间预览</h2>
+      <div class="btn-group">
+        <button class="btn">一键对齐</button>
+        <button class="btn btn-primary">开始录制</button>
+      </div>
+    </div>
+    <div class="preview-grid">
+      <div class="preview-card">
+        <span class="badge-live">LIVE</span>
+        <div class="info">主播A · 00:14:32</div>
+      </div>
+      <div class="preview-card">
+        <span class="badge-live">LIVE</span>
+        <div class="info">主播B · 00:08:15</div>
+      </div>
+      <div class="preview-card">
+        <div class="info">主播C · 00:22:41</div>
+      </div>
+      <div class="preview-card" style="background:var(--bg);display:flex;align-items:center;justify-content:center;color:var(--text-subtle);font-size:13px;border:2px dashed var(--border);">
+        + 添加房间
+      </div>
+    </div>
+    <div class="timeline">
+      <h3>时间轴 · 按 I/O 标记入出点</h3>
+      <div class="timeline-track">
+        <div class="timeline-segment" style="left:10%;width:15%"></div>
+        <div class="timeline-segment" style="left:40%;width:20%"></div>
+        <div class="timeline-segment" style="left:75%;width:12%"></div>
+        <div class="timeline-cursor" style="left:55%"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <div class="stat-card">
+      <div class="label">录制时长</div>
+      <div class="value">14h 32m</div>
+      <div class="trend">↑ 较昨日 +23%</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">今日切片</div>
+      <div class="value">47</div>
+      <div class="trend">↑ 已导出 38 个</div>
+    </div>
+    <div class="clip-list">
+      <h3>最近切片</h3>
+      <div class="clip-item">🎬 主播A · 五杀集锦 · 02:14</div>
+      <div class="clip-item">🎬 主播A · 残局1v3 · 01:08</div>
+      <div class="clip-item">🎬 主播B · 名场面 · 00:45</div>
+      <div class="clip-item">🎬 主播C · 翻盘局 · 03:22</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

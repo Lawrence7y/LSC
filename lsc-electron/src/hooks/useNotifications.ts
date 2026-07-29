@@ -53,9 +53,11 @@ export function useNotifications() {
       unsubsRef.current.push(wsClient.on(event as any, handler))
     }
 
-    // backend-error 监听
+    // backend-error 监听（返回单条注销函数，卸载时只注销自己，
+    // 不再 removeBackendErrorListeners 全量清除误删其他模块的监听）
+    let unsubBackendError: (() => void) | void = undefined
     if (window.electronAPI?.onBackendError) {
-      window.electronAPI.onBackendError((error) => {
+      unsubBackendError = window.electronAPI.onBackendError((error) => {
         if (error) {
           window.electronAPI?.showNotification?.({
             title: '后端启动失败',
@@ -68,7 +70,7 @@ export function useNotifications() {
     return () => {
       unsubsRef.current.forEach((fn) => fn())
       unsubsRef.current = []
-      window.electronAPI?.removeBackendErrorListeners?.()
+      unsubBackendError?.()
     }
   }, [])
 }

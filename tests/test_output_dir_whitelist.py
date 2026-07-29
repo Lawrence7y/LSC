@@ -32,6 +32,25 @@ def test_is_allowed_output_dir_allows_home_lsc_recordings() -> None:
     assert rh._is_allowed_output_dir("~/LSC/recordings") is True
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "D:\\desktop\\新建文件夹 (2)",
+        "E:\\videos\\clips",
+        "D:\\",
+    ],
+)
+def test_is_allowed_output_dir_allows_user_data_drives(path: str) -> None:
+    """用户数据盘（非系统盘）的导出目录必须合法，不得误伤。"""
+    assert rh._is_allowed_output_dir(path) is True
+
+
+def test_is_allowed_output_dir_rejects_empty_and_non_string() -> None:
+    assert rh._is_allowed_output_dir("") is False
+    assert rh._is_allowed_output_dir("   ") is False
+    assert rh._is_allowed_output_dir(None) is False  # type: ignore[arg-type]
+
+
 def test_save_settings_rejects_disallowed_output_dir(monkeypatch, tmp_path) -> None:
     settings_file = tmp_path / "settings.json"
     monkeypatch.setattr(rh, "SETTINGS_FILE", str(settings_file))

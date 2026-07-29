@@ -239,15 +239,24 @@ export const RefreshButton = memo(function RefreshButton({
   const spawnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const shatterPolygonRef = useRef<string>('inset(0)')
+  const shatterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const mountedRef = useRef(true)
 
   // Inject CSS once
   useEffect(() => { injectCss() }, [])
+
+  // ── Mounted guard ──
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   // ── Cleanup timers ──
   const cleanupTimers = useCallback(() => {
     if (progressTimerRef.current) { clearTimeout(progressTimerRef.current); progressTimerRef.current = null }
     if (spawnTimerRef.current) { clearTimeout(spawnTimerRef.current); spawnTimerRef.current = null }
     if (flashTimerRef.current) { clearTimeout(flashTimerRef.current); flashTimerRef.current = null }
+    if (shatterTimerRef.current) { clearTimeout(shatterTimerRef.current); shatterTimerRef.current = null }
   }, [])
 
   // ── Trigger shatter (solid blue → particles fly outward) ──
@@ -278,8 +287,10 @@ export const RefreshButton = memo(function RefreshButton({
     }
     setShatterParticles(particles)
 
-    // After 350ms, clean up everything
-    setTimeout(() => {
+    // After 380ms, clean up everything
+    shatterTimerRef.current = setTimeout(() => {
+      shatterTimerRef.current = null
+      if (!mountedRef.current) return
       setFillProgress(0)
       fillProgressRef.current = 0
       setShatterParticles([])
@@ -316,6 +327,7 @@ export const RefreshButton = memo(function RefreshButton({
 
       // Flash 200ms then shatter + callback
       flashTimerRef.current = setTimeout(() => {
+        if (!mountedRef.current) return
         setShowFlash(false)
         setEnteringParticles([])
         triggerShatter()
@@ -393,11 +405,21 @@ export const RefreshButton = memo(function RefreshButton({
     phaseRef.current = 'idle'
   }, [cleanupTimers, triggerShatter])
 
+  // ── Handle keyboard (accessibility) ──
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (disabled) return
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      // Enter/Space 视为短按
+      onShortClick()
+    }
+  }, [disabled, onShortClick])
+
   // ── Unmount cleanup ──
   useEffect(() => () => cleanupTimers(), [cleanupTimers])
 
   // ── Determine button text color based on fill depth ──
-  const textColor = fillProgress > 55 ? '#fff' : undefined
+  const textColor = fillProgress > 55 ? 'var(--overlay-text, #f5f5f7)' : undefined
 
   // ── Shatter clip-path (only applied when shattering) ──
   const clipPath = shatterParticles.length > 0 ? shatterPolygonRef.current : 'inset(0)'
@@ -413,6 +435,7 @@ export const RefreshButton = memo(function RefreshButton({
         onMouseDown={handleMouseDown}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseLeave}
+        onKeyDown={handleKeyDown}
         style={{
           position: 'relative',
           overflow: 'hidden',

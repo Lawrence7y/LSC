@@ -5,6 +5,9 @@ export class WaveformPeakBuffer {
   private analyser: AnalyserNode | null = null
   private zeroGain: GainNode | null = null
   private raf = 0
+  // 存活下界：key 随时间单调递增，小于该值的 key 已剪枝，
+  // 剪枝时按下界区间增量删除（摊还 O(1)），避免每帧全量遍历 Map。
+  private minLiveIdx = 0
 
   constructor(bucketSec = 0.05) {
     this.bucketSec = bucketSec
@@ -12,14 +15,11 @@ export class WaveformPeakBuffer {
 
   attachFromRegistry(roomId: string): boolean {
     this.detach()
-    const registry = (window as unknown as { __msePlayers?: Record<string, {
-      audioSource?: MediaElementAudioSourceNode
-      audioContext?: AudioContext
-    }> }).__msePlayers
+    const registry = window.__msePlayers
     const entry = registry?.[roomId]
     const audioSource = entry?.audioSource
-    const ctx = entry?.audioContext
-    if (!audioSource || !ctx) return false
+    if (!audioSource) return false
+    const ctx = audioSource.context as AudioContext
 
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 2048
@@ -35,6 +35,9 @@ export class WaveformPeakBuffer {
 
   start(getCommonTime: () => number): void {
     if (!this.analyser) return
+    // 重入保护：先停掉旧循环，避免重复 start 叠加多个 rAF 循环（旧循环只能靠
+    // analyser 置 null 自然终止，且 stop() 只能取消最后一个）
+    this.stop()
     const data = new Uint8Array(this.analyser.fftSize)
     const tick = () => {
       if (!this.analyser) return
@@ -49,9 +52,14 @@ export class WaveformPeakBuffer {
         const idx = Math.floor(t / this.bucketSec)
         const prev = this.peaks.get(idx) ?? 0
         this.peaks.set(idx, Math.max(prev, peak))
+        // 剪枝：key 随时间单调递增（用户回看时 t 回退则 minIdx 不前进），
+        // 按 [minLiveIdx, minIdx) 区间增量删除，不每帧全量遍历 Map
         const minIdx = idx - Math.floor(14400 / this.bucketSec)
-        for (const k of this.peaks.keys()) {
-          if (k < minIdx) this.peaks.delete(k)
+        if (minIdx > this.minLiveIdx) {
+          for (let k = this.minLiveIdx; k < minIdx; k++) {
+            this.peaks.delete(k)
+          }
+          this.minLiveIdx = minIdx
         }
       }
       this.raf = requestAnimationFrame(tick)
@@ -74,6 +82,9 @@ export class WaveformPeakBuffer {
     }
     this.analyser = null
     this.zeroGain = null
+    // 清空旧波形数据，避免 reattach 其他房间后残留显示
+    this.peaks.clear()
+    this.minLiveIdx = 0
   }
 
   sample(start: number, end: number, bars: number): number[] {

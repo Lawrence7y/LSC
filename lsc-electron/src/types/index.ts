@@ -209,6 +209,15 @@ export interface ApiResponse<T = any> {
   error?: string
 }
 
+/** 自动更新状态载荷（主进程 update-status 事件） */
+export interface UpdateStatusPayload {
+  status?: string
+  message?: string
+  percent?: number
+  version?: string
+  [key: string]: unknown
+}
+
 // Electron API
 export interface ElectronAPI {
   getAppVersion: () => Promise<string>
@@ -232,7 +241,8 @@ export interface ElectronAPI {
   setProgressBar?: (progress: number) => Promise<void>
   setTrayState?: (state: 'idle' | 'recording' | 'error') => Promise<void>
   getBackendError?: () => Promise<string | null>
-  onBackendError?: (callback: (error: string) => void) => void
+  /** 注册后端错误监听，返回单条注销函数（只注销本次注册，不影响其他模块） */
+  onBackendError?: (callback: (error: string) => void) => (() => void) | void
   removeBackendErrorListeners?: () => void
   readLogFile?: (opts: { file: string; lines?: number }) => Promise<{ success: boolean; content: string; path?: string; error?: string; size?: number }>
   openLogFolder?: () => Promise<{ success: boolean; error?: string }>
@@ -299,6 +309,8 @@ export interface TimelineHighlightBand {
   score?: number
   reason?: string
   label?: string
+  /** AI 回合确认状态：pending 虚线警示色，confirmed 实色品牌色 */
+  confirm_status?: string
 }
 
 export type ExportTarget = 'mp4' | 'draft' | 'both'
@@ -321,6 +333,20 @@ export interface JianyingDraftResult {
   warnings?: string[]
   error?: string
   error_code?: string
+}
+
+/** 三轴进度展示 DTO（仅用于 UI 展示，不改变三轴换算规则） */
+export interface TimelineProgressSummary {
+  /** MSE 播放位置（预览轴，秒） */
+  previewPosition: number
+  /** 磁盘已录制时长（录制轴，秒） */
+  recordedDuration: number
+  /** 持续分析已扫描时长（分析轴，秒） */
+  analysisScannedDuration: number
+  /** 录制领先预览的秒数，max(0, recordedDuration - previewPosition) */
+  previewDelay: number
+  /** 当前控制栏所处轴 */
+  axis: 'preview' | 'common' | 'recording_review'
 }
 
 export interface ContinuousAnalysisStatus {
@@ -358,6 +384,8 @@ export interface ContinuousAnalysisStatus {
   scan_elapsed_sec?: number
   worker_job_label?: string
   scan_running?: boolean
+  /** 分析滞后于录制的秒数（recorded - analyzed），后端 payload 提供 */
+  analysis_lag_sec?: number
 }
 
 // 主进程暴露的应用 API（与 electron/preload.ts 保持一致）
@@ -369,9 +397,31 @@ export interface AppAPI {
   onAppSettingsChange(callback: (settings: { autoLaunch: boolean; minimizeToTray: boolean }) => void): void
 }
 
+// MSE 播放器全局注册表条目（window.__msePlayers）
+export interface MsePlayerRegistryEntry {
+  feedInit: (data: ArrayBuffer) => void
+  feedMedia: (data: ArrayBuffer) => void
+  player: {
+    stop: () => void
+    pause: () => void
+    goLive: () => void
+    getBufferedRange: () => { start: number; end: number } | null
+    state: string
+    videoElement?: HTMLVideoElement
+    resumePlayback?: (silent?: boolean) => void
+  } | null
+  audioSource: MediaElementAudioSourceNode | null
+  gainNode: GainNode | null
+  /** 可选：诊断用，标识进样模式 */
+  ingestMode?: string
+}
+
 declare global {
   interface Window {
     electronAPI?: ElectronAPI
     app?: AppAPI
+    __msePlayers?: Record<string, MsePlayerRegistryEntry>
+    /** MSE init 段重试计数器 */
+    __mseInitRetryCount?: Record<string, number>
   }
 }

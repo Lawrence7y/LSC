@@ -7,10 +7,18 @@ import {
   type TimelineViewResult,
 } from '@/utils/timelineViewModel'
 
-const WORKER_CLIP_THRESHOLD = 20
+// Worker 收益阈值：computeTimelineViewModel 是 O(n) 纯算术，而每次 postMessage
+// 都要 structured-clone 整个 input（rooms/clips/timelineContext/waveformPeaks），
+// 低切片数下克隆+异步往返成本高于计算本身还白引入一帧延迟。
+// 仅在切片量级真正大（>=500）时才走 Worker。
+const WORKER_CLIP_THRESHOLD = 500
+
+type WorkerResponse =
+  | { ok: true; seq: number; result: TimelineViewResult }
+  | { ok: false; seq: number; error: string }
 
 /**
- * 切片较多时把时间线视图计算丢到 Worker；否则同步计算（避免小数据 Worker 开销）。
+ * 切片量级大时把时间线视图计算丢到 Worker；否则同步计算（避免小数据 Worker 开销）。
  * clipBlocks 独立 memo：previewPositions 高频变化时不重跑 O(n) 坐标转换。
  */
 export function useTimelineViewModel(
@@ -24,12 +32,27 @@ export function useTimelineViewModel(
   const contentEdgeRoomRef = useRef<string | null>(null)
   const [asyncView, setAsyncView] = useState<TimelineViewModel | null>(null)
   const workerRef = useRef<Worker | null>(null)
+  // 请求序号：高频 postMessage 时只采用最新响应，丢弃中间过期结果
+  const seqRef = useRef(0)
   const useWorker = input.clips.length >= WORKER_CLIP_THRESHOLD
 
   const clipBlocks = useMemo(() => {
     if (!input.commonMode || !input.timelineContext) return []
     return buildClipBlocks(input.clips, input.timelineContext)
   }, [input.commonMode, input.timelineContext, input.clips])
+
+  /** 同步计算（sync 路径主用 / worker 失败时兜底），返回完整 result 供调用方写 ref */
+  const computeSync = (): TimelineViewResult =>
+    computeTimelineViewModel({
+      ...input,
+      clipBlocks,
+      prevContentEnd: lastContentEndRef.current,
+      prevWindowStart: lastWindowStartRef.current,
+      contentEdgeRoomId: contentEdgeRoomRef.current,
+    })
+
+  const computeSyncRef = useRef(computeSync)
+  computeSyncRef.current = computeSync
 
   useEffect(() => {
     if (!useWorker) {
@@ -38,19 +61,36 @@ export function useTimelineViewModel(
       return
     }
     if (!workerRef.current) {
-      workerRef.current = new Worker(
+      const worker = new Worker(
         new URL('../workers/timelineView.worker.ts', import.meta.url),
         { type: 'module' },
       )
-      workerRef.current.onmessage = (event: MessageEvent<{ ok: boolean; result?: TimelineViewResult; error?: string }>) => {
-        if (!event.data?.ok || !event.data.result) return
-        const { view, contentEnd, windowStart, contentEdgeRoomId } = event.data.result
-        lastContentEndRef.current = contentEnd
-        lastWindowStartRef.current = windowStart
-        contentEdgeRoomRef.current = contentEdgeRoomId
-        setAsyncView(view)
+      worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+        const msg = event.data
+        if (!msg) return
+        // 过期响应：已有更新的请求发出，丢弃避免多余渲染与乱序覆盖
+        if (msg.seq !== seqRef.current) return
+        if (!msg.ok) {
+          // worker 计算失败：回退主线程同步计算，避免视图永久停留在旧值
+          console.error('[useTimelineViewModel] worker compute failed, fallback to sync:', msg.error)
+          applyResult(computeSyncRef.current())
+          return
+        }
+        applyResult(msg.result)
       }
+      worker.onerror = (event) => {
+        console.error('[useTimelineViewModel] worker error, fallback to sync:', event.message)
+        applyResult(computeSyncRef.current())
+      }
+      workerRef.current = worker
     }
+    const applyResult = (result: TimelineViewResult) => {
+      lastContentEndRef.current = result.contentEnd
+      lastWindowStartRef.current = result.windowStart
+      contentEdgeRoomRef.current = result.contentEdgeRoomId
+      setAsyncView(result.view)
+    }
+    const seq = ++seqRef.current
     const payload: TimelineViewInput = {
       ...input,
       clipBlocks,
@@ -58,7 +98,7 @@ export function useTimelineViewModel(
       prevWindowStart: lastWindowStartRef.current,
       contentEdgeRoomId: contentEdgeRoomRef.current,
     }
-    workerRef.current.postMessage(payload)
+    workerRef.current.postMessage({ seq, input: payload })
   }, [
     useWorker,
     clipBlocks,
@@ -86,19 +126,12 @@ export function useTimelineViewModel(
     workerRef.current = null
   }, [])
 
-  const syncView = useMemo(() => {
+  // sync 路径：纯计算放 useMemo（不写 ref），result 提交后由 effect 写 ref，
+  // 避免渲染期副作用（StrictMode 双渲染/并发渲染下 ref 与提交值不一致）。
+  const syncResult = useMemo(() => {
     if (useWorker) return null
-    const result = computeTimelineViewModel({
-      ...input,
-      clipBlocks,
-      prevContentEnd: lastContentEndRef.current,
-      prevWindowStart: lastWindowStartRef.current,
-      contentEdgeRoomId: contentEdgeRoomRef.current,
-    })
-    lastContentEndRef.current = result.contentEnd
-    lastWindowStartRef.current = result.windowStart
-    contentEdgeRoomRef.current = result.contentEdgeRoomId
-    return result.view
+    return computeSync()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     useWorker,
     clipBlocks,
@@ -121,5 +154,12 @@ export function useTimelineViewModel(
     input.timelineTick,
   ])
 
-  return useWorker ? asyncView : syncView
+  useEffect(() => {
+    if (!syncResult) return
+    lastContentEndRef.current = syncResult.contentEnd
+    lastWindowStartRef.current = syncResult.windowStart
+    contentEdgeRoomRef.current = syncResult.contentEdgeRoomId
+  }, [syncResult])
+
+  return useWorker ? asyncView : (syncResult?.view ?? null)
 }

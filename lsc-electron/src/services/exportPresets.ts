@@ -65,15 +65,16 @@ export const EXPORT_PRESETS: ExportPreset[] = [
 ]
 
 /**
- * 根据 ID 查找预设
+ * 根据 ID 查找预设（返回浅拷贝，防止调用方意外突变污染全局预设表）
  */
 export function getPresetById(id: string): ExportPreset | undefined {
-  return EXPORT_PRESETS.find(p => p.id === id)
+  const found = EXPORT_PRESETS.find(p => p.id === id)
+  return found ? { ...found } : undefined
 }
 
 /**
- * 获取默认预设
+ * 获取默认预设（返回浅拷贝，防止调用方意外突变污染全局预设表）
  */
 export function getDefaultPreset(): ExportPreset {
-  return EXPORT_PRESETS[0]
+  return { ...EXPORT_PRESETS[0] }
 }

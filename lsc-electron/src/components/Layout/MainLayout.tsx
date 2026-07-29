@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import { Layout, Menu, Button, Drawer } from 'antd'
 import {
@@ -46,14 +46,19 @@ const menuItems = [
 export default function MainLayout() {
   const navigate = useNavigate()
   const location = useLocation()
-  const { isConnected, send, reconnect } = useWebSocket()
+  const { send, reconnect } = useWebSocket()
   const connectionStatus = useAppStore((state) => state.connectionStatus)
   const appSettings = useAppStore((state) => state.appSettings)
   const setAppSettings = useAppStore((state) => state.setAppSettings)
-  const settings = useAppStore((state) => state.settings)
   const settingsDrawerOpen = useAppStore((state) => state.settingsDrawerOpen)
   const setSettingsDrawerOpen = useAppStore((state) => state.setSettingsDrawerOpen)
   const [connectionVisible, setConnectionVisible] = useState(false)
+  const themeTransitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // 卸载时清理主题过渡定时器
+  useEffect(() => () => {
+    if (themeTransitionTimerRef.current) clearTimeout(themeTransitionTimerRef.current)
+  }, [])
 
   // 连接断开时延迟 2 秒再显示 banner，避免 WS 短暂重连期间误报「无法连接到后端」。
   // 连接恢复时立即隐藏 banner。与 Workbench 的 Alert 防抖保持一致。
@@ -76,9 +81,15 @@ export default function MainLayout() {
 
   // 主题切换：更新 store + 实时切换 class + 持久化到后端
   const handleToggleTheme = () => {
-    const newTheme = appSettings.theme === 'dark' ? 'light' : 'dark'
+    // settings 经 getState 现取，避免为单次读取订阅整个 settings 对象引发整树重渲染
+    const { settings, appSettings: currentAppSettings } = useAppStore.getState()
+    const newTheme = currentAppSettings.theme === 'dark' ? 'light' : 'dark'
     document.documentElement.classList.add('theme-transition')
-    setTimeout(() => document.documentElement.classList.remove('theme-transition'), 400)
+    if (themeTransitionTimerRef.current) clearTimeout(themeTransitionTimerRef.current)
+    themeTransitionTimerRef.current = setTimeout(() => {
+      themeTransitionTimerRef.current = null
+      document.documentElement.classList.remove('theme-transition')
+    }, 400)
     if (newTheme === 'dark') {
       document.documentElement.classList.add('dark')
     } else {
@@ -87,7 +98,7 @@ export default function MainLayout() {
     setAppSettings({ theme: newTheme })
     send('save_settings', {
       ...settings,
-      appSettings: { ...appSettings, theme: newTheme },
+      appSettings: { ...currentAppSettings, theme: newTheme },
     })
   }
 
@@ -244,8 +255,8 @@ export default function MainLayout() {
       </Sider>
 
       <Layout>
-        {/* Connection Status Banner */}
-        {!isConnected && connectionVisible && (
+        {/* Connection Status Banner（统一由 store.connectionStatus 派生，不再混用 hook 返回值） */}
+        {connectionStatus !== 'connected' && connectionVisible && (
           <div style={{
             height: 36,
             background: 'var(--state-error)',

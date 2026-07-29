@@ -11,7 +11,11 @@ import time as _time
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication, QObject, Signal  # noqa: F401  # kept for backward compat
+from PySide6.QtCore import (  # noqa: F401  # kept for backward compat
+    QCoreApplication,
+    QObject,
+    Signal,
+)
 
 from lsc.config import ExportProfile, load_config
 from lsc.core.orchestrator import (

@@ -1,0 +1,1677 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSC v5 · 全功能原型</title>
+<style>
+/* ========================================
+   设计系统变量
+   ======================================== */
+:root {
+  color-scheme: dark;
+  /* 品牌色 */
+  --brand: #31b3ae;
+  --brand-hover: #43c6c0;
+  --brand-active: #2a9d98;
+  --brand-soft: rgba(49,179,174,.12);
+  --brand-glow: rgba(49,179,174,.25);
+
+  /* 背景层 */
+  --bg-900: #0b0d0f;
+  --bg-800: #111417;
+  --bg-700: #171b1f;
+  --bg-600: #1e2329;
+  --bg-500: #262c33;
+
+  /* 文字 */
+  --text-50: #f2f4f5;
+  --text-300: #b6bcc2;
+  --text-400: #8a9199;
+  --text-500: #5c646c;
+
+  /* 状态色 */
+  --success: #45c779;
+  --success-soft: rgba(69,199,121,.12);
+  --warning: #e7a049;
+  --warning-soft: rgba(231,160,73,.12);
+  --error: #f0645c;
+  --error-soft: rgba(240,100,92,.12);
+  --info: #559ce8;
+  --info-soft: rgba(85,156,232,.12);
+
+  /* 边框 */
+  --border: rgba(255,255,255,.08);
+  --border-strong: rgba(255,255,255,.14);
+
+  /* 圆角 */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+
+  /* 阴影 */
+  --shadow-sm: 0 2px 8px rgba(0,0,0,.2);
+  --shadow-md: 0 8px 24px rgba(0,0,0,.3);
+  --shadow-lg: 0 16px 48px rgba(0,0,0,.4);
+
+  /* 布局尺寸 */
+  --sidebar-w: 200px;
+  --topbar-h: 48px;
+  --statusbar-h: 36px;
+  --timeline-h: 96px;
+  --clip-panel-w: 340px;
+
+  /* 字体 */
+  --font: "SF Pro Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --mono: "SF Mono", "Cascadia Mono", Consolas, monospace;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg-900: #eef1f3;
+  --bg-800: #ffffff;
+  --bg-700: #f5f7f8;
+  --bg-600: #e8ecef;
+  --bg-500: #dde2e6;
+  --text-50: #171b1f;
+  --text-300: #4c555d;
+  --text-400: #7e8790;
+  --text-500: #a0a8b0;
+  --border: rgba(21,27,32,.10);
+  --border-strong: rgba(21,27,32,.18);
+}
+
+/* ========================================
+   基础重置
+   ======================================== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+body {
+  font: 13px/1.5 var(--font);
+  background: var(--bg-900);
+  color: var(--text-50);
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+input, select, textarea { font: inherit; color: inherit; }
+
+/* ========================================
+   通用组件
+   ======================================== */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 30px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--bg-600); color: var(--text-300);
+  font-size: 12px; white-space: nowrap;
+  transition: all .15s ease;
+}
+.btn:hover { background: var(--bg-500); color: var(--text-50); border-color: var(--border-strong); }
+.btn:active { transform: scale(.97); }
+.btn.primary { background: var(--brand); border-color: var(--brand); color: #062b2a; font-weight: 600; }
+.btn.primary:hover { background: var(--brand-hover); border-color: var(--brand-hover); }
+.btn.danger { background: var(--error); border-color: var(--error); color: #fff; }
+.btn.danger:hover { opacity: .9; }
+.btn.ghost { background: transparent; border-color: transparent; }
+.btn.ghost:hover { background: var(--bg-600); }
+.btn.sm { height: 26px; padding: 0 8px; font-size: 11px; }
+.btn.icon { width: 30px; padding: 0; }
+.btn.icon.sm { width: 26px; }
+
+.select {
+  height: 30px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--bg-600); color: var(--text-50); font-size: 12px;
+}
+.input {
+  height: 30px; padding: 0 10px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--bg-600); color: var(--text-50); font-size: 12px;
+}
+.input::placeholder { color: var(--text-500); }
+
+.tag {
+  display: inline-flex; align-items: center; height: 20px; padding: 0 6px;
+  border-radius: 4px; font-size: 10px; font-weight: 500;
+}
+.tag.success { background: var(--success-soft); color: var(--success); }
+.tag.warning { background: var(--warning-soft); color: var(--warning); }
+.tag.error { background: var(--error-soft); color: var(--error); }
+.tag.info { background: var(--info-soft); color: var(--info); }
+.tag.brand { background: var(--brand-soft); color: var(--brand); }
+
+.checkbox { width: 16px; height: 16px; accent-color: var(--brand); cursor: pointer; }
+
+.divider { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
+
+.toggle {
+  position: relative; width: 36px; height: 20px;
+  background: var(--bg-500); border-radius: 20px; cursor: pointer;
+  transition: background .2s;
+}
+.toggle::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; transition: transform .2s;
+}
+.toggle.on { background: var(--brand); }
+.toggle.on::after { transform: translateX(16px); }
+
+/* ========================================
+   主布局
+   ======================================== */
+.app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  height: 100vh;
+}
+
+/* ========================================
+   左侧边栏
+   ======================================== */
+.sidebar {
+  display: flex; flex-direction: column;
+  background: var(--bg-800);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.sidebar-brand {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.brand-icon {
+  width: 36px; height: 36px; border-radius: var(--r-md);
+  background: var(--brand); color: #062b2a;
+  display: grid; place-items: center;
+  font-size: 16px; font-weight: 800;
+}
+.brand-name { font-size: 15px; font-weight: 700; }
+.brand-sub { font-size: 10px; color: var(--text-500); margin-top: 1px; }
+
+.sidebar-nav {
+  flex: 1; padding: 10px 8px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-radius: var(--r-md);
+  color: var(--text-400); font-size: 13px;
+  cursor: pointer; transition: all .15s;
+  text-align: left; width: 100%;
+}
+.nav-item:hover { background: var(--bg-700); color: var(--text-50); }
+.nav-item.active { background: var(--brand-soft); color: var(--brand); }
+.nav-item svg { width: 18px; height: 18px; flex-shrink: 0; }
+
+.sidebar-footer {
+  padding: 12px 10px;
+  border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 8px;
+}
+
+.conn-status {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 5px 10px; border-radius: var(--r-sm);
+  background: var(--bg-700); border: 1px solid var(--border);
+  font-size: 11px; color: var(--text-300);
+}
+.conn-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+}
+.conn-dot.connecting { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+.conn-dot.disconnected { background: var(--error); box-shadow: 0 0 6px var(--error); }
+
+.sys-monitor { display: flex; flex-direction: column; gap: 6px; }
+.sys-row {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 10px; color: var(--text-500);
+}
+.sys-bar {
+  height: 3px; border-radius: 3px;
+  background: var(--bg-600); overflow: hidden;
+}
+.sys-fill { height: 100%; border-radius: 3px; background: var(--brand); transition: width .3s; }
+.sys-fill.warn { background: var(--warning); }
+.sys-fill.danger { background: var(--error); }
+
+.sidebar-actions { display: flex; justify-content: center; gap: 6px; }
+
+/* ========================================
+   主内容区
+   ======================================== */
+.main {
+  display: flex; flex-direction: column;
+  min-width: 0; overflow: hidden;
+}
+
+/* ========================================
+   顶部工具栏
+   ======================================== */
+.topbar {
+  display: flex; align-items: center; gap: 10px;
+  height: var(--topbar-h); padding: 0 14px;
+  background: var(--bg-800);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.topbar-title {
+  font-size: 15px; font-weight: 700; white-space: nowrap;
+}
+.topbar-badge {
+  font-size: 11px; color: var(--text-400);
+  padding: 2px 8px; border-radius: 10px;
+  background: var(--bg-700); border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.topbar-spacer { flex: 1; }
+.topbar-actions { display: flex; gap: 6px; align-items: center; }
+
+/* ========================================
+   状态栏（分析进度）
+   ======================================== */
+.statusbar {
+  display: flex; align-items: center; gap: 8px;
+  height: var(--statusbar-h); padding: 0 14px;
+  background: var(--bg-800);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  font-size: 11px; color: var(--text-400);
+  overflow-x: auto; white-space: nowrap;
+}
+.statusbar .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); flex-shrink: 0; }
+.status-item { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.status-item .label { color: var(--text-500); }
+.status-item .value { color: var(--text-300); font-family: var(--mono); }
+.status-item .value.brand { color: var(--brand); }
+.status-item .value.warning { color: var(--warning); }
+.status-item .value.success { color: var(--success); }
+.status-link { color: var(--brand); cursor: pointer; margin-left: auto; flex-shrink: 0; }
+.status-link:hover { text-decoration: underline; }
+
+/* ========================================
+   内容区（房间 + 切片面板）
+   ======================================== */
+.content {
+  display: grid;
+  grid-template-columns: 1fr var(--clip-panel-w);
+  flex: 1; min-height: 0; overflow: hidden;
+}
+
+/* ========================================
+   房间区域
+   ======================================== */
+.room-area {
+  overflow-y: auto; padding: 12px;
+  background: var(--bg-900);
+}
+.room-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+}
+
+/* ========================================
+   房间卡片
+   ======================================== */
+.room-card {
+  background: var(--bg-800);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  transition: border-color .15s;
+}
+.room-card:hover { border-color: var(--border-strong); }
+.room-card.selected { border-color: var(--brand); }
+
+.room-card-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.room-name {
+  flex: 1; min-width: 0;
+  font-weight: 600; font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.room-status-tags { display: flex; gap: 4px; flex-shrink: 0; }
+
+.room-preview {
+  position: relative;
+  aspect-ratio: 16/9;
+  background: #000;
+  overflow: hidden;
+}
+.room-preview-placeholder {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 8px; color: var(--text-500);
+}
+.preview-play-icon {
+  width: 48px; height: 48px; opacity: .4;
+}
+.preview-text { font-size: 12px; }
+.preview-info-bar {
+  position: absolute; top: 8px; right: 8px;
+  padding: 3px 8px; border-radius: 4px;
+  background: rgba(0,0,0,.7);
+  font-size: 10px; color: rgba(255,255,255,.8);
+  font-family: var(--mono);
+}
+.preview-overlay {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  background: rgba(0,0,0,.6); gap: 6px;
+}
+.preview-overlay .msg { font-size: 12px; color: var(--text-300); }
+.preview-overlay .sub { font-size: 10px; color: var(--text-500); }
+
+.room-card-body {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+.room-meta {
+  font-size: 11px; color: var(--text-400);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-bottom: 6px;
+}
+.room-record-info {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; font-family: var(--mono);
+  color: var(--text-400); margin-bottom: 8px;
+}
+.room-record-info .rec-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--error); animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+
+.room-card-actions {
+  display: flex; gap: 6px; align-items: center;
+}
+.room-card-actions .spacer { flex: 1; }
+
+/* ========================================
+   右侧切片面板
+   ======================================== */
+.clip-panel {
+  display: flex; flex-direction: column;
+  background: var(--bg-800);
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/* 添加直播间 */
+.add-room {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.add-room-title {
+  font-size: 13px; font-weight: 600; margin-bottom: 8px;
+}
+.add-room-row { display: flex; gap: 6px; }
+.add-room-row .input { flex: 1; }
+
+/* 切片操作栏 */
+.clip-toolbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.clip-stats {
+  display: flex; gap: 6px; align-items: center;
+  font-size: 11px; color: var(--text-400);
+}
+.clip-stats .num { font-family: var(--mono); color: var(--text-300); }
+.clip-stats .num.warning { color: var(--warning); }
+.clip-stats .num.success { color: var(--success); }
+
+/* 切片列表 */
+.clip-list {
+  flex: 1; overflow-y: auto; padding: 8px;
+}
+.clip-item {
+  background: var(--bg-700);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warning);
+  border-radius: var(--r-md);
+  padding: 10px;
+  margin-bottom: 6px;
+}
+.clip-item.ready { border-left-color: var(--success); }
+.clip-item.exporting { border-left-color: var(--brand); }
+.clip-item.exported { border-left-color: var(--info); }
+
+.clip-item-head {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 4px;
+}
+.clip-item-name {
+  flex: 1; min-width: 0;
+  font-weight: 600; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.clip-item-time {
+  display: flex; gap: 8px;
+  font-size: 10px; color: var(--text-500);
+  font-family: var(--mono);
+  margin-bottom: 8px;
+}
+.clip-item-actions { display: flex; gap: 4px; align-items: center; }
+.clip-item-actions .spacer { flex: 1; }
+
+.clip-progress {
+  height: 3px; border-radius: 3px;
+  background: var(--bg-600); overflow: hidden;
+  margin-bottom: 6px;
+}
+.clip-progress-fill {
+  height: 100%; background: var(--brand);
+  border-radius: 3px; transition: width .3s;
+}
+
+/* ========================================
+   底部时间线
+   ======================================== */
+.timeline-area {
+  height: var(--timeline-h);
+  background: var(--bg-800);
+  border-top: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  flex-shrink: 0;
+}
+
+.timeline-controls {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 14px;
+  flex-shrink: 0;
+}
+.timeline-controls .time-display {
+  font-family: var(--mono); font-size: 12px;
+  color: var(--text-300); margin: 0 8px;
+  white-space: nowrap;
+}
+.timeline-controls .rec-display {
+  font-family: var(--mono); font-size: 10px;
+  color: var(--text-500); white-space: nowrap;
+}
+.timeline-controls .spacer { flex: 1; }
+
+.timeline-track {
+  flex: 1; margin: 0 14px 8px;
+  background: var(--bg-700);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  position: relative;
+  overflow: hidden;
+}
+.timeline-ruler {
+  position: absolute; top: 0; left: 0; right: 0;
+  height: 18px; border-bottom: 1px solid var(--border);
+  background: repeating-linear-gradient(to right, transparent 0 79px, var(--border) 79px 80px);
+}
+.timeline-ruler-labels {
+  position: absolute; top: 3px; left: 8px; right: 8px;
+  display: flex; justify-content: space-between;
+  font-size: 9px; color: var(--text-500); font-family: var(--mono);
+}
+.timeline-waveform {
+  position: absolute; top: 20px; left: 0; right: 0; bottom: 16px;
+  display: flex; align-items: center; gap: 1px; padding: 0 4px;
+}
+.waveform-bar {
+  flex: 1; background: var(--bg-500); border-radius: 1px;
+  min-height: 2px;
+}
+.timeline-clip-band {
+  position: absolute; height: 8px; top: 24px;
+  background: var(--info); border-radius: 2px; opacity: .7;
+}
+.timeline-ai-band {
+  position: absolute; height: 14px; top: 22px;
+  border: 1px dashed var(--warning); border-radius: 3px;
+  background: var(--warning-soft);
+}
+.timeline-selection {
+  position: absolute; top: 20px; bottom: 14px;
+  border: 1px solid var(--info); border-radius: 3px;
+  background: var(--info-soft);
+}
+.timeline-marker {
+  position: absolute; top: 18px; bottom: 12px; width: 2px;
+}
+.timeline-marker.in { background: var(--success); }
+.timeline-marker.out { background: var(--error); }
+.timeline-marker::before {
+  content: attr(data-label);
+  position: absolute; top: -14px; left: -4px;
+  font-size: 9px; font-family: var(--mono);
+  color: inherit;
+}
+.timeline-playhead {
+  position: absolute; top: 18px; bottom: 12px; width: 2px;
+  background: var(--brand); z-index: 2;
+}
+.timeline-playhead::before {
+  content: ''; position: absolute; top: 0; left: -4px;
+  border: 5px solid transparent; border-top-color: var(--brand);
+}
+.timeline-bottom-bar {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  height: 14px; display: flex; align-items: center;
+  padding: 0 8px; gap: 8px;
+  font-size: 9px; color: var(--text-500);
+}
+
+/* ========================================
+   设置页面（独立路由，非 Drawer）
+   ======================================== */
+.settings-page {
+  display: none;
+  grid-template-columns: 160px 1fr;
+  height: 100vh;
+  background: var(--bg-900);
+}
+.settings-page.open { display: grid; }
+
+.settings-sidebar {
+  background: var(--bg-800);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.settings-sidebar-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-sidebar-header h2 { font-size: 16px; font-weight: 700; }
+.settings-nav {
+  flex: 1; padding: 10px 8px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.settings-nav-group {
+  margin-top: 8px; margin-bottom: 2px;
+  padding: 0 12px;
+  font-size: 10px; color: var(--text-500);
+  text-transform: uppercase; letter-spacing: .05em;
+}
+.settings-nav-group:first-child { margin-top: 0; }
+
+.settings-content {
+  overflow-y: auto; padding: 24px 32px;
+}
+.settings-content-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 24px;
+}
+.settings-content-header h2 { font-size: 20px; font-weight: 700; }
+
+.settings-section { margin-bottom: 28px; }
+.settings-section-title {
+  font-size: 14px; font-weight: 600;
+  margin-bottom: 4px; color: var(--text-50);
+}
+.settings-section-desc {
+  font-size: 11px; color: var(--text-500);
+  margin-bottom: 12px;
+}
+.settings-card {
+  background: var(--bg-800);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.settings-row {
+  display: grid; grid-template-columns: 1fr 220px;
+  align-items: center; gap: 16px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-row:last-child { border-bottom: none; }
+.settings-row-label { font-size: 13px; font-weight: 500; }
+.settings-row-desc { font-size: 11px; color: var(--text-500); margin-top: 2px; }
+.settings-row-control { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
+
+/* Cookie 区域 */
+.cookie-card {
+  background: var(--bg-700);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 14px; margin-bottom: 12px;
+}
+.cookie-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.cookie-desc { font-size: 11px; color: var(--text-400); line-height: 1.5; margin-bottom: 8px; }
+.cookie-status { font-size: 11px; margin-bottom: 8px; }
+.cookie-status.ok { color: var(--success); }
+.cookie-status.missing { color: var(--warning); }
+.cookie-textarea {
+  width: 100%; min-height: 80px; padding: 8px;
+  background: var(--bg-600); border: 1px solid var(--border);
+  border-radius: var(--r-sm); color: var(--text-50);
+  font-size: 11px; font-family: var(--mono);
+  resize: vertical; margin-bottom: 8px;
+}
+
+/* 快捷键表格 */
+.shortcut-grid {
+  display: grid; grid-template-columns: 1fr auto;
+  gap: 0;
+}
+.shortcut-row {
+  display: contents;
+}
+.shortcut-row > div {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.shortcut-row > div:last-child { text-align: right; }
+.shortcut-key {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 3px 8px; border-radius: 4px;
+  background: var(--bg-600); border: 1px solid var(--border);
+  font-family: var(--mono); font-size: 11px; color: var(--text-300);
+}
+
+/* 日志 */
+.log-viewer {
+  background: var(--bg-700);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 12px;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--text-400);
+  max-height: 300px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-all;
+}
+
+/* ========================================
+   全屏预览弹窗（修复 z-index）
+   ======================================== */
+.fullscreen-preview {
+  position: fixed; inset: 0; z-index: 500;
+  background: rgba(0,0,0,.95);
+  display: none;
+  align-items: center; justify-content: center;
+}
+.fullscreen-preview.open { display: flex; }
+
+.fs-container {
+  width: 92vw; height: 88vh;
+  max-width: 1920px;
+  background: #000;
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  position: relative;
+  display: flex; flex-direction: column;
+}
+
+.fs-video-area {
+  flex: 1; position: relative;
+  display: flex; align-items: center; justify-content: center;
+  background: #000;
+}
+.fs-video-placeholder {
+  color: var(--text-500); font-size: 14px;
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+}
+.fs-video-placeholder svg { width: 64px; height: 64px; opacity: .3; }
+
+/* 关闭按钮 — 固定在容器内右上角，z-index 高于视频 */
+.fs-close {
+  position: absolute; top: 12px; right: 12px; z-index: 10;
+  width: 36px; height: 36px; border-radius: 50%;
+  background: rgba(0,0,0,.6); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; cursor: pointer;
+  transition: background .15s;
+}
+.fs-close:hover { background: rgba(0,0,0,.85); }
+
+/* 自定义控制栏 — 替代原生 controls */
+.fs-controls {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px;
+  background: linear-gradient(transparent, rgba(0,0,0,.85));
+  position: absolute; bottom: 0; left: 0; right: 0;
+  z-index: 5;
+}
+.fs-controls .time { font-family: var(--mono); font-size: 12px; color: rgba(255,255,255,.8); }
+.fs-controls .spacer { flex: 1; }
+.fs-progress {
+  position: absolute; bottom: 48px; left: 16px; right: 16px;
+  height: 4px; background: rgba(255,255,255,.2);
+  border-radius: 4px; cursor: pointer; z-index: 5;
+}
+.fs-progress-fill {
+  height: 100%; width: 35%;
+  background: var(--brand); border-radius: 4px;
+}
+
+/* ========================================
+   Toast
+   ======================================== */
+.toast {
+  position: fixed; bottom: 24px; left: 50%;
+  transform: translateX(-50%) translateY(80px);
+  padding: 10px 20px;
+  background: var(--bg-600); border: 1px solid var(--border-strong);
+  border-radius: var(--r-md); box-shadow: var(--shadow-md);
+  font-size: 13px; color: var(--text-50);
+  z-index: 600; opacity: 0;
+  transition: all .3s;
+}
+.toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+
+/* ========================================
+   空态
+   ======================================== */
+.empty-state {
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 40px 20px; color: var(--text-500);
+  gap: 12px;
+}
+.empty-state svg { width: 48px; height: 48px; opacity: .3; }
+.empty-state .text { font-size: 13px; }
+.empty-state .sub { font-size: 11px; }
+
+/* ========================================
+   滚动条
+   ======================================== */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--bg-500); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-500); }
+
+/* ========================================
+   响应式
+   ======================================== */
+@media (max-width: 1200px) {
+  :root { --clip-panel-w: 300px; }
+}
+@media (max-width: 960px) {
+  .content { grid-template-columns: 1fr; }
+  .clip-panel { display: none; }
+  .clip-panel.mobile-open {
+    display: flex; position: fixed;
+    right: 0; top: var(--topbar-h); bottom: var(--timeline-h);
+    width: 320px; z-index: 50;
+    box-shadow: var(--shadow-lg);
+  }
+}
+</style>
+</head>
+<body>
+
+<!-- ========================================
+     工作台页面
+     ======================================== -->
+<div class="app" id="workbenchPage">
+  <!-- 左侧边栏 -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-icon">L</div>
+      <div>
+        <div class="brand-name">LSC</div>
+        <div class="brand-sub">Live Stream Clipper</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <button class="nav-item active" data-page="workbench">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        多房间管理
+      </button>
+      <button class="nav-item" data-page="settings" id="navSettings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 8a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 008 4.6a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 8c.14.31.22.65.22 1v.09a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        设置
+      </button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <!-- 连接状态 -->
+      <div class="conn-status">
+        <span class="conn-dot"></span>
+        <span>已连接</span>
+      </div>
+
+      <!-- 系统监控 -->
+      <div class="sys-monitor">
+        <div class="sys-row"><span>CPU</span><span>28%</span></div>
+        <div class="sys-bar"><div class="sys-fill" style="width:28%"></div></div>
+        <div class="sys-row"><span>内存</span><span>85%</span></div>
+        <div class="sys-bar"><div class="sys-fill warn" style="width:85%"></div></div>
+        <div class="sys-row"><span>磁盘</span><span>53%</span></div>
+        <div class="sys-bar"><div class="sys-fill" style="width:53%"></div></div>
+      </div>
+
+      <!-- 主题切换 -->
+      <div class="sidebar-actions">
+        <button class="btn ghost sm" id="themeToggle">🌙 深色</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 主内容 -->
+  <div class="main">
+    <!-- 顶部工具栏 -->
+    <header class="topbar">
+      <span class="topbar-title">多房间工作台</span>
+      <span class="topbar-badge">1 个房间</span>
+      <select class="select" style="width:90px;height:26px;font-size:11px">
+        <option>默认排序</option>
+        <option>按状态</option>
+        <option>按名称</option>
+      </select>
+      <button class="btn sm danger">停止持续分析</button>
+      <div class="topbar-spacer"></div>
+      <div class="topbar-actions">
+        <button class="btn sm">全选</button>
+        <button class="btn sm">一键对齐</button>
+        <button class="btn sm">刷新</button>
+        <button class="btn sm">静音</button>
+        <div class="divider"></div>
+        <button class="btn sm primary">批量录制</button>
+        <button class="btn sm danger">批量停止</button>
+      </div>
+    </header>
+
+    <!-- 状态栏 -->
+    <div class="statusbar">
+      <span class="dot"></span>
+      <span class="status-item"><span class="value brand">运行中</span></span>
+      <span class="status-item"><span class="label">主房</span><span class="value">9c66a8d5…</span></span>
+      <span class="status-item"><span class="label">回合</span></span>
+      <span class="status-item"><span class="label">扫描</span><span class="value">3m 25s–5m 41s</span></span>
+      <span class="status-item"><span class="label">音频推进</span></span>
+      <span class="status-item"><span class="value warning">交战中</span></span>
+      <span class="status-item"><span class="value">5m 41s / 5m 56s</span></span>
+      <span class="status-item"><span class="label">滞后</span><span class="value">14s</span></span>
+      <span class="status-item"><span class="label">入列</span><span class="value">4</span></span>
+      <span class="status-item"><span class="label">待调</span><span class="value warning">4</span></span>
+      <span class="status-item"><span class="label">可导</span><span class="value success">1</span></span>
+      <span class="status-link">去确认 →</span>
+    </div>
+
+    <!-- 内容区 -->
+    <div class="content">
+      <!-- 房间区域 -->
+      <div class="room-area">
+        <div class="room-grid">
+          <!-- 房间卡片 1 -->
+          <article class="room-card selected">
+            <div class="room-card-head">
+              <input type="checkbox" class="checkbox" checked>
+              <span class="room-name">小小乐（无畏契约）</span>
+              <div class="room-status-tags">
+                <span class="tag success">录制中</span>
+              </div>
+            </div>
+            <div class="room-preview">
+              <div class="room-preview-placeholder">
+                <svg class="preview-play-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                <span class="preview-text">启用预览</span>
+              </div>
+              <div class="preview-info-bar">1080P</div>
+            </div>
+            <div class="room-card-body">
+              <div class="room-record-info">
+                <span class="rec-dot"></span>
+                <span>已录 00:05:38</span>
+                <span>·</span>
+                <span>232 MB</span>
+              </div>
+              <div class="room-meta">02赋能最强之人，清算赋能局，人才市场力工王</div>
+              <div class="room-card-actions">
+                <button class="btn sm danger">停止录制</button>
+                <button class="btn sm">断开</button>
+                <div class="spacer"></div>
+                <button class="btn sm icon" title="静音">🔇</button>
+                <button class="btn sm icon" title="全屏预览" onclick="openFullscreen()">⛶</button>
+                <button class="btn sm icon" title="删除">🗑</button>
+              </div>
+            </div>
+          </article>
+
+          <!-- 房间卡片 2（未连接状态） -->
+          <article class="room-card">
+            <div class="room-card-head">
+              <input type="checkbox" class="checkbox">
+              <span class="room-name">房间示例 2</span>
+              <div class="room-status-tags">
+                <span class="tag error">未连接</span>
+              </div>
+            </div>
+            <div class="room-preview">
+              <div class="room-preview-placeholder">
+                <svg class="preview-play-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                <span class="preview-text">点击连接</span>
+              </div>
+            </div>
+            <div class="room-card-body">
+              <div class="room-meta">https://live.douyin.com/xxxxx</div>
+              <div class="room-card-actions">
+                <button class="btn sm primary">连接</button>
+                <button class="btn sm">删除</button>
+              </div>
+            </div>
+          </article>
+
+          <!-- 房间卡片 3（预览中状态） -->
+          <article class="room-card">
+            <div class="room-card-head">
+              <input type="checkbox" class="checkbox">
+              <span class="room-name">房间示例 3</span>
+              <div class="room-status-tags">
+                <span class="tag brand">LIVE</span>
+                <span class="tag info">预览中</span>
+              </div>
+            </div>
+            <div class="room-preview">
+              <div class="preview-overlay">
+                <div style="width:24px;height:24px;border:2px solid var(--brand);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite"></div>
+                <span class="msg">正在拉流/转码…</span>
+                <span class="sub">首次刷新通常需要 10-30 秒</span>
+              </div>
+            </div>
+            <div class="room-card-body">
+              <div class="room-meta">房间描述信息…</div>
+              <div class="room-card-actions">
+                <button class="btn sm primary">开始录制</button>
+                <button class="btn sm">断开</button>
+                <div class="spacer"></div>
+                <button class="btn sm icon" title="静音">🔇</button>
+                <button class="btn sm icon" title="全屏预览">⛶</button>
+                <button class="btn sm icon" title="删除">🗑</button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+
+      <!-- 右侧切片面板 -->
+      <aside class="clip-panel">
+        <!-- 添加直播间 -->
+        <div class="add-room">
+          <div class="add-room-title">添加直播间</div>
+          <div class="add-room-row">
+            <input class="input" placeholder="粘贴直播间链接…">
+            <button class="btn primary sm">+ 添加</button>
+          </div>
+        </div>
+
+        <!-- 切片操作栏 -->
+        <div class="clip-toolbar">
+          <button class="btn sm">全部确认</button>
+          <button class="btn sm primary">导出全部</button>
+          <div class="clip-stats">
+            <span>导出所选</span>
+            <span>共 <span class="num">4</span></span>
+            <span>待调 <span class="num warning">3</span></span>
+            <span>可导 <span class="num success">1</span></span>
+          </div>
+        </div>
+
+        <!-- 切片列表 -->
+        <div class="clip-list">
+          <!-- 待调切片 -->
+          <div class="clip-item">
+            <div class="clip-item-head">
+              <input type="checkbox" class="checkbox">
+              <span class="clip-item-name">小小乐（无畏_R01</span>
+              <span class="tag warning">待调 ≈</span>
+            </div>
+            <div class="clip-item-time">
+              <span>00:00:25 – 00:00:35</span>
+              <span>0:10</span>
+              <span style="margin-left:auto">ⓘ</span>
+            </div>
+            <div class="clip-item-actions">
+              <button class="btn sm primary">✓ 确认</button>
+              <button class="btn sm">✎</button>
+              <div class="spacer"></div>
+              <button class="btn sm danger">🗑</button>
+            </div>
+          </div>
+
+          <!-- 视觉确认切片 -->
+          <div class="clip-item">
+            <div class="clip-item-head">
+              <input type="checkbox" class="checkbox">
+              <span class="clip-item-name">小小乐（无畏_R01</span>
+              <span class="tag info">视觉确认 ≈</span>
+            </div>
+            <div class="clip-item-time">
+              <span>00:01:11 – 00:02:00</span>
+              <span>0:48</span>
+              <span style="margin-left:auto">ⓘ</span>
+            </div>
+            <div class="clip-item-actions">
+              <button class="btn sm">✎</button>
+              <div class="spacer"></div>
+              <button class="btn sm danger">🗑</button>
+            </div>
+          </div>
+
+          <!-- 待调切片 2 -->
+          <div class="clip-item">
+            <div class="clip-item-head">
+              <input type="checkbox" class="checkbox">
+              <span class="clip-item-name">小小乐（无畏_R02</span>
+              <span class="tag warning">待调 ≈</span>
+            </div>
+            <div class="clip-item-time">
+              <span>00:02:28 – 00:03:35</span>
+              <span>1:07</span>
+              <span style="margin-left:auto">ⓘ</span>
+            </div>
+            <div class="clip-item-actions">
+              <button class="btn sm primary">✓ 确认</button>
+              <button class="btn sm">✎</button>
+              <div class="spacer"></div>
+              <button class="btn sm danger">🗑</button>
+            </div>
+          </div>
+
+          <!-- 待调切片 3 -->
+          <div class="clip-item">
+            <div class="clip-item-head">
+              <input type="checkbox" class="checkbox">
+              <span class="clip-item-name">小小乐（无畏_R03</span>
+              <span class="tag warning">待调 ≈</span>
+            </div>
+            <div class="clip-item-time">
+              <span>00:03:48 – 00:04:25</span>
+              <span>0:37</span>
+              <span style="margin-left:auto">ⓘ</span>
+            </div>
+            <div class="clip-item-actions">
+              <button class="btn sm primary">✓ 确认</button>
+              <button class="btn sm">✎</button>
+              <div class="spacer"></div>
+              <button class="btn sm danger">🗑</button>
+            </div>
+          </div>
+
+          <!-- 可导切片 -->
+          <div class="clip-item ready">
+            <div class="clip-item-head">
+              <input type="checkbox" class="checkbox">
+              <span class="clip-item-name">小小乐（无畏_R04</span>
+              <span class="tag success">可导</span>
+            </div>
+            <div class="clip-item-time">
+              <span>00:04:30 – 00:05:12</span>
+              <span>0:42</span>
+              <span style="margin-left:auto">ⓘ</span>
+            </div>
+            <div class="clip-item-actions">
+              <button class="btn sm primary">导出</button>
+              <button class="btn sm">剪映</button>
+              <div class="spacer"></div>
+              <button class="btn sm danger">🗑</button>
+            </div>
+          </div>
+
+          <!-- 导出中切片 -->
+          <div class="clip-item exporting">
+            <div class="clip-item-head">
+              <span class="clip-item-name">手动切片 · 关键击杀</span>
+              <span class="tag brand">导出 62%</span>
+            </div>
+            <div class="clip-progress"><div class="clip-progress-fill" style="width:62%"></div></div>
+            <div class="clip-item-time">
+              <span>00:01:08 – 00:01:31</span>
+              <span>23.0s</span>
+            </div>
+            <div class="clip-item-actions">
+              <button class="btn sm danger">取消</button>
+            </div>
+          </div>
+
+          <!-- 已导出切片 -->
+          <div class="clip-item exported">
+            <div class="clip-item-head">
+              <span class="clip-item-name">R07 · 已完成</span>
+              <span class="tag info">已导出</span>
+            </div>
+            <div class="clip-item-time">
+              <span>01:38:22 – 01:38:57</span>
+              <span>35.0s</span>
+            </div>
+            <div class="clip-item-actions">
+              <button class="btn sm">打开文件</button>
+              <button class="btn sm">打开目录</button>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- 底部时间线 -->
+    <div class="timeline-area">
+      <div class="timeline-controls">
+        <button class="btn icon sm" title="上一帧">⏮</button>
+        <button class="btn icon sm" title="播放/暂停">▶</button>
+        <button class="btn icon sm" title="下一帧">⏭</button>
+        <select class="select" style="width:55px;height:24px;font-size:11px">
+          <option>1×</option><option>1.5×</option><option>2×</option><option>0.5×</option>
+        </select>
+        <span class="time-display">00:05:38 / 00:05:38</span>
+        <span class="rec-display">已录 00:05:38</span>
+        <div class="spacer"></div>
+        <button class="btn sm">⚡ 直播</button>
+        <button class="btn sm">✂ 添加切片</button>
+        <button class="btn sm" title="刷新">↻</button>
+        <button class="btn sm" title="缩放">🔍 1.0×</button>
+        <button class="btn sm icon" title="入点">I</button>
+        <button class="btn sm icon" title="出点">O</button>
+      </div>
+      <div class="timeline-track">
+        <div class="timeline-ruler"></div>
+        <div class="timeline-ruler-labels">
+          <span>00:00:00</span><span>00:01:00</span><span>00:02:00</span><span>00:03:00</span><span>00:04:00</span><span>00:05:00</span><span>LIVE</span>
+        </div>
+        <!-- AI 分析区域 -->
+        <div class="timeline-ai-band" style="left:8%;width:15%"></div>
+        <div class="timeline-ai-band" style="left:42%;width:18%"></div>
+        <!-- 切片区域 -->
+        <div class="timeline-clip-band" style="left:5%;width:12%"></div>
+        <div class="timeline-clip-band" style="left:28%;width:14%"></div>
+        <div class="timeline-clip-band" style="left:48%;width:11%"></div>
+        <div class="timeline-clip-band" style="left:65%;width:8%"></div>
+        <!-- 选区 -->
+        <div class="timeline-selection" style="left:42%;width:18%"></div>
+        <!-- 标记 -->
+        <div class="timeline-marker in" data-label="I" style="left:42%"></div>
+        <div class="timeline-marker out" data-label="O" style="left:60%"></div>
+        <!-- 播放头 -->
+        <div class="timeline-playhead" style="left:55%"></div>
+        <!-- 底部信息栏 -->
+        <div class="timeline-bottom-bar">
+          <span>🔵 AI 分析</span>
+          <span>🟣 切片</span>
+          <span>⬜ 选区</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========================================
+     设置页面（独立路由）
+     ======================================== -->
+<div class="settings-page" id="settingsPage">
+  <!-- 设置侧边栏 -->
+  <aside class="settings-sidebar">
+    <div class="settings-sidebar-header">
+      <div class="brand-icon" style="width:28px;height:28px;font-size:13px">L</div>
+      <h2>设置</h2>
+      <div style="flex:1"></div>
+      <button class="btn icon sm" onclick="closeSettingsPage()" title="返回工作台">←</button>
+    </div>
+    <nav class="settings-nav">
+      <div class="settings-nav-group">基础</div>
+      <button class="nav-item active" data-section="general">通用</button>
+      <button class="nav-item" data-section="preview">预览体验</button>
+      <div class="settings-nav-group">录制</div>
+      <button class="nav-item" data-section="recording">录制与编码</button>
+      <button class="nav-item" data-section="ai">AI 分析</button>
+      <div class="settings-nav-group">存储</div>
+      <button class="nav-item" data-section="storage">存储与草稿</button>
+      <button class="nav-item" data-section="account">平台账号</button>
+      <div class="settings-nav-group">系统</div>
+      <button class="nav-item" data-section="env">系统环境</button>
+      <button class="nav-item" data-section="shortcuts">快捷键</button>
+      <button class="nav-item" data-section="about">关于与更新</button>
+      <button class="nav-item" data-section="logs">日志</button>
+    </nav>
+  </aside>
+
+  <!-- 设置内容 -->
+  <div class="settings-content">
+    <div class="settings-content-header">
+      <h2 id="settingsSectionTitle">通用</h2>
+    </div>
+
+    <!-- 通用 -->
+    <div class="settings-section" id="sec-general">
+      <div class="settings-card">
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">主题</div>
+            <div class="settings-row-desc">选择界面显示主题</div>
+          </div>
+          <div class="settings-row-control">
+            <select class="select"><option>深色</option><option>浅色</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">开机自启</div>
+            <div class="settings-row-desc">系统启动时自动运行 LSC</div>
+          </div>
+          <div class="settings-row-control">
+            <div class="toggle"></div>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">最小化到托盘</div>
+            <div class="settings-row-desc">关闭窗口时最小化到系统托盘，保持录制运行</div>
+          </div>
+          <div class="settings-row-control">
+            <div class="toggle on"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 预览体验 -->
+    <div class="settings-section" id="sec-preview" style="display:none">
+      <div class="settings-card">
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">预览画质</div>
+            <div class="settings-row-desc">更改预览画质会重启预览，公共轴可能失效</div>
+          </div>
+          <div class="settings-row-control">
+            <select class="select">
+              <option>原画（不缩放）</option>
+              <option selected>高清 720p</option>
+              <option>标清 480p</option>
+              <option>流畅 360p</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 录制与编码 -->
+    <div class="settings-section" id="sec-recording" style="display:none">
+      <div class="settings-section-title">录制与编码</div>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div><div class="settings-row-label">默认画质</div></div>
+          <div class="settings-row-control">
+            <select class="select"><option>原画</option><option>蓝光</option><option>超清</option><option selected>高清</option><option>流畅</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">默认编码器</div></div>
+          <div class="settings-row-control">
+            <select class="select"><option>h264_nvenc (NVIDIA，推荐)</option><option>hevc_nvenc (NVIDIA)</option><option>h264_qsv (Intel)</option><option>h264_amf (AMD)</option><option>copy（直拷，最省）</option><option>libx264（CPU）</option><option>libx265（CPU）</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">编码参数</div></div>
+          <div class="settings-row-control">
+            <select class="select"><option selected>CRF 质量</option><option>自定义码率</option><option>不限制</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">编码预设</div></div>
+          <div class="settings-row-control">
+            <select class="select"><option>ultrafast（最快）</option><option>fast（快速）</option><option selected>medium（均衡）</option><option>slow（慢速）</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">CRF</div>
+            <div class="settings-row-desc">18（高质量，大体积）— 28（低质量，小体积）</div>
+          </div>
+          <div class="settings-row-control">
+            <input type="range" min="18" max="28" value="26" style="width:100%">
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">录制分辨率</div></div>
+          <div class="settings-row-control">
+            <select class="select"><option>原画</option><option selected>1080p (1920x1080)</option><option>720p (1280x720)</option><option>480p (854x480)</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">录制帧率</div></div>
+          <div class="settings-row-control">
+            <select class="select"><option>原画</option><option>60 fps</option><option selected>30 fps</option><option>24 fps</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">音频编码</div></div>
+          <div class="settings-row-control">
+            <select class="select"><option selected>AAC 128k</option><option>AAC 192k</option><option>AAC 256k</option></select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- AI 分析 -->
+    <div class="settings-section" id="sec-ai" style="display:none">
+      <div class="settings-section-title">AI 分析</div>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">OCR 加速</div>
+            <div class="settings-row-desc">持续分析 OCR 推理加速；自动会探测并选最快后端</div>
+          </div>
+          <div class="settings-row-control">
+            <select class="select"><option selected>DirectML（Windows GPU，推荐）</option><option>自动</option><option>CUDA（NVIDIA）</option><option>仅 CPU</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">共享进样</div>
+            <div class="settings-row-desc" style="color:var(--warning)">开启后预览与录制共用同一进程：录制中断会导致预览中断</div>
+          </div>
+          <div class="settings-row-control">
+            <div class="toggle on"></div>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">并发导出数</div>
+            <div class="settings-row-desc">同时运行的导出任务数量</div>
+          </div>
+          <div class="settings-row-control">
+            <select class="select"><option selected>1 路（低负载）</option><option>2 路（默认）</option></select>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">默认导出预设</div>
+            <div class="settings-row-desc">创建导出任务时预选</div>
+          </div>
+          <div class="settings-row-control">
+            <select class="select" style="width:260px"><option selected>原画直出 — 保持原始分辨率/帧率</option><option>抖音竖屏 — 1080x1920</option><option>快速预览 — 低质量快速导出</option></select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 存储与草稿 -->
+    <div class="settings-section" id="sec-storage" style="display:none">
+      <div class="settings-section-title">存储与草稿</div>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">存储路径</div>
+            <div class="settings-row-desc">录制文件和导出切片的保存目录</div>
+          </div>
+          <div class="settings-row-control">
+            <span style="font-size:11px;color:var(--text-400);margin-right:8px">D:\Recordings</span>
+            <button class="btn sm">浏览</button>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">剪映草稿目录</div>
+            <div class="settings-row-desc">自动探测或手动指定剪映专业版草稿目录</div>
+          </div>
+          <div class="settings-row-control">
+            <button class="btn sm">更改</button>
+            <button class="btn sm">恢复自动探测</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 平台账号 -->
+    <div class="settings-section" id="sec-account" style="display:none">
+      <div class="settings-section-title">平台账号</div>
+      <div class="settings-section-desc">配置平台 Cookie 以正常拉取直播流</div>
+
+      <div class="cookie-card">
+        <div class="cookie-title">抖音 Cookie</div>
+        <div class="cookie-desc">Chrome 新版无法自动读取 Cookie。请在浏览器登录抖音后，用 Cookie-Editor 等插件导出 JSON，粘贴到下方并保存，否则直播间会一直连不上（显示验证页/未开播）。</div>
+        <div class="cookie-status ok">已配置 12 项（ttwid, sessionid, passport_csrf_token…）</div>
+        <textarea class="cookie-textarea" placeholder='支持 JSON 对象/数组，或 ttwid=...; sessionid=... 格式'></textarea>
+        <button class="btn primary sm">保存抖音 Cookie</button>
+      </div>
+
+      <div class="cookie-card">
+        <div class="cookie-title">B站 Cookie</div>
+        <div class="cookie-desc">Windows 下浏览器 Cookie 常无法自动读取。请在浏览器登录 B 站后，用 Cookie-Editor 等插件导出 JSON（需含 SESSDATA），粘贴到下方并保存，否则可能无法拉取高画质流。</div>
+        <div class="cookie-status missing">尚未配置有效 Cookie</div>
+        <textarea class="cookie-textarea" placeholder='支持 JSON 对象/数组，或 SESSDATA=...; bili_jct=... 格式'></textarea>
+        <button class="btn primary sm">保存 B站 Cookie</button>
+      </div>
+    </div>
+
+    <!-- 系统环境 -->
+    <div class="settings-section" id="sec-env" style="display:none">
+      <div class="settings-section-title">系统环境</div>
+      <div class="settings-section-desc">检测系统依赖是否可用</div>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div><div class="settings-row-label">FFmpeg</div></div>
+          <div class="settings-row-control">
+            <span class="tag success">✓ 可用</span>
+            <span style="font-size:11px;color:var(--text-500)">6.1.1</span>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">FFprobe</div></div>
+          <div class="settings-row-control">
+            <span class="tag success">✓ 可用</span>
+            <span style="font-size:11px;color:var(--text-500)">6.1.1</span>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">NVENC 硬件编码</div></div>
+          <div class="settings-row-control">
+            <span class="tag success">✓ h264_nvenc 可用</span>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div><div class="settings-row-label">Python</div></div>
+          <div class="settings-row-control">
+            <span class="tag success">✓ 3.11.5</span>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div></div>
+          <div class="settings-row-control">
+            <button class="btn sm">↻ 重新检测</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 快捷键 -->
+    <div class="settings-section" id="sec-shortcuts" style="display:none">
+      <div class="settings-section-title">快捷键</div>
+      <div class="settings-card">
+        <div class="shortcut-grid">
+          <div class="shortcut-row"><div>页面：工作台</div><div><span class="shortcut-key">Ctrl + 1</span></div></div>
+          <div class="shortcut-row"><div>页面：设置</div><div><span class="shortcut-key">Ctrl + 2</span></div></div>
+          <div class="shortcut-row"><div>刷新页面</div><div><span class="shortcut-key">F5</span></div></div>
+          <div class="shortcut-row"><div>播放/暂停</div><div><span class="shortcut-key">Space</span></div></div>
+          <div class="shortcut-row"><div>标记入点</div><div><span class="shortcut-key">I</span></div></div>
+          <div class="shortcut-row"><div>标记出点</div><div><span class="shortcut-key">O</span></div></div>
+          <div class="shortcut-row"><div>切换录制</div><div><span class="shortcut-key">R</span></div></div>
+          <div class="shortcut-row"><div>静音/取消静音</div><div><span class="shortcut-key">M</span></div></div>
+          <div class="shortcut-row"><div>放大预览</div><div><span class="shortcut-key">F</span></div></div>
+          <div class="shortcut-row"><div>批量开始录制</div><div><span class="shortcut-key">Ctrl + R</span></div></div>
+          <div class="shortcut-row"><div>批量停止录制</div><div><span class="shortcut-key">Ctrl + Shift + R</span></div></div>
+          <div class="shortcut-row"><div>全选房间</div><div><span class="shortcut-key">Ctrl + Shift + A</span></div></div>
+          <div class="shortcut-row"><div>导出切片</div><div><span class="shortcut-key">Ctrl + E</span></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 关于与更新 -->
+    <div class="settings-section" id="sec-about" style="display:none">
+      <div class="settings-section-title">关于与更新</div>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div><div class="settings-row-label">版本</div></div>
+          <div class="settings-row-control">
+            <span style="font-size:13px;color:var(--text-400)">v3.0.0</span>
+          </div>
+        </div>
+        <div class="settings-row">
+          <div></div>
+          <div class="settings-row-control">
+            <button class="btn sm primary">检查更新</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 日志 -->
+    <div class="settings-section" id="sec-logs" style="display:none">
+      <div class="settings-section-title">日志</div>
+      <div class="settings-section-desc">
+        <button class="btn sm">📂 打开日志目录</button>
+      </div>
+      <div class="settings-card" style="padding:12px">
+        <div style="display:flex;gap:8px;margin-bottom:12px">
+          <select class="select" style="flex:1"><option>debug.log（主进程）</option><option>renderer.log（渲染进程）</option><option>backend.log（Python 后端）</option></select>
+          <button class="btn sm">↻ 刷新</button>
+          <button class="btn sm">📂 打开</button>
+        </div>
+        <div class="log-viewer">[2026-07-24 14:32:01] [INFO] WebSocket connected to ws://localhost:8765
+[2026-07-24 14:32:02] [INFO] Room 小小乐 connected, starting preview...
+[2026-07-24 14:32:03] [INFO] MSE player initialized for room 9c66a8d5
+[2026-07-24 14:32:05] [INFO] Recording started: 1080p 30fps h264_nvenc
+[2026-07-24 14:32:10] [INFO] Continuous analysis running: round detection active
+[2026-07-24 14:32:15] [WARN] Preview backpressure detected, reducing quality
+[2026-07-24 14:32:20] [INFO] Clip R01 queued for review
+[2026-07-24 14:32:25] [INFO] Clip R02 queued for review
+[2026-07-24 14:32:30] [INFO] Clip R03 queued for review
+[2026-07-24 14:32:35] [INFO] Clip R04 confirmed and ready for export</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========================================
+     全屏预览弹窗
+     ======================================== -->
+<div class="fullscreen-preview" id="fullscreenPreview">
+  <div class="fs-container">
+    <button class="fs-close" onclick="closeFullscreen()" title="关闭 (ESC)">✕</button>
+    <div class="fs-video-area">
+      <div class="fs-video-placeholder">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        <span>视频预览区域</span>
+        <span style="font-size:11px;color:var(--text-500)">（实际运行时为 MSE 视频流）</span>
+      </div>
+    </div>
+    <!-- 自定义控制栏（替代原生 controls） -->
+    <div class="fs-progress">
+      <div class="fs-progress-fill"></div>
+    </div>
+    <div class="fs-controls">
+      <button class="btn sm" title="播放/暂停">▶</button>
+      <span class="time">00:05:38 / 00:05:38</span>
+      <div class="spacer"></div>
+      <select class="select" style="height:24px;font-size:11px;background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.2);color:#fff">
+        <option>高清</option><option>标清</option><option>流畅</option>
+      </select>
+      <button class="btn sm" title="静音">🔊</button>
+      <button class="btn sm" title="缩小" onclick="closeFullscreen()">⊡ 缩小</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<style>
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+
+<script>
+// ===== 页面切换 =====
+const workbenchPage = document.getElementById('workbenchPage');
+const settingsPage = document.getElementById('settingsPage');
+const navSettings = document.getElementById('navSettings');
+
+navSettings.addEventListener('click', () => {
+  workbenchPage.style.display = 'none';
+  settingsPage.classList.add('open');
+});
+
+function closeSettingsPage() {
+  settingsPage.classList.remove('open');
+  workbenchPage.style.display = 'grid';
+}
+
+// ===== 设置页内导航 =====
+const sectionTitles = {
+  general: '通用', preview: '预览体验', recording: '录制与编码',
+  ai: 'AI 分析', storage: '存储与草稿', account: '平台账号',
+  env: '系统环境', shortcuts: '快捷键', about: '关于与更新', logs: '日志'
+};
+
+document.querySelectorAll('.settings-nav .nav-item').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.settings-nav .nav-item').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const section = btn.dataset.section;
+    document.getElementById('settingsSectionTitle').textContent = sectionTitles[section] || section;
+    document.querySelectorAll('.settings-section').forEach(s => s.style.display = 'none');
+    const target = document.getElementById('sec-' + section);
+    if (target) target.style.display = 'block';
+  });
+});
+
+// ===== 全屏预览 =====
+function openFullscreen() {
+  document.getElementById('fullscreenPreview').classList.add('open');
+}
+function closeFullscreen() {
+  document.getElementById('fullscreenPreview').classList.remove('open');
+}
+
+// ===== ESC 关闭 =====
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeFullscreen();
+    if (settingsPage.classList.contains('open')) closeSettingsPage();
+  }
+});
+
+// ===== 主题切换 =====
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const html = document.documentElement;
+  const isDark = html.dataset.theme === 'dark';
+  html.dataset.theme = isDark ? 'light' : 'dark';
+  document.getElementById('themeToggle').textContent = isDark ? '☀️ 浅色' : '🌙 深色';
+});
+
+// ===== Toast =====
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// ===== 按钮演示 =====
+document.querySelectorAll('.btn.primary').forEach(btn => {
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    showToast('操作成功');
+  });
+});
+
+// ===== URL 参数 =====
+const params = new URLSearchParams(location.search);
+if (params.get('settings') === '1') navSettings.click();
+if (params.get('preview') === '1') openFullscreen();
+if (params.get('section')) {
+  navSettings.click();
+  const secBtn = document.querySelector(`.settings-nav [data-section="${params.get('section')}"]`);
+  if (secBtn) secBtn.click();
+}
+</script>
+</body>
+</html>

@@ -15,7 +15,7 @@ export function formatManualClipLabel(streamer: string, index: number): string {
 }
 
 /** AI 回合短名：主播_R03 */
-export function formatAiRoundClipLabel(streamer: string, roundIdx: number, _index?: number): string {
+export function formatAiRoundClipLabel(streamer: string, roundIdx: number): string {
   return `${sanitizeStreamerName(streamer)}_R${String(roundIdx).padStart(2, '0')}`
 }
 

@@ -13,9 +13,9 @@ import {
   ZoomOutOutlined,
   CompressOutlined,
 } from '@ant-design/icons'
-import { RoomSession, ClipSegment, TimelineHighlightBand } from '@/types'
+import { RoomSession, ClipSegment, TimelineHighlightBand, ContinuousAnalysisStatus, TimelineProgressSummary } from '@/types'
 import type { TimelineAlignStatus } from '@/utils/timelineCoords'
-import { panTimelineWindowStart, computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, resolveLiveContentSpan, resolveRecordingReviewSpan } from '@/utils/timelineCoords'
+import { panTimelineWindowStart, computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, resolveLiveContentSpan, resolveRecordingReviewSpan, summarizeTimelineProgress } from '@/utils/timelineCoords'
 import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
 import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
@@ -72,6 +72,10 @@ interface ControlBarProps {
   recordedDurationHint?: number
   /** DVR 可回看窗口左边界（绝对秒）；Task 3 接入 bufStart */
   dvrStart?: number | null
+  /** 当前控制栏所处轴（用于三轴标注展示） */
+  axis?: TimelineProgressSummary['axis']
+  /** 持续分析状态（用于展示分析轴进度） */
+  continuousStatus?: ContinuousAnalysisStatus | null
 }
 
 /**
@@ -111,6 +115,8 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (prev.activeRefine !== next.activeRefine) return false
   if (prev.recordedDurationHint !== next.recordedDurationHint) return false
   if (prev.dvrStart !== next.dvrStart) return false
+  if (prev.axis !== next.axis) return false
+  if (prev.continuousStatus !== next.continuousStatus) return false
 
   const a = prev.room
   const b = next.room
@@ -161,10 +167,11 @@ export const ControlBar = memo(function ControlBar({
   onHighlightClick,
   localDragMark,
   activeRefine = null,
-  recordedDurationHint: _recordedDurationHint = 0,
+  recordedDurationHint = 0,
   dvrStart = null,
+  axis = 'preview',
+  continuousStatus = null,
 }: ControlBarProps) {
-  const recordedDurationHint = _recordedDurationHint
   void _alignStatus
   const isRecordingReview = isRecordingReviewMode(room?.preview_mode)
   const goLiveDisabled = isNoDvrPreviewMode(room?.preview_mode)
@@ -286,6 +293,27 @@ export const ControlBar = memo(function ControlBar({
   // 缩放时左缘 = windowStart（片段最左），未缩放短内容时 ws=0 即 0:00:00
   const trackDuration = Math.max(1, duration - windowStart)
 
+  // 三轴进度摘要（仅用于 UI 展示，不改变三轴换算规则）
+  const progressSummary = useMemo(() => {
+    const previewPosition = timelineView ? timelineView.currentTime : currentTime
+    return summarizeTimelineProgress({
+      previewPosition,
+      room,
+      continuousRecorded: recordedDurationHint,
+      continuousStatus,
+      axis,
+    })
+  }, [timelineView, currentTime, room, recordedDurationHint, continuousStatus, axis])
+
+  // 轴标签文案
+  const axisLabel = useMemo(() => {
+    switch (axis) {
+      case 'common': return '公共轴'
+      case 'recording_review': return '录制回看轴'
+      default: return '预览轴'
+    }
+  }, [axis])
+
   const displayMarkIn = (() => {
     if (localDragMark?.type === 'in') {
       return Math.max(0, localDragMark.time - windowStart)
@@ -334,12 +362,12 @@ export const ControlBar = memo(function ControlBar({
 
   return (
       <div style={{
-        padding: '12px 24px',
+        padding: '8px 24px',
         background: 'var(--bg-secondary)',
         borderTop: '1px solid var(--border-default)',
         display: 'flex',
         flexDirection: 'column',
-        gap: 12,
+        gap: 8,
         flexShrink: 0,
         zIndex: 20,
       }}>
@@ -349,7 +377,7 @@ export const ControlBar = memo(function ControlBar({
           alignItems: 'center',
           gap: 8,
           padding: '4px 12px',
-          background: 'rgba(0, 122, 255, 0.06)',
+          background: 'rgba(77, 196, 191, 0.06)',
           borderRadius: 6,
           fontSize: 12,
           color: 'var(--accent-primary)',
@@ -389,7 +417,8 @@ export const ControlBar = memo(function ControlBar({
         dvrStart={dvrStart ?? null}
         followLive={followLive}
         isScrubbing={isScrubbing}
-        height={96}
+        onGoLive={onGoLive}
+        height={64}
         zoomLevel={zoomLevel}
         onZoomChange={onZoomChange}
       />
@@ -473,42 +502,29 @@ export const ControlBar = memo(function ControlBar({
           </Tooltip>
         </Space>
 
-        {/* 中间：时间码（预览轴）；录制中另显已录墙钟，避免与房间卡片混淆 */}
+        {/* 中间：三轴语义化时间码（预览·录制·分析三轴独立标注） */}
         <Space size={2} align="center" style={{ flexShrink: 1, minWidth: 0 }}>
-          <Tooltip title="预览播放位置（时间线坐标）">
+          {/* 轴标签 */}
+          <span style={{
+            fontSize: 10,
+            fontWeight: 600,
+            color: 'var(--brand-400)',
+            whiteSpace: 'nowrap',
+            marginRight: 4,
+          }}>
+            {axisLabel}
+          </span>
+          {/* 当前播放位置（单一时间读数） */}
+          <Tooltip title="当前播放位置（预览流）">
             <span style={{
               fontFamily: 'var(--font-mono)',
               fontSize: 14,
               color: 'var(--text-primary)',
               whiteSpace: 'nowrap',
             }}>
-              {formatTime(timelineView ? timelineView.currentTime : currentTime)}
+              {formatTime(progressSummary.previewPosition)}
             </span>
           </Tooltip>
-          <span style={{ color: 'var(--text-tertiary)' }}>/</span>
-          <span style={{
-            fontFamily: 'var(--font-mono)',
-            fontSize: 14,
-            color: 'var(--text-primary)',
-            whiteSpace: 'nowrap',
-          }}>
-            {formatTime(duration)}
-          </span>
-          {room?.is_recording && room.record_started_at && (
-            <Tooltip title="录制墙钟时长（与预览轴可能差几秒）">
-              <span style={{
-                marginLeft: 8,
-                fontFamily: 'var(--font-mono)',
-                fontSize: 12,
-                color: 'var(--text-tertiary)',
-                whiteSpace: 'nowrap',
-              }}>
-                已录 {formatTime(
-                  Math.max(0, (Date.now() - new Date(room.record_started_at).getTime()) / 1000),
-                )}
-              </span>
-            </Tooltip>
-          )}
         </Space>
 
         {/* 右侧：视图控制 + 添加切片 */}
