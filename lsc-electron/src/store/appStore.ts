@@ -17,6 +17,14 @@ export interface PreviewDegradationBanner {
   reason?: string
 }
 
+// 前端 UI 状态（后端不感知，rooms_updated 不会覆盖）
+interface RoomUIState {
+  preview_phase?: string
+  mse_error?: string
+  mse_reconnecting?: { attempt: number; maxAttempts: number }
+  preview_frame_data?: string
+}
+
 interface AppState {
   rooms: RoomSession[]
   selectedRoomId: string | null
@@ -31,6 +39,7 @@ interface AppState {
   continuousAnalysisStatus: ContinuousAnalysisStatus | null
   settingsDrawerOpen: boolean
   previewDegradationBanner: PreviewDegradationBanner | null
+  uiState: Record<string, RoomUIState>  // 前端 UI 状态，按 room_id 索引
 }
 
 interface AppActions {
@@ -106,6 +115,7 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   systemStats: null,
   dependencyStatus: null,
   timelineContext: null,
+  uiState: {},
   timelineInvalidated: false,
   continuousAnalysisStatus: null,
   settingsDrawerOpen: false,
@@ -113,21 +123,9 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
 
   setRooms: (rooms) => set((state) => {
     if (state.rooms === rooms) return state
-    // rooms_updated 来自后端 _room_to_dict，不含 preview_phase 等前端字段；
-    // 整表替换会冲掉 updateRoom 写入的 phase，导致 LIVE 胶囊 / DVR 紫标条件失效。
-    const merged = rooms.map((incoming) => {
-      const prev = state.rooms.find((r) => r.room_id === incoming.room_id)
-      if (!prev) return incoming
-      return {
-        ...incoming,
-        preview_phase: incoming.preview_phase ?? prev.preview_phase,
-        mse_error: incoming.mse_error ?? prev.mse_error,
-        mse_reconnecting: incoming.mse_reconnecting ?? prev.mse_reconnecting,
-        preview_frame_data: incoming.preview_frame_data ?? prev.preview_frame_data,
-      }
-    })
-    if (roomsShallowEqual(state.rooms, merged)) return state
-    return { rooms: merged }
+    // 前端 UI 状态存储在 uiState 中，rooms 整表替换不会影响
+    if (roomsShallowEqual(state.rooms, rooms)) return state
+    return { rooms }
   }),
 
   addRoom: (room) =>
@@ -146,20 +144,51 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
     })),
 
   updateRoom: (roomId, updates) =>
-    set((state) => ({
-      rooms: state.rooms.map((r) =>
-        r.room_id === roomId ? { ...r, ...updates } : r
-      ),
-    })),
+    set((state) => {
+      // 前端 UI 字段写入 uiState，不污染后端数据模型
+      const uiFields = ['preview_phase', 'mse_error', 'mse_reconnecting', 'preview_frame_data']
+      const roomUpdates: Partial<RoomSession> = {}
+      const uiUpdates: Partial<RoomUIState> = {}
+      for (const [key, value] of Object.entries(updates)) {
+        if (uiFields.includes(key)) {
+          uiUpdates[key as keyof RoomUIState] = value as any
+        } else {
+          roomUpdates[key as keyof RoomSession] = value as any
+        }
+      }
+      return {
+        rooms: Object.keys(roomUpdates).length > 0
+          ? state.rooms.map((r) => (r.room_id === roomId ? { ...r, ...roomUpdates } : r))
+          : state.rooms,
+        uiState: {
+          ...state.uiState,
+          [roomId]: { ...state.uiState[roomId], ...uiUpdates },
+        },
+      }
+    }),
 
   setSelectedRoomId: (roomId) => set({ selectedRoomId: roomId }),
 
-  setClips: (clips) => set({ clips }),
+  setClips: (clips, meta?: { source: string; reason?: string }) => {
+    // DEV 模式：记录调用来源，便于诊断切片计数异常
+    if (import.meta.env.DEV) {
+      console.groupCollapsed(`[store] setClips(${clips.length}) ${meta?.source ?? 'unknown'}`)
+      console.trace('setClips called')
+      console.log('reason:', meta?.reason)
+      console.log('first 3:', clips.slice(0, 3).map(c => ({ id: c.clip_id, label: c.label })))
+      console.groupEnd()
+    }
+    set({ clips })
+  },
 
   addClip: (clip) =>
     set((state) => {
       // clip_id 去重：已存在则跳过
       if (clip.clip_id && state.clips.some(c => c.clip_id === clip.clip_id)) return state
+      // DEV 模式：记录新增
+      if (import.meta.env.DEV) {
+        console.log(`[store] addClip(${clip.clip_id})`, clip.label)
+      }
       // 上限 200 条，超出移除最旧
       return { clips: [...state.clips, clip].slice(-200) }
     }),

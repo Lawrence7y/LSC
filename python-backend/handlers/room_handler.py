@@ -3863,6 +3863,7 @@ def register_room_handlers(server, bridge):
         label = data.get('label', 'clip')
         preset_id = data.get('preset_id', '')
         job_id = data.get('job_id', '')
+        operation_id = data.get('operation_id', '')  # 前端唯一操作 ID，用于精确匹配
         source = data.get('source', '')
 
         # 列表导出携带的墙钟快照（优先于房间当前 mark_*_wallclock）
@@ -3873,8 +3874,8 @@ def register_room_handlers(server, bridge):
         use_room_marks = bool(data.get('use_room_marks', False))
         content_offset = data.get('content_offset', None)
 
-        _log.info("导出切片: room_id=%s, start=%.2f, end=%.2f, label=%s, preset=%s, job_id=%s",
-                  room_id, start_sec, end_sec, label, preset_id, job_id)
+        _log.info("导出切片: room_id=%s, start=%.2f, end=%.2f, label=%s, preset=%s, job_id=%s, operation_id=%s",
+                  room_id, start_sec, end_sec, label, preset_id, job_id, operation_id)
 
         result = await queue_export(
             room_id, start_sec, end_sec, label, preset_id, source, job_id,
@@ -3887,10 +3888,11 @@ def register_room_handlers(server, bridge):
         )
 
         if result.get('error'):
-            return {'success': False, 'error': result['error']}
+            return {'success': False, 'error': result['error'], 'operation_id': operation_id}
         return {
             'success': True,
             'job_id': result['job_id'],
+            'operation_id': operation_id,
             'queued': True,
             'precision': result.get('precision'),
         }

@@ -40,13 +40,13 @@ export function VideoPreview({
   const gainNodeRef = useRef<GainNode | null>(null)
   const [state, setState] = useState<MsePlayerState>('idle')
   const [error, setError] = useState<string | null>(null)
-  // 后端自动重连状态（从 store 读取）
+  // 后端自动重连状态（从 uiState 读取，避免 rooms_updated 冲掉）
   const mseReconnecting = useAppStore(
-    (s) => s.rooms.find((r) => r.room_id === roomId)?.mse_reconnecting
+    (s) => s.uiState[roomId]?.mse_reconnecting
   )
   // 预览启动阶段（refreshing_url/probing/streaming/error/idle）
   const previewPhase = useAppStore(
-    (s) => s.rooms.find((r) => r.room_id === roomId)?.preview_phase
+    (s) => s.uiState[roomId]?.preview_phase
   )
   const platform = useAppStore(
     (s) => s.rooms.find((r) => r.room_id === roomId)?.platform
