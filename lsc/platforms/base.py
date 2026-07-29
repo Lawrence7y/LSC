@@ -26,11 +26,11 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 
 def _is_private_ip(hostname: str) -> bool:
     """检查主机名是否解析为私有/内网 IP（SSRF 防护）。"""
-    import socket
     import ipaddress
+    import socket
     try:
         addr_info = socket.getaddrinfo(hostname, None)
-        for family, _, _, _, sockaddr in addr_info:
+        for _family, _, _, _, sockaddr in addr_info:
             ip = ipaddress.ip_address(sockaddr[0])
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
                 return True
