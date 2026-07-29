@@ -782,12 +782,15 @@ def _safe_terminate(proc: subprocess.Popen) -> None:
     try:
         proc.terminate()
         proc.wait(timeout=5)
-    except Exception:
+    except subprocess.TimeoutExpired:
+        # terminate 超时，强制 kill
         try:
             proc.kill()
             proc.wait(timeout=3)
         except Exception as exc:
-            _log.debug("操作异常（已忽略）: %s", exc)
+            _log.error("子进程 kill 失败 (pid=%s): %s", proc.pid, exc)
+    except Exception as exc:
+        _log.error("子进程 terminate 失败 (pid=%s): %s", proc.pid, exc)
 
 
 def _wait_for_recording_file(room, timeout_sec: float = 8.0) -> bool:

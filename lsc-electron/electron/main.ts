@@ -604,6 +604,13 @@ function _isSafePath(p: string): boolean {
     return false
   }
   const resolved = path.resolve(p)
+  // 解析符号链接，防止通过白名单目录内的符号链接绕过路径校验
+  let realResolved: string
+  try {
+    realResolved = fs.realpathSync(resolved)
+  } catch {
+    realResolved = resolved
+  }
   // 允许的目录白名单：userData 目录与用户主目录下的 LSC 文件夹（覆盖默认 output_dir ~/LSC/output 及录制产物路径）
   const allowedRoots = [
     app.getPath('userData'),
@@ -614,13 +621,17 @@ function _isSafePath(p: string): boolean {
   const allowedRootsNorm = allowedRoots.map((dir) => path.resolve(dir) + path.sep)
   // Windows 路径大小写不敏感，比较时统一小写；POSIX 保持原样
   const norm = (s: string) => (process.platform === 'win32' ? s.toLowerCase() : s)
-  const isAllowed = allowedRootsNorm.some((root) => norm(resolved + path.sep).startsWith(norm(root)))
+  // 同时检查 resolved 和 realResolved，确保符号链接也无法绕过
+  const isAllowed = allowedRootsNorm.some((root) =>
+    norm(realResolved + path.sep).startsWith(norm(root)) ||
+    norm(resolved + path.sep).startsWith(norm(root))
+  )
   if (!isAllowed) {
     return false
   }
   // 扩展名黑名单：拒绝可执行文件类型，防止通过 openPath 触发 RCE
-  const ext = path.extname(resolved).toLowerCase()
-  const blockedExts = ['.exe', '.bat', '.ps1', '.cmd', '.vbs', '.scr']
+  const ext = path.extname(realResolved).toLowerCase()
+  const blockedExts = ['.exe', '.bat', '.ps1', '.cmd', '.vbs', '.scr', '.com', '.pif', '.hta', '.msi', '.reg', '.lnk']
   if (blockedExts.includes(ext)) {
     return false
   }

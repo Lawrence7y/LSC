@@ -238,10 +238,25 @@ class LSCWebSocketServer:
             'data': data
         })
 
+        # 发送并检测慢客户端，超时客户端移出广播集合
+        slow_clients: list = []
+        async def _send_with_timeout(client):
+            try:
+                await asyncio.wait_for(client.send(message), timeout=1.0)
+            except asyncio.TimeoutError:
+                slow_clients.append(client)
+            except Exception:
+                slow_clients.append(client)
+
         await asyncio.gather(
-            *[asyncio.wait_for(client.send(message), timeout=1.0) for client in self.clients],
+            *[_send_with_timeout(client) for client in self.clients],
             return_exceptions=True,
         )
+
+        # 移除慢客户端，避免单个客户端拖慢整个广播
+        for client in slow_clients:
+            self.clients.discard(client)
+            _log.warning("Removed slow WebSocket client (send timeout)")
 
         # 高频消息不记录 INFO，确保 INFO 中 MSE 记录为 0
         _HIGH_FREQ_BROADCASTS = frozenset({
@@ -256,10 +271,23 @@ class LSCWebSocketServer:
         """广播原始二进制帧（用于 MSE fMP4，避免 base64）。"""
         if not self.clients or not payload:
             return
+        slow_clients: list = []
+        async def _send_with_timeout(client):
+            try:
+                await asyncio.wait_for(client.send(payload), timeout=1.0)
+            except asyncio.TimeoutError:
+                slow_clients.append(client)
+            except Exception:
+                slow_clients.append(client)
+
         await asyncio.gather(
-            *[asyncio.wait_for(client.send(payload), timeout=1.0) for client in self.clients],
+            *[_send_with_timeout(client) for client in self.clients],
             return_exceptions=True,
         )
+
+        for client in slow_clients:
+            self.clients.discard(client)
+            _log.warning("Removed slow WebSocket client (send timeout, bytes)")
 
     async def broadcast_mse(self, kind: str, room_id: str, payload: bytes) -> None:
         """广播 MSE init/segment 为二进制帧。"""

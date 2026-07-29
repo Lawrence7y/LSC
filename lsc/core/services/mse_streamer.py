@@ -344,6 +344,8 @@ class MseStreamer:
             if proc is not None and proc.poll() is not None:
                 time.sleep(0.3)
                 self._running = False
+                # 启动失败时清理 FFmpeg 进程，防止进程泄漏
+                self._cleanup_process()
                 if not self._error_reported:
                     self._error_reported = True
                     err_msg = self._last_stderr.strip()[:500] if self._last_stderr else "FFmpeg 进程异常退出"
@@ -373,6 +375,29 @@ class MseStreamer:
             _log.warning("Error reading FFmpeg stderr: %s", exc)
         finally:
             self._last_stderr = "\n".join(buf[-20:])
+
+    def _cleanup_process(self) -> None:
+        """清理 FFmpeg 进程（不停止读取线程），用于启动失败时的进程回收。"""
+        proc = self._process
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except Exception as exc:
+                _log.warning("MSE process cleanup failed: %s", exc)
+            finally:
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if proc.stderr:
+                        proc.stderr.close()
+                except Exception:
+                    pass
+                self._process = None
 
     def stop(self) -> None:
         """Stop the streamer and clean up resources."""

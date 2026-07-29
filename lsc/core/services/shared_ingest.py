@@ -956,13 +956,23 @@ class SharedRoomIngest:
                         _PREVIEW_STDOUT_STALL_SEC,
                         self.room_id,
                     )
+                    # kill 失败时尝试 terminate + 关闭 stdin 作为备用方案
                     try:
                         proc.kill()
                     except Exception as exc:
                         _log.warning(
-                            "shared preview stall kill failed room=%s: %s",
+                            "shared preview stall kill failed room=%s: %s, trying terminate",
                             self.room_id, exc,
                         )
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                    try:
+                        if proc.stdin:
+                            proc.stdin.close()
+                    except Exception:
+                        pass
                     try:
                         if proc.stdout:
                             proc.stdout.close()

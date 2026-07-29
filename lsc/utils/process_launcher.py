@@ -54,7 +54,8 @@ def clear_dll_directory() -> None:
 
 _ENV_WHITELIST = frozenset({
     "PATH", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
-    "HOME", "SYSTEMROOT", "PATHEXT", "PYTHONUNBUFFERED", "PYTHONPATH",
+    "HOME", "SYSTEMROOT", "PATHEXT", "PYTHONUNBUFFERED",
+    # PYTHONPATH 已从白名单移除：防止通过环境变量注入恶意 Python 模块路径
     "LSC_LOG_DIR", "LSC_BUNDLED_FFMPEG_DIR", "LSC_LOG_LEVEL",
     "LSC_BILIBILI_COOKIES",
     # #49: preserve CUDA-related env vars for multi-GPU NVENC selection

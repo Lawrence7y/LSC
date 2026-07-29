@@ -393,7 +393,11 @@ class StreamCapture:
         #   faststart: 移动 moov atom 到文件开头（便于网络播放）
         cmd += ["-f", "mp4", "-movflags", "frag_keyframe+empty_moov+faststart", output_path]
 
-        _log.info("Starting capture: %s -> %s", url, output_path)
+        # URL 脱敏：只打印 scheme+host+path，不打印 query（可能含 Token）
+        from urllib.parse import urlparse
+        _parsed = urlparse(url)
+        _safe_url = f"{_parsed.scheme}://{_parsed.netloc}{_parsed.path}"
+        _log.info("Starting capture: %s -> %s", _safe_url, output_path)
         self._set_status(CaptureStatus.CONNECTING)
 
         # Build a clean environment and platform-specific launch flags
