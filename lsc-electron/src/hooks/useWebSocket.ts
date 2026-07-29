@@ -1,7 +1,11 @@
 import { useEffect, useCallback } from 'react'
 import { message } from 'antd'
-import { wsClient } from '@/services/websocket'
+import { wsClient as _wsClient } from '@/services/websocket'
+
+// 导出 wsClient 供需要在组件外订阅事件的场景使用
+export const wsClient = _wsClient
 import { useAppStore } from '@/store/appStore'
+import { removePlayhead } from '@/utils/playheadStore'
 
 // 模块级标记：整个应用生命周期只发起一次 connect()。
 // useWebSocket() 会在 App、MainLayout、Workbench 等多处调用；连接可以共享，
@@ -9,6 +13,9 @@ import { useAppStore } from '@/store/appStore'
 let _initialConnectStarted = false
 let _sharedHandlersRefCount = 0
 let _sharedHandlersCleanup: (() => void) | null = null
+
+// 广播序列号追踪：检测丢消息并触发强制同步
+let _lastBroadcastSeq: number | null = null
 
 // 按房间跟踪 mse_init 重试定时器（对象写法，便于测试与清理）
 const _mseInitRetryTimers: Record<string, ReturnType<typeof setTimeout>> = {}
@@ -40,7 +47,7 @@ export const DISCONNECTED_SEND_WARNING = '未连接后端，操作未发送'
 const SYSTEM_STATS_MIN_INTERVAL_MS = 1000
 let _lastSystemStatsAt = 0
 
-/** 清理某房间的 MSE 缓存与重试定时器（预览关闭时调用）。 */
+/** 清理某房间的 MSE 缓存与重试定时器（预览关闭/房间移除时调用）。 */
 export function clearMseRoomCache(roomId: string): void {
   delete _mseInitCache[roomId]
   delete _mseInitCacheTime[roomId]
@@ -53,6 +60,8 @@ export function clearMseRoomCache(roomId: string): void {
   _lastMseSegmentTimePerRoom.delete(roomId)
   delete _mseWatchdogLastRecovery[roomId]
   delete _mseWatchdogFailCount[roomId]
+  // 同步清理播放头快照，避免 rAF flush 携带死房间数据
+  removePlayhead(roomId)
 }
 
 function _pruneExpiredMseCache(): void {
@@ -148,7 +157,7 @@ function _feedMseSegment(roomId: string, data: ArrayBuffer | string, type: 'init
       _cacheMseInit(roomId, buffer)
     }
 
-    const registry = (window as any).__msePlayers as Record<string, any> | undefined
+    const registry = window.__msePlayers as Record<string, any> | undefined
     const player = registry?.[roomId]
     if (!player) {
       // player 未注册时缓存 media 段，避免初始几秒丢帧。
@@ -211,7 +220,15 @@ function _attachSharedWebSocketHandlers(): () => void {
 
   const handleRooms = (data: { rooms: any[] }) => {
     if (data && Array.isArray(data.rooms)) {
-      const retryCounts = (window as any).__mseInitRetryCount as Record<string, number> | undefined
+      // 房间被移除（不再出现在整表中）：清理其 MSE 缓存与播放头，
+      // 只遍历现列表的发现不了已消失房间，必须与上一份快照对比
+      const incomingIds = new Set(data.rooms.map((r) => r.room_id))
+      for (const prev of useAppStore.getState().rooms) {
+        if (!incomingIds.has(prev.room_id)) {
+          clearMseRoomCache(prev.room_id)
+        }
+      }
+      const retryCounts = window.__mseInitRetryCount
       for (const room of data.rooms) {
         if (!room.preview_enabled) {
           if (retryCounts && retryCounts[room.room_id] !== undefined) {
@@ -233,7 +250,17 @@ function _attachSharedWebSocketHandlers(): () => void {
       }
     }
   }
-  const unsubRoomsUpdated = wsClient.on('rooms_updated', handleRooms)
+  const unsubRoomsUpdated = wsClient.on('rooms_updated', (data: any) => {
+    // 检测广播序列号是否连续，发现丢消息时触发强制同步
+    if (data && typeof data._seq === 'number') {
+      if (_lastBroadcastSeq !== null && data._seq > _lastBroadcastSeq + 1) {
+        // 序列号不连续，有消息丢失，请求全量同步
+        wsClient.send('get_rooms', {})
+      }
+      _lastBroadcastSeq = data._seq
+    }
+    handleRooms(data)
+  })
   const unsubRoomsLoaded = wsClient.on('rooms_loaded', handleRooms)
 
   const unsubRoomUpdated = wsClient.on('room_updated', (data: { room_id: string } & Record<string, any>) => {
@@ -452,7 +479,7 @@ function _attachSharedWebSocketHandlers(): () => void {
       const cachedInit = _mseInitCache[roomId]
       if (cachedInit) {
         try {
-          const registry = (window as any).__msePlayers as Record<string, any> | undefined
+          const registry = window.__msePlayers as Record<string, any> | undefined
           const player = registry?.[roomId]
           if (player) {
             player.feedInit(cachedInit)
@@ -465,8 +492,8 @@ function _attachSharedWebSocketHandlers(): () => void {
       }
 
       // 使用模块级 Map 跟踪重试次数，避免无限重试
-      ;(window as any).__mseInitRetryCount = (window as any).__mseInitRetryCount || {}
-      const counts = (window as any).__mseInitRetryCount as Record<string, number>
+      ;window.__mseInitRetryCount = window.__mseInitRetryCount || {}
+      const counts = window.__mseInitRetryCount
       const count = (counts[roomId] || 0) + 1
       counts[roomId] = count
       if (count > 10) {

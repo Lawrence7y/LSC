@@ -34,6 +34,7 @@ class BroadcastHub:
         self.manager = orchestrator
         self._broadcast_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
         self._wake = threading.Event()
+        self._seq = 0  # 广播序列号，前端用于检测丢消息
         self._async_loop: Any = None
         self._async_wake: Any = None
         self._subscribe_orchestrator_events()
@@ -99,6 +100,9 @@ class BroadcastHub:
     def queue_broadcast(self, msg: dict[str, Any]) -> None:
         """线程安全地投递一条广播消息到队列，供 WebSocket 线程消费。"""
         msg_type = msg.get('type')
+        # 附加序列号，前端用于检测丢消息
+        self._seq += 1
+        msg['_seq'] = self._seq
         try:
             self._broadcast_queue.put_nowait(msg)
             _log.debug("queued broadcast: type=%s", msg_type or '?')

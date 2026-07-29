@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
 import { LoadingOutlined, PlayCircleOutlined } from '@ant-design/icons'
 import { MsePlayer, MsePlayerState } from '@/services/mediaSourcePlayer'
-import { clearMseRoomCache, drainPendingMseSegments, getMseInitCache } from '@/hooks/useWebSocket'
+import { clearMseRoomCache, drainPendingMseSegments, getMseInitCache, wsClient } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
 
@@ -105,7 +105,7 @@ export function VideoPreview({
       currentPlayer.stop()
       playerRef.current = null
     }
-    const registry = (window as any).__msePlayers || {}
+    const registry = window.__msePlayers || {}
     if (currentPlayer && registry[roomId]?.player === currentPlayer) {
       delete registry[roomId]
     }
@@ -188,7 +188,6 @@ export function VideoPreview({
         // 首次超时自动重试一次：重新请求 init 段，适用于 B站首次预览 URL 刷新慢的场景
         if (!autoRetriedRef.current) {
           autoRetriedRef.current = true
-          console.log(`[VideoPreview] Auto-retrying preview for ${roomId}`)
           sendRef.current('request_mse_init', { room_id: roomId })
           // 重新设置 30 秒超时等待重试结果（B站 URL 刷新可能需要 10+ 秒）
           if (loadTimeoutRef.current) {
@@ -226,7 +225,7 @@ export function VideoPreview({
         onErrorRef.current?.(msg)
       },
       onBackpressure: (bpState, pending) => {
-        send('mse_backpressure', { room_id: roomId, state: bpState, pending })
+        sendRef.current('mse_backpressure', { room_id: roomId, state: bpState, pending })
       },
       onSourceOpen: () => {
         // MediaSource.sourceopen 触发后 video.src 已绑定到新 MediaSource，
@@ -249,9 +248,8 @@ export function VideoPreview({
             gain.connect(ctx.destination)
             audioSourceRef.current = source
             gainNodeRef.current = gain
-            console.log(`[VideoPreview] Web Audio routing created on sourceopen for ${roomId}`)
           }
-          const registry = (window as any).__msePlayers || {}
+          const registry = window.__msePlayers || {}
           registry[roomId] = {
             ...(registry[roomId] || {}),
             feedInit,
@@ -260,7 +258,7 @@ export function VideoPreview({
             audioSource: audioSourceRef.current,
             gainNode: gainNodeRef.current,
           }
-          ;(window as any).__msePlayers = registry
+          ;window.__msePlayers = registry
         } catch (e) {
           console.warn(`[VideoPreview] Failed to create Web Audio routing for ${roomId}:`, e)
         }
@@ -279,7 +277,6 @@ export function VideoPreview({
     const cachedInit = getMseInitCache(roomId)
     if (cachedInit) {
       player.feedInit(cachedInit)
-      console.log(`[VideoPreview] Used cached init segment (${roomId})`)
     }
 
     return () => {
@@ -295,7 +292,7 @@ export function VideoPreview({
         playerRef.current = null
       }
       // playerGeneration 重建时同步注销注册表，避免 stale player 被读播放头
-      const registry = (window as any).__msePlayers || {}
+      const registry = window.__msePlayers || {}
       if (stopping && registry[roomId]?.player === stopping) {
         delete registry[roomId]
       }
@@ -310,6 +307,17 @@ export function VideoPreview({
       }
     }
   }, [active, roomId, playerGeneration])
+
+  // MSE 重连成功后重建播放器，接受新 init 段
+  useEffect(() => {
+    const unsub = wsClient.on('mse_reconnected', (data: { room_id: string }) => {
+      if (data?.room_id === roomId) {
+        clearMseRoomCache(roomId)
+        setPlayerGeneration((g) => g + 1)
+      }
+    })
+    return () => unsub()
+  }, [roomId])
 
   // 组件卸载或切换房间时才拆掉 Web Audio 图（此时 video 元素随之销毁）
   useEffect(() => {
@@ -329,9 +337,9 @@ export function VideoPreview({
   useEffect(() => {
     if (active && videoRef.current) {
       // Register this room's player in a global registry for WS handler access
-      const registry = (window as any).__msePlayers || {}
+      const registry = window.__msePlayers || {}
       registry[roomId] = { feedInit, feedMedia, player: playerRef.current, audioSource: audioSourceRef.current, gainNode: gainNodeRef.current }
-      ;(window as any).__msePlayers = registry
+      ;window.__msePlayers = registry
       // 主动请求后端补发 init 段，消除 mse_init 早于 rooms_updated 到达的竞态
       sendRef.current('request_mse_init', { room_id: roomId })
       // 回放在 player 未注册期间缓存的 media 段，避免初始几秒丢帧。
@@ -354,7 +362,7 @@ export function VideoPreview({
       return () => {
         // 仅当注册的还是当前 player 时才删除，避免删除其他实例的注册
         // （例如全屏 VideoPreview 卸载时，不应删除小预览区的注册）
-        const currentRegistry = (window as any).__msePlayers || {}
+        const currentRegistry = window.__msePlayers || {}
         if (currentRegistry[roomId]?.player === playerRef.current) {
           delete currentRegistry[roomId]
         }
@@ -517,7 +525,7 @@ export function VideoPreview({
               padding: '4px 12px',
               fontSize: 12,
               background: retrying ? 'var(--text-500)' : 'var(--brand-500)',
-              color: '#fff',
+              color: 'var(--overlay-text, #f5f5f7)',
               border: 'none',
               borderRadius: 4,
               cursor: retrying ? 'not-allowed' : 'pointer',

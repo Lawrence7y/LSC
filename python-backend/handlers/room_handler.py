@@ -2322,6 +2322,7 @@ def register_room_handlers(server, bridge):
                     "Shared MSE reconnect exhausted for room %s (%d attempts)",
                     room_id, state['attempts'],
                 )
+                _mse_reconnect_state.pop(room_id, None)  # 清理状态，避免残留影响后续手动重开
                 exhausted_msg = (
                     _mse_offline_error_message(current_error)
                     if mse_failure_reason == 'offline'
@@ -5366,6 +5367,14 @@ def register_room_handlers(server, bridge):
         output_dir = job['output_dir']
         profile = job['profile']
         job_id = job['job_id']
+
+        # A job can spend time waiting for the global semaphore.  Notify the
+        # client only after a worker has actually claimed it, so queued cards
+        # are not mistaken for active FFmpeg exports.
+        await server.broadcast('clip_export_started', {
+            'room_id': room_id,
+            'job_id': job_id,
+        })
 
         loop = asyncio.get_running_loop()
         done_event = asyncio.Event()
