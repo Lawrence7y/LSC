@@ -1,8 +1,9 @@
 # LSC 直播切片多人系统 - 完整程序设计文档
 
-> 本文档基于代码现状生成，覆盖系统的全部模块、架构、数据流和实现细节。
+> **⚠️ 警告：本文档生成于 2026-06-30，部分内容已过时。**
 >
-> 生成日期：2026-06-30
+> 架构描述（如 QtManagerBridge + MultiRoomManager）与当前代码（RoomOrchestrator + BroadcastHub）不符。
+> 请以根目录 `CLAUDE.md` 为权威架构参考。
 
 ---
 

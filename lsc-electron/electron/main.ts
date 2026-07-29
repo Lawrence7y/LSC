@@ -6,6 +6,17 @@ import { randomBytes } from 'crypto'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { extractBackendWsUrl } from './backendUrl'
 
+// ===== EPIPE 防护：stdout/stderr 管道断裂时不崩溃 =====
+process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED') {
+    // 管道已关闭（如父进程退出），静默忽略后续写入
+    return
+  }
+  // 非 EPIPE 异常仍走默认行为（打印 + 退出）
+  console.error('Uncaught Exception:', err)
+  process.exit(1)
+})
+
 // ===== 全局日志持久化 =====
 const _MAX_LOG_SIZE = 2 * 1024 * 1024 // 2MB
 const _MAX_LOG_BACKUPS = 5
@@ -47,7 +58,7 @@ function _scheduleLogFlush(logFile: string): void {
       const now = Date.now()
       if (now - _lastLogWriteErrorAt < _LOG_ERROR_COOLDOWN_MS) return
       _lastLogWriteErrorAt = now
-      console.error('[appLog] 日志写入失败:', err)
+      try { console.error('[appLog] 日志写入失败:', err) } catch { /* EPIPE safe */ }
     })
   }, _LOG_FLUSH_MS)
 }
@@ -65,15 +76,19 @@ export function appLog(level: 'INFO' | 'WARN' | 'ERROR', module: string, msg: st
     if (Math.random() < 0.01) {
       _rotateLogFile(logFile)
     }
-    if (level === 'ERROR') {
-      console.error(line.trim())
-    } else if (level === 'WARN') {
-      console.warn(line.trim())
-    } else {
-      console.log(line.trim())
+    try {
+      if (level === 'ERROR') {
+        console.error(line.trim())
+      } else if (level === 'WARN') {
+        console.warn(line.trim())
+      } else {
+        console.log(line.trim())
+      }
+    } catch {
+      // EPIPE: stdout 管道已断裂，静默跳过控制台输出
     }
-  } catch (err) {
-    console.error('[appLog] 日志写入失败:', err)
+  } catch {
+    // 日志写入失败不应影响主进程稳定性
   }
 }
 
@@ -111,7 +126,7 @@ function loadSettings(): AppSettings {
     if (fs.existsSync(filePath)) {
       const content = fs.readFileSync(filePath, 'utf-8')
       const parsed = JSON.parse(content)
-      appLog('INFO', 'Settings', `读取本地设置成功: ${content.trim()}`)
+      appLog('INFO', 'Settings', `读取本地设置成功: keys=${Object.keys(parsed).join(',')}`)
       return {
         autoLaunch: !!parsed.autoLaunch,
         minimizeToTray: !!parsed.minimizeToTray,
@@ -127,7 +142,7 @@ function saveSettings(settings: AppSettings): void {
   try {
     const content = JSON.stringify(settings, null, 2)
     fs.writeFileSync(getSettingsFilePath(), content, 'utf-8')
-    appLog('INFO', 'Settings', `保存设置到本地成功: ${content.trim()}`)
+    appLog('INFO', 'Settings', `保存设置到本地成功: keys=${Object.keys(settings).join(',')}`)
   } catch (err) {
     appLog('ERROR', 'Settings', `写入设置失败: ${err}`)
   }

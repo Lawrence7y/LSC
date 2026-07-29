@@ -87,7 +87,8 @@ class CancellableFFmpeg:
                 continue
 
     def _terminate_tree(self) -> None:
-        assert self._proc is not None
+        if self._proc is None:
+            return
         if sys.platform == "win32":
             subprocess.run(
                 ["taskkill", "/T", "/PID", str(self._proc.pid)],
@@ -98,7 +99,8 @@ class CancellableFFmpeg:
             self._proc.terminate()
 
     def _kill_tree(self) -> None:
-        assert self._proc is not None
+        if self._proc is None:
+            return
         if sys.platform == "win32":
             subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(self._proc.pid)],

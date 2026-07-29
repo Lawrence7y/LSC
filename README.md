@@ -273,12 +273,25 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `LSC 直播切片系统 Setup x.y.z.exe` 安装即可。
 
+### 前置条件
+
+开发模式需要 **Python 3.10+** 和 **Node.js 18+**：
+
+```bash
+# 1. 安装 Python 依赖（后端需要）
+pip install -r requirements.txt
+
+# 2. 安装 Node 依赖（前端需要）
+cd lsc-electron && npm install
+```
+
+> 缺少 Python 依赖会导致后端启动失败。如果 `npm run dev` 后端报错，请先运行 `python -c "import PySide6, numpy, websockets; print('OK')"` 验证。
+
 ### 开发模式
 
 ```bash
-# 一键拉起后端 + Electron
+# 一键拉起后端 + Electron（需先完成前置条件）
 cd lsc-electron
-npm install
 npm run dev
 ```
 

@@ -1831,7 +1831,8 @@ def extract_frames_cancellable(
                 f"hybrid frame extract failed rc={completed.returncode}: {last_err}"
             )
 
-        assert completed is not None
+        if completed is None:
+            raise RuntimeError("hybrid frame extract returned None")
         frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
         precise_timestamps: list[float] = []
         for match in frame_ts_pattern.finditer(

@@ -149,7 +149,8 @@ class ValorantFrameClassifier:
     def predict_batch(self, frames_bgr: list[np.ndarray]) -> np.ndarray:
         if self._session is None or self._meta is None:
             self.load()
-        assert self._session is not None and self._meta is not None
+        if self._session is None or self._meta is None:
+            raise RuntimeError("ONNX session failed to load")
         if not frames_bgr:
             return np.zeros((0, 5), dtype=np.float32)
         batch = np.stack([self._preprocess(f) for f in frames_bgr], axis=0)
@@ -172,7 +173,8 @@ class ValorantFrameClassifier:
         return probs
 
     def _preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
-        assert self._meta is not None
+        if self._meta is None:
+            raise RuntimeError("ONNX model metadata not loaded")
         import cv2
 
         size = int(self._meta["input_size"][0])
