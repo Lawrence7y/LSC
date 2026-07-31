@@ -7,9 +7,10 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from handlers import room_handler
+
 from lsc.gui.multi_room.session import RoomSession
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +105,7 @@ def _room(tmp_path, room_id: str, offset: float, group: str = "group-a"):
         room_id=room_id,
         streamer_name=room_id,
         record_output_path=str(video),
+        is_recording=True,
         content_offset=offset,
         align_group_id=group,
     )
@@ -185,6 +187,28 @@ def test_map_highlight_to_room_uses_content_offset_delta(tmp_path) -> None:
     assert mapped["source"] == "round_detector"
 
 
+def test_map_highlight_to_room_prefers_media_start_mono(tmp_path) -> None:
+    """共享进样的进程启动时间不同于首帧时间时，必须按媒体起点映射。"""
+    main = _room(tmp_path, "main", offset=10.0)
+    side = _room(tmp_path, "side", offset=3.0)
+    main.recording_start_mono = 100.0
+    main.recording_media_start_mono = 110.0
+    side.recording_start_mono = 105.0
+    side.recording_media_start_mono = 108.0
+
+    mapped = room_handler._map_highlight_to_room(
+        {"start": 30.0, "end": 45.0},
+        main,
+        side,
+    )
+
+    # media delta=+2，content delta=+7，总偏移=+9；
+    # 若错误使用进程启动时间则会得到 +2。
+    assert mapped["offset_delta"] == 9.0
+    assert mapped["start"] == 39.0
+    assert mapped["end"] == 54.0
+
+
 def test_map_highlights_by_room_returns_room_keyed_payload(tmp_path) -> None:
     main = _room(tmp_path, "main", offset=10.0)
     side = _room(tmp_path, "side", offset=3.0)
@@ -259,7 +283,7 @@ def test_room_session_tracks_recording_media_start_mono() -> None:
 
 def test_validate_synced_analysis_targets_waits_for_file() -> None:
     """_validate_synced_analysis_targets 在 wait_for_file=True 时应等待文件创建。"""
-    from handlers.room_handler import _validate_synced_analysis_targets, _wait_for_recording_file
+    from handlers.room_handler import _validate_synced_analysis_targets
 
     tmp_dir = tempfile.mkdtemp()
     dummy_path = os.path.join(tmp_dir, "dummy.mp4")

@@ -140,7 +140,6 @@ def test_refine_handlers_return_error_on_missing_round_key():
 
 def test_save_douyin_cookies_rejects_oversized_input():
     """save_douyin_cookies must reject payloads exceeding the 1MB limit (#4)."""
-    from handlers import room_handler
     server, _ = _register_refine_handlers()
 
     oversized = "x" * (2 * 1024 * 1024)  # 2 MB
@@ -188,7 +187,6 @@ def test_align_preview_audio_rejects_too_many_rooms():
 
 def test_refined_round_keys_has_lock():
     """_refined_round_keys must be protected by a threading.Lock (#102)."""
-    from handlers import room_handler
     # The lock is created when register_room_handlers is called, which
     # sets up a closure-scoped lock. Verify by checking the handler source
     # has the lock guard pattern.

@@ -66,6 +66,8 @@ export function VideoPreview({
   const hasReceivedDataRef = useRef(false)
   // 首次超时后自动重试一次，避免 B站首次预览因 URL 刷新慢而失败
   const autoRetriedRef = useRef(false)
+  const previewPhaseRef = useRef(previewPhase)
+  previewPhaseRef.current = previewPhase
 
   // Refs hold the latest props without being listed as useEffect deps,
   // so changing send/onReady/onError identities do not trigger init→stop→init loops.
@@ -184,6 +186,16 @@ export function VideoPreview({
     }
     loadTimeoutRef.current = setTimeout(() => {
       if (!hasReceivedDataRef.current && playerRef.current) {
+        // 后端正在刷新流地址（B站等平台需 10-30s）或正在重连，重置超时等待
+        if (previewPhaseRef.current === 'refreshing_url' || mseReconnecting) {
+          if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current)
+          loadTimeoutRef.current = setTimeout(() => {
+            if (!hasReceivedDataRef.current && playerRef.current) {
+              setError('预览加载超时，请检查直播流是否正常')
+            }
+          }, 30000)
+          return
+        }
         console.warn(`[VideoPreview] 预览加载超时 (${roomId})`)
         // 首次超时自动重试一次：重新请求 init 段，适用于 B站首次预览 URL 刷新慢的场景
         if (!autoRetriedRef.current) {

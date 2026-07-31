@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +16,13 @@ _log = logging.getLogger(__name__)
 
 _persist_lock = threading.Lock()
 
-# 默认数据目录：项目根目录下的 data 文件夹
-# 使用项目内目录，避免沙箱外路径导致写入失败
+# 打包后的项目根目录在安装路径中（通常是 Program Files），不能写入。
+# Electron 会将 LSC_DATA_DIR 指向 userData；未设置时保留开发模式的项目内位置。
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATA_DIR = _PROJECT_ROOT / "data"
+_PERSISTENCE_ROOT = Path(os.environ.get("LSC_DATA_DIR", _PROJECT_ROOT))
+DEFAULT_DATA_DIR = _PERSISTENCE_ROOT / "data"
 ROOMS_FILE = DEFAULT_DATA_DIR / "rooms.json"
-SETTINGS_FILE = _PROJECT_ROOT / "settings.json"
+SETTINGS_FILE = _PERSISTENCE_ROOT / "settings.json"
 
 
 def _ensure_dir(path: Path) -> None:
@@ -324,3 +326,52 @@ def _now_iso() -> str:
     """当前时间的 ISO 8601 字符串（本地时区）。"""
     import datetime as _dt
     return _dt.datetime.now().isoformat(timespec="seconds")
+
+
+# ── P3-1: 配置热更新 ───────────────────────────────────────────────
+
+_settings_watcher = None
+
+
+def watch_settings(callback: Callable[[dict], None]) -> None:
+    """监听 settings.json 文件变化，变化时调用 callback。
+
+    使用轮询方式检测文件修改时间变化（跨平台兼容）。
+    """
+    global _settings_watcher
+    if _settings_watcher is not None:
+        return  # 已在监听
+
+    import asyncio
+
+    last_mtime = 0.0
+    if SETTINGS_FILE.exists():
+        last_mtime = SETTINGS_FILE.stat().st_mtime
+
+    async def _poll():
+        nonlocal last_mtime
+        while True:
+            await asyncio.sleep(3)  # 每 3 秒检查一次
+            try:
+                if SETTINGS_FILE.exists():
+                    current_mtime = SETTINGS_FILE.stat().st_mtime
+                    if current_mtime != last_mtime:
+                        last_mtime = current_mtime
+                        # 局部导入避免与 room_handler 循环依赖
+                        from handlers.room_handler import load_settings
+                        settings = load_settings()
+                        callback(settings)
+                        _log.info("配置热更新: settings.json 已变更")
+            except Exception as exc:
+                _log.debug("配置监听异常: %s", exc)
+
+    loop = asyncio.get_event_loop()
+    _settings_watcher = loop.create_task(_poll())
+
+
+def stop_watch_settings() -> None:
+    """停止监听配置文件。"""
+    global _settings_watcher
+    if _settings_watcher is not None:
+        _settings_watcher.cancel()
+        _settings_watcher = None

@@ -1,5 +1,6 @@
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
+
 import lsc.analyzer.ocr_accel as oa
 
 

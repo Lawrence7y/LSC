@@ -42,8 +42,10 @@ interface TimelineProps {
   followLive?: boolean
   /** 父级 scrub 中（冻结窗）；订阅直写时跳过以免打架 */
   isScrubbing?: boolean
-  /** 回直播浮动按钮回调（仅 followLive=false 时显示） */
-  onGoLive?: () => void
+  /** 分析扫描进度（0~1）：已分析时长 / 总时长，用于背景进度条 */
+  analysisProgress?: number
+  /** 当前扫描范围 [start, end]（绝对秒），用于扫描范围指示 */
+  scanRange?: [number, number] | null
 }
 
 const DEFAULT_CLIP_COLOR = 'rgba(63, 131, 248, 0.72)'
@@ -189,7 +191,8 @@ export function Timeline({
   recordedEnd = null,
   followLive = false,
   isScrubbing = false,
-  onGoLive,
+  analysisProgress,
+  scanRange = null,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
@@ -581,13 +584,15 @@ export function Timeline({
           style={{ width: innerWidth, position: 'relative', height: '100%' }}
         >
           <div className="lsc-timeline__ruler">
+            <span className="lsc-timeline__endpoint-time is-start">
+              {formatTickTime(ws)}
+            </span>
             {ticks.map(({ time, abs, isMajor, isKey }) => {
               const pct = (time / effectiveDuration) * 100
               const nearStart = pct < 2
               const nearEnd = pct > 98
-              // 主刻度 / 关键阶段显示标签；贴边时仍显示（对齐避免裁切）
-              const showLabel = (isMajor || isKey) && abs > 0
-              const labelEdge = nearStart ? 'is-start' : nearEnd ? 'is-end' : ''
+              // 两端由精确窗口时间单独标注，临近端点的主刻度不重复显示。
+              const showLabel = (isMajor || isKey) && !nearStart && !nearEnd
               return (
                 <div
                   key={abs}
@@ -599,13 +604,16 @@ export function Timeline({
                   style={{ left: `${pct}%` }}
                 >
                   {showLabel && (
-                    <span className={`lsc-timeline__tick-label ${labelEdge}`.trim()}>
+                    <span className="lsc-timeline__tick-label">
                       {formatTickTime(abs)}
                     </span>
                   )}
                 </div>
               )
             })}
+            <span className="lsc-timeline__endpoint-time is-end">
+              {formatTickTime(ws + effectiveDuration)}
+            </span>
           </div>
 
           <div
@@ -620,27 +628,61 @@ export function Timeline({
               style={{ width: `${progressPct}%` }}
             />
 
+            {/* 分析扫描进度背景条（P0: 分析扫描进度可视化） */}
+            {analysisProgress != null && analysisProgress > 0 && (
+              <div
+                className="lsc-timeline__analysis-progress"
+                style={{ width: `${clamp(analysisProgress * 100, 0, 100)}%` }}
+                title={`已分析 ${Math.round(analysisProgress * 100)}%`}
+              />
+            )}
+
+            {/* 当前扫描范围指示（P1: 扫描范围指示） */}
+            {scanRange && scanRange[1] > scanRange[0] && (() => {
+              const srLeft = clamp((scanRange[0] / effectiveDuration) * 100, 0, 100)
+              const srWidth = clamp(((scanRange[1] - scanRange[0]) / effectiveDuration) * 100, 0, 100 - srLeft)
+              return (
+                <div
+                  className="lsc-timeline__scan-range"
+                  style={{ left: `${srLeft}%`, width: `${srWidth}%` }}
+                  title={`扫描范围 ${formatTickTime(scanRange[0])}–${formatTickTime(scanRange[1])}`}
+                />
+              )
+            })()}
+
             {highlights.map((h) => {
               const left = clamp((h.start / effectiveDuration) * 100, 0, 100)
               const width = clamp(((h.end - h.start) / effectiveDuration) * 100, 0, 100 - left)
               const dur = h.end - h.start
+              const isAudioPending = h.confirm_status === 'audio_pending'
               const isPending = h.confirm_status === 'pending' || h.confirm_status === 'refining'
-              const statusLabel = h.confirm_status === 'pending' ? '待确认'
+              const statusLabel = h.confirm_status === 'audio_pending' ? '音频待复核'
+                : h.confirm_status === 'pending' ? '待确认'
                 : h.confirm_status === 'refining' ? '调整中'
                 : h.confirm_status === 'user_confirmed' ? '已确认'
                 : h.confirm_status === 'ocr_confirmed' ? 'AI可导'
                 : h.confirm_status === 'vision_confirmed' ? '视觉确认'
                 : ''
+              const precisionLabel = h.boundary_precision === 'audio_approximate' ? '音频粗定位' : ''
               const title = [
                 h.reason || h.label || 'AI 高光',
                 h.score != null ? `score ${h.score.toFixed(2)}` : '',
                 `${formatTickTime(h.start)}–${formatTickTime(h.end)}（${formatTickTime(dur)}）`,
                 statusLabel,
+                precisionLabel,
               ].filter(Boolean).join(' · ')
+              // 动态信息密度（P2: 色带动态信息密度）
+              const showLabel = width >= 4 && h.label
+              const showDuration = width >= 7
+              const showStatus = width >= 12
+              // 样式类：audio_pending 使用橙色虚线，pending 使用蓝色虚线，confirmed 使用实色
+              const highlightClass = isAudioPending ? 'lsc-timeline__highlight--audio-pending'
+                : isPending ? 'lsc-timeline__highlight--pending'
+                : 'lsc-timeline__highlight--confirmed'
               return (
                 <div
                   key={h.id}
-                  className={`lsc-timeline__highlight${isPending ? '' : ' lsc-timeline__highlight--confirmed'}`}
+                  className={`lsc-timeline__highlight ${highlightClass}`}
                   style={{ left: `${left}%`, width: `${width}%` }}
                   title={title}
                   onClick={(e) => {
@@ -648,9 +690,10 @@ export function Timeline({
                     onHighlightClick?.(h)
                   }}
                 >
-                  {width >= 4 && h.label && (
+                  {showLabel && (
                     <span className="lsc-timeline__highlight-label">
-                      {h.label}{width >= 7 ? ` · ${formatTickTime(dur)}` : ''}
+                      {h.label}{showDuration ? ` · ${formatTickTime(dur)}` : ''}
+                      {showStatus ? ` · ${statusLabel}` : ''}
                     </span>
                   )}
                 </div>
@@ -753,19 +796,6 @@ export function Timeline({
           </div>
         </div>
       </div>
-      {!followLive && onGoLive && (
-        <button
-          type="button"
-          className="lsc-timeline__go-live"
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.stopPropagation()
-            onGoLive()
-          }}
-        >
-          回直播
-        </button>
-      )}
     </div>
   )
 }

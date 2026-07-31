@@ -14,6 +14,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import shutil
 import sys
 import threading
 import time
@@ -26,6 +27,12 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+# Windows embeddable Python 的 ._pth 会忽略 PYTHONPATH；显式加载安装器写入
+# 当前用户目录的运行时依赖。
+_RUNTIME_PACKAGES = os.environ.get('LSC_PYTHON_PACKAGES')
+if _RUNTIME_PACKAGES and _RUNTIME_PACKAGES not in sys.path:
+    sys.path.insert(0, _RUNTIME_PACKAGES)
 
 
 def _get_log_dir() -> str:
@@ -46,13 +53,46 @@ def _get_log_dir() -> str:
     return os.path.join(_HERE, 'logs')
 
 
+class _CompressedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """带压缩的滚动文件日志处理器（P3-3: 日志压缩和清理）。
+
+    轮转时将旧日志压缩为 .gz 格式，节省约 80% 磁盘空间。
+    """
+
+    def doRollover(self) -> None:
+        """执行轮转并压缩旧日志"""
+        import gzip
+        super().doRollover()
+        # 压缩轮转后的旧日志
+        for i in range(self.backupCount, 0, -1):
+            sfn = f"{self.baseFilename}.{i}"
+            dfn = f"{self.baseFilename}.{i}.gz"
+            if os.path.exists(sfn) and not os.path.exists(dfn):
+                try:
+                    with open(sfn, 'rb') as f_in, gzip.open(dfn, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                    os.remove(sfn)
+                except OSError:
+                    pass
+
+
 def _setup_logging() -> logging.Logger:
-    """配置根 logger：控制台 + 滚动文件日志（2MB × 5）。"""
+    """配置根 logger：控制台 + 滚动文件日志（2MB × 5）。
+
+    环境变量：
+    - LSC_LOG_LEVEL: 设置根日志级别（DEBUG/INFO/WARNING/ERROR），默认 INFO
+    - LSC_LOG_DEBUG_LOGGERS: 逗号分隔的 logger 名，强制设为 DEBUG（如 'lsc.analyzer'）
+      例：LSC_LOG_DEBUG_LOGGERS=lsc.analyzer,lsc.handlers
+    """
     log_dir = _get_log_dir()
     log_file = os.path.join(log_dir, 'backend.log')
 
+    # 根级别：默认 INFO，可通过环境变量覆盖
+    root_level_name = os.environ.get('LSC_LOG_LEVEL', 'INFO').upper()
+    root_level = getattr(logging, root_level_name, logging.INFO)
+
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(root_level)
     # 清理可能存在的 handlers（避免重复添加）
     root.handlers.clear()
 
@@ -66,9 +106,9 @@ def _setup_logging() -> logging.Logger:
     console.setFormatter(fmt)
     root.addHandler(console)
 
-    # 滚动文件日志：单文件 2MB，保留 5 个备份
+    # 滚动文件日志：单文件 2MB，保留 5 个备份，压缩旧日志（P3-3: 日志压缩和清理）
     try:
-        file_handler = logging.handlers.RotatingFileHandler(
+        file_handler = _CompressedRotatingFileHandler(
             log_file, maxBytes=2 * 1024 * 1024, backupCount=5, encoding='utf-8',
         )
         file_handler.setFormatter(fmt)
@@ -77,7 +117,18 @@ def _setup_logging() -> logging.Logger:
         # 日志目录不可写时仅用控制台
         print(f"[warn] failed to create file log handler at {log_file}: {exc}", file=sys.stderr)
 
-    return logging.getLogger('lsc.backend')
+    # P0/P1: 允许通过环境变量强制指定 logger 为 DEBUG 级别
+    # 用法：LSC_LOG_DEBUG_LOGGERS=lsc.analyzer
+    debug_loggers = os.environ.get('LSC_LOG_DEBUG_LOGGERS', '').strip()
+    backend_log = logging.getLogger('lsc.backend')
+    if debug_loggers:
+        for name in debug_loggers.split(','):
+            name = name.strip()
+            if name:
+                logging.getLogger(name).setLevel(logging.DEBUG)
+                backend_log.info("强制 DEBUG 级别: %s (via LSC_LOG_DEBUG_LOGGERS)", name)
+
+    return backend_log
 
 
 def _install_exception_hook(log: logging.Logger) -> None:
@@ -126,14 +177,51 @@ class LSCWebSocketBackend:
         # stop() 时 set 此 event，run_until_complete 会正常返回。
         self._stop_event: asyncio.Event | None = None
         self._main_stop = threading.Event()
+        self._stop_lock = threading.Lock()
+        self._parent_watch_thread: threading.Thread | None = None
+
+    def _start_parent_watchdog(self) -> None:
+        """Electron 异常退出时主动清理录制/预览/分析及 FFmpeg 子进程。"""
+        try:
+            parent_pid = int(os.environ.get("LSC_PARENT_PID", "0") or 0)
+        except ValueError:
+            parent_pid = 0
+        if parent_pid <= 0:
+            return
+
+        def _watch() -> None:
+            try:
+                import psutil
+            except ImportError:
+                return
+            while not self._main_stop.wait(2.0):
+                if psutil.pid_exists(parent_pid):
+                    continue
+                _log.warning("Electron parent process exited; stopping backend (parent_pid=%s)", parent_pid)
+                self.stop()
+                return
+
+        self._parent_watch_thread = threading.Thread(
+            target=_watch,
+            name="electron-parent-watchdog",
+            daemon=True,
+        )
+        self._parent_watch_thread.start()
 
     def _run_ws_server(self):
         """在工作线程中运行 WebSocket 服务器。"""
-        from handlers.room_handler import register_room_handlers
+        from handlers.room_handler import register_room_handlers, restore_persisted_rooms
 
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._stop_event = asyncio.Event()
+
+        try:
+            restored = restore_persisted_rooms(self.manager)
+            _log.info("Restored %d persisted room(s) before WebSocket startup", restored)
+        except Exception:
+            # 房间恢复失败不应阻止后端启动；连接后仍可手动重新添加。
+            _log.exception("Failed to restore persisted rooms")
 
         register_room_handlers(self.server, self.bridge)
 
@@ -208,6 +296,7 @@ class LSCWebSocketBackend:
 
     def start(self):
         _log.info("Starting LSC Electron backend...")
+        self._start_parent_watchdog()
 
         self._ws_thread = threading.Thread(target=self._run_ws_server, daemon=True)
         self._ws_thread.start()
@@ -232,7 +321,11 @@ class LSCWebSocketBackend:
         的阻塞（旧实现仅设 _shutdown 标志但未调度 loop.stop，导致 ws 线程
         超时被强杀）。
         """
-        self._shutdown = True
+        with self._stop_lock:
+            if self._shutdown:
+                self._main_stop.set()
+                return
+            self._shutdown = True
         try:
             from handlers.room_handler import shutdown_room_handlers
             shutdown_room_handlers(timeout_sec=10.0)

@@ -25,6 +25,7 @@ from lsc import get_logger
 from lsc.config import load_config
 from lsc.core.services.fmp4_segments import Fmp4SegmentParser
 from lsc.platforms.base import headers_to_ffmpeg_input_args
+from lsc.utils.gpu_ffmpeg import scale_cuda_available
 from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
 
 _log = get_logger(__name__)
@@ -181,6 +182,7 @@ class MseStreamer:
 
         构建 FFmpeg 命令行并启动，随后启动后台线程读取 fMP4 输出。
         包含启动探测逻辑，等待 init segment 产出或 FFmpeg 异常退出。
+        硬件解码优先：先尝试 GPU 硬解（降低 CPU），CDN 不兼容时自动回退软解。
 
         Args:
             startup_probe_timeout: 启动探测超时时间（秒）
@@ -192,14 +194,90 @@ class MseStreamer:
             _log.warning("MseStreamer already running")
             return False
 
-        # Build scale filter if resolution specified
-        # 直播 URL 上不要强制 -hwaccel cuda / scale_cuda：CDN/HLS 硬解失败率高，
-        # 会导致 MSE init 永远不就绪。预览仍用 NVENC 编码降 CPU。
+        use_nvenc = _check_nvenc()
+        # 硬件解码策略：
+        # 1) NVENC + scale_cuda + 仅需 scale（无 fps）→ 全 GPU 管线（cuda 硬解 + scale_cuda）
+        # 2) NVENC + 需要 fps 滤镜 → d3d11va 硬解 + CPU 滤镜（fps 无 GPU 版本）
+        # 3) 无 NVENC → 不加硬解（纯 CPU 软编软解）
+        has_scale = self._width > 0 and self._height > 0
+        has_fps = self._fps > 0
+        gpu_scale_ok = (
+            use_nvenc
+            and has_scale
+            and not has_fps
+            and scale_cuda_available(self._ffmpeg_path)
+        )
+        # 决定 hwaccel 模式: "cuda_full" | "d3d11va" | ""
+        if gpu_scale_ok:
+            hwaccel_mode = "cuda_full"
+        elif use_nvenc:
+            hwaccel_mode = "d3d11va"
+        else:
+            hwaccel_mode = ""
+
+        # 第一次尝试（带硬解），失败则回退软解
+        ok = self._try_start(
+            hwaccel_mode=hwaccel_mode,
+            use_nvenc=use_nvenc,
+            startup_probe_timeout=startup_probe_timeout,
+        )
+        if ok or hwaccel_mode == "":
+            return ok
+
+        # 硬解启动失败（CDN/HLS 不兼容），回退软解重试
+        _log.warning(
+            "MSE hwaccel(%s) startup failed, retrying without hwaccel",
+            hwaccel_mode,
+        )
+        self._cleanup_after_failed_start()
+        return self._try_start(
+            hwaccel_mode="",
+            use_nvenc=use_nvenc,
+            startup_probe_timeout=startup_probe_timeout,
+        )
+
+    def _cleanup_after_failed_start(self) -> None:
+        """清理首次启动失败后的残留状态，为重试做准备。"""
+        self._running = False
+        self._init_sent = False
+        self._error_reported = False
+        self._cleanup_process()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2)
+        self._thread = None
+        if self._stderr_thread is not None and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=2)
+        self._stderr_thread = None
+
+    def _try_start(
+        self,
+        *,
+        hwaccel_mode: str,
+        use_nvenc: bool,
+        startup_probe_timeout: float,
+    ) -> bool:
+        """内部启动逻辑，支持 hwaccel 回退重试。
+
+        Args:
+            hwaccel_mode: "cuda_full"（全 GPU）| "d3d11va"（GPU 解码 + CPU 滤镜）| ""（纯 CPU）
+            use_nvenc: 是否使用 NVENC 编码
+            startup_probe_timeout: 启动探测超时
+        """
+        # Build video filter chain
         vf_parts: list[str] = []
-        if self._width > 0 and self._height > 0:
-            vf_parts.append(f"scale={self._width}:{self._height}:force_original_aspect_ratio=decrease")
-        if self._fps > 0:
-            vf_parts.append(f"fps={self._fps}")
+        if hwaccel_mode == "cuda_full":
+            # 全 GPU 管线：帧留在 CUDA 内存，scale_cuda 缩放后直接 NVENC 编码
+            if self._width > 0 and self._height > 0:
+                vf_parts.append(
+                    f"scale_cuda={self._width}:{self._height}"
+                    f":force_original_aspect_ratio=decrease"
+                )
+        else:
+            # CPU 滤镜路径（d3d11va 自动下载帧到系统内存）
+            if self._width > 0 and self._height > 0:
+                vf_parts.append(f"scale={self._width}:{self._height}:force_original_aspect_ratio=decrease")
+            if self._fps > 0:
+                vf_parts.append(f"fps={self._fps}")
 
         # FFmpeg command for low-latency fMP4 output.
         # 直接映射直播流的音视频轨（-map 0:v / -map 0:a?），保留真实音频。
@@ -216,6 +294,13 @@ class MseStreamer:
             "-fflags", "+genpts",
             "-thread_queue_size", "1024",
         ]
+
+        # 硬件解码参数（插在 -i 之前）
+        if hwaccel_mode == "cuda_full":
+            cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        elif hwaccel_mode == "d3d11va":
+            cmd += ["-hwaccel", "d3d11va"]
+
         if not self._is_file:
             cmd += [
                 # 网络超时：连接超时 10s，读写超时 15s
@@ -237,7 +322,6 @@ class MseStreamer:
         ]
 
         # 编码器选择：NVENC 硬件编码优先（大幅降低 CPU 占用），不可用时回退到 libx264 软编码
-        use_nvenc = _check_nvenc()
         if use_nvenc:
             cmd += [
                 "-c:v", "h264_nvenc",
@@ -287,7 +371,7 @@ class MseStreamer:
                 cmd.insert(insert_idx, '-1')
                 cmd.insert(insert_idx, '-live_start_index')
 
-        # Insert scale filter if needed
+        # Insert video filter if needed
         if vf_parts:
             scale_str = ",".join(vf_parts)
             # 在 -c:v 之前插入 -vf scale_str
@@ -332,7 +416,8 @@ class MseStreamer:
         self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self._stderr_thread.start()
         source_kind = "file" if self._is_file else "live"
-        _log.info("MseStreamer started (%s) for %s", source_kind, self._url[:80])
+        hw_label = hwaccel_mode or "cpu"
+        _log.info("MseStreamer started (%s, hw=%s) for %s", source_kind, hw_label, self._url[:80])
 
         # 启动探测：轮询检查 init segment 是否已产出或 FFmpeg 是否已退出
         # 比固定 sleep 更快——init 产出后立即返回，不必等满 probe_timeout

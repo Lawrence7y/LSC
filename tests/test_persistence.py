@@ -10,11 +10,8 @@ import inspect
 import json
 import os
 import sys
-import tempfile
 import threading
 from pathlib import Path
-
-import pytest
 
 # python-backend has hyphen in directory name — import via importlib
 _backend_dir = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
@@ -24,15 +21,15 @@ if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
 from persistence import (  # noqa: E402
+    _analysis_json_path,
+    _ensure_dir,
+    _persist_lock,
+    is_analysis_stale,
+    load_analysis_results,
     load_rooms,
+    save_analysis_results,
     save_rooms,
     save_settings,
-    save_analysis_results,
-    load_analysis_results,
-    is_analysis_stale,
-    _ensure_dir,
-    _analysis_json_path,
-    _persist_lock,
 )
 
 

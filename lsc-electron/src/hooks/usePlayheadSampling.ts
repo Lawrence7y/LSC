@@ -7,8 +7,9 @@ import { writeDisplayPlayhead, writePlayhead } from '@/utils/playheadStore'
 let _lastAxisFallbackWarnAt = 0
 
 /**
- * 预览播放头采样：200ms 读 MSE currentTime → playheadStore 直写；
- * setPreviewPositions 降频 500ms，仅驱动 contentEnd 等低频逻辑。
+ * 预览播放头采样：100ms 读 MSE currentTime → playheadStore 直写；
+ * setPreviewPositions 降频 500ms，确保 DVR 边界保持亚秒级更新，同时避免
+ * 多路预览时 React 树以 4Hz 重渲染。
  */
 export function usePlayheadSampling(opts: {
   setPreviewPositions: Dispatch<SetStateAction<Record<string, number>>>
@@ -28,7 +29,19 @@ export function usePlayheadSampling(opts: {
   } = opts
 
   useEffect(() => {
-    const id = setInterval(() => {
+    let rafId: number
+    let lastTick = 0
+    let lastSetState = 0
+    const SAMPLE_INTERVAL_MS = 100  // 采样间隔
+    const SETSTATE_INTERVAL_MS = 500  // setState 间隔
+
+    const tick = (now: number) => {
+      rafId = requestAnimationFrame(tick)
+
+      // 节流：按 SAMPLE_INTERVAL_MS 采样
+      if (now - lastTick < SAMPLE_INTERVAL_MS) return
+      lastTick = now
+
       // scrub 中跳过：光标走 Timeline 本地 dragTime，避免父级轮询重渲染抢帧
       if (timelineScrubbingRef.current) return
       const registry = window.__msePlayers
@@ -63,10 +76,9 @@ export function usePlayheadSampling(opts: {
           changed = true
         }
       }
-      // 低频逻辑通道：500ms 才 setState，仅驱动 contentEnd/窗口公式，降低全页重渲染
-      const now = Date.now()
-      if (changed && now - lastPositionsSetStateAtRef.current >= 500) {
-        lastPositionsSetStateAtRef.current = now
+      // 逻辑通道：500ms setState；视觉播放头仍由上面的 rAF 通道保持流畅。
+      if (changed && now - lastSetState >= SETSTATE_INTERVAL_MS) {
+        lastSetState = now
         lastPreviewPositionsRef.current = next
         setPreviewPositions(next)
       } else if (changed) {
@@ -89,7 +101,6 @@ export function usePlayheadSampling(opts: {
           } catch (err) {
             // preview→common 轴换算失败（对齐快照瞬时不可用）：降级为 preview 轴，
             // 两轴数值含义不同会导致播放头瞬时跳变，节流记录日志便于排查
-            const now = Date.now()
             if (now - _lastAxisFallbackWarnAt > 5000) {
               _lastAxisFallbackWarnAt = now
               console.warn('[usePlayheadSampling] previewToCommon failed, fallback to preview axis:', err)
@@ -100,8 +111,10 @@ export function usePlayheadSampling(opts: {
           writeDisplayPlayhead(t)
         }
       }
-    }, 200)  // 采样 200ms 供播放头直写；setState 已降频 500ms（见上）
-    return () => clearInterval(id)
+    }
+
+    rafId = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(rafId)
   }, [
     setPreviewPositions,
     lastPreviewPositionsRef,

@@ -1,61 +1,60 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { useAppStore } from './appStore'
+import type { RoomSession } from '@/types'
 
-describe('appStore', () => {
+function makeRoom(overrides: Partial<RoomSession> = {}): RoomSession {
+  return {
+    room_id: 'room-1',
+    room_url: 'https://example.test/room-1',
+    platform: 'test',
+    platform_name: 'Test',
+    streamer_name: 'Streamer',
+    stream_title: 'Title',
+    is_connecting: false,
+    is_connected: true,
+    is_recording: false,
+    record_output_path: '',
+    record_started_at: null,
+    record_size_mb: 0,
+    last_error: '',
+    preview_enabled: true,
+    preview_paused: false,
+    preview_muted: true,
+    stream_url: 'https://cdn.example.test/live.flv',
+    mark_in: null,
+    mark_out: null,
+    ...overrides,
+  }
+}
+
+describe('appStore preview event state', () => {
   beforeEach(() => {
-    // 重置 store 到初始状态
     useAppStore.setState({
-      rooms: [],
-      selectedRoomId: null,
-      clips: [],
-      connectionStatus: 'disconnected',
-      systemStats: null,
-      dependencyStatus: null,
-      timelineContext: null,
-      timelineInvalidated: false,
-      continuousAnalysisStatus: null,
-      settingsDrawerOpen: false,
-      previewDegradationBanner: null,
+      rooms: [makeRoom()],
+      selectedRoomId: 'room-1',
+      uiState: {},
     })
   })
 
-  it('should initialize with default state', () => {
-    const state = useAppStore.getState()
-    expect(state.rooms).toEqual([])
-    expect(state.clips).toEqual([])
-    expect(state.selectedRoomId).toBeNull()
-    expect(state.connectionStatus).toBe('disconnected')
+  it('镜像 preview_phase 并在 rooms_updated 整表替换后保留', () => {
+    useAppStore.getState().updateRoom('room-1', { preview_phase: 'probing' })
+
+    expect(useAppStore.getState().rooms[0].preview_phase).toBe('probing')
+    expect(useAppStore.getState().uiState['room-1']?.preview_phase).toBe('probing')
+
+    useAppStore.getState().setRooms([makeRoom({ is_recording: true })])
+
+    expect(useAppStore.getState().rooms[0]).toMatchObject({
+      is_recording: true,
+      preview_phase: 'probing',
+    })
   })
 
-  it('should set rooms', () => {
-    const rooms = [
-      { room_id: 'r1', room_url: 'https://example.com/1' },
-      { room_id: 'r2', room_url: 'https://example.com/2' },
-    ]
-    useAppStore.getState().setRooms(rooms as any)
-    expect(useAppStore.getState().rooms).toHaveLength(2)
-  })
+  it('移除房间时清理对应的预览事件状态', () => {
+    useAppStore.getState().updateRoom('room-1', { preview_phase: 'streaming' })
+    useAppStore.getState().removeRoom('room-1')
 
-  it('should set clips', () => {
-    const clips = [
-      { clip_id: 'c1', title: 'Clip 1' },
-      { clip_id: 'c2', title: 'Clip 2' },
-    ]
-    useAppStore.getState().setClips(clips as any)
-    expect(useAppStore.getState().clips).toHaveLength(2)
-  })
-
-  it('should set connection status', () => {
-    useAppStore.getState().setConnectionStatus('connected')
-    expect(useAppStore.getState().connectionStatus).toBe('connected')
-    useAppStore.getState().setConnectionStatus('disconnected')
-    expect(useAppStore.getState().connectionStatus).toBe('disconnected')
-  })
-
-  it('should set selected room id', () => {
-    useAppStore.getState().setSelectedRoomId('room-1')
-    expect(useAppStore.getState().selectedRoomId).toBe('room-1')
-    useAppStore.getState().setSelectedRoomId(null)
-    expect(useAppStore.getState().selectedRoomId).toBeNull()
+    expect(useAppStore.getState().rooms).toHaveLength(0)
+    expect(useAppStore.getState().uiState['room-1']).toBeUndefined()
   })
 })

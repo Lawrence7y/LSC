@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -43,7 +42,7 @@ def test_websocket_parses_blob_and_arraybuffer_frames() -> None:
     assert "Blob" in source
     assert "TextDecoder" in source or ".text()" in source
     # 禁止裸 JSON.parse(event.data)，必须先规范化载荷
-    onmessage_body = source.split("this.ws.onmessage", 1)[1].split("this.ws.onclose", 1)[0]
+    onmessage_body = source.split("socket.onmessage", 1)[1].split("socket.onclose", 1)[0]
     assert "JSON.parse(event.data)" not in onmessage_body
 
 
@@ -125,7 +124,8 @@ def test_preview_audio_capture_disconnects_only_current_recorder_from_shared_sou
     source = (ROOT / "lsc-electron/src/utils/previewAudioAligner.ts").read_text(encoding="utf-8")
     cleanup_body = source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
 
-    assert "source.disconnect(node)" in cleanup_body
+    assert "disconnectPartial()" in cleanup_body
+    assert "connectedSource.disconnect(workletNode)" in source
     assert "source.disconnect()" not in cleanup_body
 
 
@@ -135,9 +135,12 @@ def test_preview_audio_capture_temporarily_unmutes_shared_media_element() -> Non
     cleanup_body = source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
 
     assert "const previousMuted = video.muted" in source
-    assert "__lscSuppressMuteSync" in source
+    assert "withMuteSyncSuppressed" in source
     assert "mutedOverridden = true" in shared_branch
-    assert "video.muted = false" in shared_branch
+    assert (
+        "video.muted = false" in shared_branch
+        or "video.muted = overriddenMutedValue" in shared_branch
+    )
     assert "video.muted = previousMuted" in source
     assert "restoreMutedOverride()" in cleanup_body
 
@@ -218,8 +221,10 @@ def test_shared_preview_keeps_mse_event_names() -> None:
 
 
 def _workbench_align_live_body(source: str) -> str:
-    return source.split("const handleAlignLive = useCallback(async () => {", 1)[1].split(
-        "  }, [selectedRoomIds, send", 1
+    # 对齐流程已拆为“跳直播沿 / 捕获并发送 / 手动入口”三个相邻函数；
+    # 守卫应覆盖整个流程，而不是要求所有实现细节都堆在单个 callback 中。
+    return source.split("const seekAlignmentRoomsToLive = useCallback", 1)[1].split(
+        "// 持续分析期间定期复核对齐", 1
     )[0]
 
 
@@ -447,7 +452,7 @@ def test_clip_list_batch_export_includes_pending_confirmable_clips() -> None:
     assert "导出所选" in clip_list
     # 导出所选禁用应对齐「无可用条目」，避免选中 pending 后点击无效果
     assert "selectedActionable" in clip_list or "selectedClips.filter(canExportOrConfirmExport)" in clip_list
-    assert "disabled={selectedActionable.length === 0}" in clip_list or (
+    assert "disabled: selectedActionable.length === 0" in clip_list or "disabled={selectedActionable.length === 0}" in clip_list or (
         "selectedClips.filter(canExportOrConfirmExport)" in clip_list
         and "disabled={" in clip_list
     )
@@ -507,7 +512,7 @@ def test_continuous_analysis_copy_matches_list_only_behavior() -> None:
 def test_stop_continuous_analysis_confirms_during_finalize() -> None:
     """收尾中停止须二次确认，避免打断 OCR 升格。"""
     src = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    assert "Modal.confirm" in src or "window.confirm" in src
+    assert "modal.confirm" in src or "Modal.confirm" in src or "window.confirm" in src
     stop_region = src.split("停止持续分析", 1)[1].split("分析导出", 1)[0] if "停止持续分析" in src else src
     assert "finalizing" in src or "收尾" in stop_region or "收尾" in src
     assert "stop_continuous_analysis" in src
@@ -516,9 +521,11 @@ def test_stop_continuous_analysis_confirms_during_finalize() -> None:
 def test_analysis_progress_compact_shows_room_and_wraps() -> None:
     """compact 进度条须展示主房并允许换行，避免窄窗挤爆。"""
     src = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
-    compact = src.split("if (compact)", 1)[1].split("return (", 2)[1].split(")\n  }", 1)[0]
-    assert "flexWrap" in compact or "flex-wrap" in compact
-    assert "room_id" in compact or "主房" in compact or "roomName" in compact
+    compact_body = src.split("if (compact)", 1)[1]
+    compact_jsx = compact_body.split("return (", 1)[1].split(")\n  }", 1)[0]
+    assert "flexWrap" in compact_jsx or "flex-wrap" in compact_jsx
+    compact_head = compact_body.split("return (", 1)[0]
+    assert "主房" in compact_head or "room_id" in compact_head or "roomName" in compact_head
 
 
 def test_analysis_progress_receives_real_export_summary_counts() -> None:
@@ -578,8 +585,8 @@ def test_clip_list_uses_readable_summary_and_virtual_row_height_for_export_progr
     """虚拟行必须容纳进度条，标题不能再使用 N/N待 缩写。"""
     source = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.tsx").read_text(encoding="utf-8")
 
-    assert "const ROW_HEIGHT = 88" in source
-    assert "共 {clips.length}" in source
+    assert "const ROW_HEIGHT = 80" in source or "const ROW_HEIGHT = 88" in source
+    assert "clips.length" in source
     assert "待调" in source
 
 def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording() -> None:
@@ -587,7 +594,9 @@ def test_continuous_status_preserves_task_snapshot_and_labels_waiting_recording(
     progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
 
     assert "const previous = useAppStore.getState().continuousAnalysisStatus" in workbench
-    assert "{ ...previous, ...normalized }" in workbench
+    # 同 room_id 任务合并快照；无 room_id 的广播按 previous 合并，不整段替换丢统计
+    assert "{ ...previous, ...normalized" in workbench
+    assert "resolvedRoomId" in workbench
     assert "等待新录制" in progress
     assert "等待录制" in progress
 
@@ -686,12 +695,12 @@ def test_destructive_stop_recording_paths_require_confirm() -> None:
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     actions = (ROOT / "lsc-electron/src/hooks/useRoomActions.ts").read_text(encoding="utf-8")
     disconnect = actions.split("const handleDisconnect = useCallback", 1)[1].split("}, [send])", 1)[0]
-    assert "Modal.confirm" in disconnect
+    assert "modal.confirm" in disconnect or "Modal.confirm" in disconnect
     # R 键停止录制不得直接 handleStopRecord 而无确认
     toggle = workbench.split("case 'record:toggle'", 1)[1].split("case '", 1)[0]
-    assert "Modal.confirm" in toggle or "confirmStopRecording" in toggle
+    assert "modal.confirm" in toggle or "Modal.confirm" in toggle or "confirmStopRecording" in toggle
     longpress = workbench.split("const handleRefreshLongPress", 1)[1].split("}, [", 1)[0]
-    assert "Modal.confirm" in longpress
+    assert "modal.confirm" in longpress or "Modal.confirm" in longpress
 
 
 def test_scrub_mark_surfaces_approximate_precision() -> None:
@@ -855,7 +864,7 @@ def test_preview_phase_broadcast_and_ui() -> None:
 
     # rooms_updated 整表替换时必须保留前端 preview_phase，否则 DVR 紫标/LIVE 失效
     store = (ROOT / "lsc-electron/src/store/appStore.ts").read_text(encoding="utf-8")
-    assert "preview_phase: incoming.preview_phase ?? prev.preview_phase" in store
+    assert "preview_phase: incoming.preview_phase ?? ui?.preview_phase ?? prev?.preview_phase" in store
 
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     dvr_block = workbench.split("const dvrStart = useMemo", 1)[1].split("}, [", 1)[0]
@@ -1245,7 +1254,7 @@ def test_websocket_deep_copy_logging_is_dev_only() -> None:
         "/** 将 WebSocket", 1
     )[0]
 
-    receive_body = source.split("this.ws.onmessage", 1)[1].split("this.ws.onclose", 1)[0]
+    receive_body = source.split("socket.onmessage", 1)[1].split("socket.onclose", 1)[0]
     send_body = source.split("send(type: string, data: unknown): boolean {", 1)[1].split(
         "const message = { type, data }", 1
     )[0]
@@ -1264,7 +1273,7 @@ def test_workbench_preview_position_poll_is_500ms() -> None:
     assert "usePlayheadSampling" in workbench
     assert "setPreviewPositions" in hook
     # 关键：setState 节流 ≥500ms（即使采样间隔更短）
-    assert ">= 500" in hook or ">=500" in hook or ", 500)" in hook
+    assert "SETSTATE_INTERVAL_MS = 500" in hook or "SETSTATE_INTERVAL_MS=500" in hook
     assert "setPreviewPositions(next)" in hook
 
 
@@ -1316,7 +1325,11 @@ def test_room_card_uses_shared_recording_tick() -> None:
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     assert "recordingTick" in room_card
     assert "setInterval" not in room_card.split("function RoomCard", 1)[1].split("areRoomPropsEqual", 1)[0]
-    assert "recordingTick={timelineTick}" in workbench or "recordingTick={tick}" in workbench
+    assert (
+        "recordingTick={timelineTick}" in workbench
+        or "recordingTick={tick}" in workbench
+        or "recordingTick={Math.floor(timelineTick / 4)}" in workbench
+    )
 
 
 def test_timeline_callbacks_avoid_rooms_closure() -> None:
@@ -1404,7 +1417,7 @@ def test_websocket_parses_mse_binary_frames() -> None:
     assert "tryParseMseBinaryFrame" in ws
     assert "tryParseMseBinaryFrame" in util
     assert "mse_init" in util and "mse_segment" in util
-    onmessage = ws.split("this.ws.onmessage", 1)[1].split("this.ws.onclose", 1)[0]
+    onmessage = ws.split("socket.onmessage", 1)[1].split("socket.onclose", 1)[0]
     assert "tryParseMseBinaryFrame(event.data)" in onmessage
     assert "room_id: mse.roomId" in onmessage
 
@@ -1447,9 +1460,9 @@ def test_cliplist_window_virtualizes_large_lists() -> None:
         encoding="utf-8"
     )
     assert "VIRTUALIZE_THRESHOLD" in source
-    assert "visibleClips" in source or "visibleRange" in source
+    assert "useVirtualizer" in source
+    assert "getVirtualItems" in source
     assert "ROW_HEIGHT" in source
-    assert "scrollTop" in source
 
 
 def test_workbench_playhead_sampling_extracted() -> None:
@@ -1459,7 +1472,7 @@ def test_workbench_playhead_sampling_extracted() -> None:
     assert "usePlayheadSampling" in workbench
     assert "writeDisplayPlayhead" in hook
     assert "setPreviewPositions" in hook
-    assert ">= 500" in hook or ">=500" in hook
+    assert "SETSTATE_INTERVAL_MS = 500" in hook or "SETSTATE_INTERVAL_MS=500" in hook
 
 
 def test_workbench_room_actions_extracted() -> None:

@@ -19,7 +19,7 @@ export interface PreviewDegradationBanner {
 
 // 前端 UI 状态（后端不感知，rooms_updated 不会覆盖）
 interface RoomUIState {
-  preview_phase?: string
+  preview_phase?: RoomSession['preview_phase']
   mse_error?: string
   mse_reconnecting?: { attempt: number; maxAttempts: number }
   preview_frame_data?: string
@@ -40,6 +40,9 @@ interface AppState {
   settingsDrawerOpen: boolean
   previewDegradationBanner: PreviewDegradationBanner | null
   uiState: Record<string, RoomUIState>  // 前端 UI 状态，按 room_id 索引
+  // P2-4: 房间分组功能
+  roomGroups: Record<string, string[]>  // groupName -> roomIds
+  roomGroupOrder: string[]  // 分组顺序
 }
 
 interface AppActions {
@@ -47,6 +50,7 @@ interface AppActions {
   addRoom: (room: RoomSession) => void
   removeRoom: (roomId: string) => void
   updateRoom: (roomId: string, updates: Partial<RoomSession>) => void
+  updateRoomIncremental: (roomId: string, roomData: RoomSession) => void
   setSelectedRoomId: (roomId: string | null) => void
   setClips: (clips: ClipSegment[]) => void
   addClip: (clip: ClipSegment) => void
@@ -58,6 +62,10 @@ interface AppActions {
   setTimelineContext: (ctx: TimelineContext | null) => void
   setTimelineInvalidated: (invalidated: boolean) => void
   setContinuousAnalysisStatus: (status: ContinuousAnalysisStatus | null) => void
+  // P2-4: 房间分组功能
+  setRoomGroups: (groups: Record<string, string[]>) => void
+  setRoomGroupOrder: (order: string[]) => void
+  assignRoomToGroup: (roomId: string, groupName: string) => void
   setSettingsDrawerOpen: (open: boolean) => void
   setPreviewDegradationBanner: (info: PreviewDegradationInfo | null) => void
   dismissPreviewDegradationBanner: () => void
@@ -77,7 +85,7 @@ const defaultSettings: RecordSettings = {
   audio_bitrate: '128k',
   preview_quality: '高清',
   preset: 'medium',
-  ocr_accel: 'dml',
+  ocr_accel: 'auto',
   export_max_concurrent: 2,
   jianying_draft_dir: '',
 }
@@ -120,12 +128,28 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   continuousAnalysisStatus: null,
   settingsDrawerOpen: false,
   previewDegradationBanner: null,
+  roomGroups: {},  // P2-4: 房间分组
+  roomGroupOrder: [],  // P2-4: 分组顺序
 
   setRooms: (rooms) => set((state) => {
     if (state.rooms === rooms) return state
-    // 前端 UI 状态存储在 uiState 中，rooms 整表替换不会影响
-    if (roomsShallowEqual(state.rooms, rooms)) return state
-    return { rooms }
+    // preview_phase 等事件态由独立 WS 消息更新，后端 rooms_updated 快照不含
+    // 这些字段。整表替换时重新合并 uiState，避免 LIVE 标记、加载阶段与
+    // MSE watchdog 在一次 rooms_updated 后退回未知状态。
+    const previousById = new Map(state.rooms.map((room) => [room.room_id, room]))
+    const mergedRooms = rooms.map((incoming) => {
+      const prev = previousById.get(incoming.room_id)
+      const ui = state.uiState[incoming.room_id]
+      return {
+        ...incoming,
+        preview_phase: incoming.preview_phase ?? ui?.preview_phase ?? prev?.preview_phase,
+        mse_error: incoming.mse_error ?? ui?.mse_error ?? prev?.mse_error,
+        mse_reconnecting: incoming.mse_reconnecting ?? ui?.mse_reconnecting ?? prev?.mse_reconnecting,
+        preview_frame_data: incoming.preview_frame_data ?? ui?.preview_frame_data ?? prev?.preview_frame_data,
+      }
+    })
+    if (roomsShallowEqual(state.rooms, mergedRooms)) return state
+    return { rooms: mergedRooms }
   }),
 
   addRoom: (room) =>
@@ -137,11 +161,15 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
     })),
 
   removeRoom: (roomId) =>
-    set((state) => ({
-      rooms: state.rooms.filter((r) => r.room_id !== roomId),
-      selectedRoomId:
-        state.selectedRoomId === roomId ? null : state.selectedRoomId,
-    })),
+    set((state) => {
+      const { [roomId]: _removedUiState, ...remainingUiState } = state.uiState
+      return {
+        rooms: state.rooms.filter((r) => r.room_id !== roomId),
+        selectedRoomId:
+          state.selectedRoomId === roomId ? null : state.selectedRoomId,
+        uiState: remainingUiState,
+      }
+    }),
 
   updateRoom: (roomId, updates) =>
     set((state) => {
@@ -152,6 +180,9 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
       for (const [key, value] of Object.entries(updates)) {
         if (uiFields.includes(key)) {
           uiUpdates[key as keyof RoomUIState] = value as any
+          // RoomCard / Workbench 的热路径直接消费 RoomSession。同步镜像一份，
+          // 后续 rooms_updated 仍由 setRooms 的 uiState 合并保护。
+          roomUpdates[key as keyof RoomSession] = value as any
         } else {
           roomUpdates[key as keyof RoomSession] = value as any
         }
@@ -165,6 +196,21 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
           [roomId]: { ...state.uiState[roomId], ...uiUpdates },
         },
       }
+    }),
+
+  // 增量更新单个房间（P0-2: rooms_updated 增量更新）
+  updateRoomIncremental: (roomId: string, roomData: RoomSession) =>
+    set((state) => {
+      const idx = state.rooms.findIndex(r => r.room_id === roomId)
+      if (idx === -1) {
+        // 新房间，追加
+        return { rooms: [...state.rooms, roomData] }
+      }
+      // 浅比较：只有引用变化时才更新
+      if (state.rooms[idx] === roomData) return state
+      const newRooms = [...state.rooms]
+      newRooms[idx] = { ...newRooms[idx], ...roomData }
+      return { rooms: newRooms }
     }),
 
   setSelectedRoomId: (roomId) => set({ selectedRoomId: roomId }),
@@ -230,4 +276,22 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   setSettingsDrawerOpen: (open) => set({ settingsDrawerOpen: open }),
   setPreviewDegradationBanner: (previewDegradationBanner) => set({ previewDegradationBanner }),
   dismissPreviewDegradationBanner: () => set({ previewDegradationBanner: null }),
+  // P2-4: 房间分组功能
+  setRoomGroups: (roomGroups) => set({ roomGroups }),
+  setRoomGroupOrder: (roomGroupOrder) => set({ roomGroupOrder }),
+  assignRoomToGroup: (roomId, groupName) =>
+    set((state) => {
+      const groups = { ...state.roomGroups }
+      // 从其他分组移除
+      for (const g of Object.keys(groups)) {
+        groups[g] = groups[g].filter(id => id !== roomId)
+      }
+      // 添加到目标分组
+      if (!groups[groupName]) groups[groupName] = []
+      if (!groups[groupName].includes(roomId)) groups[groupName].push(roomId)
+      // 更新顺序
+      const order = state.roomGroupOrder.filter(g => g !== groupName)
+      order.unshift(groupName)
+      return { roomGroups: groups, roomGroupOrder: order }
+    }),
 }))

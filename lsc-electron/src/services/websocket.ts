@@ -72,7 +72,7 @@ export function normalizeWebSocketPayload(data: unknown): string | Promise<strin
  * @remarks
  * 实例以单例形式导出（{@link wsClient}），整个应用共享一个 WebSocket 连接。
  */
-class WebSocketClient {
+export class WebSocketClient {
   private ws: WebSocket | null = null
   private url: string | null
   private resolvingUrl: Promise<string> | null = null
@@ -92,13 +92,18 @@ class WebSocketClient {
   // 互相 close 对方刚建的连接，导致「WebSocket is closed before the connection
   // is established」的断连循环（表现为房间卡片在「占位符↔预览区」之间抽动）。
   private pendingConnect: Promise<void> | null = null
+  // P3-2: 后端心跳检测
+  private lastHeartbeat = 0
+  private heartbeatCheckTimer: ReturnType<typeof setInterval> | null = null
+  private readonly usesDynamicBackendUrl: boolean
 
   constructor(url: string | null = null) {
     this.url = url
+    this.usesDynamicBackendUrl = url === null
   }
 
   private resolveUrl(): Promise<string> {
-    if (this.url) {
+    if (this.url && !this.usesDynamicBackendUrl) {
       return Promise.resolve(this.url)
     }
 
@@ -110,7 +115,9 @@ class WebSocketClient {
 
       this.resolvingUrl = resolveWebSocketUrl(env, electronAPI)
         .then((url) => {
-          this.url = url
+          // Electron 后端端口由启动时动态分配。不要缓存默认兜底地址，
+          // 后端尚未就绪时的下一次重连必须重新向主进程查询真实端口。
+          if (!this.usesDynamicBackendUrl) this.url = url
           return url
         })
         .finally(() => {
@@ -141,8 +148,10 @@ class WebSocketClient {
     // 重置手动关闭标志
     this.manualClose = false
 
-    // 幂等守卫一：已有连接且处于 OPEN，直接复用，不关旧连接、不新建。
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    // 幂等守卫一：只有完成首帧认证后才算可复用的 OPEN 连接。
+    // 物理连接已 OPEN 但认证 Token 尚未取回时，继续复用 pendingConnect，
+    // 避免调用方误以为已经可以发送业务消息。
+    if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
       return Promise.resolve()
     }
     // 幂等守卫二：正在连接中（CONNECTING），复用同一个 Promise，避免并发
@@ -168,37 +177,62 @@ class WebSocketClient {
           reject(new Error('WebSocket connect timeout (15s)'))
         }, 15000)
 
-        this.ws = new WebSocket(url)
+        const socket = new WebSocket(url)
+        this.ws = socket
         // 二进制帧以 ArrayBuffer 同步解码，避免默认 Blob 触发 "[object Blob]" JSON 解析失败
-        this.ws.binaryType = 'arraybuffer'
+        socket.binaryType = 'arraybuffer'
 
-        this.ws.onopen = () => {
-          clearTimeout(connectTimeout)
+        socket.onopen = async () => {
           console.log('WebSocket connected, sending auth...')
           // 握手后首帧认证：发送 auth 消息（Token 不再通过 URL 传递）
-          this.isConnected = true
-          this.reconnectAttempts = 0
-          this.pendingConnect = null
-          // 获取 Token 并发送 auth 消息
-          const electronAPI = typeof window !== 'undefined'
-            ? (window.electronAPI as BackendElectronApi | undefined)
-            : undefined
-          if (electronAPI?.getBackendWsToken) {
-            electronAPI.getBackendWsToken().then((token) => {
-              if (token?.trim()) {
-                this.ws?.send(JSON.stringify({ type: 'auth', token }))
-              }
-            }).catch(() => {})
+          try {
+            const electronAPI = typeof window !== 'undefined'
+              ? (window.electronAPI as BackendElectronApi | undefined)
+              : undefined
+            const token = electronAPI?.getBackendWsToken
+              ? await electronAPI.getBackendWsToken()
+              : null
+
+            if (!token?.trim()) {
+              throw new Error('Backend WebSocket auth token is unavailable')
+            }
+            // IPC 取 Token 期间连接可能已被关闭或被另一条连接替换。
+            if (this.ws !== socket || socket.readyState !== WebSocket.OPEN || this.manualClose) {
+              throw new Error('WebSocket closed before authentication')
+            }
+
+            // 必须严格保证 auth 是连接上的第一帧。只有发送成功后才允许
+            // connected 回调、定时任务和离线队列发送任何业务消息。
+            socket.send(JSON.stringify({ type: 'auth', token }))
+            this.isConnected = true
+            this.reconnectAttempts = 0
+            this.pendingConnect = null
+            this.flushQueue()
+            // P3-2: 启动心跳检测
+            this._startHeartbeatCheck()
+            this.emit('connected', null)
+            clearTimeout(connectTimeout)
+            resolve()
+          } catch (error) {
+            clearTimeout(connectTimeout)
+            this.isConnected = false
+            this.pendingConnect = null
+            console.error('WebSocket authentication failed:', error)
+            reject(error)
+            if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+              socket.close()
+            }
           }
-          this.emit('connected', null)
-          this.flushQueue()
-          resolve()
         }
 
-        this.ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
           const handleText = (text: string) => {
             try {
               const message: { type: string; data: unknown } = JSON.parse(text)
+              // P3-2: 更新心跳时间
+              if (message.type === 'heartbeat') {
+                this.lastHeartbeat = Date.now()
+              }
               if (isDev) {
                 if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
                   console.log(`[WebSocket] Received message type=${message.type} (length: ${text.length})`)
@@ -234,7 +268,7 @@ class WebSocketClient {
           }
         }
 
-        this.ws.onclose = () => {
+        socket.onclose = () => {
           clearTimeout(connectTimeout)
           console.log('WebSocket disconnected')
           this.isConnected = false
@@ -246,7 +280,7 @@ class WebSocketClient {
           }
         }
 
-        this.ws.onerror = (error) => {
+        socket.onerror = (error) => {
           clearTimeout(connectTimeout)
           console.error('WebSocket error:', error)
           reject(error)
@@ -266,7 +300,7 @@ class WebSocketClient {
 
   private scheduleReconnect() {
     if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
+      return
     }
     // 超过最大重连次数，停止重连，通知 UI 显示"后端不可用"
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
@@ -276,13 +310,36 @@ class WebSocketClient {
     }
     // 通知外部进入重连中状态（M12）
     this.emit('reconnecting', null)
-    // 指数退避：1s→2s→4s→8s→15s 封顶
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 15000)
+    // 启动阶段快速探测，之后再进入指数退避，兼顾首屏速度与长期稳定性。
+    const startupDelays = [150, 300, 600, 1000]
+    const delay = this.reconnectAttempts < startupDelays.length
+      ? startupDelays[this.reconnectAttempts]
+      : Math.min(2000 * Math.pow(2, this.reconnectAttempts - startupDelays.length), 15000)
     this.reconnectAttempts++
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
       console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}, delay=${delay}ms)...`)
       this.connect().catch(() => {})
     }, delay)
+  }
+
+  // P3-2: 后端心跳检测
+  private _startHeartbeatCheck(): void {
+    this.lastHeartbeat = Date.now()
+    this.heartbeatCheckTimer = setInterval(() => {
+      if (Date.now() - this.lastHeartbeat > 15000) {
+        // 超过 15 秒无心跳，认为后端异常
+        console.warn('[WebSocket] Backend heartbeat timeout')
+        this.emit('backend_crashed', null)
+      }
+    }, 5000)
+  }
+
+  private _stopHeartbeatCheck(): void {
+    if (this.heartbeatCheckTimer !== null) {
+      clearInterval(this.heartbeatCheckTimer)
+      this.heartbeatCheckTimer = null
+    }
   }
 
   // 重连成功后将队列中暂存的消息依次发送
@@ -320,7 +377,9 @@ class WebSocketClient {
 
     const message = { type, data }
     const payload = JSON.stringify(message)
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    // WebSocket.OPEN 仅表示 TCP/WebSocket 握手完成；首帧 Token 认证完成前，
+    // 业务消息仍必须排队，否则会抢占后端要求的 auth 第一帧。
+    if (!this.isConnected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       if (!shouldQueueWhenDisconnected(type)) {
         console.warn(`[WebSocket] Dropping stale message while disconnected: ${type}`)
         return false
@@ -381,6 +440,7 @@ class WebSocketClient {
    */
   disconnect(): void {
     this.manualClose = true
+    this._stopHeartbeatCheck()  // P3-2: 清理心跳检测
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null

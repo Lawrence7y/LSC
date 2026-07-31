@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import platform
 import re
 import tempfile
@@ -115,13 +116,21 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _user_data_root() -> Path | None:
+    """Return Electron's writable user-data directory when running packaged."""
+    raw = os.environ.get("LSC_DATA_DIR", "").strip()
+    return Path(raw) if raw else None
+
+
 def _probe_cache_path() -> Path:
-    return _repo_root() / "data" / "ocr_accel_probe.json"
+    root = _user_data_root()
+    return (root / "data" if root else _repo_root() / "data") / "ocr_accel_probe.json"
 
 
 # 须与 python-backend/handlers/room_handler.py SETTINGS_FILE 一致
 def _settings_path() -> Path:
-    return _repo_root() / "python-backend" / "settings.json"
+    root = _user_data_root()
+    return (root if root else _repo_root() / "python-backend") / "settings.json"
 
 
 def rapidocr_kwargs_for(effective: str) -> dict[str, Any]:
@@ -338,21 +347,67 @@ def ffmpeg_hwaccel_args(effective_or_mode: str) -> list[str]:
     mode = normalize_ocr_accel(effective_or_mode)
     if mode == "cpu":
         return []
-    # 分析抽帧：有 NVENC 时优先 CUDA 硬解（比 d3d11va 更稳地卸掉 CPU）
-    try:
-        from lsc.core.services.mse_streamer import _check_nvenc
-
-        if _check_nvenc():
-            return ["-hwaccel", "cuda"]
-    except Exception as exc:
-        _log.debug("ocr hwaccel nvenc probe failed: %s", exc)
     if mode == "cuda":
         return ["-hwaccel", "cuda"]
-    if mode in ("dml", "auto"):
-        if platform.system() == "Windows":
-            return ["-hwaccel", "d3d11va"]
-        return []
+    if mode in ("dml", "auto") and platform.system() == "Windows":
+        return ["-hwaccel", "d3d11va"]
     return []
+
+
+def gpu_scale_available() -> bool:
+    """检测当前环境是否支持 scale_cuda 滤镜（缓存结果）。"""
+    try:
+        import shutil
+
+        from lsc.config import load_config
+        from lsc.utils.gpu_ffmpeg import scale_cuda_available
+
+        cfg = load_config()
+        ffmpeg = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+        return scale_cuda_available(ffmpeg)
+    except Exception as exc:
+        _log.debug("gpu_scale_available probe failed: %s", exc)
+        return False
+
+
+def build_hwaccel_vf(
+    cpu_vf: str,
+    *,
+    gpu_scale_pattern: str | None = None,
+) -> tuple[list[str], str]:
+    """构建硬件加速滤镜链。
+
+    当 GPU scale 可用且提供了 gpu_scale_pattern 时，将 CPU scale 替换为
+    hwupload_cuda + scale_cuda + hwdownload,format=nv12 链路，把缩放留在 GPU。
+
+    Args:
+        cpu_vf: 原始 CPU 滤镜链（如 "fps=1.0,crop=260:115:520:85,scale=780:345,showinfo"）
+        gpu_scale_pattern: 可选，CPU scale 滤镜的正则模式（如 ``r"scale=\\d+:\\d+"``），
+            匹配到的部分会被替换为 GPU 链路。
+
+    Returns:
+        (hwaccel_args, vf_string) 元组：
+        - hwaccel_args: 额外的输入侧硬解参数（通常为 d3d11va）
+        - vf_string: 最终 -vf 滤镜字符串
+    """
+    if not gpu_scale_pattern or not gpu_scale_available():
+        return [], cpu_vf
+
+    # 将 CPU scale 替换为 GPU 链路
+    gpu_chain = "hwupload_cuda,{gpu_scale},hwdownload,format=nv12"
+    try:
+        new_vf = re.sub(
+            gpu_scale_pattern,
+            lambda m: gpu_chain.format(gpu_scale=m.group(0).replace("scale=", "scale_cuda=")),
+            cpu_vf,
+            count=1,
+        )
+        if new_vf != cpu_vf:
+            hw = ffmpeg_hwaccel_args(read_settings_ocr_accel())
+            return hw, new_vf
+    except Exception as exc:
+        _log.debug("build_hwaccel_vf substitution failed: %s", exc)
+    return [], cpu_vf
 
 
 def run_ffmpeg_with_hwaccel_fallback(

@@ -649,8 +649,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/frame/"):
             rel = unquote(path[len("/frame/") :])
-            fp = (ROOT / rel).resolve()
-            if not str(fp).startswith(str(ROOT.resolve())) or not fp.is_file():
+            # normpath 防 .. 穿越，但不 resolve 以免穿透 junction/symlink
+            import os.path as _osp
+            root_str = str(ROOT)
+            fp = Path(_osp.normpath(_osp.join(root_str, rel)))
+            if not str(fp).startswith(root_str) or not fp.is_file():
                 self._json(404, {"error": "missing"})
                 return
             ctype = mimetypes.guess_type(fp.name)[0] or "image/jpeg"

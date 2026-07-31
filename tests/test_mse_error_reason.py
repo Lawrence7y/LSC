@@ -55,10 +55,10 @@ def test_mse_reconnect_exhausted_offline_message() -> None:
 
 
 def test_recording_stopped_offline_emit_in_manager() -> None:
-    source = (ROOT / "lsc/gui/multi_room/manager.py").read_text(encoding="utf-8")
+    source = (ROOT / "lsc/core/orchestrator.py").read_text(encoding="utf-8")
     marker = "reconnect stopped because stream is offline"
     idx = source.find(marker)
     assert idx != -1
     chunk = source[idx:idx + 400]
-    assert "recording_stopped.emit" in chunk
+    assert 'bus.emit("recording_stopped"' in chunk
     assert "'offline'" in chunk or '"offline"' in chunk

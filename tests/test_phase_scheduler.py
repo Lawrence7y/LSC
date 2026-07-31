@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from lsc.analyzer.phase_scheduler import (
     PROFILE_VALORANT,
+    RoundPhase,
     get_profile,
     next_round_phase,
     scan_budget_for_phase,
-    RoundPhase,
 )
 from lsc.analyzer.round_clock_predictor import predict_round_clock
 

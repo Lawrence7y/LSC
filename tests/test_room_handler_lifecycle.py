@@ -11,6 +11,7 @@ if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
 from handlers import room_handler
+
 from lsc.core.services.shared_ingest import (
     SharedIngestStartResult,
     SharedPreviewHandle,
@@ -588,8 +589,8 @@ def test_start_recording_reattaches_existing_preview_to_shared(monkeypatch, tmp_
 
 
 def test_mse_preview_starts_shared_preview_only_when_enabled(monkeypatch) -> None:
-    from lsc.core.services.ingest_registry import SharedIngestRegistry
     import lsc.core.services.mse_streamer as mse_streamer
+    from lsc.core.services.ingest_registry import SharedIngestRegistry
 
     room = SimpleNamespace(
         room_id="room-1",
@@ -688,7 +689,6 @@ def test_mse_preview_starts_shared_preview_only_when_enabled(monkeypatch) -> Non
 
 def test_recording_history_capped_on_load():
     """_load_recording_history must slice to _MAX_RECORDING_HISTORY (#18)."""
-    from handlers import room_handler
 
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     assert "return data[-_MAX_RECORDING_HISTORY:]" in source, \

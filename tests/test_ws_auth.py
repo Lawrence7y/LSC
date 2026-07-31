@@ -1,12 +1,13 @@
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python-backend"))
 
 from ws_auth import (
-    is_origin_allowed,
     extract_token_from_path,
-    validate_ws_token,
+    is_origin_allowed,
     is_ws_token_required,
+    validate_ws_token,
 )
 
 

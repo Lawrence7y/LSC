@@ -5,7 +5,6 @@ import asyncio
 import os
 import sys
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -34,8 +33,6 @@ class TestRequestIdEcho:
             return {'success': True}
 
         async def run_test():
-            import json
-            from server import _truncate_for_log
 
             msg_data = {'request_id': 'req-abc-123', 'value': 42}
             # 模拟服务器内的 request_id 提取逻辑
@@ -77,11 +74,14 @@ class _FakeWebSocket:
     def __aiter__(self):
         return self
 
+    async def recv(self):
+        return '{"type":"auth","token":""}'
+
     async def __anext__(self):
         try:
             return next(self._messages)
         except StopIteration:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
     async def send(self, message):
         self.sent.append(message)

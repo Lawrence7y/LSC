@@ -1,6 +1,5 @@
 from lsc.analyzer.base import AnalyzerCapabilities, ScanWindow
-from lsc.analyzer.generic_plugin import GenericAnalyzerPlugin
-from lsc.analyzer.registry import default, get, list_plugins, register
+from lsc.analyzer.registry import default, get, register
 
 
 def test_scan_window_fields():

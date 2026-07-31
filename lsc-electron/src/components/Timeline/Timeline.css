@@ -16,18 +16,12 @@
   position: relative;
   /* 上 padding 给刻度标签 + 紫标三角；左右给播放头圆点半宽 */
   padding: 22px 14px 2px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--background-600) transparent;
+  scrollbar-width: none;
   min-height: 52px;
 }
 
 .lsc-timeline__scroll::-webkit-scrollbar {
-  height: 3px;
-}
-
-.lsc-timeline__scroll::-webkit-scrollbar-thumb {
-  background: var(--background-600);
-  border-radius: 2px;
+  display: none;
 }
 
 .lsc-timeline__inner {
@@ -36,30 +30,30 @@
   min-width: 100%;
 }
 
-/* 起止时间码：轨道下方独立一行（唯一权威起止显示，刻度端点不再叠简写） */
-.lsc-timeline__timecode {
-  flex-shrink: 0;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 2px 14px 4px;
-  pointer-events: none;
-  z-index: 8;
-}
-
-.lsc-timeline__timecode span {
-  font-size: 11px;
-  color: var(--text-secondary, #a1a1a6);
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-  letter-spacing: 0.02em;
-  line-height: 1;
-}
-
 .lsc-timeline__ruler {
   position: relative;
   height: 14px;
   margin-top: 2px;
   pointer-events: none;
+}
+
+.lsc-timeline__endpoint-time {
+  position: absolute;
+  top: -14px;
+  z-index: 2;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--brand-300, #66cfcf);
+  white-space: nowrap;
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+.lsc-timeline__endpoint-time.is-start {
+  left: 0;
+}
+
+.lsc-timeline__endpoint-time.is-end {
+  right: 0;
 }
 
 .lsc-timeline__tick {
@@ -183,6 +177,16 @@
   background: var(--highlight-bg-hover);
 }
 
+/* 待确认回合（pending/refining）：蓝色虚线 */
+.lsc-timeline__highlight--pending {
+  background: color-mix(in srgb, var(--brand-500, #31B3AE) 12%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--brand-500, #31B3AE) 60%, transparent);
+}
+
+.lsc-timeline__highlight--pending:hover {
+  background: color-mix(in srgb, var(--brand-500, #31B3AE) 22%, transparent);
+}
+
 /* 已确认回合：实色品牌青，与切片列表状态语义一致 */
 .lsc-timeline__highlight--confirmed {
   background: color-mix(in srgb, var(--brand-500, #31B3AE) 22%, transparent);
@@ -191,6 +195,52 @@
 
 .lsc-timeline__highlight--confirmed:hover {
   background: color-mix(in srgb, var(--brand-500, #31B3AE) 34%, transparent);
+}
+
+/* 音频待复核回合：橙色虚线 + 斜线填充（P0: 音频待复核视觉区分） */
+.lsc-timeline__highlight--audio-pending {
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 15%, transparent),
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 15%, transparent) 4px,
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 8%, transparent) 4px,
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 8%, transparent) 8px
+  );
+  border: 1px dashed color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 70%, transparent);
+}
+
+.lsc-timeline__highlight--audio-pending:hover {
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 25%, transparent),
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 25%, transparent) 4px,
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 15%, transparent) 4px,
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 15%, transparent) 8px
+  );
+}
+
+/* 分析扫描进度背景条（P0: 分析扫描进度可视化） */
+.lsc-timeline__analysis-progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: color-mix(in srgb, var(--brand-500, #31B3AE) 8%, transparent);
+  border-right: 2px solid color-mix(in srgb, var(--brand-500, #31B3AE) 40%, transparent);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* 当前扫描范围指示（P1: 扫描范围指示） */
+.lsc-timeline__scan-range {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 6%, transparent);
+  border-left: 1px solid color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 50%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 50%, transparent);
+  pointer-events: none;
+  z-index: 1;
 }
 
 /* 回合带内标签（序号 · 时长），宽度过窄时由渲染层隐藏 */
@@ -372,27 +422,6 @@
     0 0 14px color-mix(in srgb, var(--brand-400, #4DC4BF) 80%, transparent);
 }
 
-/* 偏离直播沿时的「回直播」浮动按钮 */
-.lsc-timeline__go-live {
-  position: absolute;
-  top: 6px;
-  right: 16px;
-  z-index: 10;
-  background: var(--brand-500, #31B3AE);
-  color: var(--background-900, #000);
-  border: none;
-  border-radius: var(--radius-sm, 10px);
-  padding: 3px 10px;
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-  box-shadow: var(--shadow-sm);
-}
-
-.lsc-timeline__go-live:hover {
-  background: var(--brand-400, #4DC4BF);
-}
-
 /* 时间码行：中央大字当前播放位置 */
 .lsc-timeline__timecode-current {
   font-size: 13px !important;
@@ -477,6 +506,7 @@
   pointer-events: none;
   box-shadow: 0 0 0 1px var(--dvr-marker-glow), 0 0 8px 2px var(--dvr-marker-shadow);
   border-radius: 1px;
+  transition: left 240ms linear, box-shadow 0.18s ease;
 }
 
 .lsc-timeline__record-end::before {

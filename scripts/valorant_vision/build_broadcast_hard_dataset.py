@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier, _CLASS_NAMES
+from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
 
 ANN = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"
 DATA = Path.home() / "LSC" / "datasets" / "valorant_phase"

@@ -110,9 +110,9 @@ class TestRoundCompleteness:
             patch("lsc.analyzer.round_detector._extract_audio_pcm",
                   return_value=(fake_pcm, 8000)) as extract_pcm,
             patch("lsc.analyzer.round_detector._compute_rms_envelope",
-                  return_value=fake_rms) as compute_rms,
+                  return_value=fake_rms),
             patch("lsc.analyzer.round_detector._detect_chimes_from_samples",
-                  return_value=[]) as chimes,
+                  return_value=[]),
             patch("os.path.isfile", return_value=True),
         ):
             res = detect_valorant_rounds(
@@ -211,7 +211,7 @@ class TestRoundCompleteness:
             patch("lsc.analyzer.round_detector._extract_audio_pcm",
                   return_value=(pcm, 16000)) as extract,
             patch("lsc.analyzer.round_detector._detect_chimes_from_samples",
-                  return_value=[160.0 - 100.0]) as chimes,
+                  return_value=[160.0 - 100.0]),
             patch("os.path.isfile", return_value=True),
         ):
             res = detect_valorant_rounds(
@@ -758,9 +758,10 @@ class TestOcrEndKeywords:
     def test_english_end_keywords_detected(self):
         """英文胜负关键词应被识别为回合结束标记。"""
         # 验证 end_keywords 元组包含英文关键词
-        from lsc.analyzer.round_detector import _detect_round_phase_markers
         # 通过检查源码中的 end_keywords 定义来验证
         import inspect
+
+        from lsc.analyzer.round_detector import _detect_round_phase_markers
         source = inspect.getsource(_detect_round_phase_markers)
         assert "victory" in source.lower(), "应包含 victory 关键词"
         assert "defeat" in source.lower(), "应包含 defeat 关键词"

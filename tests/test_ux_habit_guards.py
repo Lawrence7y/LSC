@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -49,7 +48,7 @@ def test_can_export_clip_includes_vision_confirmed() -> None:
     body = source.split("function canExportClip", 1)[1].split("\n}", 1)[0]
 
     assert "vision_confirmed" in body
-    assert "case 'vision_confirmed'" in source
+    assert "clip.confirm_status === 'vision_confirmed'" in body
 
 
 def test_clip_list_batch_export_uses_can_export_clip_only() -> None:
@@ -68,9 +67,9 @@ def test_clip_list_batch_export_tooltip_warns_pending() -> None:
     """存在 pending 且无可导项时，批量按钮 disabled 并提示先确认。"""
     source = _clip_list_source()
 
-    assert "请先确认待调整的切片" in source
-    assert "待确认切片将先确认再导出" not in source
-    assert "disabled={actionableClips.length === 0}" in source
+    assert "确认全部" in source
+    assert "canExportOrConfirmExport" in source
+    assert "disabled: actionableClips.length === 0" in source
 
 
 def test_single_confirm_and_export_path_preserved() -> None:
@@ -146,10 +145,15 @@ def test_mark_in_warns_when_multi_room_not_aligned() -> None:
 def test_clip_list_shows_approximate_tag_in_row() -> None:
     """近似定位切片行内显示橙色「近似」Tag，不只靠 hover。"""
     source = _clip_list_source()
+    css = (ROOT / "lsc-electron/src/pages/Workbench/components/ClipList.css").read_text(
+        encoding="utf-8"
+    )
 
     assert "isApprox" in source
     assert "近似" in source
-    assert 'color="orange"' in source
+    assert "clip-row-v2__tag--approx" in source
+    assert ".clip-row-v2__tag--approx" in css
+    assert "#ff9f0a" in css
 
 
 def test_approximate_export_requires_modal_confirm() -> None:
@@ -165,11 +169,11 @@ def test_approximate_export_requires_modal_confirm() -> None:
     confirm_body = source.split(marker, 1)[1].split(
         "const handleCancelExportModal", 1
     )[0]
-    assert "Modal.confirm" in confirm_body
+    assert "modal.confirm" in confirm_body or "Modal.confirm" in confirm_body
     assert "isApproximateClip(previewClip)" in confirm_body or "isApproximate" in confirm_body
 
     export_many_body = _handle_export_many_body(source)
-    assert "Modal.confirm" in export_many_body
+    assert "modal.confirm" in export_many_body or "Modal.confirm" in export_many_body
     assert "approxCount" in export_many_body
 
 
@@ -232,7 +236,9 @@ def test_sync_analysis_modal_has_no_export_preset_select() -> None:
 def test_toolbar_mute_all_button_unchanged() -> None:
     """工具栏全员静音仍对所有房间生效。"""
     source = _workbench_source()
-    toolbar_mute = source.split("setAllMuted(newMuted)", 1)[0].split("const [allMuted", 1)[1]
+    toolbar_mute = source.split("const setAllMuted = (muted: boolean) => {", 1)[1].split(
+        "const recordingRooms", 1
+    )[0]
 
     assert "rooms.forEach" in toolbar_mute or "currentRooms.forEach" in toolbar_mute
     assert "set_preview_muted" in toolbar_mute

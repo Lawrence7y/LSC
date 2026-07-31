@@ -1,7 +1,7 @@
 """Performance benchmark for global heartbeat optimization."""
-import time
-import sys
 import os
+import sys
+import time
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def benchmark_heartbeat_iterations(num_rooms=12, num_ticks=100):
     """Benchmark heartbeat iterations with simulated rooms."""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import MagicMock
+
     from lsc.gui.multi_room.manager import MultiRoomManager, RoomSession
 
     # Create manager without Qt app

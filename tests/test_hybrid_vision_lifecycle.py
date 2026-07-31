@@ -5,8 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from handlers import room_handler
-from lsc.core.events import EventBus
 
+from lsc.core.events import EventBus
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -95,6 +95,7 @@ def _room(tmp_path, room_id: str, offset: float = 0.0):
 def test_stop_sets_stopping_until_resources_exit(tmp_path, monkeypatch) -> None:
     """stop 请求须设 stopping + scan_abort，响应不得声称已完全停止。"""
     main = _room(tmp_path, "main")
+    main.is_recording = True
     manager = _FakeManager([main])
     server = _FakeServer()
     bridge = _FakeBridge(manager)

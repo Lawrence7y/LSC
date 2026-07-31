@@ -4,7 +4,6 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
-from types import SimpleNamespace
 
 import pytest
 

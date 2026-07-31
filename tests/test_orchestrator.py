@@ -88,18 +88,36 @@ def test_max_rooms_cap(orch):
 
 def test_tick_layers_emit(orch):
     global_n = medium_n = low_n = 0
+
     def g():
-        nonlocal global_n; global_n += 1
+        nonlocal global_n
+        global_n += 1
+
     def m():
-        nonlocal medium_n; medium_n += 1
-    def l():
-        nonlocal low_n; low_n += 1
+        nonlocal medium_n
+        medium_n += 1
+
+    def low():
+        nonlocal low_n
+        low_n += 1
+
     orch.bus.subscribe("global_tick", lambda: g())
     orch.bus.subscribe("medium_tick", lambda: m())
-    orch.bus.subscribe("low_tick", lambda: l())
+    orch.bus.subscribe("low_tick", lambda: low())
     orch.add_room("https://live.example/tick")
     for _ in range(4):
         orch.call(orch._on_global_tick)
     assert global_n == 4
     assert medium_n == 4
     assert low_n == 1
+
+
+def test_missing_controller_tick_does_not_kill_orchestrator(orch):
+    room = orch.add_room("https://live.example/no-tick")
+    assert room is not None
+    orch.call(lambda: setattr(room, "is_recording", True))
+
+    # controller_factory 返回 object()，不提供 tick/watchdog_check。
+    orch.call(orch._on_global_tick)
+
+    assert orch.call(lambda: "still-alive") == "still-alive"

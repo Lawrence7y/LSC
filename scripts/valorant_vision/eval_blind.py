@@ -24,6 +24,7 @@ from eval_gates import (
     round_report_to_dict,
 )
 
+
 def _print_confusion(confusion: dict[str, dict[str, int]]) -> None:
     header = "true\\pred".ljust(12) + "".join(c.rjust(10) for c in CLASS_NAMES)
     print(header)

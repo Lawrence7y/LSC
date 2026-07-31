@@ -1,15 +1,16 @@
 # LSC Live Stream Clipper - Bundle Resources Preparation
-# Downloads embedded Python + pip dependencies + FFmpeg/FFprobe
-# Output: .bundle/python and .bundle/ffmpeg (consumed by electron-builder)
+# Downloads embedded Python ONLY (dependencies are downloaded at first run)
+# Output: .bundle/python (consumed by electron-builder)
+#
+# NOTE: Python packages (PySide6, numpy, etc.) and FFmpeg are now downloaded
+# at runtime via dependency_manager.py to keep the installer small (~60MB).
 
 $ErrorActionPreference = "Stop"
 
 # ----- Config -----
 $PythonVersion = "3.12.10"
 $PythonArch = "amd64"
-# BtbN/FFmpeg-Builds: GPL shared build (smaller, permissive)
-$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
-$GetPipUrl = "https://bootstrap.pypa.io/get-pip.py"
+$UvUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 
 # ----- Paths -----
 # Script lives in lsc-electron/scripts/, project root is two levels up
@@ -17,10 +18,8 @@ $ScriptDir = $PSScriptRoot
 $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..\..")
 $BundleDir = Join-Path $ProjectRoot "lsc-electron\.bundle"
 $PythonDir = Join-Path $BundleDir "python"
-$FfmpegDir = Join-Path $BundleDir "ffmpeg"
+$UvDir = Join-Path $BundleDir "uv"
 $TempDir = Join-Path $BundleDir ".tmp"
-$RequirementsPath = Join-Path $ProjectRoot "requirements.txt"
-$RequirementsAiPath = Join-Path $ProjectRoot "requirements-ai.txt"
 
 # ----- Helpers -----
 function Write-Step($msg) {
@@ -46,19 +45,14 @@ function Download-File($url, $dest) {
 }
 
 # ----- Main -----
-Write-Step "LSC Bundle Prep - Python $PythonVersion + FFmpeg"
+Write-Step "LSC Bundle Prep - Python $PythonVersion (embedded only)"
 
-if (-not (Test-Path $RequirementsPath)) {
-    Write-Err "requirements.txt not found: $RequirementsPath"
-    exit 1
-}
-
-foreach ($d in @($BundleDir, $PythonDir, $FfmpegDir, $TempDir)) {
+foreach ($d in @($BundleDir, $PythonDir, $UvDir, $TempDir)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
-# ============ [1/4] Embedded Python ============
-Write-Step "[1/4] Prepare embedded Python $PythonVersion ($PythonArch)"
+# ============ [1/2] Embedded Python ============
+Write-Step "[1/2] Prepare embedded Python $PythonVersion ($PythonArch)"
 
 $PythonExe = Join-Path $PythonDir "python.exe"
 if (-not (Test-Path $PythonExe)) {
@@ -81,165 +75,46 @@ if ($PthFile) {
     Write-OK "Enabled site-packages: $($PthFile.Name)"
 }
 
-# ============ [2/4] pip + Python dependencies ============
-Write-Step "[2/4] Install Python deps (PySide6 / numpy / websockets / psutil)"
-
-$PipExe = Join-Path $PythonDir "Scripts\pip.exe"
-$SitePackages = Join-Path $PythonDir "Lib\site-packages"
-$PySideMarker = Join-Path $SitePackages "PySide6\__init__.py"
-
-if (-not (Test-Path $PipExe)) {
-    Write-Host "  Installing pip..." -ForegroundColor Gray
-    $GetPipScript = Join-Path $TempDir "get-pip.py"
-    Download-File $GetPipUrl $GetPipScript
-    # --ignore-installed avoids "no RECORD file" errors when reinstalling after prior cleanup
-    & $PythonExe $GetPipScript --no-warn-script-location --ignore-installed
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "pip install failed"
-        exit 1
-    }
-    Remove-Item $GetPipScript -Force
-    Write-OK "pip installed"
-} else {
-    # pip exists but may have broken RECORD (from prior bundle cleanup), re-install safely
-    Write-Host "  pip already exists, ensuring it works..." -ForegroundColor Gray
-    $pipTest = & $PythonExe -m pip --version 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  Re-installing pip (previous install broken)..." -ForegroundColor Gray
-        $GetPipScript = Join-Path $TempDir "get-pip.py"
-        Download-File $GetPipUrl $GetPipScript
-        & $PythonExe $GetPipScript --no-warn-script-location --ignore-installed
-        if ($LASTEXITCODE -ne 0) {
-            Write-Err "pip re-install failed"
-            exit 1
-        }
-        Remove-Item $GetPipScript -Force
-    }
-    Write-OK "pip ready"
-}
-
-# Install deps if PySide6 marker missing
-if (-not (Test-Path $PySideMarker)) {
-    Write-Host "  Installing requirements.txt into site-packages..." -ForegroundColor Gray
-    & $PythonExe -m pip install --no-warn-script-location -r $RequirementsPath
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Dependency install failed"
-        exit 1
-    }
-    Write-OK "Python deps installed"
-} else {
-    Write-OK "Python deps already exist, skip install"
-}
-
-# Install AI deps (rapidocr, opencv, torch, faster-whisper, open-clip) for OCR round refinement
-if (Test-Path $RequirementsAiPath) {
-    $RapidOcrMarker = Join-Path $SitePackages "rapidocr_onnxruntime\__init__.py"
-    if (-not (Test-Path $RapidOcrMarker)) {
-        Write-Host "  Installing requirements-ai.txt into site-packages..." -ForegroundColor Gray
-        & $PythonExe -m pip install --no-warn-script-location -r $RequirementsAiPath
-        if ($LASTEXITCODE -ne 0) {
-            Write-Err "AI dependency install failed"
-            exit 1
-        }
-        Write-OK "AI deps installed"
-    } else {
-        Write-OK "AI deps already exist, skip install"
-    }
-} else {
-    Write-OK "requirements-ai.txt not found, skip AI deps"
-}
-
-# Purge pip cache to save space
-$pipCache = Join-Path $env:LOCALAPPDATA "pip\Cache"
-if (Test-Path $pipCache) {
-    Write-Host "  Purging pip cache..." -ForegroundColor Gray
-    & $PythonExe -m pip cache purge 2>&1 | Out-Null
-}
-
-# Remove __pycache__ dirs
-Get-ChildItem -Path $PythonDir -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
-    ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-
-# Remove Scripts dir (not needed in bundle, saves space and avoids entry-script clutter)
-$ScriptsDir = Join-Path $PythonDir "Scripts"
-if (Test-Path $ScriptsDir) {
-    Remove-Item $ScriptsDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-OK "Cleaned Scripts directory"
-}
-
-# Strip RECORD files from dist-info (redundant for bundled runtime)
-Get-ChildItem -Path $SitePackages -Directory -Filter "*.dist-info" -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        $record = Join-Path $_.FullName "RECORD"
-        if (Test-Path $record) { Remove-Item $record -Force -ErrorAction SilentlyContinue }
-    }
-
-# Verify deps importable
-& $PythonExe -c "import PySide6, numpy, websockets, psutil; print('deps ok')" 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+# Verify Python runs
+& $PythonExe -c "import sys; print(f'Python {sys.version}')" 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
 if ($LASTEXITCODE -ne 0) {
-    Write-Err "Dependency import verification failed"
+    Write-Err "Python verification failed"
     exit 1
 }
-Write-OK "Python deps verified"
+Write-OK "Embedded Python verified"
 
-# ============ [3/4] FFmpeg ============
-Write-Step "[3/4] Download FFmpeg (BtbN GPL shared)"
+# ============ [2/3] uv dependency installer ============
+Write-Step "[2/3] Prepare uv dependency installer"
 
-$FfmpegExe = Join-Path $FfmpegDir "ffmpeg.exe"
-$FfprobeExe = Join-Path $FfmpegDir "ffprobe.exe"
-
-if (-not (Test-Path $FfmpegExe) -or -not (Test-Path $FfprobeExe)) {
-    $FfmpegZip = Join-Path $TempDir "ffmpeg.zip"
-    Download-File $FfmpegUrl $FfmpegZip
-
-    Write-Host "  Extracting FFmpeg..." -ForegroundColor Gray
-    $FfmpegExtractDir = Join-Path $TempDir "ffmpeg-extract"
-    if (Test-Path $FfmpegExtractDir) { Remove-Item $FfmpegExtractDir -Recurse -Force }
-    Expand-Archive -Path $FfmpegZip -DestinationPath $FfmpegExtractDir -Force
-
-    # BtbN layout: ffmpeg-master-latest-win64-gpl-shared/bin/ffmpeg.exe
-    $BinDir = Get-ChildItem -Path $FfmpegExtractDir -Recurse -Directory -Filter "bin" | Select-Object -First 1
-    if (-not $BinDir) {
-        Write-Err "FFmpeg zip layout unexpected, bin/ not found"
+$UvExe = Join-Path $UvDir "uv.exe"
+if (-not (Test-Path $UvExe)) {
+    $UvZip = Join-Path $TempDir "uv.zip"
+    $UvExtract = Join-Path $TempDir "uv-extract"
+    Download-File $UvUrl $UvZip
+    Expand-Archive -LiteralPath $UvZip -DestinationPath $UvExtract -Force
+    $UvSource = Get-ChildItem -LiteralPath $UvExtract -Recurse -Filter "uv.exe" | Select-Object -First 1
+    if (-not $UvSource) {
+        Write-Err "uv.exe not found in downloaded archive"
         exit 1
     }
-
-    Copy-Item -Path (Join-Path $BinDir.FullName "ffmpeg.exe") -Destination $FfmpegExe -Force
-    Copy-Item -Path (Join-Path $BinDir.FullName "ffprobe.exe") -Destination $FfprobeExe -Force
-
-    # Copy shared DLLs (required by shared build)
-    Get-ChildItem -Path $BinDir.FullName -Filter "*.dll" | ForEach-Object {
-        Copy-Item -Path $_.FullName -Destination $FfmpegDir -Force
-    }
-
-    Remove-Item $FfmpegZip -Force
-    Remove-Item $FfmpegExtractDir -Recurse -Force
-    Write-OK "FFmpeg ready at $FfmpegDir"
-} else {
-    Write-OK "FFmpeg already exists, skip download"
+    Copy-Item -LiteralPath $UvSource.FullName -Destination $UvExe -Force
 }
-
-# Verify FFmpeg (capture output first, then check exit code — pipe resets $LASTEXITCODE)
-$ffOutput = & $FfmpegExe -version 2>&1
-$ffExit = $LASTEXITCODE
-if ($ffOutput) {
-    $firstLine = ($ffOutput | Select-Object -First 1).ToString()
-    Write-Host "  $firstLine" -ForegroundColor Gray
-}
-if ($ffExit -ne 0) {
-    Write-Err "FFmpeg verification failed (exit=$ffExit)"
+& $UvExe --version
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "uv verification failed"
     exit 1
 }
+Write-OK "uv dependency installer ready"
 
-# ============ [4/4] Summary ============
-Write-Step "[4/4] Bundle prep complete"
+# ============ [3/3] Summary ============
+Write-Step "[3/3] Bundle prep complete"
 
 $PythonSize = [math]::Round((Get-ChildItem $PythonDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
-$FfmpegSize = [math]::Round((Get-ChildItem $FfmpegDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+$UvSize = [math]::Round((Get-ChildItem $UvDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
 
 Write-Host "  Python dir: $PythonDir ($PythonSize MB)" -ForegroundColor White
-Write-Host "  FFmpeg dir: $FfmpegDir ($FfmpegSize MB)" -ForegroundColor White
-Write-Host "  Total: $([math]::Round($PythonSize + $FfmpegSize, 1)) MB" -ForegroundColor White
+Write-Host "  uv dir: $UvDir ($UvSize MB)" -ForegroundColor White
+Write-Host "  Note: Python packages and FFmpeg will be downloaded by the installer" -ForegroundColor White
 
 # Cleanup temp dir
 if (Test-Path $TempDir) { Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue }

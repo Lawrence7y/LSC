@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier, _CLASS_NAMES
+from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
 
 LIVE = Path.home() / "LSC" / "datasets" / "valorant_phase" / "live_test_59475730286"
 OVERRIDES = {162.0: "non_game", 370.0: "non_game", 78.0: "result"}
@@ -23,7 +23,6 @@ def imread(p: Path):
 
 def main() -> None:
     old = json.loads((LIVE / "eval_report.json").read_text(encoding="utf-8"))
-    details_old = {d["timestamp_sec"]: d for d in old["details"]}
     draft = LIVE / "draft_gt.json"
     gt_map = {}
     if draft.is_file():
@@ -44,7 +43,7 @@ def main() -> None:
         meta.append(d)
         if len(batch) >= 16:
             probs = clf.predict_batch(batch)
-            for row, pr in zip(meta, probs):
+            for row, pr in zip(meta, probs, strict=True):
                 pi = int(pr.argmax())
                 new_details.append(
                     {
@@ -59,7 +58,7 @@ def main() -> None:
             batch, meta = [], []
     if batch:
         probs = clf.predict_batch(batch)
-        for row, pr in zip(meta, probs):
+        for row, pr in zip(meta, probs, strict=True):
             pi = int(pr.argmax())
             new_details.append(
                 {

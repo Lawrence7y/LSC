@@ -9,14 +9,13 @@ import os
 import sys
 import threading
 
-import pytest
-
 # Add python-backend to path
 _backend_dir = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
 from broadcast_hub import BroadcastHub
+
 from lsc.core.events import EventBus
 
 

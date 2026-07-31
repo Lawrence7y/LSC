@@ -95,6 +95,60 @@ def test_parse_ffmpeg_progress_line_extracts_out_time_ms() -> None:
     state = {}
     parse_ffmpeg_progress_line("out_time_ms=15000000", state)
     assert state["out_time_ms"] == 15000000
+    assert state["out_time_us"] == 15000000
+
+
+def test_parse_ffmpeg_progress_line_supports_new_out_time_us() -> None:
+    from lsc.exporter.clip import parse_ffmpeg_progress_line
+
+    state = {}
+    parse_ffmpeg_progress_line("out_time_us=2500000", state)
+    assert state["out_time_us"] == 2500000
+
+
+def test_parse_ffmpeg_progress_line_supports_clock_time() -> None:
+    from lsc.exporter.clip import parse_ffmpeg_progress_line
+
+    state = {}
+    parse_ffmpeg_progress_line("out_time=00:01:02.500000", state)
+    assert state["out_time_us"] == 62_500_000
+
+
+def test_export_worker_invokes_direct_callbacks_without_qt_event_loop(tmp_path) -> None:
+    """Electron executor 场景不能依赖 Qt queued signal 才收到导出终态。"""
+    from lsc.exporter.clip import ExportResult
+    from lsc.gui.pages.recording_controller import ExportWorker
+
+    progress_calls = []
+    done_calls = []
+
+    class FakeExporter:
+        def export_clip(self, *args, **kwargs):
+            kwargs["progress_callback"](50.0, 5.0, 10.0)
+            return ExportResult(
+                success=True,
+                output_path=str(tmp_path / "done.mp4"),
+                clip_index=0,
+                title="done",
+                duration=10.0,
+            )
+
+    worker = ExportWorker(
+        FakeExporter(),
+        str(tmp_path / "source.mp4"),
+        0.0,
+        10.0,
+        str(tmp_path),
+        "done",
+        on_progress=lambda *args: progress_calls.append(args),
+        on_done=lambda *args: done_calls.append(args),
+    )
+    worker.run()
+
+    assert progress_calls == [(50.0, 5.0, 10.0)]
+    assert len(done_calls) == 1
+    assert done_calls[0][0] is True
+    assert done_calls[0][1].endswith("done.mp4")
 
 
 class TestExportCpuFallback:

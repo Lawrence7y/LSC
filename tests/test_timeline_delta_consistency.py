@@ -10,7 +10,7 @@ live=false（拖拽）不得使用「按下时刻的 wallclock」冒充内容时
 """
 from __future__ import annotations
 
-from lsc.core.models import RoomTimeSnapshot, TimelineContext
+from lsc.core.models import TimelineContext
 from lsc.core.services.timeline_service import build_room_snapshots_from_align
 
 
@@ -45,9 +45,8 @@ def test_common_to_recording_matches_wallclock_formula():
 
     # 与墙钟公式对照：mark_wc=media_start+preview_local, export=mark_wc-media_start-content_offset
     preview_local_b = ctx.common_to_preview("b", common)  # 10 - 1.5 = 8.5
-    content_offset_b = 1.5
     mark_wc = media_start + preview_local_b  # 仅在「预览本地时间≈录制已开时长」假设下
-    export_wallclock = mark_wc - media_start - content_offset_b  # 8.5 - 1.5 = 7.0
+    del mark_wc  # 墙钟换算公式已在注释中说明，此处仅验证 common 轴转换
     # common 路径：recording_local = common - (media_start + delta) 再加 media_start 才是文件时间？
     # 产品定义：common_to_recording 直接给出文件内秒数
     # 当 media_start 被编入 recording_to_common_delta 时，

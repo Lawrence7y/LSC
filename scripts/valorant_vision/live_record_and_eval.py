@@ -17,10 +17,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier, _CLASS_NAMES
-from lsc.platforms.registry import parse_stream
-
 import os
+
+from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
+from lsc.platforms.registry import parse_stream
 
 URL = os.environ.get("LSC_LIVE_URL", "https://live.douyin.com/59475730286")
 _room = URL.rstrip("/").split("?")[0].split("/")[-1]
@@ -113,7 +113,6 @@ def main() -> None:
     if not cap.isOpened():
         raise SystemExit("cannot open recording")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    duration = out_mp4.stat().st_size  # placeholder
     n_frames_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     dur_sec = n_frames_total / fps if fps > 0 else float(RECORD_SEC)
 
@@ -149,7 +148,7 @@ def main() -> None:
         meta_b.append(s)
         if len(batch) >= 16:
             probs = clf.predict_batch(batch)
-            for row, pr in zip(meta_b, probs):
+            for row, pr in zip(meta_b, probs, strict=True):
                 pi = int(pr.argmax())
                 details.append(
                     {
@@ -162,7 +161,7 @@ def main() -> None:
             batch, meta_b = [], []
     if batch:
         probs = clf.predict_batch(batch)
-        for row, pr in zip(meta_b, probs):
+        for row, pr in zip(meta_b, probs, strict=True):
             pi = int(pr.argmax())
             details.append(
                 {

@@ -38,6 +38,13 @@ _ENVELOPE_BASELINE_MS = 500
 _ENVELOPE_SMOOTH_MS = 80
 _ENVELOPE_MIN_OFFSET = 0.15
 _ENVELOPE_MIN_PEAK_RATIO = 3.0
+# 不同语言解说会显著压低原始波形相关分，但公共游戏音效通常仍会让
+# “原始波形候选”和“瞬态包络候选”落在同一个 lag。仅在两个独立特征
+# 一致时放宽门限，避免单纯降低全局阈值把无关直播强行对齐。
+_CROSS_LANGUAGE_WAVEFORM_MIN_SCORE = 0.015
+_CROSS_LANGUAGE_ENVELOPE_MIN_SCORE = 0.35
+_CROSS_LANGUAGE_MIN_PEAK_RATIO = 1.8
+_CROSS_LANGUAGE_OFFSET_TOLERANCE = 0.06
 
 
 @dataclass
@@ -331,6 +338,37 @@ def compute_offset(
             peak_ratio,
         )
         return env_offset, env_score
+
+    # 跨语言解说一致性 fallback：
+    # 独立人声/配乐会降低 waveform score，也会让包络峰值不够突出；
+    # 但只要公共游戏音效尚可辨识，两条特征路径仍会给出相同 lag。
+    # 完全无关音频的两个候选通常分散在不同位置，因此不直接放宽任一
+    # 单特征阈值，而要求 offset、方向和最小证据同时成立。
+    cross_language_consensus = (
+        score >= _CROSS_LANGUAGE_WAVEFORM_MIN_SCORE
+        and env_score >= _CROSS_LANGUAGE_ENVELOPE_MIN_SCORE
+        and abs(env_offset) >= _ENVELOPE_MIN_OFFSET
+        and abs(offset_sec - env_offset) <= _CROSS_LANGUAGE_OFFSET_TOLERANCE
+        and peak_ratio >= _CROSS_LANGUAGE_MIN_PEAK_RATIO
+    )
+    if cross_language_consensus:
+        consensus_score = min(
+            1.0,
+            max(
+                _CORRELATION_THRESHOLD,
+                env_score * min(1.0, peak_ratio / _ENVELOPE_MIN_PEAK_RATIO),
+            ),
+        )
+        _log.info(
+            "跨语言解说一致性对齐: offset=%.4fs, waveform_score=%.3f, "
+            "envelope_score=%.3f, peak_ratio=%.2f, confidence=%.3f",
+            env_offset,
+            score,
+            env_score,
+            peak_ratio,
+            consensus_score,
+        )
+        return env_offset, consensus_score
 
     _log.debug("互相关结果: offset=%.4fs (%.1fms), score=%.3f", offset_sec, offset_sec * 1000, score)
     return offset_sec, score

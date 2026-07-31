@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import time
 
 import pytest
@@ -13,7 +12,6 @@ from lsc.core.services.shared_ingest import (
     SharedPreviewHandle,
     SharedRoomIngest,
 )
-
 
 TS_PACKET_SIZE = 188
 

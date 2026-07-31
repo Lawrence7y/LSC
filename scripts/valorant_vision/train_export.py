@@ -152,7 +152,7 @@ def _require_torch():
             "请安装 PyTorch 后重试，或使用 tests/fixtures/valorant_vision 中的 stub 模型做 CI。",
             file=sys.stderr,
         )
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
 
 def _build_model(num_classes: int):
@@ -176,9 +176,9 @@ def _train_and_export(
 ) -> None:
     import torch
     import torch.nn as nn
+    from PIL import Image
     from torch.utils.data import DataLoader, Dataset
     from torchvision import transforms
-    from PIL import Image
 
     _seed_everything(seed)
     dataset_digest = compute_dataset_digest(train_samples + val_samples)
@@ -197,10 +197,23 @@ def _train_and_export(
                 img = img.convert("RGB")
             return self._transform(img), label
 
+    # 多语言 UI 区域增强：模拟不同语言直播流的视觉差异
+    # （繁体中文、日语、韩语、英语、西语的 UI 渲染风格不同）
+    try:
+        from scripts.valorant_vision.augment import MultiLanguageUIAugment
+        ml_augment = MultiLanguageUIAugment(
+            prob_dilate=0.5,    # 50% 概率笔画增厚（模拟繁体/日文高密度文字）
+            prob_texture=0.3,   # 30% 概率纹理增强（模拟不同字体填充率）
+            prob_erasing=0.2,   # 20% 概率 UI 遮挡（模拟不同语言 UI 元素差异）
+        )
+    except ImportError:
+        ml_augment = None
+
     train_tf = transforms.Compose([
         transforms.Resize((INPUT_SIZE + 16, INPUT_SIZE + 16)),
         transforms.RandomCrop((INPUT_SIZE, INPUT_SIZE)),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+        ml_augment if ml_augment else transforms.Lambda(lambda x: x),  # 多语言 UI 增强
+        transforms.ColorJitter(brightness=0.35, contrast=0.4, saturation=0.3, hue=0.05),
         transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.25),
         transforms.ToTensor(),
         transforms.RandomErasing(p=0.2, scale=(0.02, 0.12)),
@@ -274,7 +287,7 @@ def _train_and_export(
                 preds = model(batch_x).argmax(dim=1)
                 correct += int((preds == batch_y).sum().item())
                 total += int(batch_y.size(0))
-                for t, p in zip(batch_y.tolist(), preds.tolist()):
+                for t, p in zip(batch_y.tolist(), preds.tolist(), strict=True):
                     per_total[t] += 1
                     if t == p:
                         per_correct[t] += 1

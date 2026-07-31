@@ -16,7 +16,7 @@ from handlers import room_handler as rh
 @pytest.mark.parametrize(
     "path",
     [
-        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"),
+        os.path.join(os.environ.get("SYSTEMROOT", r"C:\Windows"), "System32"),
         "/etc",
         "/etc/passwd",
         r"C:\Program Files",

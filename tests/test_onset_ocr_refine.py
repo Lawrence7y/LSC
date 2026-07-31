@@ -7,12 +7,11 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 
-from lsc.analyzer.round_detector import detect_valorant_rounds, ValorantRoundConfig
+from lsc.analyzer.round_detector import detect_valorant_rounds
 
 
 def _make_fake_onset_module():
@@ -116,6 +115,7 @@ def test_onset_path_still_refines_without_time_range():
 def test_source_no_scan_range_guard_on_onset_ocr_path():
     """源码不应再包含 'scan_range is None' 守卫阻止 onset OCR refine。"""
     import inspect
+
     from lsc.analyzer import round_detector
     source = inspect.getsource(round_detector.detect_valorant_rounds)
     # 旧代码模式: results0 and scan_range is None

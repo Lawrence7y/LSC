@@ -1,7 +1,11 @@
-import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
+import { createElement, useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 import { App, message } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
+import {
+  RecordingSpecSelector,
+  recordingSpecFromSettings,
+} from '@/components/RecordingSpecSelector'
 
 // send 返回 boolean：false 表示断连且消息被丢弃（useWebSocket.send 已统一弹提示）
 type SendFn = (type: string, data?: any) => boolean
@@ -53,9 +57,24 @@ export function useRoomActions(opts: {
   }, [send])
 
   const handleStartRecord = useCallback((roomId: string) => {
-    useAppStore.getState().updateRoom(roomId, { is_recording_starting: true, last_error: '' })
-    send('start_recording', { room_id: roomId })
-  }, [send])
+    const spec = recordingSpecFromSettings(useAppStore.getState().settings)
+    let selectedSpec = spec
+    modal.confirm({
+      title: '选择录制规格',
+      icon: null,
+      width: 620,
+      okText: '开始录制',
+      cancelText: '取消',
+      content: createElement(RecordingSpecSelector, {
+        initial: spec,
+        onChange: (next) => { selectedSpec = next },
+      }),
+      onOk: () => {
+        useAppStore.getState().updateRoom(roomId, { is_recording_starting: true, last_error: '' })
+        send('start_recording', { room_id: roomId, recording_spec: selectedSpec })
+      },
+    })
+  }, [send, modal])
 
   const handleStopRecord = useCallback((roomId: string) => {
     const ca = useAppStore.getState().continuousAnalysisStatus

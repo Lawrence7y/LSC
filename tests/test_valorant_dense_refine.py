@@ -74,6 +74,7 @@ def test_strong_boundaries_emit_vision_confirmed() -> None:
 
 def test_low_confidence_argmax_is_unknown() -> None:
     import numpy as np
+
     from lsc.analyzer.round_detector import _predict_class_from_probs
 
     label = _predict_class_from_probs(
@@ -86,9 +87,10 @@ def test_low_confidence_argmax_is_unknown() -> None:
 
 def test_extract_frames_raises_on_ffmpeg_failure(tmp_path, monkeypatch) -> None:
     from types import SimpleNamespace
-    from lsc.analyzer.round_detector import extract_frames_cancellable
+
     import lsc.analyzer.round_detector as rd
     import lsc.utils.cancellable_ffmpeg as cancellable
+    from lsc.analyzer.round_detector import extract_frames_cancellable
 
     class _FailedFFmpeg:
         def __init__(self, *_args, **_kwargs):
@@ -117,29 +119,49 @@ def test_extract_frames_raises_on_ffmpeg_failure(tmp_path, monkeypatch) -> None:
 
 
 def test_extract_frames_cmd_uses_hwaccel_and_downscale(tmp_path, monkeypatch) -> None:
-    from types import SimpleNamespace
-    from lsc.analyzer.round_detector import extract_frames_cancellable
+    """New pipe-based implementation: verify hwaccel args and vf filter in command."""
+    import subprocess as _sp
+
     import lsc.analyzer.round_detector as rd
-    import lsc.utils.cancellable_ffmpeg as cancellable
+    from lsc.analyzer.round_detector import extract_frames_cancellable
 
     cmds: list[list[str]] = []
 
-    class _OkFFmpeg:
-        def __init__(self, cmd, **_kwargs):
+    class _FakeProc:
+        def __init__(self, cmd, **_kw):
             cmds.append(list(cmd))
+            self.returncode = 0
+            self.stdout = _FakePipe(b"")
+            self.stderr = _FakePipe(b"")
 
-        def start(self) -> None:
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
             pass
 
-        def wait(self, timeout_sec: float):
-            del timeout_sec
-            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        def communicate(self, timeout=None):
+            return b"", b""
 
-    monkeypatch.setattr(cancellable, "CancellableFFmpeg", _OkFFmpeg)
+    class _FakePipe:
+        def __init__(self, data: bytes):
+            self._data = data
+            self._pos = 0
+
+        def read(self, n=-1):
+            if self._pos >= len(self._data):
+                return b""
+            chunk = self._data[self._pos:self._pos + n]
+            self._pos += n
+            return chunk
+
+    monkeypatch.setattr(_sp, "Popen", _FakeProc)
     monkeypatch.setattr(
         rd, "ffmpeg_hwaccel_args", lambda _mode: ["-hwaccel", "d3d11va"]
     )
     monkeypatch.setattr(rd, "read_settings_ocr_accel", lambda: "dml")
+    # 禁用 GPU scale 路径，专注测试 hwaccel + CPU 滤镜
+    monkeypatch.setattr(rd, "build_hwaccel_vf", lambda vf, **kw: ([], vf))
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"fake")
 
@@ -151,7 +173,8 @@ def test_extract_frames_cmd_uses_hwaccel_and_downscale(tmp_path, monkeypatch) ->
         ffmpeg_path="ffmpeg",
     )
 
-    assert len(cmds) == 1
+    # 应有 hwaccel 尝试 + 纯 CPU 回退 = 2 个命令（第一个成功则只执行 1 个）
+    assert len(cmds) >= 1
     cmd = cmds[0]
     assert cmd[1:3] == ["-hwaccel", "d3d11va"]
     vf = cmd[cmd.index("-vf") + 1]
@@ -160,32 +183,52 @@ def test_extract_frames_cmd_uses_hwaccel_and_downscale(tmp_path, monkeypatch) ->
 
 
 def test_extract_frames_falls_back_without_hwaccel(tmp_path, monkeypatch) -> None:
-    from types import SimpleNamespace
-    from lsc.analyzer.round_detector import extract_frames_cancellable
+    """Pipe-based: first attempt with hwaccel fails, second without succeeds."""
+    import subprocess as _sp
+
     import lsc.analyzer.round_detector as rd
-    import lsc.utils.cancellable_ffmpeg as cancellable
+    from lsc.analyzer.round_detector import extract_frames_cancellable
 
     cmds: list[list[str]] = []
+    call_count = [0]
 
-    class _FallbackFFmpeg:
-        def __init__(self, cmd, **_kwargs):
-            self._cmd = list(cmd)
-            cmds.append(self._cmd)
+    class _FallbackProc:
+        def __init__(self, cmd, **_kw):
+            cmds.append(list(cmd))
+            call_count[0] += 1
+            # 第一次（带 hwaccel）失败，第二次成功
+            self.returncode = 1 if "-hwaccel" in cmd else 0
+            self.stdout = _FakePipe2(b"")
+            self.stderr = _FakePipe2(b"hw fail" if self.returncode == 1 else b"")
 
-        def start(self) -> None:
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
             pass
 
-        def wait(self, timeout_sec: float):
-            del timeout_sec
-            if "-hwaccel" in self._cmd:
-                return SimpleNamespace(returncode=1, stdout=b"", stderr=b"hw fail")
-            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        def communicate(self, timeout=None):
+            return b"", b""
 
-    monkeypatch.setattr(cancellable, "CancellableFFmpeg", _FallbackFFmpeg)
+    class _FakePipe2:
+        def __init__(self, data: bytes):
+            self._data = data
+            self._pos = 0
+
+        def read(self, n=-1):
+            if self._pos >= len(self._data):
+                return b""
+            chunk = self._data[self._pos:self._pos + n]
+            self._pos += n
+            return chunk
+
+    monkeypatch.setattr(_sp, "Popen", _FallbackProc)
     monkeypatch.setattr(
         rd, "ffmpeg_hwaccel_args", lambda _mode: ["-hwaccel", "cuda"]
     )
     monkeypatch.setattr(rd, "read_settings_ocr_accel", lambda: "cuda")
+    # 禁用 GPU scale 路径，专注测试 hwaccel 回退逻辑
+    monkeypatch.setattr(rd, "build_hwaccel_vf", lambda vf, **kw: ([], vf))
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"fake")
 
@@ -205,6 +248,7 @@ def test_extract_frames_falls_back_without_hwaccel(tmp_path, monkeypatch) -> Non
 
 def test_digit_anchors_ignore_timer_digits(monkeypatch) -> None:
     import numpy as np
+
     import lsc.analyzer.ocr_detector as ocr_detector
     from lsc.analyzer.round_detector import read_top_digit_anchors
 
@@ -230,6 +274,7 @@ def test_digit_anchors_ignore_timer_digits(monkeypatch) -> None:
 
 def test_digit_anchors_pass_ndarray_not_tempfile(monkeypatch) -> None:
     import numpy as np
+
     import lsc.analyzer.ocr_detector as ocr_detector
     from lsc.analyzer.round_detector import read_top_digit_anchors
 

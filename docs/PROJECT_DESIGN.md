@@ -428,8 +428,11 @@ else:
     cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
     cmd += ["-c:a", "aac", "-b:a", "128k"]
 
-# 输出格式：MP4 + 流式写入
-cmd += ["-f", "mp4", "-movflags", "frag_keyframe+empty_moov+faststart", output_path]
+# 输出格式：MP4 + 流式写入（录制文件）
+# 注意：录制文件不使用 empty_moov，因为 OCR 抽帧需要 moov 包含完整索引。
+# empty_moov 会在文件开头写一个空壳 moov（无 track 索引），导致录制中 OCR 无法 seek。
+# 去掉 empty_moov 后，moov 在文件末尾持续更新，OCR 可以正常定位关键帧。
+cmd += ["-f", "mp4", "-movflags", "frag_keyframe+faststart", output_path]
 ```
 
 #### 启动探测（5 秒超时）

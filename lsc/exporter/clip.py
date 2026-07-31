@@ -98,13 +98,32 @@ def compute_export_watchdog_timeout(
 def parse_ffmpeg_progress_line(line: str, state: dict[str, int]) -> None:
     """Parse a single FFmpeg progress line and update state dict.
 
-    FFmpeg outputs lines like 'out_time_ms=15000000' when using -progress pipe:1.
+    不同 FFmpeg 版本会输出 ``out_time_us``、``out_time_ms`` 或
+    ``out_time=HH:MM:SS.microseconds``。其中历史字段 ``out_time_ms`` 的
+    实际单位也是微秒。统一换算为 ``out_time_us``。
     """
     if "=" not in line:
         return
     key, value = line.strip().split("=", 1)
-    if key == "out_time_ms" and value.isdigit():
-        state["out_time_ms"] = int(value)
+    if key in {"out_time_us", "out_time_ms"}:
+        try:
+            elapsed_us = int(value)
+        except ValueError:
+            return
+        state["out_time_us"] = max(0, elapsed_us)
+        # 保留旧键，兼容现有调用方与测试。
+        state["out_time_ms"] = max(0, elapsed_us)
+        return
+    if key == "out_time":
+        try:
+            hours, minutes, seconds = value.split(":", 2)
+            elapsed_us = int(
+                (int(hours) * 3600 + int(minutes) * 60 + float(seconds)) * 1_000_000
+            )
+        except (TypeError, ValueError):
+            return
+        state["out_time_us"] = max(0, elapsed_us)
+        state["out_time_ms"] = max(0, elapsed_us)
 
 
 @dataclass
@@ -635,11 +654,11 @@ class ClipExporter:
                         if not line:
                             continue
                         parse_ffmpeg_progress_line(line, state)
-                        # Throttle progress callbacks: FFmpeg emits out_time_ms
+                        # Throttle progress callbacks: FFmpeg emits out_time_us
                         # every frame, but the UI only needs ~5 updates/sec or
                         # when the percentage changes by at least 1.
-                        if "out_time_ms" in state:
-                            elapsed_sec = state["out_time_ms"] / 1_000_000.0
+                        if "out_time_us" in state:
+                            elapsed_sec = state["out_time_us"] / 1_000_000.0
                             percent = min(100.0, (elapsed_sec / duration) * 100.0) if duration > 0 else 0.0
                             now = time.time()
                             if percent - last_reported_percent >= 1.0 or now - last_reported_time >= 0.2:
@@ -745,6 +764,10 @@ class ClipExporter:
 
         file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
 
+        # FFmpeg 已按 -t 精确生成目标时长，此处不再同步调用 ffprobe。
+        # 在虚拟机或系统高负载时，额外探测可能阻塞最长 10 秒，导致文件已经
+        # 写入但界面迟迟收不到完成回调。
+        actual_duration = duration
         thumbnail_path = ""
         if profile and profile.generate_thumbnail:
             thumb_future = None
@@ -756,15 +779,23 @@ class ClipExporter:
             except Exception as exc:
                 _log.warning("Failed to submit thumbnail job for %s: %s", output_path, exc)
 
-            actual_duration = self._get_duration(output_path)
-
             if thumb_future is not None:
                 try:
                     thumbnail_path = thumb_future.result(timeout=10.0)
                 except Exception as exc:
                     _log.warning("Thumbnail generation failed/timeout for %s: %s", output_path, exc)
-        else:
-            actual_duration = self._get_duration(output_path)
+        if progress_callback is not None:
+            try:
+                progress_callback(100.0, duration, duration)
+            except Exception as exc:
+                _log.warning("导出最终进度回调异常: %s", exc)
+
+        _log.info(
+            "export completed: output=%s duration=%.2fs size=%.2fMB",
+            output_path,
+            actual_duration,
+            file_size_mb,
+        )
 
         return ExportResult(
             success=True,

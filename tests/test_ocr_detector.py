@@ -4,8 +4,8 @@
 """
 from __future__ import annotations
 
-import sys
 import os
+import sys
 import types
 
 import pytest

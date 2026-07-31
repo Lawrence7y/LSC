@@ -29,23 +29,11 @@ const SELECT_W = { width: '100%', maxWidth: 220 }
 
 function KeyBadge({ keys }: { keys: string[] }) {
   return (
-    <span style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      gap: 4,
-      background: 'var(--background-700)',
-      border: '1px solid var(--border-default)',
-      borderRadius: 'var(--radius-xs)',
-      padding: '3px 10px',
-      fontFamily: 'var(--font-mono)',
-      fontSize: 12,
-      color: 'var(--text-50)',
-      whiteSpace: 'nowrap',
-    }}>
+    <span className="key-badge">
       {keys.map((key, i) => (
         <span key={i}>
           {i > 0 && ' + '}
-          <kbd style={{ fontFamily: 'inherit', fontSize: 12, color: 'var(--text-50)' }}>{key}</kbd>
+          <kbd>{key}</kbd>
         </span>
       ))}
     </span>
@@ -630,13 +618,18 @@ export default function Settings() {
               />
             </SettingsRow>
             <SettingsRow label="共享进样">
-              <ToggleSwitch
-                checked={!!settings.shared_ingest_enabled}
-                onChange={(v) => {
-                  handleRecordChange('shared_ingest_enabled', v)
-                  message.success(v ? '已开启共享进样（新预览/录制生效）' : '已关闭共享进样（新预览/录制生效）', 2)
-                }}
-              />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ color: 'var(--text-40)', fontSize: 12 }}>
+                  预览与录制共用同一进程，录制中断会导致预览短暂重连
+                </span>
+                <ToggleSwitch
+                  checked={!!settings.shared_ingest_enabled}
+                  onChange={(v) => {
+                    handleRecordChange('shared_ingest_enabled', v)
+                    message.success(v ? '已开启共享进样（新预览/录制生效）' : '已关闭共享进样（新预览/录制生效）', 2)
+                  }}
+                />
+              </div>
             </SettingsRow>
             <SettingsRow label="并发导出数">
               <Select

@@ -130,6 +130,10 @@ def hidden_run_kwargs(**extra: object) -> dict[str, object]:
     flags = get_creation_flags()
     if flags:
         out.setdefault("creationflags", flags)
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        out.setdefault("startupinfo", startupinfo)
     return out
 
 

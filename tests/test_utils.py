@@ -5,19 +5,15 @@ any test coverage but are critical to system stability.
 """
 from __future__ import annotations
 
-import os
-import subprocess
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from lsc.utils.process_launcher import (
+    _ENV_WHITELIST,
+    build_clean_env,
     get_creation_flags,
     prepare_launch,
-    build_clean_env,
     set_stream_nonblocking,
-    _ENV_WHITELIST,
 )
 
 
@@ -119,7 +115,7 @@ class TestFmtTime:
 
 # ── error_stats.py ─────────────────────────────────────
 
-from lsc.utils.error_stats import ErrorStats, get_error_stats
+from lsc.utils.error_stats import ErrorStats
 
 
 class TestErrorStats:

@@ -16,7 +16,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier, _CLASS_NAMES
+from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
 from lsc.platforms.registry import parse_stream
 
 URL = os.environ.get("LSC_LIVE_URL", "https://live.douyin.com/84927583848")
@@ -102,7 +102,7 @@ def main() -> None:
         if not batch:
             return
         probs = clf.predict_batch(batch)
-        for row, pr in zip(meta, probs):
+        for row, pr in zip(meta, probs, strict=True):
             pi = int(pr.argmax())
             details.append(
                 {**row, "pred": _CLASS_NAMES[pi], "conf": float(pr[pi])}

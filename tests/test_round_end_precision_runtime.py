@@ -1,8 +1,8 @@
 from lsc.analyzer.round_detector import (
+    _confidence_from_probs,
+    _is_strong_confidence,
     grade_round_confirmation,
     merge_listed_rounds,
-    _is_strong_confidence,
-    _confidence_from_probs,
 )
 
 

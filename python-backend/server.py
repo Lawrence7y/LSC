@@ -8,7 +8,7 @@ from typing import Any
 
 import websockets
 from websockets.exceptions import ConnectionClosed
-from ws_auth import is_origin_allowed, validate_ws_token
+from ws_auth import expected_ws_token, is_origin_allowed, validate_ws_token
 
 _log = logging.getLogger('lsc.server')
 
@@ -102,13 +102,10 @@ class LSCWebSocketServer:
                 origin = getter('origin') or getter('Origin') or ''
             elif isinstance(headers, dict):
                 origin = headers.get('origin') or headers.get('Origin') or ''
-        if not origin:
-            _log.warning("Rejected WebSocket connection: missing Origin header")
-            close_fn = getattr(websocket, 'close', None)
-            if callable(close_fn):
-                await close_fn(code=1008, reason='Origin required')
-            return
-        if not is_origin_allowed(origin):
+        # 打包后的 Electron ``file://`` 渲染器在部分 Chromium 版本中不会
+        # 发送 Origin。后续首帧仍强制校验由主进程注入的随机 Token，且服务
+        # 仅绑定到 loopback，因此可安全兼容这种本地受信调用。
+        if origin and not is_origin_allowed(origin):
             _log.warning("Rejected WebSocket connection from origin: %s", origin)
             close_fn = getattr(websocket, 'close', None)
             if callable(close_fn):
@@ -123,8 +120,15 @@ class LSCWebSocketServer:
                 data = json.loads(raw) if isinstance(raw, str) else {}
             except Exception:
                 data = {}
-            if data.get('type') == 'auth' and validate_ws_token(data.get('token')):
+            token = data.get('token')
+            if data.get('type') == 'auth' and validate_ws_token(token):
                 authenticated = True
+            elif data.get('type') == 'auth':
+                _log.warning(
+                    "Rejected WebSocket auth: provided token length=%d, expected token configured=%s",
+                    len(token) if isinstance(token, str) else 0,
+                    bool(expected_ws_token()),
+                )
         except asyncio.TimeoutError:
             pass
         except websockets.ConnectionClosed:
@@ -180,7 +184,7 @@ class LSCWebSocketServer:
                 log_data = _truncate_for_log(msg_data)
                 high_freq_types = frozenset({
                     'mse_segment', 'mse_init', 'rooms_updated',
-                    'export_progress', 'medium_tick',
+                    'export_progress', 'get_export_job_status', 'medium_tick',
                 })
                 if msg_type in high_freq_types:
                     _log.debug("Received WS message: type=%s", msg_type)
@@ -314,6 +318,18 @@ class LSCWebSocketServer:
         from mse_ws_frames import pack_mse_frame
         await self.broadcast_bytes(pack_mse_frame(kind, room_id, payload))
 
+    async def _heartbeat_loop(self):
+        """定期广播心跳（P3-2: 后端心跳检测）。"""
+        while True:
+            try:
+                await asyncio.sleep(5)
+                if self.clients:
+                    await self.broadcast('heartbeat', {'ts': time.time()})
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                _log.debug("heartbeat broadcast error: %s", exc)
+
     async def start(self):
         """启动服务器，支持端口回退（主端口被占用时尝试备用端口）。"""
         ports_to_try = [self.port] + [p for p in self.fallback_ports if p != self.port]
@@ -334,8 +350,13 @@ class LSCWebSocketServer:
                     self._server = srv
                     self._bound_port = port
                     _log.info(f"WebSocket server listening on ws://{self.host}:{port}")
-                    await asyncio.Future()  # 永远运行
-                    return  # 正常退出时返回
+                    # 启动心跳任务
+                    heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                    try:
+                        await asyncio.Future()  # 永远运行
+                        return  # 正常退出时返回
+                    finally:
+                        heartbeat_task.cancel()
             except OSError as e:
                 last_error = e
                 continue

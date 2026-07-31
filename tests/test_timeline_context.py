@@ -1,7 +1,6 @@
 """TimelineContext 和 ClipSnapshot 单元测试 — TDD 先行。"""
 from __future__ import annotations
 
-import time
 from uuid import uuid4
 
 import pytest
@@ -101,7 +100,7 @@ class TestTimelineContext:
 
     def test_media_start_mapping_scenario(self):
         """媒体起点 102/109 时主房 20 秒映射为目标 13 秒
-        
+
         场景：主房间 media_start_mono=102，目标房间 media_start_mono=109
         主房间 common 时间 20s 对应目标房间 recording 时间 13s
         (因为目标房间晚了 7s 开始，所以同一 common 时刻，目标房间的 recording 时间少了 7s)

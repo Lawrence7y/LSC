@@ -3,17 +3,15 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 _python_backend = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
 if _python_backend not in sys.path:
     sys.path.insert(0, _python_backend)
 
-import pytest
 
-from lsc.platforms.base import StreamInfo, BasePlatformAdapter
 from lsc.gui.multi_room.session import RoomSession
+from lsc.platforms.base import BasePlatformAdapter, StreamInfo
 
 
 class TestStreamInfoCategory:

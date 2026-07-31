@@ -167,3 +167,72 @@ def friendly_connect_error(raw: str) -> str:
     result = humanize_error(raw)
     _log.debug("friendly_connect_error: mapped to: %s", result[:80])
     return result
+
+
+# ── P1-1: 错误修复建议 ─────────────────────────────────────────────
+_REPAIR_SUGGESTIONS: list[tuple[re.Pattern, str]] = [
+    # HTTP / Network
+    (re.compile(r"403|Forbidden", re.I),
+     "请检查直播链接是否过期，尝试重新连接房间"),
+    (re.compile(r"404|Not Found", re.I),
+     "请确认主播正在直播，或尝试刷新直播间"),
+    (re.compile(r"Connection refused|ECONNREFUSED|连接被拒绝", re.I),
+     "无法连接直播服务器，请检查网络或稍后重试"),
+    (re.compile(r"Connection timed out|ETIMEDOUT|连接超时", re.I),
+     "连接超时，请检查网络状况或稍后重试"),
+    (re.compile(r"Name or service not known|getaddrinfo", re.I),
+     "域名解析失败，请检查网络连接"),
+    # 磁盘/权限
+    (re.compile(r"No space left|ENOSPC|disk full|磁盘空间不足", re.I),
+     "磁盘空间不足，请清理输出目录后重试"),
+    (re.compile(r"Permission denied|EACCES|WinError 5|拒绝访问", re.I),
+     "文件写入权限不足，请检查输出目录权限"),
+    # 录制文件
+    (re.compile(r"moov|moof|MP4.*(不完整|损坏|invalid)", re.I),
+     "录制文件不完整，可尝试使用「修复录制文件」功能"),
+    # 编码器
+    (re.compile(r"Encoder.*not found|cannot find encoder", re.I),
+     "缺少视频编码器，请检查编码器设置"),
+    (re.compile(r"Decoder.*not found|cannot find codec", re.I),
+     "缺少视频解码器，请确保 FFmpeg 安装完整"),
+    # Cookie/登录
+    (re.compile(r"Cookie|登录|login required", re.I),
+     "需要登录凭证，请检查 Cookie 配置"),
+    # 主播状态
+    (re.compile(r"直播间未开播|房间未开播|not live|下播", re.I),
+     "主播当前未开播，请稍后再试"),
+    # 共享进样
+    (re.compile(r"shared ingest|upstream ffmpeg exited", re.I),
+     "共享进样预览中断，录制可能仍在继续，请尝试重新开启预览"),
+    # OCR
+    (re.compile(r"rapidocr|OCR.*(失败|不可用|未安装)", re.I),
+     "OCR 引擎不可用，已回退到纯音频检测"),
+]
+
+
+def get_repair_suggestion(error_msg: str) -> str | None:
+    """获取错误修复建议。
+
+    根据错误信息匹配对应的修复建议，供前端展示给用户。
+    无匹配时返回 None。
+    """
+    if not error_msg or not isinstance(error_msg, str):
+        return None
+
+    for pattern, suggestion in _REPAIR_SUGGESTIONS:
+        if pattern.search(error_msg):
+            _log.debug("get_repair_suggestion matched: %s", pattern.pattern)
+            return suggestion
+
+    return None
+
+
+def humanize_error_with_suggestion(raw: str) -> dict[str, str]:
+    """返回带修复建议的错误信息。
+
+    Returns:
+        {"message": 友好错误信息, "suggestion": 修复建议或 None}
+    """
+    message = humanize_error(raw)
+    suggestion = get_repair_suggestion(raw)
+    return {"message": message, "suggestion": suggestion}

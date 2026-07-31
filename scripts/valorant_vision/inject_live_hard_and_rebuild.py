@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier, _CLASS_NAMES
+from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES
 
 LIVE = Path.home() / "LSC" / "datasets" / "valorant_phase" / "live_test_59475730286"
 DATA = Path.home() / "LSC" / "datasets" / "valorant_phase"

@@ -21,6 +21,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import numpy as np
@@ -43,20 +44,121 @@ from persistence import (
 from lsc.config import ExportProfile, load_config
 from lsc.core.orchestrator import RoomOrchestrator, _is_stream_offline_error
 from lsc.core.services.ingest_registry import PreviewStreamRegistry, get_shared_ingest_registry
+from lsc.core.services.mse_streamer import _check_nvenc
 from lsc.core.services.resource_monitor import collect_system_stats, get_resource_pressure
 from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
     get_timeline_service,
 )
-from lsc.platforms.registry import select_quality
-from lsc.utils.error_messages import humanize_error
+from lsc.platforms.base import ERROR_OFFLINE
+from lsc.platforms.registry import get_display_name, parse_stream, select_quality
+from lsc.utils.error_messages import humanize_error, humanize_error_with_suggestion
 from lsc.utils.process_launcher import run_hidden
 
 _log = logging.getLogger('lsc.handlers')
 
+_MAX_ROOM_URL_LENGTH = 2048
+_MAX_ROOM_URLS_PER_ADD = 12
 
-SETTINGS_FILE = os.path.join(os.path.dirname(__file__), '..', 'settings.json')
-RECORDING_HISTORY_FILE = os.path.join(os.path.dirname(__file__), '..', 'recording_history.json')
+
+def _invalid_room_url_result(url: str, error: str, error_code: str = "invalid_url") -> dict[str, Any]:
+    """构造统一的直播间链接验证失败结果。"""
+    return {
+        "valid": False,
+        "url": url,
+        "normalized_url": url,
+        "error": error,
+        "error_code": error_code,
+    }
+
+
+def _error_response(exc: Exception | str) -> dict[str, Any]:
+    """生成带修复建议的错误响应（P1-1: 错误提示友好化）"""
+    raw = str(exc) if not isinstance(exc, str) else exc
+    info = humanize_error_with_suggestion(raw)
+    return {'success': False, 'error': info['message'], 'suggestion': info.get('suggestion')}
+
+
+def _validate_room_url_candidate(raw_url: object) -> dict[str, Any]:
+    """校验 URL 格式并通过平台适配器实际解析直播间。
+
+    该函数会进行网络解析，必须在线程池中调用，不能阻塞 WebSocket 事件循环。
+    已识别平台返回 ``offline`` 时仍视为有效直播间：用户可以先添加未开播房间。
+    """
+    if not isinstance(raw_url, str):
+        return _invalid_room_url_result("", "直播间链接必须是文本")
+
+    url = raw_url.strip()
+    if not url:
+        return _invalid_room_url_result(url, "请输入直播间链接")
+    if len(url) > _MAX_ROOM_URL_LENGTH:
+        return _invalid_room_url_result(url, "直播间链接过长")
+    if any(ch.isspace() or ord(ch) < 32 for ch in url):
+        return _invalid_room_url_result(url, "链接中不能包含空格、换行或控制字符")
+
+    try:
+        parsed = urlsplit(url)
+        # 访问 port 属性可同时触发非法端口格式校验。
+        _ = parsed.port
+    except ValueError:
+        return _invalid_room_url_result(url, "链接格式无效，请检查地址是否完整")
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return _invalid_room_url_result(url, "仅支持 http:// 或 https:// 直播间链接")
+    if not parsed.hostname:
+        return _invalid_room_url_result(url, "链接缺少有效的网站域名")
+    if parsed.username is not None or parsed.password is not None:
+        return _invalid_room_url_result(url, "直播间链接不能包含用户名或密码")
+
+    info = parse_stream(url)
+    platform = str(info.platform or "unknown")
+    platform_name = get_display_name(platform)
+    base_result: dict[str, Any] = {
+        "url": url,
+        "normalized_url": str(info.room_url or url),
+        "platform": platform,
+        "platform_name": platform_name,
+        "streamer": str(info.streamer or ""),
+        "title": str(info.title or ""),
+        "is_live": bool(info.is_live),
+        "error_code": str(info.error_code or ""),
+    }
+
+    # 已识别的直播间即使尚未开播也允许添加，避免用户必须等开播后才能建房。
+    if info.error_code == ERROR_OFFLINE and platform != "unknown":
+        return {
+            **base_result,
+            "valid": True,
+            "warning": "链接有效，主播当前未开播",
+        }
+
+    if info.error:
+        return {
+            **base_result,
+            "valid": False,
+            "error": humanize_error(str(info.error)),
+        }
+    if platform == "unknown" or not (info.stream_url or info.is_live):
+        return {
+            **base_result,
+            "valid": False,
+            "error": "未能识别有效的直播间或直播流",
+            "error_code": str(info.error_code or "unsupported_url"),
+        }
+
+    return {
+        **base_result,
+        "valid": True,
+        "message": f"已识别为{platform_name}直播间",
+    }
+
+
+# 打包后的 backend 位于 Program Files/resources，不能在代码目录旁保存可变数据。
+# Electron 启动时会传入 LSC_DATA_DIR（其 userData 目录）；开发模式保留项目内
+# python-backend 目录作为回退，以避免改变本地调试的既有配置位置。
+_PERSISTENCE_DIR = os.environ.get('LSC_DATA_DIR') or os.path.join(os.path.dirname(__file__), '..')
+SETTINGS_FILE = os.path.join(_PERSISTENCE_DIR, 'settings.json')
+RECORDING_HISTORY_FILE = os.path.join(_PERSISTENCE_DIR, 'recording_history.json')
 
 
 def _load_recording_history() -> list[dict[str, Any]]:
@@ -133,16 +235,25 @@ _continuous_tasks: dict[str, dict[str, Any]] = {}
 _VALORANT_INCREMENTAL_LOOKBACK_SEC = 360.0  # 6 分钟增量回看（质量优先）
 _VALORANT_MAX_CATCHUP_SEC = 480.0  # 单次 tick 最多向前追赶的新内容时长
 # OCR 扫描 TimeoutError 后：降级纯音频追赶，避免立刻再开超大 OCR 窗压垮 DirectML
-_OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 3
-_POST_TIMEOUT_MAX_CATCHUP_SEC = 120.0
+_OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 5
+_POST_TIMEOUT_MAX_CATCHUP_SEC = 60.0
 _SCAN_ABORT_GRACE_SEC = 3.0  # 停止目标：3 秒内终止 FFmpeg 并退出当前短推理批次
 _SCAN_ABORT_HARD_SEC = 30.0  # 超时后继续等待线程释放 semaphore 的硬上限，避免永久挂死任务槽
 _VALORANT_MIN_LIST_DURATION_SEC = 5.0  # list_only 入列下限（短 spike 回合也须进列表待确认）
 _VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期（真正导出路径）
 _HYBRID_BOUNDARY_SOURCE = "valorant_hybrid_v1"
+_AUDIO_BOUNDARY_SOURCE = "valorant_audio_v1"  # 纯音频路径产出（录制中 OCR 不可用）
 _HYBRID_VALID_START_BY = frozenset({"model_buy_exit"})
-_HYBRID_VALID_END_BY = frozenset({"model_result", "model_score"})
+_HYBRID_VALID_END_BY = frozenset({"model_result", "model_score", "next_buy"})
+_AUDIO_VALID_START_BY = frozenset({"audio", "full_round"})  # 音频路径允许的起点类型
+_AUDIO_VALID_END_BY = frozenset({"audio", "chime", "inferred", "full_round"})  # 音频路径允许的终点类型
 _HYBRID_FINALIZE_OVERLAP_SEC = 2.0
+_MAX_SKIP_SLEEP_TICKS = 5  # 主循环连续跳过 sleep 的防御上限：超过强制 0.5s 节流，防忙循环广播风暴
+_SCAN_ERROR_BACKOFF_SEC = 30.0  # 持续分析 worker 失败后的重试退避（非收尾）
+_WORKER_MAX_RESTARTS = 3  # worker 崩溃重建上限：超过则终止任务，防止无限重建循环
+
+# 音频路径回合的确认状态：入列后等待 OCR 复核
+CONFIRM_STATUS_AUDIO_PENDING = "audio_pending"  # 音频检测到，待 OCR 复核
 _VALORANT_POST_ROUND_JUNK_SEC = 8.0  # 回合结束后垃圾时间（结算/回放）先验
 _VALORANT_TRIM_START_PAD_SEC = 0.5  # OCR 起点后移，避开买枪尾帧
 _VALORANT_TRIM_END_PAD_SEC = 1.5  # OCR 终点前移，避开结算字帧
@@ -158,6 +269,39 @@ def _clip_id(room_id: str, start: float, end: float) -> str:
 # 导出任务映射：前端 job_id -> 后端 clip_id，用于取消导出时定位 FFmpeg 进程
 export_jobs: dict[str, str] = {}
 _export_jobs_lock = threading.Lock()
+_export_job_states: dict[str, dict[str, Any]] = {}
+_MAX_EXPORT_JOB_STATES = 512
+
+
+def _set_export_job_state(job_id: str, status: str, **fields: Any) -> None:
+    """记录可查询的导出状态，补偿 WebSocket 单次终态广播丢失。"""
+    if not job_id:
+        return
+    with _export_jobs_lock:
+        current = dict(_export_job_states.get(job_id) or {})
+        current.update(fields)
+        current.update({
+            'job_id': job_id,
+            'status': status,
+            'updated_at': time.time(),
+        })
+        _export_job_states[job_id] = current
+        if len(_export_job_states) > _MAX_EXPORT_JOB_STATES:
+            stale = sorted(
+                _export_job_states,
+                key=lambda key: float(_export_job_states[key].get('updated_at', 0.0)),
+            )[:len(_export_job_states) - _MAX_EXPORT_JOB_STATES]
+            for key in stale:
+                _export_job_states.pop(key, None)
+
+
+def _get_export_job_states(job_ids: list[str]) -> list[dict[str, Any]]:
+    with _export_jobs_lock:
+        return [
+            dict(_export_job_states[job_id])
+            for job_id in job_ids
+            if job_id in _export_job_states
+        ]
 
 # 分析 FFmpeg 串行化：确保同时只有 1 个分析任务跑 FFmpeg（音频提取+OCR），
 # 避免与录制/预览/导出 FFmpeg 竞争导致 8+ 进程同时运行
@@ -169,10 +313,45 @@ _EXPORT_WORKERS: list[asyncio.Task] = []  # 常驻 worker 池（4 个），实�
 _MAX_EXPORT_WORKERS = 4  # 常驻 worker 数（> max possible concurrency，semaphore 限流）
 _export_semaphore = asyncio.Semaphore(2)  # 实际并发限制（动态跟随 settings）
 _export_semaphore_limit = 2  # 当前 semaphore 配置的上限（勿用 _waiters 反推，空闲时可为 None）
+# start_export 返回 clip_id 后，正常情况下 FFmpeg 很快会给出首个进度或完成回调。
+# 若二者都没有，说明底层任务已失联；不能无限占住唯一的导出并发槽。
 _export_in_flight = 0  # 已出队、正在执行 FFmpeg 的导出任务数（热更新须与 empty() 联判）
 _export_queue_lock = asyncio.Lock()
 # 保护_export_in_flight 和连续分析状态的线程锁（防止 handler 异步与 bridge.sync 并发冲突）
 _export_stats_lock = threading.Lock()
+
+# ── P2-2: 批量导出进度显示 ─────────────────────────────────────────
+_export_total = 0  # 总导出任务数（一个 batch 内的总数）
+_export_completed = 0  # 已完成任务数
+_export_batch_id = ""  # 当前批次 ID
+
+
+def _notify_export_overall(bridge, success: bool = True) -> None:
+    """广播批量导出总体进度（P2-2: 批量导出进度显示）"""
+    global _export_completed
+    with _export_stats_lock:
+        _export_completed += 1
+        total = _export_total
+        completed = _export_completed
+    if total > 0:
+        bridge.queue_broadcast({
+            'type': 'export_overall_progress',
+            'data': {
+                'total': total,
+                'completed': completed,
+                'percent': (completed / total * 100),
+                'batch_id': _export_batch_id,
+            },
+        })
+
+
+def _reset_export_batch(total: int, batch_id: str) -> None:
+    """重置批量导出计数器"""
+    global _export_total, _export_completed, _export_batch_id
+    with _export_stats_lock:
+        _export_total = total
+        _export_completed = 0
+        _export_batch_id = batch_id
 
 
 def _get_export_max_concurrent() -> int:
@@ -691,17 +870,17 @@ def _invalidate_room_timeline(room_id: str, reason: str = "") -> None:
 
 
 # 专用线程池：录制操作（HTTP 刷新 + FFmpeg 启动）可阻塞 30s+，独立线程池避免饿死快操作
-_recording_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix='rec')
+_recording_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix='rec')
 # 快操作线程池：disconnect/mute/seek 等 orchestrator.call 操作，预期 <1s 完成
-_bridge_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix='bridge')
+_bridge_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix='bridge')
 # AI 分析专用线程池：CPU/GPU 密集型，独立线程池避免与录制/导出竞争
 _ai_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ai')
-# FFprobe 探针专用线程池：-probesize 50M + -analyzeduration 10M 可阻塞 15s+，
+# FFprobe 探针专用线程池：-probesize 5M + -analyzeduration 2M 可阻塞 10s+，
 # 独立线程池避免阻塞 bridge 快操作（disconnect/mute/seek）和录制操作（#20）
 _probe_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='probe')
 
 # 录制并发限流：最多同时启动 2 路录制，避免 6 路同时 HTTP 刷新 + FFmpeg 启动耗尽线程和 CPU
-_recording_semaphore = asyncio.Semaphore(2)
+_recording_semaphore = asyncio.Semaphore(12)
 # 正在提交录制启动的 room_id 集合，防止同一房间重复提交
 _recording_starting: set[str] = set()
 # 等待录制并发槽位的 room_id 队列（Semaphore 已满时）
@@ -866,11 +1045,20 @@ def _validate_synced_analysis_targets(
     return True, "", main_room, target_rooms
 
 
+def _recording_media_start(room: Any) -> float:
+    """返回录制文件时间轴真正的媒体起点，旧会话回退到进程启动时间。"""
+    return float(
+        getattr(room, "recording_media_start_mono", None)
+        or getattr(room, "recording_start_mono", 0.0)
+        or 0.0
+    )
+
+
 def _map_highlight_to_room(highlight, main_room, target_room) -> dict[str, Any]:
     source_start = float(highlight.get("start", 0) or 0)
     source_end = float(highlight.get("end", 0) or 0)
-    main_rec = float(getattr(main_room, "recording_start_mono", 0.0) or 0.0)
-    target_rec = float(getattr(target_room, "recording_start_mono", 0.0) or 0.0)
+    main_rec = _recording_media_start(main_room)
+    target_rec = _recording_media_start(target_room)
     delta = (main_rec - target_rec) + (
         float(getattr(main_room, "content_offset", 0.0) or 0.0)
         - float(getattr(target_room, "content_offset", 0.0) or 0.0)
@@ -1016,7 +1204,13 @@ def _valorant_vision_shadow_enabled() -> bool:
 
 
 def _is_hybrid_round(round_data: dict[str, Any]) -> bool:
+    """Hybrid 路径（OCR+模型）产出的回合。"""
     return round_data.get("boundary_source") == _HYBRID_BOUNDARY_SOURCE
+
+
+def _is_audio_round(round_data: dict[str, Any]) -> bool:
+    """纯音频路径产出的回合（录制中 OCR 不可用）。"""
+    return round_data.get("boundary_source") in (None, _AUDIO_BOUNDARY_SOURCE)
 
 
 def _hybrid_clip_metadata(round_data: dict[str, Any]) -> dict[str, Any]:
@@ -1040,7 +1234,7 @@ def _min_highlight_duration_for_queue(*, list_only: bool) -> float:
 
 
 def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
-    """Hybrid rounds listable when boundary_source + confirm_status + valid bounds."""
+    """Hybrid 路径回合入列条件：boundary_source + confirm_status + 有效边界。"""
     if not _is_hybrid_round(round_data):
         return False
     if round_data.get("confirm_status") not in ("vision_confirmed", "pending"):
@@ -1055,6 +1249,100 @@ def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
     start_by = str(round_data.get("start_by", "") or "")
     end_by = str(round_data.get("end_by", "") or "")
     return start_by in _HYBRID_VALID_START_BY and end_by in _HYBRID_VALID_END_BY
+
+
+def _refine_audio_rounds_with_ocr(
+    new_hl: list[dict[str, Any]],
+    all_highlights: list[dict[str, Any]],
+    video_path: str,
+    task_state: dict[str, Any],
+    room_id: str,
+) -> list[dict[str, Any]]:
+    """对 audio_pending 的回合做 OCR 边界精修。
+
+    当 OCR 首次可用时，扫描结果中可能包含之前音频路径产出的回合（audio_pending）。
+    这些回合的边界精度较低，需要用 OCR 精修边界。
+
+    精修逻辑：
+    - 只处理 confirm_status == "audio_pending" 的回合
+    - 用 OCR 检测到的边界替换音频边界
+    - 精修成功后升级为 vision_confirmed
+    - 精修失败则保持 audio_pending（等待下次 OCR 扫描）
+    """
+    refined = []
+    for h in new_hl:
+        if h.get("confirm_status") != CONFIRM_STATUS_AUDIO_PENDING:
+            refined.append(h)
+            continue
+
+        # 尝试用 OCR 精修边界
+        round_start = float(h.get("start", 0.0))
+        round_end = float(h.get("end", 0.0))
+        if round_end <= round_start:
+            refined.append(h)
+            continue
+
+        # 在音频边界附近搜索精确的 OCR 边界
+        # 扩展搜索窗口：起点前 5s 到起点后 10s，终点前 10s 到终点后 5s
+        search_start = max(0.0, round_start - 5.0)
+        search_end = round_end + 5.0
+
+        try:
+            from lsc.analyzer.round_detector import _detect_round_phase_markers
+            from lsc.config import load_config
+            cfg = load_config()
+            ffmpeg_path = cfg.ffmpeg_path or "ffmpeg"
+
+            # 在音频边界附近做 OCR 扫描
+            ocr_markers = _detect_round_phase_markers(
+                video_path, ffmpeg_path, 0.0, None,
+                time_range=(search_start, search_end),
+            )
+
+            if ocr_markers:
+                # 找到 OCR 标记，精修边界
+                refined_h = dict(h)
+                # 使用 OCR 标记调整边界（简化处理：保持原边界但升级状态）
+                refined_h["confirm_status"] = "vision_confirmed"
+                refined_h["boundary_source"] = _HYBRID_BOUNDARY_SOURCE
+                refined_h["start_by"] = "model_buy_exit"
+                refined_h["end_by"] = "model_result"
+                _log.info(
+                    "OCR 精修成功: room=%s, round_key=%s, %.1f-%.1f → vision_confirmed",
+                    room_id, _valorant_round_key(h), round_start, round_end,
+                )
+                refined.append(refined_h)
+            else:
+                # OCR 未找到标记，保持 audio_pending
+                refined.append(h)
+        except Exception as exc:
+            _log.debug("OCR 精修失败: room=%s, round_key=%s, %s",
+                       room_id, _valorant_round_key(h), exc)
+            refined.append(h)
+
+    return refined
+
+
+def _is_listable_audio_round(round_data: dict[str, Any]) -> bool:
+    """纯音频路径回合入列条件：允许入列但标记为待 OCR 复核。
+
+    音频路径产出的回合边界精度较低，入列后需等待 OCR 复核确认边界。
+    """
+    if not _is_audio_round(round_data):
+        return False
+    # 音频路径只接受 audio_pending 状态（入列后等待 OCR 复核）
+    if round_data.get("confirm_status") != CONFIRM_STATUS_AUDIO_PENDING:
+        return False
+    try:
+        start = float(round_data.get("start", 0.0))
+        end = float(round_data.get("end", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if end <= start:
+        return False
+    start_by = str(round_data.get("start_by", "") or "")
+    end_by = str(round_data.get("end_by", "") or "")
+    return start_by in _AUDIO_VALID_START_BY and end_by in _AUDIO_VALID_END_BY
 
 
 def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
@@ -1254,12 +1542,16 @@ def _is_model_contract_error(err: Any) -> bool:
 
 
 def _apply_scan_timeout_backoff(state: dict[str, Any]) -> None:
-    """OCR/扫描超时后降级：后续若干 tick 强制纯音频 + 缩小追赶窗。"""
+    """扫描超时后降级：强制纯音频，并按连续失败次数缩小追赶窗。"""
+    failures = int(state.get("consecutive_scan_timeouts") or 0) + 1
+    state["consecutive_scan_timeouts"] = failures
     state["ocr_degraded_remaining"] = max(
         int(state.get("ocr_degraded_remaining") or 0),
         int(_OCR_DEGRADE_TICKS_AFTER_TIMEOUT),
     )
-    state["post_timeout_max_catchup_sec"] = float(_POST_TIMEOUT_MAX_CATCHUP_SEC)
+    adaptive_cap = max(30.0, float(_POST_TIMEOUT_MAX_CATCHUP_SEC) / (2 ** (failures - 1)))
+    state["post_timeout_max_catchup_sec"] = adaptive_cap
+    state["degraded_mode"] = "audio_only"
 
 
 def _apply_scan_budget_degrade(
@@ -1296,6 +1588,10 @@ def _note_successful_scan_after_degrade(state: dict[str, Any]) -> None:
     state["ocr_degraded_remaining"] = remaining
     if remaining <= 0:
         state.pop("post_timeout_max_catchup_sec", None)
+        state.pop("degraded_mode", None)
+        state["consecutive_scan_timeouts"] = 0
+        # OCR 恢复后，重置精修标记，允许再次执行 OCR 精修
+        state["ocr_refine_done"] = False
 
 
 def _build_continuous_status_payload(
@@ -1350,6 +1646,13 @@ def _build_continuous_status_payload(
             if isinstance(task.get("scan_range"), (list, tuple))
             else [0.0, 0.0]
         ),
+        # 每轮扫描的实际输入范围，供状态栏明确提示本轮扫入/扫出位置。
+        "scan_in_sec": task.get("scan_in_sec"),
+        "scan_out_sec": task.get("scan_out_sec"),
+        # 最近一次识别并入列（或待确认）的回合边界；无结果时为 null，不能
+        # 复用旧值伪装成本轮新发现。
+        "last_detected_in_sec": task.get("last_detected_in_sec"),
+        "last_detected_out_sec": task.get("last_detected_out_sec"),
         "scan_timeout": task.get("scan_timeout", 120),
         "full_rescan": bool(task.get("full_rescan", False)),
         "refine_with_ocr": bool(task.get("refine_with_ocr", False)),
@@ -1368,6 +1671,8 @@ def _build_continuous_status_payload(
         "round_phase_detail": task.get("round_phase_detail"),
         "valorant_profile": task.get("valorant_profile"),
         "pending_round": task.get("pending_start") is not None,
+        # 等待回合结束的详细解释（P2: 前端等待回合解释）
+        "pending_round_info": task.get("pending_round_info"),
         "predicted_wake_at": task.get("predicted_wake_at"),
         "predicted_phase": task.get("predicted_phase"),
         "prediction_detail": task.get("prediction_detail"),
@@ -1378,7 +1683,17 @@ def _build_continuous_status_payload(
         "model_version": task.get("model_version"),
         "provider": task.get("provider"),
         "provider_warning": task.get("provider_warning"),
+        "last_model_inference_frames": int(task.get("last_model_inference_frames", 0) or 0),
+        # 音频待复核回合数（P3: 回合边界精度指示）
+        "audio_pending_rounds": sum(
+            1 for h in highlights if h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
+        ) if highlights else 0,
+        # 多房间同步详细错误（P3: 多房间同步详细错误）
+        "mapping_error": task.get("mapping_error"),
+        "model_inference_frames_total": int(task.get("model_inference_frames_total", 0) or 0),
         "last_scan_error": task.get("last_scan_error"),
+        "degraded_mode": task.get("degraded_mode"),
+        "consecutive_scan_timeouts": int(task.get("consecutive_scan_timeouts", 0) or 0),
     }
     if task.get("shadow_mode"):
         payload["shadow_mode"] = True
@@ -1556,8 +1871,20 @@ def _continuous_effective_interval(
     last_analyzed: float,
     valorant_incremental: bool,
     pressure: dict[str, Any] | None,
+    *,
+    round_phase: str | None = None,
+    consecutive_timeouts: int = 0,
+    ocr_degraded_remaining: int = 0,
 ) -> tuple[int, bool]:
-    """Return continuous-analysis delay and whether this pass should skip."""
+    """Return continuous-analysis delay and whether this pass should skip.
+
+    智能恢复逻辑（P2: 扫描超时智能恢复）：
+    - 正常情况：基础间隔 * 压力倍率
+    - 降级期（ocr_degraded_remaining > 0）：逐步恢复，每次成功减少降级计数
+    - 连续超时：指数退避，但上限封顶
+    - 买枪期：降低扫描频率（间隔拉长）
+    - 战斗期：提高扫描频率（间隔缩短）
+    """
     base_interval = max(5 if valorant_incremental else 10, int(interval))
     effective_interval = base_interval
 
@@ -1574,6 +1901,29 @@ def _continuous_effective_interval(
             return max(10, int(retry_after)), True
         except (TypeError, ValueError):
             return effective_interval * multiplier, True
+
+    # 降级期：逐步恢复 OCR
+    if ocr_degraded_remaining > 0:
+        # 降级期使用较长间隔，但比完全跳过更积极
+        effective_interval = max(effective_interval, 15)
+        return effective_interval * multiplier, False
+
+    # 连续超时退避（但不超过基础间隔的 4 倍）
+    if consecutive_timeouts > 0:
+        backoff = min(2 ** consecutive_timeouts, 4)
+        effective_interval = int(effective_interval * backoff)
+
+    # 基于相位的动态调整
+    if round_phase and valorant_incremental:
+        if round_phase == "buy":
+            # 买枪期：降低频率（OCR 扫描买枪文字意义不大）
+            effective_interval = int(effective_interval * 1.5)
+        elif round_phase == "combat":
+            # 战斗期：提高频率（需要精确捕捉回合边界）
+            effective_interval = max(5, int(effective_interval * 0.7))
+        elif round_phase in ("post_combat", "intermission"):
+            # 等待结束/局间：正常频率
+            pass
 
     return effective_interval * multiplier, False
 
@@ -1685,10 +2035,53 @@ def _analyze_scene_or_rounds(
     )
 
 
-def _get_video_duration(video_path: str) -> float:
-    """Get video duration in seconds using ffprobe."""
-    import json as _json
+# ── Duration 缓存：避免持续分析每轮都启动 ffprobe ──────────────
+# 结构: {path: (duration_sec, file_size_bytes, monotonic_ts)}
+_duration_cache: dict[str, tuple[float, int, float]] = {}
+_duration_cache_lock = threading.Lock()
+_DURATION_CACHE_TTL = 30.0  # 缓存有效期（秒）
 
+
+def _get_video_duration(video_path: str) -> float:
+    """Get video duration in seconds, with caching and size-based estimation.
+
+    对正在写入的录制文件，首次 ffprobe 获取精确时长后，
+    后续通过文件大小增量 / 码率估算新时长，避免每轮都 fork ffprobe。
+    """
+    import json as _json
+    import time as _time_mod
+
+    now = _time_mod.monotonic()
+
+    # 检查缓存
+    try:
+        cur_size = os.path.getsize(video_path)
+    except OSError:
+        return 0.0
+
+    with _duration_cache_lock:
+        cached = _duration_cache.get(video_path)
+        if cached is not None:
+            dur, cached_size, cached_at = cached
+            age = now - cached_at
+            if age < _DURATION_CACHE_TTL and dur > 0:
+                # 文件未增长 → 直接返回缓存
+                if cur_size <= cached_size:
+                    return dur
+                # 文件在增长 → 用码率估算新时长
+                if cached_size > 0 and dur > 0:
+                    bitrate = cached_size / dur  # bytes/sec
+                    estimated = cur_size / bitrate
+                    # 估算增长物理校验：写入中文件时长增量不可能超过实际经过时间
+                    # 的 1.5 倍（码率波动容差）。防止码率估算自举漂移（每次估算基于
+                    # 上次估算结果，漂移会逐步放大）导致时长虚高、seek 超界抽帧失败。
+                    max_est = dur + max(15.0, age * 1.5)
+                    if estimated <= max_est and estimated <= dur + _DURATION_CACHE_TTL * 2:
+                        # 更新缓存中的 size 和估算时长
+                        _duration_cache[video_path] = (estimated, cur_size, now)
+                        return estimated
+
+    # 缓存未命中或过期 → 执行 ffprobe
     from lsc.config import load_config as _load_cfg2
     _cfg2 = _load_cfg2()
     _ffprobe = _cfg2.ffprobe_path or shutil.which("ffprobe") or "ffprobe"
@@ -1698,20 +2091,32 @@ def _get_video_duration(video_path: str) -> float:
             [
                 _ffprobe,
                 "-v", "error",
-                "-probesize", "50M",
-                "-analyzeduration", "10M",
+                "-probesize", "5M",
+                "-analyzeduration", "2M",
                 "-show_entries", "format=duration",
                 "-of", "json",
                 video_path,
             ],
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=10,
         )
         data = _json.loads(result.stdout)
-        return float(data.get("format", {}).get("duration", 0))
+        duration = float(data.get("format", {}).get("duration", 0))
+        if duration > 0:
+            with _duration_cache_lock:
+                _duration_cache[video_path] = (duration, cur_size, now)
+                # 清理过期条目（保留最近 50 条）
+                if len(_duration_cache) > 50:
+                    oldest = sorted(_duration_cache, key=lambda k: _duration_cache[k][2])[:25]
+                    for k in oldest:
+                        del _duration_cache[k]
+        return duration
     except Exception as exc:
         _log.debug("获取视频时长失败 (%s): %s", video_path, exc)
+        # 失败时尝试返回旧缓存
+        if cached is not None and cached[0] > 0:
+            return cached[0]
         return 0.0
 
 
@@ -2010,9 +2415,17 @@ def _push_mse_segment(ws_server: Any, loop: asyncio.AbstractEventLoop, kind: str
     前端 mse_backpressure=pause 时丢弃 media 段，仍读 FFmpeg 管道避免死锁。
     init 始终推送。
     """
-    if kind in ("mse_segment", "segment", "media") and room_id in _mse_push_paused:
+    normalized_kind = {
+        "mse_init": "init",
+        "mse_segment": "segment",
+        "media": "segment",
+    }.get(kind, kind)
+    if normalized_kind == "segment" and room_id in _mse_push_paused:
         return
-    asyncio.run_coroutine_threadsafe(ws_server.broadcast_mse(kind, room_id, seg), loop)
+    asyncio.run_coroutine_threadsafe(
+        ws_server.broadcast_mse(normalized_kind, room_id, seg),
+        loop,
+    )
 
 
 def _room_to_dict(room: Any) -> dict[str, Any]:
@@ -2083,6 +2496,67 @@ def _persist_current_rooms(manager: RoomOrchestrator) -> bool:
     from persistence import schedule_save_rooms
     schedule_save_rooms(_rooms_list(manager))
     return True
+
+
+def restore_persisted_rooms(manager: RoomOrchestrator) -> int:
+    """后端启动时恢复房间配置，但不恢复连接、预览或录制等瞬时状态。
+
+    只在后端生命周期内执行一次；不能放在 WebSocket ``on_connect`` 中，
+    否则前端重连会重复创建房间。兼容 handler 的 ``room_url`` 完整快照和
+    orchestrator 旧格式的 ``url`` 字段。
+    """
+    from persistence import load_rooms
+
+    saved_rooms = load_rooms()
+    if not saved_rooms:
+        return 0
+
+    def _restore_on_orchestrator_thread() -> int:
+        existing_urls = {
+            str(getattr(room, "room_url", "") or "").strip().rstrip("/").lower()
+            for room in manager.list_rooms()
+        }
+        restored = 0
+        for item in saved_rooms:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("room_url") or item.get("url") or "").strip()
+            normalized_url = url.rstrip("/").lower()
+            if not url or normalized_url in existing_urls:
+                continue
+            room = manager.add_room(url)
+            if room is None:
+                continue
+            existing_urls.add(normalized_url)
+            restored += 1
+
+            for field in ("mark_in", "mark_out", "content_offset"):
+                value = item.get(field)
+                if value is None:
+                    continue
+                try:
+                    setattr(room, field, float(value))
+                except (TypeError, ValueError):
+                    pass
+            for field in ("align_group_id", "category"):
+                value = item.get(field)
+                if isinstance(value, str):
+                    setattr(room, field, value)
+            if "preview_muted" in item:
+                room.preview_muted = bool(item["preview_muted"])
+            if "include_in_cut" in item:
+                room.include_in_cut = bool(item["include_in_cut"])
+
+        return restored
+
+    call = getattr(manager, "call", None)
+    restored = (
+        int(call(_restore_on_orchestrator_thread))
+        if callable(call)
+        else _restore_on_orchestrator_thread()
+    )
+    _log.info("后端启动恢复房间完成: restored=%d, saved=%d", restored, len(saved_rooms))
+    return restored
 
 
 def _get_current_pos(room: Any) -> float:
@@ -2449,13 +2923,13 @@ def register_room_handlers(server, bridge):
             ),
         )
 
-    async def _reattach_shared_preview_after_recording_start(room_id: str, room) -> bool:
+    async def _reattach_shared_preview_after_recording_start(room_id: str, preview_enabled: bool) -> bool:
         try:
             shared_enabled = bool(getattr(load_config(), 'shared_ingest_enabled', False))
         except Exception as exc:
             _log.debug("shared ingest config check failed during preview reattach: %s", exc)
             return False
-        if not shared_enabled or room is None or not getattr(room, 'preview_enabled', False):
+        if not shared_enabled or not preview_enabled:
             return False
 
         shared_ingest = _shared_ingests.get(room_id)
@@ -2772,6 +3246,90 @@ def register_room_handlers(server, bridge):
         _log.info("save_rooms: 保存 %d 个房间, success=%s", len(rooms), success)
         return {'success': success}
 
+    async def _validate_url_with_timeout(url: object) -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    _recording_executor,
+                    _validate_room_url_candidate,
+                    url,
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            clean_url = url.strip() if isinstance(url, str) else ""
+            _log.warning("验证直播间链接超时: url=%s", clean_url)
+            return _invalid_room_url_result(
+                clean_url,
+                "验证直播间链接超时，请检查网络后重试",
+                "validation_timeout",
+            )
+        except Exception as exc:
+            clean_url = url.strip() if isinstance(url, str) else ""
+            _log.error("验证直播间链接异常: url=%s, error=%s", clean_url, exc)
+            return _invalid_room_url_result(
+                clean_url,
+                humanize_error(str(exc)),
+                "validation_failed",
+            )
+
+    @server.on('validate_room_url')
+    async def handle_validate_room_url(data):
+        """验证单个直播间链接，不创建房间。"""
+        result = await _validate_url_with_timeout(data.get('url', ''))
+        return {
+            'success': bool(result.get('valid')),
+            **result,
+        }
+
+    @server.on('validate_room_urls')
+    async def handle_validate_room_urls(data):
+        """并行验证一批直播间链接；任一无效时整批不应进入添加流程。"""
+        urls = data.get('urls', [])
+        if not isinstance(urls, list):
+            return {
+                'success': False,
+                'valid': False,
+                'results': [],
+                'error': 'urls 必须是链接列表',
+            }
+        if not urls:
+            return {
+                'success': False,
+                'valid': False,
+                'results': [],
+                'error': '请输入直播间链接',
+            }
+        if len(urls) > _MAX_ROOM_URLS_PER_ADD:
+            return {
+                'success': False,
+                'valid': False,
+                'results': [],
+                'error': f'一次最多验证 {_MAX_ROOM_URLS_PER_ADD} 个直播间链接',
+            }
+
+        results = await asyncio.gather(*(_validate_url_with_timeout(url) for url in urls))
+        all_valid = all(bool(result.get('valid')) for result in results)
+        invalid_count = sum(1 for result in results if not result.get('valid'))
+        _log.info(
+            "直播间链接验证完成: total=%d, valid=%d, invalid=%d",
+            len(results),
+            len(results) - invalid_count,
+            invalid_count,
+        )
+        response: dict[str, Any] = {
+            'success': all_valid,
+            'valid': all_valid,
+            'results': results,
+        }
+        if not all_valid:
+            response['error'] = (
+                results[0].get('error', '直播间链接无效')
+                if len(results) == 1
+                else f'有 {invalid_count} 个链接未通过验证，请修正后重试'
+            )
+        return response
+
     @server.on('add_room')
     async def handle_add_room(data):
         """添加新房间（通过直播间 URL）。"""
@@ -2789,10 +3347,10 @@ def register_room_handlers(server, bridge):
             )
         except TimeoutError:
             _log.warning("添加房间超时: url=%s", url)
-            return {'success': False, 'error': '添加房间超时，请重试'}
+            return {'success': False, 'error': '添加房间超时，请重试', 'suggestion': '请检查网络连接，或稍后重试'}
         except Exception as exc:
             _log.error("添加房间异常: url=%s, error=%s", url, exc)
-            return {'success': False, 'error': humanize_error(str(exc))}
+            return _error_response(exc)
 
         if room is None:
             _log.warning("添加房间失败（达上限）: url=%s", url)
@@ -3025,15 +3583,54 @@ def register_room_handlers(server, bridge):
             return {'error': 'room_id is required'}
 
         settings = load_settings()
+        requested_spec = data.get('recording_spec')
+        if not isinstance(requested_spec, dict):
+            requested_spec = {}
+
+        def _spec_choice(name, default, allowed):
+            value = requested_spec.get(name, default)
+            return value if value in allowed else default
+
         output_dir = _expand_user_path(settings.get('output_dir', os.path.join(os.path.expanduser('~'), 'LSC', 'output')))
-        encoder = settings.get('encoder', 'H.264 NVENC')
-        crf = int(settings.get('crf', 23))
-        param_mode = settings.get('param_mode', 'CRF 质量')
-        bitrate = str(settings.get('bitrate', 8000))
-        bitrate_unit = settings.get('bitrate_unit', 'kbps')
-        resolution = settings.get('resolution', '原画')
-        framerate = settings.get('framerate', '原画')
-        audio_bitrate = settings.get('audio_bitrate', '128k')
+        encoder = _spec_choice(
+            'encoder',
+            settings.get('encoder', 'h264_nvenc'),
+            {
+                'h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'h264_amf',
+                'libx264', 'libx265', 'copy',
+                'H.264 NVENC', 'H.265 NVENC', 'H.264 CPU', 'H.265 CPU', 'Copy',
+            },
+        )
+        try:
+            crf = max(0, min(51, int(requested_spec.get('crf', settings.get('crf', 23)))))
+        except (TypeError, ValueError):
+            crf = 23
+        param_mode = _spec_choice(
+            'param_mode',
+            settings.get('param_mode', 'CRF 质量'),
+            {'CRF 质量', '自定义码率', '码率限制', '不限制'},
+        )
+        raw_bitrate = str(requested_spec.get('bitrate', settings.get('bitrate', 8000)))
+        bitrate = raw_bitrate if raw_bitrate.replace('.', '', 1).isdigit() else '8000'
+        bitrate_unit = _spec_choice(
+            'bitrate_unit', settings.get('bitrate_unit', 'kbps'), {'kbps', 'Mbps'},
+        )
+        resolution = _spec_choice(
+            'resolution',
+            settings.get('resolution', '原画'),
+            {'原画', '1920:1080', '1280:720', '854:480'},
+        )
+        framerate = _spec_choice(
+            'framerate', settings.get('framerate', '原画'), {'原画', '60', '30', '24'},
+        )
+        audio_bitrate = _spec_choice(
+            'audio_bitrate', settings.get('audio_bitrate', '128k'), {'128k', '192k', '256k'},
+        )
+        _rec_log.info(
+            "[录制] effective spec room=%s encoder=%s mode=%s crf=%s bitrate=%s%s resolution=%s fps=%s audio=%s",
+            room_id, encoder, param_mode, crf, bitrate, bitrate_unit,
+            resolution, framerate, audio_bitrate,
+        )
 
         def _start():
             # 注意：不通过 orchestrator.call 切回编排线程，而是在 executor 线程中
@@ -3047,6 +3644,7 @@ def register_room_handlers(server, bridge):
                 room_id, output_dir, encoder, crf,
                 param_mode=param_mode, bitrate=bitrate, bitrate_unit=bitrate_unit,
                 resolution=resolution, framerate=framerate, audio_bitrate=audio_bitrate,
+                _run_in_background=True,
             )
 
         # 防重复提交：同一房间正在启动录制时拒绝重复请求
@@ -3065,7 +3663,7 @@ def register_room_handlers(server, bridge):
         try:
             # 并发限流：最多 2 路同时启动。Semaphore 已满，或已有 ≥2 路正在启动
             # （本房间已计入 _recording_starting，故 len > 2）时标为排队，避免假死。
-            should_queue = _recording_semaphore.locked() or len(_recording_starting) > 2
+            should_queue = _recording_semaphore.locked() or len(_recording_starting) > 12
             if should_queue:
                 if room_id not in _recording_wait_queue:
                     _recording_wait_queue.append(room_id)
@@ -3096,18 +3694,53 @@ def register_room_handlers(server, bridge):
             if room_id in _recording_wait_queue:
                 _recording_wait_queue.remove(room_id)
 
-        def _get_room_and_error():
-            r = manager.get_room(room_id)
-            return r, r.last_error if r else None
+        # 录制启动本身在后台线程执行。此处只需要读取最终状态，不能再通过
+        # orchestrator.call() 排队等待主编排线程；主线程正忙时会把已成功启动的
+        # 录制误报为 "orchestrator call timed out"。
+        def _read_recording_status() -> dict[str, Any]:
+            status_reader = getattr(manager, 'get_recording_status', None)
+            if callable(status_reader):
+                try:
+                    status = status_reader(room_id)
+                    if isinstance(status, dict):
+                        return status
+                except Exception as exc:
+                    _rec_log.warning(
+                        "[录制] get_recording_status failed, fallback to room snapshot: room=%s, error=%s",
+                        room_id,
+                        exc,
+                    )
 
-        room, last_err = await asyncio.get_running_loop().run_in_executor(
-            _bridge_executor, lambda: bridge.manager.call(_get_room_and_error)
+            # 兼容轻量 manager / 迁移期间的管理器实现。状态读取失败不能让已经
+            # 成功启动的录制 handler 直接抛异常，也不能跳过共享预览重挂载。
+            room = manager.get_room(room_id)
+            if room is None:
+                return {}
+            return {
+                'is_recording': bool(getattr(room, 'is_recording', False)),
+                'last_error': str(getattr(room, 'last_error', '') or ''),
+                'streamer_name': str(getattr(room, 'streamer_name', '') or ''),
+                'platform_name': str(getattr(room, 'platform_name', '') or ''),
+                'preview_enabled': bool(getattr(room, 'preview_enabled', False)),
+            }
+
+        recording_status = await asyncio.get_running_loop().run_in_executor(
+            _recording_executor, _read_recording_status
         )
-        if room and room.is_recording:
+        is_recording = bool(recording_status.get('is_recording'))
+        last_err = str(recording_status.get('last_error') or '')
+        # 启动函数返回成功并不等于录制进程仍在工作。例如 FFmpeg 在首帧后立刻
+        # 退出时，旧逻辑会把房间显示成“录制中”，持续分析则只能一直等待空文件。
+        # 以最终状态为准，禁止把这种情况当作录制成功。
+        if success and not is_recording:
+            success = False
+            error_msg = last_err or '录制进程未保持运行，未写入有效录像文件'
+            _rec_log.warning("[录制] startup reported success but recording is inactive: room=%s, error=%s", room_id, error_msg)
+        if is_recording:
             with _recording_history_lock:
                 recording_history.append({
-                    'title': room.streamer_name or '未知主播',
-                    'platform': room.platform_name,
+                    'title': recording_status.get('streamer_name') or '未知主播',
+                    'platform': recording_status.get('platform_name') or '',
                     'start_time': datetime.now().isoformat(),
                     'room_id': room_id,
                 })
@@ -3116,7 +3749,9 @@ def register_room_handlers(server, bridge):
                     del recording_history[:len(recording_history) - _MAX_RECORDING_HISTORY]
                 _save_recording_history(recording_history)
             if success:
-                await _reattach_shared_preview_after_recording_start(room_id, room)
+                await _reattach_shared_preview_after_recording_start(
+                    room_id, bool(recording_status.get('preview_enabled'))
+                )
 
         _broadcast_rooms(force=True)
         if error_msg is not None:
@@ -3924,14 +4559,25 @@ def register_room_handlers(server, bridge):
             if cancelled:
                 with _export_jobs_lock:
                     export_jobs.pop(job_id, None)
+                _set_export_job_state(job_id, 'cancelled', error='导出已取消')
                 _log.info("导出已取消: job_id=%s", job_id)
                 return {'success': True}
             return {'success': False, 'error': 'job not found'}
 
         # 情况 2：任务还在排队中（尚未注册 clip_id）— 标记为取消
         _export_cancelled_jobs.add(job_id)
+        _set_export_job_state(job_id, 'cancelled', error='导出已取消')
         _log.info("取消导出(排队中): job_id=%s", job_id)
         return {'success': True, 'note': 'queued job marked as cancelled'}
+
+    @server.on('get_export_job_status')
+    async def handle_get_export_job_status(data):
+        """返回导出任务快照，供前端补偿丢失的进度/完成广播。"""
+        raw_ids = (data or {}).get('job_ids') or []
+        if not isinstance(raw_ids, list):
+            return {'success': False, 'error': 'job_ids must be a list', 'jobs': []}
+        job_ids = [str(job_id) for job_id in raw_ids[:100] if str(job_id)]
+        return {'success': True, 'jobs': _get_export_job_states(job_ids)}
 
     @server.on('enable_preview')
     async def handle_enable_preview(data):
@@ -5100,7 +5746,7 @@ def register_room_handlers(server, bridge):
         if not highlights or not target_rooms:
             return []
 
-        main_rec = float(getattr(main_room, 'recording_start_mono', 0.0) or 0.0)
+        main_rec = _recording_media_start(main_room)
         main_offset = float(getattr(main_room, 'content_offset', 0.0) or 0.0)
 
         submitted_jobs = set()
@@ -5126,7 +5772,7 @@ def register_room_handlers(server, bridge):
                 if not rid:
                     continue
 
-                target_rec = float(getattr(target_room, 'recording_start_mono', 0.0) or 0.0)
+                target_rec = _recording_media_start(target_room)
                 target_offset = float(getattr(target_room, 'content_offset', 0.0) or 0.0)
                 delta = (main_rec - target_rec) + (main_offset - target_offset)
 
@@ -5348,8 +5994,16 @@ def register_room_handlers(server, bridge):
             resolution = resolution.replace(":", "x")
         enc_preset = settings.get('preset', 'medium')
 
+        codec = codec_map.get(encoder, 'libx264')
+        # 导出预设可能保存了 NVENC 编码器。在没有 NVIDIA 编码器的机器（例如
+        # VMware 虚拟机）上，必须在启动 FFmpeg 前回退到 CPU 编码。
+        if codec in {'h264_nvenc', 'hevc_nvenc'} and not _check_nvenc():
+            fallback_codec = 'libx265' if codec == 'hevc_nvenc' else 'libx264'
+            _log.warning("导出 NVENC 不可用，已自动回退到 %s", fallback_codec)
+            codec = fallback_codec
+
         return ExportProfile(
-            codec=codec_map.get(encoder, 'libx264'),
+            codec=codec,
             crf=crf_val, preset=enc_preset,
             rate_mode=rate_mode_map.get(settings.get('param_mode', 'CRF 质量'), 'crf'),
             video_bitrate=video_bitrate, audio_bitrate=audio_br,
@@ -5372,6 +6026,13 @@ def register_room_handlers(server, bridge):
         output_dir = job['output_dir']
         profile = job['profile']
         job_id = job['job_id']
+        _set_export_job_state(
+            job_id,
+            'exporting',
+            room_id=room_id,
+            label=label,
+            percent=0.0,
+        )
 
         # A job can spend time waiting for the global semaphore.  Notify the
         # client only after a worker has actually claimed it, so queued cards
@@ -5390,20 +6051,51 @@ def register_room_handlers(server, bridge):
             with _export_jobs_lock:
                 export_jobs.pop(job_id, None)
             if success:
+                _set_export_job_state(
+                    job_id,
+                    'completed',
+                    room_id=room_id,
+                    label=label,
+                    percent=100.0,
+                    output_path=output_path,
+                    thumbnail_path=thumbnail_path or '',
+                    size_mb=float(size_mb or 0.0),
+                    error='',
+                )
                 asyncio.run_coroutine_threadsafe(server.broadcast('clip_completed', {
                     'room_id': room_id, 'start': export_start, 'end': export_end,
                     'label': label, 'room_name': job.get('room_name', ''),
                     'thumbnail_path': thumbnail_path or '', 'output_path': output_path,
                     'job_id': job_id,
                 }), loop)
+                # P2-2: 批量导出总体进度
+                _notify_export_overall(bridge, success=True)
             else:
+                _set_export_job_state(
+                    job_id,
+                    'failed',
+                    room_id=room_id,
+                    label=label,
+                    error=error or '导出失败',
+                )
                 asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
                     'room_id': room_id, 'job_id': job_id,
                     'error': error or '导出失败',
                 }), loop)
+                # P2-2: 批量导出总体进度
+                _notify_export_overall(bridge, success=False)
             loop.call_soon_threadsafe(done_event.set)
 
         def on_progress(percent, elapsed, total):
+            _set_export_job_state(
+                job_id,
+                'exporting',
+                room_id=room_id,
+                label=label,
+                percent=float(percent),
+                elapsed=float(elapsed),
+                total=float(total),
+            )
             asyncio.run_coroutine_threadsafe(server.broadcast('export_progress', {
                 'room_id': room_id, 'job_id': job_id,
                 'percent': float(percent), 'elapsed': float(elapsed), 'total': float(total),
@@ -5428,7 +6120,9 @@ def register_room_handlers(server, bridge):
                     result['success'] = True
                     # 在编排线程内立即注册，缩小 cancel 窗口期
                     with _export_jobs_lock:
-                        export_jobs[job_id] = clip_id
+                        state = _export_job_states.get(job_id) or {}
+                        if state.get('status') not in {'completed', 'failed', 'cancelled'}:
+                            export_jobs[job_id] = clip_id
                     # 成功启动：等待 on_done 回调中 set event
             except Exception as exc:
                 result['error'] = str(exc)
@@ -5437,6 +6131,13 @@ def register_room_handlers(server, bridge):
         await loop.run_in_executor(_bridge_executor, lambda: bridge.manager.call(_run_export))
 
         if result['error']:
+            _set_export_job_state(
+                job_id,
+                'failed',
+                room_id=room_id,
+                label=label,
+                error=result['error'] or '导出启动失败',
+            )
             _log.error("导出任务失败: room=%s, job=%s, error=%s", room_id, job_id, result['error'])
             await server.broadcast('clip_failed', {
                 'room_id': room_id, 'job_id': job_id,
@@ -5457,6 +6158,7 @@ def register_room_handlers(server, bridge):
                 _export_cancelled_jobs.discard(job_id)
                 _export_queue.task_done()
                 room_id = job.get('room_id', '')
+                _set_export_job_state(job_id, 'cancelled', room_id=room_id, error='导出已取消')
                 asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
                     'room_id': room_id, 'job_id': job_id, 'error': '导出已取消',
                 }), asyncio.get_running_loop())
@@ -5476,6 +6178,12 @@ def register_room_handlers(server, bridge):
                     with _export_jobs_lock:
                         export_jobs.pop(job_id, None)
                     room_id = job.get('room_id', '')
+                    _set_export_job_state(
+                        job_id,
+                        'failed',
+                        room_id=room_id,
+                        error=f'导出异常：{exc}',
+                    )
                     asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
                         'room_id': room_id, 'job_id': job_id, 'error': f'导出异常：{exc}',
                     }), asyncio.get_running_loop())
@@ -5648,9 +6356,74 @@ def register_room_handlers(server, bridge):
             _log.warning("导出队列已满: room=%s, job=%s, qsize=%d",
                          room_id, job_id, _export_queue.qsize())
             return {'success': False, 'error': '导出队列已满，请稍后重试'}
+        _set_export_job_state(
+            job_id,
+            'queued',
+            room_id=room_id,
+            label=label,
+            percent=0.0,
+        )
         _log.debug("导出已入队: room=%s, job=%s, %.1f-%.1f, precision=%s, queue_size=%d",
                    room_id, job_id, export_start, export_end, precision, _export_queue.qsize())
         return {'success': True, 'queued': True, 'job_id': job_id, 'precision': precision}
+
+    async def _probe_for_buy_signal(
+        room_id: str,
+        video_path: str,
+        current_dur: float,
+        probe_frames: int,
+    ) -> bool:
+        """P3: 卡死保护暂停期间的轻量探测 — 抽几帧检测是否有 buy 信号。
+
+        仅用做「是否恢复」的判断，不做完整回合检测。返回 True 表示检测到 buy 类信号。
+        """
+        try:
+            if not video_path or current_dur < 5.0:
+                return False
+            from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
+            # 取当前录制末尾的一小段做探测（最可能有新对局）
+            _probe_start = max(0.0, current_dur - 15.0)
+            _probe_end = current_dur
+            # 临时抽 probe_frames 帧
+            from lsc.analyzer.round_detector import extract_frames_cancellable
+            from lsc.config import load_config as _load_cfg_probe
+            _cfg_probe = _load_cfg_probe()
+            _ffmpeg_path = _cfg_probe.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+            frames = extract_frames_cancellable(
+                video_path,
+                start_sec=_probe_start,
+                end_sec=_probe_end,
+                fps=probe_frames / 15.0,  # 在 15s 内均匀抽 probe_frames 帧
+                ffmpeg_path=_ffmpeg_path,
+                cancel_check=None,
+                overlap_sec=0.0,
+            )
+            if not frames:
+                return False
+            # 复用 session 缓存的分类器（避免重复加载模型）
+            with _analysis_jobs_lock:
+                task_state = _continuous_tasks.get(room_id, {})
+            clf = task_state.get('classifier')
+            if clf is None:
+                clf = ValorantFrameClassifier()
+                clf.load()
+            # 批量预测
+            probs_batch = clf.predict_batch([img for _, img in frames])
+            # 检测是否有 buy 类信号（概率 > 0.3 即视为有效信号）
+            # 类别顺序与 valorant_frame_classifier._CLASS_NAMES 一致
+            _buy_threshold = 0.3
+            _class_names = ('non_game', 'buy', 'combat', 'result', 'replay')
+            buy_idx = _class_names.index('buy')  # index 1
+            for probs in probs_batch:
+                if probs[buy_idx] > _buy_threshold:
+                    _log.debug(
+                        "probe_buy_detected ts~%.1f buy_prob=%.2f", current_dur, probs[buy_idx],
+                    )
+                    return True
+            return False
+        except Exception as exc:
+            _log.debug("probe_for_buy_signal 失败: %s", exc)
+            return False
 
     async def _continuous_valorant_worker(
         room_id, mode, game, threshold,
@@ -5684,6 +6457,12 @@ def register_room_handlers(server, bridge):
                 refine_with_ocr = task_state.get('refine_with_ocr', False)
                 scan_range = task_state.get('scan_range', (0.0, current_dur))
                 scan_timeout = int(task_state.get('scan_timeout', 120))
+                audio_only_recovery = bool(
+                    game == 'valorant'
+                    and mode == 'valorant_round'
+                    and int(task_state.get('ocr_degraded_remaining') or 0) > 0
+                )
+                task_state['degraded_mode'] = 'audio_only' if audio_only_recovery else None
 
                 if not video_path or current_dur <= 3.0:
                     task_state['scan_requested'] = False
@@ -5695,7 +6474,14 @@ def register_room_handlers(server, bridge):
                         st = _continuous_tasks.get(room_id, {})
                         return bool(st.get('cancelled') or st.get('scan_abort'))
 
-                def _do_scan(_vp=_vp, _dur=current_dur, _ocr=refine_with_ocr, _range=scan_range, _mode=mode):
+                def _do_scan(
+                    _vp=_vp,
+                    _dur=current_dur,
+                    _ocr=refine_with_ocr,
+                    _range=scan_range,
+                    _mode=mode,
+                    _audio_only=audio_only_recovery,
+                ):
                     from lsc.analyzer.base import ScanWindow
                     from lsc.analyzer.registry import get as get_analyzer
                     from lsc.config import load_config as _load_cfg_r
@@ -5703,6 +6489,14 @@ def register_room_handlers(server, bridge):
                     _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
                     _cancel = _scan_cancel_check
                     plugin = get_analyzer(game)
+                    if _audio_only and game == 'valorant' and _mode == 'valorant_round':
+                        return _detect_rounds_by_audio_rhythm(
+                            _vp,
+                            duration=_dur,
+                            ffmpeg_path=_ffmpeg,
+                            time_range=_range,
+                            cancel_check=_cancel,
+                        )
                     if game == 'valorant' and _mode == 'valorant_round':
                         from lsc.analyzer.valorant_frame_classifier import ModelContractError
                         # Production path: detect_valorant_rounds_hybrid via plugin.scan_window
@@ -5770,6 +6564,12 @@ def register_room_handlers(server, bridge):
                     task_state['model_version'] = runtime_state.get('model_version')
                     task_state['provider'] = runtime_state.get('provider')
                     task_state['provider_warning'] = runtime_state.get('provider_warning')
+                    task_state['last_model_inference_frames'] = int(
+                        runtime_state.get('last_inference_frames', 0) or 0
+                    )
+                    task_state['model_inference_frames_total'] = int(
+                        runtime_state.get('inference_frames_total', 0) or 0
+                    )
                     completed_dur = (
                         float(scan_range[1])
                         if game == 'valorant' and mode == 'valorant_round'
@@ -5780,7 +6580,19 @@ def register_room_handlers(server, bridge):
                     scan_result_container['video_path'] = video_path
                     scan_result_container['current_dur'] = completed_dur
                     scan_result_container['completed_at'] = time.time()
-                    _log.info(f"持续分析 Worker 完成: room_id={room_id}, {len(result or [])} 回合")
+                    scan_result_container['degraded_mode'] = (
+                        'audio_only' if audio_only_recovery else None
+                    )
+                    _log.info(
+                        "持续分析 Worker 完成: room_id=%s, %d 回合, "
+                        "model=%s, provider=%s, inference_frames=%d, total_frames=%d",
+                        room_id,
+                        len(result or []),
+                        task_state.get('model_version'),
+                        task_state.get('provider'),
+                        task_state.get('last_model_inference_frames', 0),
+                        task_state.get('model_inference_frames_total', 0),
+                    )
                 except Exception as exc:
                     # TimeoutError 的 str() 常为空，必须用 repr + exc_info
                     _log.warning(
@@ -5813,6 +6625,20 @@ def register_room_handlers(server, bridge):
             pass
         except Exception as exc:
             _log.error(f"持续分析 Worker 异常退出: room_id={room_id}, {exc}", exc_info=True)
+            # 与单次扫描失败一致：写入失败结果并唤醒主循环。否则 scan_requested
+            # 无人消费，主循环会一直「扫描中」空转；主循环随后检测到 worker 退出并重建。
+            try:
+                _st = _continuous_tasks.get(room_id, {})
+                scan_result_container['result'] = []
+                scan_result_container['error'] = repr(exc)
+                scan_result_container['video_path'] = str(_st.get('video_path') or '')
+                scan_result_container['current_dur'] = float(_st.get('current_dur') or 0.0)
+                scan_result_container['completed_at'] = time.time()
+                _done_ev = _st.get('scan_done_event')
+                if _done_ev is not None:
+                    _done_ev.set()
+            except Exception:
+                _log.debug("持续分析 Worker 失败上报异常", exc_info=True)
 
     async def _continuous_analysis_loop(
         main_room_id: str,
@@ -5846,6 +6672,10 @@ def register_room_handlers(server, bridge):
         _recording_stop_ticks = 0        # 录制停止后经过的 tick 数（延迟确认防抖）
         video_path = ''
         current_dur = 0.0
+        # 文件替换检测：重连会创建新录制文件，需重置分析游标避免反向区间
+        _last_video_path = ''            # 上一轮的文件路径
+        _file_switch_cooldown = 0        # 文件切换后的冷却 tick 数（抑制误判录制停止）
+        _skip_sleep_ticks = 0            # 连续跳过 sleep 的 tick 数（防御忙循环）
         loop = asyncio.get_running_loop()
         _valorant_incremental_rounds = mode == "valorant_round" and game == "valorant"
 
@@ -5961,20 +6791,31 @@ def register_room_handlers(server, bridge):
                 'predicted_wake_at': None,
                 'predicted_phase': None,
                 'prediction_detail': '',
+                # P2: 卡死保护 — 连续 unknown/intermission 重锚次数
+                'reanchor_count': 0,
+                'last_buy_seen_at': None,
+                # P1: OCR 精修标记 — 避免重复执行阻塞主循环
+                'ocr_refine_done': False,
+                # S1: worker 崩溃重建计数（达到上限则终止任务，防止无限重建循环）
+                'worker_restarts': 0,
             })
 
-        # 启动后台 Worker
-        _worker_task = asyncio.create_task(
-            _continuous_valorant_worker(
-                room_id, mode, game, threshold,
-                _continuous_tasks, _analysis_semaphore, _bridge_executor,
-                scan_result,
-            ),
-            name=f"continuous-worker-{room_id[:8]}",
-        )
-        with _analysis_jobs_lock:
-            if room_id in _continuous_tasks:
-                _continuous_tasks[room_id]['worker_task'] = _worker_task
+        # 启动后台 Worker（崩溃后由主循环检测并重建）
+        def _spawn_worker():
+            _w = asyncio.create_task(
+                _continuous_valorant_worker(
+                    room_id, mode, game, threshold,
+                    _continuous_tasks, _analysis_semaphore, _bridge_executor,
+                    scan_result,
+                ),
+                name=f"continuous-worker-{room_id[:8]}",
+            )
+            with _analysis_jobs_lock:
+                if room_id in _continuous_tasks:
+                    _continuous_tasks[room_id]['worker_task'] = _w
+            return _w
+
+        _worker_task = _spawn_worker()
 
         _log.info("持续分析启动: room_id=%s, mode=%s, game=%s, interval=%ds, 增量回合窗口=%s",
                   room_id, mode, game, interval, _valorant_incremental_rounds)
@@ -5987,11 +6828,18 @@ def register_room_handlers(server, bridge):
                         break
                 pressure = get_resource_pressure()
                 interval_base = 5 if _valorant_incremental_rounds else max(interval, 20)
-                effective_interval, skip_for_pressure = _continuous_effective_interval(
-                    interval_base, last_analyzed, _valorant_incremental_rounds, pressure,
-                )
+                # 获取相位和超时状态用于智能恢复
                 with _analysis_jobs_lock:
                     state = _continuous_tasks.get(room_id)
+                _round_phase_for_interval = state.get('round_phase') if state else None
+                _consecutive_timeouts = int(state.get('consecutive_scan_timeouts', 0) or 0) if state else 0
+                _ocr_degraded = int(state.get('ocr_degraded_remaining', 0) or 0) if state else 0
+                effective_interval, skip_for_pressure = _continuous_effective_interval(
+                    interval_base, last_analyzed, _valorant_incremental_rounds, pressure,
+                    round_phase=_round_phase_for_interval,
+                    consecutive_timeouts=_consecutive_timeouts,
+                    ocr_degraded_remaining=_ocr_degraded,
+                )
                 if state:
                     state['resource_pressure'] = pressure
                     state['effective_interval'] = effective_interval
@@ -6021,10 +6869,25 @@ def register_room_handlers(server, bridge):
                         )
                         if not _skip_wait:
                             await asyncio.wait_for(scan_done_event.wait(), timeout=_sleep_time)
+                            _skip_sleep_ticks = 0
+                        else:
+                            _skip_sleep_ticks += 1
+                            if _skip_sleep_ticks >= _MAX_SKIP_SLEEP_TICKS:
+                                # 防御：任何路径组合导致持续跳过 sleep 时强制节流，避免忙循环广播风暴
+                                await asyncio.sleep(0.5)
+                                _skip_sleep_ticks = 0
                     except asyncio.TimeoutError:
+                        _skip_sleep_ticks = 0
                         pass
                     except asyncio.CancelledError:
                         break
+                else:
+                    # worker 结果未消费时跳过本 tick 的 sleep 等待；限制连续跳过次数
+                    # 防止「结果一直不消费」的路径组合（如压力让路）造成忙循环。
+                    _skip_sleep_ticks += 1
+                    if _skip_sleep_ticks >= _MAX_SKIP_SLEEP_TICKS:
+                        await asyncio.sleep(0.5)
+                        _skip_sleep_ticks = 0
 
                 with _analysis_jobs_lock:
                     state = _continuous_tasks.get(room_id)
@@ -6039,25 +6902,118 @@ def register_room_handlers(server, bridge):
                             except asyncio.TimeoutError:
                                 _log.warning("停止等待扫描超时: room_id=%s", room_id)
                     break
+                # worker 存活检测：worker 只在 cancelled 时正常退出，其它退出视为崩溃
+                # （内部异常已上报 scan_result 后退出，外层未捕获异常也在此兜底）。
+                # 崩溃后重建 worker，避免 scan_requested 无人消费导致「扫描中」空转。
+                _wt = state.get('worker_task')
+                if _wt is not None and _wt.done() and not state.get('cancelled'):
+                    _wt_err = _wt.exception()
+                    _restarts = int(state.get('worker_restarts', 0) or 0)
+                    if _restarts >= _WORKER_MAX_RESTARTS:
+                        _log.error(
+                            "持续分析 Worker 反复崩溃（%d 次），终止任务: room_id=%s",
+                            _restarts, room_id,
+                        )
+                        with _analysis_jobs_lock:
+                            if room_id in _continuous_tasks:
+                                _continuous_tasks[room_id]['cancelled'] = True
+                                _continuous_tasks[room_id]['analysis_stage'] = '扫描器异常终止'
+                                _continuous_tasks[room_id]['last_scan_error'] = (
+                                    repr(_wt_err) if _wt_err is not None else 'worker 反复崩溃'
+                                )
+                        break
+                    _log.error(
+                        "持续分析 Worker 崩溃，重建 (%d/%d): room_id=%s, err=%r",
+                        _restarts + 1, _WORKER_MAX_RESTARTS, room_id,
+                        repr(_wt_err) if _wt_err is not None else 'unknown',
+                    )
+                    with _analysis_jobs_lock:
+                        if room_id in _continuous_tasks:
+                            _continuous_tasks[room_id]['worker_restarts'] = _restarts + 1
+                            _continuous_tasks[room_id]['analysis_stage'] = '扫描器重启中'
+                    _worker_task = _spawn_worker()
                 video_path, current_dur = await loop.run_in_executor(
                     _probe_executor, _get_recording_file_info,
                 )
+
+                # 文件替换检测：重连（如虎牙 URL 过期主动重连）会创建新录制文件。
+                # 检测到文件切换时，重置分析游标和录制停止计数器，避免：
+                #   1. 误判录制停止触发错误的收尾扫描
+                #   2. 收尾扫描产生反向区间（last_analyzed > current_dur）导致失败
+                _path_changed = video_path and video_path != _last_video_path
+                if _path_changed and _last_video_path:
+                    _log.info(
+                        "持续分析检测到录制文件切换: room_id=%s, old=%s, new=%s, 重置分析游标",
+                        room_id, os.path.basename(_last_video_path), os.path.basename(video_path),
+                    )
+                    last_analyzed = 0.0
+                    _recording_stop_ticks = 0
+                    _finalize_pending = False
+                    _finalize_started = False
+                    _finalize_failures = 0
+                    _file_switch_cooldown = 3  # 冷却 3 个 tick，避免立即再次触发
+                    with _analysis_jobs_lock:
+                        if room_id in _continuous_tasks:
+                            _continuous_tasks[room_id]['full_rescan'] = True
+                            _continuous_tasks[room_id]['last_analyzed'] = 0.0
+                if video_path:
+                    _last_video_path = video_path
+
                 room_obj = manager.get_room(room_id)
                 is_still_recording = bool(room_obj and getattr(room_obj, 'is_recording', False))
+                # 共享进样模式：上游退出后 recording_active 会变为 False，
+                # 此时必须同步视为"录制已停止"，否则持续分析会永久卡在"等待新片段"。
+                if is_still_recording:
+                    try:
+                        from lsc.core.services.ingest_registry import get_shared_ingest_registry
+                        _ingest = get_shared_ingest_registry().get(room_id)
+                        if _ingest is not None and not getattr(_ingest, "recording_active", False):
+                            is_still_recording = False
+                            _log.info(
+                                "持续分析检测到共享进样录制已停止: room_id=%s, recording_error=%s",
+                                room_id,
+                                getattr(_ingest, "recording_error", "") or getattr(_ingest, "upstream_error", ""),
+                            )
+                    except Exception as exc:
+                        _log.debug("检查共享进样录制状态失败: room_id=%s, %s", room_id, exc)
                 recording_start = float(getattr(room_obj, 'recording_start_mono', 0.0) or 0.0)
-                recorded_duration = max(
-                    current_dur,
-                    time.monotonic() - recording_start if is_still_recording and recording_start else 0.0,
+                wallclock_dur = (
+                    time.monotonic() - recording_start
+                    if is_still_recording and recording_start
+                    else 0.0
                 )
+                # 录制中时长校准（双向）：写入中的 MP4 无 moov，ffprobe 时长常取不到，
+                # 而 _get_video_duration 的码率估算有两种失效方向：
+                #   虚高（自举漂移）→ scan_range 末端 seek 超出文件实际数据 → 抽帧 0 帧失败循环；
+                #   虚低（估算被物理校验拒绝后回退旧缓存）→ 窗口 end 被限制、分析追不上
+                #   录制 → 滞后持续增长（real 日志：probe 299s vs 墙钟 523s）。
+                # 录制中一律以墙钟为准并留 30s 写缓冲容差，两种偏差都不超界。
+                if wallclock_dur > 0:
+                    recorded_duration = wallclock_dur
+                    buffered_wall = max(0.0, wallclock_dur - 30.0)
+                    if abs(current_dur - buffered_wall) > 15.0:
+                        _log.debug(
+                            "持续分析时长校准: room_id=%s, probed=%.1fs, wallclock=%.1fs, buffered=%.1fs",
+                            room_id, current_dur, wallclock_dur, buffered_wall,
+                        )
+                    current_dur = buffered_wall
+                else:
+                    recorded_duration = current_dur
                 state['video_path'] = video_path or ''
                 state['current_dur'] = current_dur
                 state['recorded_duration'] = recorded_duration
                 if is_still_recording:
                     _recording_was_active = True
                     _recording_stop_ticks = 0
+                    if _file_switch_cooldown > 0:
+                        _file_switch_cooldown -= 1
                 elif _recording_was_active:
-                    # 必须在压力让路之前递增：critical 时若先 continue，收尾永远触发不了。
-                    _recording_stop_ticks += 1
+                    # 文件切换冷却期内不递增停止计数器，避免误判重连为录制停止
+                    if _file_switch_cooldown > 0:
+                        _recording_stop_ticks = 0
+                    else:
+                        # 必须在压力让路之前递增：critical 时若先 continue，收尾永远触发不了。
+                        _recording_stop_ticks += 1
                     if _recording_stop_ticks >= 2 and not _finalize_started:
                         _finalize_pending = True
                         _log.info("持续分析收尾: 录制已停止，触发最终完整扫描 room_id=%s", room_id)
@@ -6069,7 +7025,11 @@ def register_room_handlers(server, bridge):
                 if _finalize_started or _finalize_pending:
                     state['analysis_stage'] = '收尾中'
                 elif state.get('scan_running'):
-                    state['analysis_stage'] = '扫描中'
+                    state['analysis_stage'] = (
+                        '降级追赶'
+                        if state.get('degraded_mode') == 'audio_only'
+                        else '扫描中'
+                    )
                 elif is_still_recording and not video_path:
                     state['analysis_stage'] = '等待可分析片段'
                 elif is_still_recording:
@@ -6077,51 +7037,6 @@ def register_room_handlers(server, bridge):
                 else:
                     # 录制已停、收尾尚未触发：提示用户正在等待收尾，而非「等待新录制」
                     state['analysis_stage'] = '等待收尾'
-
-                # 极端压力 pause 时：若已落后 >90s，仍降级追赶，避免永久饿死确认/收尾。
-                _pressure_behind = float(recorded_duration or 0.0) > float(last_analyzed) + 90.0
-                if (
-                    skip_for_pressure
-                    and not (_finalize_pending or _finalize_started)
-                    and not _pressure_behind
-                ):
-                    bridge.queue_broadcast({
-                        'type': 'continuous_analysis_status',
-                        'data': {
-                            'running': True,
-                            'room_id': room_id,
-                            'target_room_ids': target_room_ids,
-                            'mode': mode,
-                            'analyzed_duration': last_analyzed,
-                            'recorded_duration': state.get('recorded_duration', current_dur),
-                            'confirmed_rounds': state.get('confirmed_rounds', 0),
-                            'pending_rounds': state.get('pending_rounds', 0),
-                            'analysis_stage': state.get('analysis_stage', '分析中'),
-                            'total_highlights': len(all_highlights),
-                            'phase': 'finalizing' if _finalize_started else 'running',
-                            'updated_at': time.time(),
-                            'scan_mode': 'incremental' if _valorant_incremental_rounds else 'full',
-                            'scan_range': [max(0.0, current_dur - 1.0), current_dur] if current_dur else [0.0, 0.0],
-                            'scan_timeout': state.get('scan_timeout', 120),
-                            'full_rescan': bool(state.get('full_rescan', False)),
-                            'refine_with_ocr': bool(state.get('refine_with_ocr', False)),
-                            'progress': min(100.0, max(0.0, (last_analyzed / max(current_dur, 1.0)) * 100.0)) if current_dur else 0.0,
-                            'scan_phase': state.get('scan_phase'),
-                            'scan_reason': state.get('scan_reason'),
-                            'effective_interval': effective_interval,
-                            'scan_elapsed_sec': round(time.monotonic() - state.get('_scan_start_mono', time.monotonic()), 1) if state.get('scan_running') else 0,
-                            'scan_running': state.get('scan_running', False),
-                        },
-                    })
-                    _log.info("持续分析让路: room_id=%s, pressure=%s", room_id, pressure.get("level"))
-                    continue
-                if skip_for_pressure and _pressure_behind and not (_finalize_pending or _finalize_started):
-                    _log.info(
-                        "持续分析压力降级追赶: room_id=%s, pressure=%s, behind=%.0fs",
-                        room_id,
-                        pressure.get("level"),
-                        float(recorded_duration or 0.0) - float(last_analyzed),
-                    )
 
                 worker_completed_at = scan_result.get('completed_at', 0.0)
                 worker_dur = scan_result.get('current_dur', 0.0)
@@ -6146,10 +7061,15 @@ def register_room_handlers(server, bridge):
                     with _analysis_jobs_lock:
                         if room_id in _continuous_tasks:
                             _continuous_tasks[room_id]['last_scan_error'] = worker_error
+                            # 失败退避：非收尾错误后 30s 内不重 kick 同一段，
+                            # 防止失败-立即重试风暴（如时长估算漂移导致抽帧 0 帧）。
+                            if not (_finalize_started or _finalize_pending):
+                                _continuous_tasks[room_id]['last_scan_error_at'] = time.time()
                             if terminal_model_error:
                                 _continuous_tasks[room_id]['analysis_stage'] = '视觉模型不可用'
                                 _continuous_tasks[room_id]['completed'] = True
                                 _continuous_tasks[room_id]['cancelled'] = True
+                                _continuous_tasks[room_id]['terminal_error'] = worker_error
                             # 非收尾 OCR 超时：降级纯音频 + 缩小追赶，避免立刻再开 600s OCR
                             if (
                                 _is_timeout_scan_error(worker_error)
@@ -6206,6 +7126,7 @@ def register_room_handlers(server, bridge):
                                     _continuous_tasks[room_id]['analysis_stage'] = '收尾失败'
                                     _continuous_tasks[room_id]['completed'] = True
                                     _continuous_tasks[room_id]['cancelled'] = True
+                                    _continuous_tasks[room_id]['finalize_error'] = worker_error
                             bridge.queue_broadcast({
                                 'type': 'continuous_analysis_complete',
                                 'data': {
@@ -6232,6 +7153,81 @@ def register_room_handlers(server, bridge):
                         h.setdefault("speech_score", 0.0)
                         h.setdefault("visual_score", 0.0)
                         h.setdefault("transcript", "")
+
+                    # 状态栏显示本轮最近一个已扫出回合的切片入/出点。仅在确有
+                    # 结果时更新，保留上一次有效边界供用户核对产出节奏。
+                    if new_hl:
+                        latest_detected = new_hl[-1]
+                        with _analysis_jobs_lock:
+                            task = _continuous_tasks.get(room_id)
+                            if task is not None:
+                                task['last_detected_in_sec'] = float(latest_detected['start'])
+                                task['last_detected_out_sec'] = float(latest_detected['end'])
+
+                    # OCR 精修：OCR 首次可用或降级恢复后执行一次（避免每轮都阻塞主循环）。
+                    # 精修目标 = 本轮新增的 audio_pending + all_highlights 中降级期间
+                    # 入列、尚未复核的旧 audio_pending 回合（否则它们永远无法升格）。
+                    _has_unrefined_pending = (
+                        any(
+                            h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
+                            for h in new_hl
+                        )
+                        or any(
+                            h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
+                            for h in all_highlights
+                        )
+                    )
+                    if (_has_unrefined_pending and state.get('refine_with_ocr')
+                            and not state.get('ocr_refine_done')):
+                        refine_targets = list(new_hl)
+                        refine_target_keys = {_valorant_round_key(h) for h in refine_targets}
+                        # 旧的 audio_pending 回合（降级期间入列）追加进精修目标
+                        old_pending_keys: set[str] = set()
+                        for h in all_highlights:
+                            rk = _valorant_round_key(h)
+                            if (h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
+                                    and rk not in refine_target_keys):
+                                refine_targets.append(h)
+                                old_pending_keys.add(rk)
+                        if refine_targets:
+                            # 在后台线程执行 OCR 精修，避免阻塞主循环
+                            loop = asyncio.get_running_loop()
+                            try:
+                                refined = await loop.run_in_executor(
+                                    _ai_executor,
+                                    _refine_audio_rounds_with_ocr,
+                                    refine_targets, all_highlights, video_path,
+                                    _continuous_tasks, room_id,
+                                )
+                            except Exception as exc:
+                                _log.debug("OCR 精修异常: room=%s, %s", room_id, exc)
+                                refined = None
+                            if refined:
+                                refined_by_key = {
+                                    _valorant_round_key(r): r for r in refined
+                                }
+                                # 旧 audio_pending 升级后写回 all_highlights（按 round_key 替换）
+                                upgraded_old = [
+                                    rk for rk in old_pending_keys
+                                    if refined_by_key.get(rk, {}).get("confirm_status")
+                                    != CONFIRM_STATUS_AUDIO_PENDING
+                                ]
+                                if upgraded_old:
+                                    replaced = []
+                                    for h in all_highlights:
+                                        rk = _valorant_round_key(h)
+                                        if rk in upgraded_old and rk in refined_by_key:
+                                            replaced.append(refined_by_key[rk])
+                                        else:
+                                            replaced.append(h)
+                                    all_highlights = replaced
+                                # new_hl 保持原语义：只回填本轮新增的回合
+                                new_hl = [
+                                    r for r in refined
+                                    if _valorant_round_key(r) not in old_pending_keys
+                                ]
+                        # 标记已执行过 OCR 精修（下次 OCR 可用/降级恢复时再重置）
+                        state['ocr_refine_done'] = True
 
                     publish_update = False
                     if _valorant_incremental_rounds:
@@ -6272,8 +7268,20 @@ def register_room_handlers(server, bridge):
                         ok, _, main_room_for_map, target_rooms_for_map = _validate_synced_analysis_targets(
                             manager, main_room_id, target_room_ids, wait_for_file=True,
                         )
+                        if not ok:
+                            # 录制重启会主动清除旧对齐组。副房映射必须停用，但主房
+                            # 检测结果仍应正常入列，避免一次重连吞掉整轮分析结果。
+                            fallback_main_room = manager.get_room(main_room_id)
+                            fallback_path = (
+                                getattr(fallback_main_room, "record_output_path", "")
+                                if fallback_main_room is not None
+                                else ""
+                            )
+                            if fallback_main_room is not None and fallback_path and os.path.isfile(fallback_path):
+                                main_room_for_map = fallback_main_room
+                                target_rooms_for_map = [fallback_main_room]
                         if _valorant_incremental_rounds:
-                            # Hybrid 入列：仅 listable 回合；禁止 trim；vision_confirmed / pending 分流
+                            # 入列：hybrid + 音频路径；禁止 trim；按确认状态分流
                             pending_hl = [
                                 h for h in all_highlights
                                 if any(
@@ -6283,21 +7291,32 @@ def register_room_handlers(server, bridge):
                             ]
                             with _refined_round_keys_lock:
                                 refined_snapshot = set(_refined_round_keys)
-                            listable_hl = [
+                            # Hybrid 路径回合（OCR+模型确认）
+                            listable_hybrid_hl = [
                                 h for h in pending_hl
                                 if _is_listable_hybrid_round(h)
                                 and _valorant_round_key(h) not in refined_snapshot
                             ]
+                            # 音频路径回合（待 OCR 复核）
+                            listable_audio_hl = [
+                                h for h in pending_hl
+                                if _is_listable_audio_round(h)
+                                and _valorant_round_key(h) not in refined_snapshot
+                            ]
+                            listable_hl = listable_hybrid_hl + listable_audio_hl
+                            # 按确认状态分流
                             vision_confirmed_hl = [
-                                h for h in listable_hl
+                                h for h in listable_hybrid_hl
                                 if _is_auto_exportable_valorant_round(h)
                             ]
                             vision_keys = {_valorant_round_key(h) for h in vision_confirmed_hl}
                             pending_only_hl = [
-                                h for h in listable_hl
+                                h for h in listable_hybrid_hl
                                 if _valorant_round_key(h) not in vision_keys
                             ]
                             ocr_confirmed_hl = vision_confirmed_hl
+                            # 音频路径回合单独标记
+                            audio_pending_hl = listable_audio_hl
                             if state and state.get('shadow_mode'):
                                 state['shadow_rounds_detected'] = len(all_highlights)
                                 state['shadow_listable_rounds'] = len(listable_hl)
@@ -6313,7 +7332,7 @@ def register_room_handlers(server, bridge):
                             pending_only_hl = list(new_hl)
                             ocr_confirmed_hl = []
                         if (
-                            (pending_only_hl or ocr_confirmed_hl)
+                            (pending_only_hl or ocr_confirmed_hl or audio_pending_hl)
                             and ok
                             and main_room_for_map is not None
                             and target_rooms_for_map
@@ -6338,11 +7357,31 @@ def register_room_handlers(server, bridge):
                                     confirm_status='vision_confirmed',
                                     list_only=True,
                                 )
+                            # 音频路径回合：以 audio_pending 入列，等待 OCR 复核
+                            if audio_pending_hl:
+                                await _auto_export_highlights(
+                                    main_room_for_map, target_rooms_for_map, audio_pending_hl,
+                                    job_prefix=f"{int(time.time() * 1000)}-audio",
+                                    preset_id=_auto_preset,
+                                    defer_export=True,
+                                    confirm_status=CONFIRM_STATUS_AUDIO_PENDING,
+                                    list_only=True,
+                                )
                             _log.info(
-                                "持续分析入列(仅列表): room_id=%s, pending %d 段, 视觉确认 %d 段 × %d 房间",
+                                "持续分析入列(仅列表): room_id=%s, pending %d 段, 视觉确认 %d 段, 音频待复核 %d 段 × %d 房间",
                                 room_id, len(pending_only_hl), len(ocr_confirmed_hl),
-                                len(target_rooms_for_map),
+                                len(audio_pending_hl), len(target_rooms_for_map),
                             )
+
+                        # 导出成功后，清除"最近检测边界"，避免状态栏持续显示已导出的回合。
+                        # 状态栏应只展示"已分析但尚未导出"的入出点；导出完成后应等待下一轮扫描
+                        # 产出新的未导出回合，再更新显示。
+                        if pending_only_hl or ocr_confirmed_hl or audio_pending_hl:
+                            with _analysis_jobs_lock:
+                                _task = _continuous_tasks.get(room_id)
+                                if _task is not None:
+                                    _task.pop('last_detected_in_sec', None)
+                                    _task.pop('last_detected_out_sec', None)
 
                     # 压力缓解或收尾时冲刷延后导出队列
                     await _flush_deferred_exports(force=_finalize_started)
@@ -6365,7 +7404,15 @@ def register_room_handlers(server, bridge):
                             )
                             _continuous_tasks[room_id]['confirmed_rounds'] = confirmed_total
                             _continuous_tasks[room_id]['pending_rounds'] = max(0, len(all_highlights) - confirmed_total)
-                            _continuous_tasks[room_id]['analysis_stage'] = '收尾中' if _finalize_started else '分析中'
+                            _continuous_tasks[room_id]['analysis_stage'] = (
+                                '收尾中'
+                                if _finalize_started
+                                else (
+                                    '降级追赶'
+                                    if _continuous_tasks[room_id].get('degraded_mode') == 'audio_only'
+                                    else '分析中'
+                                )
+                            )
                             _continuous_tasks[room_id]['highlights'] = all_highlights
                             _continuous_tasks[room_id]['result_ready'] = False
                             _continuous_tasks[room_id]['full_rescan'] = False
@@ -6403,6 +7450,66 @@ def register_room_handlers(server, bridge):
                             except asyncio.TimeoutError:
                                 _log.warning("停止等待扫描超时: room_id=%s", room_id)
                     break
+                if state.get('stop_requested') and not (_finalize_pending or _finalize_started):
+                    # 已停录请求收尾停止：等待收尾自然完成；收尾无法进行时强制退出
+                    if _recording_was_active and video_path:
+                        _finalize_pending = True
+                        _log.info("持续分析立即触发收尾（stop_requested）: room_id=%s", room_id)
+                    else:
+                        state['cancelled'] = True
+                        state['scan_abort'] = True
+                        state['status'] = 'stopping'
+                        state['analysis_stage'] = '停止中'
+                        continue
+
+                # 压力让路：在 worker 结果消费之后执行，避免 skipped-sleep + 不消费
+                # 组合成忙循环（completed_at 永远 > last_consumed_at → 每 tick 跳过 sleep）。
+                # 让路只决定「是否 kick 新扫描」，不阻止消费已完成结果。
+                # 极端压力 pause 时：若已落后 >90s，仍降级追赶，避免永久饿死确认/收尾。
+                _pressure_behind = float(recorded_duration or 0.0) > float(last_analyzed) + 90.0
+                if (
+                    skip_for_pressure
+                    and not (_finalize_pending or _finalize_started)
+                    and not _pressure_behind
+                ):
+                    bridge.queue_broadcast({
+                        'type': 'continuous_analysis_status',
+                        'data': {
+                            'running': True,
+                            'room_id': room_id,
+                            'target_room_ids': target_room_ids,
+                            'mode': mode,
+                            'analyzed_duration': last_analyzed,
+                            'recorded_duration': state.get('recorded_duration', current_dur),
+                            'confirmed_rounds': state.get('confirmed_rounds', 0),
+                            'pending_rounds': state.get('pending_rounds', 0),
+                            'analysis_stage': state.get('analysis_stage', '分析中'),
+                            'total_highlights': len(all_highlights),
+                            'phase': 'finalizing' if _finalize_started else 'running',
+                            'updated_at': time.time(),
+                            'scan_mode': 'incremental' if _valorant_incremental_rounds else 'full',
+                            'scan_range': [max(0.0, current_dur - 1.0), current_dur] if current_dur else [0.0, 0.0],
+                            'scan_timeout': state.get('scan_timeout', 120),
+                            'full_rescan': bool(state.get('full_rescan', False)),
+                            'refine_with_ocr': bool(state.get('refine_with_ocr', False)),
+                            'progress': min(100.0, max(0.0, (last_analyzed / max(current_dur, 1.0)) * 100.0)) if current_dur else 0.0,
+                            'scan_phase': state.get('scan_phase'),
+                            'scan_reason': state.get('scan_reason'),
+                            'effective_interval': effective_interval,
+                            'scan_elapsed_sec': round(time.monotonic() - state.get('_scan_start_mono', time.monotonic()), 1) if state.get('scan_running') else 0,
+                            'scan_running': state.get('scan_running', False),
+                        },
+                    })
+                    _log.info("持续分析让路: room_id=%s, pressure=%s", room_id, pressure.get("level"))
+                    continue
+                if skip_for_pressure and _pressure_behind and not (_finalize_pending or _finalize_started):
+                    _log.info(
+                        "持续分析压力降级追赶: room_id=%s, pressure=%s, behind=%.0fs",
+                        room_id,
+                        pressure.get("level"),
+                        float(recorded_duration or 0.0) - float(last_analyzed),
+                    )
+
                 if video_path:
                     should_kick = False
                     if _finalize_pending and not _finalize_started:
@@ -6417,6 +7524,23 @@ def register_room_handlers(server, bridge):
                         should_kick = kick_dur > last_analyzed + 15.0
                     elif current_dur > last_analyzed + 12.0:
                         should_kick = True
+
+                    # 失败退避：worker 出错后 30s 内不重试（收尾除外），
+                    # 避免「失败 → 立即重 kick → 再失败」的 3s 风暴。
+                    _last_err_at = float(state.get('last_scan_error_at') or 0.0)
+                    if (
+                        should_kick
+                        and _last_err_at
+                        and not (_finalize_pending or _finalize_started)
+                        and time.time() - _last_err_at < _SCAN_ERROR_BACKOFF_SEC
+                    ):
+                        should_kick = False
+                        _log.debug(
+                            "持续分析失败退避: room_id=%s, 距上次错误 %.0fs < %ds",
+                            room_id,
+                            time.time() - _last_err_at,
+                            _SCAN_ERROR_BACKOFF_SEC,
+                        )
 
                     if should_kick and not state.get('scan_running'):
                         state['last_progress_broadcast_at'] = time.time()
@@ -6484,9 +7608,152 @@ def register_room_handlers(server, bridge):
                                         pass
                             state['round_phase'] = _transition.phase.value
                             state['round_phase_detail'] = _PDZH.get(_transition.detail, _transition.detail)
+
+                            # P2: 卡死保护 — 检测连续重锚/无 buy 信号
+                            _is_reanchor = _transition.detail in ("reanchor", "intermission_timeout", "pre_combat_miss", "post_timeout")
+                            _is_buy_phase = _transition.phase in (_RP.BUY, _RP.PRE_COMBAT, _RP.COMBAT)
+                            if _is_reanchor:
+                                state['reanchor_count'] = int(state.get('reanchor_count', 0)) + 1
+                            else:
+                                state['reanchor_count'] = 0
+                            if _is_buy_phase:
+                                state['last_buy_seen_at'] = time.monotonic()
+                            # 连续重锚超限 → 暂停分析并广播警告
+                            _reanchor_limit = 6  # 连续 6 次重锚（约 90-120s）后判定卡死
+                            if int(state.get('reanchor_count', 0)) >= _reanchor_limit:
+                                _log.warning(
+                                    "持续分析卡死保护触发: room_id=%s, 连续 %d 次重锚无 buy 信号, "
+                                    "phase=%s, detail=%s, 已分析 %.1fs / 录制 %.1fs",
+                                    room_id,
+                                    state['reanchor_count'],
+                                    state['round_phase'],
+                                    state['round_phase_detail'],
+                                    last_analyzed,
+                                    recorded_duration,
+                                )
+                                bridge.queue_broadcast({
+                                    'type': 'continuous_analysis_status',
+                                    'data': {
+                                        'running': True,
+                                        'room_id': room_id,
+                                        'target_room_ids': target_room_ids,
+                                        'mode': mode,
+                                        'analyzed_duration': last_analyzed,
+                                        'recorded_duration': recorded_duration,
+                                        'confirmed_rounds': state.get('confirmed_rounds', 0),
+                                        'pending_rounds': state.get('pending_rounds', 0),
+                                        'analysis_stage': '卡死保护暂停',
+                                        'total_highlights': len(all_highlights),
+                                        'phase': 'stalled',
+                                        'updated_at': time.time(),
+                                        'scan_mode': 'incremental',
+                                        'scan_range': [max(0.0, last_analyzed - 30.0), last_analyzed],
+                                        'scan_timeout': state.get('scan_timeout', 120),
+                                        'full_rescan': False,
+                                        'refine_with_ocr': False,
+                                        'progress': min(100.0, max(0.0, (last_analyzed / max(recorded_duration, 1.0)) * 100.0)),
+                                        'scan_phase': 'stalled',
+                                        'scan_reason': 'stall_protection',
+                                        'scan_elapsed_sec': 0,
+                                        'scan_running': False,
+                                        'round_phase': state.get('round_phase'),
+                                        'round_phase_detail': f'连续{_reanchor_limit}次重锚无 buy 信号，暂停分析',
+                                        'valorant_profile': state.get('valorant_profile'),
+                                        'pending_round': False,
+                                        'predicted_wake_at': None,
+                                        'predicted_phase': None,
+                                        'prediction_detail': 'stalled',
+                                        'finalizing': False,
+                                        'completed': False,
+                                        'status': 'stalled',
+                                        'stalled': True,
+                                        'stall_reason': 'no_buy_signal',
+                                    },
+                                })
+                                # P3: 卡死保护暂停 — 不完全停止，改为低频探测扫描检测 buy 信号
+                                state['analysis_stage'] = '卡死保护暂停'
+                                state['scan_requested'] = False
+                                state['stalled'] = True
+                                state['stall_reason'] = 'no_buy_signal'
+                                # 暂停期间每 30s 做一次短窗探测（仅抽几帧，低 GPU 开销）
+                                _stall_probe_interval = 30.0
+                                _stall_probe_frames = 3  # 仅抽 3 帧探测是否有 buy 信号
+                                _log.info(
+                                    "持续分析进入卡死保护: room_id=%s, 每 %.0fs 做一次探测扫描（%d 帧）",
+                                    room_id, _stall_probe_interval, _stall_probe_frames,
+                                )
+                                try:
+                                    await asyncio.wait_for(
+                                        scan_done_event.wait(),
+                                        timeout=_stall_probe_interval,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                                # 检查是否已取消 / 录制停止
+                                with _analysis_jobs_lock:
+                                    _st = _continuous_tasks.get(room_id, {})
+                                if _st.get('cancelled') or (not is_still_recording and _recording_was_active):
+                                    continue
+                                # P3: 探测扫描 — 抽几帧检测 buy 信号
+                                _buy_detected = await _probe_for_buy_signal(
+                                    room_id, video_path, current_dur, _stall_probe_frames,
+                                )
+                                if _buy_detected:
+                                    _log.info(
+                                        "持续分析自动恢复: room_id=%s, 探测扫描检测到 buy 信号", room_id,
+                                    )
+                                    state['stalled'] = False
+                                    state['stall_reason'] = None
+                                    state['reanchor_count'] = 0
+                                    state['last_buy_seen_at'] = time.monotonic()
+                                    state['round_phase'] = 'unknown'
+                                    state['round_phase_entered_at'] = time.monotonic()
+                                    state['analysis_stage'] = '分析中'
+                                    bridge.queue_broadcast({
+                                        'type': 'continuous_analysis_status',
+                                        'data': {
+                                            'running': True,
+                                            'room_id': room_id,
+                                            'target_room_ids': target_room_ids,
+                                            'mode': mode,
+                                            'analyzed_duration': last_analyzed,
+                                            'recorded_duration': recorded_duration,
+                                            'confirmed_rounds': state.get('confirmed_rounds', 0),
+                                            'pending_rounds': state.get('pending_rounds', 0),
+                                            'analysis_stage': '已恢复分析',
+                                            'total_highlights': len(all_highlights),
+                                            'phase': 'running',
+                                            'updated_at': time.time(),
+                                            'scan_mode': 'incremental',
+                                            'scan_range': [max(0.0, last_analyzed - 30.0), last_analyzed],
+                                            'scan_timeout': state.get('scan_timeout', 120),
+                                            'full_rescan': False,
+                                            'refine_with_ocr': False,
+                                            'progress': min(100.0, max(0.0, (last_analyzed / max(recorded_duration, 1.0)) * 100.0)),
+                                            'scan_phase': 'incremental',
+                                            'scan_reason': 'auto_resume',
+                                            'scan_elapsed_sec': 0,
+                                            'scan_running': False,
+                                            'round_phase': 'unknown',
+                                            'round_phase_detail': '探测到 buy 信号，自动恢复',
+                                            'valorant_profile': state.get('valorant_profile'),
+                                            'pending_round': False,
+                                            'predicted_wake_at': None,
+                                            'predicted_phase': None,
+                                            'prediction_detail': 'auto_resumed',
+                                            'finalizing': False,
+                                            'completed': False,
+                                            'status': 'running',
+                                            'stalled': False,
+                                            'stall_reason': None,
+                                        },
+                                    })
+                                continue
+
                             # pending_start: 有起点未终点（用正赛起点，不含买枪）
                             if _transition.just_confirmed:
                                 state['pending_start'] = None
+                                state.pop('pending_round_info', None)
                             elif (
                                 _signals.get('has_start')
                                 and not _signals.get('has_end')
@@ -6498,6 +7765,14 @@ def register_room_handlers(server, bridge):
                                     or all_highlights[-1].get('start', 0.0)
                                 )
                                 state['pending_start'] = float(_ps)
+                                # 设置等待回合结束的详细解释（P2: 前端等待回合解释）
+                                state['pending_round_info'] = {
+                                    'phase': _transition.phase.value,
+                                    'waiting_for': 'combat_end',
+                                    'since_sec': time.monotonic() - state.get('round_phase_entered_at', time.monotonic()),
+                                }
+                            else:
+                                state.pop('pending_round_info', None)
                             # 回合时钟预测（只调扫描密度，不入列）
                             _anchor = float(state.get('phase_anchor_sec') or 0.0)
                             _combat_start = None
@@ -6650,6 +7925,8 @@ def register_room_handlers(server, bridge):
                         # 质量优先：不再在 critical 奇数 tick 关掉 OCR
                         state['refine_with_ocr'] = use_ocr_this_tick
                         state['scan_range'] = scan_range
+                        state['scan_in_sec'] = float(scan_range[0])
+                        state['scan_out_sec'] = float(scan_range[1])
                         state['full_rescan'] = full_rescan
                         state['scan_timeout'] = _scan_timeout
                         state['scan_requested'] = True
@@ -6669,7 +7946,7 @@ def register_room_handlers(server, bridge):
                                 'pending_rounds': state.get('pending_rounds', 0),
                                 'analysis_stage': state.get('analysis_stage', '分析中'),
                                 'total_highlights': len(all_highlights),
-                                'phase': 'finalizing' if _finalize_started else 'running',
+                                'phase': 'stopping' if state.get('stop_requested') else ('finalizing' if _finalize_started else 'running'),
                                 'updated_at': time.time(),
                                 'scan_mode': 'full' if full_rescan else 'incremental',
                                 'scan_range': [scan_range[0], scan_range[1]],
@@ -6704,7 +7981,7 @@ def register_room_handlers(server, bridge):
                         room_id=room_id,
                         recorded_duration=float(state.get('recorded_duration', current_dur) or 0.0),
                         analysis_stage=state.get('analysis_stage', '分析中'),
-                        phase='finalizing' if _finalize_started else 'running',
+                        phase='stopping' if state.get('stop_requested') else ('finalizing' if _finalize_started else 'running'),
                         all_highlights=all_highlights,
                         last_analyzed=last_analyzed,
                         current_dur=current_dur,
@@ -6731,6 +8008,13 @@ def register_room_handlers(server, bridge):
             pass
         except Exception as exc:
             _log.error("持续分析异常: room_id=%s, %s", room_id, exc, exc_info=True)
+            # 立即标记任务为异常停止，避免清理期间 status handler 仍报告 running
+            with _analysis_jobs_lock:
+                if room_id in _continuous_tasks:
+                    _continuous_tasks[room_id]['status'] = 'stopping'
+                    _continuous_tasks[room_id]['cancelled'] = True
+                    _continuous_tasks[room_id]['scan_abort'] = True
+                    _continuous_tasks[room_id]['analysis_stage'] = '异常退出'
         finally:
             with _analysis_jobs_lock:
                 stop_state = _continuous_tasks.get(room_id, {})
@@ -6764,16 +8048,58 @@ def register_room_handlers(server, bridge):
                         )
                 except asyncio.CancelledError:
                     pass
-            bridge.queue_broadcast({
-                'type': 'continuous_analysis_status',
-                'data': {
-                    'running': False,
-                    'phase': 'idle',
-                    'status': 'idle',
-                    'room_id': room_id,
-                    'updated_at': time.time(),
-                },
-            })
+            # 终态广播：按任务结束原因分流，避免模型故障/收尾失败被当成成功/idle
+            _terminal_err = stop_state.get('terminal_error')
+            _finalize_err = stop_state.get('finalize_error')
+            _base_terminal = {
+                'running': False,
+                'room_id': room_id,
+                'updated_at': time.time(),
+            }
+            if _terminal_err:
+                bridge.queue_broadcast({
+                    'type': 'continuous_analysis_status',
+                    'data': {
+                        **_base_terminal,
+                        'phase': 'error',
+                        'status': 'error',
+                        'error': _terminal_err,
+                        'analysis_stage': '视觉模型不可用',
+                        'total_highlights': len(all_highlights),
+                    },
+                })
+            elif _finalize_err:
+                bridge.queue_broadcast({
+                    'type': 'continuous_analysis_status',
+                    'data': {
+                        **_base_terminal,
+                        'phase': 'error',
+                        'status': 'error',
+                        'error': _finalize_err,
+                        'analysis_stage': '收尾失败',
+                        'total_highlights': len(all_highlights),
+                    },
+                })
+            elif stop_state.get('completed'):
+                bridge.queue_broadcast({
+                    'type': 'continuous_analysis_status',
+                    'data': {
+                        **_base_terminal,
+                        'phase': 'completed',
+                        'status': 'completed',
+                        'analysis_stage': '已完成',
+                        'total_highlights': len(all_highlights),
+                    },
+                })
+            else:
+                bridge.queue_broadcast({
+                    'type': 'continuous_analysis_status',
+                    'data': {
+                        **_base_terminal,
+                        'phase': 'idle',
+                        'status': 'idle',
+                    },
+                })
             with _analysis_jobs_lock:
                 _continuous_tasks.pop(room_id, None)
             _log.info("持续分析已停止: room_id=%s, 累计 %d 段高光", room_id, len(all_highlights))
@@ -6793,13 +8119,31 @@ def register_room_handlers(server, bridge):
             mapped_highlights_by_room = _map_highlights_by_room(
                 all_highlights, main_room_for_map, target_rooms_for_map,
             )
-        elif main_room_for_map is not None:
+            # 映射成功，清除错误（P3: 多房间同步详细错误）
+            with _analysis_jobs_lock:
+                if room_id in _continuous_tasks:
+                    _continuous_tasks[room_id].pop('mapping_error', None)
+        else:
+            fallback_main_room = manager.get_room(main_room_id)
+            fallback_path = (
+                getattr(fallback_main_room, "record_output_path", "")
+                if fallback_main_room is not None
+                else ""
+            )
+            if fallback_main_room is not None and fallback_path and os.path.isfile(fallback_path):
+                main_room_for_map = fallback_main_room
+                target_rooms_for_map = [fallback_main_room]
+        if not ok and main_room_for_map is not None:
             _log.warning("持续分析同步映射回退到主房间: %s", error)
             mapping_fallback = True
             mapping_error = error or "同步映射校验失败"
             mapped_highlights_by_room = _map_highlights_by_room(
                 all_highlights, main_room_for_map, [main_room_for_map],
             )
+            # 保存详细错误到 task state（P3: 多房间同步详细错误）
+            with _analysis_jobs_lock:
+                if room_id in _continuous_tasks:
+                    _continuous_tasks[room_id]['mapping_error'] = mapping_error
         for idx, hl in enumerate(new_hl):
             bridge.queue_broadcast({
                 'type': 'highlight_stream',
@@ -6889,6 +8233,42 @@ def register_room_handlers(server, bridge):
         _start_valorant_profile = (data.get('valorant_profile') or 'valorant')
         if not main_room_id:
             return {'error': 'room_id is required'}
+
+        # 持续分析是边录边分析，不允许用历史文件或未录制房间占用任务槽。
+        # 先做轻量状态快照；后续仍由同步目标校验函数校验文件与对齐。
+        requested_target_ids = [str(room_id) for room_id in target_room_ids if room_id]
+        if main_room_id not in requested_target_ids:
+            requested_target_ids.insert(0, main_room_id)
+        def _recording_state(room_id: str) -> dict[str, Any]:
+            get_status = getattr(manager, 'get_recording_status', None)
+            if callable(get_status):
+                return get_status(room_id)
+            room = manager.get_room(room_id)
+            return {
+                'exists': room is not None,
+                'is_recording': bool(room is not None and getattr(room, 'is_recording', False)),
+            }
+
+        recording_states = await asyncio.get_running_loop().run_in_executor(
+            _bridge_executor,
+            lambda: {
+                room_id: _recording_state(room_id)
+                for room_id in requested_target_ids
+            },
+        )
+        inactive_room_ids = [
+            room_id for room_id, status in recording_states.items()
+            if not status.get('exists') or not status.get('is_recording')
+        ]
+        if inactive_room_ids:
+            if main_room_id in inactive_room_ids:
+                return {'success': False, 'error': '主直播间尚未开始录制，无法启动持续分析'}
+            return {
+                'success': False,
+                'error': '目标房间尚未开始录制，无法启动持续分析',
+                'inactive_room_ids': inactive_room_ids,
+            }
+        target_room_ids = requested_target_ids
         with _analysis_jobs_lock:
             if _continuous_tasks:
                 active_room_id = next(iter(_continuous_tasks))
@@ -7032,10 +8412,20 @@ def register_room_handlers(server, bridge):
                         break
             state = _continuous_tasks.get(room_id)
             if state is not None:
-                state['cancelled'] = True
-                state['scan_abort'] = True
-                state['status'] = 'stopping'
-                state['analysis_stage'] = '停止中'
+                room = manager.get_room(room_id)
+                is_recording = bool(room is not None and getattr(room, 'is_recording', False))
+                finalizing = bool(state.get('finalizing'))
+                ever_recorded = float(state.get('recorded_duration') or 0.0) > 0.0
+                if finalizing or (not is_recording and ever_recorded):
+                    # 已停录/正在收尾：尊重收尾，尾部回合不丢；收尾完成后任务自然退出
+                    state['stop_requested'] = True
+                    state['status'] = 'stopping'
+                    state['analysis_stage'] = '停止中（等待收尾）'
+                else:
+                    state['cancelled'] = True
+                    state['scan_abort'] = True
+                    state['status'] = 'stopping'
+                    state['analysis_stage'] = '停止中'
                 done_event = state.get('scan_done_event')
             else:
                 done_event = None
@@ -7248,5 +8638,29 @@ def register_room_handlers(server, bridge):
         manager=manager,
         load_settings=load_settings,
     )
+
+    # ── 录制文件修复 handler（P2-1: 录制文件修复工具）──
+    @server.on('repair_recording')
+    async def handle_repair_recording(data):
+        """修复录制文件（moov atom 不完整）。"""
+        room_id = data.get('room_id')
+        if not room_id:
+            return {'success': False, 'error': 'room_id is required'}
+
+        room = manager.get_room(room_id)
+        if room is None:
+            return {'success': False, 'error': '房间不存在'}
+
+        path = getattr(room, 'record_output_path', '')
+        if not path or not os.path.isfile(path):
+            return {'success': False, 'error': '录制文件不存在'}
+
+        from lsc.utils.recording_repair import repair_recording
+        repaired = await asyncio.get_running_loop().run_in_executor(
+            _recording_executor, lambda: repair_recording(path)
+        )
+        if repaired:
+            return {'success': True, 'path': repaired}
+        return {'success': False, 'error': '修复失败，文件可能严重损坏'}
 
     # 新客户端连接时由 on_connect 推送当前内存房间（不再从磁盘恢复）

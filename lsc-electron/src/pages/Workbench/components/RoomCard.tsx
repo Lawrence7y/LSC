@@ -65,9 +65,17 @@ interface RoomCardProps {
   recordingTick?: number
   /** 放大态播放器控制：预览播放位置（秒，仅放大房间传入实时值） */
   previewPos?: number
+  previewDuration?: number
   onPlayPause?: () => void
   onSeekBack?: () => void
   onSeekFwd?: () => void
+  onSeekTo?: (roomId: string, time: number) => void
+  /** AI 检测到的回合列表（用于在预览时间线上显示） */
+  detectedRounds?: Array<{ start: number; end: number; confirm_status?: string }>
+  /** 主时间线 windowStart（common 模式下用于同步指示） */
+  mainWindowStart?: number | null
+  /** 是否处于 common 模式 */
+  isCommonMode?: boolean
 }
 
 /**
@@ -95,6 +103,9 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
   if (prev.onPlayPause !== next.onPlayPause) return false
   if (prev.onSeekBack !== next.onSeekBack) return false
   if (prev.onSeekFwd !== next.onSeekFwd) return false
+  if (prev.onSeekTo !== next.onSeekTo) return false
+  if (prev.previewDuration !== next.previewDuration) return false
+  if (prev.detectedRounds !== next.detectedRounds) return false
   // previewPos 高频变化：仅当本卡处于放大态才参与比较，避免普通卡片每秒重渲染
   if (prev.previewPos !== next.previewPos && next.expandedRoomId != null && next.expandedRoomId === next.room.room_id) return false
 
@@ -147,9 +158,14 @@ export const RoomCard = memo(function RoomCard({
   onCollapse,
   recordingTick = 0,
   previewPos = 0,
+  previewDuration = 0,
   onPlayPause,
   onSeekBack,
   onSeekFwd,
+  onSeekTo,
+  detectedRounds = [],
+  mainWindowStart = null,
+  isCommonMode = false,
 }: RoomCardProps) {
   const tick = recordingTick
   const [disconnecting, setDisconnecting] = useState(false)
@@ -202,8 +218,70 @@ export const RoomCard = memo(function RoomCard({
 
   /** 放大态播放控制所需派生量 */
   const isPreviewPlaying = room.preview_enabled && !room.preview_paused
-  const expDurHint = Math.max(previewPos, recordingElapsedSeconds, room.mark_in ?? 0, room.mark_out ?? 0, 1)
-  const expProgressPct = Math.min(100, (previewPos / expDurHint) * 100)
+  const videoElement = window.__msePlayers?.[room.room_id]?.player?.videoElement
+  const playerDuration = videoElement?.duration ?? 0
+  const finitePlayerDuration = Number.isFinite(playerDuration) ? playerDuration : 0
+  const isFileReview = room.preview_mode === 'recording_review'
+  const supportsLiveDvr = !isFileReview && room.preview_mode !== 'degraded'
+  let bufferedStart = 0
+  let bufferedEnd = 0
+  try {
+    const ranges = videoElement?.buffered
+    if (ranges && ranges.length > 0) {
+      bufferedStart = ranges.start(0)
+      bufferedEnd = ranges.end(ranges.length - 1)
+    }
+  } catch {
+    bufferedStart = 0
+    bufferedEnd = 0
+  }
+  const fallbackEnd = Math.max(
+    previewDuration,
+    finitePlayerDuration,
+    previewPos,
+    recordingElapsedSeconds,
+    room.mark_in ?? 0,
+    room.mark_out ?? 0,
+    1,
+  )
+  const hasLiveDvrRange = supportsLiveDvr && bufferedEnd - bufferedStart > 1
+  const liveDvrDuration = hasLiveDvrRange ? bufferedEnd - bufferedStart : 0
+  // 直播时在 DVR 起点左侧保留一小段滚动禁用区，使边界始终清晰可见，
+  // 又不会因直播数小时后 0→bufferedEnd 过长而把可回放区域挤成一条细线。
+  const boundaryLeadSeconds = Math.max(10, Math.min(60, liveDvrDuration * 0.2))
+  const expTimelineStart = hasLiveDvrRange
+    ? Math.max(0, bufferedStart - boundaryLeadSeconds)
+    : 0
+  const expTimelineEnd = hasLiveDvrRange
+    ? bufferedEnd
+    : fallbackEnd
+  const expTimelineSpan = Math.max(1, expTimelineEnd - expTimelineStart)
+  const replayBoundary = hasLiveDvrRange ? bufferedStart : expTimelineStart
+  const replayBoundaryPct = Math.max(
+    0,
+    Math.min(100, ((replayBoundary - expTimelineStart) / expTimelineSpan) * 100),
+  )
+  const expProgressPct = Math.max(
+    0,
+    Math.min(100, ((previewPos - expTimelineStart) / expTimelineSpan) * 100),
+  )
+  const progressFillLeftPct = hasLiveDvrRange ? replayBoundaryPct : 0
+  const progressFillWidthPct = Math.max(0, expProgressPct - progressFillLeftPct)
+  const seekExpandedTimeline = (clientX: number, track: HTMLElement) => {
+    if (!onSeekTo || expTimelineSpan <= 0) return
+    const rect = track.getBoundingClientRect()
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)))
+    let target = expTimelineStart + ratio * expTimelineSpan
+    if (hasLiveDvrRange) {
+      const boundaryRatio = replayBoundaryPct / 100
+      const snapRatio = Math.min(0.08, 14 / Math.max(1, rect.width))
+      // 左侧整体不可回放；边界右侧 14px 内也吸附到最早可回放位置。
+      if (ratio <= boundaryRatio + snapRatio) {
+        target = replayBoundary
+      }
+    }
+    onSeekTo(room.room_id, target)
+  }
   const overlayBtnStyle: React.CSSProperties = {
     color: 'var(--overlay-text, #f5f5f7)',
     background: 'var(--overlay-btn-bg, rgba(0,0,0,0.5))',
@@ -536,22 +614,119 @@ export const RoomCard = memo(function RoomCard({
             {/* 底部控制区：普通态单行；放大态 = 动态进度条 + 播放控制行（原有按键全部保留、不被遮挡） */}
             {isExpanded ? (
               <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, display: 'flex', flexDirection: 'column', background: 'linear-gradient(transparent, rgba(0,0,0,0.78))', zIndex: 9 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px 2px' }}>
-                  <span className="pbar-line" style={{ flex: 1, height: 6 }}>
-                    <span className="pbar-fill" style={{ width: `${expProgressPct}%` }} />
+                <div className="room-card__expanded-timeline">
+                  <span className="room-card__expanded-time">{formatTime(expTimelineStart)}</span>
+                  <div
+                    role="slider"
+                    tabIndex={0}
+                    aria-label="预览时间线"
+                    aria-valuemin={Math.round(replayBoundary)}
+                    aria-valuemax={Math.round(expTimelineEnd)}
+                    aria-valuenow={Math.round(previewPos)}
+                    className="room-card__expanded-track"
+                    onPointerDown={(e) => {
+                      e.stopPropagation()
+                      e.currentTarget.setPointerCapture(e.pointerId)
+                      seekExpandedTimeline(e.clientX, e.currentTarget)
+                    }}
+                    onPointerMove={(e) => {
+                      if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
+                      e.stopPropagation()
+                      seekExpandedTimeline(e.clientX, e.currentTarget)
+                    }}
+                    onPointerUp={(e) => {
+                      e.stopPropagation()
+                      seekExpandedTimeline(e.clientX, e.currentTarget)
+                      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                        e.currentTarget.releasePointerCapture(e.pointerId)
+                      }
+                    }}
+                    onPointerCancel={(e) => {
+                      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                        e.currentTarget.releasePointerCapture(e.pointerId)
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (!onSeekTo) return
+                      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        onSeekTo(room.room_id, Math.max(replayBoundary, Math.min(
+                          expTimelineEnd,
+                          previewPos + (e.key === 'ArrowLeft' ? -10 : 10),
+                        )))
+                      }
+                    }}
+                  >
+                    {hasLiveDvrRange && (
+                      <>
+                        <span
+                          className="room-card__expanded-unavailable"
+                          style={{ width: `${replayBoundaryPct}%` }}
+                        />
+                        <span
+                          className="room-card__expanded-replay-boundary"
+                          style={{ left: `${replayBoundaryPct}%` }}
+                          title={`回放边界 ${formatTime(replayBoundary)}：左侧不可回放，右侧可回放`}
+                        />
+                      </>
+                    )}
+                    {/* 主时间线位置指示器（P3: 预览时间线与主时间线同步滚动） */}
+                    {isCommonMode && mainWindowStart != null && (() => {
+                      const mwPct = Math.max(0, Math.min(100, ((mainWindowStart - expTimelineStart) / expTimelineSpan) * 100))
+                      return (
+                        <span
+                          className="room-card__expanded-main-pos"
+                          style={{ left: `${mwPct}%` }}
+                          title={`主时间线位置 ${formatTime(mainWindowStart)}`}
+                        />
+                      )
+                    })()}
+                    {/* AI 检测到的回合色带（P1: 预览时间线显示检测回合） */}
+                    {detectedRounds.map((round, idx) => {
+                      const rLeft = Math.max(0, Math.min(100, ((round.start - expTimelineStart) / expTimelineSpan) * 100))
+                      const rWidth = Math.max(0, Math.min(100 - rLeft, ((round.end - round.start) / expTimelineSpan) * 100))
+                      if (rWidth <= 0) return null
+                      const isAudioPending = round.confirm_status === 'audio_pending'
+                      const isConfirmed = round.confirm_status === 'vision_confirmed' || round.confirm_status === 'ocr_confirmed'
+                      const roundClass = isAudioPending ? 'room-card__expanded-round--audio'
+                        : isConfirmed ? 'room-card__expanded-round--confirmed'
+                        : 'room-card__expanded-round--pending'
+                      return (
+                        <span
+                          key={idx}
+                          className={`room-card__expanded-round ${roundClass}`}
+                          style={{ left: `${rLeft}%`, width: `${rWidth}%` }}
+                          title={`${formatTime(round.start)}–${formatTime(round.end)}`}
+                        />
+                      )
+                    })}
+                    <span
+                      className="room-card__expanded-track-fill"
+                      style={{
+                        left: `${progressFillLeftPct}%`,
+                        width: `${progressFillWidthPct}%`,
+                      }}
+                    />
+                    <span
+                      className="room-card__expanded-track-thumb"
+                      style={{ left: `${expProgressPct}%` }}
+                    />
+                  </div>
+                  <span className="room-card__expanded-time room-card__expanded-time--end">
+                    {formatTime(expTimelineEnd)}
                   </span>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'rgba(255,255,255,0.85)' }}>{formatTime(previewPos)}</span>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 8px 6px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                     <Tooltip title={isPreviewPlaying ? '暂停' : '播放'}>
                       <Button type="text" size="small" icon={isPreviewPlaying ? <PauseCircleOutlined /> : <PlayCircleOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onPlayPause?.() }} />
                     </Tooltip>
-                    <Tooltip title="后退 10 秒">
-                      <Button type="text" size="small" icon={<StepBackwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekBack?.() }} />
+                    <Tooltip title="后退 10 秒（与总体时间线一致）">
+                      <Button type="text" size="small" icon={<StepBackwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekBack?.() }}>10s</Button>
                     </Tooltip>
-                    <Tooltip title="前进 10 秒">
-                      <Button type="text" size="small" icon={<StepForwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekFwd?.() }} />
+                    <Tooltip title="前进 10 秒（与总体时间线一致）">
+                      <Button type="text" size="small" icon={<StepForwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekFwd?.() }}>10s</Button>
                     </Tooltip>
                     {qualitySelect}
                   </div>

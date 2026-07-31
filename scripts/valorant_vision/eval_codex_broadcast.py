@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier, _CLASS_NAMES
+from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
 
 DEFAULT_ANNOTATION_DIR = Path(
     r"D:\Project\直播切片多人\.worktrees\valorant-frame-labeling-pilot"
@@ -73,7 +73,7 @@ def main() -> None:
         meta.append(item)
         if len(batch) >= 32:
             probs = clf.predict_batch(batch)
-            for it, pr in zip(meta, probs):
+            for it, pr in zip(meta, probs, strict=True):
                 pi = int(pr.argmax())
                 pred = _CLASS_NAMES[pi]
                 gt = labels[it["id"]]["label"]
@@ -92,7 +92,7 @@ def main() -> None:
             batch, meta = [], []
     if batch:
         probs = clf.predict_batch(batch)
-        for it, pr in zip(meta, probs):
+        for it, pr in zip(meta, probs, strict=True):
             pi = int(pr.argmax())
             pred = _CLASS_NAMES[pi]
             gt = labels[it["id"]]["label"]

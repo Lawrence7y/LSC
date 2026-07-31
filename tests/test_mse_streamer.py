@@ -38,8 +38,9 @@ def test_mse_streamer_file_mode_skips_network_flags() -> None:
         def poll(self):
             return 0
 
-    import lsc.core.services.mse_streamer as mse_mod
     from unittest.mock import patch
+
+    import lsc.core.services.mse_streamer as mse_mod
 
     streamer = mse_mod.MseStreamer(
         url=r"C:\recordings\room.mp4",

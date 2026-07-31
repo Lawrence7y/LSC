@@ -12,10 +12,10 @@ import pytest
 from lsc.config import (
     ExportProfile,
     LscConfig,
+    _find_executable,
     load_config,
     reload_config,
     reset_config,
-    _find_executable,
 )
 
 

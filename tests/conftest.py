@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Add repo root and python-backend so tests can import lsc and handlers
 import sys
+
 _repo_root = os.path.join(os.path.dirname(__file__), '..')
 _python_backend = os.path.join(_repo_root, 'python-backend')
 if _repo_root not in sys.path:
@@ -17,8 +18,6 @@ if _python_backend not in sys.path:
     sys.path.insert(0, _python_backend)
 
 from lsc.config import LscConfig  # noqa: E402
-
-
 
 
 @pytest.fixture

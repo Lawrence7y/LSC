@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from handlers import room_handler
-from lsc.analyzer.registry import get
 
+from lsc.analyzer.registry import get
 
 REQUIRED_STATUS_KEYS = {
     "running",
@@ -154,7 +152,7 @@ def test_status_payload_keys_stable():
         last_analyzed=10.0,
         current_dur=20.0,
     )
-    assert REQUIRED_STATUS_KEYS <= set(payload.keys())
+    assert set(payload.keys()) >= REQUIRED_STATUS_KEYS
 
 
 def test_continuous_highlights_payload_keys_shape():
@@ -170,7 +168,7 @@ def test_continuous_highlights_payload_keys_shape():
         "mapping_fallback": False,
         "error": None,
     }
-    assert REQUIRED_HIGHLIGHTS_KEYS <= set(sample.keys())
+    assert set(sample.keys()) >= REQUIRED_HIGHLIGHTS_KEYS
     src = Path(__file__).resolve().parents[1] / "python-backend/handlers/room_handler.py"
     text = src.read_text(encoding="utf-8")
     block = text.split("'type': 'continuous_highlights'", 1)[1].split("'data': {", 1)[1]

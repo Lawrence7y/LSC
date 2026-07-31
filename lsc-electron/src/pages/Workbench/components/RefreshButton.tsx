@@ -429,7 +429,8 @@ export const RefreshButton = memo(function RefreshButton({
     <Tooltip title={disabled ? '' : tooltip}>
       <Button
         ref={buttonRef}
-        size="small"
+        size="middle"
+        className="workbench-toolbar__refresh"
         icon={<ReloadOutlined />}
         disabled={disabled}
         onMouseDown={handleMouseDown}

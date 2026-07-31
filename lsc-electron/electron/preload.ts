@@ -28,6 +28,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getPlatform: () => process.platform,
   getBackendWsUrl: () => ipcRenderer.invoke('get-backend-ws-url'),
   getBackendWsToken: () => ipcRenderer.invoke('get-backend-ws-token'),
+  onBackendReady: (callback: (payload: { url: string }) => void) => {
+    const wrapper = (_event: any, payload: { url: string }) => callback(payload)
+    ipcRenderer.on('backend-ready', wrapper)
+    return () => ipcRenderer.removeListener('backend-ready', wrapper)
+  },
   
   // 窗口控制
   minimizeWindow: () => ipcRenderer.invoke('minimize-window'),
@@ -96,6 +101,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const handler = () => callback()
     ipcRenderer.on('cleanup-all-rooms', handler)
     return () => ipcRenderer.removeListener('cleanup-all-rooms', handler)
+  },
+
+  // 依赖安装管理
+  getStartupDependencyState: () => ipcRenderer.invoke('get-startup-dependency-state'),
+  onStartupDependencyState: (callback: (state: any) => void) => {
+    const wrapper = (_event: any, state: any) => callback(state)
+    ipcRenderer.on('startup-dependency-state', wrapper)
+    return () => ipcRenderer.removeListener('startup-dependency-state', wrapper)
+  },
+  checkDependencies: () => ipcRenderer.invoke('check-dependencies'),
+  installDependencies: (options?: { includeAi?: boolean }) =>
+    ipcRenderer.invoke('install-dependencies', options),
+  cancelDependencies: () => ipcRenderer.invoke('cancel-dependencies'),
+  onDependencyProgress: (callback: (event: any) => void) => {
+    const wrapper = (_event: any, evt: any) => callback(evt)
+    ipcRenderer.on('dependency-progress', wrapper)
+    return () => ipcRenderer.removeListener('dependency-progress', wrapper)
+  },
+  onDependenciesMissing: (callback: (result: any) => void) => {
+    const wrapper = (_event: any, result: any) => callback(result)
+    ipcRenderer.on('dependencies-missing', wrapper)
+    return () => ipcRenderer.removeListener('dependencies-missing', wrapper)
   },
 })
 

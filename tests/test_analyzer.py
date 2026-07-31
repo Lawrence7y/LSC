@@ -5,10 +5,6 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from unittest.mock import patch
-
 import pytest
 
 from lsc.analyzer.pipeline import HighlightAnalyzer
@@ -19,7 +15,6 @@ class TestHighlightAnalyzer:
 
     def test_cancel_check(self, tmp_path):
         """取消检查应在分析前中断，返回 None。"""
-        from lsc.analyzer.pipeline import HighlightAnalyzer
 
         video = tmp_path / "video.mp4"
         video.write_bytes(b"fake")
@@ -30,7 +25,6 @@ class TestHighlightAnalyzer:
 
     def test_analyze_file_not_found(self):
         """视频文件不存在时应抛出 FileNotFoundError。"""
-        from lsc.analyzer.pipeline import HighlightAnalyzer
 
         analyzer = HighlightAnalyzer()
         with pytest.raises(FileNotFoundError):
@@ -60,7 +54,6 @@ class TestBackendIntegration:
 
     def test_highlight_analyzer_instantiable_without_ai_deps(self):
         """HighlightAnalyzer 可在未安装 AI 依赖时实例化（不加载模型）。"""
-        from lsc.analyzer.pipeline import HighlightAnalyzer
 
         analyzer = HighlightAnalyzer()
         assert analyzer.analysis_time_sec == 0.0
@@ -73,7 +66,6 @@ class TestIntegration:
 
     def test_full_pipeline_with_mock_video(self, tmp_path):
         """使用 mock 视频跑完整 pipeline（验证编排逻辑）。"""
-        from lsc.analyzer.pipeline import HighlightAnalyzer
 
         video = tmp_path / "video.mp4"
         video.write_bytes(b"fake")

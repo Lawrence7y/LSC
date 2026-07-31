@@ -5,11 +5,39 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from handlers import room_handler
 
-
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_pressure_yield_check_after_worker_consume() -> None:
+    """压力让路须在 worker 结果消费之后：让路 continue 不消费结果会与
+    skipped-sleep（completed_at > last_consumed_at）组合成忙循环广播风暴。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    consume_idx = src.find("worker_completed_at = scan_result.get('completed_at', 0.0)")
+    yield_idx = src.find("_log.info(\"持续分析让路:")
+    assert consume_idx > 0
+    assert yield_idx > consume_idx
+
+
+def test_skip_sleep_has_ceiling() -> None:
+    """主循环连续跳过 sleep 须有上限强制节流，防止任何路径组合重演忙循环。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_MAX_SKIP_SLEEP_TICKS" in src
+    assert "_skip_sleep_ticks" in src
+
+
+def test_continuous_alignment_has_safe_periodic_refresh_guard() -> None:
+    """持续分析须定期重对齐，且前台使用/DVR 回看时不得强制跳直播沿。"""
+    source = (
+        ROOT / "lsc-electron" / "src" / "pages" / "Workbench" / "index.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "10 * 60 * 1000" in source
+    assert "document.hidden" in source
+    assert "document.hasFocus()" in source
+    assert "seekAlignmentRoomsToLive(roomSet)" in source
+    assert "Math.abs(room?.content_offset ?? 0) + 1.5" in source
 
 
 def test_continuous_analysis_requires_growing_recording_file_shape() -> None:
@@ -39,7 +67,7 @@ def test_valorant_round_window_merge_replaces_overlapping_drift() -> None:
         (item["start"], item["end"]) for item in window
     ]
     assert all(item.get("round_key") for item in merged)
-    for prev, cur in zip(merged, merged[1:]):
+    for prev, cur in zip(merged, merged[1:], strict=False):
         assert prev["end"] <= cur["start"]
 
 
@@ -694,8 +722,9 @@ def test_derive_round_signals_uses_energy_fields_not_score() -> None:
 
 def test_clamped_ocr_format_output_not_auto_exportable_without_hybrid() -> None:
     """Legacy OCR 输出不再满足 hybrid 可导门禁。"""
-    from lsc.analyzer.round_detector import ValorantRoundConfig, _format_output
     import numpy as np
+
+    from lsc.analyzer.round_detector import ValorantRoundConfig, _format_output
 
     cfg = ValorantRoundConfig(full_round=True, pre_combat_pad=2.0, tail_pad=0.0)
     phase = [{
@@ -717,6 +746,7 @@ def test_clamped_ocr_format_output_not_auto_exportable_without_hybrid() -> None:
 
 def test_ocr_combat_energy_rejects_buy_phase_only_segments() -> None:
     import numpy as np
+
     from lsc.analyzer.round_detector import _ocr_round_has_combat_energy
 
     quiet = np.full(60, 10.0, dtype=np.float64)
@@ -1007,4 +1037,171 @@ def test_model_contract_error_broadcasts_terminal_error() -> None:
 
     assert "continuous_analysis_complete" in branch
     assert "'error': worker_error" in branch or '"error": worker_error' in branch
+
+
+def test_frontend_finalize_stop_only_targets_analysis_rooms() -> None:
+    """停止并收尾不得误停未参与本次分析的其它录制房间。"""
+    wb = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    stop_ui = wb.split("// 每次打开都重置操作值", 1)[1].split(
+        "} else {\n                      openAnalysisModal()", 1
+    )[0]
+
+    assert "stopModeRef.current = 'stop_with_finalize'" in stop_ui
+    assert "ca?.target_room_ids" in stop_ui
+    assert "activeTargetIds.has(r.room_id)" in stop_ui
+    assert "recordingRooms.forEach" in stop_ui
+
+
+def test_duration_estimate_rejected_when_growth_implausible(monkeypatch, tmp_path) -> None:
+    """时长估算增长超物理界限时必须拒绝并回退 ffprobe，防止自举漂移虚高。
+
+    场景：缓存 dur=100s（5 秒前采样，size=50MB），实际码率波动导致文件涨到
+    60MB。码率估算 = 60/50*100 = 120s > dur + max(15, age*1.5) = 115s，
+    必须拒绝估算（旧实现会采用并写回缓存，漂移逐步放大）。
+    """
+    import time as _time
+
+    video = tmp_path / "rec.mp4"
+    video.write_bytes(b"\x00" * (60 * 1024 * 1024))
+
+    from handlers import room_handler as rh
+
+    cache_key = str(video)
+    now = _time.monotonic()
+    with rh._duration_cache_lock:
+        rh._duration_cache[cache_key] = (100.0, 50 * 1024 * 1024, now - 5.0)
+
+    def _ffprobe_fails(*_args, **_kwargs):
+        raise RuntimeError("ffprobe unavailable")
+
+    monkeypatch.setattr(rh, "run_hidden", _ffprobe_fails)
+    try:
+        result = rh._get_video_duration(cache_key)
+        # 估算 120s 被拒绝（> dur + max(15, age*1.5) = 115s）→ ffprobe 失败 → 回退旧缓存
+        assert result == 100.0
+        with rh._duration_cache_lock:
+            cached = rh._duration_cache[cache_key]
+        # 缓存不得被虚高估算污染
+        assert cached[0] == 100.0
+    finally:
+        with rh._duration_cache_lock:
+            rh._duration_cache.pop(cache_key, None)
+
+
+def test_loop_wallclock_calibrates_probed_duration() -> None:
+    """持续分析循环必须用墙钟校准录制中时长（双向）。
+
+    虚高 dur 导致抽帧 seek 超界；虚低 dur（估算被拒绝回退旧缓存）导致
+    分析窗口 end 被限制、滞后持续增长。录制中一律以墙钟 - 30s 缓冲为准。
+    """
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _continuous_valorant_worker", 1
+    )[0]
+    assert "wallclock_dur" in loop
+    assert "recorded_duration = wallclock_dur" in loop
+    assert "buffered_wall = max(0.0, wallclock_dur - 30.0)" in loop
+    assert "current_dur = buffered_wall" in loop
+    assert "abs(current_dur - buffered_wall) > 15.0" in loop
+
+
+def test_scan_error_backoff_guards_kick() -> None:
+    """worker 失败后必须退避重试，防止失败-立即重 kick 风暴。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_SCAN_ERROR_BACKOFF_SEC" in src
+    assert "last_scan_error_at" in src
+    assert "time.time() - _last_err_at < _SCAN_ERROR_BACKOFF_SEC" in src
+
+
+def test_worker_crash_detection_and_restart() -> None:
+    """worker 异常退出（非 cancelled）必须被主循环检测并重建，且重建有上限。
+
+    否则 scan_requested 无人消费，主循环每 2s 空转、状态永远「扫描中」。
+    """
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_WORKER_MAX_RESTARTS" in src
+    assert "worker_restarts" in src
+    # 主循环内：worker 存活检测 + 重建
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _continuous_valorant_worker", 1
+    )[0]
+    assert "worker_task" in loop
+    assert "_spawn_worker" in loop
+    assert "扫描器异常终止" in loop
+    assert "扫描器重启中" in loop
+    # 崩溃判定：done() 且非 cancelled 才重建（正常停止路径不重建）
+    assert "_wt is not None and _wt.done() and not state.get('cancelled')" in loop
+
+
+def test_worker_crash_reports_failure_to_main_loop() -> None:
+    """worker 外层 except 必须把失败写入 scan_result 并唤醒主循环。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    worker = src.split("async def _continuous_valorant_worker", 1)[1].split(
+        "async def _continuous_analysis_loop", 1
+    )[0]
+    assert "持续分析 Worker 异常退出" in worker
+    assert "scan_result_container['completed_at'] = time.time()" in worker
+    assert "scan_result_container['error']" in worker
+
+
+def test_ocr_recovery_reprocesses_old_audio_pending() -> None:
+    """OCR 降级恢复后必须：(1) 重置 ocr_refine_done；(2) 把降级期间入列的
+    旧 audio_pending 回合纳入精修目标——否则它们永远无法升格。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    # 降级恢复：递减到 0 时重置精修标记
+    assert "ocr_refine_done" in src
+    assert "state[\"ocr_refine_done\"] = False" in src
+    # 主循环精修块：收集 all_highlights 中旧的 audio_pending 回合
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _continuous_valorant_worker", 1
+    )[0]
+    assert "old_pending_keys" in loop
+    assert "_has_unrefined_pending" in loop
+    # 精修结果按 round_key 写回 all_highlights
+    assert "refined_by_key" in loop
+
+
+def test_merge_round_windows_boundary_drift_does_not_duplicate() -> None:
+    """边界微调（±2s 漂移）后的同一回合必须被合并为一条，不得重复入列。"""
+    existing = [
+        {
+            "start": 100.0, "end": 160.0,
+            "start_by": "model_buy_exit", "end_by": "model_result",
+            "boundary_source": "valorant_hybrid_v1",
+            "confirm_status": "vision_confirmed", "phase": "combat",
+            "round_key": "round-000010",
+        },
+    ]
+    window = [
+        {
+            "start": 101.5, "end": 162.0,  # 起点 +1.5s / 终点 +2s 漂移
+            "start_by": "model_buy_exit", "end_by": "model_result",
+            "boundary_source": "valorant_hybrid_v1",
+            "confirm_status": "vision_confirmed", "phase": "combat",
+        },
+    ]
+    merged = room_handler._merge_round_windows(existing, window)
+    assert len(merged) == 1
+    # 继承既有 round_key，并采用更新后的边界
+    assert merged[0]["round_key"] == "round-000010"
+    assert abs(merged[0]["end"] - 162.0) < 0.1
+
+
+def test_new_rounds_boundary_drift_not_counted_as_fresh() -> None:
+    """_new_rounds 对边界漂移的同一回合不得计为新回合（增量提示口径）。"""
+    prev = [
+        {
+            "start": 100.0, "end": 160.0,
+            "boundary_source": "valorant_hybrid_v1",
+            "confirm_status": "vision_confirmed",
+        },
+    ]
+    current = [
+        {
+            "start": 101.5, "end": 162.0,
+            "boundary_source": "valorant_hybrid_v1",
+            "confirm_status": "vision_confirmed",
+        },
+    ]
+    assert room_handler._new_rounds(prev, current) == []
 

@@ -22,7 +22,6 @@ def main() -> None:
     auto = json.loads(SUSPECTS.read_text(encoding="utf-8")) if SUSPECTS.exists() else []
 
     by_rel = {q["rel_path"].replace("\\", "/"): q for q in queue}
-    by_id = {q["id"]: q for q in queue}
 
     # Build ordered review list: must fixes → uncertain → other auto suspects
     ordered: list[dict] = []

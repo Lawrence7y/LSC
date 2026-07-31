@@ -65,7 +65,7 @@ export interface RoomSession {
 }
 
 // 切片确认状态（与导出状态正交：确认管可信度，export 管导出队列）
-export type ClipConfirmStatus = 'pending' | 'refining' | 'user_confirmed' | 'ocr_confirmed' | 'vision_confirmed'
+export type ClipConfirmStatus = 'pending' | 'refining' | 'user_confirmed' | 'ocr_confirmed' | 'vision_confirmed' | 'audio_pending'
 
 // 切片相关
 export interface ClipSegment {
@@ -224,6 +224,7 @@ export interface ElectronAPI {
   getPlatform: () => string
   getBackendWsUrl: () => Promise<string | null>
   getBackendWsToken?: () => Promise<string | null>
+  onBackendReady?: (callback: (payload: { url: string }) => void) => () => void
   minimizeWindow: () => Promise<void>
   maximizeWindow: () => Promise<void>
   closeWindow: () => Promise<void>
@@ -309,8 +310,14 @@ export interface TimelineHighlightBand {
   score?: number
   reason?: string
   label?: string
-  /** AI 回合确认状态：pending 虚线警示色，confirmed 实色品牌色 */
+  /** AI 回合确认状态：audio_pending 橙色虚线（待 OCR 复核），pending 蓝色虚线，confirmed 实色品牌色 */
   confirm_status?: string
+  /** 边界精度：audio_approximate=音频粗定位，ocr_exact=OCR 精确定位 */
+  boundary_precision?: 'audio_approximate' | 'ocr_exact'
+  /** 该回合是在哪个扫描范围检测到的（可选） */
+  scan_range?: [number, number]
+  /** 来源房间（多房间时有用） */
+  room_id?: string
 }
 
 export type ExportTarget = 'mp4' | 'draft' | 'both'
@@ -360,13 +367,19 @@ export interface ContinuousAnalysisStatus {
   pending_rounds?: number
   analysis_stage?: string
   total_highlights?: number
-  phase?: 'idle' | 'running' | 'stopping' | 'finalizing' | 'completed' | 'error'
+  phase?: 'idle' | 'running' | 'stopping' | 'finalizing' | 'completed' | 'error' | 'stalled'
   status?: string
   updated_at?: number
   scan_mode?: 'full' | 'incremental'
   scan_phase?: 'full' | 'incremental'
   scan_reason?: string
   scan_range?: [number, number]
+  /** 本轮实际扫描窗口的入/出点（秒） */
+  scan_in_sec?: number | null
+  scan_out_sec?: number | null
+  /** 最近一次扫出的回合切片入/出点（秒） */
+  last_detected_in_sec?: number | null
+  last_detected_out_sec?: number | null
   scan_timeout?: number
   full_rescan?: boolean
   refine_with_ocr?: boolean
@@ -378,6 +391,12 @@ export interface ContinuousAnalysisStatus {
   round_phase?: 'unknown' | 'buy' | 'pre_combat' | 'combat' | 'post_combat' | 'intermission'
   round_phase_detail?: string
   pending_round?: boolean
+  /** 等待回合结束的详细解释（P2: 前端等待回合解释） */
+  pending_round_info?: {
+    phase?: string           // 当前等待的相位
+    waiting_for?: string     // 等待什么（如 "buy_end", "combat_end"）
+    since_sec?: number       // 已等待秒数
+  } | null
   predicted_wake_at?: number | null
   predicted_phase?: string | null
   prediction_detail?: string
@@ -386,6 +405,22 @@ export interface ContinuousAnalysisStatus {
   scan_running?: boolean
   /** 分析滞后于录制的秒数（recorded - analyzed），后端 payload 提供 */
   analysis_lag_sec?: number
+  model_version?: string | null
+  provider?: string | null
+  provider_warning?: string | null
+  last_model_inference_frames?: number
+  model_inference_frames_total?: number
+  last_scan_error?: string | null
+  degraded_mode?: 'audio_only' | string | null
+  consecutive_scan_timeouts?: number
+  /** P2 卡死保护：是否处于暂停状态（连续重锚无 buy 信号） */
+  stalled?: boolean
+  /** 卡死原因：no_buy_signal / user_paused 等 */
+  stall_reason?: string
+  /** 音频待复核回合数（P3: 回合边界精度指示） */
+  audio_pending_rounds?: number
+  /** 多房间同步详细错误（P3: 多房间同步详细错误） */
+  mapping_error?: string | null
 }
 
 // 主进程暴露的应用 API（与 electron/preload.ts 保持一致）

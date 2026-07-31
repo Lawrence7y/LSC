@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
+import { useMemo, useRef, useState, useCallback } from 'react'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import { Card, List, Button, Empty, Checkbox, Tooltip, Dropdown } from 'antd'
 import {
   DeleteOutlined,
@@ -63,12 +64,24 @@ function needsConfirm(clip: ClipSegment): boolean {
   return clip.confirm_status === 'pending' || clip.confirm_status === 'refining'
 }
 
+/** 音频路径产出的回合，需要 OCR 复核后才能导出 */
+function needsOcrReview(clip: ClipSegment): boolean {
+  return clip.confirm_status === 'audio_pending'
+}
+
+/** 需要用户/后端继续处理：待确认边界 或 待 OCR 复核（用于「待调」tab 与计数） */
+function needsAttention(clip: ClipSegment): boolean {
+  return needsConfirm(clip) || needsOcrReview(clip)
+}
+
 function canExportClip(clip: ClipSegment): boolean {
   const confirmed = !clip.confirm_status ||
     clip.confirm_status === 'user_confirmed' ||
     clip.confirm_status === 'ocr_confirmed' ||
     clip.confirm_status === 'vision_confirmed'
   if (!confirmed) return false
+  // audio_pending 需要 OCR 复核后才能导出
+  if (needsOcrReview(clip)) return false
   if (clip.export_status === 'queued' || clip.export_status === 'exporting') return false
   return true
 }
@@ -80,10 +93,11 @@ function canExportOrConfirmExport(clip: ClipSegment, hasConfirmAndExport: boolea
   return hasConfirmAndExport && needsConfirm(clip)
 }
 
-/** 状态 → 色轨修饰类（语义：待调=琥珀 / AI=紫 / 可导=品牌青 / 已导=绿 / 失败=红 / 进行中=青） */
+/** 状态 → 色轨修饰类（语义：待调=琥珀 / AI=紫 / 可导=品牌青 / 已导=绿 / 失败=红 / 进行中=青 / 音频待复核=橙） */
 function railClass(clip: ClipSegment, isRefining: boolean, isExporting: boolean): string {
   if (isExporting || clip.export_status === 'queued') return 'rail-busy'
   if (clip.export_status === 'failed') return 'rail-failed'
+  if (clip.confirm_status === 'audio_pending') return 'rail-audio-pending'
   if (isRefining || clip.confirm_status === 'pending') return 'rail-pending'
   if (clip.confirm_status === 'ocr_confirmed' || clip.confirm_status === 'vision_confirmed') return 'rail-ai'
   if (clip.exported) return 'rail-exported'
@@ -117,38 +131,25 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
     () => selectedClips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
     [selectedClips, hasConfirmAndExport],
   )
-  const pendingCount = useMemo(() => clips.filter(needsConfirm).length, [clips])
-  const pendingClips = useMemo(() => clips.filter(needsConfirm), [clips])
+  const pendingCount = useMemo(() => clips.filter(needsAttention).length, [clips])
+  const confirmAllClips = useMemo(() => clips.filter(needsConfirm), [clips])
   const multiRoom = useMemo(() => new Set(clips.map(c => c.room_id)).size > 1, [clips])
   const filteredClips = useMemo(
-    () => (filter === 'all' ? clips : clips.filter(needsConfirm)),
+    () => (filter === 'all' ? clips : clips.filter(needsAttention)),
     [clips, filter],
   )
 
-  const [scrollTop, setScrollTop] = useState(0)
-  const [viewportH, setViewportH] = useState(480)
   const scrollRef = useRef<HTMLDivElement>(null)
   const useVirtual = filteredClips.length >= VIRTUALIZE_THRESHOLD
-  const visibleRange = useMemo(() => {
-    if (!useVirtual) return [0, filteredClips.length] as const
-    const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN)
-    const end = Math.min(filteredClips.length, Math.ceil((scrollTop + viewportH) / ROW_HEIGHT) + OVERSCAN)
-    return [start, end] as const
-  }, [useVirtual, scrollTop, viewportH, filteredClips.length])
-  const visibleClips = useMemo(
-    () => (useVirtual ? filteredClips.slice(visibleRange[0], visibleRange[1]) : filteredClips),
-    [filteredClips, useVirtual, visibleRange],
-  )
 
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
-    const update = () => setViewportH(el.clientHeight || 480)
-    update()
-    const ro = new ResizeObserver(update)
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [clips.length])
+  // 使用 @tanstack/react-virtual 实现高效虚拟列表
+  const virtualizer = useVirtualizer({
+    count: filteredClips.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: OVERSCAN,
+    enabled: useVirtual,
+  })
 
   const toggleSelected = useCallback((clipId: string, checked: boolean) => {
     setSelectedClipIds(prev => {
@@ -159,7 +160,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
     })
   }, [setSelectedClipIds])
 
-  const renderClipRow = useCallback((clip: ClipSegment, indexOffset = 0) => {
+  const renderClipRow = useCallback((clip: ClipSegment) => {
     const clipId = getClipStableId(clip)
     const prog = clip.job_id ? exportProgress?.[clip.job_id] : undefined
     const isExporting = !!prog || clip.export_status === 'exporting'
@@ -190,11 +191,14 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         className={`clip-row-v2 ${railClass(clip, isRefining, isExporting)}${selectedClipIds.has(clipId) ? ' is-sel' : ''}${isRefining ? ' is-refining' : ''}`}
         style={useVirtual ? {
           position: 'absolute' as const,
-          top: (visibleRange[0] + indexOffset) * ROW_HEIGHT,
+          top: 0,
           left: 0,
           right: 0,
           height: ROW_HEIGHT - 4,
-        } : undefined}
+        } : {
+          contentVisibility: 'auto',
+          containIntrinsicSize: `0 ${ROW_HEIGHT}px`,
+        }}
       >
         <span className="clip-row-v2__rail" />
         <Checkbox
@@ -214,6 +218,14 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
               <span className="clip-row-v2__label">{clip.label}</span>
             </Tooltip>
             {isAI && <span className="clip-row-v2__tag clip-row-v2__tag--ai">AI</span>}
+            {needsOcrReview(clip) && (
+              <Tooltip title="音频路径检测到，等待 OCR 复核边界；复核完成后会自动升格，无需手动确认">
+                <span className="clip-row-v2__tag clip-row-v2__tag--audio-pending">OCR 复核中</span>
+              </Tooltip>
+            )}
+            {clip.confirm_status === 'user_confirmed' && (
+              <span className="clip-row-v2__tag clip-row-v2__tag--confirmed">已确认</span>
+            )}
             {isApprox && (
               <Tooltip title="近似定位：边界为音频推断，建议精修后导出">
                 <span className="clip-row-v2__tag clip-row-v2__tag--approx">近似</span>
@@ -221,11 +233,17 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
             )}
           </div>
           <div className="clip-row-v2__bottom" onClick={e => e.stopPropagation()}>
-            {isExporting ? (
-              <span className="clip-row-v2__prog">
-                <span className="pbar-line"><span className="pbar-fill" style={{ width: `${(prog?.percent ?? 0).toFixed(0)}%` }} /></span>
-                <span className="clip-row-v2__pct">{(prog?.percent ?? 0).toFixed(0)}%</span>
-              </span>
+              {isExporting ? (
+                <span className="clip-row-v2__prog">
+                  <span className="pbar-line">
+                    {(prog?.percent ?? 0) > 0
+                      ? <span className="pbar-fill" style={{ width: `${prog!.percent.toFixed(0)}%` }} />
+                      : <span className="pbar-ind" />}
+                  </span>
+                  <span className="clip-row-v2__pct">
+                    {(prog?.percent ?? 0) > 0 ? `${prog!.percent.toFixed(0)}%` : '准备中'}
+                  </span>
+                </span>
             ) : (
               <span className="clip-row-v2__time">
                 {formatTime(clip.start)}<i className="sep-dot">→</i>{formatTime(clip.end)}<i className="sep-dot">·</i><span className="dur">{formatDuration(clip.end - clip.start)}</span>
@@ -317,7 +335,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         </div>
       </div>
     )
-  }, [exportProgress, refiningClipId, selectedClipIds, onConfirmAndExport, onConfirmClip, onSelectClip, onDelete, onExport, onCancelExport, onOpenFile, toggleSelected, useVirtual, visibleRange, multiRoom])
+  }, [exportProgress, refiningClipId, selectedClipIds, onConfirmAndExport, onConfirmClip, onSelectClip, onDelete, onExport, onCancelExport, onOpenFile, toggleSelected, useVirtual, multiRoom])
 
   return (
     <Card
@@ -356,9 +374,10 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                   {
                     key: 'confirm-all',
                     icon: <CheckOutlined />,
-                    label: `确认全部（${pendingCount}）`,
-                    disabled: pendingCount === 0,
-                    onClick: () => onConfirmAll?.(pendingClips),
+                    // 仅确认待确认边界的回合；audio_pending 等 OCR 复核自动升格，批量确认会跳过复核
+                    label: `确认全部（${confirmAllClips.length}）`,
+                    disabled: confirmAllClips.length === 0,
+                    onClick: () => onConfirmAll?.(confirmAllClips),
                   },
                 ],
               }}
@@ -403,15 +422,29 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
       ) : (
         <div
           ref={scrollRef}
-          onScroll={(e) => {
-            if (!useVirtual) return
-            setScrollTop((e.target as HTMLDivElement).scrollTop)
-          }}
           style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', position: 'relative' }}
         >
           {useVirtual ? (
-            <div style={{ height: filteredClips.length * ROW_HEIGHT, position: 'relative' }}>
-              {visibleClips.map((clip, i) => renderClipRow(clip, i))}
+            // 虚拟列表：只渲染可见行
+            <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+              {virtualizer.getVirtualItems().map((virtualRow) => {
+                const clip = filteredClips[virtualRow.index]
+                return (
+                  <div
+                    key={virtualRow.key}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      height: virtualRow.size,
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
+                  >
+                    {renderClipRow(clip)}
+                  </div>
+                )
+              })}
             </div>
           ) : (
             <List

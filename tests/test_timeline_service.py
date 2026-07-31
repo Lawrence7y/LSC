@@ -1,14 +1,10 @@
 """TimelineService 单元测试 — TDD 先行。"""
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from lsc.core.models import (
-    ClipSnapshot,
     RoomTimeSnapshot,
-    TimelineContext,
 )
 from lsc.core.services.timeline_service import TimelineService
 
@@ -225,14 +221,32 @@ class TestTimelineServiceEpochChange:
         assert service.get_timeline(ctx.timeline_id) is None
         assert service.get_clip_snapshot(clip.clip_id) is not None
 
-    def test_recording_id_change_updates(self, service, valid_snapshots):
-        """录制启动/重连时生成新 recording_id。"""
+    def test_recording_id_change_invalidates_existing_epoch(self, service, valid_snapshots):
+        """已有录制重连后媒体起点失效，旧 TimelineContext 必须失效。"""
         ctx = service.create_timeline("room-1", valid_snapshots)
-        service.on_recording_id_change("room-1", "new-rec-id")
+        service.on_recording_id_change("room-1", "new-rec-id", media_start_mono=200.0)
         updated = service.get_timeline(ctx.timeline_id)
-        # recording_id 变化不应使 timeline 失效，只更新快照
+        assert updated is None
+
+    def test_first_recording_epoch_updates_media_start(self, service, valid_snapshots):
+        """预览先对齐、随后首次录制时，可原子补齐 recording ID 与媒体起点。"""
+        valid_snapshots["room-1"].recording_id = ""
+        valid_snapshots["room-1"].media_start_mono = 0.0
+        valid_snapshots["room-1"].recording_to_common_delta = 1.0
+        ctx = service.create_timeline("room-1", valid_snapshots)
+
+        service.on_recording_id_change(
+            "room-1",
+            "first-rec-id",
+            media_start_mono=200.0,
+        )
+
+        updated = service.get_timeline(ctx.timeline_id)
         assert updated is not None
-        assert updated.room_snapshots["room-1"].recording_id == "new-rec-id"
+        snap = updated.room_snapshots["room-1"]
+        assert snap.recording_id == "first-rec-id"
+        assert snap.media_start_mono == 200.0
+        assert snap.recording_to_common_delta == 201.0
 
 
 class TestTimelineServiceAtomicAlignment:

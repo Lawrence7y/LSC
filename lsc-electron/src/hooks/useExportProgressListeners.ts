@@ -1,20 +1,17 @@
-import { useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
+import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 import { message } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import type { ExportProgressInfo } from '@/pages/Workbench/components/ClipList'
 
 type OnFn = (type: string, handler: (data: any) => void) => () => void
-
-/** 进度条目超时：超过该时长无任何 export_progress 更新，判定终态事件丢失并清扫 */
-const EXPORT_PROGRESS_STALE_MS = 120_000
-/** 超时清扫巡检间隔 */
-const EXPORT_PROGRESS_SWEEP_INTERVAL_MS = 30_000
+type SendFn = (type: string, data?: any) => boolean
 
 /**
  * 导出进度 / 完成 / 失败 WebSocket 监听（从 Workbench 拆出，降低巨型组件体积）。
  */
 export function useExportProgressListeners(opts: {
   on: OnFn
+  send: SendFn
   setExportProgressMap: Dispatch<SetStateAction<Record<string, ExportProgressInfo>>>
   exportProgressPendingRef: MutableRefObject<Record<string, ExportProgressInfo>>
   exportProgressFlushTimerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>
@@ -23,15 +20,13 @@ export function useExportProgressListeners(opts: {
 }): void {
   const {
     on,
+    send,
     setExportProgressMap,
     exportProgressPendingRef,
     exportProgressFlushTimerRef,
     exportProgressStatusPendingRef,
     pendingExportJobIdsRef,
   } = opts
-  // 各 job 最近一次进度时间戳：用于终态事件（clip_completed/clip_failed）丢失时的兜底清扫
-  const lastProgressAtRef = useRef<Record<string, number>>({})
-
   useEffect(() => {
     const unsubs: (() => void)[] = []
     const flushExportProgress = () => {
@@ -60,6 +55,16 @@ export function useExportProgressListeners(opts: {
       if (exportProgressFlushTimerRef.current != null) return
       exportProgressFlushTimerRef.current = setTimeout(flushExportProgress, 500)
     }
+    unsubs.push(on('clip_export_started', (data: any) => {
+      if (!data?.job_id) return
+      exportProgressPendingRef.current[data.job_id] = {
+        percent: 0,
+        elapsed: 0,
+        total: 0,
+      }
+      exportProgressStatusPendingRef.current.add(data.job_id)
+      scheduleExportProgressFlush()
+    }))
     unsubs.push(on('export_progress', (data: any) => {
       if (data?.job_id && typeof data.percent === 'number') {
         exportProgressPendingRef.current[data.job_id] = {
@@ -67,7 +72,6 @@ export function useExportProgressListeners(opts: {
           elapsed: data.elapsed ?? 0,
           total: data.total ?? 0,
         }
-        lastProgressAtRef.current[data.job_id] = Date.now()
         exportProgressStatusPendingRef.current.add(data.job_id)
         scheduleExportProgressFlush()
       }
@@ -82,7 +86,6 @@ export function useExportProgressListeners(opts: {
         )
         store.setClips(updatedClips)
         delete exportProgressPendingRef.current[data.job_id]
-        delete lastProgressAtRef.current[data.job_id]
         exportProgressStatusPendingRef.current.delete(data.job_id)
         setExportProgressMap(prev => {
           if (!prev[data.job_id]) return prev
@@ -106,7 +109,6 @@ export function useExportProgressListeners(opts: {
       if (data?.job_id) {
         const jid = data.job_id
         delete exportProgressPendingRef.current[jid]
-        delete lastProgressAtRef.current[jid]
         exportProgressStatusPendingRef.current.delete(jid)
         setExportProgressMap(prev => {
           if (!prev[jid]) return prev
@@ -166,38 +168,82 @@ export function useExportProgressListeners(opts: {
         message.warning(`取消导出失败：${data.error || '任务可能已结束'}`)
       }
     }))
-    // 超时清扫：后端若漏发终态事件（进程崩溃/消息丢失），进度条目不会永久残留
-    const sweepTimer = setInterval(() => {
-      const now = Date.now()
-      const staleJobIds = Object.keys(lastProgressAtRef.current).filter(
-        (jid) => now - lastProgressAtRef.current[jid] > EXPORT_PROGRESS_STALE_MS,
-      )
-      if (staleJobIds.length === 0) return
-      const staleSet = new Set(staleJobIds)
-      for (const jid of staleJobIds) {
-        delete lastProgressAtRef.current[jid]
-        delete exportProgressPendingRef.current[jid]
-        exportProgressStatusPendingRef.current.delete(jid)
-      }
-      setExportProgressMap(prev => {
-        let next = prev
-        for (const jid of staleJobIds) {
-          if (next[jid]) {
-            if (next === prev) next = { ...prev }
-            delete next[jid]
-          }
-        }
-        return next
-      })
+    unsubs.push(on('get_export_job_status_response', (data: {
+      success?: boolean
+      jobs?: Array<{
+        job_id: string
+        status: 'queued' | 'exporting' | 'completed' | 'failed' | 'cancelled'
+        percent?: number
+        elapsed?: number
+        total?: number
+        output_path?: string
+        error?: string
+      }>
+    }) => {
+      if (data?.success === false || !Array.isArray(data?.jobs)) return
       const store = useAppStore.getState()
-      store.setClips(store.clips.map(c =>
-        c.job_id && staleSet.has(c.job_id) && c.export_status === 'exporting'
-          ? { ...c, export_status: 'failed' as const, export_error: '导出进度超时，请检查产物或重试' }
-          : c
-      ))
-    }, EXPORT_PROGRESS_SWEEP_INTERVAL_MS)
+      let clipsChanged = false
+      let nextClips = store.clips
+      for (const job of data.jobs) {
+        if (!job?.job_id) continue
+        if (job.status === 'queued' || job.status === 'exporting') {
+          exportProgressPendingRef.current[job.job_id] = {
+            percent: Number(job.percent || 0),
+            elapsed: Number(job.elapsed || 0),
+            total: Number(job.total || 0),
+          }
+          exportProgressStatusPendingRef.current.add(job.job_id)
+          scheduleExportProgressFlush()
+          continue
+        }
+        delete exportProgressPendingRef.current[job.job_id]
+        exportProgressStatusPendingRef.current.delete(job.job_id)
+        setExportProgressMap(prev => {
+          if (!prev[job.job_id]) return prev
+          const next = { ...prev }
+          delete next[job.job_id]
+          return next
+        })
+        nextClips = nextClips.map(clip => {
+          if (clip.job_id !== job.job_id) return clip
+          clipsChanged = true
+          if (job.status === 'completed') {
+            return {
+              ...clip,
+              exported: true,
+              outputPath: job.output_path,
+              export_status: 'completed' as const,
+              export_error: undefined,
+            }
+          }
+          return {
+            ...clip,
+            export_status: job.status === 'cancelled' ? 'pending' as const : 'failed' as const,
+            export_error: job.status === 'cancelled' ? undefined : (job.error || '导出失败'),
+          }
+        })
+      }
+      if (clipsChanged) store.setClips(nextClips)
+    }))
+
+    // 终态补偿：广播可能因重连或线程切换丢失，主动查询仍在队列/导出中的任务。
+    // 从 1500ms 提升到 5000ms：主要进度由 export_progress 事件实时推送，
+    // 此定时器仅为安全网，无需高频轮询。
+    const syncExportJobStatus = () => {
+      const jobIds = useAppStore.getState().clips
+        .filter(clip => (
+          (clip.export_status === 'queued' || clip.export_status === 'exporting')
+          && Boolean(clip.job_id)
+        ))
+        .map(clip => clip.job_id!)
+      if (jobIds.length > 0) {
+        send('get_export_job_status', { job_ids: [...new Set(jobIds)] })
+      }
+    }
+    syncExportJobStatus()
+    const statusSyncTimer = setInterval(syncExportJobStatus, 5000)
     return () => {
-      clearInterval(sweepTimer)
+      clearInterval(statusSyncTimer)
       if (exportProgressFlushTimerRef.current != null) {
         clearTimeout(exportProgressFlushTimerRef.current)
         exportProgressFlushTimerRef.current = null
@@ -206,6 +252,7 @@ export function useExportProgressListeners(opts: {
     }
   }, [
     on,
+    send,
     setExportProgressMap,
     exportProgressPendingRef,
     exportProgressFlushTimerRef,

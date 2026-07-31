@@ -1,6 +1,7 @@
 import { useEffect, useCallback } from 'react'
 import { message } from 'antd'
 import { wsClient as _wsClient } from '@/services/websocket'
+import type { RoomSession } from '@/types'
 
 // 导出 wsClient 供需要在组件外订阅事件的场景使用
 export const wsClient = _wsClient
@@ -83,7 +84,7 @@ function _pruneExpiredMseCache(): void {
 }
 
 // 定期清理过期 MSE 缓存，避免 segment 缓存先过期时需等待下次 cache 调用才清理
-const _mseCacheCleanupInterval = setInterval(_pruneExpiredMseCache, 60_000)
+setInterval(_pruneExpiredMseCache, 60_000)
 
 function _cacheMseInit(roomId: string, buffer: ArrayBuffer): void {
   _pruneExpiredMseCache()
@@ -209,16 +210,24 @@ function _attachSharedWebSocketHandlers(): () => void {
     // 断连终止）。使用 setTimeout 避免阻塞 get_settings 的处理。
     setTimeout(() => {
       const rooms = useAppStore.getState().rooms
+      const uiState = useAppStore.getState().uiState
       for (const room of rooms) {
-        if (room.preview_enabled && room.is_connected) {
+        if (room.preview_enabled && room.is_connected && !uiState[room.room_id]?.mse_reconnecting) {
           console.log(`[WS] Reconnecting preview for room ${room.room_id} after WS reconnect`)
           wsClient.send('enable_preview', { room_id: room.room_id, enabled: true, mode: 'mse' })
         }
       }
-    }, 500)
+    }, 1000)
   })
   const unsubDisconnected = wsClient.on('disconnected', () => {
     useAppStore.getState().setConnectionStatus('disconnected')
+  })
+  const unsubscribeBackendReady = window.electronAPI?.onBackendReady?.(() => {
+    if (wsClient.connected) return
+    useAppStore.getState().setConnectionStatus('connecting')
+    wsClient.reconnect().catch(() => {
+      useAppStore.getState().setConnectionStatus('disconnected')
+    })
   })
 
   const handleRooms = (data: { rooms: any[] }) => {
@@ -266,10 +275,16 @@ function _attachSharedWebSocketHandlers(): () => void {
   })
   const unsubRoomsLoaded = wsClient.on('rooms_loaded', handleRooms)
 
-  const unsubRoomUpdated = wsClient.on('room_updated', (data: { room_id: string } & Record<string, any>) => {
+  const unsubRoomUpdated = wsClient.on('room_updated', (data: any) => {
     if (data && data.room_id) {
-      const { room_id, ...updates } = data
-      useAppStore.getState().updateRoom(room_id, updates)
+      // 如果有完整 room 对象，使用增量更新（P0-2: rooms_updated 增量更新）
+      if (data.room) {
+        useAppStore.getState().updateRoomIncremental(data.room_id, data.room as RoomSession)
+      } else {
+        // 否则使用字段级更新
+        const { room_id, ...updates } = data as { room_id: string } & Partial<RoomSession>
+        useAppStore.getState().updateRoom(room_id, updates)
+      }
     }
   })
 
@@ -527,11 +542,15 @@ function _attachSharedWebSocketHandlers(): () => void {
     if (!wsClient.connected) return
     _pruneExpiredMseCache()
     const now = Date.now()
-    const rooms = useAppStore.getState().rooms
+    const currentStore = useAppStore.getState()
+    const rooms = currentStore.rooms
     for (const r of rooms) {
       if (!r.preview_enabled || !r.is_connected) continue
       if (r.preview_paused) continue
-      if (r.preview_phase && r.preview_phase !== 'streaming') continue
+      const roomUi = currentStore.uiState[r.room_id]
+      const previewPhase = roomUi?.preview_phase ?? r.preview_phase
+      if (previewPhase && previewPhase !== 'streaming') continue
+      if (roomUi?.mse_reconnecting) continue
       const lastRecv = _lastMseSegmentTimePerRoom.get(r.room_id)
       if (!lastRecv) continue
       const stall = now - lastRecv
@@ -560,6 +579,7 @@ function _attachSharedWebSocketHandlers(): () => void {
   return () => {
     unsubConnected()
     unsubDisconnected()
+    unsubscribeBackendReady?.()
     unsubRoomsUpdated()
     unsubRoomsLoaded()
     unsubRoomUpdated()

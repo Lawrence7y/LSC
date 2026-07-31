@@ -350,14 +350,15 @@ class StreamCapture:
         # 流重连参数（仅对 HTTP/HTTPS 直播流生效）
         # -reconnect 1: 启用自动重连
         # -reconnect_streamed 1: 对流式传输也启用重连
-        # -reconnect_delay_max 5: 最大重连间隔 5 秒
-        # -timeout 30000000: 网络超时 30 秒（微秒）
+        # -reconnect_delay_max 3: 最大重连间隔 3 秒（降低以更快触发系统级重连）
+        # -timeout 20000000: 网络超时 20 秒（微秒），比 FFmpeg 默认更短，
+        #   让 403/连接断开更快被检测到，交给系统级重连切换 CDN 线路
         if url.startswith(("http://", "https://")):
             cmd += [
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-                "-timeout", "30000000",
+                "-reconnect_delay_max", "3",
+                "-timeout", "20000000",
             ]
 
         # 输入专属选项（如自定义 headers）必须放在 -i 之前
@@ -389,11 +390,17 @@ class StreamCapture:
 
         # 输出格式配置
         # -f mp4: 强制 MP4 容器格式
-        # -movflags frag_keyframe+empty_moov+faststart:
+        # -movflags frag_keyframe+faststart:
         #   frag_keyframe: 每个关键帧生成一个片段（支持流式写入）
-        #   empty_moov: 文件头在结束时写入（支持边录边写）
         #   faststart: 移动 moov atom 到文件开头（便于网络播放）
-        cmd += ["-f", "mp4", "-movflags", "frag_keyframe+empty_moov+faststart", output_path]
+        #
+        # 注意：不使用 empty_mov。empty_moov 会在文件开头写一个空壳 moov（无 track 索引），
+        # 导致录制中/录制刚结束时 OCR 抽帧时 FFmpeg 无法通过 moov 定位关键帧。
+        # 去掉 empty_moov 后，moov 会在文件末尾持续更新（包含已写入片段的完整索引），
+        # OCR 抽帧时 FFmpeg 可以正常 seek 到已写入的关键帧。
+        # 代价：录制中如果 FFmpeg 异常退出，文件可能因 moov 不完整而无法播放
+        # （但 FFmpeg 正常停止时会写完整 moov，且 frag_keyframe 保证每个片段可独立解码）。
+        cmd += ["-f", "mp4", "-movflags", "frag_keyframe+faststart", output_path]
 
         # URL 脱敏：只打印 scheme+host+path，不打印 query（可能含 Token）
         from urllib.parse import urlparse
@@ -667,10 +674,7 @@ class StreamCapture:
 
         文件卡住检测逻辑：
           - 每次调用记录当前文件大小
-          - 如果连续 6 次（即约 30 秒，6 个检查周期 × 5 秒间隔）文件大小
-            无变化且文件非空，则认为直播流可能已卡住，返回警告信息。
-            阈值与 FFmpeg 的 -timeout 30000000（30 秒）对齐，给内置重连
-            机制充分时间完成，避免网络抖动误判为卡住。
+          - 如果连续 6 次检查文件大小未变化则判定为卡住（可能直播流中断）
           - 文件大小恢复增长时会重置计数器
 
         Returns:

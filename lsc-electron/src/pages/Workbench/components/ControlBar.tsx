@@ -76,6 +76,10 @@ interface ControlBarProps {
   axis?: TimelineProgressSummary['axis']
   /** 持续分析状态（用于展示分析轴进度） */
   continuousStatus?: ContinuousAnalysisStatus | null
+  /** 分析扫描进度（0~1）：已分析时长 / 总时长 */
+  analysisProgress?: number
+  /** 当前扫描范围 [start, end]（绝对秒） */
+  scanRange?: [number, number] | null
 }
 
 /**
@@ -117,6 +121,8 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (prev.dvrStart !== next.dvrStart) return false
   if (prev.axis !== next.axis) return false
   if (prev.continuousStatus !== next.continuousStatus) return false
+  if (prev.analysisProgress !== next.analysisProgress) return false
+  if (prev.scanRange !== next.scanRange) return false
 
   const a = prev.room
   const b = next.room
@@ -171,6 +177,8 @@ export const ControlBar = memo(function ControlBar({
   dvrStart = null,
   axis = 'preview',
   continuousStatus = null,
+  analysisProgress,
+  scanRange = null,
 }: ControlBarProps) {
   void _alignStatus
   const isRecordingReview = isRecordingReviewMode(room?.preview_mode)
@@ -371,23 +379,57 @@ export const ControlBar = memo(function ControlBar({
         flexShrink: 0,
         zIndex: 20,
       }}>
-      {multiSelectCount > 0 && (
+      {/* 顶部信息行：三轴指示器 + 多选提示（P2: 三轴同步状态指示） */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+        {/* 三轴指示器 */}
         <div style={{
           display: 'inline-flex',
           alignItems: 'center',
-          gap: 8,
-          padding: '4px 12px',
-          background: 'rgba(77, 196, 191, 0.06)',
-          borderRadius: 6,
-          fontSize: 12,
-          color: 'var(--accent-primary)',
-          fontWeight: 500,
-          alignSelf: 'flex-start',
+          gap: 4,
+          padding: '2px 8px',
+          background: 'var(--bg-tertiary, #2c2c2e)',
+          borderRadius: 4,
+          fontSize: 11,
         }}>
-          <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-primary)' }} />
-          {multiSelectCount} 个房间已选中 — 时间线 / 入出点 / 播放控制全局生效
+          {(['preview', 'common', 'recording_review'] as const).map((ax) => {
+            const isActive = axis === ax
+            const label = ax === 'preview' ? '预览轴' : ax === 'common' ? '公共轴' : '录制轴'
+            return (
+              <span
+                key={ax}
+                style={{
+                  padding: '2px 8px',
+                  borderRadius: 3,
+                  background: isActive ? 'var(--brand-500, #31B3AE)' : 'transparent',
+                  color: isActive ? '#fff' : 'var(--text-400, #888780)',
+                  fontWeight: isActive ? 600 : 400,
+                  cursor: 'default',
+                  transition: 'all 150ms ease',
+                }}
+                title={`当前轴：${axisLabel}`}
+              >
+                {label}
+              </span>
+            )
+          })}
         </div>
-      )}
+        {multiSelectCount > 0 && (
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '2px 10px',
+            background: 'rgba(77, 196, 191, 0.08)',
+            borderRadius: 4,
+            fontSize: 11,
+            color: 'var(--brand-400, #4DC4BF)',
+            fontWeight: 500,
+          }}>
+            <span style={{ display: 'inline-block', width: 5, height: 5, borderRadius: '50%', background: 'var(--brand-400, #4DC4BF)' }} />
+            {multiSelectCount} 房间 · 全局控制
+          </div>
+        )}
+      </div>
       <Timeline
         duration={trackDuration}
         currentTime={displayCurrent}
@@ -417,10 +459,11 @@ export const ControlBar = memo(function ControlBar({
         dvrStart={dvrStart ?? null}
         followLive={followLive}
         isScrubbing={isScrubbing}
-        onGoLive={onGoLive}
         height={64}
         zoomLevel={zoomLevel}
         onZoomChange={onZoomChange}
+        analysisProgress={analysisProgress}
+        scanRange={scanRange}
       />
 
       {/* 控制按钮 */}

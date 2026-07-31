@@ -3,12 +3,12 @@ from __future__ import annotations
 from lsc.config import LscConfig
 from lsc.core.models import RecordingStatus, RoomInfo
 from lsc.core.services.ingest_registry import get_shared_ingest_registry
-from lsc.core.services.shared_ingest import SharedIngestStartResult
 from lsc.core.services.recording_service import RecordingService, _SharedCaptureAdapter
+from lsc.core.services.shared_ingest import SharedIngestStartResult
 
 
 class _FakeCapture:
-    instances: list["_FakeCapture"] = []
+    instances: list[_FakeCapture] = []
 
     def __init__(self, _config):
         self.starts: list[dict] = []

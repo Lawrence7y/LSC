@@ -35,7 +35,7 @@ def transition_centers(queue: list[dict], labels: dict) -> list[tuple[str, str, 
     out: list[tuple[str, str, float]] = []
     for (video_id, split), items in groups.items():
         ordered = sorted(items, key=lambda row: row["timestamp_sec"])
-        for left, right in zip(ordered, ordered[1:]):
+        for left, right in zip(ordered, ordered[1:], strict=False):
             if labels[left["id"]]["label"] != labels[right["id"]]["label"]:
                 out.append((video_id, split, (left["timestamp_sec"] + right["timestamp_sec"]) / 2.0))
     return out

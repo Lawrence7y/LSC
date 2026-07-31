@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -89,7 +88,7 @@ def test_short_refresh_confirms_when_analyzing_or_aligned() -> None:
     """Task 3: 短按刷新在对齐就绪或持续分析中须二次确认。"""
     body = _handle_refresh_short_click_body(_workbench_source())
 
-    assert "Modal.confirm" in body
+    assert "modal.confirm" in body or "Modal.confirm" in body
     assert "刷新预览将使公共轴失效" in body
     assert "continuousAnalyzing" in body
     assert "getAlignStatus" in body

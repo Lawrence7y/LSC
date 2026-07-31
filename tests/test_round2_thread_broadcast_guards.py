@@ -5,13 +5,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGER = (ROOT / "lsc/gui/multi_room/manager.py").read_text(encoding="utf-8")
+ORCHESTRATOR = (ROOT / "lsc/core/orchestrator.py").read_text(encoding="utf-8")
 SERVER = (ROOT / "python-backend/server.py").read_text(encoding="utf-8")
 ROOM_HANDLER = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
 
 
 def test_recording_reconnect_does_not_spawn_raw_thread() -> None:
     """录制重连必须在 Qt 主线程路径执行，禁止 threading.Thread 直接改房间状态。"""
-    body = MANAGER.split("def _start_recording_reconnect_thread", 1)[1].split(
+    body = ORCHESTRATOR.split("def _start_recording_reconnect_thread", 1)[1].split(
         "def _start_global_timer", 1
     )[0]
     assert "threading.Thread" not in body
@@ -20,12 +21,12 @@ def test_recording_reconnect_does_not_spawn_raw_thread() -> None:
 
 def test_proactive_reconnect_does_not_spawn_raw_thread() -> None:
     """URL 过期主动重连禁止后台线程直接调用 start_recording。"""
-    chunk = MANAGER.split("stream URL expiring soon, proactive reconnect", 1)[1].split(
-        "self.global_tick.emit()", 1
+    chunk = ORCHESTRATOR.split("stream URL expiring soon, proactive reconnect", 1)[1].split(
+        'self.bus.emit("global_tick")', 1
     )[0]
     assert "threading.Thread" not in chunk
     assert "_do_proactive_reconnect" in chunk
-    do_body = MANAGER.split("def _do_proactive_reconnect", 1)[1].split(
+    do_body = ORCHESTRATOR.split("def _do_proactive_reconnect", 1)[1].split(
         "def _start_recording_reconnect_thread", 1
     )[0]
     assert "start_recording" in do_body
@@ -51,6 +52,7 @@ def test_export_semaphore_waits_for_in_flight_jobs() -> None:
 
 
 def test_size_update_uses_room_lock() -> None:
-    """SizeUpdateRunnable 写 record_size_mb 须持 RoomSession 锁。"""
-    body = MANAGER.split("class SizeUpdateRunnable", 1)[1].split("class _ConnectWorker", 1)[0]
+    """SizeUpdateJob 写 record_size_mb 须持 RoomSession 锁。"""
+    orchestrator = (ROOT / "lsc/core/orchestrator.py").read_text(encoding="utf-8")
+    body = orchestrator.split("class SizeUpdateJob", 1)[1].split("class RoomOrchestrator", 1)[0]
     assert "_room_lock" in body

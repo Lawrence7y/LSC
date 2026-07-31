@@ -1,18 +1,64 @@
+import { useEffect, useState, useCallback } from 'react'
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { ConfigProvider, theme, App as AntdApp } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import MainLayout from './components/Layout/MainLayout'
 import ErrorBoundary from './components/ErrorBoundary'
 import Workbench from './pages/Workbench'
+import SplashScreen from './pages/SplashScreen'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useNotifications } from '@/hooks/useNotifications'
 import { useAppStore } from '@/store/appStore'
+
+interface StartupDependencyState {
+  phase: 'checking' | 'installing' | 'ready' | 'error'
+  result?: {
+    python: Record<string, boolean>
+    core_ok: boolean
+    ai_ok: boolean
+    ffmpeg_ok: boolean
+    all_ok: boolean
+  }
+  error?: string
+}
 
 function AppContent() {
   useWebSocket()
   useNotifications()
 
+  const [dependencyState, setDependencyState] = useState<StartupDependencyState | null>(null)
+  const [dependencyOverlayDismissed, setDependencyOverlayDismissed] = useState(false)
+
+  useEffect(() => {
+    const api = (window as any).electronAPI
+    let active = true
+    const unsubscribe = api?.onStartupDependencyState?.((state: StartupDependencyState) => {
+      if (!active) return
+      setDependencyState(state)
+      if (state.phase === 'installing') setDependencyOverlayDismissed(false)
+    })
+
+    api?.getStartupDependencyState?.()
+      .then((state: StartupDependencyState) => {
+        if (active && state) setDependencyState(state)
+      })
+      .catch(() => {})
+
+    return () => {
+      active = false
+      unsubscribe?.()
+    }
+  }, [])
+
+  const handleReady = useCallback(() => {
+    setDependencyOverlayDismissed(true)
+  }, [])
+
+  const showDependencyOverlay = !dependencyOverlayDismissed &&
+    (dependencyState?.phase === 'installing' || dependencyState?.phase === 'error')
+
   return (
+    <>
       <HashRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Routes>
           <Route path="/" element={<MainLayout />}>
@@ -21,6 +67,18 @@ function AppContent() {
           </Route>
         </Routes>
       </HashRouter>
+      {showDependencyOverlay && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 10000 }}>
+          <SplashScreen
+            onReady={handleReady}
+            autoCheck={false}
+            initialResult={dependencyState?.result}
+            initialStatus={dependencyState?.phase}
+            initialError={dependencyState?.error}
+          />
+        </div>
+      )}
+    </>
   )
 }
 

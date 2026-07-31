@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 CLASS_NAMES = ("non_game", "buy", "combat", "result", "replay")
 SOURCE_TYPES = ("broadcast", "pov")
@@ -340,9 +341,7 @@ def compute_round_report(rounds: dict[str, Any]) -> RoundReport:
             vc_start.append(p0 - g0)
             vc_end.append(p1 - g1)
         if is_listed:
-            if pred.get("is_false_positive") is True:
-                pass
-            elif pred.get("is_true_positive") is False:
+            if pred.get("is_false_positive") is True or pred.get("is_true_positive") is False:
                 pass
             else:
                 listed_tp += 1

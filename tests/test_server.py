@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import sys
-import threading
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from websockets.exceptions import ConnectionClosed
@@ -22,7 +20,7 @@ _backend_dir = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-from server import _truncate_for_log, _NumpyJSONEncoder, _json_dumps, LSCWebSocketServer
+from server import LSCWebSocketServer, _json_dumps, _truncate_for_log
 from ws_auth import is_origin_allowed
 
 
@@ -247,13 +245,23 @@ class _MockWebSocket:
     Yields the provided messages then raises ConnectionClosed to end the
     receive loop, mirroring a real client disconnect.
     """
-    def __init__(self, messages: list[str], origin: str = '', path: str = '/'):
+    def __init__(
+        self,
+        messages: list[str],
+        origin: str = '',
+        path: str = '/',
+        auth_message: str | None = None,
+    ):
         self._messages = list(messages)
+        self._auth_message = auth_message or json.dumps({'type': 'auth', 'token': ''})
         self.sent: list[str] = []
         self.request_headers = MagicMock()
         self.request_headers.get = MagicMock(return_value=origin)
         self.path = path
         self._closed = False
+
+    async def recv(self):
+        return self._auth_message
 
     def __aiter__(self):
         return self
@@ -355,8 +363,8 @@ class TestOriginRejectionInHandleClient:
     def _ws_token_not_required(self, monkeypatch):
         monkeypatch.setenv("LSC_WS_TOKEN_REQUIRED", "0")
 
-    def test_missing_origin_rejected(self):
-        """handle_client must close the connection when Origin is missing (#14)."""
+    def test_missing_origin_accepted_with_first_frame_auth(self):
+        """打包版 Electron 可能不发 Origin，首帧认证仍须允许本机受信连接。"""
         srv = LSCWebSocketServer()
         ws = _MockWebSocket([], origin='')  # no Origin header
 
@@ -366,8 +374,7 @@ class TestOriginRejectionInHandleClient:
         finally:
             loop.close()
 
-        # Connection must have been closed and client NOT added
-        assert ws._closed is True
+        assert ws._closed is False
         assert ws not in srv.clients
 
     def test_null_origin_accepted(self):
@@ -400,7 +407,11 @@ class TestTokenRejectionInHandleClient:
 
     def test_missing_token_rejected(self):
         srv = LSCWebSocketServer()
-        ws = _MockWebSocket([], origin='http://localhost:5173', path='/')
+        ws = _MockWebSocket(
+            [],
+            origin='http://localhost:5173',
+            auth_message=json.dumps({'type': 'auth'}),
+        )
 
         loop = asyncio.new_event_loop()
         try:
@@ -413,7 +424,11 @@ class TestTokenRejectionInHandleClient:
 
     def test_invalid_token_rejected(self):
         srv = LSCWebSocketServer()
-        ws = _MockWebSocket([], origin='http://localhost:5173', path='/?token=wrong')
+        ws = _MockWebSocket(
+            [],
+            origin='http://localhost:5173',
+            auth_message=json.dumps({'type': 'auth', 'token': 'wrong'}),
+        )
 
         loop = asyncio.new_event_loop()
         try:
@@ -436,6 +451,7 @@ class TestBroadcastNumpySerialization:
         silently dropped the broadcast.
         """
         import inspect
+
         from main import LSCWebSocketBackend
 
         source = inspect.getsource(LSCWebSocketBackend._broadcast_coroutine)

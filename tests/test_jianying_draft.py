@@ -56,8 +56,9 @@ def test_clip_timeranges_same_target_different_source():
     a = map_clip_timeranges(5.0, 10.0, recording_to_common_delta=0.0, draft_origin=0.0)
     b = map_clip_timeranges(5.0, 10.0, recording_to_common_delta=1.5, draft_origin=0.0)
     assert a[:2] == b[:2] == (5.0, 5.0)
-    assert a[2:] == (5.0, 5.0)
-    assert b[2:] == (3.5, 5.0)
+    assert a[2:4] == (5.0, 5.0)
+    assert b[2:4] == (3.5, 5.0)
+    assert a[4] is b[4] is False
 
 
 def test_clip_skip_when_source_before_zero():

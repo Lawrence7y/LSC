@@ -254,6 +254,9 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
     *   负值则反之。
     在导出时通过调整 FFmpeg `-ss` 参数，使多视角切片达到画面级严格对齐。
 *   **置信度防线**：互相关计算的最大相似度必须大于 `0.1` 阈值，否则会被判定为内容不相关，自动降级至 0 偏移，防止无声视频或不同内容视频强行对齐导致错误。
+*   **跨语言解说 fallback**：原始波形低置信时，额外计算公共音量瞬态包络。只有“波形候选偏移”和“瞬态候选偏移”在 `60ms` 内一致，且两路最小证据均达标时，才允许将结果升格到可信阈值；禁止单纯降低相关阈值，以免把无关语言/无关直播误对齐。
+*   **持续分析漂移复核**：多房持续分析每 `10` 分钟尝试重新采集 `8s` 预览音频。仅在应用不处于前台交互且目标房未进入 DVR 深度回看时运行；复核前各房独立回到自己的直播沿，完成后重新应用 offset。
+*   **录制 epoch 约束**：副房高光映射必须优先使用 `recording_media_start_mono`（首帧媒体起点），旧会话才回退 `recording_start_mono`。录制重启/重连生成新 `recording_id` 时，旧 TimelineContext 与 `align_group_id/content_offset` 必须失效，重新一键对齐后才能恢复副房映射。
 
 ## 6. 前端 UI 设计与设计系统
 
@@ -364,6 +367,8 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
     *   预览最多 **4路**（`MAX_CONCURRENT_PREVIEWS`），≥6 路时动态降分辨率 ≤ 854×480，≥8 路时限制 ≤ 640×360。
     *   录制最多 **12路**（`MAX_CONCURRENT_RECORDINGS`），启动并发用 `asyncio.Semaphore(2)` 限制，防止多路 HTTP 刷新同时阻塞。
 *   **init 段竞态修复**：`mse_init` 消息可能早于 `rooms_updated` 到达前端（前端 VideoPreview 组件尚未挂载）。`SharedRoomIngest` 内部缓存最近一次 init 段（`last_init_segment`），前端挂载后主动发送 `request_mse_init`，后端通过 `replay_init()` 补发，解决竞态。
+*   **MSE 事件契约**：`broadcast_mse(kind, ...)` 的 `kind` 统一使用 `init` / `segment`，禁止调用方重复传入 `mse_` 前缀。前端 `preview_phase` 等事件态须同时镜像到 `uiState` 与 `RoomSession`，`rooms_updated` 整表替换时必须保留，否则会导致 LIVE 状态丢失和 watchdog 在 `refreshing_url/probing` 阶段误重连。
+*   **心跳隔离**：单房 controller 的 `tick()` / `watchdog_check()` 缺失或抛错不得终止 `RoomOrchestrator` 线程；必须记录告警并继续推进其它房间的录制、预览和重连。
 *   **MSE 启动流程时序**：
     1.  前端发送 `enable_preview {mode: "mse"}`
     2.  后端 `_handle_mse_preview` 调用 `mgr.refresh_stream_url()` 刷新流地址（B站等平台耗时可达 10s+，在 `_recording_executor` 线程池执行，不阻塞 Qt 主线程）
@@ -497,6 +502,9 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 *   **分析导出 Modal**：打开时冻结 `continuousTargetRoomIds = currentTargetIds`（含单房 `selectedRoomId` 回退）。主房 Radio 与确认启动时的 `target_room_ids` **必须同源**（一律用 `continuousTargetRooms` / `continuousTargetRoomIds`），禁止在 `selectedRoomList` 与冻结列表间切换导致「只能选一间 / 只分析一间」。
 *   若打开 Modal 时已多选 ≥2 房，但确认时 `target_room_ids.length < 2`，须拦截并提示保持多选。
 *   映射校验失败回退仅主房时，广播 `continuous_highlights` 须带 `mapping_fallback: true` + `error`，前端 toast「副房间映射失败」。
+*   录制重连导致对齐 epoch 失效时，主房检测结果继续正常入列；副房映射暂停，不得复用旧 `content_offset`。用户重新一键对齐后恢复多房同步。
+*   “停止录制并收尾”只允许停止当前分析快照 `target_room_ids` 中仍在录制的房间，禁止停止未参与本次分析的其它独立录制任务；每次打开确认框必须重置停止模式，不能复用上次选择。
+*   直播跟进没有固定终点，运行中即使 `analyzed_duration == recorded_duration`，进度展示也不得冒充任务已 100% 完成；须标记为“实时跟进”，固定范围只用于停录收尾/已完成阶段。
 
 ### 8.7 时间线坐标系契约（进度条 / windowStart）
 
@@ -681,6 +689,26 @@ Electron 应用使用 `electron-builder` 进行打包：
       mainWindow.loadFile(path.join(__dirname, '../../dist/index.html'));
     }
     ```
+
+#### 10.3.2 依赖安装后下载机制（运行时下载）
+
+为减小安装包体积（从 ~530MB 降至 ~60-80MB），Python 依赖和 FFmpeg 改为首次启动时下载：
+
+*   **安装包内容**：仅包含 Electron 壳 + Python 嵌入版（~15MB）+ lsc/python-backend/scripts 源码
+*   **运行时下载**：首次启动时通过 `dependency_manager.py` 检测并安装缺失依赖：
+    1.  Python 核心依赖（PySide6、numpy、websockets、psutil）— 约 700MB
+    2.  AI 分析依赖（torch、faster-whisper、rapidocr 等）— 约 800MB
+    3.  FFmpeg + FFprobe — 约 170MB
+*   **下载流程**：
+    1.  Electron 主进程调用 `checkDependencies()` 检测依赖状态
+    2. 缺失时自动启动 `installDependencies()`，通过 `dependency-progress` IPC 事件报告进度
+    3. 前端 `SplashScreen` 组件显示实时进度（总进度条 + 各阶段状态）
+    4. 安装完成后自动启动 Python 后端
+*   **相关文件**：
+    *   `python-backend/dependency_manager.py` — 依赖检测与安装核心模块
+    *   `lsc-electron/electron/main.ts` — `checkDependencies` / `installDependencies` / `ensureDependenciesThenStartBackend`
+    *   `lsc-electron/src/pages/SplashScreen/` — 前端启动/安装进度页
+    *   `lsc-electron/scripts/prep-bundle.ps1` — 仅下载 Python 嵌入版（不再打包依赖和 FFmpeg）
 
 ## 11. 安全防御与防御性工程设计
 

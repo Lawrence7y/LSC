@@ -88,9 +88,8 @@ def main() -> None:
         old = best.get(s["id"])
         if old is None or rank[s["priority"]] < rank[old["priority"]]:
             best[s["id"]] = s
-        elif old and rank[s["priority"]] == rank[old["priority"]]:
-            if s["reason"] not in old["reason"]:
-                old["reason"] = f"{old['reason']}；{s['reason']}"
+        elif rank[s["priority"]] == rank[old["priority"]] and s["reason"] not in old["reason"]:
+            old["reason"] = f"{old['reason']}；{s['reason']}"
 
     final = sorted(
         best.values(),

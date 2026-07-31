@@ -1,4 +1,51 @@
 /* 房间区域右侧滚动条 */
+.workbench-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.workbench-toolbar__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.workbench-toolbar__identity,
+.workbench-toolbar__actions {
+  align-items: center;
+}
+
+.workbench-toolbar__actions .ant-btn,
+.workbench-toolbar__identity .ant-btn,
+.workbench-toolbar__refresh {
+  height: 32px;
+  min-width: 88px;
+  padding-inline: 12px;
+  border-radius: var(--radius-xs, 6px);
+}
+
+.workbench-toolbar__identity .ant-select-selector {
+  min-height: 32px !important;
+  align-items: center;
+}
+
+.workbench-toolbar__actions .ant-btn .anticon,
+.workbench-toolbar__identity .ant-btn .anticon {
+  font-size: 14px;
+}
+
+@media (max-width: 1100px) {
+  .workbench-toolbar__row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 .workbench-room-scroll {
   scrollbar-width: thin;
   scrollbar-color: var(--text-400, #8e8e93) transparent;
@@ -66,4 +113,184 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .pbar-fill::after, .pbar-ind { animation: none; }
+}
+
+.room-url-validation {
+  margin-top: 10px;
+  padding: 7px 9px;
+  border-radius: 8px;
+}
+
+.room-url-validation .ant-alert-message {
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* 放大预览时间线：加大命中区域，显示首尾时间并支持点击/键盘定位。 */
+.room-card__expanded-timeline {
+  display: grid;
+  grid-template-columns: minmax(54px, auto) 1fr minmax(54px, auto);
+  align-items: center;
+  gap: 10px;
+  padding: 14px 14px 8px;
+}
+
+.room-card__expanded-time {
+  color: rgba(255, 255, 255, 0.9);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.room-card__expanded-time--end {
+  text-align: right;
+}
+
+.room-card__expanded-track {
+  position: relative;
+  height: 18px;
+  cursor: pointer;
+  outline: none;
+}
+
+.room-card__expanded-track::before {
+  content: '';
+  position: absolute;
+  inset: 7px 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.24);
+  z-index: 0;
+}
+
+.room-card__expanded-track-fill {
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  left: 0;
+  border-radius: 999px;
+  background: var(--brand-400, #4dc4bf);
+  box-shadow: 0 0 8px rgba(77, 196, 191, 0.42);
+  z-index: 2;
+  transition: width 120ms linear;
+}
+
+.room-card__expanded-track-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--brand-500, #31b3ae);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.45);
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease;
+  z-index: 5;
+}
+
+/* 预览时间线 - AI 检测到的回合色带（P1: 预览时间线显示检测回合） */
+.room-card__expanded-round {
+  position: absolute;
+  top: 9px;
+  height: 6px;
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.85;
+}
+
+.room-card__expanded-round--confirmed {
+  background: color-mix(in srgb, var(--brand-500, #31B3AE) 60%, transparent);
+}
+
+.room-card__expanded-round--pending {
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--brand-500, #31B3AE) 40%, transparent),
+    color-mix(in srgb, var(--brand-500, #31B3AE) 40%, transparent) 3px,
+    transparent 3px,
+    transparent 6px
+  );
+}
+
+.room-card__expanded-round--audio {
+  background: repeating-linear-gradient(
+    -45deg,
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 50%, transparent),
+    color-mix(in srgb, var(--state-warning-dark, #ff9f0a) 50%, transparent) 3px,
+    transparent 3px,
+    transparent 6px
+  );
+}
+
+/* 主时间线位置指示器（P3: 预览时间线与主时间线同步滚动） */
+.room-card__expanded-main-pos {
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  width: 2px;
+  background: color-mix(in srgb, var(--brand-300, #66cfcf) 80%, transparent);
+  border-radius: 1px;
+  pointer-events: none;
+  z-index: 3;
+  box-shadow: 0 0 4px rgba(102, 207, 207, 0.5);
+}
+
+.room-card__expanded-track:hover .room-card__expanded-track-thumb,
+.room-card__expanded-track:focus-visible .room-card__expanded-track-thumb {
+  opacity: 1;
+}
+
+.room-card__expanded-track:focus-visible {
+  box-shadow: 0 0 0 2px rgba(77, 196, 191, 0.7);
+  border-radius: 9px;
+}
+
+.room-card__expanded-unavailable {
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  left: 0;
+  border-radius: 999px 0 0 999px;
+  background:
+    repeating-linear-gradient(
+      135deg,
+      rgba(255, 255, 255, 0.13) 0,
+      rgba(255, 255, 255, 0.13) 4px,
+      rgba(0, 0, 0, 0.22) 4px,
+      rgba(0, 0, 0, 0.22) 8px
+    ),
+    rgba(70, 70, 74, 0.84);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.room-card__expanded-replay-boundary {
+  position: absolute;
+  top: 0;
+  width: 3px;
+  height: 18px;
+  border-radius: 2px;
+  background: #bf5af2;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    0 0 9px rgba(191, 90, 242, 0.95);
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 6;
+}
+
+.room-card__expanded-replay-boundary::before {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 7px rgba(191, 90, 242, 0.9);
+  transform: translateX(-50%);
 }

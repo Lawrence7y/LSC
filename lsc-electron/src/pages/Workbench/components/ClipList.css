@@ -159,6 +159,16 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
   background: rgba(255, 159, 10, 0.12);
 }
 
+.clip-row-v2__tag--audio-pending {
+  color: var(--state-warning-dark, #ff9f0a);
+  background: rgba(255, 159, 10, 0.12);
+}
+
+.clip-row-v2__tag--confirmed {
+  color: var(--state-success, #1D9E75);
+  background: rgba(29, 158, 117, 0.12);
+}
+
 .clip-row-v2__bottom {
   display: flex;
   align-items: center;

@@ -19,6 +19,9 @@ from lsc.utils.process_launcher import prepare_launch
 _log = get_logger(__name__)
 STARTUP_PROBE_TIMEOUT_SEC = 15.0
 STARTUP_PROBE_INTERVAL_SEC = 0.2
+# MP4 会在启动时先写入很小的文件头；仅凭文件非空会把随即退出的 FFmpeg
+# 误认为录制成功。要求录制进程至少稳定存活一小段时间再确认启动成功。
+_RECORDING_START_STABLE_SEC = 1.0
 # 上游连接超时后仍无数据则快速失败（上游 -timeout 为 10s，加 3s 缓冲）
 _UPSTREAM_NO_DATA_FAST_FAIL_SEC = 13.0
 TS_PACKET_SIZE = 188
@@ -1079,21 +1082,25 @@ class SharedRoomIngest:
     def _wait_for_startup_data(self, recording_path: str) -> bool:
         deadline = time.monotonic() + STARTUP_PROBE_TIMEOUT_SEC
         fast_fail_at = time.monotonic() + _UPSTREAM_NO_DATA_FAST_FAIL_SEC
+        output_seen_at: float | None = None
         while True:
-            if self._recording_output_has_started(recording_path):
-                if self.recording_media_start_mono <= 0:
-                    self.recording_media_start_mono = time.monotonic()
-                return True
             with self._lock:
                 proc = self._recording_process
                 upstream_failed = bool(self.upstream_error)
             if upstream_failed:
                 return False
-            if proc is not None and self._poll(proc) is not None:
-                started = self._recording_output_has_started(recording_path)
-                if started and self.recording_media_start_mono <= 0:
-                    self.recording_media_start_mono = time.monotonic()
-                return started
+            # Watcher 线程已清空进程引用，说明录制端已经退出；即便 MP4 文件头
+            # 已落盘也不能视作有效录制，交由调用方回退到常规录制器。
+            if proc is None or self._poll(proc) is not None:
+                return False
+            if self._recording_output_has_started(recording_path):
+                now = time.monotonic()
+                if output_seen_at is None:
+                    output_seen_at = now
+                elif now - output_seen_at >= _RECORDING_START_STABLE_SEC:
+                    if self.recording_media_start_mono <= 0:
+                        self.recording_media_start_mono = now
+                    return True
             # 快速失败：上游超时仍无数据，检查上游 stderr 诊断原因
             if not self._upstream_has_produced_data and time.monotonic() >= fast_fail_at:
                 upstream_tail = self._stderr_tail(self._stderr_buffer)

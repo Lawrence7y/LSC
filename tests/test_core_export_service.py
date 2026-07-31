@@ -151,8 +151,9 @@ class TestExportServiceSingleExport:
 
     def test_export_clip_async(self, service, sample_clip, tmp_path):
         svc, mock_exporter = service
-        from lsc.exporter.clip import ExportResult as ClipExportResult
         import time
+
+        from lsc.exporter.clip import ExportResult as ClipExportResult
 
         # 让 mock 稍微慢一点，确保 is_exporting 能检测到
         original_call_count = {"n": 0}
@@ -337,7 +338,7 @@ class TestExportServiceManifest:
 
         import json
 
-        with open(manifest_path, "r", encoding="utf-8") as f:
+        with open(manifest_path, encoding="utf-8") as f:
             data = json.load(f)
 
         assert data["source"] == "/tmp/source.mp4"

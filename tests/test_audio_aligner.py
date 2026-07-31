@@ -147,11 +147,37 @@ class TestComputeOffset:
         assert abs(offset - (-1.2)) < 0.05
         assert score >= 0.3
 
+    @pytest.mark.parametrize("seed", range(10))
+    def test_cross_language_consensus_survives_loud_commentary(self, seed):
+        """解说与公共游戏声相当响时，双特征一致性仍应建立可信对齐。"""
+        duration = 8.0
+        long_signal = _shared_event_signal(duration + 2.0, seed=100 + seed)
+        ref = _shifted_window(long_signal, 0.0, duration)
+        delayed = _shifted_window(long_signal, 1.2, duration)
+        ref = ref + _noise_signal(duration, seed=1000 + seed)
+        delayed = delayed + _noise_signal(duration, seed=2000 + seed)
+
+        offset, score = compute_offset(ref, delayed, SAMPLE_RATE)
+
+        assert abs(offset - (-1.2)) < 0.06
+        assert score >= 0.3
+
     def test_unrelated_noisy_streams_do_not_get_high_fallback_score(self):
         """完全不相关的主播音频不应被包络 fallback 误判为高置信。"""
         duration = 8.0
         ref = _noise_signal(duration, seed=101)
         other = _noise_signal(duration, seed=202)
+
+        _, score = compute_offset(ref, other, SAMPLE_RATE)
+
+        assert score < 0.3
+
+    @pytest.mark.parametrize("seed", range(20))
+    def test_cross_language_consensus_rejects_unrelated_streams(self, seed):
+        """放宽门限后仍不得把两路无关解说噪声判为可信对齐。"""
+        duration = 8.0
+        ref = _noise_signal(duration, seed=3000 + seed)
+        other = _noise_signal(duration, seed=4000 + seed)
 
         _, score = compute_offset(ref, other, SAMPLE_RATE)
 

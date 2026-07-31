@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, No
 import path from 'path'
 import fs from 'fs'
 import https from 'https'
-import { randomBytes } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { extractBackendWsUrl } from './backendUrl'
 
@@ -103,6 +103,26 @@ let pythonDetectError: string | null = null
 let backendWsUrl: string | null = null
 let backendOutputBuffer = ''
 const backendWsToken = randomBytes(32).toString('base64url')
+// 依赖安装进程（用于前端取消或监控）
+let depInstallProcess: ChildProcess | null = null
+let depInstallCancelled = false
+
+type StartupDependencyPhase = 'checking' | 'installing' | 'ready' | 'error'
+
+interface StartupDependencyState {
+  phase: StartupDependencyPhase
+  result?: DepCheckResult
+  error?: string
+}
+
+let startupDependencyState: StartupDependencyState = { phase: 'checking' }
+
+function updateStartupDependencyState(state: StartupDependencyState): void {
+  startupDependencyState = state
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('startup-dependency-state', state)
+  }
+}
 
 interface AppSettings {
   autoLaunch: boolean
@@ -168,6 +188,77 @@ function getBackendLogPath(): string {
   return path.join(app.getPath('userData'), 'logs', 'backend-stdout.log')
 }
 
+function getBackendProcessStatePath(): string {
+  return path.join(app.getPath('userData'), 'runtime', 'backend-process.json')
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function cleanupRecordedOrphanBackend(): void {
+  const statePath = getBackendProcessStatePath()
+  try {
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+      backendPid?: number
+      parentPid?: number
+    }
+    const backendPid = Number(state.backendPid || 0)
+    const parentPid = Number(state.parentPid || 0)
+    if (isProcessAlive(backendPid) && !isProcessAlive(parentPid)) {
+      appLog('WARN', 'Backend', `发现孤儿后端 PID=${backendPid}，启动前清理`)
+      if (process.platform === 'win32') {
+        execSync(`taskkill /T /F /PID ${backendPid}`, { stdio: 'ignore' })
+      } else {
+        process.kill(backendPid, 'SIGKILL')
+      }
+    }
+  } catch {
+    // 首次启动或状态文件损坏时忽略。
+  }
+  try {
+    fs.unlinkSync(statePath)
+  } catch {
+    // 文件不存在或已被占用时不影响启动。
+  }
+}
+
+function cleanupLegacyOrphanBackendsOnce(): void {
+  if (process.platform !== 'win32') return
+  const markerPath = path.join(app.getPath('userData'), 'runtime', 'orphan-cleanup-v1')
+  if (fs.existsSync(markerPath)) return
+  const command = [
+    "$items = Get-CimInstance Win32_Process | Where-Object {",
+    "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and",
+    "$_.CommandLine -match '[\\\\/]python-backend[\\\\/]main\\.py(?:\\s|$)'",
+    "};",
+    "foreach ($item in $items) {",
+    "$parent = Get-Process -Id $item.ParentProcessId -ErrorAction SilentlyContinue;",
+    "if (-not $parent) { Stop-Process -Id $item.ProcessId -Force -ErrorAction SilentlyContinue }",
+    "}",
+  ].join(' ')
+  try {
+    execSync(`powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "${command}"`, {
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+  } catch (err) {
+    appLog('WARN', 'Backend', `旧版孤儿后端扫描失败: ${err}`)
+  }
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true })
+    fs.writeFileSync(markerPath, new Date().toISOString(), 'utf8')
+  } catch {
+    // 标记失败只会导致下次重复扫描，不影响后端启动。
+  }
+}
+
 function writeLog(line: string): void {
   try {
     backendLogStream?.write(line)
@@ -187,6 +278,9 @@ function consumeBackendOutput(data: Buffer): void {
     backendWsUrl = wsUrl
     writeLog(`[backend-url-detected] ${wsUrl}\n`)
     appLog('INFO', 'Backend', `检测到后端 WebSocket URL: ${wsUrl}`)
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('backend-ready', { url: wsUrl })
+    }
   }
 }
 
@@ -236,10 +330,298 @@ function detectPython(): string | null {
   return null
 }
 
+// ===== 依赖安装管理 =====
+
+/** 获取 dependency_manager.py 的路径 */
+function getDepManagerScriptPath(): string {
+  const backendDir = getBackendDir()
+  return path.join(backendDir, 'dependency_manager.py')
+}
+
+/** 获取 FFmpeg 解压目标目录 */
+function getFfmpegBundleDir(): string {
+  if (app.isPackaged) {
+    const bundled = path.join(process.resourcesPath, 'ffmpeg')
+    if (fs.existsSync(path.join(bundled, 'ffmpeg.exe'))) return bundled
+  }
+  return path.join(app.getPath('userData'), 'runtime', 'ffmpeg')
+}
+
+/** 依赖安装目录。必须位于用户数据目录，不能写入受保护的安装目录。 */
+function getRuntimePackagesDir(): string {
+  return path.join(app.getPath('userData'), 'runtime', 'python-packages')
+}
+
+/** requirements 文件位置：生产环境来自 extraResources，开发环境来自项目根目录。 */
+function getRequirementsDir(): string {
+  if (app.isPackaged) return process.resourcesPath
+  return path.join(__dirname, '../../..')
+}
+
+const DEPENDENCY_MARKER_VERSION = 3
+const REQUIRED_RUNTIME_MODULES = [
+  'PySide6',
+  'numpy',
+  'websockets',
+  'psutil',
+  'faster_whisper',
+  'torch',
+  'open_clip',
+  'PIL',
+  'rapidocr_onnxruntime',
+  'cv2',
+]
+
+function getDependencyMarkerPath(): string {
+  return path.join(app.getPath('userData'), 'runtime', 'dependencies-ready.json')
+}
+
+function getDependencyFingerprint(): string {
+  const hash = createHash('sha256')
+  hash.update(`${DEPENDENCY_MARKER_VERSION}:${process.platform}:${process.arch}`)
+  for (const fileName of ['requirements.txt', 'requirements-ai.txt']) {
+    const filePath = path.join(getRequirementsDir(), fileName)
+    hash.update(`:${fileName}:`)
+    try {
+      hash.update(fs.readFileSync(filePath))
+    } catch {
+      hash.update('missing')
+    }
+  }
+  return hash.digest('hex')
+}
+
+function hasRequiredRuntimeFiles(): boolean {
+  const packageDir = getRuntimePackagesDir()
+  const modulesReady = REQUIRED_RUNTIME_MODULES.every((moduleName) =>
+    fs.existsSync(path.join(packageDir, moduleName)) ||
+    fs.existsSync(path.join(packageDir, `${moduleName}.py`))
+  )
+  let inferenceProviderReady = true
+  if (process.platform === 'win32') {
+    try {
+      const entries = fs.readdirSync(packageDir)
+      inferenceProviderReady = entries.some((name) =>
+        /^onnxruntime_(directml|gpu)-.+\.dist-info$/i.test(name)
+      )
+    } catch {
+      inferenceProviderReady = false
+    }
+  }
+  return modulesReady &&
+    inferenceProviderReady &&
+    fs.existsSync(path.join(getFfmpegBundleDir(), 'ffmpeg.exe'))
+}
+
+function hasValidDependencyMarker(): boolean {
+  try {
+    const marker = JSON.parse(fs.readFileSync(getDependencyMarkerPath(), 'utf8')) as {
+      version?: number
+      fingerprint?: string
+    }
+    return marker.version === DEPENDENCY_MARKER_VERSION &&
+      marker.fingerprint === getDependencyFingerprint() &&
+      hasRequiredRuntimeFiles()
+  } catch {
+    return false
+  }
+}
+
+function writeDependencyMarker(): void {
+  try {
+    const markerPath = getDependencyMarkerPath()
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true })
+    fs.writeFileSync(markerPath, JSON.stringify({
+      version: DEPENDENCY_MARKER_VERSION,
+      fingerprint: getDependencyFingerprint(),
+      verifiedAt: new Date().toISOString(),
+    }), 'utf8')
+  } catch (err) {
+    appLog('WARN', 'Dependencies', `写入依赖就绪标记失败: ${err}`)
+  }
+}
+
+function getDependencyEnv(): NodeJS.ProcessEnv {
+  const packageDir = getRuntimePackagesDir()
+  const pythonPath = [packageDir, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
+  return {
+    ...process.env,
+    PYTHONUNBUFFERED: '1',
+    LSC_RUNTIME_DIR: path.join(app.getPath('userData'), 'runtime'),
+    LSC_PYTHON_PACKAGES: packageDir,
+    LSC_REQUIREMENTS_DIR: getRequirementsDir(),
+    LSC_BUNDLED_FFMPEG_DIR: app.isPackaged ? path.join(process.resourcesPath, 'ffmpeg') : '',
+    PYTHONPATH: pythonPath,
+  }
+}
+
+/**
+ * 运行依赖检测，返回结构化结果。
+ * 检测失败（脚本不存在或执行出错）时返回 null。
+ */
+function checkDependencies(): Promise<DepCheckResult | null> {
+  return new Promise((resolve) => {
+    const pythonExe = detectPython()
+    if (!pythonExe) {
+      resolve(null)
+      return
+    }
+    const script = getDepManagerScriptPath()
+    if (!fs.existsSync(script)) {
+      // 脚本不存在（旧版本兼容），跳过检测
+      resolve(null)
+      return
+    }
+
+    const proc = spawn(pythonExe, [script, 'check'], {
+      cwd: getBackendDir(),
+      env: getDependencyEnv(),
+      windowsHide: true,
+    })
+
+    let stdout = ''
+    let stderr = ''
+    if (proc.stdout) proc.stdout.on('data', (d) => { stdout += d.toString() })
+    if (proc.stderr) proc.stderr.on('data', (d) => { stderr += d.toString() })
+
+    proc.on('error', () => resolve(null))
+    proc.on('exit', (code) => {
+      if (code !== 0 && code !== 2) {
+        // 0 = all ok, 2 = missing deps, 其他 = 执行出错
+        resolve(null)
+        return
+      }
+      // 解析最后一行 JSON 结果
+      const lines = stdout.trim().split('\n')
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const obj = JSON.parse(lines[i])
+          if (obj.event === 'result') {
+            resolve(obj as DepCheckResult)
+            return
+          }
+        } catch {
+          // 跳过非 JSON 行
+        }
+      }
+      resolve(null)
+    })
+  })
+}
+
+interface DepCheckResult {
+  event: 'result'
+  python: Record<string, boolean>
+  core_ok: boolean
+  ai_ok: boolean
+  ffmpeg_ok: boolean
+  all_ok: boolean
+}
+
+/**
+ * 启动依赖安装进程，通过事件向前端报告进度。
+ * 返回 Promise，安装完成时 resolve(true)，失败或取消时 resolve(false)。
+ */
+function installDependencies(includeAi: boolean): Promise<boolean> {
+  return new Promise((resolve) => {
+    const pythonExe = detectPython()
+    if (!pythonExe) {
+      resolve(false)
+      return
+    }
+    const script = getDepManagerScriptPath()
+    if (!fs.existsSync(script)) {
+      resolve(false)
+      return
+    }
+
+    depInstallCancelled = false
+    const args = [script, 'install']
+    if (!includeAi) args.push('--no-ai')
+
+    const env = getDependencyEnv()
+
+    depInstallProcess = spawn(pythonExe, args, {
+      cwd: getBackendDir(),
+      env,
+      windowsHide: true,
+    })
+
+    if (depInstallProcess.stdout) {
+      depInstallProcess.stdout.on('data', (data: Buffer) => {
+        const text = data.toString()
+        // 每行是一个 JSON 事件
+        for (const line of text.split('\n')) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+          try {
+            const evt = JSON.parse(trimmed)
+            // 转发到前端
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('dependency-progress', evt)
+            }
+          } catch {
+            // 非 JSON 行，作为日志输出
+            appLog('INFO', 'DepInstall', trimmed)
+          }
+        }
+      })
+    }
+    if (depInstallProcess.stderr) {
+      depInstallProcess.stderr.on('data', (data: Buffer) => {
+        const text = data.toString().trim()
+        if (text) appLog('WARN', 'DepInstall', text)
+      })
+    }
+
+    depInstallProcess.on('error', (err) => {
+      appLog('ERROR', 'DepInstall', `安装进程启动失败: ${err}`)
+      depInstallProcess = null
+      resolve(false)
+    })
+
+    depInstallProcess.on('exit', (code) => {
+      depInstallProcess = null
+      if (depInstallCancelled) {
+        appLog('INFO', 'DepInstall', '依赖安装已取消')
+        resolve(false)
+        return
+      }
+      const success = code === 0
+      appLog(
+        success ? 'INFO' : 'ERROR',
+        'DepInstall',
+        `依赖安装${success ? '完成' : '失败'} (exit=${code})`,
+      )
+      resolve(success)
+    })
+  })
+}
+
+/** 取消正在进行的依赖安装 */
+function cancelDependencyInstall(): void {
+  if (!depInstallProcess) return
+  depInstallCancelled = true
+  const pid = depInstallProcess.pid
+  if (!pid) {
+    depInstallProcess = null
+    return
+  }
+  try {
+    if (process.platform === 'win32') {
+      execSync(`taskkill /T /F /PID ${pid}`, { stdio: 'ignore' })
+    } else {
+      process.kill(pid, 'SIGTERM')
+    }
+  } catch {
+    // 忽略终止失败
+  }
+}
+
 // 获取打包内的 FFmpeg 目录(开发模式下返回 null,由系统 PATH 兜底)
 function getBundledFfmpegDir(): string | null {
   try {
-    const dir = path.join(process.resourcesPath, 'ffmpeg')
+    const dir = getFfmpegBundleDir()
     if (fs.existsSync(dir) && fs.existsSync(path.join(dir, 'ffmpeg.exe'))) {
       return dir
     }
@@ -250,9 +632,18 @@ function getBundledFfmpegDir(): string | null {
 }
 
 function spawnBackend(): void {
+  if (backendProcess && backendProcess.exitCode === null && !backendProcess.killed) {
+    appLog('INFO', 'Backend', '后端已在运行，跳过重复启动')
+    return
+  }
   const backendDir = getBackendDir()
   const backendEntry = path.join(backendDir, 'main.py')
   const interpreter = detectPython()
+  // 安装目录（尤其是 Program Files）对普通用户只读；后端的配置、房间记录和
+  // 缓存必须统一写入 Electron 的 userData 目录。
+  const backendDataDir = app.getPath('userData')
+  cleanupRecordedOrphanBackend()
+  cleanupLegacyOrphanBackendsOnce()
   backendWsUrl = null
   backendOutputBuffer = ''
 
@@ -263,9 +654,9 @@ function spawnBackend(): void {
   appLog('INFO', 'Backend', `日志目录: ${logDir}`)
   try {
     fs.mkdirSync(logDir, { recursive: true })
+    fs.mkdirSync(backendDataDir, { recursive: true })
   } catch (err) {
-    // 目录可能已存在，忽略
-    appLog('ERROR', 'Backend', `创建日志目录失败: ${err}`)
+    appLog('ERROR', 'Backend', `创建后端数据目录失败: ${err}`)
   }
 
   // 创建日志写入流（必须监听 error 事件，否则异步打开失败会变成 uncaught exception）
@@ -327,12 +718,15 @@ function spawnBackend(): void {
     SYSTEMROOT: process.env.SYSTEMROOT,
     PATHEXT: process.env.PATHEXT,
     PYTHONUNBUFFERED: '1',
-    LSC_LOG_DIR: path.join(app.getPath('userData'), 'logs'),
+    LSC_LOG_DIR: path.join(backendDataDir, 'logs'),
+    // 所有后端可变状态必须保存在用户数据目录，不能写入 Program Files/resources。
+    LSC_DATA_DIR: backendDataDir,
+    LSC_CONFIG_PATH: process.env.LSC_CONFIG_PATH || path.join(backendDataDir, 'lsc_config.json'),
+    LSC_PYTHON_PACKAGES: getRuntimePackagesDir(),
+    LSC_PARENT_PID: String(process.pid),
     LSC_WS_TOKEN: backendWsToken,
     LSC_WS_TOKEN_REQUIRED: '1',
-  }
-  if (process.env.LSC_CONFIG_PATH) {
-    safeEnv.LSC_CONFIG_PATH = process.env.LSC_CONFIG_PATH
+    PYTHONPATH: [getRuntimePackagesDir(), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
   }
   for (const key of ['LSC_VALORANT_MODEL_DIR', 'LSC_VALORANT_VISION_SHADOW'] as const) {
     if (process.env[key]) {
@@ -343,23 +737,33 @@ function spawnBackend(): void {
   if (bundledFfmpegDir) {
     safeEnv.LSC_BUNDLED_FFMPEG_DIR = bundledFfmpegDir
   }
-  // PYTHONPATH 如有则透传
-  if (process.env.PYTHONPATH) {
-    safeEnv.PYTHONPATH = process.env.PYTHONPATH
-  }
-
   try {
     backendProcess = spawn(interpreter, [backendEntry], {
       cwd: backendDir,
       env: safeEnv,
       windowsHide: true,
-      // Windows 下脱离父进程的受限 token，避免 dev 模式下子进程权限不足
-      // 导致写入用户主目录时 WinError 5 拒绝访问
-      detached: process.platform === 'win32',
+      // 后端必须跟随 Electron 生命周期；可写目录已统一指向 userData，
+      // 不再通过 detached 绕过权限，否则 Electron 异常退出会留下孤儿分析进程。
+      detached: false,
     })
   } catch (err) {
     writeLog(`[spawn-failed] ${err}\n`)
     return
+  }
+
+  const spawnedPid = backendProcess.pid
+  if (spawnedPid) {
+    try {
+      const statePath = getBackendProcessStatePath()
+      fs.mkdirSync(path.dirname(statePath), { recursive: true })
+      fs.writeFileSync(statePath, JSON.stringify({
+        backendPid: spawnedPid,
+        parentPid: process.pid,
+        startedAt: new Date().toISOString(),
+      }), 'utf8')
+    } catch (err) {
+      appLog('WARN', 'Backend', `写入后端进程状态失败: ${err}`)
+    }
   }
 
   // 捕获 stdout/stderr 写入日志
@@ -382,6 +786,15 @@ function spawnBackend(): void {
     backendProcess = null
     backendWsUrl = null
     backendOutputBuffer = ''
+    try {
+      const statePath = getBackendProcessStatePath()
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { backendPid?: number }
+      if (Number(state.backendPid || 0) === Number(spawnedPid || 0)) {
+        fs.unlinkSync(statePath)
+      }
+    } catch {
+      // 状态文件可能已由下一实例接管。
+    }
   })
 
   backendProcess.on('error', (err) => {
@@ -646,9 +1059,9 @@ function registerWindowIpc(): void {
     return app.getVersion()
   })
   ipcMain.handle('get-backend-ws-url', () => {
-    appLog('INFO', 'IPC', `获取后端 WebSocket URL: ${backendWsUrl}`)
     return backendWsUrl
   })
+  ipcMain.handle('get-startup-dependency-state', () => startupDependencyState)
   ipcMain.handle('get-backend-ws-token', () => backendWsToken)
 
   ipcMain.handle('minimize-window', () => {
@@ -907,7 +1320,7 @@ function registerWindowIpc(): void {
     // 任务栏闪烁
     if (mainWindow && !mainWindow.isFocused()) {
       mainWindow.flashFrame(true)
-      mainWindow.once('focus', () => mainWindow.flashFrame(false))
+      mainWindow.once('focus', () => mainWindow!.flashFrame(false))
     }
   })
 
@@ -990,6 +1403,7 @@ function createWindow() {
       backgroundThrottling: false, // 禁用后台节流，确保预览/录制计时器在窗口非活跃时仍精确运行
     },
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    backgroundColor: '#0f1018',
     show: false,
   });
 
@@ -1054,11 +1468,11 @@ function createWindow() {
       _loadRetries++
       const delay = Math.pow(2, _loadRetries - 1) * 1000
       appLog('WARN', 'createWindow', `正在重试加载 (${_loadRetries}/${_MAX_LOAD_RETRIES})，${delay}ms 后重试`)
-      setTimeout(() => mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL!), delay)
+      setTimeout(() => mainWindow!.loadURL(process.env.VITE_DEV_SERVER_URL!), delay)
     }
   })
 
-  mainWindow.webContents.on('crashed', () => {
+  mainWindow.webContents.on('render-process-gone' as any, () => {
     appLog('ERROR', 'createWindow', `RENDERER CRASHED`);
   })
 
@@ -1136,24 +1550,111 @@ function registerAppSettingsIpc(): void {
 
 // ===== 生命周期 =====
 
-app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+let isQuitting = false
 
-const gotLock = app.requestSingleInstanceLock()
-if (!gotLock) {
-  app.quit()
-} else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) {
-        mainWindow.restore()
+  // ===== 依赖安装 IPC =====
+
+  function registerDependencyIpc(): void {
+    // 前端查询依赖状态
+    ipcMain.handle('check-dependencies', async () => {
+      appLog('INFO', 'IPC', '前端查询依赖状态')
+      const result = await checkDependencies()
+      return { success: true, data: result }
+    })
+
+    // 前端触发依赖安装
+    ipcMain.handle('install-dependencies', async (_event, options?: { includeAi?: boolean }) => {
+      const includeAi = options?.includeAi !== false
+      appLog('INFO', 'IPC', `前端触发依赖安装 (includeAi=${includeAi})`)
+      if (depInstallProcess) {
+        return { success: false, error: '依赖正在安装中，请稍候' }
       }
-      mainWindow.focus()
-    }
-  })
+      updateStartupDependencyState({ phase: 'installing', result: startupDependencyState.result })
+      const success = await installDependencies(includeAi)
+      if (success && includeAi) {
+        writeDependencyMarker()
+        updateStartupDependencyState({ phase: 'ready' })
+        spawnBackend()
+      } else if (!success) {
+        updateStartupDependencyState({
+          phase: 'error',
+          result: startupDependencyState.result,
+          error: '运行依赖安装失败，请检查网络后重试',
+        })
+      }
+      return { success }
+    })
 
-  let isQuitting = false
+    // 前端取消依赖安装
+    ipcMain.handle('cancel-dependencies', () => {
+      appLog('INFO', 'IPC', '前端取消依赖安装')
+      cancelDependencyInstall()
+      return { success: true }
+    })
+  }
+
+  /**
+   * 启动流程：检查依赖 → 安装缺失 → 启动后端。
+   * 如果依赖已就绪则直接启动后端。
+   */
+  async function ensureDependenciesThenStartBackend(): Promise<void> {
+    // 开发版和安装版共用同一运行时目录与检测流程。首次发现只有 CPU 版
+    // onnxruntime 时会自动迁移到 DirectML；验证完成后仍走毫秒级快速路径。
+    if (hasValidDependencyMarker()) {
+      appLog('INFO', 'App', '依赖快速校验通过，直接启动后端')
+      updateStartupDependencyState({ phase: 'ready' })
+      spawnBackend()
+      return
+    }
+
+    const depResult = await checkDependencies()
+
+    if (!depResult) {
+      // 检测失败（脚本不存在或执行出错），尝试直接启动
+      appLog('WARN', 'App', '依赖检测失败，尝试直接启动后端')
+      updateStartupDependencyState({ phase: 'ready' })
+      spawnBackend()
+      return
+    }
+
+    if (depResult.all_ok) {
+      // 所有依赖已就绪，直接启动
+      appLog('INFO', 'App', '所有依赖已就绪，启动后端')
+      writeDependencyMarker()
+      updateStartupDependencyState({ phase: 'ready' })
+      spawnBackend()
+      return
+    }
+
+    // 有缺失依赖，通知前端显示安装界面
+    appLog('WARN', 'App', `依赖缺失: core=${depResult.core_ok}, ai=${depResult.ai_ok}, ffmpeg=${depResult.ffmpeg_ok}`)
+    updateStartupDependencyState({ phase: 'installing', result: depResult })
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('dependencies-missing', depResult)
+    }
+
+    // 自动开始安装（前端也可以通过 IPC 控制）
+    const success = await installDependencies(true)
+    if (success) {
+      appLog('INFO', 'App', '依赖安装完成，启动后端')
+      writeDependencyMarker()
+      updateStartupDependencyState({ phase: 'ready' })
+      spawnBackend()
+    } else {
+      appLog('ERROR', 'App', '依赖安装失败，等待用户重试')
+      updateStartupDependencyState({
+        phase: 'error',
+        result: depResult,
+        error: '运行依赖安装失败，请检查网络后重试',
+      })
+      // 保持前端在安装界面，用户可手动重试
+    }
+  }
 
   app.whenReady().then(() => {
+    // 必须在 app.ready 之后才能访问 commandLine
+    app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
     // 启动时读取 app-settings.json 初始化缓存
     settingsCache = loadSettings()
     // 同步 autoLaunch 状态到系统
@@ -1173,10 +1674,15 @@ if (!gotLock) {
     // 注册窗口 IPC（只注册一次）
     registerWindowIpc()
 
-    // 并行启动后端 + 创建窗口 + 创建托盘
-    spawnBackend()
+    // 注册依赖安装相关 IPC
+    registerDependencyIpc()
+
+    // 先创建窗口（显示加载界面），再异步检查依赖并启动后端
     createWindow()
     createTray()
+
+    // 异步检查依赖，缺失时安装，完成后启动后端
+    ensureDependenciesThenStartBackend()
   })
 
   app.on('before-quit', (event) => {
@@ -1225,4 +1731,4 @@ if (!gotLock) {
       mainWindow.focus()
     }
   })
-}
+

@@ -53,6 +53,6 @@ def test_mse_streamer_file_mode_skips_network_flags() -> None:
 
 
 def test_room_session_has_preview_mode_field() -> None:
-    source = (ROOT / "lsc/gui/multi_room/session.py").read_text(encoding="utf-8")
+    source = (ROOT / "lsc/core/session.py").read_text(encoding="utf-8")
     assert "preview_mode" in source
     assert "recording_review" in source or "live_mse" in source

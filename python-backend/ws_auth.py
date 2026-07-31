@@ -11,7 +11,9 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 def is_origin_allowed(origin: str) -> bool:
     if not origin:
         return False
-    if origin == "null":
+    # Electron 以 loadFile() 加载界面时，Chromium 可能发送 ``null``
+    # 或 ``file://``；两者均为本地打包界面的合法来源。
+    if origin in {"null", "file://"}:
         return True
     try:
         parsed = urlparse(origin)

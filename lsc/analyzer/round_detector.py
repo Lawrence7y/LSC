@@ -18,8 +18,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
-import wave
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
 import numpy as np
 
 from lsc.analyzer.ocr_accel import (
+    build_hwaccel_vf,
     ffmpeg_hwaccel_args,
     read_settings_ocr_accel,
     run_ffmpeg_with_hwaccel_fallback,
@@ -64,6 +66,10 @@ class ValorantRoundConfig:
     max_round_total: float = 155.0
     # 部分长枪局买枪期可达 45s（含解说明），留 10s 安全余量
     buy_phase_max: float = 55.0
+    # OCR 估准备（无 prep 标记时 end = next_exit - 典型买枪时长）使用的买枪先验。
+    # 标准局 30s；手枪局/半场首局可达 45s，调用方已知档位时可用
+    # phase_scheduler buy_duration_pistol_sec 覆盖。
+    buy_duration_sec: float = 30.0
 
     # 买枪期裁剪
     # 降低到 25：让基线更贴近实际准备期能量，防止解说/音乐导致准备期能量偏高
@@ -105,6 +111,52 @@ class ValorantRoundConfig:
 
 _DEFAULT_CONFIG = ValorantRoundConfig()
 _SAMPLE_RATE = 8000
+
+# ── 音频缓存（P0-1: 分析结果音频缓存）────────────────────────────
+# 缓存最近提取的音频数据，避免增量分析时重复提取重叠时间段的音频。
+# 键: (video_path, time_range) -> (samples, framerate, timestamp)
+_AUDIO_CACHE: dict[tuple[str, tuple[float, float] | None], tuple[np.ndarray, int, float]] = {}
+_AUDIO_CACHE_MAX_SIZE = 5  # 最多缓存 5 个文件的音频
+_AUDIO_CACHE_TTL_SEC = 600.0  # 缓存 10 分钟
+
+
+def _get_cached_audio_pcm(
+    video_path: str,
+    time_range: tuple[float, float] | None = None,
+) -> tuple[np.ndarray, int] | None:
+    """获取缓存的音频，命中时直接返回"""
+    global _AUDIO_CACHE
+    key = (video_path, time_range)
+    cached = _AUDIO_CACHE.get(key)
+    if cached is None:
+        return None
+    samples, framerate, ts = cached
+    # TTL 检查
+    if time.monotonic() - ts > _AUDIO_CACHE_TTL_SEC:
+        del _AUDIO_CACHE[key]
+        return None
+    return samples.copy(), framerate  # 返回拷贝防止外部修改
+
+
+def _cache_audio_pcm(
+    video_path: str,
+    samples: np.ndarray,
+    framerate: int,
+    time_range: tuple[float, float] | None = None,
+) -> None:
+    """缓存音频数据（LRU 淘汰）"""
+    global _AUDIO_CACHE
+    # LRU 淘汰：超过上限时移除最旧的条目
+    if len(_AUDIO_CACHE) >= _AUDIO_CACHE_MAX_SIZE:
+        oldest_key = min(_AUDIO_CACHE, key=lambda k: _AUDIO_CACHE[k][2])
+        del _AUDIO_CACHE[oldest_key]
+    _AUDIO_CACHE[(video_path, time_range)] = (samples.copy(), framerate, time.monotonic())
+
+
+def clear_audio_cache() -> None:
+    """清空音频缓存（录制文件切换时调用）"""
+    global _AUDIO_CACHE
+    _AUDIO_CACHE.clear()
 
 
 def detect_valorant_rounds(
@@ -506,39 +558,65 @@ def _extract_audio_pcm(
     """提取音频 PCM 原始样本（一次提取，多算法复用）。
 
     统一使用 16kHz 以支持钟声 FFT 的频率分析需求。
+    带缓存：相同 video_path + time_range 的第二次调用直接返回缓存。
+    使用内存管道代替临时 WAV 文件，消除磁盘 I/O。
 
     Returns:
         (samples_array, sample_rate) 或 (None, 0) 失败时
     """
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-    os.close(tmp_fd)
+    # 检查缓存
+    cached = _get_cached_audio_pcm(video_path, time_range)
+    if cached is not None:
+        return cached
 
+    # 使用 raw PCM 管道：-f s16le 输出纯 PCM，无需 WAV 头解析，无磁盘写入
     cmd = [ffmpeg_path, "-y", "-loglevel", "error"]
     if time_range is not None:
         cmd += ["-ss", f"{time_range[0]:.3f}", "-t", f"{time_range[1] - time_range[0]:.3f}"]
-    cmd += ["-i", video_path, "-ar", str(sample_rate), "-ac", "1", "-f", "wav", tmp_path]
+    cmd += [
+        "-i", video_path,
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-f", "s16le",
+        "pipe:1",
+    ]
 
     try:
-        run_hidden(cmd, capture_output=True, timeout=120)
+        from lsc.utils.process_launcher import prepare_launch
+        env, creation_flags, cwd = prepare_launch(ffmpeg_path)
+        popen_kwargs: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": env,
+        }
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+        if cwd:
+            popen_kwargs["cwd"] = cwd
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            raw, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            _log.warning("音频 PCM 提取超时")
+            return None, 0
 
-        with wave.open(tmp_path, "rb") as wf:
-            n_frames = wf.getnframes()
-            framerate = wf.getframerate()
-            raw = wf.readframes(n_frames)
+        if proc.returncode != 0 or not raw:
+            return None, 0
 
         samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
         if len(samples) == 0:
             return None, 0
-        return samples, framerate
+
+        # 缓存提取结果
+        _cache_audio_pcm(video_path, samples, sample_rate, time_range)
+
+        return samples, sample_rate
 
     except Exception as exc:
         _log.warning("音频 PCM 提取失败: %s", exc)
         return None, 0
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 def _compute_rms_envelope(
@@ -1170,6 +1248,9 @@ def _format_output(
                 "speech_score": 0.0,
                 "visual_score": 0.0,
                 "transcript": "",
+                # 纯音频路径标记：boundary_source 标识为音频，confirm_status 标记为待 OCR 复核
+                "boundary_source": "valorant_audio_v1",
+                "confirm_status": "audio_pending",
             })
 
     return results
@@ -1214,7 +1295,6 @@ def _detect_round_phase_markers(
         return []
 
     import re
-    import shutil
 
     resolution = _get_video_resolution(video_path, ffmpeg_path)
     if resolution is None:
@@ -1248,16 +1328,21 @@ def _detect_round_phase_markers(
     try:
         output_pattern = os.path.join(tmp_dir, "phase_%05d.jpg")
         fps = max(0.2, 1.0 / max(cfg.phase_sample_interval, 0.1))
+        # 构建滤镜链：尝试将 3x scale 转移到 GPU（scale_cuda）
+        cpu_vf = f"fps={fps:.3f},crop={w}:{h}:{x}:{y},scale={w * 3}:{h * 3},showinfo"
+        extra_hw, final_vf = build_hwaccel_vf(
+            cpu_vf, gpu_scale_pattern=r"scale=\d+:\d+"
+        )
         cmd = [ffmpeg_path, "-y", "-loglevel", "error"]
         if time_range is not None:
             cmd += ["-ss", f"{range_offset:.3f}", "-t", f"{scan_duration:.3f}"]
         cmd += [
             "-i", video_path,
-            "-vf", f"fps={fps:.3f},crop={w}:{h}:{x}:{y},scale={w * 3}:{h * 3},showinfo",
+            "-vf", final_vf,
             "-q:v", "2",
             output_pattern,
         ]
-        hw = ffmpeg_hwaccel_args(read_settings_ocr_accel())
+        hw = extra_hw or ffmpeg_hwaccel_args(read_settings_ocr_accel())
         result = run_ffmpeg_with_hwaccel_fallback(cmd, hwaccel_args=hw, timeout=360)
 
         frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
@@ -1575,7 +1660,7 @@ def _build_round_segments_from_phase_markers(
     prep_starts = [p for p in preps if 0 < p <= duration]
     results: list[dict[str, Any]] = []
     min_span = max(cfg.min_combat_duration, cfg.min_ocr_round_duration)
-    typical_buy_sec = 30.0
+    typical_buy_sec = float(cfg.buy_duration_sec)
 
     # 解说/转播流：无 buy 标记时用连续胜利字建段
     if not segment_starts:
@@ -1668,12 +1753,12 @@ def _build_round_segments_from_phase_markers(
                 end = estimated
                 end_by = "next_buy"
                 tail_by = "ocr_phase"
-                ocr_end = victory
-        elif victory is not None:
-            end = victory
+                ocr_end = victory_end if victory_end is not None else 0.0
+        elif victory_end is not None:
+            end = victory_end
             end_by = "ocr_result"
             tail_by = "ocr_phase"
-            ocr_end = victory
+            ocr_end = victory_end
         else:
             end = duration
             end_by = "open_tail"
@@ -1748,12 +1833,13 @@ def extract_frames_cancellable(
     cancel_check: Callable[[], bool] | None = None,
     overlap_sec: float = 2.0,
 ) -> list[tuple[float, np.ndarray]]:
-    """Extract downscaled JPEGs with optional hwaccel; dedupe by showinfo pts.
+    """Extract downscaled frames via memory pipe; dedupe by showinfo pts.
 
     Hybrid 分类只需 224×224，OCR 只要顶部条带；抽帧统一缩到 640 宽，
     并复用 OCR 路径的硬解参数（失败自动回退软解）。
+    使用 image2pipe 内存管道代替临时文件，消除磁盘 I/O。
     """
-    from lsc.utils.cancellable_ffmpeg import CancellableFFmpeg, FFmpegCancelled
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
     from lsc.utils.process_launcher import prepare_launch
 
     scan_start = max(0.0, start_sec - overlap_sec)
@@ -1767,97 +1853,147 @@ def extract_frames_cancellable(
     except ImportError as exc:
         raise RuntimeError("opencv-python 未安装，无法解码抽帧") from exc
 
-    tmp_dir = tempfile.mkdtemp(prefix="lsc_hybrid_frames_")
-    frames: list[tuple[float, np.ndarray]] = []
-    try:
-        output_pattern = os.path.join(tmp_dir, "frame_%05d.jpg")
-        vf = (
-            f"scale={_HYBRID_EXTRACT_MAX_WIDTH}:-2,"
-            f"fps={fps:.3f},showinfo"
-        )
-        base_cmd = [
+    # fps 放在 scale 前面：先降帧再缩放，避免对丢弃帧做无用 scale
+    cpu_vf = f"fps={fps:.3f},scale={_HYBRID_EXTRACT_MAX_WIDTH}:-2,showinfo"
+    gpu_hw, gpu_vf = build_hwaccel_vf(
+        cpu_vf, gpu_scale_pattern=r"scale=\d+:-2"
+    )
+
+    def _build_pipe_cmd(vf_str: str) -> list[str]:
+        return [
             ffmpeg_path,
             "-y",
-            "-loglevel",
-            "info",
-            "-ss",
-            f"{scan_start:.3f}",
-            "-t",
-            f"{scan_duration:.3f}",
-            "-i",
-            video_path,
-            "-vf",
-            vf,
-            "-q:v",
-            "2",
-            output_pattern,
+            "-loglevel", "info",
+            "-ss", f"{scan_start:.3f}",
+            "-t", f"{scan_duration:.3f}",
+            "-i", video_path,
+            "-vf", vf_str,
+            "-q:v", "2",
+            "-f", "image2pipe",
+            "-c:v", "mjpeg",
+            "pipe:1",
         ]
-        hwaccel_args = ffmpeg_hwaccel_args(read_settings_ocr_accel())
-        attempts: list[list[str]] = []
-        if hwaccel_args:
-            attempts.append([base_cmd[0], *hwaccel_args, *base_cmd[1:]])
-        attempts.append(list(base_cmd))
 
-        env, _creation_flags, cwd = prepare_launch(ffmpeg_path)
-        completed = None
-        last_err = ""
-        for attempt_i, cmd in enumerate(attempts):
-            # 硬解失败后清掉半成品，避免软解读到残帧
-            for stale in os.listdir(tmp_dir):
-                try:
-                    os.remove(os.path.join(tmp_dir, stale))
-                except OSError:
-                    pass
-            runner = CancellableFFmpeg(
-                cmd, cancel_check=cancel_check, env=env, cwd=cwd
-            )
-            runner.start()
-            try:
-                completed = runner.wait(timeout_sec=360.0)
-            except FFmpegCancelled:
-                raise
-            if completed.returncode == 0:
-                break
-            last_err = (completed.stderr or b"").decode(
-                "utf-8", errors="replace"
-            )[-500:]
+    # 构建尝试列表：GPU 路径 → CPU 回退
+    attempts: list[list[str]] = []
+    if gpu_hw and gpu_vf != cpu_vf:
+        gpu_cmd = _build_pipe_cmd(gpu_vf)
+        attempts.append([gpu_cmd[0], *gpu_hw, *gpu_cmd[1:]])
+    hwaccel_args = ffmpeg_hwaccel_args(read_settings_ocr_accel())
+    cpu_cmd = _build_pipe_cmd(cpu_vf)
+    if hwaccel_args:
+        attempts.append([cpu_cmd[0], *hwaccel_args, *cpu_cmd[1:]])
+    attempts.append(cpu_cmd)
+
+    env, creation_flags, cwd = prepare_launch(ffmpeg_path)
+    frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
+
+    for attempt_i, cmd in enumerate(attempts):
+        if cancel_check and cancel_check():
+            raise FFmpegCancelled("ffmpeg cancelled")
+
+        popen_kwargs: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": env,
+        }
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
+        if cwd:
+            popen_kwargs["cwd"] = cwd
+
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+
+        # 后台线程读取 stderr 收集时间戳
+        stderr_chunks: list[bytes] = []
+
+        def _read_stderr():
+            assert proc.stderr is not None
+            while True:
+                chunk = proc.stderr.read(8192)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+
+        import threading as _thr
+        stderr_thread = _thr.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
+
+        # 主线程从 stdout 读取 JPEG 流，按 SOI/EOI 分割
+        frames: list[tuple[float, np.ndarray]] = []
+        buffer = bytearray()
+        JPEG_SOI = b"\xff\xd8"
+        JPEG_EOI = b"\xff\xd9"
+        cancelled = False
+
+        try:
+            assert proc.stdout is not None
+            while True:
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    break
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                # 提取完整 JPEG 帧
+                while True:
+                    soi_idx = buffer.find(JPEG_SOI)
+                    if soi_idx < 0:
+                        buffer.clear()
+                        break
+                    eoi_idx = buffer.find(JPEG_EOI, soi_idx + 2)
+                    if eoi_idx < 0:
+                        # 保留未完成帧，丢弃 SOI 前的垃圾数据
+                        if soi_idx > 0:
+                            del buffer[:soi_idx]
+                        break
+                    jpeg_data = bytes(buffer[soi_idx:eoi_idx + 2])
+                    del buffer[:eoi_idx + 2]
+                    img = cv2.imdecode(
+                        np.frombuffer(jpeg_data, dtype=np.uint8),
+                        cv2.IMREAD_COLOR,
+                    )
+                    if img is not None:
+                        frames.append((0.0, img))  # 时间戳后续填充
+        except (OSError, ValueError):
+            pass
+        finally:
+            if cancelled:
+                proc.kill()
+            proc.wait(timeout=10)
+            stderr_thread.join(timeout=5)
+
+        if cancelled:
+            raise FFmpegCancelled("ffmpeg cancelled")
+
+        if proc.returncode != 0 and not frames:
+            last_err = b"".join(stderr_chunks).decode("utf-8", errors="replace")[-500:]
             if attempt_i + 1 < len(attempts):
                 _log.warning(
                     "hybrid frame extract hwaccel 失败 (code=%s)，回退软解",
-                    completed.returncode,
+                    proc.returncode,
                 )
                 continue
             raise RuntimeError(
-                f"hybrid frame extract failed rc={completed.returncode}: {last_err}"
+                f"hybrid frame extract failed rc={proc.returncode}: {last_err}"
             )
 
-        if completed is None:
-            raise RuntimeError("hybrid frame extract returned None")
-        frame_ts_pattern = re.compile(r"pts_time:(\d+\.?\d*)")
+        # 从 stderr 解析时间戳并填充到 frames
+        stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
         precise_timestamps: list[float] = []
-        for match in frame_ts_pattern.finditer(
-            (completed.stderr or b"").decode("utf-8", errors="replace")
-        ):
+        for match in frame_ts_pattern.finditer(stderr_text):
             ts = float(match.group(1))
             if not precise_timestamps or ts > precise_timestamps[-1] + 0.001:
                 precise_timestamps.append(ts)
 
-        frame_files = sorted(f for f in os.listdir(tmp_dir) if f.endswith(".jpg"))
-        for i, fname in enumerate(frame_files):
-            if cancel_check and cancel_check():
-                raise FFmpegCancelled("ffmpeg cancelled")
-            fpath = os.path.join(tmp_dir, fname)
-            img = cv2.imread(fpath)
-            if img is None:
-                continue
+        result: list[tuple[float, np.ndarray]] = []
+        for i, (_, img) in enumerate(frames):
             rel_ts = precise_timestamps[i] if i < len(precise_timestamps) else i / max(fps, 0.1)
-            frames.append((scan_start + rel_ts, img))
-    except FFmpegCancelled:
-        raise
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            result.append((scan_start + rel_ts, img))
+        return result
 
-    return frames
+    return []
 
 
 def read_top_digit_anchors(
@@ -2072,15 +2208,32 @@ def _pick_confirm_status(a: str | None, b: str | None) -> str:
 def _merge_two_listed_rounds(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     a_start, a_end = _row_interval(a)
     b_start, b_end = _row_interval(b)
-    merged = {**a, **b}
+    start_src = a if a_start <= b_start else b
+    end_src = a if a_end >= b_end else b
+    a_conf = float(a.get("boundary_confidence") or 0.0)
+    b_conf = float(b.get("boundary_confidence") or 0.0)
     merged_start = min(a_start, b_start)
     merged_end = max(a_end, b_end)
-    merged["start"] = merged_start
-    merged["end"] = merged_end
-    merged["confirm_status"] = _pick_confirm_status(
-        a.get("confirm_status"),
-        b.get("confirm_status"),
-    )
+    merged = {
+        **a,
+        **b,
+        "start": merged_start,
+        "end": merged_end,
+        # 起点证据取更早一侧、终点证据取更晚一侧，避免浅合并让后者无脑覆盖
+        # 更强（更高置信度）的边界证据导致确认判定失真。
+        "start_by": start_src.get("start_by") or "model_buy_exit",
+        "start_confidence": start_src.get("start_confidence"),
+        "end_by": end_src.get("end_by") or "model_result",
+        "end_confidence": end_src.get("end_confidence"),
+        "boundary_evidence": end_src.get("boundary_evidence")
+        or a.get("boundary_evidence")
+        or (),
+        "boundary_confidence": (a if a_conf >= b_conf else b).get("boundary_confidence"),
+        "confirm_status": _pick_confirm_status(
+            a.get("confirm_status"),
+            b.get("confirm_status"),
+        ),
+    }
     if merged_end - merged_start > 150.0:
         merged["merge_audit"] = "long_duration"
     return merged
@@ -2516,6 +2669,14 @@ def detect_valorant_rounds_hybrid(
     if progress_callback:
         progress_callback("hybrid_coarse", 0.0, "粗扫抽帧")
 
+    # 增量任务持有 FSM/分类器游标，但仍必须从调度器给出的回看窗口抽帧。
+    # 回合状态机需要在下一局准备阶段重新看到上一局结算附近的上下文，才
+    # 能可靠闭合上一回合。曾将起点推进到 last_processed_ts，虽然少了推理
+    # 帧，却让这个上下文被完全过滤，表现为「已扫到两回合但始终 0 片段」。
+    # 去重只用于避免把旧帧再次推进 FSM；FFmpeg 的 overlap 保留给解码稳定性。
+    last_processed_ts = float(state.get("last_processed_ts", -1.0))
+    state["last_inference_frames"] = 0
+
     coarse_frames = extractor(
         video_path,
         start_sec=scan_start,
@@ -2527,7 +2688,6 @@ def detect_valorant_rounds_hybrid(
     )
 
     coarse_frames = _dedupe_timestamp_frames(coarse_frames)
-    last_processed_ts = float(state.get("last_processed_ts", -1.0))
     coarse_frames = [
         item for item in coarse_frames
         if item[0] > last_processed_ts + 0.001
@@ -2542,6 +2702,10 @@ def detect_valorant_rounds_hybrid(
         batch = coarse_frames[offset : offset + _HYBRID_COARSE_BATCH]
         probs = clf.predict_batch([img for _, img in batch])
         coarse_probs.extend(probs)
+    state["last_inference_frames"] = len(coarse_frames)
+    state["inference_frames_total"] = (
+        int(state.get("inference_frames_total", 0) or 0) + len(coarse_frames)
+    )
 
     existing_fsm = state.get("fsm")
     # Clone (not deepcopy): feed() mutates FSM; runtime_state["fsm"] must stay intact
@@ -2554,11 +2718,25 @@ def detect_valorant_rounds_hybrid(
     closed_rounds: list[dict[str, Any]] = []
     prev_predicted: str | None = state.get("prev_predicted")
     total_frames = len(coarse_frames)
+    # 当前回合（opened 之后）内是否出现过交战钟（timer≤100s）。
+    # 之前只检查最后一帧 evidence，边界帧标签失真会错误削弱/增强终点确认。
+    _round_open = False
+    _round_timer_seen = False
 
+    _log_pred_every_n = 5  # 每 N 帧输出一次预测，避免日志膨胀
     for idx, (ts, img) in enumerate(coarse_frames):
         probs_row = coarse_probs[idx]
         probs_dict = _probs_row_to_dict(probs_row)
         predicted = _predict_class_from_probs(probs_row, thresholds=thresholds)
+
+        # P0: 逐帧预测 DEBUG 日志 — 诊断「推理在跑但 0 回合」的根因
+        if idx % _log_pred_every_n == 0 or predicted in ("buy", "combat"):
+            _log.debug(
+                "hybrid_predict ts=%.1f cls=%s probs=%s",
+                ts,
+                predicted,
+                {k: round(v, 2) for k, v in sorted(probs_dict.items(), key=lambda x: -x[1])[:3]},
+            )
 
         timer_seconds: float | None = None
         left_score: int | None = None
@@ -2575,11 +2753,21 @@ def detect_valorant_rounds_hybrid(
             right_score=right_score,
             model_version=model_version,
         )
+        # 累计当前已打开回合内的交战钟证据（FSM 尚未 feed，本帧 opened 不计入）
+        if (
+            _round_open
+            and not _round_timer_seen
+            and timer_seconds is not None
+            and timer_seconds <= 100.0
+        ):
+            _round_timer_seen = True
         events = fsm.feed(evidence)
         prev_predicted = predicted
 
         for event in events:
             if event.kind == "opened" and event.round_key and event.start is not None:
+                _round_open = True
+                _round_timer_seen = False
                 canonical_key = _make_hybrid_round_key(event.start, session_id)
                 key_map[event.round_key] = canonical_key
                 try:
@@ -2646,10 +2834,9 @@ def detect_valorant_rounds_hybrid(
                 end_confidence = _confidence_from_probs(
                     end_probs, end_label, thresholds=thresholds,
                 )
-                timer_combat = any(
-                    ev.timer_seconds is not None and ev.timer_seconds <= 100.0
-                    for ev in [evidence]
-                )
+                timer_combat = _round_timer_seen
+                _round_open = False
+                _round_timer_seen = False
                 end_strong = _is_strong_confidence(
                     end_confidence,
                     thresholds,

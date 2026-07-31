@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Alert, Card, Typography } from 'antd'
 import { ContinuousAnalysisStatus } from '@/types'
+import { calculateConfirmedAnalysisPercent } from '@/utils/analysisProgress'
 
 export interface ExportSummary {
   /** 切片列表中待确认/待调（不是导出入队） */
@@ -49,7 +50,16 @@ interface PrimaryStatus {
 function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportSummary): PrimaryStatus {
   const stage = current.analysis_stage ?? ''
   const listed = summary.listed || (current.total_highlights ?? 0)
+  const cpuFallback = current.provider === 'CPUExecutionProvider'
+    || current.provider_warning?.includes('CPUExecutionProvider')
 
+  if (current.phase === 'stalled' || current.stalled) {
+    return {
+      verb: '未检测到对局',
+      detail: current.round_phase_detail || '连续重锚无 buy 信号，已暂停扫描',
+      tone: 'warning',
+    }
+  }
   if (current.phase === 'error' || current.error) {
     return { verb: '持续分析异常', detail: current.error ?? '请重试或查看日志', tone: 'error' }
   }
@@ -62,8 +72,32 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
   if (current.phase === 'stopping' || stage === '停止中') {
     return { verb: '停止中…', detail: '等待扫描退出并释放任务槽', tone: 'idle' }
   }
+  if (stage === '异常退出' || stage === '视觉模型不可用') {
+    return { verb: '分析异常退出', detail: '请重新启动持续分析，或查看日志排查原因', tone: 'error' }
+  }
   if (stage === '收尾失败') {
     return { verb: '收尾失败', detail: '可重新启动持续分析', tone: 'error' }
+  }
+  if (current.degraded_mode === 'audio_only' || stage === '降级追赶') {
+    return {
+      verb: '降级追赶中',
+      detail: '上一轮扫描超时，已切换短窗音频分析并继续推进',
+      tone: 'warning',
+    }
+  }
+  if (current.last_scan_error) {
+    return {
+      verb: '扫描恢复中',
+      detail: `上一轮超时 · 已自动缩小分析窗口`,
+      tone: 'warning',
+    }
+  }
+  if (cpuFallback) {
+    return {
+      verb: 'CPU 慢速分析',
+      detail: 'GPU 推理不可用，分析可能逐渐落后录制',
+      tone: 'warning',
+    }
   }
   if (stage === '等待收尾') {
     return { verb: '等待收尾', detail: '请先停录后再完成收尾扫描', tone: 'idle', nextAction: undefined }
@@ -84,8 +118,9 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
   if (stage === '等待可分析片段' || stage === '等待新片段') {
     return { verb: '等待片段', detail: '录制写入中，凑够窗口即扫描', tone: 'idle' }
   }
-  const scanPart = (current.scan_range?.[1] ?? 0) > 0
-    ? `扫描 ${formatDuration(current.scan_range?.[0] ?? 0)}–${formatDuration(current.scan_range?.[1] ?? 0)}`
+  const detectedPart = Number.isFinite(current.last_detected_in_sec)
+    && Number.isFinite(current.last_detected_out_sec)
+    ? `最近切片：入 ${formatDuration(current.last_detected_in_sec!)} · 出 ${formatDuration(current.last_detected_out_sec!)}`
     : ''
   const reasonPart = current.scan_reason === 'audio_increment'
     ? '音频推进'
@@ -95,9 +130,13 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
   const phasePart = current.mode === 'valorant_round'
     ? (current.round_phase_detail || ROUND_PHASE_LABEL[current.round_phase || ''] || '')
     : ''
+  // 音频待复核回合数（P3: 回合边界精度指示）
+  const audioPendingPart = (current.audio_pending_rounds ?? 0) > 0
+    ? `${current.audio_pending_rounds} 个待 OCR 复核`
+    : ''
   return {
     verb: current.scan_running ? '扫描中' : '运行中',
-    detail: [scanPart, reasonPart, phasePart].filter(Boolean).join(' · '),
+    detail: [detectedPart, reasonPart, phasePart, audioPendingPart].filter(Boolean).join(' · '),
     tone: 'active',
     nextAction: summary.pendingConfirm > 0 ? 'confirm' : undefined,
   }
@@ -146,19 +185,20 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
   /** 点击「待调 / 去确认」时跳转切片列表 */
   onGoToClips?: () => void
 }) {
-  const [, setTick] = useState(0)
-  useEffect(() => {
-    if (!status?.running) return
-    const timer = setInterval(() => setTick((t) => t + 1), 1000)
-    return () => clearInterval(timer)
-  }, [status?.running])
-
   if (!status) return null
   const current = status
   const summary = exportSummary ?? {
     pendingConfirm: 0, queued: 0, exporting: 0, completed: 0, failed: 0, listed: 0,
   }
-  const hasContent = Boolean(current.running || current.phase === 'completed' || current.phase === 'finalizing')
+  const hasContent = Boolean(
+    current.running
+    || current.phase === 'completed'
+    || current.phase === 'finalizing'
+    // 错误/停止态也必须展示：错误只在 toast 闪现无法排查，
+    // 停止中与按钮 loading 同屏矛盾（详见 derivePrimaryStatus 分支）
+    || current.phase === 'error'
+    || current.phase === 'stopping'
+  )
   if (!hasContent) {
     return compact
       ? <Typography.Text type="secondary">持续分析未运行</Typography.Text>
@@ -167,14 +207,29 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
 
   const ps = derivePrimaryStatus(current, summary)
   const isFinalizing = current.phase === 'finalizing'
-  const isWorkerActive = isFinalizing || !!current.scan_running
+  // F4: 停止/收尾过程的本地计时（后端无 stopping 起始时间戳，前端自计时）
+  const [stoppingElapsed, setStoppingElapsed] = useState(0)
+  useEffect(() => {
+    if (current.phase !== 'stopping' && current.phase !== 'finalizing') return
+    const startedAt = Date.now()
+    setStoppingElapsed(0)
+    const t = setInterval(() => setStoppingElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000)
+    return () => clearInterval(t)
+  }, [current.phase])
+  if (current.phase === 'stopping') {
+    ps.verb = '停止中…'
+    ps.detail = `正在停止并等待扫描退出 · 已等待 ${stoppingElapsed}s（通常 1–2 分钟）`
+    ps.tone = 'idle'
+  }
   const analyzed = current.analyzed_duration ?? 0
   const recorded = current.recorded_duration ?? 0
   const lagSec = current.analysis_lag_sec ?? Math.max(0, recorded - analyzed)
-  const scanEnd = current.scan_range?.[1] ?? analyzed
-  const hasFixedScanRange = Boolean(scanEnd > 0 && isWorkerActive)
-  const rawPercent = scanEnd > 0 ? Math.min(100, Math.max(0, (analyzed / scanEnd) * 100)) : 0
-  const livePercent = isWorkerActive ? Math.min(rawPercent, 95) : rawPercent
+  const hasFixedScanRange = !current.running
+    || current.phase === 'finalizing'
+    || current.phase === 'completed'
+  const livePercent = calculateConfirmedAnalysisPercent(analyzed, recorded)
+  // 直播录制的终点持续向后移动；即便暂时追平，也不能用 100% 暗示任务完成。
+  const confirmedPercent = hasFixedScanRange ? livePercent : Math.min(98, livePercent)
   const listed = summary.listed || (current.total_highlights ?? 0)
   const pendingN = summary.pendingConfirm > 0 ? summary.pendingConfirm : (current.pending_rounds ?? 0)
   const exportActive = summary.queued > 0 || summary.exporting > 0 || summary.failed > 0
@@ -201,7 +256,26 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
       {(current.confirmed_rounds ?? 0) > 0 && (
         <Chip tone="success" title="边界可信、可确认导出（不是「已全部导出」）">可导 {current.confirmed_rounds}</Chip>
       )}
-      {current.pending_round && !isFinalizing && <Chip tone="warning">等待回合结束</Chip>}
+      {current.pending_round && !isFinalizing && (
+        <Chip tone="warning" title={current.pending_round_info?.waiting_for ? `等待 ${current.pending_round_info.waiting_for}` : undefined}>
+          {current.pending_round_info?.phase
+            ? `等待${ROUND_PHASE_LABEL[current.pending_round_info.phase] || current.pending_round_info.phase}`
+            : '等待回合结束'}
+          {current.pending_round_info?.since_sec ? ` ${Math.floor(current.pending_round_info.since_sec)}s` : ''}
+        </Chip>
+      )}
+      {current.degraded_mode === 'audio_only' && (
+        <Chip tone="warning" title="视觉扫描超时后自动切换为短窗音频追赶">音频追赶</Chip>
+      )}
+      {current.provider === 'CPUExecutionProvider' && (
+        <Chip tone="warning" title={current.provider_warning || 'GPU 推理不可用'}>CPU 模式</Chip>
+      )}
+      {(current.audio_pending_rounds ?? 0) > 0 && (
+        <Chip tone="default" title="音频路径检测到，待 OCR 复核边界">音频待复核 {current.audio_pending_rounds}</Chip>
+      )}
+      {current.mapping_error && (
+        <Chip tone="warning" title={current.mapping_error}>同步异常</Chip>
+      )}
     </>
   )
 
@@ -214,50 +288,60 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
     </Chip>
   )
 
+  // compact 模式只保留核心：状态 + 进度 + 需行动的 Chip
   if (compact) {
+    // hover 时展示完整信息
+    const fullTitle = [
+      ps.detail,
+      roomLabel ? `主房 ${roomLabel}` : '',
+      `模式 ${modeLabel}`,
+      listed > 0 ? `入列 ${listed}` : '',
+      (current.confirmed_rounds ?? 0) > 0 ? `可导 ${current.confirmed_rounds}` : '',
+      current.degraded_mode === 'audio_only' ? '音频追赶' : '',
+      current.provider === 'CPUExecutionProvider' ? 'CPU 模式' : '',
+      (current.audio_pending_rounds ?? 0) > 0 ? `音频待复核 ${current.audio_pending_rounds}` : '',
+      current.mapping_error ? `同步异常: ${current.mapping_error}` : '',
+    ].filter(Boolean).join(' · ')
+
     return (
-      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 14, fontVariantNumeric: 'tabular-nums', fontSize: 13, minWidth: 0, flex: 1 }}>
+      <div title={fullTitle} style={{ display: 'flex', alignItems: 'center', gap: 10, fontVariantNumeric: 'tabular-nums', fontSize: 13, minWidth: 0, flex: 1, flexWrap: 'wrap' }}>
         <style>{`@keyframes caPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(0.8)}}`}</style>
 
-        {/* 主状态区：动词 + 一句人话 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          {dot}
-          <span style={{ fontWeight: 600, color: 'var(--text-50)', whiteSpace: 'nowrap' }}>{ps.verb}</span>
-          {roomLabel && <Chip title={current.room_id || undefined}>主房 {roomLabel}</Chip>}
-          <Chip>{modeLabel}</Chip>
-          {ps.detail && (
-            <span style={{
-              fontSize: 12, color: 'var(--text-400)', overflow: 'hidden',
-              textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 360,
-            }} title={ps.detail}>
-              {ps.detail}
-            </span>
-          )}
-        </div>
+        {/* ① 状态圆点 + 动词 */}
+        {dot}
+        <span style={{ fontWeight: 600, color: 'var(--text-50)', whiteSpace: 'nowrap', flexShrink: 0 }}>{ps.verb}</span>
 
-        {/* 进度区：条 + 已分析/已录/滞后 */}
+        {/* ② 进度条 + 时间 */}
         {current.phase !== 'completed' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: '0 1 280px', minWidth: 140 }}>
-            <div style={{ flex: 1, maxWidth: 240, height: 5, background: 'var(--background-700)', borderRadius: 3, overflow: 'hidden' }}>
-              <div style={{ width: `${hasFixedScanRange ? livePercent : 0}%`, height: '100%', background: 'var(--brand-600)', borderRadius: 3, transition: 'width 0.5s ease' }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 1 260px', minWidth: 100 }}
+            title="直播实时跟进中，录制的终点持续向后移动；完成后补扫尾部，进度不会显示 100%">
+            <div style={{ flex: 1, maxWidth: 180, height: 4, background: 'var(--background-700)', borderRadius: 'var(--radius-xs, 6px)', overflow: 'hidden' }}>
+              <div style={{ width: `${confirmedPercent}%`, height: '100%', background: TONE_COLOR[ps.tone === 'idle' ? 'active' : ps.tone], borderRadius: 'var(--radius-xs, 6px)', transition: 'width 0.5s ease' }} />
             </div>
-            <span style={{ fontSize: 12, color: 'var(--text-400)', whiteSpace: 'nowrap' }}>
-              {formatDuration(analyzed)} / {formatDuration(recorded || scanEnd)}
-              {lagSec > 1 && current.running ? ` · 滞后 ${formatDuration(lagSec)}` : ''}
+            <span style={{ fontSize: 11, color: 'var(--text-400)', whiteSpace: 'nowrap' }}>
+              {!hasFixedScanRange && '实时跟进 '}
+              {formatDuration(analyzed)}/{formatDuration(recorded)}
+              {lagSec > 5 && current.running ? ` · 滞后${formatDuration(lagSec)}` : ''}
             </span>
           </div>
         )}
 
-        {/* 行动区 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-          {actionChips}
-          {exportChip}
-          {current.analysis_stage === '等待收尾' && (
-            <Typography.Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
-              请先停录
-            </Typography.Text>
-          )}
-        </div>
+        {/* ③ 行动 Chip：仅显示需要用户操作的 */}
+        {pendingN > 0 && (
+          <Chip tone="warning" title="有待确认的切片，点击前往切片列表" onClick={onGoToClips}>
+            待调 {pendingN}
+          </Chip>
+        )}
+        {summary.failed > 0 && (
+          <Chip tone="warning" title={`导出失败 ${summary.failed} 个`}>
+            失败 {summary.failed}
+          </Chip>
+        )}
+        {ps.nextAction === 'confirm' && pendingN === 0 && (
+          <Chip tone="warning" title="点击前往切片列表确认" onClick={onGoToClips}>
+            去确认
+          </Chip>
+        )}
       </div>
     )
   }
@@ -276,16 +360,14 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
 
         {current.phase !== 'completed' && (
           <>
-            <span className="pbar-line" style={{ height: 6, borderRadius: 3 }}>
-              <span
-                className="pbar-fill"
-                style={{ width: `${Math.round(isWorkerActive ? Math.min(livePercent, 95) : livePercent)}%` }}
-              />
-            </span>
+            <div style={{ height: 5, borderRadius: 'var(--radius-xs, 6px)', background: 'var(--background-700)', overflow: 'hidden' }}>
+              <div style={{ width: `${confirmedPercent}%`, height: '100%', background: TONE_COLOR[ps.tone === 'idle' ? 'active' : ps.tone], borderRadius: 'var(--radius-xs, 6px)', transition: 'width 0.5s ease' }} />
+            </div>
             <Typography.Text type="secondary">
-              已分析 {formatDuration(analyzed)} / 已录 {formatDuration(recorded)}
+              {!hasFixedScanRange ? '实时跟进 · ' : ''}
+              后台已确认分析 {formatDuration(analyzed)} / 已录 {formatDuration(recorded)}
+              {current.scan_running ? ` · 本轮扫描已用 ${formatDuration(current.scan_elapsed_sec ?? 0)}` : ''}
               {lagSec > 1 && current.running ? ` · 滞后 ${formatDuration(lagSec)}` : ''}
-              {isWorkerActive && livePercent >= 95 ? '（后台精修中，完成后自动更新）' : ''}
             </Typography.Text>
           </>
         )}
@@ -301,6 +383,24 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
             showIcon
             message={isFinalizing ? '正在进行最终回合确认（首次约 1–2 分钟）' : '请先结束录制，并等待收尾完成'}
             description="停录后会做一次收尾扫描，把尾部回合补入列表（待确认）。收尾完成后回合仍需你确认/导出。"
+          />
+        )}
+        {(current.provider_warning || current.last_scan_error) && current.phase === 'running' && (
+          <Alert
+            type="warning"
+            showIcon
+            message={
+              current.degraded_mode === 'audio_only'
+                ? '视觉扫描超时，已自动切换短窗音频追赶'
+                : current.provider === 'CPUExecutionProvider'
+                  ? 'GPU 推理不可用，当前使用 CPU 慢速分析'
+                  : '上一轮扫描超时，正在自动恢复'
+            }
+            description={
+              current.provider === 'CPUExecutionProvider'
+                ? '分析仍会继续，但可能落后录制；新版安装器会自动安装并校验 DirectML。'
+                : `已连续超时 ${current.consecutive_scan_timeouts ?? 1} 次，程序会缩小窗口后继续推进。`
+            }
           />
         )}
         {current.running && !isFinalizing && current.phase === 'running' && (

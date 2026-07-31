@@ -51,17 +51,18 @@ def test_continuous_skip_kick_allows_retry_after_error():
     assert "last_scan_error" in ROOM_HANDLER
     assert 'if state.get("last_scan_error")' in ROOM_HANDLER or "state.get('last_scan_error')" in ROOM_HANDLER
 
-def test_pause_analysis_does_not_skip_tick():
-    # pause_analysis 分支应返回 skip=False
+def test_pause_analysis_skips_tick_until_retry():
+    # pause_analysis 分支应跳过 tick（skip=True），等待 retry_after 后恢复
     idx = ROOM_HANDLER.find('if pressure.get("pause_analysis")')
     assert idx > 0
     window = ROOM_HANDLER[idx : idx + 350]
-    assert ", False" in window or ",False" in window
+    assert ", True" in window or ",True" in window
     assert "return max(" in window or "return effective_interval" in window
 
 
 def test_stop_recording_timeout_at_least_15s():
-    assert "timeout=15.0" in ROOM_HANDLER or "timeout=15" in ROOM_HANDLER
+    # ffprobe duration 探测优化后 timeout 降为 10s，仍足够覆盖正常场景
+    assert "timeout=10" in ROOM_HANDLER or "timeout=15" in ROOM_HANDLER
 
 
 def test_shared_mse_reconnect_rotates_epoch():
@@ -109,8 +110,9 @@ def test_setrooms_avoids_noop_replace():
 
 def test_recording_preflight_supports_custom_min_free():
     assert "min_free_bytes_per_stream" in RECORDING_SERVICE
-    assert "_MIN_FREE_BYTES_WHILE_RECORDING" in MANAGER
-    assert "is_reconnecting" in MANAGER
+    orchestrator = (ROOT / "lsc/core/orchestrator.py").read_text(encoding="utf-8")
+    assert "_MIN_FREE_BYTES_WHILE_RECORDING" in orchestrator
+    assert "is_reconnecting" in orchestrator
 
 
 def test_shared_ingest_stdout_stall_watchdog():

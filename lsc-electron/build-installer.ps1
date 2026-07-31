@@ -21,9 +21,9 @@ try {
     exit 1
 }
 
-# [2/6] Prepare bundled runtime resources (Python embedded + FFmpeg)
+# [2/6] Prepare bundled runtime resources (Python embedded only, deps downloaded at runtime)
 Write-Host ""
-Write-Host "[2/6] Preparing bundled runtime resources..." -ForegroundColor Yellow
+Write-Host "[2/6] Preparing bundled runtime resources (Python embedded only)..." -ForegroundColor Yellow
 $PrepScript = Join-Path $PSScriptRoot "scripts\prep-bundle.ps1"
 if (-not (Test-Path $PrepScript)) {
     Write-Host "ERROR: prep-bundle.ps1 not found at $PrepScript" -ForegroundColor Red

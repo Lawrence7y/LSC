@@ -1,8 +1,8 @@
 # tests/test_ocr_accel.py
 from lsc.analyzer.ocr_accel import (
     VALID_OCR_ACCEL,
-    normalize_ocr_accel,
     list_accel_candidates,
+    normalize_ocr_accel,
     resolve_ocr_accel,
 )
 
@@ -146,8 +146,9 @@ def test_read_settings_ocr_accel(tmp_path, monkeypatch) -> None:
 
 
 def test_ffmpeg_hwaccel_args() -> None:
-    from lsc.analyzer.ocr_accel import ffmpeg_hwaccel_args
     import platform
+
+    from lsc.analyzer.ocr_accel import ffmpeg_hwaccel_args
 
     assert ffmpeg_hwaccel_args("cpu") == []
     assert ffmpeg_hwaccel_args("dml") == ["-hwaccel", "d3d11va"]

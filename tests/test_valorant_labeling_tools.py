@@ -7,7 +7,6 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "valorant_vision"
 sys.path.insert(0, str(SCRIPTS))
 
 import pytest
-
 from apply_interval_labels import apply_interval_candidates, export_manifest, label_at
 from build_label_queue import VideoSession, build_queue, choose_split
 from densify_boundaries import dense_timestamps, densify_queue, transition_centers

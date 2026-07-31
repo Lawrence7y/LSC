@@ -144,6 +144,11 @@ export const WORKBENCH_SHORTCUTS = {
   BATCH_STOP:        { key: 'r', ctrl: true, shift: true, id: 'batch:stop' },
   SELECT_ALL:        { key: 'a', ctrl: true, shift: true, id: 'select:all' },
   EXPORT_CLIP:       { key: 'e', ctrl: true,     id: 'export:clip' },
+  // P2-3: 快捷键完善
+  TOGGLE_CLIPS:      { key: 'c',                 id: 'toggle:clips' },
+  CYCLE_ROOM:        { key: 'Tab',               id: 'cycle:room' },
+  CONFIRM_REFINE:    { key: 'Enter',             id: 'confirm:refine' },
+  CANCEL_REFINE:     { key: 'Escape',            id: 'cancel:refine' },
 } as const
 
 /** 导航类快捷键（id 以 page: 开头）的按键集合，输入聚焦时仍放行。

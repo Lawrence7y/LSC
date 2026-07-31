@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier, _CLASS_NAMES
+from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
 
 LIVE = Path.home() / "LSC" / "datasets" / "valorant_phase" / "live_test_84927583848"
 
@@ -36,7 +36,7 @@ def main() -> None:
         meta.append(it)
         if len(batch) >= 16:
             probs = clf.predict_batch(batch)
-            for row, pr in zip(meta, probs):
+            for row, pr in zip(meta, probs, strict=True):
                 pi = int(pr.argmax())
                 pred = _CLASS_NAMES[pi]
                 details.append(
@@ -54,7 +54,7 @@ def main() -> None:
             batch, meta = [], []
     if batch:
         probs = clf.predict_batch(batch)
-        for row, pr in zip(meta, probs):
+        for row, pr in zip(meta, probs, strict=True):
             pi = int(pr.argmax())
             pred = _CLASS_NAMES[pi]
             details.append(

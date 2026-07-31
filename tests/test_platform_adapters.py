@@ -639,6 +639,126 @@ def test_huya_adapter_returns_restricted_when_no_public_stream_found(monkeypatch
     assert "公开流" in info.error
 
 
+def test_huya_adapter_parses_hyplayer_config_modern_payload(monkeypatch):
+    """现代 ``var hyPlayerConfig`` 路径（2025-2026 虎牙页面结构）。"""
+    from lsc.platforms.huya import HUYA_HEADERS, HuyaAdapter
+
+    adapter = HuyaAdapter()
+    html = """
+    <html>
+      <script>
+        var hyPlayerConfig = {
+          "stream": {
+            "data": [{
+              "gameStreamInfoList": [{
+                "sFlvUrl": "https://tx.example.com/live",
+                "sStreamName": "room-456",
+                "sFlvUrlSuffix": "flv",
+                "sFlvAntiCode": "fm=xyz&txyp=1&wsTime=6d1a3c00"
+              }],
+              "gameLiveInfo": {
+                "roomName": " hyPlayerConfig 标题",
+                "nick": "hyPlayerConfig 主播",
+                "gameFullName": "英雄联盟",
+                "isSecret": 0
+              }
+            }]
+          }
+        };
+      </script>
+    </html>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://www.huya.com/456")
+
+    assert info.platform == "huya"
+    assert info.is_live is True
+    assert info.title == " hyPlayerConfig 标题"
+    assert info.streamer == "hyPlayerConfig 主播"
+    assert info.category == "英雄联盟"
+    assert info.stream_url == "https://tx.example.com/live/room-456.flv?fm=xyz&txyp=1&wsTime=6d1a3c00"
+    assert info.selected_quality == "source"
+    assert info.headers == HUYA_HEADERS
+
+
+def test_huya_adapter_hyplayer_config_defaults_to_live_when_isSecret_missing():
+    """当 hyPlayerConfig 路径中 isSecret 字段缺失时，默认视为已开播。
+
+    修复前：isSecret 缺失时 ``None == 0`` 为 False，导致 tLiveStatus=0（误判未开播）。
+    修复后：room_info 缺失 tLiveStatus 时默认视为已开播（stream 数据存在即有直播内容）。
+    """
+    from lsc.platforms.huya import HuyaAdapter
+
+    adapter = HuyaAdapter()
+    html = """
+    <html>
+      <script>
+        var hyPlayerConfig = {
+          "stream": {
+            "data": [{
+              "gameStreamInfoList": [{
+                "sFlvUrl": "https://hs.example.com/live",
+                "sStreamName": "room-789",
+                "sFlvUrlSuffix": "flv",
+                "sFlvAntiCode": "fm=def"
+              }],
+              "gameLiveInfo": {
+                "roomName": "无 isSecret 字段",
+                "nick": "主播B"
+              }
+            }]
+          }
+        };
+      </script>
+    </html>
+    """
+    adapter._fetch_page = lambda url: html
+
+    info = adapter.parse("https://www.huya.com/789")
+
+    assert info.platform == "huya"
+    assert info.is_live is True
+    assert info.title == "无 isSecret 字段"
+    assert info.streamer == "主播B"
+
+
+def test_huya_adapter_falls_back_to_html_title_when_stream_data_missing(monkeypatch):
+    """当 stream 数据缺失时，从 HTML <title> 标签提取标题和主播名。"""
+    from lsc.platforms.huya import HuyaAdapter
+
+    adapter = HuyaAdapter()
+    html = """
+    <html>
+      <head><title>主播名 - 房间标题-虎牙直播</title></head>
+      <script>
+        window.HNF_GLOBAL_INIT = {
+          "roomInfo": {"tLiveStatus": 1, "sIntroduction": ""},
+          "profileInfo": {"nick": ""},
+          "stream": {
+            "data": [{
+              "gameStreamInfoList": [{
+                "sFlvUrl": "https://huya.example.com/live",
+                "sStreamName": "room-111",
+                "sFlvUrlSuffix": "flv",
+                "sFlvAntiCode": "fm=ghi"
+              }]
+            }]
+          }
+        };
+      </script>
+    </html>
+    """
+    monkeypatch.setattr(adapter, "_fetch_page", lambda url: html)
+
+    info = adapter.parse("https://www.huya.com/111")
+
+    assert info.platform == "huya"
+    assert info.is_live is True
+    assert info.title == "房间标题"
+    assert info.streamer == "主播名"
+
+
 def test_huya_registry_detection():
     assert detect_platform("https://www.huya.com/123") == "huya"
 

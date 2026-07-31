@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
+
+_log = logging.getLogger(__name__)
 
 RESULT_TAIL_SEC = 1.5
 NON_GAME_ABORT_SEC = 5.0
@@ -83,6 +86,8 @@ class RoundFSM:
         # 买枪倒计时粘性：combat 误检帧常不读 OCR，用最近一次 timer 外推挡住买枪内开局
         self._last_timer: float | None = None
         self._last_timer_ts: float | None = None
+        # next_buy 闭合计数器：ROUND_OPEN 期间连续 buy 帧数，达到阈值才闭合
+        self._buy_close_count: int = 0
 
     def clone(self) -> RoundFSM:
         """Shallow copy for incremental hybrid passes; avoids deepcopy on each tick."""
@@ -101,6 +106,7 @@ class RoundFSM:
         other._refined = {k: dict(v) for k, v in self._refined.items()}
         other._last_timer = self._last_timer
         other._last_timer_ts = self._last_timer_ts
+        other._buy_close_count = self._buy_close_count
         return other
 
     def feed(self, ev: FrameEvidence) -> list[RoundEvent]:
@@ -110,20 +116,53 @@ class RoundFSM:
             self._last_timer = float(ev.timer_seconds)
             self._last_timer_ts = float(ev.timestamp)
 
+        # non_game/replay must never open or close a round (including via score path).
+        # 保持原始控制流：最先检查并返回，绝不执行后续 ROUND_OPEN 逻辑。
+        if cls in ("non_game", "replay"):
+            # P1: 诊断日志 — 放在 return 前，不改变控制流
+            if cls == "replay":
+                _log.debug(
+                    "fsm_skip ts=%.1f cls=replay state=%s",
+                    ev.timestamp, self._state.value,
+                )
+            return events
+
         if self._state == _State.ROUND_OPEN:
             if self._open_start is not None and ev.timestamp - self._open_start > self._config.max_open_sec:
+                _log.debug(
+                    "fsm_discard ts=%.1f state=round_open open_start=%.1f exceeds max_open_sec=%.0f",
+                    ev.timestamp, self._open_start, self._config.max_open_sec,
+                )
                 events.append(self._discard())
             elif cls == "non_game":
                 if self._non_game_start is None:
                     self._non_game_start = ev.timestamp
                 elif ev.timestamp - self._non_game_start > self._config.non_game_abort_sec:
+                    _log.debug(
+                        "fsm_discard ts=%.1f state=round_open non_game_abort after %.1fs",
+                        ev.timestamp, self._config.non_game_abort_sec,
+                    )
                     events.append(self._discard())
             else:
                 self._non_game_start = None
 
-        # non_game/replay must never open or close a round (including via score path).
-        if cls in ("non_game", "replay"):
-            return events
+        # next_buy 闭合：ROUND_OPEN 期间连续 4 帧 buy（4秒@1FPS）才触发，
+        # 避免交战中 2 帧短暂误检导致回合被切成两半。
+        if self._state == _State.ROUND_OPEN and cls == "buy":
+            self._buy_close_count += 1
+            open_dur = ev.timestamp - (self._open_start or ev.timestamp)
+            if self._buy_close_count >= 4 and open_dur >= 15.0:
+                _log.debug(
+                    "fsm_close_on_buy ts=%.1f round=%s open_dur=%.0fs buy_frames=%d",
+                    ev.timestamp, self._round_key, open_dur, self._buy_close_count,
+                )
+                close = self._close_round(first_result_ts=ev.timestamp, end_by="next_buy")
+                self._state = _State.WAIT_COMBAT
+                if close is not None:
+                    events.append(close)
+                return events
+        elif self._state == _State.ROUND_OPEN:
+            self._buy_close_count = 0
 
         effective_timer = self._effective_timer(ev)
 
@@ -141,6 +180,10 @@ class RoundFSM:
         if self._state == _State.ROUND_OPEN and cls == "result":
             # 仅当本帧读到交战钟时才判误检；不用粘性外推，避免关局被长期挡住。
             if _is_combat_phase_timer(ev.timer_seconds):
+                _log.debug(
+                    "fsm_skip_close ts=%.1f cls=combat timer=%.0f — combat timer blocks false result",
+                    ev.timestamp, ev.timer_seconds,
+                )
                 return events
             self._note_score(ev)
             if self._advance_stable(
@@ -153,12 +196,25 @@ class RoundFSM:
                     end_by="model_result",
                 )
                 if close is not None:
+                    _log.debug(
+                        "fsm_close ts=%.1f round=%s start=%.1f end=%.1f",
+                        ev.timestamp, self._round_key, self._open_start,
+                        self._stable_run_first_ts or ev.timestamp,
+                    )
                     events.append(close)
                 return events
             return events
 
         if self._advance_stable(cls, ev.timestamp):
-            events.extend(self._on_stable_transition(cls, timer_seconds=effective_timer))
+            old_state = self._state
+            transition_events = self._on_stable_transition(cls, timer_seconds=effective_timer)
+            if self._state != old_state:
+                _log.debug(
+                    "fsm_transition %s -> %s (cls=%s ts=%.1f timer=%s)",
+                    old_state.value, self._state.value, cls, ev.timestamp,
+                    f"{effective_timer:.0f}" if effective_timer is not None else None,
+                )
+            events.extend(transition_events)
 
         return events
 
@@ -210,6 +266,10 @@ class RoundFSM:
         if self._state == _State.WAIT_COMBAT and cls == "combat":
             # 买枪倒计时内的 combat 误检不得开局（否则起点落在买枪段）。
             if _is_buy_phase_timer(timer_seconds):
+                _log.debug(
+                    "fsm_block_open cls=combat timer=%.0f — buy-phase timer blocks round open",
+                    timer_seconds,
+                )
                 return []
             self._state = _State.ROUND_OPEN
             self._open_start = first_ts
@@ -255,13 +315,17 @@ class RoundFSM:
         if self._round_key is None or self._open_start is None:
             return None
 
-        end = first_result_ts + self._config.result_tail_sec
+        # next_buy：买枪起始即为上一回合终点，无需额外 tail padding
+        if end_by == "next_buy":
+            end = first_result_ts
+        else:
+            end = first_result_ts + self._config.result_tail_sec
         if end_by == "model_result" and not self._score_increment_seen and self._ocr_conflict:
             return None
         if end_by == "model_score" and self._ocr_conflict:
             return None
 
-        if self._score_increment_seen and end_by in {"model_result", "model_score"}:
+        if self._score_increment_seen and end_by in {"model_result", "model_score", "next_buy"}:
             confirm_status = "vision_confirmed"
         elif end_by == "model_result":
             confirm_status = "pending"
@@ -341,4 +405,5 @@ class RoundFSM:
         self._score_increment_seen = False
         self._ocr_conflict = False
         self._non_game_start = None
+        self._buy_close_count = 0
         self._reset_stable()

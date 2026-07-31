@@ -255,24 +255,52 @@ class TimelineService:
             tid = ctx.timeline_id
         self.invalidate_timeline(tid, f"preview_epoch_change: {room_id}:{new_epoch_id}")
 
-    def on_recording_id_change(self, room_id: str, new_recording_id: str) -> None:
-        """录制启动/重连时调用，更新 recording_id。
+    def on_recording_id_change(
+        self,
+        room_id: str,
+        new_recording_id: str,
+        media_start_mono: float | None = None,
+    ) -> None:
+        """录制 epoch 变化时更新首个 recording，重连则使旧时间线上下文失效。
 
-        不使 TimelineContext 失效，只更新快照中的 recording_id。
-        已创建的 ClipSnapshot.recording_id 保持冻结旧值。
+        首次从“未录制”进入录制时可保留已有预览对齐，并把精确媒体起点写入
+        ``recording_to_common_delta``。已有 recording_id 变为另一个非空 ID
+        表示录制重启/重连；旧快照的媒体起点已经失效，必须整体失效后重新对齐。
+        已创建的 ClipSnapshot 仍冻结旧 recording_id，不受影响。
         """
+        invalidate_timeline_id = ""
         with self._lock:
             ctx = self.get_active_timeline_for_room(room_id)
             if ctx is not None and room_id in ctx.room_snapshots:
-                old_id = ctx.room_snapshots[room_id].recording_id
-                ctx.room_snapshots[room_id].recording_id = new_recording_id
-                ctx.clip_ready = all(
-                    bool(snap.recording_id) for snap in ctx.room_snapshots.values()
-                )
-                _log.info(
-                    "recording_id 更新: room=%s, old=%s, new=%s, clip_ready=%s",
-                    room_id, old_id, new_recording_id, ctx.clip_ready,
-                )
+                snap = ctx.room_snapshots[room_id]
+                old_id = snap.recording_id
+                if old_id and new_recording_id and old_id != new_recording_id:
+                    invalidate_timeline_id = ctx.timeline_id
+                else:
+                    snap.recording_id = new_recording_id
+                    media_start = float(media_start_mono or 0.0)
+                    if media_start > 0.0:
+                        snap.media_start_mono = media_start
+                        snap.recording_to_common_delta = (
+                            media_start + snap.preview_to_common_delta
+                        )
+                    ctx.clip_ready = all(
+                        bool(item.recording_id) for item in ctx.room_snapshots.values()
+                    )
+                    _log.info(
+                        "recording epoch 更新: room=%s, old=%s, new=%s, "
+                        "media_start=%.6f, clip_ready=%s",
+                        room_id,
+                        old_id,
+                        new_recording_id,
+                        media_start,
+                        ctx.clip_ready,
+                    )
+        if invalidate_timeline_id:
+            self.invalidate_timeline(
+                invalidate_timeline_id,
+                f"recording_epoch_change:{room_id}:{new_recording_id}",
+            )
 
 
 # 全局单例

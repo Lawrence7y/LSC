@@ -283,3 +283,34 @@ def test_incremental_runtime_state_keeps_open_round_across_windows(tmp_path) -> 
     assert first == []
     assert len(second) == 1
     assert second[0]["round_key"].startswith("hybrid-session-long-")
+
+
+def test_incremental_runtime_state_keeps_lookback_for_round_closure(tmp_path) -> None:
+    video = tmp_path / "incremental.mp4"
+    video.write_bytes(b"fake")
+    coarse_starts: list[float] = []
+
+    def recording_extract(*args, **kwargs):
+        if abs(float(kwargs["fps"]) - 1.0) < 0.01:
+            coarse_starts.append(float(kwargs["start_sec"]))
+        return _fake_extract(*args, **kwargs)
+
+    state: dict = {}
+    common = {
+        "classifier": _EncodedClassifier(),
+        "extract_fn": recording_extract,
+        "read_anchors_fn": _fake_anchors,
+        "runtime_state": state,
+    }
+
+    detect_valorant_rounds_hybrid(str(video), time_range=(0.0, 60.0), **common)
+    first_cursor = float(state["last_processed_ts"])
+    detect_valorant_rounds_hybrid(str(video), time_range=(0.0, 90.0), **common)
+
+    assert coarse_starts[0] == 0.0
+    # 增量窗必须保留调度器请求的回看上下文；下一局买枪画面需要它来闭合
+    # 上一局。旧帧仍会在进入 FSM 前去重，因此不会重复推理。
+    assert coarse_starts[-1] == 0.0
+    assert first_cursor == 60.0
+    assert state["last_inference_frames"] < 40
+    assert state["inference_frames_total"] > state["last_inference_frames"]

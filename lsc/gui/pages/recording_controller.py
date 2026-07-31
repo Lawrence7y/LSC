@@ -25,6 +25,7 @@ except ImportError:
 
 from lsc.platforms.registry import parse_stream, select_quality
 from lsc.recorder.capture import validate_recording
+from lsc.utils.process_launcher import hidden_run_kwargs
 
 _log = get_logger(__name__)
 
@@ -86,7 +87,7 @@ class ExportWorker(QThread):
     progress = Signal(float, float, float)  # percent, elapsed_sec, total_sec
 
     def __init__(self, exporter, video_path, start, end, output_dir, title,
-                 profile=None):
+                 profile=None, on_done=None, on_progress=None):
         super().__init__()
         self._exporter = exporter
         self._video_path = video_path
@@ -95,6 +96,8 @@ class ExportWorker(QThread):
         self._output_dir = output_dir
         self._title = title
         self._profile = profile
+        self._done_callback = on_done
+        self._progress_callback = on_progress
         self._proc = None  # FFmpeg Popen 进程引用，供 cancel 使用
         self._cancelled = False
 
@@ -114,9 +117,23 @@ class ExportWorker(QThread):
                 result, success=False, output_path="",
                 error="导出已取消", file_size_mb=0.0, thumbnail_path="",
             )
-        self.finished.emit(
+        callback_args = (
             result.success, result.output_path, result.error,
             result.file_size_mb, result.thumbnail_path or "",
+        )
+        # Electron 后端从 asyncio executor 调用 start_export；此时依赖 Qt
+        # queued signal 会出现 finished 已 emit、但接收槽迟迟不执行的情况。
+        # 终态回调直接在 worker 线程调用，handler 自身通过
+        # run_coroutine_threadsafe 回到 asyncio 循环，保证完成事件不丢。
+        if self._done_callback is not None:
+            try:
+                self._done_callback(*callback_args)
+            except Exception:
+                _log.exception("direct export done callback raised")
+        self.finished.emit(*callback_args)
+        _log.info(
+            "export worker callback emitted: success=%s output=%s error=%s",
+            result.success, result.output_path, result.error,
         )
 
     def _on_process(self, proc) -> None:
@@ -125,6 +142,11 @@ class ExportWorker(QThread):
 
     def _on_progress(self, percent: float, elapsed: float, total: float) -> None:
         """FFmpeg 进度回调，转发到 Qt 信号。"""
+        if self._progress_callback is not None:
+            try:
+                self._progress_callback(percent, elapsed, total)
+            except Exception:
+                _log.exception("direct export progress callback raised")
         self.progress.emit(percent, elapsed, total)
 
     def cancel(self) -> bool:
@@ -339,7 +361,10 @@ class RecordingController:
                 "-show_streams",
                 source,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)  # noqa: S603
+            result = subprocess.run(  # noqa: S603
+                cmd,
+                **hidden_run_kwargs(capture_output=True, text=True, timeout=10),
+            )
             payload = json.loads(result.stdout or "{}")
             stream = next(
                 (item for item in payload.get("streams", []) if item.get("codec_type") == "video"),
@@ -513,8 +538,8 @@ class RecordingController:
         Parameters
         ----------
         resolution, framerate : str | None
-            Reserved for future video filter support. Currently accepted
-            but not applied (stream is recorded at native resolution/fps).
+            可选的输出分辨率与帧率。非原画值会通过 FFmpeg 缩放/帧率参数应用；
+            直拷模式与变换冲突时自动回退到 H.264 CPU。
         audio_bitrate : str | None
             Audio bitrate string, e.g. "128k", "96k". Falls back to "128k"
             when None or empty.
@@ -549,6 +574,8 @@ class RecordingController:
         _encoder_map = {
             "h264_nvenc": "H.264 NVENC",
             "hevc_nvenc": "H.265 NVENC",
+            "h264_qsv": "h264_qsv",
+            "h264_amf": "h264_amf",
             "libx264": "H.264 CPU",
             "libx265": "H.265 CPU",
             "copy": "Copy",
@@ -563,16 +590,24 @@ class RecordingController:
         target_bitrate = self._normalize_bitrate_value(bitrate, bitrate_unit)
         bufsize = ""
 
-        if encoder == "H.264 NVENC":
+        if encoder_used in {"H.264 NVENC", "H.265 NVENC"}:
             if on_status:
                 on_status("检测 NVENC 硬件编码...", "info")
             if not self.is_nvenc_available():
                 if on_status:
-                    on_status("NVENC 不可用，自动切换为 Copy 模式", "warning")
-                encoder_used = "Copy"
+                    on_status("NVENC 不可用，自动切换为 CPU 编码", "warning")
+                encoder_used = "H.265 CPU" if encoder_used == "H.265 NVENC" else "H.264 CPU"
 
         if param_mode == "不限制":
             encoder_used = "Copy"
+
+        resize_requested = bool(resolution and resolution != "原画")
+        fps_requested = bool(framerate and framerate != "原画")
+        # copy 无法同时缩放或改帧率；用户选择了输出规格时自动转为兼容的 CPU 编码。
+        if encoder_used == "Copy" and (resize_requested or fps_requested):
+            encoder_used = "H.264 CPU"
+            if on_status:
+                on_status("原画直拷不支持缩放/改帧率，已切换为 H.264 CPU", "warning")
 
         if target_bitrate:
             suffix = target_bitrate[-1]
@@ -586,43 +621,63 @@ class RecordingController:
             except ValueError:
                 bufsize = ""
 
-        if encoder_used == "H.264 CPU" and param_mode == "码率限制" and target_bitrate:
-            output_args += ["-c:v", "libx264", "-preset", "medium"]
-            output_args += ["-b:v", target_bitrate, "-maxrate", target_bitrate]
-            if bufsize:
+        rate_limited = param_mode in {"码率限制", "自定义码率"} and bool(target_bitrate)
+        codec_name = {
+            "H.264 CPU": "libx264",
+            "H.265 CPU": "libx265",
+            "H.264 NVENC": "h264_nvenc",
+            "H.265 NVENC": "hevc_nvenc",
+            "h264_qsv": "h264_qsv",
+            "h264_amf": "h264_amf",
+        }.get(encoder_used)
+
+        if codec_name:
+            output_args += ["-c:v", codec_name]
+            if codec_name in {"libx264", "libx265"}:
+                output_args += ["-preset", "medium"]
+                if rate_limited:
+                    output_args += ["-b:v", target_bitrate, "-maxrate", target_bitrate]
+                else:
+                    output_args += ["-crf", str(crf)]
+            elif codec_name in {"h264_nvenc", "hevc_nvenc"}:
+                output_args += ["-preset", "p4"]
+                if rate_limited:
+                    output_args += ["-rc", "cbr", "-b:v", target_bitrate, "-maxrate", target_bitrate]
+                else:
+                    output_args += ["-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+            else:
+                # QSV/AMF 的质量参数跨驱动版本差异较大；固定码率兼容性最好。
+                safe_bitrate = target_bitrate or "8000k"
+                output_args += ["-b:v", safe_bitrate, "-maxrate", safe_bitrate]
+            if rate_limited and bufsize:
                 output_args += ["-bufsize", bufsize]
+
+            if resize_requested:
+                width, height = str(resolution).split(":", 1)
+                output_args += [
+                    "-vf",
+                    (
+                        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+                    ),
+                ]
+            if fps_requested:
+                output_args += ["-r", str(framerate)]
             output_args += ["-c:a", "aac", "-b:a", audio_br]
-            self._capture.start(stream_url, output_path,
-                                codec="custom", input_args=input_args,
-                                extra_args=output_args)
-        elif encoder_used == "H.264 CPU":
-            # Use -preset medium for better compression efficiency than fast
-            # (same CRF = smaller file, slightly higher CPU usage)
-            output_args += ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf)]
-            output_args += ["-c:a", "aac", "-b:a", audio_br]
-            self._capture.start(stream_url, output_path,
-                                codec="custom", input_args=input_args,
-                                extra_args=output_args)
-        elif encoder_used == "H.264 NVENC" and param_mode == "码率限制" and target_bitrate:
-            output_args += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "cbr_hq"]
-            output_args += ["-b:v", target_bitrate, "-maxrate", target_bitrate]
-            if bufsize:
-                output_args += ["-bufsize", bufsize]
-            output_args += ["-c:a", "aac", "-b:a", audio_br]
-            self._capture.start(stream_url, output_path,
-                                codec="custom", input_args=input_args,
-                                extra_args=output_args)
-        elif encoder_used == "H.264 NVENC":
-            # NVENC uses -cq (constant quality) which is the NVENC equivalent of CRF
-            output_args += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
-            output_args += ["-c:a", "aac", "-b:a", audio_br]
-            self._capture.start(stream_url, output_path,
-                                codec="custom", input_args=input_args,
-                                extra_args=output_args)
+            self._capture.start(
+                stream_url,
+                output_path,
+                codec="custom",
+                input_args=input_args,
+                extra_args=output_args,
+            )
         else:
-            self._capture.start(stream_url, output_path,
-                                input_args=input_args,
-                                extra_args=output_args)
+            self._capture.start(
+                stream_url,
+                output_path,
+                codec="copy",
+                input_args=input_args,
+            )
 
         if self._capture.status.value == "recording":
             # Capture confirmed running - set controller state atomically
@@ -710,7 +765,10 @@ class RecordingController:
                 return 0.0
             cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
                    "-show_format", target_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                cmd,
+                **hidden_run_kwargs(capture_output=True, text=True, timeout=10),
+            )
             data = json.loads(result.stdout)
             dur = float(data.get("format", {}).get("duration", 0))
             return dur if dur > 0 else 0.0
@@ -783,11 +841,6 @@ class RecordingController:
             self._last_export_error = f"录制文件不存在: {self.video_path}"
             return ""
 
-        self._export_thread = ExportWorker(
-            self._exporter, self.video_path,
-            start_sec, end_sec, output_dir, name,
-            profile=profile,
-        )
         self._last_export_error = ""
         export_id = uuid4().hex
         # 完成后从映射中移除，避免字典无限增长
@@ -797,9 +850,13 @@ class RecordingController:
                 on_done(*args)
             except Exception:
                 _log.exception("on_done callback raised in start_export")
-        self._export_thread.finished.connect(_on_finished)
-        if on_progress is not None:
-            self._export_thread.progress.connect(on_progress)
+        self._export_thread = ExportWorker(
+            self._exporter, self.video_path,
+            start_sec, end_sec, output_dir, name,
+            profile=profile,
+            on_done=_on_finished,
+            on_progress=on_progress,
+        )
         self._export_workers[export_id] = self._export_thread
         self._export_thread.start()
         return export_id

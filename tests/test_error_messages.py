@@ -5,12 +5,10 @@ RECOVERABLE/NON_RECOVERABLE classification functions, and edge cases.
 """
 from __future__ import annotations
 
-import pytest
-
 from lsc.utils.error_messages import (
+    friendly_connect_error,
     humanize_error,
     is_recoverable_error,
-    friendly_connect_error,
 )
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import shutil
-from collections import Counter
 from pathlib import Path
 
 import cv2

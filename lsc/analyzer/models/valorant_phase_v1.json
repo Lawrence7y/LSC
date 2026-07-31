@@ -23,10 +23,14 @@
     0.225
   ],
   "threshold_version": "v1",
-  "sha256": "bfc89e9063874b4fc775d4b243900f44389d0b80b63128f06a5cb9c17daf6d91",
-  "dataset_version": "manual-6341t-488v",
+  "sha256": "e477222567f9e58d8e420f846b3c65f05b7aef24b0f8ed2c95b7511b862766bf",
+  "dataset_version": "manual-7342t-669v",
   "thresholds": {
     "stable_prob": 0.55,
     "high_prob": 0.8
-  }
+  },
+  "seed": 20260722,
+  "train_count": 7342,
+  "val_count": 669,
+  "dataset_digest": "a3f1f789432a1013b7cfa4b0e04cd11e37abbef7a1ca4d6d1112b58b45b5d51a"
 }

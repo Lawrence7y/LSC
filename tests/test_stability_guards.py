@@ -15,8 +15,6 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 _python_backend = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
 if _python_backend not in sys.path:
     sys.path.insert(0, _python_backend)

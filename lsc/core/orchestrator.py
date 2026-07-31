@@ -32,6 +32,11 @@ from lsc.platforms.registry import parse_stream, select_quality
 
 _log = logging.getLogger(__name__)
 
+# 多个 RoomOrchestrator（测试、热重启或迁移期桥接）可能指向同一个 rooms.json。
+# 原子替换所用的固定 .tmp 路径必须跨实例串行，否则一个实例会先移走另一个
+# 实例的临时文件，表现为 WinError 2，并可能让录制/预览状态恢复数据丢失。
+_ROOMS_PERSIST_LOCK = threading.Lock()
+
 _T = TypeVar("_T")
 
 ControllerFactory = Callable[[], object]
@@ -525,7 +530,7 @@ class _BatchRecordJob:
 
     def run(self) -> None:
         started = 0
-        worker_count = min(4, len(self._room_ids))
+        worker_count = min(12, len(self._room_ids))
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = {}
             for room_id in self._room_ids:
@@ -537,6 +542,7 @@ class _BatchRecordJob:
                     param_mode=self._param_mode,
                     bitrate=self._bitrate,
                     bitrate_unit=self._bitrate_unit,
+                    _run_in_background=True,
                 )
                 futures[fut] = room_id
             for fut in as_completed(futures):
@@ -571,6 +577,32 @@ class _CallRequest:
         self.cancelled = False
 
 
+def _mark_failed_cdn_if_huya(room, error_msg: str) -> None:
+    """当虎牙录制遇到 403/连接失败时，标记当前 CDN 线路为坏线路。
+
+    下次 re-parse 时 Huya adapter 会跳过该线路，尝试其他 CDN（al/tx/hs）。
+    """
+    if not error_msg or not room.stream_info:
+        return
+    if room.stream_info.platform != "huya":
+        return
+    lowered = error_msg.lower()
+    if "403" not in lowered and "forbidden" not in lowered and "i/o error" not in lowered:
+        return
+    stream_url = room.stream_info.stream_url or ""
+    if not stream_url:
+        return
+    try:
+        from urllib.parse import urlparse as _urlparse
+        host = _urlparse(stream_url).netloc.lower()
+        cdn_name = host.split(".")[0] if host else ""
+        if cdn_name:
+            from lsc.platforms.huya import mark_cdn_bad
+            mark_cdn_bad(cdn_name)
+    except Exception as exc:
+        _log.debug("mark_failed_cdn failed: %s", exc)
+
+
 class RoomOrchestrator:
     _MAX_PENDING_REQUESTS = 8
 
@@ -599,6 +631,7 @@ class RoomOrchestrator:
         self._loop_deadline: float | None = None
         self._dirty_recording: bool = False
         self._dirty_connection: bool = False
+        self._missing_controller_tick_warned: set[str] = set()
         self._loop_room_id: str | None = None
         self._loop_start: float = 0.0
         self._loop_end: float = 0.0
@@ -786,6 +819,48 @@ class RoomOrchestrator:
         with self._lock:
             return self._rooms.get(room_id)
 
+    def get_recording_status(self, room_id: str) -> dict[str, Any]:
+        """Return a small, lock-protected recording status snapshot.
+
+        This read-only helper deliberately does not marshal through ``call()``.
+        Starting a recording is performed in a worker because URL refresh and the
+        FFmpeg startup probe may block; waiting for a busy orchestrator thread just
+        to read the final state can otherwise turn a successful recording start into
+        a misleading ``orchestrator call timed out`` error.
+        """
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None:
+                return {
+                    "exists": False,
+                    "is_recording": False,
+                    "last_error": "",
+                    "streamer_name": "",
+                    "platform_name": "",
+                    "preview_enabled": False,
+                }
+            is_recording = bool(room.is_recording)
+            last_error = str(room.last_error or "")
+            # 共享录制使用独立 FFmpeg sink。它退出后必须立刻反映到状态，不能只
+            # 依赖 RoomSession 的旧布尔值，否则界面会继续显示“录制中”。
+            try:
+                shared_ingest = get_shared_ingest_registry().get(room_id)
+            except Exception:
+                shared_ingest = None
+            if shared_ingest is not None and not bool(getattr(shared_ingest, "recording_active", False)):
+                is_recording = False
+                shared_error = str(getattr(shared_ingest, "recording_error", "") or "")
+                if shared_error:
+                    last_error = shared_error
+            return {
+                "exists": True,
+                "is_recording": is_recording,
+                "last_error": last_error,
+                "streamer_name": str(room.streamer_name or ""),
+                "platform_name": str(room.platform_name or ""),
+                "preview_enabled": bool(room.preview_enabled),
+            }
+
     def list_rooms(self) -> list[RoomSession]:
         """Return all currently managed ``RoomSession`` objects."""
         if self._thread is not None and threading.current_thread() is not self._thread:
@@ -823,6 +898,7 @@ class RoomOrchestrator:
             room = self._rooms.pop(room_id, None)
         if room is None:
             return False
+        self._missing_controller_tick_warned.discard(room_id)
         # 若正在循环试听这个房间,停止 timer,避免删房后空转。
         if self._loop_room_id == room_id:
             self.stop_range_loop()
@@ -983,19 +1059,20 @@ class RoomOrchestrator:
         do_fsync = write_n % 5 == 0
 
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                f.flush()
-                if do_fsync:
-                    os.fsync(f.fileno())
+            with _ROOMS_PERSIST_LOCK:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    if do_fsync:
+                        os.fsync(f.fileno())
 
-            if os.path.isfile(path):
-                try:
-                    os.replace(path, bak_path)
-                except Exception as exc:
-                    _log.warning("Failed to create config backup: %s", exc)
+                if os.path.isfile(path):
+                    try:
+                        os.replace(path, bak_path)
+                    except Exception as exc:
+                        _log.warning("Failed to create config backup: %s", exc)
 
-            os.replace(tmp_path, path)
+                os.replace(tmp_path, path)
             _log.info("Saved %d rooms to %s", count, path)
             return count
         except Exception as exc:
@@ -1749,7 +1826,8 @@ class RoomOrchestrator:
                         bitrate_unit: str = "kbps",
                         resolution: str | None = None,
                         framerate: str | None = None,
-                        audio_bitrate: str | None = None) -> bool:
+                        audio_bitrate: str | None = None,
+                        *, _run_in_background: bool = False) -> bool:
         """Start FFmpeg recording for a single connected room.
 
         The method performs a pre-flight disk-space check, refreshes the
@@ -1774,18 +1852,58 @@ class RoomOrchestrator:
         Returns:
             True if recording started successfully.
         """
-        if self._thread is not None and threading.current_thread() is not self._thread:
+        if (self._thread is not None and threading.current_thread() is not self._thread
+                and not _run_in_background):
             return self.call(lambda: type(self).start_recording(self, room_id=room_id, output_dir=output_dir, encoder=encoder, crf=crf, param_mode=param_mode, bitrate=bitrate, bitrate_unit=bitrate_unit, resolution=resolution, framerate=framerate, audio_bitrate=audio_bitrate))
         _log.info("[录制诊断] start_recording called for room_id=%s", room_id)
-        room = self.get_room(room_id)
+        # ``_run_in_background`` 由 Electron 后端的录制执行器使用：URL 刷新和
+        # FFmpeg 首帧探测可能超过 10 秒，不能再排队到编排线程后触发 call 超时。
+        # 读取房间引用受 _lock 保护；后续耗时工作不持锁，避免阻塞其他状态读取。
+        with self._lock:
+            room = self._rooms.get(room_id)
         if room is None:
             _log.warning("[录制诊断] room not found: %s", room_id)
             return False
+        previous_recording_id = str(getattr(room, "recording_id", "") or "")
+
+        def _commit_recording_epoch(media_start_mono: float | None) -> None:
+            """提交新录制 epoch；重启时清除旧音频对齐，禁止复用陈旧 offset。"""
+            new_recording_id = uuid4().hex
+            room.recording_id = new_recording_id
+            get_timeline_service().on_recording_id_change(
+                room_id,
+                new_recording_id,
+                media_start_mono=media_start_mono,
+            )
+            if previous_recording_id:
+                if room.align_group_id or room.content_offset:
+                    _log.warning(
+                        "Room %s recording epoch changed; clearing stale alignment group %s",
+                        room_id,
+                        room.align_group_id,
+                    )
+                room.align_group_id = ""
+                room.content_offset = 0.0
+
         controller = room.controller
         if controller is None:
             _log.warning("[录制诊断] controller is None for room %s (is_connected=%s)", room_id, room.is_connected)
             room.last_error = "录制控制器未初始化"
             return False
+        effective_encoder = encoder
+        normalized_encoder = str(encoder or "").lower()
+        if "nvenc" in normalized_encoder:
+            try:
+                nvenc_available = bool(controller.is_nvenc_available())
+            except Exception:
+                nvenc_available = False
+            if not nvenc_available:
+                effective_encoder = "H.265 CPU" if "265" in normalized_encoder or "hevc" in normalized_encoder else "H.264 CPU"
+                _log.warning(
+                    "NVENC is unavailable; falling back to %s for room %s",
+                    effective_encoder,
+                    room_id,
+                )
         _log.info("[录制诊断] controller OK, is_connected=%s, stream_url=%s", room.is_connected, bool(getattr(controller, 'stream_url', None)))
         # 预览刷新失败可能误清 is_connected，但流缓存仍可用
         if not room.is_connected and not _heal_connected_flag(room):
@@ -1858,7 +1976,7 @@ class RoomOrchestrator:
 
         _log.info("[录制诊断] calling start_recording_with_crf, output_dir=%s", room_output_dir)
         shared_profile = self._build_recording_profile(
-            encoder, crf, param_mode, bitrate, bitrate_unit, resolution, framerate, audio_bitrate,
+            effective_encoder, crf, param_mode, bitrate, bitrate_unit, resolution, framerate, audio_bitrate,
         )
         shared_output, shared_media_start, shared_error = self._start_shared_recording_if_enabled(
             room, room_output_dir, stream_url, shared_profile,
@@ -1877,11 +1995,12 @@ class RoomOrchestrator:
             room._first_frame_corrected = False
             room._shared_ingest_last_file_size = 0
             room._shared_ingest_stall_checks = 0
-            room.recording_id = uuid4().hex
-            get_timeline_service().on_recording_id_change(room_id, room.recording_id)
+            _commit_recording_epoch(
+                room.recording_media_start_mono or room.recording_start_mono
+            )
             self._dirty_recording = True
             room.reconnect_output_dir = room_output_dir
-            room.reconnect_encoder = encoder
+            room.reconnect_encoder = effective_encoder
             room.reconnect_crf = crf
             room.reconnect_param_mode = param_mode
             room.reconnect_bitrate = bitrate or ""
@@ -1894,12 +2013,18 @@ class RoomOrchestrator:
             return True
         if shared_error:
             room.last_error = shared_error
-            return False
+            # 共享进样只是性能优化，不应成为录制可用性的单点故障。尤其在 VMware
+            # 等环境中，pipe sink 可能启动后立即退出；此时改用常规 StreamCapture。
+            _log.warning(
+                "shared ingest unavailable, falling back to regular recording: room=%s, error=%s",
+                room_id,
+                shared_error,
+            )
 
         ok, output_path, _encoder_used, error_msg = controller.start_recording_with_crf(
             stream_url,
             room_output_dir,
-            encoder,
+            effective_encoder,
             crf,
             param_mode=param_mode,
             bitrate=bitrate,
@@ -1920,8 +2045,9 @@ class RoomOrchestrator:
             room._first_frame_corrected = False
             room._shared_ingest_last_file_size = 0
             room._shared_ingest_stall_checks = 0
-            room.recording_id = uuid4().hex
-            get_timeline_service().on_recording_id_change(room_id, room.recording_id)
+            _commit_recording_epoch(
+                room.recording_media_start_mono or room.recording_start_mono
+            )
         else:
             room.recording_start_mono = None
             room.recording_media_start_mono = None
@@ -1931,7 +2057,7 @@ class RoomOrchestrator:
         if ok:
             # Save recording params for auto-reconnect
             room.reconnect_output_dir = room_output_dir
-            room.reconnect_encoder = encoder
+            room.reconnect_encoder = effective_encoder
             room.reconnect_crf = crf
             room.reconnect_param_mode = param_mode
             room.reconnect_bitrate = bitrate or ""
@@ -1975,8 +2101,19 @@ class RoomOrchestrator:
                 fps = float(framerate)
             except (TypeError, ValueError):
                 fps = 0.0
+        # ExportProfile 会直接把 codec 传给 FFmpeg；界面设置则使用展示名称。
+        # 两者不能混用，否则 NVENC 自动回退为 "H.264 CPU" 时 FFmpeg 会报
+        # "Unknown encoder"，录制文件停在首个很短的片段，持续分析也就没有
+        # 新内容可处理。
+        ffmpeg_codec = {
+            "H.264 CPU": "libx264",
+            "H.265 CPU": "libx265",
+            "H.264 NVENC": "h264_nvenc",
+            "H.265 NVENC": "hevc_nvenc",
+            "Copy": "copy",
+        }.get(encoder, encoder)
         return ExportProfile(
-            codec=encoder,
+            codec=ffmpeg_codec,
             crf=crf,
             preset="medium",
             audio_bitrate=(audio_bitrate or "128k").strip() or "128k",
@@ -2018,6 +2155,14 @@ class RoomOrchestrator:
             _log.warning("shared ingest recording failed room=%s: %s", room.room_id, exc)
             return "", 0.0, str(exc)
         if result.ok:
+            # _wait_for_startup_data 已确保录制进程稳定存活 1 秒以上；
+            # 此处仅检查 recording_active 作为最终确认，不再额外检�� PID，
+            # 避免在 mock/测试环境中因无真实进程而误判。
+            if not bool(getattr(ingest, "recording_active", False)):
+                error = str(getattr(ingest, "recording_error", "") or "shared recording process is not running")
+                registry.stop_room(room.room_id, reason="shared recording process unavailable")
+                _log.warning("shared ingest recording unusable room=%s: %s", room.room_id, error)
+                return "", 0.0, error
             return output_path, getattr(ingest, "recording_media_start_mono", 0.0), ""
         registry.stop_room(room.room_id, reason="shared recording start failed")
         _log.warning("shared ingest recording failed room=%s: %s", room.room_id, result.error)
@@ -2139,18 +2284,32 @@ class RoomOrchestrator:
             if preflight:
                 _log.warning("批量录制预检失败: %s", preflight)
                 return {r.room_id: False for r in rooms}
-        return {
-            r.room_id: self.start_recording(
-                r.room_id,
-                output_dir,
-                encoder,
-                crf,
-                param_mode=param_mode,
-                bitrate=bitrate,
-                bitrate_unit=bitrate_unit,
-            )
-            for r in rooms
-        }
+        if not rooms:
+            return {}
+        with ThreadPoolExecutor(max_workers=min(12, len(rooms))) as pool:
+            futures = {
+                pool.submit(
+                    self.start_recording,
+                    room.room_id,
+                    output_dir,
+                    encoder,
+                    crf,
+                    param_mode=param_mode,
+                    bitrate=bitrate,
+                    bitrate_unit=bitrate_unit,
+                    _run_in_background=True,
+                ): room.room_id
+                for room in rooms
+            }
+            results: dict[str, bool] = {}
+            for future in as_completed(futures):
+                room_id = futures[future]
+                try:
+                    results[room_id] = bool(future.result())
+                except Exception as exc:
+                    _log.error("Batch recording room failed: room_id=%s, error=%s", room_id, exc)
+                    results[room_id] = False
+            return results
 
     def start_recording_all_async(self, output_dir: str, encoder: str, crf: int,
                                   param_mode: str = "CRF 质量", bitrate: str | None = None,
@@ -2607,7 +2766,12 @@ class RoomOrchestrator:
             room.is_reconnecting = True
 
     def _do_proactive_reconnect(self, room: RoomSession) -> None:
-        """URL 过期前在 Qt 主线程重启录制（由 global tick 调用）。"""
+        """URL 过期前在 Qt 主线程重启录制（由 global tick 调用）。
+
+        失败时回退到常规重连流程（_attempt_recording_reconnect），
+        避免录制静默死亡。
+        """
+        reconnect_error = "流 URL 即将过期，主动刷新"
         try:
             registry = get_shared_ingest_registry()
             shared_ingest = registry.get(room.room_id)
@@ -2636,13 +2800,22 @@ class RoomOrchestrator:
             )
             if ok:
                 _log.info("Room %s proactive reconnect succeeded", room.room_id)
-            else:
-                _log.warning("Room %s proactive reconnect failed: %s", room.room_id, room.last_error)
+                return
+            # 启动失败：记录错误并回退到常规重连流程
+            reconnect_error = room.last_error or "主动刷新录制失败"
+            _log.warning("Room %s proactive reconnect failed: %s, falling back to regular reconnect",
+                         room.room_id, reconnect_error)
         except Exception as exc:
-            _log.warning("Room %s proactive reconnect failed: %s", room.room_id, exc)
+            reconnect_error = str(exc)
+            _log.warning("Room %s proactive reconnect failed: %s, falling back to regular reconnect",
+                         room.room_id, exc)
         finally:
             room.is_reconnecting = False
             self._dirty_recording = True
+
+        # 回退到常规重连流程：通过 _attempt_recording_reconnect 进行指数退避重试
+        # 这样可以在 URL 刷新后仍失败时（如下播、网络抖动）继续尝试恢复
+        self._start_recording_reconnect_thread(room, reconnect_error)
 
     def _start_recording_reconnect_thread(self, room: RoomSession, error_msg: str) -> bool:
         """在 Qt 主线程执行重连（由 global tick 调用），禁止后台线程改房间状态。
@@ -2703,9 +2876,41 @@ class RoomOrchestrator:
                 registry = get_shared_ingest_registry()
                 ingest = registry.get(room.room_id)
                 if ingest is not None:
+                    # 关键修复：上游退出后 recording_active 会立即变为 False。
+                    # 如果错误可恢复（403/网络断开），先尝试重连再放弃；
+                    # 仅在不可恢复或重连耗尽时才标记录制停止。
+                    if not getattr(ingest, "recording_active", False) and not room.is_reconnecting:
+                        err = getattr(ingest, "recording_error", "") or getattr(ingest, "upstream_error", "")
+                        # 标记失败的 CDN 线路，让下次 re-parse 跳过它
+                        _mark_failed_cdn_if_huya(room, err)
+                        from lsc.utils.error_messages import is_recoverable_error
+                        if err and is_recoverable_error(err) and room.reconnect_attempts < _MAX_RECONNECT_ATTEMPTS:
+                            _log.warning(
+                                "Room %s shared ingest 已停止（可恢复），触发重连: %s",
+                                room.room_id, err[:120],
+                            )
+                            room.is_reconnecting = True
+                            self._start_recording_reconnect_thread(room, err)
+                        else:
+                            _log.warning(
+                                "Room %s shared ingest 已停止（不可恢复/重连耗尽），同步 is_recording=False: %s",
+                                room.room_id, err,
+                            )
+                            room.is_recording = False
+                            room.is_reconnecting = False
+                            if err:
+                                room.last_error = err
+                            self._dirty_recording = True
+                            self.bus.emit("recording_stopped",
+                                room.room_id,
+                                'shared_ingest_stopped',
+                                err or "共享进样上游已停止",
+                            )
+                            continue
                     ingest_error = getattr(ingest, "recording_error", "") or getattr(ingest, "upstream_error", "")
                     if ingest_error and not room.is_reconnecting:
                         _log.warning("Room %s shared ingest error: %s", room.room_id, ingest_error)
+                        _mark_failed_cdn_if_huya(room, ingest_error)
                         self._start_recording_reconnect_thread(room, ingest_error)
                     elif room_medium and not room.is_reconnecting:
                         if getattr(ingest, "recording_active", False) and room.record_output_path:
@@ -2720,11 +2925,38 @@ class RoomOrchestrator:
                             room,
                             room.last_error or "录制恢复到期",
                         )
+                    # 主动流 URL 过期检测（与 controller 路径对齐）
+                    if is_low_tick and room.is_recording and not room.is_reconnecting:
+                        stream_url = ""
+                        if room.stream_info and room.stream_info.stream_url:
+                            stream_url = room.stream_info.stream_url
+                        if stream_url and _is_stream_url_expiring(stream_url):
+                            _log.info("Room %s stream URL expiring soon (shared ingest), proactive reconnect", room.room_id)
+                            room.is_reconnecting = True
+                            room._cancel_reconnect.clear()
+                            self._do_proactive_reconnect(room)
                 continue
 
             # ── High-frequency: lightweight operations ──
             if room.is_recording:
-                controller.tick()
+                tick_fn = getattr(controller, "tick", None)
+                if callable(tick_fn):
+                    try:
+                        tick_fn()
+                    except Exception as exc:
+                        # 单个 controller 的计时异常不得杀死 RoomOrchestrator；
+                        # 否则所有房间的预览重连、磁盘守卫和持续分析状态都会冻结。
+                        _log.warning(
+                            "Room %s controller tick failed: %s",
+                            room.room_id,
+                            exc,
+                        )
+                elif room.room_id not in self._missing_controller_tick_warned:
+                    self._missing_controller_tick_warned.add(room.room_id)
+                    _log.warning(
+                        "Room %s controller has no tick(); heartbeat continues in degraded mode",
+                        room.room_id,
+                    )
 
             if room.preview_enabled and not room.preview_paused:
                 widget = room.preview_widget
@@ -2754,6 +2986,12 @@ class RoomOrchestrator:
                                 room.recording_start_mono = media_start
                                 room.recording_media_start_mono = media_start
                                 room._first_frame_corrected = True
+                                if room.recording_id:
+                                    get_timeline_service().on_recording_id_change(
+                                        room.room_id,
+                                        room.recording_id,
+                                        media_start_mono=media_start,
+                                    )
                                 _log.info(
                                     "Room %s recording_start_mono 首帧校正完成 (file_size=%d)",
                                     room.room_id, file_size,
@@ -2767,9 +3005,19 @@ class RoomOrchestrator:
                     )
 
                 if room.is_recording and not room.is_reconnecting:
-                    error_msg = controller.watchdog_check()
+                    watchdog_fn = getattr(controller, "watchdog_check", None)
+                    try:
+                        error_msg = watchdog_fn() if callable(watchdog_fn) else None
+                    except Exception as exc:
+                        _log.warning(
+                            "Room %s controller watchdog failed: %s",
+                            room.room_id,
+                            exc,
+                        )
+                        error_msg = None
                     if error_msg:
                         _log.warning("Room %s watchdog: %s", room.room_id, error_msg)
+                        _mark_failed_cdn_if_huya(room, error_msg)
                         self._start_recording_reconnect_thread(room, error_msg)
 
             # 重连到期必须每 tick 检查，不得被交错轮询推迟

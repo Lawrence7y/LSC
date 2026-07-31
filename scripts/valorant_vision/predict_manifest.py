@@ -27,7 +27,8 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from extract_frames import ManifestRow, SPLITS, load_manifest, output_path_for  # noqa: E402
+from extract_frames import SPLITS, ManifestRow, load_manifest, output_path_for  # noqa: E402
+
 from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier  # noqa: E402
 
 _log = logging.getLogger(__name__)

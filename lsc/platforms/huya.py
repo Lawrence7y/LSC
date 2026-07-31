@@ -22,9 +22,46 @@ from .base import (
 
 HUYA_HEADERS = {
     "Referer": "https://www.huya.com/",
+    "Origin": "https://www.huya.com",
     "User-Agent": DEFAULT_USER_AGENT,
 }
 _ROOM_PATH_RE = re.compile(r"^/[^/?#]+/?$")
+
+# CDN line blacklist: CDN name → monotonic timestamp when blacklisted.
+# When a CDN line returns 403, the orchestrator calls mark_cdn_bad() so
+# the next parse skips it and tries a different line (al → tx → hs …).
+_CDN_BLACKLIST_TTL_SEC = 300.0  # 5 min: CDN blocks are often temporary
+_cdn_blacklist: dict[str, float] = {}
+
+
+def mark_cdn_bad(cdn_name: str) -> None:
+    """Mark a CDN line as bad so the adapter skips it on the next parse.
+
+    Called by the orchestrator when a 403 or connection failure is detected
+    on a specific CDN line. The blacklist entry expires after
+    ``_CDN_BLACKLIST_TTL_SEC`` seconds.
+    """
+    import time as _time
+    if cdn_name:
+        _cdn_blacklist[cdn_name] = _time.monotonic()
+        _log.info("Huya CDN line '%s' blacklisted for %.0fs", cdn_name, _CDN_BLACKLIST_TTL_SEC)
+
+
+def clear_cdn_blacklist() -> None:
+    """Clear all blacklisted CDN lines (e.g. on room disconnect)."""
+    _cdn_blacklist.clear()
+
+
+def _is_cdn_blacklisted(cdn_name: str) -> bool:
+    """Check if a CDN line is currently blacklisted (and prune expired entries)."""
+    import time as _time
+    ts = _cdn_blacklist.get(cdn_name)
+    if ts is None:
+        return False
+    if _time.monotonic() - ts > _CDN_BLACKLIST_TTL_SEC:
+        _cdn_blacklist.pop(cdn_name, None)
+        return False
+    return True
 
 
 class HuyaAdapter(BasePlatformAdapter):
@@ -92,13 +129,12 @@ class HuyaAdapter(BasePlatformAdapter):
                         title = title or page_title
             except Exception as exc:
                 _log.debug("操作异常（已忽略）: %s", exc)
-        # 覆盖回 room_info/profile_info 以便后续使用
-        if title:
-            room_info["sIntroduction"] = title
-        if streamer:
-            profile_info["nick"] = streamer
 
-        if int(room_info.get("tLiveStatus") or 0) != 1:
+        # 开播状态检查：优先使用 room_info 中的 tLiveStatus；
+        # 若 room_info 缺失该字段（如 hyPlayerConfig 路径推导的 room_info），
+        # 则默认视为已开播（因为 stream 数据存在即表明有直播内容）
+        live_status = room_info.get("tLiveStatus")
+        if live_status is not None and int(live_status) != 1:
             return self._failed(clean_url, "虎牙直播间未开播", ERROR_OFFLINE, raw=data)
 
         quality_urls = self._extract_stream_urls(data)
@@ -108,8 +144,8 @@ class HuyaAdapter(BasePlatformAdapter):
         return self._success(
             clean_url,
             stream_url=quality_urls.get("source", ""),
-            title=str(room_info.get("sIntroduction") or ""),
-            streamer=str(profile_info.get("nick") or ""),
+            title=title or "虎牙直播",
+            streamer=streamer or "虎牙主播",
             is_live=True,
             quality_urls=quality_urls,
             selected_quality="source",
@@ -157,9 +193,11 @@ class HuyaAdapter(BasePlatformAdapter):
     def _try_extract_hyplayer_config(self, html: str) -> dict[str, Any] | None:
         """Extract stream/room info from the modern ``var hyPlayerConfig`` block.
 
-        The outer object is a JS literal, so we locate the ``stream:`` field
-        and parse its JSON value. We then return a shape compatible with the
-        rest of the adapter (keys: roomInfo, profileInfo, stream).
+        The outer object is a JS literal. The ``stream`` key may be quoted
+        (``"stream":``) or unquoted (``stream:``) depending on the page
+        revision, so we try both forms. We then parse its JSON value and
+        return a shape compatible with the rest of the adapter (keys:
+        roomInfo, profileInfo, stream).
         """
         marker = "var hyPlayerConfig"
         marker_index = html.find(marker)
@@ -170,17 +208,18 @@ class HuyaAdapter(BasePlatformAdapter):
         if brace_index < 0:
             return None
 
-        # Locate the "stream:" field inside the JS object. The key is not
-        # quoted in the JS literal, so we search for "stream:" directly and
-        # make sure it sits inside the config block (before the next top-level
-        # key would be enough for a quick check).
-        stream_key = "stream:"
-        stream_index = html.find(stream_key, brace_index)
-        if stream_index < 0:
-            return None
-
-        colon_index = stream_index + len(stream_key) - 1
-        if html[colon_index] != ":":
+        # Locate the "stream" field inside the JS object. The key may be
+        # quoted or unquoted, so we try both forms.
+        colon_index = -1
+        for stream_key in ('"stream":', 'stream:'):
+            stream_index = html.find(stream_key, brace_index)
+            if stream_index < 0:
+                continue
+            candidate = stream_index + len(stream_key) - 1
+            if html[candidate] == ":":
+                colon_index = candidate
+                break
+        if colon_index < 0:
             return None
 
         decoder = json.JSONDecoder()
@@ -208,8 +247,10 @@ class HuyaAdapter(BasePlatformAdapter):
                 game_live_info = stream_data["data"][0].get("gameLiveInfo") or {}
 
             if room_info is None:
+                # 注意：isSecret 字段缺失时不能判定为未开播。
+                # 虎牙 stream 数据存在即表明有直播内容，默认视为已开播。
                 room_info = {
-                    "tLiveStatus": 1 if game_live_info.get("isSecret") == 0 else 0,
+                    "tLiveStatus": 1,
                     "sIntroduction": game_live_info.get("roomName", ""),
                 }
             if profile_info is None:
@@ -256,6 +297,10 @@ class HuyaAdapter(BasePlatformAdapter):
         Huya usually exposes multiple CDN lines (e.g. al, tx, hs). Some lines
         may return 403 in the current network environment, so we keep all of
         them and let the probe step pick a reachable one.
+
+        All URLs are upgraded to HTTPS — Huya CDN enforces stricter anti-bot
+        rules on plain HTTP, and FFmpeg recording via HTTP is frequently
+        rejected with 403 after 10-30 seconds.
         """
         stream = data.get("stream")
         stream = stream if isinstance(stream, dict) else {}
@@ -273,6 +318,11 @@ class HuyaAdapter(BasePlatformAdapter):
                 anti_code = str(stream_info.get("sFlvAntiCode") or "")
                 if not flv_url.startswith(("http://", "https://")) or not stream_name:
                     continue
+                # Force HTTPS: Huya CDN blocks plain-HTTP FFmpeg connections
+                # with 403 after a short period; HTTPS connections are more
+                # stable and less likely to trigger anti-bot rules.
+                if flv_url.startswith("http://"):
+                    flv_url = "https://" + flv_url[len("http://"):]
                 stream_url = f"{flv_url.rstrip('/')}/{stream_name}.{suffix}"
                 if anti_code:
                     stream_url = f"{stream_url}?{anti_code}"
@@ -293,12 +343,21 @@ class HuyaAdapter(BasePlatformAdapter):
         # multiple lines are available, since the al line frequently rejects
         # anonymous/ffmpeg requests in certain networks. If only one line is
         # present we use it as source regardless of its name.
+        # Skip CDN lines that have been blacklisted (403 errors) so the
+        # reconnect cycle tries a different CDN instead of re-using the bad one.
         if cdn_names and "source" not in quality_urls:
             preferred = next(
-                (name for name in cdn_names if name != "al"),
-                cdn_names[0],
+                (name for name in cdn_names
+                 if name != "al" and not _is_cdn_blacklisted(name)),
+                None,
             )
-            quality_urls = {"source": quality_urls[preferred], **quality_urls}
+            if preferred is None:
+                # All non-al lines are blacklisted; try al, then any
+                preferred = next(
+                    (name for name in cdn_names if not _is_cdn_blacklisted(name)),
+                    cdn_names[0],  # last resort: re-use first even if blacklisted
+                )
+            return {"source": quality_urls[preferred], **quality_urls}
         return quality_urls
 
     def _failed(

@@ -25,15 +25,34 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 
 
 def _is_private_ip(hostname: str) -> bool:
-    """检查主机名是否解析为私有/内网 IP（SSRF 防护）。"""
+    """检查主机名是否解析为私有/内网 IP（SSRF 防护）。
+
+    仅阻止真正的私有/内网地址：
+    - RFC 1918 私有地址（10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16）
+    - loopback（127.0.0.0/8）
+    - link-local（169.254.0.0/16）
+
+    注意：不阻止 198.18.0.0/15 等保留地址，因为部分网络环境（企业代理/VPN）
+    会使用这类地址作为合法网关，且实际 HTTP 请求可以正常到达。
+    """
     import ipaddress
     import socket
+
+    # 明确定义的私有网络范围（仅 RFC 1918 + loopback + link-local）
+    _PRIVATE_NETWORKS = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("169.254.0.0/16"),
+    ]
     try:
         addr_info = socket.getaddrinfo(hostname, None)
         for _family, _, _, _, sockaddr in addr_info:
             ip = ipaddress.ip_address(sockaddr[0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return True
+            for network in _PRIVATE_NETWORKS:
+                if ip in network:
+                    return True
     except Exception:
         # 解析失败时保守处理，拒绝访问
         return True
