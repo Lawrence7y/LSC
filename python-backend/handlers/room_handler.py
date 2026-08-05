@@ -255,7 +255,7 @@ _SCAN_ABORT_HARD_SEC = 30.0  # 超时后继续等待线程释放 semaphore 的�
 _VALORANT_MIN_LIST_DURATION_SEC = 5.0  # list_only 入列下限（短 spike 回合也须进列表待确认）
 _OCR_BOUNDARY_SOURCE = "valorant_ocr_v1"  # 纯 OCR 路径产出（顶部条 + 中央横幅）
 _OCR_VALID_START_BY = frozenset({"ocr_combat"})
-_OCR_VALID_END_BY = frozenset({"next_prep", "next_combat", "open_tail", "max_open_close"})
+_OCR_VALID_END_BY = frozenset({"next_prep", "open_tail"})
 _OCR_FINALIZE_OVERLAP_SEC = 120.0
 _MAX_SKIP_SLEEP_TICKS = 5  # 主循环连续跳过 sleep 的防御上限：超过强制 0.5s 节流，防忙循环广播风暴
 _SCAN_ERROR_BACKOFF_SEC = 30.0  # 持续分析 worker 失败后的重试退避（非收尾）
@@ -6114,6 +6114,7 @@ def register_room_handlers(server, bridge):
                             'runtime_state': task_state.setdefault('ocr_runtime_state', {}),
                             'current_dur': _dur,
                             'finalize': _finalizing,
+                            'valorant_profile': str(task_state.get('valorant_profile') or 'valorant'),
                         }
                         return plugin.scan_window(
                             _vp, _window, _scan_state, cancel_check=_cancel,

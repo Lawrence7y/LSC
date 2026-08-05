@@ -9,10 +9,12 @@ from lsc.analyzer.valorant_ocr_rounds import (
 )
 
 
-def _feed_labels(fsm: OcrRoundFSM, seq: list[tuple[str, float, float | None]]) -> list[dict]:
+def _feed_labels(fsm: OcrRoundFSM, seq: list) -> list[dict]:
     out: list[dict] = []
-    for label, ts, timer in seq:
-        out.extend(fsm.feed(label, ts, timer))
+    for item in seq:
+        label, ts, timer = item[0], item[1], item[2]
+        timer_raw = bool(item[3]) if len(item) > 3 else False
+        out.extend(fsm.feed(label, ts, timer, timer_raw=timer_raw))
     return out
 
 
@@ -271,7 +273,7 @@ def test_settle_timeout_closes_open_tail():
 
 
 def test_max_open_force_close():
-    """交战超时（175s）强制闭合。"""
+    """严格契约：交战超时不再强制闭合，回合保持打开直到真出点或收尾。"""
     fsm = OcrRoundFSM()
     seq = [
         ("prep", 0.0, 30.0),
@@ -281,9 +283,12 @@ def test_max_open_force_close():
         ("combat", 182.0, 18.0),
     ]
     rounds = _feed_labels(fsm, seq)
-    assert len(rounds) == 1
-    assert rounds[0]["end_by"] == "max_open_close"
-    assert rounds[0]["end"] == 180.0
+    assert rounds == []  # 无真出点 → 不产出
+    # 收尾例外：finalize 时 open_tail+pending 产出
+    closed = fsm.force_close(end_ts=182.0)
+    assert len(closed) == 1
+    assert closed[0]["end_by"] == "open_tail"
+    assert closed[0]["confirm_status"] == "pending"
 
 
 def test_short_round_discarded():
@@ -341,7 +346,7 @@ def test_short_round_discarded():
 
 
 def test_missed_prep_closes_on_next_combat():
-    """SETTLE 错过准备直接见新交战钟 → 出点取新交战首帧（宁长勿短）。"""
+    """严格契约：SETTLE 错过准备直接见新交战钟 → 旧回合无真出点不产出，只开新回合。"""
     fsm = OcrRoundFSM()
     seq = [
         ("prep", 0.0, 30.0),
@@ -369,13 +374,47 @@ def test_missed_prep_closes_on_next_combat():
         ("neutral", 22.0, None),
         ("neutral", 23.0, None),
         ("neutral", 24.0, None),
-        ("combat", 25.0, 90.0),  # 距 result 7s ≥6 且满钟（≥85）→ 新回合
+        ("combat", 25.0, 90.0, True),  # 满钟原始读数 → 新回合（旧回合放弃）
         ("combat", 26.0, 79.0),
+        ("neutral", 27.0, None),
+        ("neutral", 28.0, None),
+        ("neutral", 29.0, None),
+        ("neutral", 30.0, None),
+        ("neutral", 31.0, None),
+        ("neutral", 32.0, None),
+        ("neutral", 33.0, None),
+        ("neutral", 34.0, None),
+        ("neutral", 35.0, None),
+        ("neutral", 36.0, None),
+        ("neutral", 37.0, None),
+        ("neutral", 38.0, None),
+        ("neutral", 39.0, None),
+        ("neutral", 40.0, None),
+        ("neutral", 41.0, None),
+        ("neutral", 42.0, None),
+        ("neutral", 43.0, None),
+        ("neutral", 44.0, None),
+        ("neutral", 45.0, None),
+        ("neutral", 46.0, None),
+        ("neutral", 47.0, None),
+        ("neutral", 48.0, None),
+        ("neutral", 49.0, None),
+        ("neutral", 50.0, None),
+        ("neutral", 51.0, None),
+        ("neutral", 52.0, None),
+        ("neutral", 53.0, None),
+        ("neutral", 54.0, None),
+        ("prep", 55.0, 30.0),    # 新回合无 result：距交战 30s，游程开始
+        ("prep", 56.0, 29.0),
+        ("prep", 57.0, 28.0),
+        ("prep", 58.0, 27.0),    # 连续 4 帧 → 闭合，出点=55
     ]
     rounds = _feed_labels(fsm, seq)
+    # 旧回合（1-25）无真出点被放弃；新回合 25 起，55 处闭合
     assert len(rounds) == 1
-    assert rounds[0]["end"] == 25.0
-    assert rounds[0]["end_by"] == "next_combat"
+    assert rounds[0]["start"] == 25.0
+    assert rounds[0]["end"] == 55.0
+    assert rounds[0]["end_by"] == "next_prep"
 
 
 def test_settle_residual_combat_clock_ignored():
@@ -401,9 +440,9 @@ def test_settle_residual_combat_clock_ignored():
         ("combat", 16.0, 75.0),
         ("combat", 17.0, 74.0),
         ("settle", 18.0, None),
-        ("combat", 19.0, 63.0),  # 残留钟：距 result 1s → 忽略
-        ("combat", 20.0, 62.0),
-        ("combat", 21.0, 61.0),
+        ("combat", 19.0, 63.0, True),  # 残留钟：距 result 1s → 忽略
+        ("combat", 20.0, 62.0, True),
+        ("combat", 21.0, 61.0, True),
         ("neutral", 22.0, None),
         ("neutral", 23.0, None),
         ("neutral", 24.0, None),
@@ -414,8 +453,54 @@ def test_settle_residual_combat_clock_ignored():
     assert len(rounds) == 1
     assert rounds[0]["end"] == 26.0
     assert rounds[0]["end_by"] == "next_prep"
-    # 未产生假的新回合开局
+    assert rounds[0]["start"] == 1.0  # 未产生假的新回合开局
+
+
+def test_settle_extrapolated_clock_never_opens_new_round():
+    """高值残余外推钟（结算后 last_timer 外推 ≥85）不得开新回合（timer_raw=False）。"""
+    fsm = OcrRoundFSM()
+    seq = [
+        ("prep", 0.0, 30.0),
+        ("combat", 1.0, 90.0),
+        ("combat", 2.0, 89.0),
+        ("combat", 3.0, 88.0),
+        ("combat", 4.0, 87.0),
+        ("combat", 5.0, 86.0),
+        ("combat", 6.0, 85.0),
+        ("combat", 7.0, 84.0),
+        ("combat", 8.0, 83.0),
+        ("combat", 9.0, 82.0),
+        ("combat", 10.0, 81.0),
+        ("combat", 11.0, 80.0),
+        ("combat", 12.0, 79.0),
+        ("combat", 13.0, 78.0),
+        ("combat", 14.0, 77.0),
+        ("combat", 15.0, 76.0),
+        ("combat", 16.0, 75.0),
+        ("combat", 17.0, 74.0),
+        ("settle", 18.0, None),
+        ("combat", 19.0, 90.0, False),  # 外推 90（非 raw）→ 不得开新回合
+        ("combat", 20.0, 89.0, False),
+        ("combat", 21.0, 88.0, False),
+        ("combat", 22.0, 87.0, False),
+        ("combat", 23.0, 86.0, False),
+        ("neutral", 24.0, None),
+        ("combat", 25.0, 85.0, False),  # 外推残余钟（非 raw）→ 忽略，不开新回合
+        ("combat", 26.0, 84.0, False),
+        ("combat", 27.0, 83.0, False),
+        ("combat", 28.0, 82.0, False),
+        ("combat", 29.0, 81.0, False),
+        ("combat", 30.0, 80.0, False),
+        ("combat", 31.0, 79.0, False),
+        ("prep", 32.0, 30.0),
+        ("prep", 33.0, 29.0),    # 两帧确认 → 真准备 → 闭合
+    ]
+    rounds = _feed_labels(fsm, seq)
+    # 外推残余钟不触发新回合 → 回合 1 起，32 处真 prep 闭合
     assert len(rounds) == 1
+    assert rounds[0]["start"] == 1.0
+    assert rounds[0]["end"] == 32.0
+    assert rounds[0]["end_by"] == "next_prep"
 
 
 def test_phase_cycle_prior_patches_gaps_and_removes_noise():
@@ -465,7 +550,7 @@ def test_fsm_clone_is_independent():
     assert closed2[0]["end"] == 21.0
 
 def test_close_contract_pending_vs_confirmed():
-    """出点契约：next_prep 才 vision_confirmed；伪造出点一律 pending。"""
+    """严格出点契约：next_prep 才产出（vision_confirmed）；无真出点不产出；收尾例外 pending。"""
     # next_prep → vision_confirmed
     fsm = OcrRoundFSM()
     seq = [
@@ -481,18 +566,17 @@ def test_close_contract_pending_vs_confirmed():
         ("prep", 21.0, 30.0),
     ]
     rounds = _feed_labels(fsm, seq)
+    assert len(rounds) == 1
     assert rounds[0]["confirm_status"] == "vision_confirmed"
     assert rounds[0]["end_by"] == "next_prep"
     assert "round_key" not in rounds[0]  # round_key 由消费端统一生成
 
-    # max_open_close → pending
+    # 无真出点（长时间 COMBAT）→ 不产出
     fsm2 = OcrRoundFSM()
     seq2 = [("prep", 0.0, 30.0), ("combat", 1.0, 90.0), ("combat", 180.0, 20.0)]
-    rounds2 = _feed_labels(fsm2, seq2)
-    assert rounds2[0]["confirm_status"] == "pending"
-    assert rounds2[0]["end_by"] == "max_open_close"
+    assert _feed_labels(fsm2, seq2) == []
 
-    # next_combat → pending
+    # 无真出点（SETTLE 等不到 prep）→ 不产出
     fsm3 = OcrRoundFSM()
     seq3 = [("prep", 0.0, 30.0)] + [("combat", float(i), 95.0 - i) for i in range(1, 15)] + [
         ("settle", 15.0, None),
@@ -502,16 +586,14 @@ def test_close_contract_pending_vs_confirmed():
         ("neutral", 19.0, None),
         ("neutral", 20.0, None),
         ("neutral", 21.0, None),
-        ("combat", 22.0, 90.0),  # 满钟（≥85）→ 新回合
     ]
-    rounds3 = _feed_labels(fsm3, seq3)
-    assert rounds3[0]["confirm_status"] == "pending"
-    assert rounds3[0]["end_by"] == "next_combat"
+    assert _feed_labels(fsm3, seq3) == []
 
-    # force_close → pending
+    # 收尾例外：force_close → open_tail + pending
     fsm4 = OcrRoundFSM()
     _feed_labels(fsm4, [("prep", 0.0, 30.0)] + [("combat", float(i), 95.0 - i) for i in range(1, 15)])
     closed4 = fsm4.force_close(end_ts=30.0)
+    assert len(closed4) == 1
     assert closed4[0]["confirm_status"] == "pending"
     assert closed4[0]["end_by"] == "open_tail"
 
@@ -551,12 +633,11 @@ def test_round_key_is_ten_second_bucket():
     assert _round_key(100.0) != _round_key(106.0)
     assert _round_key(4.0) == _round_key(4.5)
 
-def test_pending_upgrade_across_windows(monkeypatch, tmp_path):
-    """跨窗口 pending 升级：伪造出点回合在后续窗口见到真准备信号 → 升级 vision_confirmed。"""
+def test_open_round_closes_across_windows(monkeypatch, tmp_path):
+    """跨窗口 FSM 持久化：回合在窗口 A 打开（无出点不产出），窗口 B 见真准备信号后闭合产出。"""
     import numpy as np
 
     import lsc.analyzer.valorant_ocr_rounds as mod
-    from lsc.analyzer.valorant_ocr_rounds import _round_key
 
     video = tmp_path / "video.mp4"
     video.write_bytes(b"dummy")
@@ -565,24 +646,21 @@ def test_pending_upgrade_across_windows(monkeypatch, tmp_path):
         return [(float(ts), np.zeros((360, 640, 3), dtype=np.uint8))
                 for ts in range(int(start), int(end) + 1)]
 
-    # window1 (0..120)：prep 0-5 → combat 6-100 → settle 101 → neutral → combat 111（next_combat → pending）
+    # window1 (0..120)：prep 0-5 → combat 6-100（锚点两帧确认 @7）→ settle 101 → SETTLE 等 prep
     w1_readings = []
     for ts in range(0, 121):
         if ts <= 5:
             w1_readings.append((30.0 - ts, None, None))
         elif ts <= 100:
             w1_readings.append((95.0 - (ts - 6), None, None))
-        elif ts == 101 or ts <= 110:
-            w1_readings.append((None, None, None))
         else:
-            w1_readings.append((90.0 - (ts - 111), None, None))
+            w1_readings.append((None, None, None))
 
     it1 = iter(w1_readings)
+    ci1 = [0]
 
     def fake_top1(img):
         return next(it1, (None, None, None))
-
-    ci1 = [0]
 
     def fake_center1(img):
         ci1[0] += 1
@@ -595,20 +673,16 @@ def test_pending_upgrade_across_windows(monkeypatch, tmp_path):
     state: dict = {}
     rounds1 = mod.detect_valorant_rounds_ocr(str(video), time_range=(0.0, 120.0),
                                               runtime_state=state, finalize=False)
-    assert len(rounds1) == 1
-    assert rounds1[0]["confirm_status"] == "pending"
-    assert rounds1[0]["end_by"] == "next_combat"
+    assert rounds1 == []  # 严格契约：无真出点不产出
 
-    # window2 (121..150)：回合B 交战钟延续 → 130-135 单次 prep 信号（不足闭合游程）→ 升级事件
+    # window2 (121..150)：SETTLE 延续 → prep 130-131（两帧确认）→ 闭合产出
     # 注：last_processed_ts=120 会过滤 ≤120 的帧，fake 读数必须与过滤后帧一一对应
     w2_readings = []
     for ts in range(121, 151):
         if ts < 130:
-            w2_readings.append((90.0 - (ts - 111), None, None))   # 回合B 交战钟（111 起）
-        elif ts <= 135:
-            w2_readings.append((30.0 - (ts - 130), None, None))   # 单次 prep 信号（距交战 <30s 不闭合）
+            w2_readings.append((None, None, None))
         else:
-            w2_readings.append((60.0 - (ts - 135), None, None))   # 交战继续
+            w2_readings.append((30.0 - (ts - 130), None, None))
 
     it2 = iter(w2_readings)
 
@@ -621,15 +695,11 @@ def test_pending_upgrade_across_windows(monkeypatch, tmp_path):
 
     rounds2 = mod.detect_valorant_rounds_ocr(str(video), time_range=(100.0, 150.0),
                                               runtime_state=state, finalize=False)
-    print("ROUNDS2:", rounds2)
-    upgraded = [r for r in rounds2 if r.get("upgraded")]
-    assert len(upgraded) == 1
-    assert upgraded[0]["confirm_status"] == "vision_confirmed"
-    assert upgraded[0]["end_by"] == "next_prep"
-    assert upgraded[0]["end"] == 131.0  # 准备信号需两帧确认
-    assert upgraded[0]["round_key"] == _round_key(6.0)
-    # 升级后 pending 队列清空
-    assert state.get("pending_out_rounds") == {}
+    assert len(rounds2) == 1
+    assert rounds2[0]["start"] == 7.0   # 入点跨窗口持久化（锚点两帧确认 @7）
+    assert rounds2[0]["end"] == 131.0   # 窗口 B 的真准备信号（两帧确认）
+    assert rounds2[0]["confirm_status"] == "vision_confirmed"
+    assert rounds2[0]["end_by"] == "next_prep"
 
 
 def test_replay_annotation():
@@ -638,10 +708,10 @@ def test_replay_annotation():
 
     r = {"start": 10.0, "end": 60.0, "result_ts": 30.0}
     labels = [
-        (5.0, "combat", None), (10.0, "combat", None), (15.0, "combat", None),
-        (20.0, "neutral", None), (25.0, "neutral", None), (30.0, "settle", None),
-        (35.0, "neutral", None), (40.0, "neutral", None), (45.0, "neutral", None),
-        (50.0, "neutral", None), (55.0, "neutral", None), (60.0, "prep", None),
+        (5.0, "combat", None, True), (10.0, "combat", None, True), (15.0, "combat", None, True),
+        (20.0, "neutral", None, False), (25.0, "neutral", None, False), (30.0, "settle", None, False),
+        (35.0, "neutral", None, False), (40.0, "neutral", None, False), (45.0, "neutral", None, False),
+        (50.0, "neutral", None, False), (55.0, "neutral", None, False), (60.0, "prep", None, True),
     ]
     _annotate_replay(r, labels)
     assert r["replay_segments"] == [[35.0, 55.0]]
@@ -673,6 +743,38 @@ def test_refine_boundary_ts_finds_first_frame(monkeypatch):
     monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it2, (None, None, None)))
     ts2 = mod._refine_boundary_ts("v.mp4", "ffmpeg", 100.0, "combat")
     assert ts2 is None
+
+
+def test_refine_boundary_ts_respects_min_start(monkeypatch):
+    """prep 密扫 min_start_ts：游程首帧不得早于结算保护线（排除结算画面倒计时）。"""
+    import numpy as np
+
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    frames = [(90.0 + i * 0.1, np.zeros((360, 640, 3), dtype=np.uint8)) for i in range(61)]
+    monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: frames)
+
+    # 前 30 帧（90-93s）结算倒计时（prep 读数），之后（93+）真准备
+    readings = [(30.0 - i * 0.1, None, None) for i in range(30)] + [(28.0, None, None)] * 31
+    it = iter(readings)
+    monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it, (None, None, None)))
+    monkeypatch.setattr(mod, "_read_center_banner", lambda img: (False, False))
+
+    # 无 min_start_ts：选中结算倒计时首帧 90.0
+    ts = mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep")
+    assert ts == 90.0
+
+    # min_start_ts=94.0：结算倒计时（90-93s）被排除，游程从 94.0 起（94-95.9 持续 prep）
+    it2 = iter(readings)
+    monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it2, (None, None, None)))
+    ts2 = mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep", min_start_ts=94.0)
+    assert ts2 == 94.0
+
+    # min_start_ts=96.0：94-95.9 也排除 → None（保留粗扫值）
+    it3 = iter(readings)
+    monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it3, (None, None, None)))
+    ts3 = mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep", min_start_ts=96.0)
+    assert ts3 is None
 
 def test_adjacent_rounds_do_not_overlap(monkeypatch, tmp_path):
     """相邻回合边界修整：前一回合出点不得越过下一回合入点（密扫微调导致重叠时）。"""
