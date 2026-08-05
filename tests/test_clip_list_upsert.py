@@ -125,7 +125,6 @@ def test_build_continuous_status_confirmed_rounds_default_zero() -> None:
             "highlights": [{"start": 1, "end": 2}, {"start": 3, "end": 4}],
             "analysis_stage": "分析中",
             "refine_with_ocr": True,
-            "round_phase": "combat",
             "valorant_profile": "valorant",
             "scan_running": False,
         },
@@ -135,5 +134,5 @@ def test_build_continuous_status_confirmed_rounds_default_zero() -> None:
     assert payload["confirmed_rounds"] == 0
     assert payload["total_highlights"] == 2
     assert payload["refine_with_ocr"] is True
-    assert payload["round_phase"] == "combat"
+    assert "round_phase" not in payload  # 纯 OCR 路径不再上报相位字段
     assert payload["valorant_profile"] == "valorant"

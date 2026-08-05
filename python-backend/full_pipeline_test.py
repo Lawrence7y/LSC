@@ -92,11 +92,11 @@ def main():
     print("="*60)
 
     # Step 1: Detection
-    from lsc.analyzer.round_detector import detect_valorant_rounds
+    from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
     print("\n[1/3] Running detect_valorant_rounds...")
     mem_before = proc.memory_info().rss / 1e6
     t0 = time.perf_counter()
-    all_rounds = detect_valorant_rounds(VIDEO_PATH, duration=duration, refine_with_ocr=False)
+    all_rounds = detect_valorant_rounds_ocr(VIDEO_PATH, finalize=True)
     detect_time = time.perf_counter() - t0
     mem_after = proc.memory_info().rss / 1e6
     print(f"  Detected {len(all_rounds)} rounds in {detect_time:.3f}s")
@@ -117,9 +117,9 @@ def main():
     print(f"  Valid rounds: {len(valid_rounds)}")
 
     # Clean up old clips first
-    for f in os.listdir(OUTPUT_DIR):
-        if f.startswith("clip_") and f.endswith(".mp4"):
-            os.remove(os.path.join(OUTPUT_DIR, f))
+    for fn in os.listdir(OUTPUT_DIR):
+        if fn.startswith("clip_") and fn.endswith(".mp4"):
+            os.remove(os.path.join(OUTPUT_DIR, fn))
 
     exported = []
     t_export_start = time.perf_counter()

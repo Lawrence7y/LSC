@@ -75,7 +75,7 @@ def export_clip(source_path, output_path, ffmpeg_path, start_sec, end_sec):
 
 def run_full_video(proc, video_path, duration, ffmpeg_path):
     """Run detection ONCE on full video, slice into windows for export."""
-    from lsc.analyzer.round_detector import detect_valorant_rounds
+    from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
 
     print(f"\n{'='*60}")
     print(f"Running detect_valorant_rounds on FULL video ({duration:.0f}s)")
@@ -84,10 +84,10 @@ def run_full_video(proc, video_path, duration, ffmpeg_path):
     mem_before = proc.memory_info().rss / 1e6
     t0 = time.perf_counter()
 
-    all_rounds = detect_valorant_rounds(
+    all_rounds = detect_valorant_rounds_ocr(
         video_path,
-        duration=duration,
-        refine_with_ocr=False,
+
+
     )
 
     detect_time = time.perf_counter() - t0

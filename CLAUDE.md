@@ -67,20 +67,23 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
 
 ### 2.1 跨线程双层桥接机制
 
-由于 `MultiRoomManager` 基于 PySide6 的 Qt 事件循环运行，必须驻留在 **Qt 主线程**，而 WebSocket 服务器运行在**工作线程**以避免网络阻塞 UI，因此系统实现了 `QtManagerBridge` 作为通信桥梁。
+> [!NOTE]
+> **架构现状（2026 已迁移）**：系统已从 PySide6 迁移为纯 Python 线程桥接。下述 Qt 信号槽描述为历史参考，实际实现为 `RoomOrchestrator.call()`（同步调用原语）+ `BroadcastHub`（线程安全 FIFO 广播队列）。`python-backend/message_bridge.py` 已不存在。
+
+由于 `RoomOrchestrator` 运行在独立的编排线程，而 WebSocket 服务器运行在**工作线程**以避免网络阻塞编排，因此系统实现了 `Orchestrator.call` 作为桥梁：
 
 ```
-[WebSocket Handler 线程]                                    [Qt 主线程]
+[WebSocket Handler 线程]                                    [编排线程]
           │                                                    │
-    1. bridge.call(fn, *args)                                  │
-          │ ─── 2. 发射 Qt 信号 (_execute) ──────────────────> │
+     1. orchestrator.call(fn, *args)                           │
+          │ ─── 2. 入 _cmd_queue（线程安全队列）──────────────> │
           │                                                    │ 3. 执行核心逻辑 (fn)
           │ <── 5. 事件被唤醒 (req.event.set()) ───────────────│ 4. 处理完成/捕获异常
-    6. 返回结果/抛出异常                                       │
+     6. 返回结果/抛出异常                                       │
 ```
 
-*   **同步调用原语**：WebSocket 接收到前端请求后，调用 `bridge.call()`。该方法内部会创建一个 `_CallRequest` 对象并将其通过 Qt 信号 `_execute` 发射。主线程被唤醒并执行该函数，执行完毕后触发 `threading.Event` 唤醒工作线程。支持配置 `timeout`（默认 10.0 秒）。
-*   **状态广播分发**：主线程的状态更新（如房间连接完成、录制进度等）不能直接调用 asyncio，需要调用 `bridge.queue_broadcast(msg)`，将其写入线程安全的 FIFO 队列中。WebSocket 服务线程中的 `_broadcast_coroutine` 循环以 100ms 的频率从队列中读取并推送至前端。
+*   **同步调用原语**：WebSocket 接收到前端请求后，调用 `orchestrator.call()`。该方法内部创建 `_CallRequest` 并通过线程安全队列投递，编排线程执行完毕后设置 `threading.Event` 唤醒工作线程。支持配置 `timeout`（默认 10.0 秒）。**超时语义**：超时仅标记 `cancelled` 并抛 `TimeoutError`，请求仍可能在编排线程执行——调用方必须把超时视为「结果未知」而非「未执行」，禁止盲目重试（重复副作用）。
+*   **状态广播分发**：主线程/编排线程的状态更新不能直接调用 asyncio，需要调用 `bridge.queue_broadcast(msg)`，将其写入线程安全的 FIFO 队列中。WebSocket 服务线程中的广播协程从队列中读取并推送至前端（`BroadcastHub`，队列上限 1000，满时按类型驱逐/扩容）。
 
 ### 2.2 WebSocket 协议规范
 
@@ -214,9 +217,8 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
     *   核心 `ExportService` 线程池历史默认上限为 2（`_DEFAULT_MAX_CONCURRENT`）。
     *   WebSocket 路径另有**全局 asyncio 导出队列**：常驻 worker 池（`_MAX_EXPORT_WORKERS = 4`）+ `_export_semaphore` 限流，实际并发跟随 `settings.export_max_concurrent`（仅允许 1 或 2）。
 *   **⚠️ Semaphore 热更新禁区**：`_ensure_export_queue` 调整并发上限时，**禁止**读取 `asyncio.Semaphore._waiters` 或调用 `_waiters.__len__()`。Python 3.10+ 在无等待者时 `_waiters` 为 `None`，会导致每次导出入队报 `'NoneType' object has no attribute '__len__'`。必须用模块级 `_export_semaphore_limit` 记录已配置上限，与 `desired` 比较后再替换 Semaphore。
-*   **竖屏裁剪算法**：当选择“竖屏裁剪 (9:16)”时，FFmpeg 滤镜参数会动态转换为：
-    `crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920`
-    该公式提取画面中心区域并缩放到标准的 1080x1920。
+*   **竖屏导出算法**：当选择“竖屏 (9:16)”时，FFmpeg 滤镜为 **letterbox 等比缩放 + 补黑边**（保留完整原画面，不再中心裁剪）：
+    `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black`
 *   **错误友好转化**：后端内置了面向用户的友好错误友好化映射工具 (`utils/error_messages.py`)。它包含 19 组正则表达式（含 2 组保留原始路径的 `_PRESERVE_RAW_PATTERNS` 和 17 组 `_PATTERNS`），捕获 FFmpeg 的底层报错（如 "Server returned 403 Forbidden"、"Connection refused"、"磁盘空间不足" 等中英文错误）并自动转换为中文友好提示。同时提供 `is_recoverable_error()` 判断是否值得自动重连。
 
 ### 5.3 音频对齐技术 (`audio_aligner.py`)
@@ -253,7 +255,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
     *   正值表示该房间的视频内容处于“领先”（进度快于基准），导出时切片的 mark_in 时间需增加此偏移量；
     *   负值则反之。
     在导出时通过调整 FFmpeg `-ss` 参数，使多视角切片达到画面级严格对齐。
-*   **置信度防线**：互相关计算的最大相似度必须大于 `0.1` 阈值，否则会被判定为内容不相关，自动降级至 0 偏移，防止无声视频或不同内容视频强行对齐导致错误。
+*   **置信度防线**：互相关计算的最大相似度必须大于 `0.3` 阈值（实现有意将文档旧值 0.1 收紧——环境噪声即可达到 0.1，0.3 才能过滤无关内容强行对齐），否则会被判定为内容不相关，自动降级至 0 偏移，防止无声视频或不同内容视频强行对齐导致错误。0.1 仍作为 pairwise 桥接阈值使用。
 *   **跨语言解说 fallback**：原始波形低置信时，额外计算公共音量瞬态包络。只有“波形候选偏移”和“瞬态候选偏移”在 `60ms` 内一致，且两路最小证据均达标时，才允许将结果升格到可信阈值；禁止单纯降低相关阈值，以免把无关语言/无关直播误对齐。
 *   **持续分析漂移复核**：多房持续分析每 `10` 分钟尝试重新采集 `8s` 预览音频。仅在应用不处于前台交互且目标房未进入 DVR 深度回看时运行；复核前各房独立回到自己的直播沿，完成后重新应用 offset。
 *   **录制 epoch 约束**：副房高光映射必须优先使用 `recording_media_start_mono`（首帧媒体起点），旧会话才回退 `recording_start_mono`。录制重启/重连生成新 `recording_id` 时，旧 TimelineContext 与 `align_group_id/content_offset` 必须失效，重新一键对齐后才能恢复副房映射。
@@ -364,7 +366,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 
 *   **独立启动时机**：用户点击"开始录制"触发 `start_recording`；用户点击"预览"触发 `enable_preview {mode: "mse"}`。两者完全解耦，可以只录不看、只看不录、或同时进行。
 *   **并发上限**：
-    *   预览最多 **4路**（`MAX_CONCURRENT_PREVIEWS`），≥6 路时动态降分辨率 ≤ 854×480，≥8 路时限制 ≤ 640×360。
+    *   预览最多 **4路**（`MAX_CONCURRENT_PREVIEWS`，MSE 路径硬上限，超限拒绝启动），≥3 路时动态降分辨率 ≤ 854×480@20fps，≥4 路时限制 ≤ 640×360@15fps（压力等级 critical/pressure 亦触发）。
     *   录制最多 **12路**（`MAX_CONCURRENT_RECORDINGS`），启动并发用 `asyncio.Semaphore(2)` 限制，防止多路 HTTP 刷新同时阻塞。
 *   **init 段竞态修复**：`mse_init` 消息可能早于 `rooms_updated` 到达前端（前端 VideoPreview 组件尚未挂载）。`SharedRoomIngest` 内部缓存最近一次 init 段（`last_init_segment`），前端挂载后主动发送 `request_mse_init`，后端通过 `replay_init()` 补发，解决竞态。
 *   **MSE 事件契约**：`broadcast_mse(kind, ...)` 的 `kind` 统一使用 `init` / `segment`，禁止调用方重复传入 `mse_` 前缀。前端 `preview_phase` 等事件态须同时镜像到 `uiState` 与 `RoomSession`，`rooms_updated` 整表替换时必须保留，否则会导致 LIVE 状态丢失和 watchdog 在 `refreshing_url/probing` 阶段误重连。
@@ -477,7 +479,7 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 ### 8.4 AI 高光切片精修与「确认并导出」
 
-持续分析 / 同步分析检出的 AI 回合默认 `confirm_status='pending'`、`export_deferred=true`，**不自动 FFmpeg 导出**，只经 `clip_queued` 入切片列表。
+持续分析检出的 AI 回合（纯 OCR 确认，入点+出点齐备）`confirm_status='vision_confirmed'`，经 `clip_queued` 入切片列表并直接自动导出；用户手动标记的切片以 `user_confirmed` 计。
 
 *   **导出门禁**：`confirm_status` 为 `pending` / `refining` 时不可直接导出；须 `user_confirmed` 或 `ocr_confirmed`（或无 `confirm_status` 的手动切片）。
 *   **交互**：用户可点选切片进入精修（拖时间线调入出点 →「确认」），或直接点「确认并导出」（`handleConfirmClip` 后立即打开导出预览弹窗）。
@@ -505,6 +507,25 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 *   录制重连导致对齐 epoch 失效时，主房检测结果继续正常入列；副房映射暂停，不得复用旧 `content_offset`。用户重新一键对齐后恢复多房同步。
 *   “停止录制并收尾”只允许停止当前分析快照 `target_room_ids` 中仍在录制的房间，禁止停止未参与本次分析的其它独立录制任务；每次打开确认框必须重置停止模式，不能复用上次选择。
 *   直播跟进没有固定终点，运行中即使 `analyzed_duration == recorded_duration`，进度展示也不得冒充任务已 100% 完成；须标记为“实时跟进”，固定范围只用于停录收尾/已完成阶段。
+
+### 8.6.1 纯 OCR 检测架构（2026-08-05 简化）
+
+持续分析（valorant_round）与录制后全量分析统一走 `lsc/analyzer/valorant_ocr_rounds.py` 纯 OCR 检测器，
+不再依赖 ONNX 模型 / 音频钟声 / 相位调度 / 密扫精修：
+
+*   **扫描区域**（每帧 1fps 双区域 OCR）：顶部计分板 + 回合计时器（`_read_top_anchors`）、
+    中央回合横幅竖带（`_read_center_banner`，准备/结算关键词）。
+*   **切片语义**：入点 = 交战阶段第一帧（交战钟 >45s 连续确认），出点 = 下回合准备阶段第一帧
+    （新买枪倒计时或"购买阶段"横幅）；交战 + 结算 + 回放（赛事流）均在切片内。
+    检测器返回 (start, end) 即经 `_export_and_broadcast` → `clip_queued` 直接入切片列表与时间线。
+*   **OCR 先验**：
+    *   相近相似原则：时间相近的两帧属性大致相同 → 计时器外推、两帧确认、冻结读数忽略（回放残留）；
+    *   循环原则：POV = 准备→交战→结算，赛事 = 准备→交战→结算→回放；只有交战阶段确定
+        （交战钟锚点），其余相位不确定但顺序固定；非游戏画面可任意穿插。
+*   **防误判窗口**：结算画面 5s 倒计时不得当准备（距 result <6s 忽略）；无结算信号的 prep 需
+    连续 ≥4 帧且距交战 ≥30s；交战尾段残余钟（锚点 stale 后）不得开新回合。
+*   **增量扫描**：固定 lookback 30s + 追赶 480s（`compute_valorant_scan_budget`），
+    FSM/锚点/外推基准跨窗口持久化于 `ocr_runtime_state`。
 
 ### 8.7 时间线坐标系契约（进度条 / windowStart）
 
@@ -726,18 +747,19 @@ Electron 应用使用 `electron-builder` 进行打包：
 ### 11.2 子进程运行安全设计
 
 *   **进程环境变量白名单**：启动 Python 后端子进程时，严禁污染或直接透传全部父进程环境变量。只透传精简的安全环境变量：
-    `PATH`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP`、`HOME`、`SYSTEMROOT`、`PATHEXT`、`PYTHONUNBUFFERED=1` 及 `PYTHONPATH`。
-*   **非阻塞管道防死锁**：在 MSE 转码或录制捕获子进程读取数据时，必须对 stdout/stderr 描述符调用 `_set_stream_nonblocking()`（Windows 下利用 `msvcrt` 接口，POSIX 下使用 `fcntl` 接口设置 `O_NONBLOCK`），保证在高负载下读写管道不发生物理死锁。
-*   **Windows 权限防御**：在 Windows 平台下启动 Python 后端子进程时，必须将 `detached` 参数设为 `true`，以脱离父进程的受限 Token，防范由于 `WinError 5` 权限不足导致写入用户主目录失败。
+    `PATH`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP`、`HOME`、`SYSTEMROOT`、`PATHEXT`、`PYTHONUNBUFFERED=1` 及 `PYTHONPATH`（另加 `LSC_*` 必要项）。
+*   **非阻塞管道防死锁**：在 MSE 转码或录制捕获子进程读取数据时，必须对 stdout/stderr 描述符调用 `_set_stream_nonblocking()`（POSIX 下使用 `fcntl` 接口设置 `O_NONBLOCK`）。**Windows 下读侧保持阻塞 no-op**（实测非阻塞 fd 上 `BufferedReader.readline` 无数据时返回 `b''`，会把逐行迭代误判为 EOF 提前退出读线程，导致管道积压）；写侧（共享进样 stdin）由 `shared_ingest` 单独 `os.set_blocking(fd, False)` + `_write_all` 捕获 `BlockingIOError` 重试至 deadline，保证超时保护真正生效。
+*   **Windows 权限防御**：后端可写目录已统一指向 userData（`LSC_DATA_DIR`），`detached` 恒为 `false` 使后端跟随 Electron 生命周期（防孤儿分析进程），不再依赖 detached 绕过 WinError 5。
 
 ### 11.3 崩溃容错与日志滚动体系
 
-*   **未处理异常捕获**：后端入口 `main.py` 安装了 `sys.excepthook`，任何后台线程或主线程发生的未捕获异常，都会完整格式化 traceback 写入日志，防止服务瞬时悄无声息崩溃退出。
-*   **Qt 消息重定向**：安装了 `qInstallMessageHandler`，将 PySide6 的底层内核 Critical/Fatal 警告无缝桥接到 Python logging 体系，防止 Qt 异常直接 abort 进程。
-*   **日志轮转机制**：日志文件大小限制为 **2MB**，最大备份数为 **5个**，采用 `RotatingFileHandler` 滚动覆盖，确保不会因长期挂机导致磁盘爆满。
+*   **未处理异常捕获**：后端入口 `main.py` 安装了 `sys.excepthook`（含 `threading.excepthook`），任何后台线程或主线程发生的未捕获异常，都会完整格式化 traceback 写入日志，防止服务瞬时悄无声息崩溃退出。
+*   **Qt 消息重定向**：~~`qInstallMessageHandler`~~ —— 系统已全面迁离 PySide6（python-backend 无 Qt 导入），该条不再适用。
+*   **日志轮转机制**：日志文件大小限制为 **2MB**，最大备份数为 **5个**，采用 `RotatingFileHandler` 滚动覆盖（另带 gzip 压缩），确保不会因长期挂机导致磁盘爆满。
 *   **优雅停机保护**：
-    *   主进程销毁时，Windows 环境下使用 `taskkill /T /F` 强杀子进程树，防止 FFmpeg 僵尸进程残留挂载占用端口。
+    *   主进程销毁时，Windows 环境下 Electron 先写优雅停机信号文件（`userData/stop.signal`），后端 `main.py` 主循环轮询到后自行执行 `stop()`（flush rooms.json 未落盘写入 + 正常停 FFmpeg），Electron 轮询等待 ≤4s，超时再用 `taskkill /T /F` 强杀子进程树兜底，防止 FFmpeg 僵尸进程残留挂载占用端口。
     *   POSIX 环境下先发 `SIGTERM`，如果 3 秒内未退出再调度 `SIGKILL`，采用非阻塞的轮询检测，防止同步忙等待阻塞 Electron UI 主线程。
+    *   导出取消/录制停止等强杀 FFmpeg 的统一入口为 `lsc/utils/process_launcher.py: kill_process_tree()`（Windows `taskkill /T /F`；POSIX `SIGTERM → 3s → SIGKILL`），禁止直接 `proc.kill()`。
 
 ### 11.4 错误处理与异常捕获规范
 
@@ -808,14 +830,14 @@ Electron 应用使用 `electron-builder` 进行打包：
 ### 12.1 全局快捷键约束表 (`useKeyboardShortcuts.ts`)
 
 为了提升多视角的剪辑效率，系统注册了键盘快捷键：
-*   **焦点判定原则**：当输入焦点在 `input`、`textarea` 或 `select` 等交互控件上时，必须被自动拦截释放，避免用户打字搜索时误触发切片操作（Ctrl+1/2/3 页面导航及 F5 刷新不受此限制）。
+*   **焦点判定原则**：当输入焦点在 `input`、`textarea` 或 `select` 等交互控件上时，必须被自动拦截释放，避免用户打字搜索时误触发切片操作（Ctrl+1/2 页面导航及 F5 刷新不受此限制）。
+*   **无修饰键约束**：未声明 Ctrl 的快捷键（如 `i`/`o`/`m`/`f`/空格）**必须**在 Ctrl/Cmd 组合按下时失效——否则 Ctrl+F（浏览器查找）、Ctrl+O（打开文件）等系统快捷键会被误触发（`matchesShortcut` 将 `ctrl === undefined` 视为「必须无修饰键」）。
 *   **快捷键对照表**：
 
 | 功能 | 快捷键 | 动作 ID |
 | :--- | :--- | :--- |
-| **切换页面：Dashboard** | `Ctrl + 1` | `page:dashboard` |
-| **切换页面：工作台** | `Ctrl + 2` | `page:workbench` |
-| **切换页面：设置** | `Ctrl + 3` | `page:settings` |
+| **切换页面：工作台** | `Ctrl + 1` | `page:workbench` |
+| **切换页面：设置** | `Ctrl + 2` | `page:settings` |
 | **播放 / 暂停** | `Space` (空格) | `play:toggle` |
 | **标记时间轴入点** | `i` | `mark:in` |
 | **标记时间轴出点** | `o` | `mark:out` |

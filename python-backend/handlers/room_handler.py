@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 
 # 添加 lsc 到 Python 路径
 import sys
@@ -30,10 +29,6 @@ _LSC_ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
 if _LSC_ROOT not in sys.path:
     sys.path.insert(0, _LSC_ROOT)
 
-from handlers.timeline_handlers import (
-    register_timeline_handlers,
-    timeline_to_dict,
-)
 from persistence import (
     is_analysis_stale,
     load_analysis_results,
@@ -41,10 +36,18 @@ from persistence import (
     save_rooms,
 )
 
+from handlers.timeline_handlers import (
+    register_timeline_handlers,
+    timeline_to_dict,
+)
 from lsc.config import ExportProfile, load_config
-from lsc.core.orchestrator import RoomOrchestrator, _is_stream_offline_error
+from lsc.core.orchestrator import (
+    RoomOrchestrator,
+    _get_configured_max_previews,
+    _is_stream_offline_error,
+)
 from lsc.core.services.ingest_registry import PreviewStreamRegistry, get_shared_ingest_registry
-from lsc.core.services.mse_streamer import _check_nvenc
+from lsc.core.services.mse_streamer import MseStreamer, _check_nvenc
 from lsc.core.services.resource_monitor import collect_system_stats, get_resource_pressure
 from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
@@ -229,10 +232,20 @@ _analysis_jobs: dict[str, dict[str, Any]] = {}
 _analysis_jobs_lock = threading.RLock()
 _ANALYSIS_JOB_TTL = 300.0  # 5 分钟后自动清理已完成的分析结果
 
+
+def _clear_analysis_job(room_id: str) -> None:
+    """移除房间的分析任务登记（失败/清理路径）。
+
+    登记提前到 handler 线程后，任何失败路径都必须清理登记，
+    否则前端会一直看到「分析中」卡住。
+    """
+    with _analysis_jobs_lock:
+        _analysis_jobs.pop(room_id, None)
+
 # 持续分析任务状态：room_id -> {task, last_analyzed, highlights, cancelled}
 # 边录边分析：后台 asyncio 任务定期对录制文件新增段做增量场景检测
 _continuous_tasks: dict[str, dict[str, Any]] = {}
-_VALORANT_INCREMENTAL_LOOKBACK_SEC = 360.0  # 6 分钟增量回看（质量优先）
+_VALORANT_INCREMENTAL_LOOKBACK_SEC = 30.0  # 纯 OCR 增量回看（与 valorant_plugin 一致）
 _VALORANT_MAX_CATCHUP_SEC = 480.0  # 单次 tick 最多向前追赶的新内容时长
 # OCR 扫描 TimeoutError 后：降级纯音频追赶，避免立刻再开超大 OCR 窗压垮 DirectML
 _OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 5
@@ -240,26 +253,48 @@ _POST_TIMEOUT_MAX_CATCHUP_SEC = 60.0
 _SCAN_ABORT_GRACE_SEC = 3.0  # 停止目标：3 秒内终止 FFmpeg 并退出当前短推理批次
 _SCAN_ABORT_HARD_SEC = 30.0  # 超时后继续等待线程释放 semaphore 的硬上限，避免永久挂死任务槽
 _VALORANT_MIN_LIST_DURATION_SEC = 5.0  # list_only 入列下限（短 spike 回合也须进列表待确认）
-_VALORANT_MIN_EXPORT_DURATION_SEC = 35.0  # 短于此的 OCR 段视为假买枪/准备期（真正导出路径）
-_HYBRID_BOUNDARY_SOURCE = "valorant_hybrid_v1"
-_AUDIO_BOUNDARY_SOURCE = "valorant_audio_v1"  # 纯音频路径产出（录制中 OCR 不可用）
-_HYBRID_VALID_START_BY = frozenset({"model_buy_exit"})
-_HYBRID_VALID_END_BY = frozenset({"model_result", "model_score", "next_buy"})
-_AUDIO_VALID_START_BY = frozenset({"audio", "full_round"})  # 音频路径允许的起点类型
-_AUDIO_VALID_END_BY = frozenset({"audio", "chime", "inferred", "full_round"})  # 音频路径允许的终点类型
-_HYBRID_FINALIZE_OVERLAP_SEC = 2.0
+_OCR_BOUNDARY_SOURCE = "valorant_ocr_v1"  # 纯 OCR 路径产出（顶部条 + 中央横幅）
+_OCR_VALID_START_BY = frozenset({"ocr_combat"})
+_OCR_VALID_END_BY = frozenset({"next_prep", "next_combat", "open_tail", "max_open_close"})
+_OCR_FINALIZE_OVERLAP_SEC = 120.0
 _MAX_SKIP_SLEEP_TICKS = 5  # 主循环连续跳过 sleep 的防御上限：超过强制 0.5s 节流，防忙循环广播风暴
 _SCAN_ERROR_BACKOFF_SEC = 30.0  # 持续分析 worker 失败后的重试退避（非收尾）
+_SCAN_MAX_TIMEOUT_RETRIES = 3  # 同一窗口连续超时重试上限：超过则跳过该窗口（防死循环）
 _WORKER_MAX_RESTARTS = 3  # worker 崩溃重建上限：超过则终止任务，防止无限重建循环
-
-# 音频路径回合的确认状态：入列后等待 OCR 复核
-CONFIRM_STATUS_AUDIO_PENDING = "audio_pending"  # 音频检测到，待 OCR 复核
-_VALORANT_POST_ROUND_JUNK_SEC = 8.0  # 回合结束后垃圾时间（结算/回放）先验
-_VALORANT_TRIM_START_PAD_SEC = 0.5  # OCR 起点后移，避开买枪尾帧
-_VALORANT_TRIM_END_PAD_SEC = 1.5  # OCR 终点前移，避开结算字帧
-# 与 ValorantRoundConfig.full_round_audio_pre_pad 对齐：入列时抵消无 OCR full_round 向前糊窗
-_VALORANT_FULL_ROUND_AUDIO_PRE_PAD_SEC = 8.0
 _deferred_export_jobs: list[dict[str, Any]] = []  # 延后导出队列（先入列，压力缓解后再导出）
+
+# ── 质量优先模式 ─────────────────────────────────────────────────────
+# 质量优先（默认开启）下，资源压力不再干预持续分析与导出：不暂停分析、
+# 不拉长扫描间隔、不阻塞延后导出冲刷。真实压力仍照常广播供前端展示。
+# 背景（2026-08-04 实测）：录制+预览+多路解码使 CPU 频繁 ≥95%，
+# critical 压力触发 pause_analysis 与 ×3~×4 间隔倍率，导致分析滞后
+# 持续增长到 130s+，切片输出晚于下一回合交手。
+_QUALITY_FIRST_NORMAL_PRESSURE: dict[str, Any] = {
+    "level": "normal",
+    "analysis_interval_multiplier": 1,
+    "pause_analysis": False,
+    "degrade_analysis": False,
+    "analysis_window_sec": 240,
+    "ocr_sample_interval": 2.0,
+}
+
+
+def _quality_first_enabled() -> bool:
+    """质量优先开关（appSettings.analysis_quality_first，默认 True）。"""
+    try:
+        settings = load_settings()
+        app = settings.get('appSettings', {}) if isinstance(settings, dict) else {}
+        return bool(app.get('analysis_quality_first', True))
+    except Exception:
+        return True
+
+
+def _analysis_pressure() -> dict[str, Any]:
+    """分析/导出决策用的资源压力：质量优先模式下一律返回 normal。"""
+    if _quality_first_enabled():
+        return dict(_QUALITY_FIRST_NORMAL_PRESSURE)
+    return get_resource_pressure()
+
 
 def _clip_id(room_id: str, start: float, end: float) -> str:
     """生成稳定的切片 ID（前后端同算法独立计算，用于去重）。"""
@@ -308,15 +343,6 @@ def _get_export_job_states(job_ids: list[str]) -> list[dict[str, Any]]:
 _analysis_semaphore = asyncio.Semaphore(1)
 
 # 全局导出队列：所有导出任务（手动/自动/分析）统一入队，worker 池并行消费
-_export_queue: asyncio.Queue | None = None
-_EXPORT_WORKERS: list[asyncio.Task] = []  # 常驻 worker 池（4 个），实际并发由 _export_semaphore 控制
-_MAX_EXPORT_WORKERS = 4  # 常驻 worker 数（> max possible concurrency，semaphore 限流）
-_export_semaphore = asyncio.Semaphore(2)  # 实际并发限制（动态跟随 settings）
-_export_semaphore_limit = 2  # 当前 semaphore 配置的上限（勿用 _waiters 反推，空闲时可为 None）
-# start_export 返回 clip_id 后，正常情况下 FFmpeg 很快会给出首个进度或完成回调。
-# 若二者都没有，说明底层任务已失联；不能无限占住唯一的导出并发槽。
-_export_in_flight = 0  # 已出队、正在执行 FFmpeg 的导出任务数（热更新须与 empty() 联判）
-_export_queue_lock = asyncio.Lock()
 # 保护_export_in_flight 和连续分析状态的线程锁（防止 handler 异步与 bridge.sync 并发冲突）
 _export_stats_lock = threading.Lock()
 
@@ -425,7 +451,6 @@ def _compute_preview_quality_params(data: dict | None = None) -> dict[str, Any]:
     settings = load_settings()
     preview_quality = (data or {}).get('preview_quality') or settings.get('preview_quality', '高清')
     preset = _get_preview_quality_preset(preview_quality)
-    from lsc.core.services.mse_streamer import _check_nvenc
     use_nvenc = _check_nvenc()
     preset_width = preset['width']
     preset_height = preset['height']
@@ -528,6 +553,9 @@ def _configure_shared_preview_quality(shared_ingest, data: dict | None = None) -
 # 正在启动 MSE 的 room_id 集合，防止启动过程中重复请求
 _mse_starting: set[str] = set()
 _mse_starting_lock = threading.Lock()
+# 已广播 preview_phase=streaming 的房间（首个 init 段到达后置位）。
+# 启动/重连成功时 discard，让新 streamer 的 init 触发一次 streaming 广播。
+_mse_live_phase: set[str] = set()
 
 # MSE 预览自动重连状态: {room_id: {"attempts": int}}
 _mse_reconnect_state: dict[str, dict[str, Any]] = {}
@@ -756,8 +784,6 @@ async def _start_recording_file_mse(
             await srv.broadcast("preview_phase", {"room_id": room_id, "phase": "error"})
 
         def _start_file_streamer():
-            from lsc.core.services.mse_streamer import MseStreamer
-
             try:
                 streamer = MseStreamer(
                     url=path,
@@ -765,15 +791,15 @@ async def _start_recording_file_mse(
                     width=width,
                     height=height,
                     fps=fps,
-                    video_bitrate=video_bitrate,
-                    crf_value=crf_value,
-                    on_init_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                    video_bitrate=video_bitrate,  # type: ignore[arg-type]
+                    crf_value=crf_value,  # type: ignore[arg-type]
+                    on_init_segment=lambda seg, _room_id=room_id: _push_mse_segment(  # type: ignore[misc]
                         srv, loop, 'mse_init', _room_id, seg
                     ),
-                    on_media_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                    on_media_segment=lambda seg, _room_id=room_id: _push_mse_segment(  # type: ignore[misc]
                         srv, loop, 'mse_segment', _room_id, seg
                     ),
-                    on_error=lambda err, _room_id=room_id: asyncio.run_coroutine_threadsafe(
+                    on_error=lambda err, _room_id=room_id: asyncio.run_coroutine_threadsafe(  # type: ignore[misc,arg-type]
                         _on_file_mse_error(err), loop
                     ),
                 )
@@ -880,7 +906,7 @@ _ai_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ai')
 _probe_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='probe')
 
 # 录制并发限流：最多同时启动 2 路录制，避免 6 路同时 HTTP 刷新 + FFmpeg 启动耗尽线程和 CPU
-_recording_semaphore = asyncio.Semaphore(12)
+_recording_semaphore = asyncio.Semaphore(2)
 # 正在提交录制启动的 room_id 集合，防止同一房间重复提交
 _recording_starting: set[str] = set()
 # 等待录制并发槽位的 room_id 队列（Semaphore 已满时）
@@ -913,6 +939,7 @@ def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
     with _mse_starting_lock:
         _mse_starting.clear()
     _mse_reconnect_state.clear()
+    _mse_live_phase.clear()
     _recording_starting.clear()
     _recording_wait_queue.clear()
     with _export_jobs_lock:
@@ -954,22 +981,6 @@ def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
 
     _log.info("room handlers shutdown complete timeout_sec=%.1f stats=%s", timeout_sec, stats)
     return stats
-
-
-def _safe_terminate(proc: subprocess.Popen) -> None:
-    """安全终止子进程：terminate → 等 5s → kill 兜底。"""
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        # terminate 超时，强制 kill
-        try:
-            proc.kill()
-            proc.wait(timeout=3)
-        except Exception as exc:
-            _log.error("子进程 kill 失败 (pid=%s): %s", proc.pid, exc)
-    except Exception as exc:
-        _log.error("子进程 terminate 失败 (pid=%s): %s", proc.pid, exc)
 
 
 def _wait_for_recording_file(room, timeout_sec: float = 8.0) -> bool:
@@ -1100,9 +1111,9 @@ def _detect_audio_energy_peaks(*args, **kwargs):
 
 
 def _detect_rounds_by_audio_rhythm(*args, **kwargs):
-    """兼容包装：逻辑已迁至 lsc.analyzer.valorant_plugin。"""
-    from lsc.analyzer.valorant_plugin import detect_rounds_by_audio_rhythm
-    return detect_rounds_by_audio_rhythm(*args, **kwargs)
+    """兼容包装：音频回合检测已随纯 OCR 简化移除，恒返回空列表。"""
+    _log.warning("detect_rounds_by_audio_rhythm 已废弃（纯 OCR 路径），返回空结果")
+    return []
 
 
 def _new_rounds(
@@ -1151,12 +1162,10 @@ def _drop_open_tail_rounds(
 ) -> list[dict[str, Any]]:
     """持续分析只发布已闭合回合：过滤仍贴着录制尾部的未闭合回合。
 
-    使用两段式 margin 判定：
-    - end >= current_dur - 3s：尾部数据不完整（_margin），直接丢弃
-    - end >= current_dur - 20s：回合可能仍在进行中（pending_margin），标记为 phase="pending" 保留
-
-    Hybrid FSM 已用 model_result / model_score 闭合的回合不得按 tip 距离丢弃：
-    结算帧本来就贴近扫描尖端，误删会导致「有交战内容但 0 回合」。
+    - end >= current_dur - 3s：尾部数据不完整，直接丢弃
+    - end >= current_dur - 20s：回合可能仍在进行中，标记为 phase="pending" 保留
+    - 明确闭合（end_by 在 _OCR_VALID_END_BY）的回合按 tip 距离保留：
+      结算帧本来就贴近扫描尖端，误删会导致「有交战内容但 0 回合」。
     """
     if not rounds:
         return []
@@ -1166,55 +1175,34 @@ def _drop_open_tail_rounds(
         end = float(last.get("end", 0.0))
     except (TypeError, ValueError):
         end = 0.0
-    # 明确的 open_tail 需要保留，等待下一次回看确认结束边界。
     if last.get("tail_by") == "open_tail":
         last["phase"] = "pending"
         return cleaned
     end_by = str(last.get("end_by", "") or "")
-    # Hybrid 已闭合：保留（含 end 贴近 tip 的情况）
-    if end_by in _HYBRID_VALID_END_BY:
+    if end_by in _OCR_VALID_END_BY:
         return cleaned
-    # 3s 内：数据本身不完整，丢弃
     if end >= current_dur - tail_margin:
         return cleaned[:-1]
-    # 20s 内：回合可能仍在进行中，标记为 pending 保留（前端可展示"进行中"）
     pending_margin = 20.0
     if end >= current_dur - pending_margin:
         last["phase"] = "pending"
     return cleaned
 
 
-def _resolve_valorant_model_dir():
-    """Resolve hybrid vision model directory (env override or package default)."""
-    from pathlib import Path
-
-    env = os.environ.get("LSC_VALORANT_MODEL_DIR", "").strip()
-    if env:
-        return Path(env)
-    from lsc.analyzer.valorant_frame_classifier import _DEFAULT_DIR
-
-    return _DEFAULT_DIR
-
-
 def _valorant_vision_shadow_enabled() -> bool:
-    """Pre-cutover shadow: run hybrid detection but skip clip_queued / listing."""
+    """Pre-cutover shadow: run OCR detection but skip clip_queued / listing."""
     return os.environ.get("LSC_VALORANT_VISION_SHADOW", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
 
 
-def _is_hybrid_round(round_data: dict[str, Any]) -> bool:
-    """Hybrid 路径（OCR+模型）产出的回合。"""
-    return round_data.get("boundary_source") == _HYBRID_BOUNDARY_SOURCE
-
-
-def _is_audio_round(round_data: dict[str, Any]) -> bool:
-    """纯音频路径产出的回合（录制中 OCR 不可用）。"""
-    return round_data.get("boundary_source") in (None, _AUDIO_BOUNDARY_SOURCE)
+def _is_ocr_round(round_data: dict[str, Any]) -> bool:
+    """纯 OCR 路径（顶部条 + 中央横幅）产出的回合。"""
+    return round_data.get("boundary_source") == _OCR_BOUNDARY_SOURCE
 
 
 def _hybrid_clip_metadata(round_data: dict[str, Any]) -> dict[str, Any]:
-    """Return the small hybrid evidence payload forwarded to clip_queued."""
+    """Return the small evidence payload forwarded to clip_queued."""
     keys = (
         "boundary_source",
         "boundary_evidence",
@@ -1227,15 +1215,15 @@ def _hybrid_clip_metadata(round_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _min_highlight_duration_for_queue(*, list_only: bool) -> float:
-    """list_only 用低门槛入列；真正导出仍用 35s 过滤假买枪段。"""
+    """入列下限：纯 OCR 确认的回合（入点+出点齐备）直接入列导出。"""
     if list_only:
         return _VALORANT_MIN_LIST_DURATION_SEC
-    return _VALORANT_MIN_EXPORT_DURATION_SEC
+    return _VALORANT_MIN_LIST_DURATION_SEC
 
 
-def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
-    """Hybrid 路径回合入列条件：boundary_source + confirm_status + 有效边界。"""
-    if not _is_hybrid_round(round_data):
+def _is_listable_ocr_round(round_data: dict[str, Any]) -> bool:
+    """纯 OCR 回合入列条件：boundary_source + confirm_status + 有效边界。"""
+    if not _is_ocr_round(round_data):
         return False
     if round_data.get("confirm_status") not in ("vision_confirmed", "pending"):
         return False
@@ -1248,106 +1236,12 @@ def _is_listable_hybrid_round(round_data: dict[str, Any]) -> bool:
         return False
     start_by = str(round_data.get("start_by", "") or "")
     end_by = str(round_data.get("end_by", "") or "")
-    return start_by in _HYBRID_VALID_START_BY and end_by in _HYBRID_VALID_END_BY
-
-
-def _refine_audio_rounds_with_ocr(
-    new_hl: list[dict[str, Any]],
-    all_highlights: list[dict[str, Any]],
-    video_path: str,
-    task_state: dict[str, Any],
-    room_id: str,
-) -> list[dict[str, Any]]:
-    """对 audio_pending 的回合做 OCR 边界精修。
-
-    当 OCR 首次可用时，扫描结果中可能包含之前音频路径产出的回合（audio_pending）。
-    这些回合的边界精度较低，需要用 OCR 精修边界。
-
-    精修逻辑：
-    - 只处理 confirm_status == "audio_pending" 的回合
-    - 用 OCR 检测到的边界替换音频边界
-    - 精修成功后升级为 vision_confirmed
-    - 精修失败则保持 audio_pending（等待下次 OCR 扫描）
-    """
-    refined = []
-    for h in new_hl:
-        if h.get("confirm_status") != CONFIRM_STATUS_AUDIO_PENDING:
-            refined.append(h)
-            continue
-
-        # 尝试用 OCR 精修边界
-        round_start = float(h.get("start", 0.0))
-        round_end = float(h.get("end", 0.0))
-        if round_end <= round_start:
-            refined.append(h)
-            continue
-
-        # 在音频边界附近搜索精确的 OCR 边界
-        # 扩展搜索窗口：起点前 5s 到起点后 10s，终点前 10s 到终点后 5s
-        search_start = max(0.0, round_start - 5.0)
-        search_end = round_end + 5.0
-
-        try:
-            from lsc.analyzer.round_detector import _detect_round_phase_markers
-            from lsc.config import load_config
-            cfg = load_config()
-            ffmpeg_path = cfg.ffmpeg_path or "ffmpeg"
-
-            # 在音频边界附近做 OCR 扫描
-            ocr_markers = _detect_round_phase_markers(
-                video_path, ffmpeg_path, 0.0, None,
-                time_range=(search_start, search_end),
-            )
-
-            if ocr_markers:
-                # 找到 OCR 标记，精修边界
-                refined_h = dict(h)
-                # 使用 OCR 标记调整边界（简化处理：保持原边界但升级状态）
-                refined_h["confirm_status"] = "vision_confirmed"
-                refined_h["boundary_source"] = _HYBRID_BOUNDARY_SOURCE
-                refined_h["start_by"] = "model_buy_exit"
-                refined_h["end_by"] = "model_result"
-                _log.info(
-                    "OCR 精修成功: room=%s, round_key=%s, %.1f-%.1f → vision_confirmed",
-                    room_id, _valorant_round_key(h), round_start, round_end,
-                )
-                refined.append(refined_h)
-            else:
-                # OCR 未找到标记，保持 audio_pending
-                refined.append(h)
-        except Exception as exc:
-            _log.debug("OCR 精修失败: room=%s, round_key=%s, %s",
-                       room_id, _valorant_round_key(h), exc)
-            refined.append(h)
-
-    return refined
-
-
-def _is_listable_audio_round(round_data: dict[str, Any]) -> bool:
-    """纯音频路径回合入列条件：允许入列但标记为待 OCR 复核。
-
-    音频路径产出的回合边界精度较低，入列后需等待 OCR 复核确认边界。
-    """
-    if not _is_audio_round(round_data):
-        return False
-    # 音频路径只接受 audio_pending 状态（入列后等待 OCR 复核）
-    if round_data.get("confirm_status") != CONFIRM_STATUS_AUDIO_PENDING:
-        return False
-    try:
-        start = float(round_data.get("start", 0.0))
-        end = float(round_data.get("end", 0.0))
-    except (TypeError, ValueError):
-        return False
-    if end <= start:
-        return False
-    start_by = str(round_data.get("start_by", "") or "")
-    end_by = str(round_data.get("end_by", "") or "")
-    return start_by in _AUDIO_VALID_START_BY and end_by in _AUDIO_VALID_END_BY
+    return start_by in _OCR_VALID_START_BY and end_by in _OCR_VALID_END_BY
 
 
 def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
-    """Return whether a hybrid round is exportable (vision_confirmed + model boundaries)."""
-    if not _is_hybrid_round(round_data):
+    """Return whether an OCR round is exportable (vision_confirmed + valid boundaries)."""
+    if not _is_ocr_round(round_data):
         return False
     try:
         start = float(round_data.get("start", 0.0))
@@ -1360,93 +1254,7 @@ def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
         return False
     start_by = str(round_data.get("start_by", "") or "")
     end_by = str(round_data.get("end_by", "") or "")
-    return start_by in _HYBRID_VALID_START_BY and end_by in _HYBRID_VALID_END_BY
-
-
-def _trim_valorant_combat_bounds(round_data: dict[str, Any]) -> dict[str, Any]:
-    """将回合收紧为正赛段：去掉准备期与回合结束垃圾尾。
-
-    OCR：ocr_start/round_start +0.5；ocr_end -1.5；next_buy 回推 post junk。
-    音频钟声：终点贴 round_end_sec（不再 -1.5，避免砍掉回合末击杀）。
-    full_round 糊窗：抵消 audio_pre_pad，并砍尾 junk。
-    """
-    out = dict(round_data)
-    try:
-        start = float(out.get("start", 0.0))
-        end = float(out.get("end", 0.0))
-    except (TypeError, ValueError):
-        return out
-
-    start_by = str(out.get("start_by", "") or "")
-    end_by = str(out.get("end_by", "") or "")
-    tail_by = str(out.get("tail_by", "") or "")
-    phase = str(out.get("phase", "") or "")
-
-    def _f(key: str) -> float | None:
-        raw = out.get(key)
-        if raw is None:
-            return None
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return None
-
-    ocr_start = _f("ocr_start")
-    ocr_end = _f("ocr_end")
-    round_start = _f("round_start_sec")
-    round_end = _f("round_end_sec")
-
-    # --- start ---
-    if ocr_start is not None or start_by == "ocr_buy_exit":
-        base = ocr_start if ocr_start is not None else round_start
-        # 防御：增量窗对 buy/ocr_start 双重 range_offset 时会偏离 start 数十秒
-        if base is not None and abs(base - start) <= 20.0:
-            start = base + _VALORANT_TRIM_START_PAD_SEC
-        elif round_start is not None and abs(round_start - start) <= 20.0:
-            start = round_start + _VALORANT_TRIM_START_PAD_SEC
-        elif start_by == "ocr_buy_exit":
-            start = start + _VALORANT_TRIM_START_PAD_SEC
-    elif start_by == "full_round" or phase == "full_round":
-        # 无 OCR full_round 曾向前扩 pre_pad；入列时抵消，贴近战斗抬升
-        start = start + _VALORANT_FULL_ROUND_AUDIO_PRE_PAD_SEC
-        if round_start is not None:
-            start = max(start, round_start + _VALORANT_FULL_ROUND_AUDIO_PRE_PAD_SEC)
-    # 纯音频 combat：检测侧已买枪 trim，保持 start 不动
-
-    # --- end ---
-    # next_buy = 下一准备阶段开始，必须原样保留（用户要录到准备之前的全部内容）
-    # 禁止因附带的胜利字 ocr_end 把终点拽回结算点（对照：105.4 → 95.1）
-    if end_by == "next_buy":
-        pass
-    elif end_by == "ocr_result" or (
-        ocr_end is not None and end_by not in {"next_buy", "open_tail"}
-    ):
-        base = ocr_end if ocr_end is not None else round_end
-        if base is not None:
-            end = base - _VALORANT_TRIM_END_PAD_SEC
-        elif end_by == "ocr_result":
-            end = end - _VALORANT_TRIM_END_PAD_SEC
-    elif (round_end is not None and (tail_by == "chime" or end_by == "chime")):
-        # 钟声即正赛终点；夹到钟声附近，保留至多 0.5s 余韵
-        # 防御：增量窗局部 round_end 未加 range_offset 时会 < start，忽略坏元数据
-        if round_end > start:
-            end = min(end, round_end + 0.5)
-    elif start_by == "full_round" or end_by == "full_round" or phase == "full_round":
-        end = max(
-            start + _VALORANT_MIN_EXPORT_DURATION_SEC * 0.5,
-            end - _VALORANT_POST_ROUND_JUNK_SEC,
-        )
-    elif end_by in ("audio", "inferred") and tail_by != "chime":
-        end = max(
-            start + _VALORANT_MIN_EXPORT_DURATION_SEC * 0.5,
-            end - _VALORANT_POST_ROUND_JUNK_SEC * 0.5,
-        )
-
-    if end <= start:
-        return out
-    out["start"] = round(start, 3)
-    out["end"] = round(end, 3)
-    return out
+    return start_by in _OCR_VALID_START_BY and end_by in _OCR_VALID_END_BY
 
 
 def _valorant_round_key(round_data: dict[str, Any]) -> str:
@@ -1477,6 +1285,7 @@ def _should_broadcast_clip_list_update(
     exported_ids: dict[str, None],
     refined_keys: set[str],
     listed_bounds: dict[str, tuple[float, float, str]],
+    deleted_keys: dict[str, None] | None = None,
 ) -> str:
     """决定 list_only 路径是否广播 clip_queued。
 
@@ -1484,6 +1293,8 @@ def _should_broadcast_clip_list_update(
     -------
     ``"first"`` | ``"upsert"`` | ``"skip"``
     """
+    if deleted_keys and listed_key in deleted_keys:
+        return "skip"
     if round_key in refined_keys:
         return "skip"
     if listed_key in exported_ids:
@@ -1542,16 +1353,9 @@ def _is_model_contract_error(err: Any) -> bool:
 
 
 def _apply_scan_timeout_backoff(state: dict[str, Any]) -> None:
-    """扫描超时后降级：强制纯音频，并按连续失败次数缩小追赶窗。"""
+    """超时后仅记录失败计数（结果优先：不做降级，计数用于同窗重试上限判断）。"""
     failures = int(state.get("consecutive_scan_timeouts") or 0) + 1
     state["consecutive_scan_timeouts"] = failures
-    state["ocr_degraded_remaining"] = max(
-        int(state.get("ocr_degraded_remaining") or 0),
-        int(_OCR_DEGRADE_TICKS_AFTER_TIMEOUT),
-    )
-    adaptive_cap = max(30.0, float(_POST_TIMEOUT_MAX_CATCHUP_SEC) / (2 ** (failures - 1)))
-    state["post_timeout_max_catchup_sec"] = adaptive_cap
-    state["degraded_mode"] = "audio_only"
 
 
 def _apply_scan_budget_degrade(
@@ -1561,37 +1365,22 @@ def _apply_scan_budget_degrade(
     last_analyzed: float,
     use_ocr: bool,
 ) -> tuple[bool, tuple[float, float]]:
-    """若处于超时降级期：关 OCR，并把 scan_end 钳到 last_analyzed+cap。"""
-    remaining = int(state.get("ocr_degraded_remaining") or 0)
-    if remaining <= 0:
-        return bool(use_ocr), (float(scan_range[0]), float(scan_range[1]))
-    try:
-        cap = float(state.get("post_timeout_max_catchup_sec") or _POST_TIMEOUT_MAX_CATCHUP_SEC)
-    except (TypeError, ValueError):
-        cap = float(_POST_TIMEOUT_MAX_CATCHUP_SEC)
-    cap = max(30.0, min(cap, float(_VALORANT_MAX_CATCHUP_SEC)))
-    start = float(scan_range[0])
-    end = float(scan_range[1])
-    la = max(0.0, float(last_analyzed))
-    capped_end = min(end, max(la, start) + cap)
-    if capped_end < start:
-        capped_end = start
-    return False, (round(start, 3), round(capped_end, 3))
+    """结果优先：任何情况下都不降级（不关 OCR、不缩窗），原样返回。"""
+    return use_ocr, (float(scan_range[0]), float(scan_range[1]))
 
 
 def _note_successful_scan_after_degrade(state: dict[str, Any]) -> None:
-    """成功消费一次扫描后递减降级计数。"""
-    remaining = int(state.get("ocr_degraded_remaining") or 0)
-    if remaining <= 0:
-        return
-    remaining -= 1
-    state["ocr_degraded_remaining"] = remaining
-    if remaining <= 0:
-        state.pop("post_timeout_max_catchup_sec", None)
-        state.pop("degraded_mode", None)
-        state["consecutive_scan_timeouts"] = 0
-        # OCR 恢复后，重置精修标记，允许再次执行 OCR 精修
-        state["ocr_refine_done"] = False
+    """成功消费一次扫描后清除超时计数（不再有降级恢复流程）。"""
+    state["consecutive_scan_timeouts"] = 0
+
+
+def _continuous_listed_clip_snapshot(task: dict[str, Any]) -> list[dict[str, Any]]:
+    listed_clip_state = task.get("listed_clips") or {}
+    if isinstance(listed_clip_state, dict):
+        return [dict(item) for item in listed_clip_state.values() if isinstance(item, dict)]
+    if isinstance(listed_clip_state, list):
+        return [dict(item) for item in listed_clip_state if isinstance(item, dict)]
+    return []
 
 
 def _build_continuous_status_payload(
@@ -1625,6 +1414,7 @@ def _build_continuous_status_payload(
         pending = max(0, len(highlights) - confirmed)
     finalizing = bool(task.get("finalizing") or phase == "finalizing")
     resolved_phase = phase or ("finalizing" if finalizing else "running")
+    listed_clips = _continuous_listed_clip_snapshot(task)
     # stopping/completed/idle/error 对前端均视为非「分析运行中」；stopping 另由 phase 驱动忙碌态。
     running = resolved_phase in ("running", "finalizing")
     payload: dict[str, Any] = {
@@ -1638,6 +1428,10 @@ def _build_continuous_status_payload(
         "pending_rounds": pending,
         "analysis_stage": stage,
         "total_highlights": len(highlights) if highlights is not None else 0,
+        # Full authoritative snapshot: reconnecting/reloaded renderers reconcile
+        # their ephemeral clip store instead of relying on one-shot broadcasts.
+        "listed_clip_count": len(listed_clips),
+        "listed_clips": listed_clips,
         "phase": resolved_phase,
         "updated_at": time.time(),
         "scan_mode": task.get("scan_phase", "incremental"),
@@ -1667,30 +1461,13 @@ def _build_continuous_status_payload(
             else 0
         ),
         "scan_running": bool(task.get("scan_running", False)),
-        "round_phase": task.get("round_phase"),
-        "round_phase_detail": task.get("round_phase_detail"),
         "valorant_profile": task.get("valorant_profile"),
-        "pending_round": task.get("pending_start") is not None,
-        # 等待回合结束的详细解释（P2: 前端等待回合解释）
-        "pending_round_info": task.get("pending_round_info"),
-        "predicted_wake_at": task.get("predicted_wake_at"),
-        "predicted_phase": task.get("predicted_phase"),
-        "prediction_detail": task.get("prediction_detail"),
         "finalizing": finalizing,
         "completed": bool(task.get("completed", False)),
         "status": task.get("status", "running"),
         "analysis_lag_sec": max(0.0, rec_dur - analyzed) if rec_dur else 0.0,
-        "model_version": task.get("model_version"),
-        "provider": task.get("provider"),
-        "provider_warning": task.get("provider_warning"),
-        "last_model_inference_frames": int(task.get("last_model_inference_frames", 0) or 0),
-        # 音频待复核回合数（P3: 回合边界精度指示）
-        "audio_pending_rounds": sum(
-            1 for h in highlights if h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
-        ) if highlights else 0,
         # 多房间同步详细错误（P3: 多房间同步详细错误）
         "mapping_error": task.get("mapping_error"),
-        "model_inference_frames_total": int(task.get("model_inference_frames_total", 0) or 0),
         "last_scan_error": task.get("last_scan_error"),
         "degraded_mode": task.get("degraded_mode"),
         "consecutive_scan_timeouts": int(task.get("consecutive_scan_timeouts", 0) or 0),
@@ -1755,8 +1532,8 @@ def _merge_round_windows(
                 continue
             if old.get("round_key") and not new_item.get("round_key"):
                 new_item["round_key"] = old["round_key"]
-            old_hybrid = _is_hybrid_round(old) or _is_listable_hybrid_round(old)
-            new_hybrid = _is_hybrid_round(new_item) or _is_listable_hybrid_round(new_item)
+            old_hybrid = _is_ocr_round(old) or _is_listable_ocr_round(old)
+            new_hybrid = _is_ocr_round(new_item) or _is_listable_ocr_round(new_item)
             if old_hybrid and not new_hybrid:
                 replaced_confirmed = True
                 break
@@ -1833,9 +1610,8 @@ def _round_lists_changed(
 
 
 def _continuous_valorant_refine_with_ocr(*args, **kwargs):
-    """兼容 tests/test_continuous_analysis_guards.py。"""
-    from lsc.analyzer.valorant_plugin import valorant_refine_with_ocr
-    return valorant_refine_with_ocr(*args, **kwargs)
+    """纯 OCR 路径恒开 OCR；保留恒 False 契约（无 legacy OCR refine 开关）。"""
+    return False
 
 
 def _finalize_scan_timeout(duration_sec: float, attempt: int = 1) -> int:
@@ -1981,31 +1757,26 @@ def _analyze_scene_or_rounds(
     """scene 模式的统一分析入口：Valorant 优先回合分割，其余走场景检测。
 
     对一次性分析（录制已结束的完整文件）：
-    - game="valorant" 时经 AnalyzerRegistry → detect_valorant_rounds_hybrid；
+    - game="valorant" 时经 AnalyzerRegistry → detect_valorant_rounds_ocr；
     - 无结果或非 valorant，回退到 generic scene 分析。
 
     Returns:
         高光段列表；被取消时返回 None（与 _run_scene_analysis 语义一致）。
     """
     from lsc.analyzer.registry import get as get_analyzer
-    from lsc.config import load_config as _load_cfg_r
 
-    _cfg = _load_cfg_r()
+    _cfg = load_config()
     _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
     options = {
         "threshold": threshold,
         "ffmpeg_path": _ffmpeg,
-        "model_dir": _resolve_valorant_model_dir() if game == "valorant" else None,
     }
 
     if game == "valorant":
         try:
-            from lsc.analyzer.valorant_frame_classifier import ModelContractError
-
             if progress_callback:
-                progress_callback("round_detect", 0.0, "Valorant 混合视觉回合检测中...")
+                progress_callback("round_detect", 0.0, "Valorant OCR 回合检测中...")
             plugin = get_analyzer("valorant")
-            # Production path: detect_valorant_rounds_hybrid (via ValorantAnalyzerPlugin)
             highlights = plugin.analyze_file(
                 video_path,
                 progress_callback=progress_callback,
@@ -2016,16 +1787,14 @@ def _analyze_scene_or_rounds(
                 return None
             if highlights:
                 _log.info(
-                    "Valorant 混合视觉回合检测: %d 回合 (path=%s)",
+                    "Valorant OCR 回合检测: %d 回合 (path=%s)",
                     len(highlights),
                     os.path.basename(video_path),
                 )
                 return highlights
-            _log.info("Valorant 混合视觉检测无结果，回退到场景检测")
-        except ModelContractError as exc:
-            _log.warning("Valorant 模型不可用，回退到场景检测: %s", exc)
+            _log.info("Valorant OCR 检测无结果，回退到场景检测")
         except Exception as exc:
-            _log.warning("Valorant 混合视觉检测失败，回退到场景检测: %s", exc)
+            _log.warning("Valorant OCR 检测失败，回退到场景检测: %s", exc)
 
     return get_analyzer("generic").analyze_file(
         video_path,
@@ -2048,10 +1817,7 @@ def _get_video_duration(video_path: str) -> float:
     对正在写入的录制文件，首次 ffprobe 获取精确时长后，
     后续通过文件大小增量 / 码率估算新时长，避免每轮都 fork ffprobe。
     """
-    import json as _json
-    import time as _time_mod
-
-    now = _time_mod.monotonic()
+    now = time.monotonic()
 
     # 检查缓存
     try:
@@ -2082,8 +1848,7 @@ def _get_video_duration(video_path: str) -> float:
                         return estimated
 
     # 缓存未命中或过期 → 执行 ffprobe
-    from lsc.config import load_config as _load_cfg2
-    _cfg2 = _load_cfg2()
+    _cfg2 = load_config()
     _ffprobe = _cfg2.ffprobe_path or shutil.which("ffprobe") or "ffprobe"
 
     try:
@@ -2101,7 +1866,7 @@ def _get_video_duration(video_path: str) -> float:
             text=True,
             timeout=10,
         )
-        data = _json.loads(result.stdout)
+        data = json.loads(result.stdout)
         duration = float(data.get("format", {}).get("duration", 0))
         if duration > 0:
             with _duration_cache_lock:
@@ -2176,7 +1941,28 @@ def _safe_float(value, default: float = 0.0) -> float:
 
 
 def _get_export_preset(preset_id: str) -> dict[str, Any] | None:
-    """Get export preset configuration by ID."""
+    """Get export preset configuration by ID.
+
+    优先查找用户自定义预设（存于 settings.json 的 appSettings.custom_export_presets），
+    未命中再回退到内置预设。
+    """
+    # 自定义预设优先
+    try:
+        custom_presets = load_settings().get('appSettings', {}).get('custom_export_presets', [])
+        if isinstance(custom_presets, list):
+            for cp in custom_presets:
+                if isinstance(cp, dict) and cp.get('id') == preset_id:
+                    return {
+                        'codec': cp.get('codec', 'h264_nvenc'),
+                        'crf': cp.get('crf', 23),
+                        'resolution': cp.get('resolution', ''),
+                        'framerate': cp.get('framerate', '原画'),
+                        'audio_bitrate': cp.get('audio_bitrate', '128k'),
+                        'vertical_crop': bool(cp.get('vertical_crop', False)),
+                    }
+    except Exception as exc:
+        _log.warning("读取自定义导出预设失败，回退内置预设: %s", exc)
+
     presets = {
         'douyin_vertical': {
             'codec': 'h264_nvenc',
@@ -2422,6 +2208,15 @@ def _push_mse_segment(ws_server: Any, loop: asyncio.AbstractEventLoop, kind: str
     }.get(kind, kind)
     if normalized_kind == "segment" and room_id in _mse_push_paused:
         return
+    if normalized_kind == "init" and room_id not in _mse_live_phase:
+        # phase 'streaming' 延迟到首个 init 段产出（§优化 F3）：
+        # 慢流连接期间 phase 停留在 probing，前端 10s segment watchdog
+        # 不会在「流尚未连通」时误触发重连；init 到达瞬间进入播放态
+        _mse_live_phase.add(room_id)
+        asyncio.run_coroutine_threadsafe(
+            ws_server.broadcast('preview_phase', {'room_id': room_id, 'phase': 'streaming'}),
+            loop,
+        )
     asyncio.run_coroutine_threadsafe(
         ws_server.broadcast_mse(normalized_kind, room_id, seg),
         loop,
@@ -2650,16 +2445,20 @@ def _resolve_export_range(
                 'exact',
             )
         return (
-            max(0.0, start_sec - content_offset),
-            max(0.0, end_sec - content_offset),
+            max(0.0, start_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),
+            max(0.0, end_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),
             'approximate',
         )
 
     return (
-        max(0.0, start_sec - content_offset),
-        max(0.0, end_sec - content_offset),
+        max(0.0, start_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),
+        max(0.0, end_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),
         'approximate',
     )
+
+
+# §8.2 降级补偿：无墙钟快照时用固定 preview_latency 近似预览流相对录制流的延迟
+_PREVIEW_LATENCY_FALLBACK = 2.0
 
 
 
@@ -2673,6 +2472,12 @@ def _purge_stale_analysis_jobs() -> None:
             _analysis_jobs.pop(rid, None)
     if stale:
         _log.debug("purged %d stale analysis jobs", len(stale))
+
+
+async def _ensure_export_queue():
+    """Module-level backward-compat entry (server.py imports this)."""
+    from handlers.export_handlers import ensure_export_queue
+    await ensure_export_queue()
 
 
 def register_room_handlers(server, bridge):
@@ -2738,6 +2543,27 @@ def register_room_handlers(server, bridge):
         """
         _log.info("Shared MSE error for room %s: %s", room_id, err)
 
+        # 启动期忽略：_handle_mse_preview 启动（含 MseStreamer 硬解→软解回退
+        # 重试）期间 FFmpeg 立即退出会触发 on_error；此时重连循环若介入，
+        # 会与软解重试并行创建第二个 FFmpeg 进程互相覆盖。启动成败由
+        # _handle_mse_preview 统一处理（_mse_starting finally 中 discard）。
+        if room_id in _mse_starting:
+            _log.debug(
+                "Shared MSE error during startup, ignored (room=%s): %s",
+                room_id, err,
+            )
+            return
+
+        # 防重入：与 legacy 版一致，退避等待期间重复 on_error 由在途循环接管
+        prev_state = _mse_reconnect_state.get(room_id)
+        if prev_state and prev_state.get('running'):
+            _log.info(
+                "Shared MSE reconnect loop already running for room %s, "
+                "ignoring duplicate error: %s", room_id, err,
+            )
+            return
+        _mse_reconnect_state[room_id] = {'attempts': 0, 'running': True}
+
         old_handle = _preview_stream_registry().pop(room_id)
         if old_handle is not None:
             try:
@@ -2751,6 +2577,7 @@ def register_room_handlers(server, bridge):
 
         async def _finalize(error_text: str, reason: str, timeline_reason: str) -> None:
             _mse_reconnect_state.pop(room_id, None)
+            _mse_live_phase.discard(room_id)
             await server.broadcast('mse_error', {
                 'room_id': room_id,
                 'error': error_text,
@@ -2841,6 +2668,27 @@ def register_room_handlers(server, bridge):
                 return
 
             # 强制刷新流地址，避免复用已 404 的 CDN 死链
+            # 403 错误时先拉黑当前 CDN 线路，使重新解析时跳过该线路尝试其他 CDN
+            if '403' in current_error:
+                try:
+                    def _mark_bad_cdn():
+                        room = manager.get_room(room_id)
+                        url = ''
+                        if room and room.stream_info and room.stream_info.stream_url:
+                            url = room.stream_info.stream_url
+                        elif room and room.stream_url_cached:
+                            url = room.stream_url_cached
+                        if url:
+                            from urllib.parse import urlparse as _up
+                            host = _up(url).netloc.lower()
+                            cdn = host.split('.')[0] if host else ''
+                            if cdn:
+                                from lsc.platforms.huya import mark_cdn_bad
+                                mark_cdn_bad(cdn)
+                                _log.info("Shared MSE reconnect: marked CDN '%s' bad for room %s", cdn, room_id)
+                    await loop.run_in_executor(_bridge_executor, lambda: bridge.manager.call(_mark_bad_cdn))
+                except Exception as exc:
+                    _log.debug("Shared MSE reconnect mark_cdn_bad failed: %s", exc)
             try:
                 refresh_ok = await loop.run_in_executor(
                     _recording_executor,
@@ -2880,6 +2728,7 @@ def register_room_handlers(server, bridge):
 
             if result.get('success'):
                 _mse_reconnect_state.pop(room_id, None)
+                _mse_live_phase.discard(room_id)
                 _log.info("Shared MSE reconnect succeeded for room %s", room_id)
 
                 def _rotate_shared_epoch_on_reconnect():
@@ -2918,7 +2767,7 @@ def register_room_handlers(server, bridge):
             on_media_segment=lambda seg: _push_mse_segment(
                 server, loop, 'mse_segment', room_id, seg
             ),
-            on_error=lambda err: asyncio.run_coroutine_threadsafe(
+            on_error=lambda err: asyncio.run_coroutine_threadsafe(  # type: ignore[arg-type]
                 _shared_mse_on_error(room_id, err, loop), loop
             ),
         )
@@ -3101,6 +2950,27 @@ def register_room_handlers(server, bridge):
 
     bus.subscribe("recording_stopped", _on_manager_recording_stopped_offline)
 
+    def _on_recording_reconnected(room_id: str) -> None:
+        """录制重连成功后重新挂载共享进样预览。
+
+        录制重连（快速路径）会 stop 整个 SharedRoomIngest 并清空预览订阅者，
+        而 MSE 自动重连循环可能先行耗尽导致 preview_enabled 被置 false。
+        此处兜底重新 attach 预览，恢复画面而无需用户手动重开。
+        """
+        loop = _capture_ws_loop()
+        if loop is None or not loop.is_running():
+            _log.debug(
+                "skip shared preview reattach on reconnect: no running WS loop (room_id=%s)",
+                room_id,
+            )
+            return
+        asyncio.run_coroutine_threadsafe(
+            _reattach_shared_preview_after_recording_start(room_id, True),
+            loop,
+        )
+
+    bus.subscribe("recording_reconnected", _on_recording_reconnected)
+
     def _broadcast_system_stats():
         """广播系统资源快照到前端。"""
         try:
@@ -3210,10 +3080,10 @@ def register_room_handlers(server, bridge):
                 if getattr(room, 'is_reconnecting', False):
                     continue
                 if getattr(room, 'last_error', None):
-                    room.last_error = None
+                    room.last_error = None  # type: ignore[assignment]
                     refreshed += 1
                 if getattr(room, 'preview_error', None):
-                    room.preview_error = None
+                    room.preview_error = None  # type: ignore[assignment]
                     refreshed += 1
             return refreshed
 
@@ -3913,8 +3783,7 @@ def register_room_handlers(server, bridge):
         _log.debug("设置入点: room_id=%s, time=%s, live=%s", room_id, time_value, live)
 
         # 实时标记才捕获 wallclock；拖动标记不捕获（wallclock 不代表内容时刻）
-        import time as _time
-        captured_wallclock = _time.monotonic() if live else None
+        captured_wallclock = time.monotonic() if live else None
         # 删除入点 (time: null) 场景不需要 wallclock
         if time_value is None and 'time' in data:
             captured_wallclock = None
@@ -3953,8 +3822,7 @@ def register_room_handlers(server, bridge):
         live = data.get('live', True)
         _log.debug("设置出点: room_id=%s, time=%s, live=%s", room_id, time_value, live)
 
-        import time as _time
-        captured_wallclock = _time.monotonic() if live else None
+        captured_wallclock = time.monotonic() if live else None
         if time_value is None and 'time' in data:
             captured_wallclock = None
 
@@ -4059,7 +3927,6 @@ def register_room_handlers(server, bridge):
             _log.warning("save_settings 校验失败: %s", exc)
             return {'success': False, 'error': str(exc)}
         except OSError as exc:
-            from lsc.utils.error_messages import humanize_error
             _log.error("保存设置失败: %s", exc)
             return {'success': False, 'error': humanize_error(str(exc))}
         _log.info(
@@ -4100,7 +3967,6 @@ def register_room_handlers(server, bridge):
         except (ValueError, json.JSONDecodeError) as exc:
             return {'success': False, 'error': str(exc)}
         except OSError as exc:
-            from lsc.utils.error_messages import humanize_error
             _log.error("保存抖音 Cookie 失败: %s", exc)
             return {'success': False, 'error': humanize_error(str(exc))}
 
@@ -4134,8 +4000,40 @@ def register_room_handlers(server, bridge):
         except (ValueError, json.JSONDecodeError) as exc:
             return {'success': False, 'error': str(exc)}
         except OSError as exc:
-            from lsc.utils.error_messages import humanize_error
             _log.error("保存 B站 Cookie 失败: %s", exc)
+            return {'success': False, 'error': humanize_error(str(exc))}
+
+    @server.on('get_huya_cookie_status')
+    async def handle_get_huya_cookie_status(data):
+        """查询虎牙 Cookie 是否已配置。"""
+        from lsc.platforms.cookie_helper import get_huya_cookie_status
+        try:
+            return {'success': True, **get_huya_cookie_status()}
+        except Exception as exc:
+            _log.warning("get_huya_cookie_status failed: %s", exc)
+            return {'success': False, 'error': str(exc), 'configured': False, 'count': 0}
+
+    @server.on('save_huya_cookies')
+    async def handle_save_huya_cookies(data):
+        """保存用户粘贴的虎牙 Cookie（JSON / Cookie 头）。"""
+        from lsc.platforms.cookie_helper import save_huya_cookies_from_text
+        raw = ''
+        if isinstance(data, dict):
+            raw = str(data.get('cookies') or data.get('text') or '')
+        if not raw.strip():
+            return {'success': False, 'error': '请粘贴 Cookie 内容'}
+        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
+        if len(raw) > _MAX_COOKIE_BYTES:
+            _log.warning("虎牙 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
+            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
+        try:
+            status = save_huya_cookies_from_text(raw)
+            _log.info("虎牙 Cookie 已保存: count=%s", status.get('count'))
+            return {'success': True, **status}
+        except (ValueError, json.JSONDecodeError) as exc:
+            return {'success': False, 'error': str(exc)}
+        except OSError as exc:
+            _log.error("保存虎牙 Cookie 失败: %s", exc)
             return {'success': False, 'error': humanize_error(str(exc))}
 
     @server.on('set_content_offset')
@@ -4302,8 +4200,7 @@ def register_room_handlers(server, bridge):
                     'precision': 'buffer_only',
                 }
 
-            import time as _align_time
-            group_id = f"align_{int(_align_time.time())}"
+            group_id = f"align_{int(time.time())}"
             reference_room_id = result.reference_room_id
 
             def _apply_alignment_and_create_timeline():
@@ -4433,11 +4330,10 @@ def register_room_handlers(server, bridge):
     @server.on('check_dependencies')
     async def handle_check_dependencies(data):
         """检测系统依赖状态：FFmpeg / FFprobe / NVENC / Python"""
-        from lsc.config import load_config as _load_config
         from lsc.core.services.mse_streamer import _check_nvenc
         from lsc.utils.process_launcher import prepare_launch as _prepare_launch
 
-        cfg = _load_config()
+        cfg = load_config()
         _log.info("检测依赖: ffmpeg=%s, ffprobe=%s, nvenc=%s",
                   cfg.ffmpeg_path or shutil.which("ffmpeg"),
                   cfg.ffprobe_path or shutil.which("ffprobe"),
@@ -4451,12 +4347,12 @@ def register_room_handlers(server, bridge):
         if ffmpeg_ok:
             try:
                 env, cflags, cwd = _prepare_launch(ffmpeg_path)
-                rkw = {"capture_output": True, "text": True, "timeout": 5, "env": env}
-                if cwd:
-                    rkw["cwd"] = cwd
-                if cflags:
-                    rkw["creationflags"] = cflags
-                r = subprocess.run([ffmpeg_path, "-version"], **rkw)
+                r = run_hidden(
+                    [ffmpeg_path, "-version"],
+                    capture_output=True, text=True, timeout=5,
+                    env=env, cwd=cwd,
+                    **({"creationflags": cflags} if cflags else {}),
+                )
                 if r.returncode == 0:
                     ffmpeg_version = r.stdout.split('\n')[0].strip()
             except Exception as exc:
@@ -4470,12 +4366,12 @@ def register_room_handlers(server, bridge):
         if ffprobe_ok:
             try:
                 env, cflags, cwd = _prepare_launch(ffprobe_path)
-                rkw = {"capture_output": True, "text": True, "timeout": 5, "env": env}
-                if cwd:
-                    rkw["cwd"] = cwd
-                if cflags:
-                    rkw["creationflags"] = cflags
-                r = subprocess.run([ffprobe_path, "-version"], **rkw)
+                r = run_hidden(
+                    [ffprobe_path, "-version"],
+                    capture_output=True, text=True, timeout=5,
+                    env=env, cwd=cwd,
+                    **({"creationflags": cflags} if cflags else {}),
+                )
                 if r.returncode == 0:
                     ffprobe_version = r.stdout.split('\n')[0].strip()
             except Exception as exc:
@@ -4492,48 +4388,56 @@ def register_room_handlers(server, bridge):
 
         return {'success': True, 'dependencies': results}
 
-    @server.on('export_clip')
-    async def handle_export_clip(data):
-        """导出视频切片 — 统一入队到全局导出队列。"""
+    @server.on('render_clip_preview')
+    async def handle_render_clip_preview(data):
+        """从录制文件抽入点/中点/出点三帧，供导出前画面预览。"""
+        import base64
+
         room_id = data.get('room_id')
-        start_sec = _safe_float(data.get('start', 0))
-        end_sec = _safe_float(data.get('end', 0))
-        label = data.get('label', 'clip')
-        preset_id = data.get('preset_id', '')
-        job_id = data.get('job_id', '')
-        operation_id = data.get('operation_id', '')  # 前端唯一操作 ID，用于精确匹配
-        source = data.get('source', '')
+        try:
+            start = float(data.get('start', 0.0))
+            end = float(data.get('end', 0.0))
+        except (TypeError, ValueError):
+            return {'success': False, 'error': '时间参数无效'}
+        if not room_id or not (end > start):
+            return {'success': False, 'error': '参数无效'}
+        room = manager.get_room(room_id)
+        if room is None:
+            return {'success': False, 'error': '房间不存在'}
+        path = getattr(room, 'record_output_path', '')
+        if not path or not os.path.isfile(path):
+            return {'success': False, 'error': '该房间没有录制文件'}
 
-        # 列表导出携带的墙钟快照（优先于房间当前 mark_*_wallclock）
-        mark_in_wallclock = data.get('mark_in_wallclock')
-        mark_out_wallclock = data.get('mark_out_wallclock')
-        recording_start_mono = data.get('recording_start_mono')
-        recording_media_start_mono = data.get('recording_media_start_mono')
-        use_room_marks = bool(data.get('use_room_marks', False))
-        content_offset = data.get('content_offset', None)
+        def _render() -> list[str | None]:
+            import cv2
 
-        _log.info("导出切片: room_id=%s, start=%.2f, end=%.2f, label=%s, preset=%s, job_id=%s, operation_id=%s",
-                  room_id, start_sec, end_sec, label, preset_id, job_id, operation_id)
+            from lsc.analyzer.valorant_ocr_rounds import extract_frames_cancellable
+            cfg = load_config()
+            ffmpeg_path = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+            frames: list[str | None] = []
+            for pt in (start, (start + end) / 2.0, end):
+                t0 = max(0.0, pt - 0.4)
+                got = extract_frames_cancellable(
+                    video_path=path,
+                    start_sec=t0,
+                    end_sec=t0 + 0.8,
+                    fps=1,
+                    ffmpeg_path=ffmpeg_path,
+                    overlap_sec=0.0,
+                )
+                if not got:
+                    frames.append(None)
+                    continue
+                ok, buf = cv2.imencode(
+                    '.jpg', got[0][1], [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+                )
+                frames.append(base64.b64encode(buf.tobytes()).decode('ascii') if ok else None)
+            return frames
 
-        result = await queue_export(
-            room_id, start_sec, end_sec, label, preset_id, source, job_id,
-            mark_in_wallclock=mark_in_wallclock,
-            mark_out_wallclock=mark_out_wallclock,
-            recording_start_mono=recording_start_mono,
-            recording_media_start_mono=recording_media_start_mono,
-            use_room_marks=use_room_marks,
-            content_offset=content_offset,
+        frames = await asyncio.get_running_loop().run_in_executor(
+            _recording_executor, _render
         )
-
-        if result.get('error'):
-            return {'success': False, 'error': result['error'], 'operation_id': operation_id}
-        return {
-            'success': True,
-            'job_id': result['job_id'],
-            'operation_id': operation_id,
-            'queued': True,
-            'precision': result.get('precision'),
-        }
+        return {'success': True, 'frames': frames, 'start': start, 'end': end}
 
     @server.on('cancel_export')
     async def handle_cancel_export(data):
@@ -4595,7 +4499,7 @@ def register_room_handlers(server, bridge):
 
         def _preview():
             if enabled:
-                return manager.start_preview(room_id, mode=mode)
+                return manager.start_preview(room_id, mode=mode)  # type: ignore[call-arg]
             manager.stop_preview(room_id)
             return True
 
@@ -4632,6 +4536,20 @@ def register_room_handlers(server, bridge):
                     return _mse_preview_success_response(
                         room_id, data, note='already streaming, init replayed',
                     )
+            # §7.3.3 硬上限：预览最多 4 路（MSE 为前端唯一预览路径，原上限检查仅存于
+            # 已弃用的 mpv 路径 orchestrator.start_preview）。已在运行的重发 init 提前
+            # return 不占新进程；此处仅拦截「新启动」。
+            max_previews = _get_configured_max_previews()
+            if _preview_stream_registry().active_count() >= max_previews:
+                _log.warning(
+                    "预览数已达上限 (%d)，拒绝启动 MSE 预览: room_id=%s",
+                    max_previews, room_id,
+                )
+                return {
+                    'success': False,
+                    'room_id': room_id,
+                    'error': f'预览数已达上限 ({max_previews})，请先关闭其它预览',
+                }
             try:
                 shared_enabled = bool(getattr(load_config(), 'shared_ingest_enabled', False))
             except Exception as exc:
@@ -4646,12 +4564,14 @@ def register_room_handlers(server, bridge):
                 ):
                     loop = asyncio.get_running_loop()
                     shared_handle = None
+                    if shared_ingest is None:  # 类型收窄守卫（替代 assert，-O 模式不失效）
+                        return {'success': False, 'error': '共享进样实例不可用'}
                     try:
                         if force_restart:
                             # 停止旧预览 FFmpeg 以应用新画质参数
                             def _stop_preview_sink():
                                 try:
-                                    shared_ingest.stop_preview_sink()
+                                    shared_ingest.stop_preview_sink()  # type: ignore[union-attr]
                                 except Exception as exc:
                                     _log.debug("stop_preview_sink 失败: %s", exc)
                             await asyncio.get_running_loop().run_in_executor(_bridge_executor, _stop_preview_sink)
@@ -4666,7 +4586,7 @@ def register_room_handlers(server, bridge):
                             on_media_segment=lambda seg: _push_mse_segment(
                                 srv, loop, 'mse_segment', room_id, seg
                             ),
-                            on_error=lambda err: asyncio.run_coroutine_threadsafe(
+                            on_error=lambda err: asyncio.run_coroutine_threadsafe(  # type: ignore[arg-type]
                                 _shared_mse_on_error(room_id, err, loop), loop
                             ),
                         )
@@ -4677,8 +4597,8 @@ def register_room_handlers(server, bridge):
                                 preview_params = _compute_preview_quality_params(data)
                                 valid_keys = {'width', 'height', 'use_nvenc', 'video_bitrate', 'crf_value', 'fps'}
                                 filtered = {k: v for k, v in preview_params.items() if k in valid_keys}
-                                shared_ingest.configure_preview(**filtered)
-                                return shared_ingest.start_preview(**filtered)
+                                shared_ingest.configure_preview(**filtered)  # type: ignore[union-attr]
+                                return shared_ingest.start_preview(**filtered)  # type: ignore[union-attr]
                             try:
                                 result = await asyncio.get_running_loop().run_in_executor(_bridge_executor, _start_preview_sink)
                                 if not getattr(result, 'ok', False):
@@ -4720,23 +4640,27 @@ def register_room_handlers(server, bridge):
                     loop = asyncio.get_running_loop()
                     shared_handle = None
                     try:
+                        # 提前定义，供首次启动和 code=0 重试共用
+                        settings = load_settings()
+                        preview_quality = (data or {}).get('preview_quality') or settings.get('preview_quality', '高清')
+
+                        def _read_shared_snapshot():
+                            room = mgr.get_room(room_id)
+                            if room is None:
+                                return None
+                            return {
+                                'is_connected': room.is_connected,
+                                'stream_url': room.stream_info.stream_url if room.stream_info else '',
+                                'headers': (room.stream_info.headers if room.stream_info else None) or {},
+                                'quality_urls': (room.stream_info.quality_urls if room.stream_info else {}),
+                            }
+
                         if shared_ingest is None or getattr(shared_ingest, 'is_stopped', True):
                             refresh_ok = await asyncio.get_running_loop().run_in_executor(
                                 _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=False)
                             )
                             if not refresh_ok:
                                 raise RuntimeError("stream url refresh failed")
-
-                            def _read_shared_snapshot():
-                                room = mgr.get_room(room_id)
-                                if room is None:
-                                    return None
-                                return {
-                                    'is_connected': room.is_connected,
-                                    'stream_url': room.stream_info.stream_url if room.stream_info else '',
-                                    'headers': (room.stream_info.headers if room.stream_info else None) or {},
-                                    'quality_urls': (room.stream_info.quality_urls if room.stream_info else {}),
-                                }
 
                             snapshot = await asyncio.get_running_loop().run_in_executor(
                                 _bridge_executor, lambda: bridge.manager.call(_read_shared_snapshot)
@@ -4745,8 +4669,6 @@ def register_room_handlers(server, bridge):
                                 raise RuntimeError("room is not connected or has no stream url")
 
                             stream_url = snapshot['stream_url']
-                            settings = load_settings()
-                            preview_quality = (data or {}).get('preview_quality') or settings.get('preview_quality', '高清')
                             quality_urls = snapshot.get('quality_urls') or {}
                             if quality_urls:
                                 selected_url, _selected_key = select_quality(
@@ -4769,7 +4691,40 @@ def register_room_handlers(server, bridge):
                             shared_ingest.configure_preview(**filtered)
                             result = shared_ingest.start_preview(**filtered)
                             if not getattr(result, 'ok', False):
-                                raise RuntimeError(getattr(result, 'error', '') or "shared preview start failed")
+                                first_error = getattr(result, 'error', '') or "shared preview start failed"
+                                # code=0 表示 CDN 返回空响应（虎牙反爬签名过期），强制刷新流地址后重试一次
+                                if 'code=0' in first_error:
+                                    _log.info(
+                                        "shared preview code=0, force-refreshing stream URL: room_id=%s",
+                                        room_id,
+                                    )
+                                    _stop_idle_shared_ingest(room_id, reason="code=0 retry")
+                                    retry_refresh = await asyncio.get_running_loop().run_in_executor(
+                                        _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=True)
+                                    )
+                                    if retry_refresh:
+                                        retry_snapshot = await asyncio.get_running_loop().run_in_executor(
+                                            _bridge_executor, lambda: bridge.manager.call(_read_shared_snapshot)
+                                        )
+                                        if retry_snapshot and retry_snapshot.get('stream_url'):
+                                            retry_url = retry_snapshot['stream_url']
+                                            retry_quality_urls = retry_snapshot.get('quality_urls') or {}
+                                            if retry_quality_urls:
+                                                sel_url, _ = select_quality(
+                                                    {'qualityUrls': retry_quality_urls, 'streamUrl': retry_url, 'selectedQuality': ''},
+                                                    preview_quality,
+                                                )
+                                                if sel_url:
+                                                    retry_url = sel_url
+                                            shared_ingest = _shared_ingests.get_or_create(
+                                                room_id,
+                                                url=retry_url,
+                                                headers=retry_snapshot.get('headers') or {},
+                                            )
+                                            shared_ingest.configure_preview(**filtered)
+                                            result = shared_ingest.start_preview(**filtered)
+                                if not getattr(result, 'ok', False):
+                                    raise RuntimeError(getattr(result, 'error', '') or first_error)
 
                         _configure_shared_preview_quality(shared_ingest, data)
                         shared_handle = _attach_shared_preview_handle(room_id, shared_ingest, loop)
@@ -4876,7 +4831,7 @@ def register_room_handlers(server, bridge):
 
                 # 读取预览画质预设（优先消息传入的 preview_quality，回退到全局设置）
                 settings = load_settings()
-                preview_quality = data.get('preview_quality') or settings.get('preview_quality', '高清')
+                preview_quality = data.get('preview_quality') or settings.get('preview_quality', '高清')  # type: ignore[union-attr]
 
                 # 根据用户选择的预览画质，从 quality_urls 中挑选对应画质的流地址
                 quality_urls = snapshot.get('quality_urls') or {}
@@ -4912,6 +4867,27 @@ def register_room_handlers(server, bridge):
                     """
                     _log.info("MSE error for room %s: %s", room_id, err)
 
+                    # 启动期忽略：与 shared 版一致，_handle_mse_preview 启动
+                    # （含硬解→软解回退）期间的 on_error 由启动流程统一处理，
+                    # 避免重连循环与软解重试并行创建两个 FFmpeg 进程
+                    if room_id in _mse_starting:
+                        _log.debug(
+                            "MSE error during startup, ignored (room=%s): %s",
+                            room_id, err,
+                        )
+                        return
+
+                    # 0. 防重入：退避等待期间新 on_error 可能再次触发本函数，
+                    #    并发循环会各自启动 FFmpeg 进程；由在途循环接管，直接返回
+                    prev_state = _mse_reconnect_state.get(room_id)
+                    if prev_state and prev_state.get('running'):
+                        _log.info(
+                            "MSE reconnect loop already running for room %s, "
+                            "ignoring duplicate error: %s", room_id, err,
+                        )
+                        return
+                    _mse_reconnect_state[room_id] = {'attempts': 0, 'running': True}
+
                     # 1. 从 _mse_streamers 移除并停止已失效的 streamer（仅首次执行）
                     old_streamer = _preview_stream_registry().pop(room_id)
                     if old_streamer is not None:
@@ -4926,6 +4902,7 @@ def register_room_handlers(server, bridge):
 
                     async def _finalize_mse_error(error_text: str, reason: str, timeline_reason: str) -> None:
                         _mse_reconnect_state.pop(room_id, None)
+                        _mse_live_phase.discard(room_id)
                         await srv.broadcast('mse_error', {
                             'room_id': room_id,
                             'error': error_text,
@@ -5140,15 +5117,15 @@ def register_room_handlers(server, bridge):
                                     height=r_height,
                                     fps=r_fps,
                                     headers=r_headers or None,
-                                    video_bitrate=r_bitrate,
-                                    crf_value=r_crf,
-                                    on_init_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                                    video_bitrate=r_bitrate,  # type: ignore[arg-type]
+                                    crf_value=r_crf,  # type: ignore[arg-type]
+                                    on_init_segment=lambda seg, _room_id=room_id: _push_mse_segment(  # type: ignore[misc]
                                         srv, loop, 'mse_init', _room_id, seg
                                     ),
-                                    on_media_segment=lambda seg, _room_id=room_id: _push_mse_segment(
+                                    on_media_segment=lambda seg, _room_id=room_id: _push_mse_segment(  # type: ignore[misc]
                                         srv, loop, 'mse_segment', _room_id, seg
                                     ),
-                                    on_error=lambda e, _room_id=room_id: asyncio.run_coroutine_threadsafe(
+                                    on_error=lambda e, _room_id=room_id: asyncio.run_coroutine_threadsafe(  # type: ignore[misc,arg-type]
                                         _on_mse_error(_room_id, e, loop), loop
                                     ),
                                 )
@@ -5179,6 +5156,7 @@ def register_room_handlers(server, bridge):
 
                         if success:
                             _mse_reconnect_state.pop(room_id, None)
+                            _mse_live_phase.discard(room_id)
                             _log.info("MSE reconnect succeeded for room %s", room_id)
 
                             def _rotate_epoch_on_reconnect():
@@ -5235,7 +5213,7 @@ def register_room_handlers(server, bridge):
                             on_media_segment=lambda seg: _push_mse_segment(
                                 srv, loop, 'mse_segment', room_id, seg
                             ),
-                            on_error=lambda err: asyncio.run_coroutine_threadsafe(
+                            on_error=lambda err: asyncio.run_coroutine_threadsafe(  # type: ignore[arg-type]
                                 _on_mse_error(room_id, err, loop), loop
                             ),
                         )
@@ -5304,14 +5282,17 @@ def register_room_handlers(server, bridge):
                     if leak_streamer is not None:
                         try:
                             leak_streamer.stop()
-                        except Exception as exc:
-                            _log.debug("停止泄漏 streamer 失败 (cleanup): %s", exc)
+                        except Exception as stop_exc:
+                            _log.debug("停止泄漏 streamer 失败 (cleanup): %s", stop_exc)
                         _stop_idle_shared_ingest(room_id, reason="preview state sync failed")
                     return {'success': False, 'room_id': room_id, 'error': f'预览状态同步失败：{exc}'}
 
                 _mse_reconnect_state.pop(room_id, None)
+                # streaming phase 由首个 init 段到达时广播（_push_mse_segment），
+                # 此处仅重置 live 标志；启动期间 phase 保持 probing，避免
+                # 前端 watchdog 在流未连通时误触发重连
+                _mse_live_phase.discard(room_id)
                 _broadcast_rooms()
-                await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'streaming'})
                 return _mse_preview_success_response(room_id, data, note='mse streaming started')
             finally:
                 with _mse_starting_lock:
@@ -5335,6 +5316,7 @@ def register_room_handlers(server, bridge):
 
             await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_disable))
             _mse_reconnect_state.pop(room_id, None)
+            _mse_live_phase.discard(room_id)
             _clear_mse_push_paused(room_id)
             _broadcast_rooms()
             _log.info("MSE 预览已停止: room_id=%s", room_id)
@@ -5431,17 +5413,22 @@ def register_room_handlers(server, bridge):
             return {'success': False, 'error': '该房间正在持续分析中，请先停止持续分析'}
         _log.info("启动分析: room_id=%s, mode=%s, threshold=%.2f", room_id, mode, threshold)
 
+        # 冲突检查通过后立即登记，消除「检查 → executor 内登记」的跨线程窗口：
+        # 否则两个并发 start_analysis 都能通过检查，后登记覆盖先登记导致双任务并行。
+        with _analysis_jobs_lock:
+            _analysis_jobs[room_id] = {"progress": 0.0, "highlights": [], "mode": mode, "cancelled": False}
+
         def _do_analysis():
             room = manager.get_room(room_id)
             if room is None:
+                _clear_analysis_job(room_id)
                 return {'success': False, 'error': '房间不存在'}
             if not room.record_output_path or not os.path.isfile(room.record_output_path):
+                _clear_analysis_job(room_id)
                 return {'success': False, 'error': '录制文件不存在'}
 
             video_path = room.record_output_path
             t0 = time.monotonic()
-            with _analysis_jobs_lock:
-                _analysis_jobs[room_id] = {"progress": 0.0, "highlights": [], "mode": mode, "cancelled": False}
 
             # 进度回调与取消检查（scene 和 AI 模式共用，P0-4）
             def _progress_cb(stage, progress, detail):
@@ -5500,6 +5487,11 @@ def register_room_handlers(server, bridge):
                 'success': False,
                 'error': f'分析超时（{_timeout}s），可能模型下载卡住或视频过长。请检查网络后重试。',
             }
+        except Exception as exc:
+            # 分析内部异常：清理登记，避免前端「分析中」永久卡死
+            _clear_analysis_job(room_id)
+            _log.error("分析执行异常: room_id=%s, mode=%s: %s", room_id, mode, exc, exc_info=True)
+            return {'success': False, 'error': f'分析执行失败: {exc}'}
         return result
 
     @server.on('start_analysis_export')
@@ -5555,7 +5547,7 @@ def register_room_handlers(server, bridge):
                 return {'success': False, 'error': error}
 
             # 3. 高光分析主房间（复用 scene/AI 分析逻辑）
-            video_path = main_room.record_output_path
+            video_path = main_room.record_output_path  # type: ignore[union-attr]
             t0 = time.monotonic()
             with _analysis_jobs_lock:
                 _analysis_jobs[main_room_id] = {"progress": 0.0, "highlights": [], "mode": mode, "cancelled": False}
@@ -5722,10 +5714,43 @@ def register_room_handlers(server, bridge):
     _exported_clip_ids: dict[str, None] = {}  # 已真正导出 / 入导出队列（保序、有界）
     _listed_clip_ids: dict[str, None] = {}  # 已向切片列表广播过的 room:round_key（保序、有界）
     _listed_clip_bounds: dict[str, tuple[float, float, str]] = {}  # listed_key -> (start, end, status)
+    _deleted_clip_keys: dict[str, None] = {}  # 用户删除的 listed_key（tombstone，防止 OCR upsert 复活）
     _refined_round_keys: set[str] = set()  # 精修中或已确认的 round_key（OCR 不得改边界）
     # 保护 _refined_round_keys 的锁：asyncio handler 与分析 executor 线程
     # 均会并发读写（#102），无锁可导致重复导出或 OCR 误改冻结边界
     _refined_round_keys_lock = threading.Lock()
+
+    def _remember_continuous_listed_clip(payload: dict[str, Any]) -> None:
+        """Keep an authoritative clip snapshot for WS reconnect/reload recovery."""
+        room_id = str(payload.get("room_id") or "")
+        if not room_id:
+            return
+        snapshot_key = f"{room_id}:{payload.get('round_key') or payload.get('clip_id') or ''}"
+        with _analysis_jobs_lock:
+            if snapshot_key in _deleted_clip_keys:
+                return
+            snapshots: dict[str, dict[str, Any]] | None = None
+            for task_state in _continuous_tasks.values():
+                target_ids = task_state.get("target_room_ids") or []
+                if room_id not in target_ids:
+                    continue
+                snapshots = task_state.setdefault("listed_clips", {})
+                break
+            if snapshots is None:
+                # 同步分析（start_analysis_export）无 _continuous_tasks 条目，记到
+                # _analysis_jobs 任务状态，供断连后 get_analysis_status 恢复。
+                for job_state in _analysis_jobs.values():
+                    target_ids = job_state.get("target_room_ids") or []
+                    if room_id not in target_ids:
+                        continue
+                    snapshots = job_state.setdefault("listed_clips", {})
+                    break
+            if snapshots is None:
+                return
+            snapshots[snapshot_key] = dict(payload)
+            if len(snapshots) > 512:
+                for stale_key in list(snapshots)[:256]:
+                    snapshots.pop(stale_key, None)
 
     async def _auto_export_highlights(main_room, target_rooms, highlights, job_prefix, preset_id='',
                                       defer_export: bool = True,
@@ -5803,6 +5828,7 @@ def register_room_handlers(server, bridge):
                         exported_ids=_exported_clip_ids,
                         refined_keys=refined_snapshot,
                         listed_bounds=_listed_clip_bounds,
+                        deleted_keys=_deleted_clip_keys,
                     )
                     if action == "skip":
                         continue
@@ -5816,9 +5842,7 @@ def register_room_handlers(server, bridge):
                     _bounded_clip_key_add(_listed_clip_ids, listed_key)
                     _bounded_clip_key_add(_listed_clip_bounds, listed_key, (start_r, end_r, confirm_status))
                     submitted_jobs.add((round_key, rid))
-                    bridge.queue_broadcast({
-                        'type': 'clip_queued',
-                        'data': {
+                    clip_payload = {
                             'clip_id': clip_id,
                             'job_id': job_id,
                             'room_id': rid,
@@ -5831,7 +5855,11 @@ def register_room_handlers(server, bridge):
                             'round_key': round_key,
                             'upsert': action == "upsert",
                             **_hybrid_clip_metadata(hl),
-                        },
+                    }
+                    _remember_continuous_listed_clip(clip_payload)
+                    bridge.queue_broadcast({
+                        'type': 'clip_queued',
+                        'data': clip_payload,
                     })
                     _log.info(
                         "仅入列(%s): room=%s, round_key=%s, status=%s, %.1f-%.1f",
@@ -5923,7 +5951,7 @@ def register_room_handlers(server, bridge):
         """压力缓解或收尾时，把延后队列真正送进导出 worker。"""
         if not _deferred_export_jobs:
             return 0
-        pressure = get_resource_pressure()
+        pressure = _analysis_pressure()
         if not force and (
             pressure.get('pause_analysis')
             or pressure.get('level') == 'critical'
@@ -6011,426 +6039,12 @@ def register_room_handlers(server, bridge):
             vertical_crop=vertical_crop,
         )
 
-    async def _process_export_job(job):
-        """处理单个导出任务 — orchestrator.call 提交到编排线程，等待 FFmpeg 完成后才返回。
-
-        done_event 在两种情况下被 set：
-        1. manager.start_export 启动失败（无 clip_id）→ 立即 set，不启动 FFmpeg
-        2. FFmpeg 导出完成（on_done 回调）→ 异步 set
-        这保证队列中下一个任务必须等上一个 FFmpeg 完成后才开始。
-        """
-        room_id = job['room_id']
-        export_start = job['start']
-        export_end = job['end']
-        label = job['label']
-        output_dir = job['output_dir']
-        profile = job['profile']
-        job_id = job['job_id']
-        _set_export_job_state(
-            job_id,
-            'exporting',
-            room_id=room_id,
-            label=label,
-            percent=0.0,
-        )
-
-        # A job can spend time waiting for the global semaphore.  Notify the
-        # client only after a worker has actually claimed it, so queued cards
-        # are not mistaken for active FFmpeg exports.
-        await server.broadcast('clip_export_started', {
-            'room_id': room_id,
-            'job_id': job_id,
-        })
-
-        loop = asyncio.get_running_loop()
-        done_event = asyncio.Event()
-        result = {'success': False, 'clip_id': '', 'error': ''}
-
-        def on_done(success, output_path, error, size_mb, thumbnail_path):
-            """FFmpeg 导出完成的回调（编排线程）。"""
-            with _export_jobs_lock:
-                export_jobs.pop(job_id, None)
-            if success:
-                _set_export_job_state(
-                    job_id,
-                    'completed',
-                    room_id=room_id,
-                    label=label,
-                    percent=100.0,
-                    output_path=output_path,
-                    thumbnail_path=thumbnail_path or '',
-                    size_mb=float(size_mb or 0.0),
-                    error='',
-                )
-                asyncio.run_coroutine_threadsafe(server.broadcast('clip_completed', {
-                    'room_id': room_id, 'start': export_start, 'end': export_end,
-                    'label': label, 'room_name': job.get('room_name', ''),
-                    'thumbnail_path': thumbnail_path or '', 'output_path': output_path,
-                    'job_id': job_id,
-                }), loop)
-                # P2-2: 批量导出总体进度
-                _notify_export_overall(bridge, success=True)
-            else:
-                _set_export_job_state(
-                    job_id,
-                    'failed',
-                    room_id=room_id,
-                    label=label,
-                    error=error or '导出失败',
-                )
-                asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
-                    'room_id': room_id, 'job_id': job_id,
-                    'error': error or '导出失败',
-                }), loop)
-                # P2-2: 批量导出总体进度
-                _notify_export_overall(bridge, success=False)
-            loop.call_soon_threadsafe(done_event.set)
-
-        def on_progress(percent, elapsed, total):
-            _set_export_job_state(
-                job_id,
-                'exporting',
-                room_id=room_id,
-                label=label,
-                percent=float(percent),
-                elapsed=float(elapsed),
-                total=float(total),
-            )
-            asyncio.run_coroutine_threadsafe(server.broadcast('export_progress', {
-                'room_id': room_id, 'job_id': job_id,
-                'percent': float(percent), 'elapsed': float(elapsed), 'total': float(total),
-            }), loop)
-
-        def _run_export():
-            """在编排线程提交导出（通过 orchestrator.call 调用）。"""
-            try:
-                clip_id = manager.start_export(
-                    room_id, export_start, export_end,
-                    output_dir=output_dir, title=label,
-                    profile=profile, on_done=on_done, on_progress=on_progress,
-                )
-                result['clip_id'] = clip_id or ''
-                if not clip_id:
-                    # 启动失败：立即结束，不等待 FFmpeg
-                    room = manager.get_room(room_id)
-                    controller = None if room is None else room.controller
-                    result['error'] = getattr(controller, '_last_export_error', '') or '导出启动失败'
-                    loop.call_soon_threadsafe(done_event.set)
-                else:
-                    result['success'] = True
-                    # 在编排线程内立即注册，缩小 cancel 窗口期
-                    with _export_jobs_lock:
-                        state = _export_job_states.get(job_id) or {}
-                        if state.get('status') not in {'completed', 'failed', 'cancelled'}:
-                            export_jobs[job_id] = clip_id
-                    # 成功启动：等待 on_done 回调中 set event
-            except Exception as exc:
-                result['error'] = str(exc)
-                loop.call_soon_threadsafe(done_event.set)
-
-        await loop.run_in_executor(_bridge_executor, lambda: bridge.manager.call(_run_export))
-
-        if result['error']:
-            _set_export_job_state(
-                job_id,
-                'failed',
-                room_id=room_id,
-                label=label,
-                error=result['error'] or '导出启动失败',
-            )
-            _log.error("导出任务失败: room=%s, job=%s, error=%s", room_id, job_id, result['error'])
-            await server.broadcast('clip_failed', {
-                'room_id': room_id, 'job_id': job_id,
-                'error': result['error'] or '导出启动失败',
-            })
-
-        # 等待 FFmpeg 实际完成（通过 on_done 回调 set event）
-        await done_event.wait()
-
-    async def _export_queue_worker():
-        """常驻 worker 消费循环；并发由 _export_semaphore 控制（动态跟随 settings）。"""
-        global _export_in_flight
-        while True:
-            job = await _export_queue.get()
-            job_id = job.get('job_id', '')
-            # 检查是否已被取消（在排队期间被前端取消）
-            if job_id and job_id in _export_cancelled_jobs:
-                _export_cancelled_jobs.discard(job_id)
-                _export_queue.task_done()
-                room_id = job.get('room_id', '')
-                _set_export_job_state(job_id, 'cancelled', room_id=room_id, error='导出已取消')
-                asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
-                    'room_id': room_id, 'job_id': job_id, 'error': '导出已取消',
-                }), asyncio.get_running_loop())
-                continue
-            try:
-                async with _export_semaphore:
-                    with _export_stats_lock:
-                        _export_in_flight += 1
-                    try:
-                        await _process_export_job(job)
-                    finally:
-                        with _export_stats_lock:
-                            _export_in_flight -= 1
-            except Exception as exc:
-                _log.error("导出队列异常：%s", exc, exc_info=True)
-                if job_id:
-                    with _export_jobs_lock:
-                        export_jobs.pop(job_id, None)
-                    room_id = job.get('room_id', '')
-                    _set_export_job_state(
-                        job_id,
-                        'failed',
-                        room_id=room_id,
-                        error=f'导出异常：{exc}',
-                    )
-                    asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
-                        'room_id': room_id, 'job_id': job_id, 'error': f'导出异常：{exc}',
-                    }), asyncio.get_running_loop())
-            finally:
-                _export_queue.task_done()
-
-    async def _ensure_export_queue():
-        """确保全局导出队列和常驻 worker 已初始化；同步 semaphore 并发上限（热更新）。"""
-        global _export_queue, _EXPORT_WORKERS, _export_semaphore, _export_semaphore_limit
-        async with _export_queue_lock:
-            if _export_queue is None:
-                _export_queue = asyncio.Queue(maxsize=100)  # #100 cap
-            # 热更新：按已记录的配置上限比较，避免读取 Semaphore._waiters
-            #（空闲时 _waiters 可为 None，调用 __len__ 会抛 NoneType 错误）
-            desired = _get_export_max_concurrent()
-            if _export_semaphore_limit != desired:
-                # 仅在队列为空且无在途导出时替换 semaphore，避免 empty() 误判
-                # （job 已出队、worker 正持有旧 permit 处理 FFmpeg 时队列可为空）
-                if _export_queue.empty() and _export_in_flight == 0:
-                    _export_semaphore = asyncio.Semaphore(desired)
-                    _export_semaphore_limit = desired
-                    _log.info("导出并发上限已更新: %d", desired)
-                else:
-                    _log.warning(
-                        "导出并发上限变更(%d->%d)延迟生效：队列非空或有在途任务(in_flight=%d)，"
-                        "待清空后下次 _ensure_export_queue 再替换",
-                        _export_semaphore_limit, desired, _export_in_flight,
-                    )
-            # 清理已结束的 worker，补充到常驻池大小
-            _EXPORT_WORKERS[:] = [t for t in _EXPORT_WORKERS if not t.done()]
-            _purge_stale_analysis_jobs()
-            while len(_EXPORT_WORKERS) < _MAX_EXPORT_WORKERS:
-                _EXPORT_WORKERS.append(asyncio.create_task(_export_queue_worker()))
-            if len(_EXPORT_WORKERS) == _MAX_EXPORT_WORKERS:
-                _log.debug("导出队列 worker 池已就绪: %d 个 worker, 并发=%d",
-                           len(_EXPORT_WORKERS), desired)
-
-    async def queue_export(room_id, start_sec, end_sec, label='clip', preset_id='',
-                          source='', job_id='',
-                          mark_in_wallclock=None, mark_out_wallclock=None,
-                          recording_start_mono=None, recording_media_start_mono=None,
-                          use_room_marks=False, content_offset=None):
-        """统一导出入口：校验参数、计算时间映射、构建 profile、入队。
-
-        所有导出路径（手动/自动/分析/clip_id）均通过此函数入队，
-        保证全局同时最多 _EXPORT_MAX_CONCURRENT 个 FFmpeg 导出进程。
-
-        时间映射优先级（§2.1）：
-        1. source == 'ai_highlight' → 直接使用传入 start/end（忽略快照）
-        2. 请求携带 mark_in/out_wallclock + recording_*_mono 快照 → 精确映射
-        3. use_room_marks=True → 使用房间当前 mark_*_wallclock（仅「导当前选区」）
-        4. 否则 → start/end + content_offset，precision=approximate
-        """
-        if not room_id:
-            return {'error': 'room_id is required'}
-        if start_sec >= end_sec:
-            return {'error': '入点必须早于出点'}
-
-        await _ensure_export_queue()
-
-        room = manager.get_room(room_id)
-        if room is None:
-            return {'error': '房间不存在'}
-
-        room_name = getattr(room, 'streamer_name', '') or room_id
-        # 优先使用切片入队时的 content_offset 快照，避免重对齐改变历史切片
-        if content_offset is not None:
-            try:
-                content_offset = float(content_offset)
-            except (TypeError, ValueError):
-                content_offset = float(getattr(room, 'content_offset', 0.0) or 0.0)
-        else:
-            content_offset = float(getattr(room, 'content_offset', 0.0) or 0.0)
-
-        # 请求快照字段（列表导出时由前端 handleAddClip 快照写入）
-        snap_in = mark_in_wallclock
-        snap_out = mark_out_wallclock
-        snap_rec = recording_media_start_mono if recording_media_start_mono is not None else recording_start_mono
-        # 兼容字符串/None：_safe_float 风格的宽松转换
-        if snap_in is not None:
-            try:
-                snap_in = float(snap_in)
-            except (TypeError, ValueError):
-                snap_in = None
-        if snap_out is not None:
-            try:
-                snap_out = float(snap_out)
-            except (TypeError, ValueError):
-                snap_out = None
-        if snap_rec is not None:
-            try:
-                snap_rec = float(snap_rec)
-            except (TypeError, ValueError):
-                snap_rec = None
-
-        room_mark_in = getattr(room, 'mark_in_wallclock', None)
-        room_mark_out = getattr(room, 'mark_out_wallclock', None)
-        room_rec_start = (
-            getattr(room, 'recording_media_start_mono', None)
-            or getattr(room, 'recording_start_mono', None)
-        )
-
-        export_start, export_end, precision = _resolve_export_range(
-            start_sec,
-            end_sec,
-            source=source,
-            content_offset=content_offset,
-            snap_in=snap_in,
-            snap_out=snap_out,
-            snap_rec=snap_rec,
-            use_room_marks=use_room_marks,
-            room_mark_in=room_mark_in,
-            room_mark_out=room_mark_out,
-            room_rec_start=room_rec_start,
-        )
-
-        if precision == 'approximate':
-            if use_room_marks:
-                _log.warning(
-                    "导出降级：use_room_marks 但墙钟不可用，使用 start/end "
-                    "(room=%s, start=%.2f, end=%.2f)",
-                    room_id, export_start, export_end,
-                )
-            else:
-                missing = []
-                if snap_in is None:
-                    missing.append('mark_in_wallclock')
-                if snap_out is None:
-                    missing.append('mark_out_wallclock')
-                if snap_rec is None:
-                    missing.append('recording_*_mono')
-                any_present = (
-                    snap_in is not None
-                    or snap_out is not None
-                    or snap_rec is not None
-                )
-                if any_present:
-                    _log.warning(
-                        "导出降级：部分墙钟快照缺失，降级 missing=%s "
-                        "(room=%s, start=%.2f, end=%.2f)",
-                        missing, room_id, export_start, export_end,
-                    )
-                else:
-                    _log.warning(
-                        "导出降级：无墙钟快照，使用 start/end "
-                        "(room=%s, start=%.2f, end=%.2f)",
-                        room_id, export_start, export_end,
-                    )
-
-        if export_start >= export_end:
-            return {'error': '导出时间范围无效（入点>=出点）'}
-
-        settings = load_settings()
-        profile = _build_export_profile(settings, preset_id)
-        output_dir = _expand_user_path(
-            settings.get('output_dir', os.path.join(os.path.expanduser('~'), 'LSC', 'output'))
-        )
-
-        if not job_id:
-            job_id = f"q-{int(time.time() * 1000)}-{room_id[:6]}"
-
-        job = {
-            'room_id': room_id, 'start': export_start, 'end': export_end,
-            'label': label, 'output_dir': output_dir, 'profile': profile,
-            'job_id': job_id, 'room_name': room_name,
-        }
-        try:
-            _export_queue.put_nowait(job)
-        except asyncio.QueueFull:
-            _log.warning("导出队列已满: room=%s, job=%s, qsize=%d",
-                         room_id, job_id, _export_queue.qsize())
-            return {'success': False, 'error': '导出队列已满，请稍后重试'}
-        _set_export_job_state(
-            job_id,
-            'queued',
-            room_id=room_id,
-            label=label,
-            percent=0.0,
-        )
-        _log.debug("导出已入队: room=%s, job=%s, %.1f-%.1f, precision=%s, queue_size=%d",
-                   room_id, job_id, export_start, export_end, precision, _export_queue.qsize())
-        return {'success': True, 'queued': True, 'job_id': job_id, 'precision': precision}
-
-    async def _probe_for_buy_signal(
-        room_id: str,
-        video_path: str,
-        current_dur: float,
-        probe_frames: int,
-    ) -> bool:
-        """P3: 卡死保护暂停期间的轻量探测 — 抽几帧检测是否有 buy 信号。
-
-        仅用做「是否恢复」的判断，不做完整回合检测。返回 True 表示检测到 buy 类信号。
-        """
-        try:
-            if not video_path or current_dur < 5.0:
-                return False
-            from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
-            # 取当前录制末尾的一小段做探测（最可能有新对局）
-            _probe_start = max(0.0, current_dur - 15.0)
-            _probe_end = current_dur
-            # 临时抽 probe_frames 帧
-            from lsc.analyzer.round_detector import extract_frames_cancellable
-            from lsc.config import load_config as _load_cfg_probe
-            _cfg_probe = _load_cfg_probe()
-            _ffmpeg_path = _cfg_probe.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
-            frames = extract_frames_cancellable(
-                video_path,
-                start_sec=_probe_start,
-                end_sec=_probe_end,
-                fps=probe_frames / 15.0,  # 在 15s 内均匀抽 probe_frames 帧
-                ffmpeg_path=_ffmpeg_path,
-                cancel_check=None,
-                overlap_sec=0.0,
-            )
-            if not frames:
-                return False
-            # 复用 session 缓存的分类器（避免重复加载模型）
-            with _analysis_jobs_lock:
-                task_state = _continuous_tasks.get(room_id, {})
-            clf = task_state.get('classifier')
-            if clf is None:
-                clf = ValorantFrameClassifier()
-                clf.load()
-            # 批量预测
-            probs_batch = clf.predict_batch([img for _, img in frames])
-            # 检测是否有 buy 类信号（概率 > 0.3 即视为有效信号）
-            # 类别顺序与 valorant_frame_classifier._CLASS_NAMES 一致
-            _buy_threshold = 0.3
-            _class_names = ('non_game', 'buy', 'combat', 'result', 'replay')
-            buy_idx = _class_names.index('buy')  # index 1
-            for probs in probs_batch:
-                if probs[buy_idx] > _buy_threshold:
-                    _log.debug(
-                        "probe_buy_detected ts~%.1f buy_prob=%.2f", current_dur, probs[buy_idx],
-                    )
-                    return True
-            return False
-        except Exception as exc:
-            _log.debug("probe_for_buy_signal 失败: %s", exc)
-            return False
-
     async def _continuous_valorant_worker(
         room_id, mode, game, threshold,
         _continuous_tasks, _analysis_semaphore, _bridge_executor,
         scan_result_container: dict,
     ) -> None:
-        """后台 Worker：连续执行 detect_valorant_rounds_hybrid / detect_rounds_by_audio_rhythm。
+        """后台 Worker：连续执行 detect_valorant_rounds_ocr。
 
         持有 _analysis_semaphore 确保同时只有 1 个 FFmpeg。
         主循环通过 scan_result_container['video_path'] / ['current_dur'] / ['refine_with_ocr']
@@ -6457,12 +6071,10 @@ def register_room_handlers(server, bridge):
                 refine_with_ocr = task_state.get('refine_with_ocr', False)
                 scan_range = task_state.get('scan_range', (0.0, current_dur))
                 scan_timeout = int(task_state.get('scan_timeout', 120))
-                audio_only_recovery = bool(
-                    game == 'valorant'
-                    and mode == 'valorant_round'
-                    and int(task_state.get('ocr_degraded_remaining') or 0) > 0
+                _finalizing = bool(
+                    task_state.get('finalizing') or task_state.get('finalize_pending')
                 )
-                task_state['degraded_mode'] = 'audio_only' if audio_only_recovery else None
+                task_state['degraded_mode'] = None
 
                 if not video_path or current_dur <= 3.0:
                     task_state['scan_requested'] = False
@@ -6480,48 +6092,32 @@ def register_room_handlers(server, bridge):
                     _ocr=refine_with_ocr,
                     _range=scan_range,
                     _mode=mode,
-                    _audio_only=audio_only_recovery,
                 ):
                     from lsc.analyzer.base import ScanWindow
                     from lsc.analyzer.registry import get as get_analyzer
-                    from lsc.config import load_config as _load_cfg_r
-                    _cfg = _load_cfg_r()
+                    _cfg = load_config()
                     _ffmpeg = _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
                     _cancel = _scan_cancel_check
                     plugin = get_analyzer(game)
-                    if _audio_only and game == 'valorant' and _mode == 'valorant_round':
-                        return _detect_rounds_by_audio_rhythm(
-                            _vp,
-                            duration=_dur,
-                            ffmpeg_path=_ffmpeg,
-                            time_range=_range,
-                            cancel_check=_cancel,
-                        )
                     if game == 'valorant' and _mode == 'valorant_round':
-                        from lsc.analyzer.valorant_frame_classifier import ModelContractError
-                        # Production path: detect_valorant_rounds_hybrid via plugin.scan_window
-                        try:
-                            _window = ScanWindow(
-                                start_sec=float(_range[0]),
-                                end_sec=float(_range[1]),
-                                timeout_sec=float(scan_timeout),
-                                use_ocr=bool(_ocr),
-                            )
-                            _scan_state = {
-                                'mode': _mode,
-                                'game': game,
-                                'ffmpeg_path': _ffmpeg,
-                                'model_dir': _resolve_valorant_model_dir(),
-                                'session_id': str(task_state.get('session_id', '') or ''),
-                                'runtime_state': task_state.setdefault('hybrid_runtime_state', {}),
-                                'classifier': task_state.get('classifier'),
-                                'current_dur': _dur,
-                            }
-                            return plugin.scan_window(
-                                _vp, _window, _scan_state, cancel_check=_cancel,
-                            )
-                        except ModelContractError as exc:
-                            raise RuntimeError(f"ModelContractError: {exc}") from exc
+                        _window = ScanWindow(
+                            start_sec=float(_range[0]),
+                            end_sec=float(_range[1]),
+                            timeout_sec=float(scan_timeout),
+                            use_ocr=bool(_ocr),
+                        )
+                        _scan_state = {
+                            'mode': _mode,
+                            'game': game,
+                            'ffmpeg_path': _ffmpeg,
+                            'session_id': str(task_state.get('session_id', '') or ''),
+                            'runtime_state': task_state.setdefault('ocr_runtime_state', {}),
+                            'current_dur': _dur,
+                            'finalize': _finalizing,
+                        }
+                        return plugin.scan_window(
+                            _vp, _window, _scan_state, cancel_check=_cancel,
+                        )
                     return _detect_rounds_by_audio_rhythm(
                         _vp, duration=_dur, ffmpeg_path=_ffmpeg,
                         time_range=_range,
@@ -6560,16 +6156,6 @@ def register_room_handlers(server, bridge):
                                     room_id,
                                 )
                             raise
-                    runtime_state = task_state.get('hybrid_runtime_state') or {}
-                    task_state['model_version'] = runtime_state.get('model_version')
-                    task_state['provider'] = runtime_state.get('provider')
-                    task_state['provider_warning'] = runtime_state.get('provider_warning')
-                    task_state['last_model_inference_frames'] = int(
-                        runtime_state.get('last_inference_frames', 0) or 0
-                    )
-                    task_state['model_inference_frames_total'] = int(
-                        runtime_state.get('inference_frames_total', 0) or 0
-                    )
                     completed_dur = (
                         float(scan_range[1])
                         if game == 'valorant' and mode == 'valorant_round'
@@ -6580,18 +6166,11 @@ def register_room_handlers(server, bridge):
                     scan_result_container['video_path'] = video_path
                     scan_result_container['current_dur'] = completed_dur
                     scan_result_container['completed_at'] = time.time()
-                    scan_result_container['degraded_mode'] = (
-                        'audio_only' if audio_only_recovery else None
-                    )
+                    scan_result_container['degraded_mode'] = None
                     _log.info(
-                        "持续分析 Worker 完成: room_id=%s, %d 回合, "
-                        "model=%s, provider=%s, inference_frames=%d, total_frames=%d",
+                        "持续分析 Worker 完成: room_id=%s, %d 回合",
                         room_id,
                         len(result or []),
-                        task_state.get('model_version'),
-                        task_state.get('provider'),
-                        task_state.get('last_model_inference_frames', 0),
-                        task_state.get('model_inference_frames_total', 0),
                     )
                 except Exception as exc:
                     # TimeoutError 的 str() 常为空，必须用 repr + exc_info
@@ -6622,7 +6201,8 @@ def register_room_handlers(server, bridge):
                         except Exception:
                             _log.debug("scan_done_event.set 失败", exc_info=True)
         except asyncio.CancelledError:
-            pass
+            # 停止持续分析时的正常取消路径；记录以便排查「分析突然停止」
+            _log.debug("持续分析 Worker 被取消: room_id=%s", room_id)
         except Exception as exc:
             _log.error(f"持续分析 Worker 异常退出: room_id={room_id}, {exc}", exc_info=True)
             # 与单次扫描失败一致：写入失败结果并唤醒主循环。否则 scan_requested
@@ -6700,68 +6280,10 @@ def register_room_handlers(server, bridge):
                         return candidate, dur
             return None, 0.0
 
-        def _derive_round_signals(highlights, current_dur_val):
-            """从最新扫描结果推导相位调度器信号。
-
-            OCR 标签（round_start/end）与音频（energy_rise/collapse、chime）交叉验证；
-            禁止用 score 冒充能量信号。
-            """
-            _signals = {
-                'energy_rise': False,
-                'left_buy_ocr': False,
-                'chime': False,
-                'energy_collapse': False,
-                'has_start': False,
-                'has_end': False,
-                'next_buy_seen': False,
-            }
-            if not highlights:
-                return _signals
-            # 取最后 2 个回合（最新回合 + 可能的前一回合）
-            recent = highlights[-2:] if len(highlights) >= 2 else highlights
-            latest = recent[-1]
-            start_by = str(latest.get('start_by', ''))
-            end_by = str(latest.get('end_by', ''))
-            tail_by = str(latest.get('tail_by', ''))
-            phase_val = str(latest.get('phase', ''))
-            # has_start: OCR 或 hybrid 模型可信起点
-            if (
-                start_by in ('ocr_buy_exit', 'ocr', 'model_buy_exit')
-                or latest.get('ocr_confirmed')
-            ):
-                _signals['has_start'] = True
-            # has_end: OCR 或 hybrid 模型可信终点
-            if end_by in ('ocr_result', 'next_buy', 'model_result', 'model_score'):
-                _signals['has_end'] = True
-            # next_buy_seen: 终点由下一买枪确定
-            if end_by == 'next_buy':
-                _signals['next_buy_seen'] = True
-            # chime: 钟声裁尾 → 同时视为能量塌陷
-            if tail_by == 'chime':
-                _signals['chime'] = True
-                _signals['energy_collapse'] = True
-            # left_buy: 最新回合已超越买枪期（OCR / hybrid 起点）
-            if (
-                start_by in ('ocr_buy_exit', 'ocr', 'model_buy_exit')
-                and phase_val not in ('pending', '')
-            ):
-                _signals['left_buy_ocr'] = True
-            # 真实 RMS 信号（round_detector 写入）；缺省时不回退到 score
-            if latest.get('energy_rise') is True:
-                _signals['energy_rise'] = True
-            if latest.get('energy_collapse') is True:
-                _signals['energy_collapse'] = True
-            return _signals
-
         # 初始化任务状态
         with _analysis_jobs_lock:
             if room_id not in _continuous_tasks:
                 _continuous_tasks[room_id] = {}
-            # 规范化 valorant_profile（pov/broadcast 等旧别名一律映射为统一档）
-            _profile_name = 'valorant'
-            if _valorant_incremental_rounds:
-                from lsc.analyzer.phase_scheduler import get_profile as _get_profile_init
-                _profile_name = _get_profile_init(valorant_profile).name
             _continuous_tasks[room_id].update({
                 'cancelled': False,
                 'scan_requested': False,
@@ -6780,22 +6302,9 @@ def register_room_handlers(server, bridge):
                 'shadow_rounds_detected': 0,
                 'shadow_listable_rounds': 0,
                 'shadow_vision_confirmed': 0,
-                'hybrid_runtime_state': {},
-                # 相位调度状态
-                'round_phase': 'unknown',
-                'round_phase_detail': '',
-                'round_phase_entered_at': time.monotonic(),
-                'valorant_profile': _profile_name,
-                'pending_start': None,
-                'phase_anchor_sec': 0.0,
-                'predicted_wake_at': None,
-                'predicted_phase': None,
-                'prediction_detail': '',
-                # P2: 卡死保护 — 连续 unknown/intermission 重锚次数
-                'reanchor_count': 0,
-                'last_buy_seen_at': None,
-                # P1: OCR 精修标记 — 避免重复执行阻塞主循环
-                'ocr_refine_done': False,
+                # 纯 OCR 检测器跨窗口状态（FSM/锚点/计时器外推）
+                'ocr_runtime_state': {},
+                'valorant_profile': 'valorant',
                 # S1: worker 崩溃重建计数（达到上限则终止任务，防止无限重建循环）
                 'worker_restarts': 0,
             })
@@ -6826,17 +6335,16 @@ def register_room_handlers(server, bridge):
                 with _analysis_jobs_lock:
                     if _continuous_tasks.get(room_id, {}).get('cancelled'):
                         break
-                pressure = get_resource_pressure()
+                # 质量优先模式下压力归一化为 normal，分析不再被掐停/拉长间隔
+                pressure = _analysis_pressure()
                 interval_base = 5 if _valorant_incremental_rounds else max(interval, 20)
-                # 获取相位和超时状态用于智能恢复
+                # 获取超时状态用于智能恢复
                 with _analysis_jobs_lock:
                     state = _continuous_tasks.get(room_id)
-                _round_phase_for_interval = state.get('round_phase') if state else None
                 _consecutive_timeouts = int(state.get('consecutive_scan_timeouts', 0) or 0) if state else 0
                 _ocr_degraded = int(state.get('ocr_degraded_remaining', 0) or 0) if state else 0
                 effective_interval, skip_for_pressure = _continuous_effective_interval(
                     interval_base, last_analyzed, _valorant_incremental_rounds, pressure,
-                    round_phase=_round_phase_for_interval,
                     consecutive_timeouts=_consecutive_timeouts,
                     ocr_degraded_remaining=_ocr_degraded,
                 )
@@ -7061,36 +6569,53 @@ def register_room_handlers(server, bridge):
                     with _analysis_jobs_lock:
                         if room_id in _continuous_tasks:
                             _continuous_tasks[room_id]['last_scan_error'] = worker_error
-                            # 失败退避：非收尾错误后 30s 内不重 kick 同一段，
-                            # 防止失败-立即重试风暴（如时长估算漂移导致抽帧 0 帧）。
-                            if not (_finalize_started or _finalize_pending):
-                                _continuous_tasks[room_id]['last_scan_error_at'] = time.time()
+                            # 结果优先：不做失败退避，下一次 kick 立即重试同一窗口
+                            # （skip-kick 因 last_scan_error 已放行同窗重试）。
                             if terminal_model_error:
                                 _continuous_tasks[room_id]['analysis_stage'] = '视觉模型不可用'
                                 _continuous_tasks[room_id]['completed'] = True
                                 _continuous_tasks[room_id]['cancelled'] = True
                                 _continuous_tasks[room_id]['terminal_error'] = worker_error
-                            # 非收尾 OCR 超时：降级纯音频 + 缩小追赶，避免立刻再开 600s OCR
+                            # 非收尾扫描超时：结果优先，不做纯音频/关 OCR 降级。
+                            # 连续超时达到上限后跳过该窗口（强制推进游标），
+                            # 避免同窗无限重试死循环；跳过时保留警告便于排查。
                             if (
                                 _is_timeout_scan_error(worker_error)
                                 and not (_finalize_started or _finalize_pending)
                             ):
                                 _apply_scan_timeout_backoff(_continuous_tasks[room_id])
-                                _log.warning(
-                                    "持续分析 OCR 超时降级: room_id=%s, degrade_ticks=%s, max_catchup=%.0fs",
-                                    room_id,
-                                    _continuous_tasks[room_id].get("ocr_degraded_remaining"),
+                                _timeout_failures = int(
                                     _continuous_tasks[room_id].get(
-                                        "post_timeout_max_catchup_sec",
-                                        _POST_TIMEOUT_MAX_CATCHUP_SEC,
-                                    ),
+                                        "consecutive_scan_timeouts", 0
+                                    ) or 0
                                 )
+                                if _timeout_failures >= _SCAN_MAX_TIMEOUT_RETRIES:
+                                    _skip_to = float(
+                                        _continuous_tasks[room_id].get(
+                                            "scan_out_sec",
+                                            worker_dur or 0.0,
+                                        ) or 0.0
+                                    )
+                                    _log.warning(
+                                        "持续分析连续超时 %d 次，跳过该窗口（游标推进到 %.1fs）: room_id=%s",
+                                        _timeout_failures, _skip_to, room_id,
+                                    )
+                                    _continuous_tasks[room_id][
+                                        "consecutive_scan_timeouts"
+                                    ] = 0
+                                    _continuous_tasks[room_id]["last_analyzed"] = max(
+                                        float(_continuous_tasks[room_id].get(
+                                            "last_analyzed", 0.0) or 0.0),
+                                        _skip_to,
+                                    )
                     if terminal_model_error:
                         bridge.queue_broadcast({
                             'type': 'continuous_analysis_complete',
                             'data': {
                                 'room_id': room_id,
                                 'total_highlights': len(all_highlights),
+                                'listed_clip_count': len(_continuous_listed_clip_snapshot(state)),
+                                'listed_clips': _continuous_listed_clip_snapshot(state),
                                 'error': worker_error,
                             },
                         })
@@ -7132,6 +6657,8 @@ def register_room_handlers(server, bridge):
                                 'data': {
                                     'room_id': room_id,
                                     'total_highlights': len(all_highlights),
+                                    'listed_clip_count': len(_continuous_listed_clip_snapshot(state)),
+                                    'listed_clips': _continuous_listed_clip_snapshot(state),
                                     'error': worker_error,
                                 },
                             })
@@ -7163,71 +6690,6 @@ def register_room_handlers(server, bridge):
                             if task is not None:
                                 task['last_detected_in_sec'] = float(latest_detected['start'])
                                 task['last_detected_out_sec'] = float(latest_detected['end'])
-
-                    # OCR 精修：OCR 首次可用或降级恢复后执行一次（避免每轮都阻塞主循环）。
-                    # 精修目标 = 本轮新增的 audio_pending + all_highlights 中降级期间
-                    # 入列、尚未复核的旧 audio_pending 回合（否则它们永远无法升格）。
-                    _has_unrefined_pending = (
-                        any(
-                            h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
-                            for h in new_hl
-                        )
-                        or any(
-                            h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
-                            for h in all_highlights
-                        )
-                    )
-                    if (_has_unrefined_pending and state.get('refine_with_ocr')
-                            and not state.get('ocr_refine_done')):
-                        refine_targets = list(new_hl)
-                        refine_target_keys = {_valorant_round_key(h) for h in refine_targets}
-                        # 旧的 audio_pending 回合（降级期间入列）追加进精修目标
-                        old_pending_keys: set[str] = set()
-                        for h in all_highlights:
-                            rk = _valorant_round_key(h)
-                            if (h.get("confirm_status") == CONFIRM_STATUS_AUDIO_PENDING
-                                    and rk not in refine_target_keys):
-                                refine_targets.append(h)
-                                old_pending_keys.add(rk)
-                        if refine_targets:
-                            # 在后台线程执行 OCR 精修，避免阻塞主循环
-                            loop = asyncio.get_running_loop()
-                            try:
-                                refined = await loop.run_in_executor(
-                                    _ai_executor,
-                                    _refine_audio_rounds_with_ocr,
-                                    refine_targets, all_highlights, video_path,
-                                    _continuous_tasks, room_id,
-                                )
-                            except Exception as exc:
-                                _log.debug("OCR 精修异常: room=%s, %s", room_id, exc)
-                                refined = None
-                            if refined:
-                                refined_by_key = {
-                                    _valorant_round_key(r): r for r in refined
-                                }
-                                # 旧 audio_pending 升级后写回 all_highlights（按 round_key 替换）
-                                upgraded_old = [
-                                    rk for rk in old_pending_keys
-                                    if refined_by_key.get(rk, {}).get("confirm_status")
-                                    != CONFIRM_STATUS_AUDIO_PENDING
-                                ]
-                                if upgraded_old:
-                                    replaced = []
-                                    for h in all_highlights:
-                                        rk = _valorant_round_key(h)
-                                        if rk in upgraded_old and rk in refined_by_key:
-                                            replaced.append(refined_by_key[rk])
-                                        else:
-                                            replaced.append(h)
-                                    all_highlights = replaced
-                                # new_hl 保持原语义：只回填本轮新增的回合
-                                new_hl = [
-                                    r for r in refined
-                                    if _valorant_round_key(r) not in old_pending_keys
-                                ]
-                        # 标记已执行过 OCR 精修（下次 OCR 可用/降级恢复时再重置）
-                        state['ocr_refine_done'] = True
 
                     publish_update = False
                     if _valorant_incremental_rounds:
@@ -7281,102 +6743,72 @@ def register_room_handlers(server, bridge):
                                 main_room_for_map = fallback_main_room
                                 target_rooms_for_map = [fallback_main_room]
                         if _valorant_incremental_rounds:
-                            # 入列：hybrid + 音频路径；禁止 trim；按确认状态分流
-                            pending_hl = [
+                            # 入列：只加入切片列表与时间线（clip_queued），不启动 FFmpeg 导出；
+                            # vision_confirmed（真出点）与 pending（伪造出点等确认）分流标记
+                            listable_hl = [
                                 h for h in all_highlights
-                                if any(
+                                if _is_listable_ocr_round(h)
+                                and any(
                                     f"{rid}:{_valorant_round_key(h)}" not in _exported_clip_ids
                                     for rid in target_room_ids
                                 )
                             ]
-                            with _refined_round_keys_lock:
-                                refined_snapshot = set(_refined_round_keys)
-                            # Hybrid 路径回合（OCR+模型确认）
-                            listable_hybrid_hl = [
-                                h for h in pending_hl
-                                if _is_listable_hybrid_round(h)
-                                and _valorant_round_key(h) not in refined_snapshot
-                            ]
-                            # 音频路径回合（待 OCR 复核）
-                            listable_audio_hl = [
-                                h for h in pending_hl
-                                if _is_listable_audio_round(h)
-                                and _valorant_round_key(h) not in refined_snapshot
-                            ]
-                            listable_hl = listable_hybrid_hl + listable_audio_hl
-                            # 按确认状态分流
-                            vision_confirmed_hl = [
-                                h for h in listable_hybrid_hl
-                                if _is_auto_exportable_valorant_round(h)
-                            ]
-                            vision_keys = {_valorant_round_key(h) for h in vision_confirmed_hl}
-                            pending_only_hl = [
-                                h for h in listable_hybrid_hl
-                                if _valorant_round_key(h) not in vision_keys
-                            ]
-                            ocr_confirmed_hl = vision_confirmed_hl
-                            # 音频路径回合单独标记
-                            audio_pending_hl = listable_audio_hl
                             if state and state.get('shadow_mode'):
                                 state['shadow_rounds_detected'] = len(all_highlights)
                                 state['shadow_listable_rounds'] = len(listable_hl)
-                                state['shadow_vision_confirmed'] = len(vision_confirmed_hl)
+                                state['shadow_vision_confirmed'] = len(listable_hl)
                                 _log.info(
-                                    "Shadow 模式: room_id=%s, 检测 %d 回合, 可入列 %d, 视觉确认 %d（跳过 clip_queued）",
+                                    "Shadow 模式: room_id=%s, 检测 %d 回合, 可入列 %d（跳过 clip_queued）",
                                     room_id,
                                     len(all_highlights),
                                     len(listable_hl),
-                                    len(vision_confirmed_hl),
                                 )
                         else:
-                            pending_only_hl = list(new_hl)
-                            ocr_confirmed_hl = []
+                            listable_hl = list(new_hl)
                         if (
-                            (pending_only_hl or ocr_confirmed_hl or audio_pending_hl)
+                            listable_hl
                             and ok
                             and main_room_for_map is not None
                             and target_rooms_for_map
                             and not (state and state.get('shadow_mode'))
                         ):
                             _auto_preset = load_settings().get('appSettings', {}).get('default_export_preset', '')
-                            if pending_only_hl:
+                            confirmed_hl = [
+                                h for h in listable_hl
+                                if _is_auto_exportable_valorant_round(h)
+                            ]
+                            pending_hl = [
+                                h for h in listable_hl
+                                if not _is_auto_exportable_valorant_round(h)
+                            ]
+                            # 只入列不导出：list_only=True 仅广播 clip_queued 入切片列表与时间线
+                            if confirmed_hl:
                                 await _auto_export_highlights(
-                                    main_room_for_map, target_rooms_for_map, pending_only_hl,
+                                    main_room_for_map, target_rooms_for_map, confirmed_hl,
                                     job_prefix=f"{int(time.time() * 1000)}",
-                                    preset_id=_auto_preset,
-                                    defer_export=True,
-                                    confirm_status='pending',
-                                    list_only=True,
-                                )
-                            if ocr_confirmed_hl:
-                                await _auto_export_highlights(
-                                    main_room_for_map, target_rooms_for_map, ocr_confirmed_hl,
-                                    job_prefix=f"{int(time.time() * 1000)}-vision",
                                     preset_id=_auto_preset,
                                     defer_export=True,
                                     confirm_status='vision_confirmed',
                                     list_only=True,
                                 )
-                            # 音频路径回合：以 audio_pending 入列，等待 OCR 复核
-                            if audio_pending_hl:
+                            if pending_hl:
                                 await _auto_export_highlights(
-                                    main_room_for_map, target_rooms_for_map, audio_pending_hl,
-                                    job_prefix=f"{int(time.time() * 1000)}-audio",
+                                    main_room_for_map, target_rooms_for_map, pending_hl,
+                                    job_prefix=f"{int(time.time() * 1000)}-pending",
                                     preset_id=_auto_preset,
                                     defer_export=True,
-                                    confirm_status=CONFIRM_STATUS_AUDIO_PENDING,
+                                    confirm_status='pending',
                                     list_only=True,
                                 )
                             _log.info(
-                                "持续分析入列(仅列表): room_id=%s, pending %d 段, 视觉确认 %d 段, 音频待复核 %d 段 × %d 房间",
-                                room_id, len(pending_only_hl), len(ocr_confirmed_hl),
-                                len(audio_pending_hl), len(target_rooms_for_map),
+                                "持续分析入列（仅列表）: room_id=%s, 确认 %d 段, pending %d 段 × %d 房间",
+                                room_id, len(confirmed_hl), len(pending_hl), len(target_rooms_for_map),
                             )
 
                         # 导出成功后，清除"最近检测边界"，避免状态栏持续显示已导出的回合。
                         # 状态栏应只展示"已分析但尚未导出"的入出点；导出完成后应等待下一轮扫描
                         # 产出新的未导出回合，再更新显示。
-                        if pending_only_hl or ocr_confirmed_hl or audio_pending_hl:
+                        if listable_hl:
                             with _analysis_jobs_lock:
                                 _task = _continuous_tasks.get(room_id)
                                 if _task is not None:
@@ -7391,13 +6823,6 @@ def register_room_handlers(server, bridge):
                         if room_id in _continuous_tasks:
                             _continuous_tasks[room_id]['last_analyzed'] = last_analyzed
                             _continuous_tasks[room_id]['recorded_duration'] = max(recorded_duration, worker_dur)
-                            if worker_result:
-                                _first_hybrid = next(
-                                    (h for h in worker_result if h.get("model_version")),
-                                    None,
-                                )
-                                if _first_hybrid:
-                                    _continuous_tasks[room_id]['model_version'] = _first_hybrid.get("model_version")
                             confirmed_total = sum(
                                 1 for item in all_highlights
                                 if _is_auto_exportable_valorant_round(item)
@@ -7429,6 +6854,8 @@ def register_room_handlers(server, bridge):
                             'data': {
                                 'room_id': room_id,
                                 'total_highlights': len(all_highlights),
+                                'listed_clip_count': len(_continuous_listed_clip_snapshot(state)),
+                                'listed_clips': _continuous_listed_clip_snapshot(state),
                             },
                         })
                         with _analysis_jobs_lock:
@@ -7546,288 +6973,7 @@ def register_room_handlers(server, bridge):
                         state['last_progress_broadcast_at'] = time.time()
                         _scan_counter += 1
 
-                        # 相位调度：收尾阶段跳过，避免 UI 仍显示「买枪休眠中」
-                        _pred = None
-                        if _valorant_incremental_rounds and not (_finalize_started or _finalize_pending):
-                            from lsc.analyzer.phase_scheduler import (
-                                PHASE_DETAIL_ZH as _PDZH,
-                            )
-                            from lsc.analyzer.phase_scheduler import (
-                                RoundPhase as _RP,
-                            )
-                            from lsc.analyzer.phase_scheduler import (
-                                get_profile as _gp,
-                            )
-                            from lsc.analyzer.phase_scheduler import (
-                                next_round_phase as _nrp,
-                            )
-                            from lsc.analyzer.round_clock_predictor import (
-                                predict_round_clock as _prc,
-                            )
-                            _cfg = _gp(state.get('valorant_profile'))
-                            try:
-                                _cur_phase = _RP(state.get('round_phase', 'unknown'))
-                            except ValueError:
-                                _cur_phase = _RP.UNKNOWN
-                            _signals = _derive_round_signals(all_highlights, current_dur)
-                            _transition = _nrp(
-                                _cur_phase, _cfg,
-                                now_mono=time.monotonic(),
-                                phase_entered_at=float(state.get('round_phase_entered_at', time.monotonic())),
-                                signals=_signals,
-                            )
-                            _prev_phase = state.get('round_phase')
-                            if _transition.phase.value != _prev_phase:
-                                state['round_phase_entered_at'] = time.monotonic()
-                                # 录像轴锚点：优先 OCR round_end / round_start，避免 full_round 把买枪算进交战
-                                if _transition.just_confirmed and all_highlights:
-                                    _last_hl = all_highlights[-1]
-                                    _anchor_raw = (
-                                        _last_hl.get('round_end_sec')
-                                        or _last_hl.get('ocr_end')
-                                        or _last_hl.get('end')
-                                        or current_dur
-                                    )
-                                    try:
-                                        state['phase_anchor_sec'] = float(_anchor_raw)
-                                    except (TypeError, ValueError):
-                                        state['phase_anchor_sec'] = float(current_dur)
-                                elif _transition.phase in (_RP.BUY, _RP.INTERMISSION, _RP.UNKNOWN):
-                                    state['phase_anchor_sec'] = float(current_dur)
-                                elif _transition.phase == _RP.COMBAT and all_highlights:
-                                    _last_hl = all_highlights[-1]
-                                    _cs = (
-                                        _last_hl.get('round_start_sec')
-                                        or _last_hl.get('ocr_start')
-                                        or _last_hl.get('start')
-                                    )
-                                    try:
-                                        if _cs is not None:
-                                            state['phase_anchor_sec'] = float(_cs)
-                                    except (TypeError, ValueError):
-                                        pass
-                            state['round_phase'] = _transition.phase.value
-                            state['round_phase_detail'] = _PDZH.get(_transition.detail, _transition.detail)
-
-                            # P2: 卡死保护 — 检测连续重锚/无 buy 信号
-                            _is_reanchor = _transition.detail in ("reanchor", "intermission_timeout", "pre_combat_miss", "post_timeout")
-                            _is_buy_phase = _transition.phase in (_RP.BUY, _RP.PRE_COMBAT, _RP.COMBAT)
-                            if _is_reanchor:
-                                state['reanchor_count'] = int(state.get('reanchor_count', 0)) + 1
-                            else:
-                                state['reanchor_count'] = 0
-                            if _is_buy_phase:
-                                state['last_buy_seen_at'] = time.monotonic()
-                            # 连续重锚超限 → 暂停分析并广播警告
-                            _reanchor_limit = 6  # 连续 6 次重锚（约 90-120s）后判定卡死
-                            if int(state.get('reanchor_count', 0)) >= _reanchor_limit:
-                                _log.warning(
-                                    "持续分析卡死保护触发: room_id=%s, 连续 %d 次重锚无 buy 信号, "
-                                    "phase=%s, detail=%s, 已分析 %.1fs / 录制 %.1fs",
-                                    room_id,
-                                    state['reanchor_count'],
-                                    state['round_phase'],
-                                    state['round_phase_detail'],
-                                    last_analyzed,
-                                    recorded_duration,
-                                )
-                                bridge.queue_broadcast({
-                                    'type': 'continuous_analysis_status',
-                                    'data': {
-                                        'running': True,
-                                        'room_id': room_id,
-                                        'target_room_ids': target_room_ids,
-                                        'mode': mode,
-                                        'analyzed_duration': last_analyzed,
-                                        'recorded_duration': recorded_duration,
-                                        'confirmed_rounds': state.get('confirmed_rounds', 0),
-                                        'pending_rounds': state.get('pending_rounds', 0),
-                                        'analysis_stage': '卡死保护暂停',
-                                        'total_highlights': len(all_highlights),
-                                        'phase': 'stalled',
-                                        'updated_at': time.time(),
-                                        'scan_mode': 'incremental',
-                                        'scan_range': [max(0.0, last_analyzed - 30.0), last_analyzed],
-                                        'scan_timeout': state.get('scan_timeout', 120),
-                                        'full_rescan': False,
-                                        'refine_with_ocr': False,
-                                        'progress': min(100.0, max(0.0, (last_analyzed / max(recorded_duration, 1.0)) * 100.0)),
-                                        'scan_phase': 'stalled',
-                                        'scan_reason': 'stall_protection',
-                                        'scan_elapsed_sec': 0,
-                                        'scan_running': False,
-                                        'round_phase': state.get('round_phase'),
-                                        'round_phase_detail': f'连续{_reanchor_limit}次重锚无 buy 信号，暂停分析',
-                                        'valorant_profile': state.get('valorant_profile'),
-                                        'pending_round': False,
-                                        'predicted_wake_at': None,
-                                        'predicted_phase': None,
-                                        'prediction_detail': 'stalled',
-                                        'finalizing': False,
-                                        'completed': False,
-                                        'status': 'stalled',
-                                        'stalled': True,
-                                        'stall_reason': 'no_buy_signal',
-                                    },
-                                })
-                                # P3: 卡死保护暂停 — 不完全停止，改为低频探测扫描检测 buy 信号
-                                state['analysis_stage'] = '卡死保护暂停'
-                                state['scan_requested'] = False
-                                state['stalled'] = True
-                                state['stall_reason'] = 'no_buy_signal'
-                                # 暂停期间每 30s 做一次短窗探测（仅抽几帧，低 GPU 开销）
-                                _stall_probe_interval = 30.0
-                                _stall_probe_frames = 3  # 仅抽 3 帧探测是否有 buy 信号
-                                _log.info(
-                                    "持续分析进入卡死保护: room_id=%s, 每 %.0fs 做一次探测扫描（%d 帧）",
-                                    room_id, _stall_probe_interval, _stall_probe_frames,
-                                )
-                                try:
-                                    await asyncio.wait_for(
-                                        scan_done_event.wait(),
-                                        timeout=_stall_probe_interval,
-                                    )
-                                except asyncio.TimeoutError:
-                                    pass
-                                # 检查是否已取消 / 录制停止
-                                with _analysis_jobs_lock:
-                                    _st = _continuous_tasks.get(room_id, {})
-                                if _st.get('cancelled') or (not is_still_recording and _recording_was_active):
-                                    continue
-                                # P3: 探测扫描 — 抽几帧检测 buy 信号
-                                _buy_detected = await _probe_for_buy_signal(
-                                    room_id, video_path, current_dur, _stall_probe_frames,
-                                )
-                                if _buy_detected:
-                                    _log.info(
-                                        "持续分析自动恢复: room_id=%s, 探测扫描检测到 buy 信号", room_id,
-                                    )
-                                    state['stalled'] = False
-                                    state['stall_reason'] = None
-                                    state['reanchor_count'] = 0
-                                    state['last_buy_seen_at'] = time.monotonic()
-                                    state['round_phase'] = 'unknown'
-                                    state['round_phase_entered_at'] = time.monotonic()
-                                    state['analysis_stage'] = '分析中'
-                                    bridge.queue_broadcast({
-                                        'type': 'continuous_analysis_status',
-                                        'data': {
-                                            'running': True,
-                                            'room_id': room_id,
-                                            'target_room_ids': target_room_ids,
-                                            'mode': mode,
-                                            'analyzed_duration': last_analyzed,
-                                            'recorded_duration': recorded_duration,
-                                            'confirmed_rounds': state.get('confirmed_rounds', 0),
-                                            'pending_rounds': state.get('pending_rounds', 0),
-                                            'analysis_stage': '已恢复分析',
-                                            'total_highlights': len(all_highlights),
-                                            'phase': 'running',
-                                            'updated_at': time.time(),
-                                            'scan_mode': 'incremental',
-                                            'scan_range': [max(0.0, last_analyzed - 30.0), last_analyzed],
-                                            'scan_timeout': state.get('scan_timeout', 120),
-                                            'full_rescan': False,
-                                            'refine_with_ocr': False,
-                                            'progress': min(100.0, max(0.0, (last_analyzed / max(recorded_duration, 1.0)) * 100.0)),
-                                            'scan_phase': 'incremental',
-                                            'scan_reason': 'auto_resume',
-                                            'scan_elapsed_sec': 0,
-                                            'scan_running': False,
-                                            'round_phase': 'unknown',
-                                            'round_phase_detail': '探测到 buy 信号，自动恢复',
-                                            'valorant_profile': state.get('valorant_profile'),
-                                            'pending_round': False,
-                                            'predicted_wake_at': None,
-                                            'predicted_phase': None,
-                                            'prediction_detail': 'auto_resumed',
-                                            'finalizing': False,
-                                            'completed': False,
-                                            'status': 'running',
-                                            'stalled': False,
-                                            'stall_reason': None,
-                                        },
-                                    })
-                                continue
-
-                            # pending_start: 有起点未终点（用正赛起点，不含买枪）
-                            if _transition.just_confirmed:
-                                state['pending_start'] = None
-                                state.pop('pending_round_info', None)
-                            elif (
-                                _signals.get('has_start')
-                                and not _signals.get('has_end')
-                                and all_highlights
-                            ):
-                                _ps = (
-                                    all_highlights[-1].get('round_start_sec')
-                                    or all_highlights[-1].get('ocr_start')
-                                    or all_highlights[-1].get('start', 0.0)
-                                )
-                                state['pending_start'] = float(_ps)
-                                # 设置等待回合结束的详细解释（P2: 前端等待回合解释）
-                                state['pending_round_info'] = {
-                                    'phase': _transition.phase.value,
-                                    'waiting_for': 'combat_end',
-                                    'since_sec': time.monotonic() - state.get('round_phase_entered_at', time.monotonic()),
-                                }
-                            else:
-                                state.pop('pending_round_info', None)
-                            # 回合时钟预测（只调扫描密度，不入列）
-                            _anchor = float(state.get('phase_anchor_sec') or 0.0)
-                            _combat_start = None
-                            _combat_end_hint = None
-                            if all_highlights:
-                                _last_hl = all_highlights[-1]
-                                try:
-                                    _combat_start = float(
-                                        _last_hl.get('round_start_sec')
-                                        or _last_hl.get('ocr_start')
-                                        or _last_hl.get('start')
-                                    )
-                                except (TypeError, ValueError):
-                                    _combat_start = None
-                                if _signals.get('chime') or _signals.get('has_end'):
-                                    try:
-                                        _combat_end_hint = float(
-                                            _last_hl.get('round_end_sec')
-                                            or _last_hl.get('ocr_end')
-                                            or _last_hl.get('end', current_dur)
-                                            or current_dur
-                                        )
-                                    except (TypeError, ValueError):
-                                        _combat_end_hint = float(current_dur)
-                            _pred = _prc(
-                                _transition.phase,
-                                _cfg,
-                                phase_anchor_sec=_anchor,
-                                now_sec=float(current_dur),
-                                signals=_signals,
-                                combat_start_sec=_combat_start,
-                                combat_end_hint_sec=_combat_end_hint,
-                            )
-                            state['predicted_wake_at'] = _pred.predicted_wake_at
-                            state['predicted_phase'] = (
-                                _pred.predicted_phase.value if _pred.predicted_phase else None
-                            )
-                            state['prediction_detail'] = _pred.detail
-                            _log.debug(
-                                "相位预测: room=%s phase=%s anchor=%.1f wake=%s dense=%s detail=%s",
-                                room_id[:8],
-                                _transition.phase.value,
-                                _anchor,
-                                _pred.predicted_wake_at,
-                                _pred.in_dense_window,
-                                _pred.detail,
-                            )
-                        elif _finalize_started or _finalize_pending:
-                            state['round_phase_detail'] = '全文件收尾精修'
-                            state['pending_start'] = None
-
-                        # 扫描预算（传入相位参数；未传时走旧路径）
-                        _rp = state.get('round_phase') if _valorant_incremental_rounds else None
-                        _vp = state.get('valorant_profile') if _valorant_incremental_rounds else None
-                        _ps = state.get('pending_start') if _valorant_incremental_rounds else None
+                        # 扫描预算：固定增量窗口（回看 30s + 追赶），纯 OCR 恒开
                         from lsc.analyzer.registry import get as get_analyzer
                         _analyzer = get_analyzer(game)
                         if _analyzer.capabilities().realtime_continuous:
@@ -7835,10 +6981,6 @@ def register_room_handlers(server, bridge):
                                 'mode': mode,
                                 'last_analyzed': last_analyzed,
                                 'tick_count': _scan_counter,
-                                'round_phase': _rp,
-                                'valorant_profile': _vp,
-                                'pending_start': _ps,
-                                'prediction': _pred,
                             }
                             _window = _analyzer.plan_scan_window(
                                 _plan_state, current_dur, pressure or {},
@@ -7849,24 +6991,29 @@ def register_room_handlers(server, bridge):
                             full_rescan = bool(_plan_state.get('full_rescan', last_analyzed <= 0.0))
                         else:
                             scan_range, use_ocr_this_tick, _scan_timeout, full_rescan = _continuous_valorant_scan_budget(
-                                mode, last_analyzed, current_dur, pressure, _scan_counter,
-                                round_phase=_rp,
-                                valorant_profile=_vp,
-                                pending_start=_ps,
-                                prediction=_pred,
+                                mode, last_analyzed, current_dur, pressure,
                             )
                         # 停录收尾：从游标继续处理尾部（保留重叠），禁止默认全文件重扫
                         if _finalize_started or _finalize_pending:
                             scan_range = (
-                                max(0.0, float(last_analyzed) - _HYBRID_FINALIZE_OVERLAP_SEC),
+                                max(0.0, float(last_analyzed) - _OCR_FINALIZE_OVERLAP_SEC),
                                 float(current_dur),
                             )
-                            use_ocr_this_tick = False
+                            use_ocr_this_tick = True
                             full_rescan = False
                             _scan_timeout = max(
                                 _scan_timeout,
                                 _finalize_scan_timeout(current_dur, attempt=_finalize_failures + 1),
                             )
+                            # 重置 FSM 游标，允许重叠区域的帧被重新处理；
+                            # 否则 last_processed_ts 会过滤掉回看窗口内的所有帧，
+                            # 导致收尾扫描实际只处理极少新帧，几乎不产出切片。
+                            _rs = state.get('ocr_runtime_state')
+                            if _rs is not None:
+                                _rs['last_processed_ts'] = max(
+                                    0.0,
+                                    float(last_analyzed) - _OCR_FINALIZE_OVERLAP_SEC,
+                                )
                         else:
                             use_ocr_this_tick, scan_range = _apply_scan_budget_degrade(
                                 state,
@@ -7874,9 +7021,14 @@ def register_room_handlers(server, bridge):
                                 last_analyzed=last_analyzed,
                                 use_ocr=use_ocr_this_tick,
                             )
+                            # 纯 OCR 粗扫的锚点读取（OCR）每帧执行；降级期外必须给足
+                            # 覆盖双区域 OCR 的开销，避免超时→空窗。
+                            _ocr_anchor_active = not (
+                                int(state.get('ocr_degraded_remaining') or 0) > 0
+                            )
                             _scan_timeout = _window_scan_timeout(
                                 max(1.0, float(scan_range[1]) - float(scan_range[0])),
-                                use_ocr=use_ocr_this_tick,
+                                use_ocr=_ocr_anchor_active,
                             )
                         if _should_skip_continuous_scan_kick(
                             state,
@@ -7889,36 +7041,12 @@ def register_room_handlers(server, bridge):
                         state['video_path'] = video_path
                         state['current_dur'] = current_dur
                         state['refine_with_ocr'] = use_ocr_this_tick
-                        # ocr_sample_interval: 从相位预算取，而非仅从 pressure 取
                         try:
                             _budget_ocr_iv = float(
                                 pressure.get('ocr_sample_interval', 2.0) or 2.0
                             )
                         except (TypeError, ValueError):
                             _budget_ocr_iv = 2.0
-                        if _valorant_incremental_rounds and _rp is not None:
-                            from lsc.analyzer.phase_scheduler import (
-                                RoundPhase as _RP2,
-                            )
-                            from lsc.analyzer.phase_scheduler import (
-                                get_profile as _gp2,
-                            )
-                            from lsc.analyzer.phase_scheduler import (
-                                scan_budget_for_phase as _sbf,
-                            )
-                            _cfg2 = _gp2(_vp)
-                            try:
-                                _ph2 = _RP2(_rp)
-                            except ValueError:
-                                _ph2 = _RP2.UNKNOWN
-                            _bgt = _sbf(
-                                _ph2, _cfg2,
-                                last_analyzed=last_analyzed,
-                                current_dur=current_dur,
-                                prediction=_pred,
-                            )
-                            if _bgt.need_ocr and _bgt.ocr_interval_sec < 999.0:
-                                _budget_ocr_iv = _bgt.ocr_interval_sec
                         if _finalize_started or _finalize_pending:
                             _budget_ocr_iv = min(_budget_ocr_iv, 1.0)
                         state['ocr_sample_interval'] = _budget_ocr_iv
@@ -7959,14 +7087,7 @@ def register_room_handlers(server, bridge):
                                 'effective_interval': effective_interval,
                                 'scan_elapsed_sec': round(time.monotonic() - state.get('_scan_start_mono', time.monotonic()), 1) if state.get('scan_running') else 0,
                                 'scan_running': state.get('scan_running', False),
-                                # 相位调度字段
-                                'round_phase': state.get('round_phase'),
-                                'round_phase_detail': state.get('round_phase_detail'),
                                 'valorant_profile': state.get('valorant_profile'),
-                                'pending_round': state.get('pending_start') is not None,
-                                'predicted_wake_at': state.get('predicted_wake_at'),
-                                'predicted_phase': state.get('predicted_phase'),
-                                'prediction_detail': state.get('prediction_detail'),
                             },
                         })
 
@@ -8242,7 +7363,7 @@ def register_room_handlers(server, bridge):
         def _recording_state(room_id: str) -> dict[str, Any]:
             get_status = getattr(manager, 'get_recording_status', None)
             if callable(get_status):
-                return get_status(room_id)
+                return get_status(room_id)  # type: ignore[no-any-return]
             room = manager.get_room(room_id)
             return {
                 'exists': room is not None,
@@ -8528,7 +7649,12 @@ def register_room_handlers(server, bridge):
 
     @server.on('confirm_highlight_clip')
     async def handle_confirm_highlight_clip(data):
-        """用户确认精修结果：主房 + 目标房均为 user_confirmed，不自动导出。"""
+        """用户确认精修结果：主房 + 目标房均为 user_confirmed，不自动导出。
+
+        ⚠️ 本 handler 被 handlers.analysis_handlers 的同名注册覆盖
+        （register_analysis_handlers 后注册，server.on 覆写），永不触发；
+        实际生效版本在 analysis_handlers.py（含 align_group_id 校验）。保留仅防回滚。
+        """
         room_id = data.get('room_id', '')
         round_key = data.get('round_key', '') or data.get('clip_id', '')
         start = float(data.get('start', 0))
@@ -8627,6 +7753,112 @@ def register_room_handlers(server, bridge):
         })
         _log.info("精修取消: room=%s, round_key=%s", room_id, round_key)
         return {'success': True, 'round_key': round_key, 'status': 'pending'}
+
+    @server.on('delete_clip')
+    async def handle_delete_clip(data):
+        """删除已入列切片：从权威快照移除并记 tombstone，防止 OCR upsert 复活。"""
+        room_id = data.get('room_id', '')
+        round_key = data.get('round_key', '') or data.get('clip_id', '')
+        if not room_id or not round_key:
+            return {'success': False, 'error': 'room_id 与 round_key 均不能为空'}
+        listed_key = f"{room_id}:{round_key}"
+        removed = False
+        with _analysis_jobs_lock:
+            if listed_key in _listed_clip_ids:
+                _listed_clip_ids.pop(listed_key, None)
+                removed = True
+            _listed_clip_bounds.pop(listed_key, None)
+            _bounded_clip_key_add(_deleted_clip_keys, listed_key)
+            for task_state in _continuous_tasks.values():
+                snapshots = task_state.get("listed_clips")
+                if snapshots and listed_key in snapshots:
+                    snapshots.pop(listed_key, None)
+            for job_state in _analysis_jobs.values():
+                snapshots = job_state.get("listed_clips")
+                if snapshots and listed_key in snapshots:
+                    snapshots.pop(listed_key, None)
+        # 解除精修冻结与残留状态，避免引用已删切片
+        with _refined_round_keys_lock:
+            _refined_round_keys.discard(round_key)
+        _clip_refine_state.pop(round_key, None)
+        _log.info("删除切片: room=%s, round_key=%s, removed=%s", room_id, round_key, removed)
+        return {'success': True, 'removed': removed}
+
+    # ── 职责域子模块注册（拆分自 room_handler，保持 WebSocket 路由不变）──
+    from handlers.alignment_handlers import register_alignment_handlers
+    register_alignment_handlers(
+        server,
+        bridge=bridge,
+        manager=manager,
+        broadcast_rooms=_broadcast_rooms,
+        bridge_executor=_bridge_executor,
+        recording_executor=_recording_executor,
+    )
+
+    from handlers.recording_handlers import register_recording_handlers
+    register_recording_handlers(
+        server,
+        bridge=bridge,
+        manager=manager,
+        broadcast_rooms=_broadcast_rooms,
+        bridge_executor=_bridge_executor,
+        recording_executor=_recording_executor,
+        recording_semaphore=_recording_semaphore,
+        recording_starting=_recording_starting,
+        recording_wait_queue=_recording_wait_queue,
+        recording_history=recording_history,
+        recording_history_lock=_recording_history_lock,
+        max_recording_history=_MAX_RECORDING_HISTORY,
+        save_recording_history=_save_recording_history,
+        load_settings=load_settings,
+        expand_user_path=_expand_user_path,
+        reattach_shared_preview=_reattach_shared_preview_after_recording_start,
+    )
+
+    from handlers.export_handlers import get_queue_export, register_export_handlers
+    register_export_handlers(
+        server,
+        bridge=bridge,
+        manager=manager,
+        bridge_executor=_bridge_executor,
+        load_settings=load_settings,
+        expand_user_path=_expand_user_path,
+        purge_stale_analysis_jobs=_purge_stale_analysis_jobs,
+        ext_export_jobs=export_jobs,
+        ext_export_jobs_lock=_export_jobs_lock,
+        ext_export_cancelled_jobs=_export_cancelled_jobs,
+    )
+
+    # 全局唯一导出入队入口（原 room_handler 旧导出管道已删除，避免双队列并发突破
+    # export_max_concurrent 上限）：所有路径（手动 export_clip / export_clip_by_id /
+    # AI 自动导出 / 延后导出）统一走 handlers.export_handlers 的队列与 semaphore
+    queue_export = get_queue_export()
+
+    from handlers.analysis_handlers import register_analysis_handlers
+    register_analysis_handlers(
+        server,
+        bridge=bridge,
+        manager=manager,
+        bridge_executor=_bridge_executor,
+        ai_executor=_ai_executor,
+        load_settings=load_settings,
+        safe_float=_safe_float,
+        analyze_scene_or_rounds=_analyze_scene_or_rounds,
+        validate_synced_analysis_targets=_validate_synced_analysis_targets,
+        continuous_analysis_loop=_continuous_analysis_loop,
+        auto_export_highlights=_auto_export_highlights,
+        build_continuous_status_payload=_build_continuous_status_payload,
+        map_highlight_to_room=_map_highlight_to_room,
+        recording_media_start=_recording_media_start,
+        min_highlight_duration_for_queue=_min_highlight_duration_for_queue,
+        valorant_round_key=_valorant_round_key,
+        should_broadcast_clip_list_update=_should_broadcast_clip_list_update,
+        analysis_jobs=_analysis_jobs,
+        analysis_jobs_lock=_analysis_jobs_lock,
+        continuous_tasks=_continuous_tasks,
+        refined_round_keys=_refined_round_keys,
+        refined_round_keys_lock=_refined_round_keys_lock,
+    )
 
     # ── TimelineContext 集成（已抽离至 handlers.timeline_handlers）──
     register_timeline_handlers(server, bridge=bridge, manager=manager, queue_export=queue_export)

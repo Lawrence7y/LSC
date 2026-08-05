@@ -91,15 +91,14 @@ def profile_energy_analysis(pcm_bytes):
 
 
 def profile_full_analysis(ffmpeg, video_path, duration):
-    from lsc.analyzer.round_detector import detect_valorant_rounds
+    from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
 
     profiler = cProfile.Profile()
     profiler.enable()
 
     t0 = time.perf_counter()
-    rounds = detect_valorant_rounds(
-        video_path, duration=duration, time_range=(0, max(duration, 1.0)),
-        refine_with_ocr=False,
+    rounds = detect_valorant_rounds_ocr(
+        video_path, time_range=(0, max(duration, 1.0)),
     )
     wall_time = time.perf_counter() - t0
 

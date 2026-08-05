@@ -107,21 +107,22 @@ class HighlightAnalyzer:
                   os.path.basename(video_path), game)
 
         # ── Valorant Round-First 快速路径 ──
-        # 当 game="valorant" 时，优先使用音频能量检测回合边界，
-        # 直接输出所有回合的战斗阶段（无需 Whisper/CLIP/OCR）。
+        # 当 game="valorant" 时，优先使用纯 OCR 检测回合边界（顶部条+中央横幅），
+        # 直接输出所有回合的交战阶段（无需 Whisper/CLIP/音频）。
         if game == "valorant":
             try:
-                from lsc.analyzer.round_detector import detect_valorant_rounds
+                from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
                 from lsc.config import load_config as _load_cfg_rd
                 _cfg_rd = _load_cfg_rd()
                 _ffmpeg_rd = _cfg_rd.ffmpeg_path or "ffmpeg"
 
                 self._report_progress("round_detect", 0.0, "Valorant 回合检测中...")
-                round_segments = detect_valorant_rounds(
+                round_segments = detect_valorant_rounds_ocr(
                     video_path,
                     ffmpeg_path=_ffmpeg_rd,
                     progress_callback=self._progress_callback,
                     cancel_check=self._cancel_check,
+                    finalize=True,
                 )
                 if self._is_cancelled():
                     return None

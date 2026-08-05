@@ -59,7 +59,7 @@ def format_rounds(rounds):
 
 def run_analysis_cycle(proc, video_path, duration, cycle_num, scan_start, scan_end):
     """Run one analysis cycle and measure all resources."""
-    from lsc.analyzer.round_detector import detect_valorant_rounds
+    from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
 
     print(f"\n{'='*60}")
     print(f"Cycle {cycle_num}: analyzing {scan_start:.0f}s - {scan_end:.0f}s")
@@ -71,12 +71,10 @@ def run_analysis_cycle(proc, video_path, duration, cycle_num, scan_start, scan_e
 
     # Run detection
     t0 = time.perf_counter()
-    rounds = detect_valorant_rounds(
+    rounds = detect_valorant_rounds_ocr(
         video_path,
-        duration=duration,
         time_range=(scan_start, scan_end),
-        refine_with_ocr=False,
-    )
+        )
     wall_time = time.perf_counter() - t0
 
     # After state

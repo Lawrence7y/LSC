@@ -339,15 +339,15 @@ def test_merge_round_windows_preserves_round_key_when_boundaries_shift() -> None
     previous = [{
         "start": 30.0, "end": 80.0, "round_key": "hybrid-003",
         "phase": "pending",
-        "boundary_source": "valorant_hybrid_v1",
+        "boundary_source": "valorant_ocr_v1",
         "confirm_status": "pending",
-        "start_by": "model_buy_exit", "end_by": "open_tail",
+        "start_by": "ocr_combat", "end_by": "open_tail",
     }]
     current = [{
         "start": 32.0, "end": 83.0, "phase": "combat",
-        "boundary_source": "valorant_hybrid_v1",
+        "boundary_source": "valorant_ocr_v1",
         "confirm_status": "vision_confirmed",
-        "start_by": "model_buy_exit", "end_by": "model_result",
+        "start_by": "ocr_combat", "end_by": "next_prep",
     }]
 
     merged = room_handler._merge_round_windows(previous, current)
@@ -360,15 +360,15 @@ def test_new_rounds_includes_pending_to_confirmed_update() -> None:
     previous = [{
         "start": 30.0, "end": 80.0, "round_key": "hybrid-003",
         "phase": "pending",
-        "boundary_source": "valorant_hybrid_v1",
+        "boundary_source": "valorant_ocr_v1",
         "confirm_status": "pending",
-        "start_by": "model_buy_exit", "end_by": "open_tail",
+        "start_by": "ocr_combat", "end_by": "open_tail",
     }]
     current = [{
         "start": 32.0, "end": 83.0, "phase": "combat",
-        "boundary_source": "valorant_hybrid_v1",
+        "boundary_source": "valorant_ocr_v1",
         "confirm_status": "vision_confirmed",
-        "start_by": "model_buy_exit", "end_by": "model_result",
+        "start_by": "ocr_combat", "end_by": "next_prep",
     }]
 
     fresh = room_handler._new_rounds(previous, current)

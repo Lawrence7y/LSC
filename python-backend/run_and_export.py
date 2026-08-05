@@ -73,19 +73,17 @@ def export_round_video(source_path, output_path, ffmpeg_path, start_sec, end_sec
 
 
 def run_analysis_cycle(proc, video_path, duration, cycle_num, scan_start, scan_end, ffmpeg_path):
-    from lsc.analyzer.round_detector import detect_valorant_rounds
+    from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
 
     print(f"\n{'='*60}")
     print(f"Cycle {cycle_num}: analyzing {scan_start:.0f}s - {scan_end:.0f}s")
 
     mem_before = proc.memory_info().rss / 1e6
     t0 = time.perf_counter()
-    rounds = detect_valorant_rounds(
+    rounds = detect_valorant_rounds_ocr(
         video_path,
-        duration=duration,
         time_range=(scan_start, scan_end),
-        refine_with_ocr=False,
-    )
+        )
     detect_time = time.perf_counter() - t0
     mem_after = proc.memory_info().rss / 1e6
 

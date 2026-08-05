@@ -4,7 +4,6 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 from handlers import room_handler
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,14 +71,14 @@ def test_valorant_round_window_merge_replaces_overlapping_drift() -> None:
 
 
 def test_valorant_merge_keeps_hybrid_over_full_round() -> None:
-    """已 hybrid 确认的回合，不得被后续 full_round 音频结果覆盖。"""
+    """已 OCR 确认的回合，不得被后续 full_round 音频结果覆盖。"""
     existing = [
         {
             "start": 12.0,
             "end": 76.0,
-            "start_by": "model_buy_exit",
-            "end_by": "model_result",
-            "boundary_source": "valorant_hybrid_v1",
+            "start_by": "ocr_combat",
+            "end_by": "next_prep",
+            "boundary_source": "valorant_ocr_v1",
             "confirm_status": "vision_confirmed",
             "phase": "combat",
             "round_key": "round-000001",
@@ -87,9 +86,9 @@ def test_valorant_merge_keeps_hybrid_over_full_round() -> None:
         {
             "start": 97.0,
             "end": 192.0,
-            "start_by": "model_buy_exit",
-            "end_by": "model_score",
-            "boundary_source": "valorant_hybrid_v1",
+            "start_by": "ocr_combat",
+            "end_by": "next_prep",
+            "boundary_source": "valorant_ocr_v1",
             "confirm_status": "vision_confirmed",
             "phase": "combat",
             "round_key": "round-000009",
@@ -114,20 +113,20 @@ def test_valorant_merge_keeps_hybrid_over_full_round() -> None:
     ]
     merged = room_handler._merge_round_windows(existing, window)
     assert any(
-        abs(float(item["start"]) - 97.0) < 0.1 and item.get("end_by") == "model_score"
+        abs(float(item["start"]) - 97.0) < 0.1 and item.get("end_by") == "next_prep"
         for item in merged
     )
 
 
 def test_valorant_merge_keeps_hybrid_round_over_audio_overlap() -> None:
-    """Hybrid 回合不得被重叠的纯音频窗吃掉。"""
+    """OCR 回合不得被重叠的纯音频窗吃掉。"""
     existing = [
         {
             "start": 327.0,
             "end": 400.0,
-            "start_by": "model_buy_exit",
-            "end_by": "model_result",
-            "boundary_source": "valorant_hybrid_v1",
+            "start_by": "ocr_combat",
+            "end_by": "next_prep",
+            "boundary_source": "valorant_ocr_v1",
             "confirm_status": "vision_confirmed",
             "phase": "combat",
             "round_key": "round-000033",
@@ -145,7 +144,7 @@ def test_valorant_merge_keeps_hybrid_round_over_audio_overlap() -> None:
     merged = room_handler._merge_round_windows(existing, window)
     assert len(merged) == 1
     assert merged[0]["round_key"] == "round-000033"
-    assert merged[0]["start_by"] == "model_buy_exit"
+    assert merged[0]["start_by"] == "ocr_combat"
 
 
 def test_valorant_merge_abuts_overlap_instead_of_dropping() -> None:
@@ -203,18 +202,15 @@ def test_window_scan_timeout_ocr_not_starved_at_fifty_seconds() -> None:
 
 
 def test_continuous_valorant_budget_ocr_timeout_covers_short_window() -> None:
-    """post_combat 短窗预算超时仍须足够长（legacy OCR refine 已禁用）。"""
+    """纯 OCR 路径：use_ocr 恒开，短窗超时也须足够长。"""
     _, use_ocr, timeout, _ = room_handler._continuous_valorant_scan_budget(
         "valorant_round",
         last_analyzed=100.0,
         current_dur=150.0,
         pressure={"level": "normal"},
-        tick_count=5,
-        round_phase="post_combat",
-        valorant_profile="broadcast",
     )
-    assert use_ocr is False
-    assert timeout >= 45
+    assert use_ocr is True
+    assert timeout >= 120
 
 
 def test_continuous_analysis_interval_respects_resource_pressure() -> None:
@@ -276,21 +272,21 @@ def test_open_tail_round_is_retained_as_pending_for_status() -> None:
 
 
 def test_hybrid_closed_round_near_tip_is_not_dropped() -> None:
-    """结算帧贴近扫描 tip 时，不得把已闭合 hybrid 回合当 open_tail 丢弃。"""
+    """结算帧贴近扫描 tip 时，不得把已闭合 OCR 回合当 open_tail 丢弃。"""
     rounds = [{
         "start": 92.444,
         "end": 188.611,
         "phase": "combat",
-        "boundary_source": "valorant_hybrid_v1",
-        "start_by": "model_buy_exit",
-        "end_by": "model_result",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_prep",
         "confirm_status": "pending",
     }]
 
     retained = room_handler._drop_open_tail_rounds(rounds, current_dur=192.0)
 
     assert retained == rounds
-    assert room_handler._is_listable_hybrid_round(retained[0])
+    assert room_handler._is_listable_ocr_round(retained[0])
 
 
 def test_incomplete_non_hybrid_tip_round_still_dropped() -> None:
@@ -304,27 +300,28 @@ def test_incomplete_non_hybrid_tip_round_still_dropped() -> None:
 def test_new_rounds_releases_pending_round_when_hybrid_confirms() -> None:
     previous = [{
         "start": 100.0, "end": 180.0, "phase": "pending",
-        "boundary_source": "valorant_hybrid_v1",
-        "start_by": "model_buy_exit", "end_by": "open_tail",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat", "end_by": "open_tail",
         "confirm_status": "pending",
     }]
     current = [{
         "start": 100.0, "end": 195.0, "phase": "combat",
-        "boundary_source": "valorant_hybrid_v1",
-        "start_by": "model_buy_exit", "end_by": "model_result",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat", "end_by": "next_prep",
         "confirm_status": "vision_confirmed",
     }]
 
     assert room_handler._new_rounds(previous, current) == current
 
 
-def test_valorant_incremental_lookback_is_six_minutes() -> None:
-    assert room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC == 360.0
+def test_valorant_incremental_lookback_is_bounded() -> None:
+    # 纯 OCR 固定 lookback=30（与 valorant_plugin 一致），不随相位变化
+    assert room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC == 30.0
     assert room_handler._VALORANT_MAX_CATCHUP_SEC > 0.0
 
 
 def test_continuous_valorant_budget_uses_first_full_scan_then_catchup_window() -> None:
-    """首次全量；之后从 last_analyzed 回看并向前追赶，禁止跳到尾部滑动窗。"""
+    """首次全量；之后从 last_analyzed 回看 30s 并向前追赶，禁止跳到尾部滑动窗。"""
     first_range, first_ocr, _, first_full = room_handler._continuous_valorant_scan_budget(
         mode="valorant_round",
         last_analyzed=0.0,
@@ -344,11 +341,11 @@ def test_continuous_valorant_budget_uses_first_full_scan_then_catchup_window() -
         pressure={"level": "critical", "analysis_window_sec": 75, "degrade_analysis": True, "pause_analysis": True},
     )
 
-    assert (first_range, first_ocr, first_full) == ((0.0, 120.0), False, True)
-    # 回看 180s → 420，向前追赶到 720；不得变成 current-lookback=540 而跳过 540 前的未分析区间
-    assert (normal_range, normal_ocr, normal_full) == ((420.0, 720.0), False, False)
-    # hybrid 路径：pause 也不恢复 legacy OCR refine
-    assert critical_ocr is False
+    assert (first_range, first_ocr, first_full) == ((0.0, 120.0), True, True)
+    # 回看 30s → 570，向前追赶到 720；不得变成 current-lookback=690 而跳过中段
+    assert (normal_range, normal_ocr, normal_full) == ((570.0, 720.0), True, False)
+    # 纯 OCR 路径：pressure 不关 OCR
+    assert critical_ocr is True
     assert critical_full is False
     assert critical_range[0] <= 600.0
     assert critical_range[1] == 720.0
@@ -370,7 +367,7 @@ def test_continuous_valorant_budget_does_not_skip_middle_when_falling_behind() -
     assert scan_range[1] >= 277.0 - 1.0
     # 旧逻辑 current-60=217 会跳过 25→217；新逻辑必须从 last_analyzed 回看覆盖中段
     assert scan_range[0] < 217.0
-    assert scan_range[0] <= max(0.0, 25.0 - 240.0) + 1.0
+    assert scan_range[0] <= max(0.0, 25.0 - 30.0) + 1.0
 
 
 def test_continuous_valorant_budget_does_not_expand_with_recording_length() -> None:
@@ -410,14 +407,12 @@ def test_continuous_valorant_budget_caps_catchup_span() -> None:
 
 
 def test_continuous_valorant_budget_post_combat_caps_catchup_span() -> None:
-    """post_combat 相位调度下追赶窗口仍受 _MAX_CATCHUP_SEC + lookback 约束。"""
+    """追赶窗口始终受 _MAX_CATCHUP_SEC + lookback 约束（纯 OCR 无相位参数）。"""
     scan_range, _, _, _ = room_handler._continuous_valorant_scan_budget(
         mode="valorant_round",
         last_analyzed=100.0,
         current_dur=3600.0,
         pressure={"level": "normal"},
-        round_phase="post_combat",
-        valorant_profile="broadcast",
     )
     lookback = room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC
     max_catchup = room_handler._VALORANT_MAX_CATCHUP_SEC
@@ -427,33 +422,27 @@ def test_continuous_valorant_budget_post_combat_caps_catchup_span() -> None:
 
 
 def test_continuous_valorant_budget_honors_phase_short_window() -> None:
-    """相位调度下 buy 相位使用短窗；混合视觉不再走 legacy OCR refine。"""
+    """纯 OCR 固定增量预算：不随相位变化，恒开 OCR。"""
     scan_range, use_ocr, _, full = room_handler._continuous_valorant_scan_budget(
         "valorant_round",
         last_analyzed=100.0,
         current_dur=180.0,
         pressure={"level": "normal"},
-        tick_count=3,
-        round_phase="buy",
-        valorant_profile="pov",
     )
     assert full is False
-    assert use_ocr is False
+    assert use_ocr is True
     assert scan_range[1] - scan_range[0] < 240.0
 
 
 def test_continuous_valorant_budget_dense_ocr_in_post_combat() -> None:
-    """post_combat 相位预算仍生效，但 hybrid 路径不再启用 legacy OCR refine。"""
+    """纯 OCR 路径：任何时刻 OCR 恒开（不再有 legacy OCR refine 开关）。"""
     _, use_ocr, _, _ = room_handler._continuous_valorant_scan_budget(
         "valorant_round",
         last_analyzed=100.0,
         current_dur=150.0,
         pressure={"level": "normal"},
-        tick_count=5,
-        round_phase="post_combat",
-        valorant_profile="broadcast",
     )
-    assert use_ocr is False
+    assert use_ocr is True
 
 
 def test_valorant_round_scan_uses_catchup_window_after_first_scan() -> None:
@@ -461,7 +450,7 @@ def test_valorant_round_scan_uses_catchup_window_after_first_scan() -> None:
         "valorant_round", 600.0, 720.0, {"level": "normal", "analysis_window_sec": 180}
     )
 
-    assert (scan_range, use_ocr, full_rescan) == ((420.0, 720.0), False, False)
+    assert (scan_range, use_ocr, full_rescan) == ((570.0, 720.0), True, False)
 
 
 def test_valorant_round_scan_only_first_pass_is_full() -> None:
@@ -473,13 +462,13 @@ def test_valorant_round_scan_only_first_pass_is_full() -> None:
     )
 
     assert (first_range, first_full) == ((0.0, 120.0), True)
-    # 默认 lookback=240 → max(0, 600-240)=360，向前追赶到 720
+    # 固定 lookback=30 → max(0, 600-30)=570，向前追赶到 720
     assert later_range[0] == max(0.0, 600.0 - room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC)
     assert later_range[0] <= 600.0
     assert later_range[1] == 720.0
     assert later_full is False
-    assert first_ocr is False
-    assert later_ocr is False
+    assert first_ocr is True
+    assert later_ocr is True
 
 
 def test_valorant_round_ocr_refine_disabled_for_hybrid() -> None:
@@ -515,9 +504,9 @@ def test_only_hybrid_vision_confirmed_rounds_are_auto_exportable() -> None:
         "start": 102.0,
         "end": 154.0,
         "phase": "combat",
-        "boundary_source": "valorant_hybrid_v1",
-        "start_by": "model_buy_exit",
-        "end_by": "model_result",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_prep",
         "confirm_status": "vision_confirmed",
     }
     assert room_handler._is_auto_exportable_valorant_round(hybrid_ok)
@@ -527,150 +516,53 @@ def test_only_hybrid_vision_confirmed_rounds_are_auto_exportable() -> None:
     })
     assert not room_handler._is_auto_exportable_valorant_round({
         "start": 102.0, "end": 154.0, "phase": "combat",
-        "start_by": "ocr_buy_exit", "end_by": "ocr_result",
+        "start_by": "ocr_combat", "end_by": "next_prep",
     })
     assert not room_handler._is_auto_exportable_valorant_round({
         "start": 102.0, "end": 154.0, "phase": "combat",
-        "start_by": "ocr_buy_exit", "end_by": "next_buy",
-    })
-    assert not room_handler._is_auto_exportable_valorant_round({
-        "start": 102.0, "end": 154.0, "phase": "pending",
-        "start_by": "ocr_buy_exit", "end_by": "open_tail",
-    })
-    assert not room_handler._is_auto_exportable_valorant_round({
-        "start": 102.0, "end": 154.0, "phase": "combat",
-        "start_by": "audio", "end_by": "audio",
+        "boundary_source": "valorant_hybrid_v1",
+        "start_by": "model_buy_exit", "end_by": "model_result",
+        "confirm_status": "vision_confirmed",
     })
     assert not room_handler._is_auto_exportable_valorant_round({
         "start": 102.0, "end": 154.0, "phase": "combat",
-        "start_by": "full_round", "end_by": "full_round",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat", "end_by": "open_tail",
+        "confirm_status": "pending",
     })
     assert not room_handler._is_auto_exportable_valorant_round({
         "start": 154.0, "end": 102.0, "phase": "combat",
-        "start_by": "ocr_buy_exit", "end_by": "ocr_result",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat", "end_by": "next_prep",
+        "confirm_status": "vision_confirmed",
     })
 
 
-def test_trim_valorant_combat_bounds_drops_post_junk() -> None:
-    """OCR 双可信入列时裁掉结算后垃圾尾，正赛段作为高质量边界。"""
-    trimmed = room_handler._trim_valorant_combat_bounds({
-        "start": 102.0,
-        "end": 190.0,
-        "phase": "combat",
-        "start_by": "ocr_buy_exit",
-        "end_by": "ocr_result",
-        "ocr_start": 102.0,
-        "ocr_end": 180.0,
-        "round_start_sec": 102.0,
-        "round_end_sec": 180.0,
-    })
-    # 质量档：start +0.5 避开买枪尾帧，end -1.5 避开结算字帧
-    assert trimmed["start"] == 102.5
-    assert trimmed["end"] == 178.5
-    assert not room_handler._is_auto_exportable_valorant_round(trimmed)
-
-    next_buy = room_handler._trim_valorant_combat_bounds({
-        "start": 100.0,
-        "end": 200.0,
-        "phase": "combat",
-        "start_by": "ocr_buy_exit",
-        "end_by": "next_buy",
-        "round_start_sec": 100.0,
-    })
-    assert next_buy["start"] == 100.5
-    assert next_buy["end"] == 200.0  # 准备阶段起点保持，不再 -8s junk
-
-
-def test_trim_next_buy_keeps_prep_end_even_with_ocr_end() -> None:
-    """用户要录到下回合准备开始：next_buy 终点不得被胜利字 ocr_end 拽回。
-
-    对照讲过往导出：analysis end=105.4(next_buy) 但导出成 95.1(=ocr_end 96.6-1.5)。
-    """
-    trimmed = room_handler._trim_valorant_combat_bounds({
-        "start": 24.6,
-        "end": 105.4,
-        "phase": "combat",
-        "start_by": "ocr_buy_exit",
-        "end_by": "next_buy",
-        "ocr_start": 24.6,
-        "ocr_end": 96.6,
-        "round_start_sec": 24.6,
-        "round_end_sec": 96.6,
-    })
-    assert trimmed["start"] == pytest.approx(25.1, abs=0.05)
-    assert trimmed["end"] == 105.4  # 保持准备开始，禁止 96.6-1.5
-
-
-def test_trim_ignores_double_offset_ocr_start() -> None:
-    """ocr_start 若明显偏离 start（双重 range_offset），不得把入点拽飞。"""
-    trimmed = room_handler._trim_valorant_combat_bounds({
-        "start": 375.8,
-        "end": 487.3,
-        "phase": "combat",
-        "start_by": "ocr_buy_exit",
-        "end_by": "next_buy",
-        "ocr_start": 747.5,  # 错位元数据
-        "buy_marker_sec": 746.7,
-        "round_start_sec": 747.5,
-    })
-    assert trimmed["start"] == pytest.approx(376.3, abs=0.2)
-    assert trimmed["end"] == 487.3
-
-
-def test_trim_audio_chime_snaps_to_round_end_not_before_chime() -> None:
-    """无 OCR 但有钟声：终点贴钟声，不得再 -1.5s 砍掉回合末击杀。"""
-    trimmed = room_handler._trim_valorant_combat_bounds({
-        "start": 100.0,
-        "end": 183.0,  # chime 180 + tail_pad 3
-        "phase": "combat",
-        "start_by": "audio",
-        "end_by": "chime",
-        "tail_by": "chime",
-        "round_start_sec": 100.0,
-        "round_end_sec": 180.0,
-    })
-    assert trimmed["start"] == 100.0  # 音频战斗起点已过买枪裁剪，不再 +0.5
-    assert 180.0 <= trimmed["end"] <= 181.0
-
-
-def test_trim_full_round_audio_undoes_pre_pad_and_junk() -> None:
-    """遗留 full_round 糊窗：回推起点 pre_pad、砍尾 junk，贴近正赛。"""
-    trimmed = room_handler._trim_valorant_combat_bounds({
-        "start": 92.0,  # combat@100 - 8s pre_pad
-        "end": 210.0,
-        "phase": "full_round",
-        "start_by": "full_round",
-        "end_by": "full_round",
-        "tail_by": "full_round",
-        "round_start_sec": 92.0,
-        "round_end_sec": None,
-    })
-    assert trimmed["start"] == 100.0  # +8s 抵消 full_round_audio_pre_pad
-    assert trimmed["end"] == 202.0  # -8s post junk
-
-
-def test_continuous_valorant_worker_uses_hybrid_detect() -> None:
-    """valorant_round 持续分析须走 hybrid 视觉检测，禁止回退纯音频 detect_valorant_rounds。"""
+def test_continuous_valorant_worker_uses_ocr_detect() -> None:
+    """valorant_round 持续分析须走纯 OCR 检测，禁止回退纯音频 detect_valorant_rounds。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     worker = src.split("def _continuous_valorant_worker", 1)[1].split(
         "async def _continuous_analysis_loop", 1
     )[0]
-    assert "detect_valorant_rounds_hybrid" in worker
-    assert "ModelContractError" in worker
+    assert "detect_valorant_rounds_hybrid" not in worker
+    assert "ModelContractError" not in worker
     hybrid_branch = worker.split("if game == 'valorant' and _mode == 'valorant_round':", 1)[1]
-    assert "detect_valorant_rounds_hybrid" in hybrid_branch.split("return _detect_rounds_by_audio_rhythm", 1)[0]
+    assert "plugin.scan_window" in hybrid_branch.split("return _detect_rounds_by_audio_rhythm", 1)[0]
     assert "detect_valorant_rounds(" not in worker
 
 
 def test_legacy_audio_ocr_boundary_cannot_enter_valorant_list_path() -> None:
-    """音频/OCR 旧边界不得进入 hybrid 入列路径。"""
+    """音频/旧模型边界不得进入纯 OCR 入列路径。"""
     legacy_cases = [
         {"start": 10.0, "end": 80.0, "start_by": "ocr_buy_exit", "end_by": "ocr_result", "ocr_confirmed": True},
         {"start": 10.0, "end": 80.0, "start_by": "audio", "end_by": "chime"},
         {"start": 10.0, "end": 80.0, "start_by": "full_round", "end_by": "full_round"},
+        {"start": 10.0, "end": 80.0, "boundary_source": "valorant_hybrid_v1",
+         "start_by": "model_buy_exit", "end_by": "model_result",
+         "confirm_status": "vision_confirmed"},
     ]
     for rd in legacy_cases:
-        assert room_handler._is_listable_hybrid_round(rd) is False
+        assert room_handler._is_listable_ocr_round(rd) is False
         assert room_handler._is_auto_exportable_valorant_round(rd) is False
 
 
@@ -687,11 +579,13 @@ def test_shadow_mode_skips_listing_path() -> None:
     assert "and not (state and state.get('shadow_mode'))" in loop
 
 
-def test_analyze_scene_or_rounds_uses_hybrid_for_valorant() -> None:
+def test_analyze_scene_or_rounds_uses_ocr_for_valorant() -> None:
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     fn = src.split("def _analyze_scene_or_rounds", 1)[1].split("def _get_video_duration", 1)[0]
-    assert "detect_valorant_rounds_hybrid" in fn
+    assert "plugin.analyze_file" in fn
+    assert "detect_valorant_rounds_hybrid" not in fn
     assert "detect_valorant_rounds(" not in fn
+    assert "ModelContractError" not in fn
 
 
 def test_shadow_env_helper(monkeypatch) -> None:
@@ -702,58 +596,14 @@ def test_shadow_env_helper(monkeypatch) -> None:
 
 
 def test_derive_round_signals_uses_energy_fields_not_score() -> None:
-    """相位信号必须用真实 energy_rise/collapse，禁止 score 冒充。"""
-    # 直接测试逻辑：高 score 但无 energy 字段 → 不应视为 energy_rise
-    # 通过公开的 helper 行为：合并后的 highlight 字段约定
+    """纯 OCR 路径已无相位调度信号推导；保留字段约定校验（无 energy 冒充）。"""
     hl = {
         "start": 10.0, "end": 90.0, "score": 0.95,
         "start_by": "ocr_buy_exit", "end_by": "open_tail",
         "phase": "pending", "tail_by": "open_tail",
     }
-    # score 高但无 energy_rise：调度侧不应仅凭 score 进 pre_combat
     assert hl.get("energy_rise") is not True
-    hl2 = dict(hl)
-    hl2["energy_rise"] = True
-    hl2["tail_by"] = "chime"
-    hl2["energy_collapse"] = True
-    assert hl2["energy_rise"] is True
-    assert hl2["energy_collapse"] is True
-
-
-def test_clamped_ocr_format_output_not_auto_exportable_without_hybrid() -> None:
-    """Legacy OCR 输出不再满足 hybrid 可导门禁。"""
-    import numpy as np
-
-    from lsc.analyzer.round_detector import ValorantRoundConfig, _format_output
-
-    cfg = ValorantRoundConfig(full_round=True, pre_combat_pad=2.0, tail_pad=0.0)
-    phase = [{
-        "start": 40.0,
-        "end": 153.0,
-        "start_by": "ocr_buy_exit",
-        "end_by": "next_buy",
-        "tail_by": "ocr_phase",
-        "ocr_confirmed": True,
-        "ocr_end": None,
-    }]
-    result = _format_output(
-        [(40, 152)], np.ones(152, dtype=np.float32), 1.0, 153.0, cfg,
-        phase_rounds=phase,
-    )
-    assert not room_handler._is_auto_exportable_valorant_round(result[0])
-    assert not room_handler._is_listable_hybrid_round(result[0])
-
-
-def test_ocr_combat_energy_rejects_buy_phase_only_segments() -> None:
-    import numpy as np
-
-    from lsc.analyzer.round_detector import _ocr_round_has_combat_energy
-
-    quiet = np.full(60, 10.0, dtype=np.float64)
-    combat = np.concatenate([np.full(10, 10.0), np.full(50, 80.0)])
-    threshold = 40.0
-    assert _ocr_round_has_combat_energy(quiet, 0, 60, threshold) is False
-    assert _ocr_round_has_combat_energy(combat, 0, 60, threshold) is True
+    assert hl.get("energy_collapse") is not True
 
 
 def test_start_continuous_analysis_validates_off_event_loop() -> None:
@@ -793,14 +643,13 @@ def test_scene_continuous_export_branch_is_list_only() -> None:
 
 
 def test_pending_highlights_hybrid_path_skips_trim() -> None:
-    """Hybrid 入列禁止 _trim_valorant_combat_bounds；仅 legacy OCR 路径保留 trim。"""
+    """纯 OCR 入列不裁边界：入点/出点原样入列（trim 已删除）。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
         "async def _export_and_broadcast", 1
     )[0]
-    assert "_is_listable_hybrid_round" in loop
-    hybrid_block = loop.split("if _valorant_incremental_rounds:", 1)[1].split("else:", 1)[0]
-    assert "_trim_valorant_combat_bounds" not in hybrid_block
+    assert "_is_listable_ocr_round" in loop
+    assert "_trim_valorant_combat_bounds" not in loop
 
 
 def test_is_timeout_scan_error_detects_asyncio_timeout() -> None:
@@ -812,35 +661,33 @@ def test_is_timeout_scan_error_detects_asyncio_timeout() -> None:
     assert not room_handler._is_timeout_scan_error(None)
 
 
-def test_apply_scan_timeout_backoff_disables_ocr_and_caps_catchup() -> None:
-    """OCR 超时后须降级纯音频并限制追赶窗，避免立刻再开 600s OCR。"""
+def test_apply_scan_timeout_backoff_never_degrades() -> None:
+    """质量优先（2026-08-04）：超时仅计数（用于同窗重试上限），
+    不再降级纯音频/关 OCR——降级曾导致回合永远 audio_pending 无法升格。"""
     state: dict = {"refine_with_ocr": True, "last_scan_error": "TimeoutError()"}
     room_handler._apply_scan_timeout_backoff(state)
-    assert int(state.get("ocr_degraded_remaining", 0)) >= 2
-    assert float(state.get("post_timeout_max_catchup_sec", 999)) <= 180.0
+    assert int(state.get("consecutive_scan_timeouts", 0)) == 1
+    assert int(state.get("ocr_degraded_remaining", 0)) == 0
 
 
-def test_apply_scan_budget_degrade_forces_audio_and_caps_range() -> None:
-    """预算层：ocr_degraded 时关掉 OCR，并把 end 钳到 last_analyzed+cap。"""
-    scan_range = (2431.0, 3031.0)  # 现场超时后膨胀窗
+def test_apply_scan_budget_degrade_never_shrinks_window() -> None:
+    """质量优先：预算层任何情况下不关 OCR、不缩窗，原样返回。"""
+    scan_range = (2431.0, 3031.0)
     use_ocr, capped = room_handler._apply_scan_budget_degrade(
         {"ocr_degraded_remaining": 3, "post_timeout_max_catchup_sec": 120.0},
         scan_range=scan_range,
         last_analyzed=2551.0,
         use_ocr=True,
     )
-    assert use_ocr is False
-    assert capped[0] == 2431.0
-    assert capped[1] <= 2551.0 + 120.0 + 0.01
-    assert capped[1] < 3031.0
+    assert use_ocr is True
+    assert capped == (2431.0, 3031.0)
 
 
-def test_clear_ocr_degrade_on_success_decrements() -> None:
-    state = {"ocr_degraded_remaining": 2}
+def test_successful_scan_clears_timeout_count() -> None:
+    """成功扫描后清除连续超时计数（无降级恢复流程）。"""
+    state = {"consecutive_scan_timeouts": 2}
     room_handler._note_successful_scan_after_degrade(state)
-    assert state["ocr_degraded_remaining"] == 1
-    room_handler._note_successful_scan_after_degrade(state)
-    assert state["ocr_degraded_remaining"] == 0
+    assert state["consecutive_scan_timeouts"] == 0
 
 
 def test_continuous_worker_holds_semaphore_until_timed_out_scan_aborts() -> None:
@@ -859,44 +706,101 @@ def test_continuous_worker_holds_semaphore_until_timed_out_scan_aborts() -> None
 def test_vision_confirmed_is_exportable_gate() -> None:
     rd = {
         "start": 10.0, "end": 55.0, "phase": "combat",
-        "boundary_source": "valorant_hybrid_v1",
-        "start_by": "model_buy_exit",
-        "end_by": "model_result",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_prep",
         "confirm_status": "vision_confirmed",
     }
     assert room_handler._is_auto_exportable_valorant_round(rd) is True
-    assert room_handler._is_listable_hybrid_round(rd) is True
+    assert room_handler._is_listable_ocr_round(rd) is True
 
 
 def test_hybrid_pending_listable_not_exportable() -> None:
     rd = {
         "start": 10.0, "end": 55.0, "phase": "combat",
-        "boundary_source": "valorant_hybrid_v1",
-        "start_by": "model_buy_exit",
-        "end_by": "model_result",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "open_tail",
         "confirm_status": "pending",
     }
-    assert room_handler._is_listable_hybrid_round(rd) is True
+    assert room_handler._is_listable_ocr_round(rd) is True
     assert room_handler._is_auto_exportable_valorant_round(rd) is False
 
 
 def test_non_hybrid_not_listable_as_hybrid() -> None:
     rd = {"start": 10.0, "end": 80.0, "start_by": "full_round", "end_by": "energy_collapse"}
-    assert room_handler._is_listable_hybrid_round(rd) is False
+    assert room_handler._is_listable_ocr_round(rd) is False
+
+
+def test_chime_corrected_pending_round_is_listable() -> None:
+    """open_tail 闭合边界（end_by=open_tail）可入列表（等待下轮确认）。"""
+    rd = {
+        "start": 100.0, "end": 150.0, "phase": "combat",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "open_tail",
+        "confirm_status": "pending",
+    }
+    assert room_handler._is_listable_ocr_round(rd) is True
+    assert room_handler._is_auto_exportable_valorant_round(rd) is False
+
+
+def test_chime_corrected_vision_confirmed_is_exportable() -> None:
+    rd = {
+        "start": 100.0, "end": 150.0, "phase": "combat",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_prep",
+        "confirm_status": "vision_confirmed",
+    }
+    assert room_handler._is_auto_exportable_valorant_round(rd) is True
+
+
+def test_chime_corrected_closed_round_near_tip_is_not_dropped() -> None:
+    """next_prep 是闭合边界，_drop_open_tail_rounds 不得按 open_tail 丢弃。"""
+    rounds = [{
+        "start": 92.444,
+        "end": 188.611,
+        "phase": "combat",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_prep",
+        "confirm_status": "pending",
+    }]
+
+    retained = room_handler._drop_open_tail_rounds(rounds, current_dur=192.0)
+
+    assert retained == rounds
+    assert room_handler._is_listable_ocr_round(retained[0])
+
+
+def test_round_end_events_merge_keeps_last_spike() -> None:
+    """回合结束钟声合并须保留窗口内最后一个 spike（结束连声的最后一声），
+    而非能量最高者（交火枪声会提前结束点）。"""
+    import lsc.analyzer.sound_detector as sd
+
+    events = [
+        {"timestamp": 10.0, "score": 0.9},
+        {"timestamp": 14.0, "score": 0.6},
+        {"timestamp": 30.0, "score": 0.8},
+        {"timestamp": 33.0, "score": 0.4},
+    ]
+    merged = sd._merge_events_last(events, merge_window=8.0)
+    assert [e["timestamp"] for e in merged] == [14.0, 33.0]
+
+    src = (ROOT / "lsc/analyzer/sound_detector.py").read_text(encoding="utf-8")
+    assert "detect_round_end_events" in src
+    assert "_merge_events_last" in src
 
 
 def test_list_only_min_duration_allows_short_hybrid_rounds() -> None:
-    """现场：34.8s hybrid 回合 toast 了但被 35s 导出门槛挡住入列。
-
-    list_only 须用更低门槛（≥5s），真正导出路径仍可保留 35s。
-    """
+    """纯 OCR 确认的回合（入点+出点齐备）直接入列导出，门槛统一为 5s。"""
     assert hasattr(room_handler, "_min_highlight_duration_for_queue")
     assert room_handler._min_highlight_duration_for_queue(list_only=True) <= 5.0
-    assert room_handler._min_highlight_duration_for_queue(list_only=False) >= 35.0
-    # 现场短回合应过 list_only 门、不过导出门外
+    assert room_handler._min_highlight_duration_for_queue(list_only=False) <= 5.0
+    # 现场短回合应过入列门
     short = 187.3 - 152.5  # 34.8
     assert short >= room_handler._min_highlight_duration_for_queue(list_only=True)
-    assert short < room_handler._min_highlight_duration_for_queue(list_only=False)
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     auto_fn = src.split("async def _auto_export_highlights", 1)[1].split(
         "async def queue_export", 1
@@ -981,18 +885,17 @@ def test_status_payload_reports_provider_and_latest_error() -> None:
     payload = room_handler._build_continuous_status_payload(
         {
             "mode": "valorant_round",
-            "provider": "CPUExecutionProvider",
-            "provider_warning": "valorant classifier fell back to CPU",
-            "model_version": "v1",
-            "last_scan_error": "model missing",
+            "last_scan_error": "ocr failed",
         },
         room_id="main",
     )
 
-    assert payload["provider"] == "CPUExecutionProvider"
-    assert payload["provider_warning"] == "valorant classifier fell back to CPU"
-    assert payload["model_version"] == "v1"
-    assert payload["last_scan_error"] == "model missing"
+    assert payload["last_scan_error"] == "ocr failed"
+    # 纯 OCR 路径不再上报模型/推理统计字段
+    assert "model_version" not in payload
+    assert "provider" not in payload
+    assert "round_phase" not in payload
+    assert "predicted_phase" not in payload
 
 
 def test_hybrid_clip_metadata_preserves_boundary_evidence() -> None:
@@ -1145,20 +1048,11 @@ def test_worker_crash_reports_failure_to_main_loop() -> None:
 
 
 def test_ocr_recovery_reprocesses_old_audio_pending() -> None:
-    """OCR 降级恢复后必须：(1) 重置 ocr_refine_done；(2) 把降级期间入列的
-    旧 audio_pending 回合纳入精修目标——否则它们永远无法升格。"""
+    """纯 OCR 路径已无音频降级/升格机制（降级机制随音频路径删除）。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    # 降级恢复：递减到 0 时重置精修标记
-    assert "ocr_refine_done" in src
-    assert "state[\"ocr_refine_done\"] = False" in src
-    # 主循环精修块：收集 all_highlights 中旧的 audio_pending 回合
-    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
-        "async def _continuous_valorant_worker", 1
-    )[0]
-    assert "old_pending_keys" in loop
-    assert "_has_unrefined_pending" in loop
-    # 精修结果按 round_key 写回 all_highlights
-    assert "refined_by_key" in loop
+    assert "ocr_refine_done" not in src
+    assert "old_pending_keys" not in src
+    assert "_normalize_audio_pending_rounds" not in src
 
 
 def test_merge_round_windows_boundary_drift_does_not_duplicate() -> None:
@@ -1166,8 +1060,8 @@ def test_merge_round_windows_boundary_drift_does_not_duplicate() -> None:
     existing = [
         {
             "start": 100.0, "end": 160.0,
-            "start_by": "model_buy_exit", "end_by": "model_result",
-            "boundary_source": "valorant_hybrid_v1",
+            "start_by": "ocr_combat", "end_by": "next_prep",
+            "boundary_source": "valorant_ocr_v1",
             "confirm_status": "vision_confirmed", "phase": "combat",
             "round_key": "round-000010",
         },
@@ -1175,8 +1069,8 @@ def test_merge_round_windows_boundary_drift_does_not_duplicate() -> None:
     window = [
         {
             "start": 101.5, "end": 162.0,  # 起点 +1.5s / 终点 +2s 漂移
-            "start_by": "model_buy_exit", "end_by": "model_result",
-            "boundary_source": "valorant_hybrid_v1",
+            "start_by": "ocr_combat", "end_by": "next_prep",
+            "boundary_source": "valorant_ocr_v1",
             "confirm_status": "vision_confirmed", "phase": "combat",
         },
     ]
@@ -1192,16 +1086,60 @@ def test_new_rounds_boundary_drift_not_counted_as_fresh() -> None:
     prev = [
         {
             "start": 100.0, "end": 160.0,
-            "boundary_source": "valorant_hybrid_v1",
+            "boundary_source": "valorant_ocr_v1",
             "confirm_status": "vision_confirmed",
         },
     ]
     current = [
         {
             "start": 101.5, "end": 162.0,
-            "boundary_source": "valorant_hybrid_v1",
+            "boundary_source": "valorant_ocr_v1",
             "confirm_status": "vision_confirmed",
         },
     ]
     assert room_handler._new_rounds(prev, current) == []
 
+
+def test_audio_only_recovery_rounds_are_tagged_and_listable() -> None:
+    """纯音频降级路径已删除：无音频回合入列语义。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_normalize_audio_pending_rounds" not in src
+    assert "_is_listable_audio_round" not in src
+    assert "audio_pending" not in src
+
+
+def test_continuous_status_contains_authoritative_listed_clip_snapshot() -> None:
+    clip = {
+        "clip_id": "r1_330_720",
+        "room_id": "r1",
+        "start": 33.0,
+        "end": 72.0,
+        "label": "R01",
+        "round_key": "round-000003",
+        "confirm_status": "audio_pending",
+    }
+    task = {
+        "mode": "valorant_round",
+        "target_room_ids": ["r1"],
+        "highlights": [clip],
+        "listed_clips": {"r1:round-000003": clip},
+    }
+
+    payload = room_handler._build_continuous_status_payload(task, room_id="r1")
+
+    assert payload["total_highlights"] == 1
+    assert payload["listed_clip_count"] == 1
+    assert payload["listed_clips"] == [clip]
+
+
+def test_continuous_valorant_listing_is_list_only() -> None:
+    """持续分析入列必须 list_only（只入切片列表+时间线），禁止自动 FFmpeg 导出。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _export_and_broadcast", 1
+    )[0]
+    listing_block = loop.split("持续分析入列（仅列表）", 1)[0]
+    assert "list_only=True" in listing_block
+    assert "list_only=False" not in listing_block
+    # 入列不得触发即时导出（queue_export 由用户手动确认后执行）
+    assert "defer_export=False" not in listing_block

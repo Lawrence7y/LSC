@@ -29,20 +29,11 @@ REQUIRED_STATUS_KEYS = {
     "scan_reason",
     "scan_elapsed_sec",
     "scan_running",
-    "round_phase",
-    "round_phase_detail",
     "valorant_profile",
-    "pending_round",
-    "predicted_wake_at",
-    "predicted_phase",
-    "prediction_detail",
     "finalizing",
     "completed",
     "status",
     "analysis_lag_sec",
-    "model_version",
-    "provider",
-    "provider_warning",
     "last_scan_error",
 }
 
@@ -59,10 +50,10 @@ REQUIRED_HIGHLIGHTS_KEYS = {
 }
 
 
-def test_valorant_analyze_file_matches_hybrid_direct(monkeypatch, tmp_path):
+def test_valorant_analyze_file_matches_ocr_direct(monkeypatch, tmp_path):
     fixed = [{"start": 1.0, "end": 10.0, "title": "R1"}]
     monkeypatch.setattr(
-        "lsc.analyzer.round_detector.detect_valorant_rounds_hybrid",
+        "lsc.analyzer.valorant_ocr_rounds.detect_valorant_rounds_ocr",
         lambda *a, **k: fixed,
     )
     out = get("valorant").analyze_file(str(tmp_path / "x.mp4"))
@@ -92,7 +83,6 @@ def test_plan_scan_window_matches_budget_helper():
         "mode": "valorant_round",
         "last_analyzed": 120.0,
         "tick_count": 3,
-        "round_phase": None,
     }
     pressure = {"analysis_window_sec": 60.0}
     window = get("valorant").plan_scan_window(dict(state), 200.0, pressure)
@@ -101,8 +91,6 @@ def test_plan_scan_window_matches_budget_helper():
         120.0,
         200.0,
         pressure,
-        3,
-        round_phase=None,
     )
     assert (window.start_sec, window.end_sec) == scan_range
     assert window.use_ocr is use_ocr
@@ -179,7 +167,7 @@ def test_continuous_highlights_payload_keys_shape():
 
 def test_handler_scan_budget_reexport_parity():
     a = room_handler._continuous_valorant_scan_budget(
-        "valorant_round", 0.0, 90.0, {}, 0
+        "valorant_round", 0.0, 90.0, {}
     )
     from lsc.analyzer.valorant_plugin import compute_valorant_scan_budget
 
@@ -188,6 +176,5 @@ def test_handler_scan_budget_reexport_parity():
         last_analyzed=0.0,
         current_dur=90.0,
         pressure={},
-        tick_count=0,
     )
     assert a == b
