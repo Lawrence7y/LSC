@@ -247,6 +247,9 @@ def test_preview_audio_aligner_rejects_near_silent_rms() -> None:
     assert "peak < 1e-5 || rms < 1e-5" in source
     assert "silent_audio" in source
     assert "0.5 / peak" in source
+    # CSP 拦截 AudioWorklet 时回退 ScriptProcessor，避免「有效音频不足」
+    assert "captureWithScriptProcessor" in source
+    assert "createScriptProcessor" in source
 
 
 def test_workbench_alignment_request_includes_preview_diagnostics() -> None:
@@ -1073,11 +1076,14 @@ def test_timeline_scrub_can_leave_live_edge() -> None:
     assert "setTimelineFollowLive(false)" in workbench
     assert "followLive={timelineFollowLive}" in workbench
     view_model = (ROOT / "lsc-electron/src/utils/timelineViewModel.ts").read_text(encoding="utf-8")
-    assert "panTimelineWindowStart" in view_model
+    timeline_window = (ROOT / "lsc-electron/src/utils/timelineWindow.ts").read_text(encoding="utf-8")
+    assert "computeTimelineWindow" in view_model
+    assert "panTimelineWindowStart" in timeline_window
     assert "panTimelineWindowStart" in coords
     assert "TIMELINE_MAX_WINDOW * 0.15" not in workbench
     assert "TIMELINE_MAX_WINDOW * 0.15" not in control
     assert "TIMELINE_MAX_WINDOW * 0.15" not in view_model
+    assert "TIMELINE_MAX_WINDOW * 0.15" not in timeline_window
 
     seek_body = workbench.split("const mseSeek = useCallback", 1)[1].split("const mseTogglePlayPause", 1)[0]
     assert "bufEnd - 0.5" not in seek_body
@@ -1524,3 +1530,23 @@ def test_qt_global_tick_is_3s_with_stagger() -> None:
     assert "_STAGGER_GROUPS = 3" in orch
     assert "_TICK_INTERVAL_MS / 1000.0" in orch
     assert "room_idx % _STAGGER_GROUPS" in orch
+
+
+def test_timeline_1x_zero_and_dvr_lookback_contract() -> None:
+    """1x Live 左端=0；紫线/预览左端=liveEdge−120；禁止 boundaryLead。"""
+    window = (ROOT / "lsc-electron/src/utils/timelineWindow.ts").read_text(encoding="utf-8")
+    assert "DVR_LOOKBACK_SEC = 120" in window
+    assert "export function computeTimelineWindow" in window
+    assert "export function computeDvrLeftEdge" in window
+    assert "zoom <= 1 && input.followLive && !input.scrubbing" in window
+    room = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    assert "boundaryLeadSeconds" not in room
+    assert "computeDvrLeftEdge" in room
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "computeDvrLeftEdge" in workbench
+    store = (ROOT / "lsc-electron/src/utils/playheadStore.ts").read_text(encoding="utf-8")
+    assert "retainClockLoop" in store
+    assert "writeLiveEdgeBase" in store
+    control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
+    assert "retainClockLoop" in control
+    assert "readLiveEdgeDisplay" in control

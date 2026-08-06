@@ -9,13 +9,13 @@ import type { TimelineViewModel } from '@/pages/Workbench/components/ControlBar'
 import {
   computeRecordedDurationHint,
   isRecordingReviewMode,
-  panTimelineWindowStart,
   previewToCommon,
   resolveLiveContentSpan,
   resolveRecordingReviewSpan,
 } from '@/utils/timelineCoords'
+import { computeTimelineWindow, TIMELINE_MAX_WINDOW } from '@/utils/timelineWindow'
 
-export const TIMELINE_MAX_WINDOW = 600
+export { TIMELINE_MAX_WINDOW }
 
 export type TimelineClipBlock = { start: number; end: number }
 
@@ -50,6 +50,8 @@ export type TimelineViewInput = {
   contentEdgeRoomId: string | null
   /** 预计算的 clip 块（跳过 O(n) 坐标转换） */
   clipBlocks?: TimelineClipBlock[]
+  /** 缩放倍率；1x Live 时 windowStart 固定 0 */
+  zoomLevel?: number
 }
 
 export type TimelineViewResult = {
@@ -166,29 +168,23 @@ export function computeTimelineViewModel(input: TimelineViewInput): TimelineView
   const rawEnd = Math.max(elapsed, curCommon, 0)
   const contentEnd = Math.max(nextContentEnd, rawEnd, 1)
 
-  let ws = 0
-  let dur = contentEnd
-  if (refineStart != null && refineEnd != null && refineEnd > refineStart) {
-    const mid = (refineStart + refineEnd) / 2
-    const half = Math.min(TIMELINE_MAX_WINDOW, Math.max(30, (refineEnd - refineStart) * 4)) / 2
-    ws = Math.max(0, mid - half)
-    dur = Math.max(contentEnd, ws + half * 2, 1)
-  } else if (contentEnd > TIMELINE_MAX_WINDOW) {
-    dur = contentEnd
-    if (timelineFollowLive && !timelineScrubbing) {
-      ws = contentEnd - TIMELINE_MAX_WINDOW
-    } else if (timelineScrubbing && frozenWindowStart != null) {
-      ws = frozenWindowStart
-    } else {
-      const playhead = Math.max(0, curCommon)
-      ws = panTimelineWindowStart(
-        playhead,
-        contentEnd,
-        TIMELINE_MAX_WINDOW,
-        frozenWindowStart ?? prevWindowStart,
-      )
-    }
-  }
+  const zoomLevel = input.zoomLevel ?? 1
+  const refining =
+    refineStart != null && refineEnd != null && refineEnd > refineStart
+      ? { start: refineStart, end: refineEnd }
+      : null
+  const win = computeTimelineWindow({
+    contentEnd,
+    zoomLevel,
+    followLive: timelineFollowLive,
+    scrubbing: timelineScrubbing,
+    frozenWindowStart,
+    playhead: Math.max(0, curCommon),
+    prevWindowStart,
+    refining,
+  })
+  const ws = win.windowStart
+  const dur = win.duration
 
   const markIn = commonMarkIn ?? (refRoom?.mark_in != null
     ? previewToCommon(timelineContext, referenceRoomId, refRoom.mark_in)

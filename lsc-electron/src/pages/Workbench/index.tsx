@@ -35,6 +35,7 @@ import {
   recordingToCommon,
   resolveRecordingReviewSpan,
 } from '@/utils/timelineCoords'
+import { computeDvrLeftEdge } from '@/utils/timelineWindow'
 import { useTimelineViewModel } from '@/hooks/useTimelineViewModel'
 
 /** 贴右此容差内视为回到 Live（秒） */
@@ -225,7 +226,9 @@ function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
     no_audio_track: '无音轨',
     buffer_empty: 'buffer 空',
     silent: '静音或音量过低',
+    silent_audio: '静音或音量过低',
     timeout: '捕获超时',
+    capture_timeout: '捕获超时',
     capture_exception: '捕获异常',
   }
   return failures
@@ -527,6 +530,7 @@ export default function Workbench() {
     recordedDurationHint: continuousAnalysisStatus?.recorded_duration,
     mediaDuration: referenceRoomId ? (getRoomMediaDuration(referenceRoomId) ?? undefined) : undefined,
     timelineTick,
+    zoomLevel: timelineZoom,
   })
 
   // 同步 Worker/纯函数算出的 contentEnd，供 seek/Live 贴边使用
@@ -539,7 +543,7 @@ export default function Workbench() {
     }
   }, [timelineView?.contentEnd, timelineView?.windowStart])
 
-  // 紫标 = MSE 缓冲左沿（与 timelineView / contentEnd 同轴）；recording_review / degraded 无紫标
+  // 紫标 = liveEdge − 120s（与预览条左端契约一致）；recording_review / degraded 无紫标
   const dvrStart = useMemo((): number | null => {
     const rid = resolveDvrSourceRoomId(
       referenceRoomId,
@@ -557,16 +561,16 @@ export default function Workbench() {
     }
     const buf = getRoomBufferedRange(rid)
     if (!buf) return null
-    const bufStart = buf.start
+    const dvrPreview = computeDvrLeftEdge(buf.end)
     if (commonMode && timelineContext?.room_snapshots[rid]) {
       try {
-        return previewToCommon(timelineContext, rid, bufStart)
+        return previewToCommon(timelineContext, rid, dvrPreview)
       } catch {
         // 对齐快照瞬时不可用时回退 preview 轴，避免紫标整段消失
-        return bufStart
+        return dvrPreview
       }
     }
-    return bufStart
+    return dvrPreview
   }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, commonMode, timelineContext, previewPositions, timelineTick])
 
   // recording_review / degraded：强制退出 followLive
@@ -1808,7 +1812,10 @@ export default function Workbench() {
       const captureFailures: CaptureFailure[] = []
       const capturePromises = [...roomIds].map(async rid => {
         const entry = registry?.[rid]
-        const video = entry?.player?.videoElement as HTMLVideoElement | undefined
+        const video = (
+          entry?.player?.videoElement
+          ?? document.querySelector(`video[data-room-id="${rid}"]`)
+        ) as HTMLVideoElement | null | undefined
         if (!video) {
           captureFailures.push({ roomId: rid, reason: 'no_video' })
           return null

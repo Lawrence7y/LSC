@@ -15,10 +15,17 @@ import {
 } from '@ant-design/icons'
 import { RoomSession, ClipSegment, TimelineHighlightBand, ContinuousAnalysisStatus, TimelineProgressSummary } from '@/types'
 import type { TimelineAlignStatus } from '@/utils/timelineCoords'
-import { panTimelineWindowStart, computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, resolveLiveContentSpan, resolveRecordingReviewSpan, summarizeTimelineProgress } from '@/utils/timelineCoords'
+import { computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, resolveLiveContentSpan, resolveRecordingReviewSpan, summarizeTimelineProgress } from '@/utils/timelineCoords'
+import { computeTimelineWindow } from '@/utils/timelineWindow'
 import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
 import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
+import {
+  readLiveEdgeDisplay,
+  retainClockLoop,
+  subscribeClock,
+  writeLiveEdgeBase,
+} from '@/utils/playheadStore'
 
 export interface TimelineViewModel {
   duration: number
@@ -207,7 +214,6 @@ export const ControlBar = memo(function ControlBar({
   const isDisabled = !room && (multiSelectCount ?? 0) === 0
 
   // 可视窗跟内容走；不设默认时长；光标贴内容右端（像原生预览进度条）
-  const TIMELINE_MAX_WINDOW = 600
   const contentEdgeRef = useRef(1)
   const contentEdgeRoomRef = useRef<string | null>(null)
   const localTimeline = useMemo(() => {
@@ -253,30 +259,21 @@ export const ControlBar = memo(function ControlBar({
     const rawEnd = Math.max(elapsed, previewPos, 0)
     const contentEnd = Math.max(contentEdgeRef.current, rawEnd, 1)
     contentEdgeRef.current = contentEnd
-    let ws = 0
-    let dur = contentEnd
-    if (activeRefine && activeRefine.end > activeRefine.start) {
-      const mid = (activeRefine.start + activeRefine.end) / 2
-      const half = Math.min(TIMELINE_MAX_WINDOW, Math.max(30, (activeRefine.end - activeRefine.start) * 4)) / 2
-      ws = Math.max(0, mid - half)
-      dur = Math.max(contentEnd, ws + half * 2, 1)
-    } else if (contentEnd > TIMELINE_MAX_WINDOW) {
-      dur = contentEnd
-      if (followLive && !isScrubbing) {
-        ws = contentEnd - TIMELINE_MAX_WINDOW
-      } else if (isScrubbing && frozenWindowStart != null) {
-        ws = frozenWindowStart
-      } else {
-        // scrub 后仅越界时平移；缩放窗左缘 = ws；短内容 ws=0 即 0:00:00
-        const playhead = Math.max(0, previewPos)
-        ws = panTimelineWindowStart(
-          playhead,
-          contentEnd,
-          TIMELINE_MAX_WINDOW,
-          frozenWindowStart ?? 0,
-        )
-      }
-    }
+    const win = computeTimelineWindow({
+      contentEnd,
+      zoomLevel,
+      followLive,
+      scrubbing: isScrubbing,
+      frozenWindowStart,
+      playhead: Math.max(0, previewPos),
+      prevWindowStart: frozenWindowStart ?? 0,
+      refining:
+        activeRefine && activeRefine.end > activeRefine.start
+          ? { start: activeRefine.start, end: activeRefine.end }
+          : null,
+    })
+    const ws = win.windowStart
+    const dur = win.duration
     if (followLive && !isScrubbing) {
       cur = contentEnd
     } else if (previewPos > 0 || !followLive) {
@@ -293,10 +290,33 @@ export const ControlBar = memo(function ControlBar({
     room?.room_id, room?.mark_out, room?.mark_in, room?.preview_mode, room?.preview_enabled,
     room?.is_recording, room?.record_started_at,
     previewPos, tick, activeRefine, followLive, isScrubbing, frozenWindowStart,
-    recordedDurationHint, isRecordingReview, clips,
+    recordedDurationHint, isRecordingReview, clips, zoomLevel,
   ])
 
   const { duration, currentTime, windowStart } = timelineView ?? localTimeline
+  const contentEndAbs = timelineView?.contentEnd ?? localTimeline.contentEnd
+
+  // Live 右沿采样 → rAF 插值；时钟文案直写 DOM
+  useEffect(() => {
+    writeLiveEdgeBase(contentEndAbs)
+  }, [contentEndAbs])
+
+  const timeLabelRef = useRef<HTMLSpanElement>(null)
+  useEffect(() => {
+    const release = retainClockLoop()
+    const unsub = subscribeClock(() => {
+      const el = timeLabelRef.current
+      if (!el) return
+      const t = (followLive && !isScrubbing)
+        ? readLiveEdgeDisplay(true)
+        : (timelineView ? timelineView.currentTime : currentTime)
+      el.textContent = formatTime(Math.max(0, t))
+    })
+    return () => {
+      unsub()
+      release()
+    }
+  }, [followLive, isScrubbing, timelineView, currentTime])
   // Timeline 内时间一律相对 windowStart；轨长 = 可视窗长度（无默认垫高）
   // 缩放时左缘 = windowStart（片段最左），未缩放短内容时 ws=0 即 0:00:00
   const trackDuration = Math.max(1, duration - windowStart)
@@ -559,7 +579,9 @@ export const ControlBar = memo(function ControlBar({
           </span>
           {/* 当前播放位置（单一时间读数） */}
           <Tooltip title="当前播放位置（预览流）">
-            <span style={{
+            <span
+              ref={timeLabelRef}
+              style={{
               fontFamily: 'var(--font-mono)',
               fontSize: 14,
               color: 'var(--text-primary)',

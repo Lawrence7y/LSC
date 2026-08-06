@@ -119,6 +119,7 @@ export function useTimelineViewModel(
     input.recordedDurationHint,
     input.mediaDuration,
     input.timelineTick,
+    input.zoomLevel,
   ])
 
   useEffect(() => () => {
@@ -152,6 +153,7 @@ export function useTimelineViewModel(
     input.recordedDurationHint,
     input.mediaDuration,
     input.timelineTick,
+    input.zoomLevel,
   ])
 
   useEffect(() => {

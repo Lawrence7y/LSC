@@ -742,7 +742,7 @@ export function Timeline({
                   snapFlash?.type === 'record' ? ' lsc-timeline__record-end--snap' : ''
                 }`}
                 style={{ left: `${dvrStartPct}%` }}
-                title={`DVR 左边界 ${formatTime(dvrStart!)}：左侧回跟播，右侧可回看`}
+                title={`DVR 左边界 ${formatTime(dvrStart!)}：约实时−2分钟，左侧回跟播，右侧可回看`}
               />
             )}
 

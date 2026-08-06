@@ -1,16 +1,13 @@
 /**
- * 播放头位置订阅式存储（模块级，不进 React state）。
+ * 播放头 / 时钟订阅式存储（模块级，不进 React state）。
  *
- * 背景：预览播放头是纯视觉元素，原先经 200ms setState 轮询驱动整个
- * Workbench 重渲染。改为「采样循环 writePlayhead + rAF 通知订阅者」，
- * 订阅方（Timeline 播放头图层）直接写 DOM，60fps 流畅且不参与 React 渲染周期。
- *
- * 注意：React state（previewPositions）仍保留用于 contentEnd 等逻辑计算，
- * 只是降频更新；本模块只负责高频视觉通道。
+ * 播放头：采样循环 writePlayhead + rAF 通知订阅者，Timeline 直写 DOM。
+ * 时钟：录制已录时长、Live 贴边时刻在 rAF 循环中插值，避免 1s setInterval 跳变。
  */
 
 export type PlayheadListener = (positions: Readonly<Record<string, number>>) => void
 export type DisplayPlayheadListener = (absoluteTime: number) => void
+export type ClockListener = () => void
 
 /** 时间线显示轴绝对时间（common 或单房 preview），供 Timeline 直写 DOM */
 const DISPLAY_KEY = '__display__'
@@ -18,8 +15,14 @@ const DISPLAY_KEY = '__display__'
 const positions: Record<string, number> = {}
 const listeners = new Set<PlayheadListener>()
 const displayListeners = new Set<DisplayPlayheadListener>()
+const clockListeners = new Set<ClockListener>()
 let rafId: number | null = null
 let dirty = false
+let clockLoopId: number | null = null
+let clockLoopRefs = 0
+
+/** Live 右沿插值基准（contentEnd 采样点） */
+let liveEdgeBase = { sec: 0, monoMs: 0 }
 
 /** 采样循环写入（高频调用安全：阈值过滤 + rAF 合帧通知） */
 export function writePlayhead(roomId: string, t: number): void {
@@ -33,6 +36,18 @@ export function writePlayhead(roomId: string, t: number): void {
 /** 写入时间线显示轴绝对播放头（与 timelineView.currentTime 同轴） */
 export function writeDisplayPlayhead(absoluteTime: number): void {
   writePlayhead(DISPLAY_KEY, absoluteTime)
+}
+
+/** Live 贴边：写入 contentEnd 采样，供 rAF 插值连续走秒 */
+export function writeLiveEdgeBase(contentEndSec: number): void {
+  if (!Number.isFinite(contentEndSec) || contentEndSec < 0) return
+  liveEdgeBase = { sec: contentEndSec, monoMs: performance.now() }
+}
+
+export function readLiveEdgeDisplay(followLive: boolean): number {
+  if (!followLive) return readDisplayPlayhead()
+  if (liveEdgeBase.monoMs <= 0) return readDisplayPlayhead()
+  return liveEdgeBase.sec + (performance.now() - liveEdgeBase.monoMs) / 1000
 }
 
 export function readPlayhead(roomId: string): number {
@@ -64,6 +79,47 @@ export function subscribeDisplayPlayhead(fn: DisplayPlayheadListener): () => voi
   return () => {
     displayListeners.delete(fn)
   }
+}
+
+/** 时钟文案订阅：每帧回调一次（需配合 retainClockLoop） */
+export function subscribeClock(fn: ClockListener): () => void {
+  clockListeners.add(fn)
+  return () => {
+    clockListeners.delete(fn)
+  }
+}
+
+/** 有录制/需要连续时钟时保持 rAF 循环 */
+export function retainClockLoop(): () => void {
+  clockLoopRefs += 1
+  ensureClockLoop()
+  return () => {
+    clockLoopRefs = Math.max(0, clockLoopRefs - 1)
+    if (clockLoopRefs === 0 && clockLoopId !== null) {
+      cancelAnimationFrame(clockLoopId)
+      clockLoopId = null
+    }
+  }
+}
+
+function ensureClockLoop(): void {
+  if (clockLoopId !== null) return
+  const tick = () => {
+    clockLoopId = null
+    if (clockLoopRefs <= 0) return
+    clockListeners.forEach((fn) => {
+      try {
+        fn()
+      } catch (err) {
+        console.error('[playheadStore] clock listener error:', err)
+      }
+    })
+    // 同时冲刷 display 订阅（Live 插值时也要刷新）
+    dirty = true
+    scheduleFlush()
+    clockLoopId = requestAnimationFrame(tick)
+  }
+  clockLoopId = requestAnimationFrame(tick)
 }
 
 function scheduleFlush(): void {

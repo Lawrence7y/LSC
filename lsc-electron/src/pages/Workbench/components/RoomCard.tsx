@@ -18,6 +18,8 @@ import {
 import { RoomSession } from '@/types'
 import { VideoPreview } from '@/components/VideoPreview'
 import { formatTime } from '@/utils/time'
+import { computeDvrLeftEdge } from '@/utils/timelineWindow'
+import { retainClockLoop, subscribeClock } from '@/utils/playheadStore'
 import { useAppStore } from '@/store/appStore'
 
 function openDouyinCookieSettings(e: React.MouseEvent) {
@@ -216,6 +218,23 @@ export const RoomCard = memo(function RoomCard({
     return (Date.now() - new Date(room.record_started_at).getTime()) / 1000
   }, [room.is_recording, room.record_started_at, tick])
 
+  const recordedLabelRef = useRef<HTMLSpanElement>(null)
+  useEffect(() => {
+    if (!room.is_recording || !room.record_started_at) return
+    const startedAt = new Date(room.record_started_at).getTime()
+    const release = retainClockLoop()
+    const unsub = subscribeClock(() => {
+      const el = recordedLabelRef.current
+      if (!el) return
+      const sec = Math.max(0, (Date.now() - startedAt) / 1000)
+      el.textContent = `已录 ${formatTime(sec)}`
+    })
+    return () => {
+      unsub()
+      release()
+    }
+  }, [room.is_recording, room.record_started_at])
+
   /** 放大态播放控制所需派生量 */
   const isPreviewPlaying = room.preview_enabled && !room.preview_paused
   const videoElement = window.__msePlayers?.[room.room_id]?.player?.videoElement
@@ -245,18 +264,15 @@ export const RoomCard = memo(function RoomCard({
     1,
   )
   const hasLiveDvrRange = supportsLiveDvr && bufferedEnd - bufferedStart > 1
-  const liveDvrDuration = hasLiveDvrRange ? bufferedEnd - bufferedStart : 0
-  // 直播时在 DVR 起点左侧保留一小段滚动禁用区，使边界始终清晰可见，
-  // 又不会因直播数小时后 0→bufferedEnd 过长而把可回放区域挤成一条细线。
-  const boundaryLeadSeconds = Math.max(10, Math.min(60, liveDvrDuration * 0.2))
-  const expTimelineStart = hasLiveDvrRange
-    ? Math.max(0, bufferedStart - boundaryLeadSeconds)
-    : 0
+  const liveEdge = hasLiveDvrRange ? bufferedEnd : fallbackEnd
+  const purple = hasLiveDvrRange ? computeDvrLeftEdge(liveEdge) : 0
+  // 预览条左端 = 紫线 = liveEdge − 120s（不再在紫线左侧留 lead）
+  const expTimelineStart = hasLiveDvrRange ? purple : 0
   const expTimelineEnd = hasLiveDvrRange
     ? bufferedEnd
     : fallbackEnd
   const expTimelineSpan = Math.max(1, expTimelineEnd - expTimelineStart)
-  const replayBoundary = hasLiveDvrRange ? bufferedStart : expTimelineStart
+  const replayBoundary = purple
   const replayBoundaryPct = Math.max(
     0,
     Math.min(100, ((replayBoundary - expTimelineStart) / expTimelineSpan) * 100),
@@ -667,7 +683,7 @@ export const RoomCard = memo(function RoomCard({
                         <span
                           className="room-card__expanded-replay-boundary"
                           style={{ left: `${replayBoundaryPct}%` }}
-                          title={`回放边界 ${formatTime(replayBoundary)}：左侧不可回放，右侧可回放`}
+                          title={`DVR 左边界 ${formatTime(replayBoundary)}：约实时−2分钟，左侧不可回放，右侧可回放`}
                         />
                       </>
                     )}
@@ -833,7 +849,7 @@ export const RoomCard = memo(function RoomCard({
             {room.record_started_at && (
               <>
                 <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
-                <span style={{ fontFamily: 'monospace', flexShrink: 0 }}>
+                <span ref={recordedLabelRef} style={{ fontFamily: 'monospace', flexShrink: 0 }}>
                   已录 {formatTime(recordingElapsedSeconds)}
                 </span>
               </>
