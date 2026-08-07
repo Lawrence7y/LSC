@@ -43,6 +43,7 @@ def probe_duration(video_path: str, ffprobe: str = "ffprobe") -> float:
             [ffprobe, "-v", "quiet", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
             capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
             creationflags=get_creation_flags(),
         )
         return float(result.stdout.strip())

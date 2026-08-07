@@ -106,6 +106,15 @@ class FrameCaptureWorker:
         set_stream_nonblocking(proc.stdout)
         return proc
 
+    def _close_proc_pipes(self, process: subprocess.Popen) -> None:
+        """关闭子进程管道，防止反复重启时父进程读端 fd 泄漏。"""
+        for pipe in (getattr(process, "stdout", None), getattr(process, "stderr", None)):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
     # ── 读线程 ────────────────────────────────────────────────
 
     def _reader_loop(self) -> None:
@@ -154,6 +163,7 @@ class FrameCaptureWorker:
                 process.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 pass
+            self._close_proc_pipes(process)
         self._process = None
 
         if self._stop_event.is_set():
@@ -214,6 +224,7 @@ class FrameCaptureWorker:
                         pass
             except Exception as exc:
                 _log.warning("FrameCapture stop error: %s", exc)
+            self._close_proc_pipes(process)
         self._process = None
         thread = self._reader_thread
         if thread is not None and thread.is_alive():

@@ -385,8 +385,8 @@ export default function Workbench() {
   const [previewPositions, setPreviewPositions] = useState<Record<string, number>>({})
   // 缓存上次 previewPositions 快照，仅在 currentTime 真正变化时 setState，避免无差别重渲染
   const lastPreviewPositionsRef = useRef<Record<string, number>>({})
-  // React state 降频刷新：播放头视觉走 playheadStore rAF 直写（60fps），
-  // setPreviewPositions 仅驱动 contentEnd/窗口公式等低频逻辑，无需 200ms
+  // React state 降频刷新：播放头视觉走 playheadStore 每帧直写（~60fps），
+  // setPreviewPositions 仅驱动 contentEnd/窗口公式等低频逻辑（500ms）
   const lastPositionsSetStateAtRef = useRef(0)
   /** 用户拖拽/步进后的 UI 播放头；超出 MSE 缓冲时仍保持，避免被拽回直播沿 */
   const scrubOverrideRef = useRef<Record<string, number>>({})
@@ -511,6 +511,22 @@ export default function Workbench() {
     }
     return out
   }, [clips, commonMode, timelineContext])
+
+  // 预生成每房 detectedRounds 的稳定引用，避免每次渲染重建数组击穿 RoomCard 的 memo
+  const detectedRoundsByRoom = useMemo(() => {
+    const m = new Map<string, Array<{ start: number; end: number; confirm_status?: string }>>()
+    for (const c of clips) {
+      if (c.is_ai_highlight && c.room_id) {
+        let arr = m.get(c.room_id)
+        if (!arr) {
+          arr = []
+          m.set(c.room_id, arr)
+        }
+        arr.push({ start: c.start, end: c.end, confirm_status: c.confirm_status })
+      }
+    }
+    return m
+  }, [clips])
 
   const timelineView = useTimelineViewModel({
     commonMode,
@@ -1238,6 +1254,13 @@ export default function Workbench() {
     })
   }, [resolveSeekTargets, enterTimelineLive, mseSeek, dvrStart, resolveReviewSeekEdge])
 
+  // 稳定 onHighlightClick 引用，避免每次渲染新建内联箭头击穿 ControlBar 的 memo 比较器
+  const handleHighlightClick = useCallback((h: { start: number; end: number }) => {
+    setCommonMarkIn(h.start)
+    setCommonMarkOut(h.end)
+    handleTimelineSeek(h.start)
+  }, [setCommonMarkIn, setCommonMarkOut, handleTimelineSeek])
+
   const handleTimelineScrubStart = useCallback((ws: number) => {
     // 冻结真实左缘；一拖即退出 Live
     setFrozenWindowStart(Math.max(0, ws))
@@ -1881,6 +1904,14 @@ export default function Workbench() {
         }
         return false
       }
+      // 采集可能短暂触碰 muted/play；发送前把各房预览拉回播放，避免一端卡死拖垮对齐等待
+      for (const rid of roomIds) {
+        try {
+          registry?.[rid]?.player?.resumePlayback?.(true)
+        } catch (e) {
+          console.warn('[Workbench] resumePlayback after capture failed:', rid, e)
+        }
+      }
       const queued = send('align_preview_audio', { rooms: results })
       if (!queued) {
         alignmentInFlightRef.current = false
@@ -1923,6 +1954,31 @@ export default function Workbench() {
     const registry = window.__msePlayers
     if (!registry) return
 
+    if (selectedRoomIds.size < 2) {
+      message.info('已同步预览进度（单房间无需音频对齐）')
+      return
+    }
+
+    const missingPreview = [...selectedRoomIds].filter((rid) => {
+      const entry = registry[rid]
+      const video = (
+        entry?.player?.videoElement
+        ?? document.querySelector(`video[data-room-id="${rid}"]`)
+      ) as HTMLVideoElement | null | undefined
+      return !video
+    })
+    if (missingPreview.length > 0) {
+      const names = missingPreview.map((rid) => {
+        const room = rooms.find((r) => r.room_id === rid)
+        return room?.streamer || room?.title || rid.slice(0, 8)
+      })
+      message.warning(
+        `未精确对齐：以下房间未开预览（需先点预览出画面）：${names.join('、')}`,
+        6,
+      )
+      return
+    }
+
     // Phase 1: 各房间独立跳到自己的直播沿。禁止共用 currentTime 绝对值。
     const anyBuffered = await seekAlignmentRoomsToLive(new Set(selectedRoomIds))
     if (!anyBuffered && selectedRoomIds.size >= 2) {
@@ -1930,14 +1986,9 @@ export default function Workbench() {
       return
     }
 
-    // 少于 2 个房间时不需要音频对齐
-    if (selectedRoomIds.size < 2) {
-      message.info('已同步预览进度（单房间无需音频对齐）')
-      return
-    }
     // Phase 2: 并行音频捕获 + 后端多特征计算
     await captureAndSendAlignment(new Set(selectedRoomIds), false)
-  }, [selectedRoomIds, captureAndSendAlignment, seekAlignmentRoomsToLive])
+  }, [selectedRoomIds, captureAndSendAlignment, seekAlignmentRoomsToLive, rooms])
 
   // 持续分析期间定期复核对齐。仅在所有目标房都贴近直播沿时运行，
   // 用户正在 DVR 回看时跳过，避免后台 seek 打断操作。
@@ -4051,9 +4102,7 @@ export default function Workbench() {
                         onSeekFwd={handleControlSeekFwd}
                         onSeekTo={handleExpandedPreviewSeek}
                         recordingTick={Math.floor(timelineTick / 4)}
-                        detectedRounds={clips
-                          .filter(c => c.is_ai_highlight && c.room_id === room.room_id)
-                          .map(c => ({ start: c.start, end: c.end, confirm_status: c.confirm_status }))}
+                        detectedRounds={detectedRoundsByRoom.get(room.room_id)}
                         mainWindowStart={timelineView?.windowStart ?? null}
                         isCommonMode={!!(commonMode && timelineContext)}
                       />
@@ -4106,11 +4155,7 @@ export default function Workbench() {
             activeRefine={activeRefineRange}
             recordedDurationHint={recordedDurationHint}
             dvrStart={dvrStart}
-            onHighlightClick={(h) => {
-              setCommonMarkIn(h.start)
-              setCommonMarkOut(h.end)
-              handleTimelineSeek(h.start)
-            }}
+            onHighlightClick={handleHighlightClick}
           />
         </div>
 

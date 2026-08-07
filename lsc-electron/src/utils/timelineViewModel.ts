@@ -17,7 +17,7 @@ import { computeTimelineWindow, TIMELINE_MAX_WINDOW } from '@/utils/timelineWind
 
 export { TIMELINE_MAX_WINDOW }
 
-export type TimelineClipBlock = { start: number; end: number }
+export type TimelineClipBlock = { start: number; end: number; uid?: string }
 
 export type TimelineViewInput = {
   commonMode: boolean
@@ -79,7 +79,10 @@ export function buildClipBlocks(
           return null
         }
       }
-      return { start, end }
+      // uid 保留原始 clip 的稳定标识（round_key/clip_id），供 Timeline 作 React key，
+      // 避免窗口平移后多条已越窗 clip 被 clamp 到同一坐标产生重复 key。
+      const block: TimelineClipBlock = { start, end, uid: c.round_key ?? c.clip_id ?? undefined }
+      return block
     })
     .filter((c): c is TimelineClipBlock => c != null)
 }

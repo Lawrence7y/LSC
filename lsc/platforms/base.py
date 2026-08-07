@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, getproxies, urlopen
 
 ERROR_UNSUPPORTED_URL = "unsupported_url"
 ERROR_OFFLINE = "offline"

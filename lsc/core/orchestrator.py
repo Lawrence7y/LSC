@@ -131,17 +131,21 @@ def _is_stream_url_expiring(url: str, threshold_sec: int = _STREAM_URL_REFRESH_T
         from urllib.parse import urlparse as _urlparse
         params = parse_qs(_urlparse(url).query)
         now = time.time()
-        for key in ('expire', 'expires', 'wsTime'):
-            vals = params.get(key, [])
-            if not vals:
-                continue
-            raw = vals[0]
-            try:
-                ts = int(raw, 16) if all(c in '0123456789abcdefABCDEF' for c in raw) and len(raw) >= 6 else int(raw)
-            except (ValueError, OverflowError):
-                continue
-            if now > ts - threshold_sec:
-                return True
+        # 启发式：遍历所有 query 参数值，识别"像时间戳"的整数（十进制或 hex，
+        # 值接近当前时间 ±48h），覆盖任意平台的任意过期参数名，避免平台新增
+        # URL 参数（斗鱼 time、快手/小红书签名等）时效检测静默失效。
+        # B站 expires 是十进制；虎牙/抖音 wsTime/expire、斗鱼 time 是 hex。
+        for vals in params.values():
+            for raw in vals:
+                if not raw:
+                    continue
+                for _base in (16, 10):
+                    try:
+                        _ts = int(raw, _base)
+                    except (ValueError, OverflowError):
+                        continue
+                    if _ts > 0 and abs(_ts - now) < 48 * 3600 and now > _ts - threshold_sec:
+                        return True
     except Exception as exc:
         _log.debug("操作异常（已忽略）: %s", exc)
     return False
@@ -354,17 +358,21 @@ def _is_stream_url_expiring(url: str, threshold_sec: int = _STREAM_URL_REFRESH_T
         from urllib.parse import urlparse as _urlparse
         params = parse_qs(_urlparse(url).query)
         now = _time_mod.time()
-        for key in ('expire', 'expires', 'wsTime'):
-            vals = params.get(key, [])
-            if not vals:
-                continue
-            raw = vals[0]
-            try:
-                ts = int(raw, 16) if all(c in '0123456789abcdefABCDEF' for c in raw) and len(raw) >= 6 else int(raw)
-            except (ValueError, OverflowError):
-                continue
-            if now > ts - threshold_sec:
-                return True
+        # 启发式：遍历所有 query 参数值，识别"像时间戳"的整数（十进制或 hex，
+        # 值接近当前时间 ±48h），覆盖任意平台的任意过期参数名，避免平台新增
+        # URL 参数（斗鱼 time、快手/小红书签名等）时效检测静默失效。
+        # B站 expires 是十进制；虎牙/抖音 wsTime/expire、斗鱼 time 是 hex。
+        for vals in params.values():
+            for raw in vals:
+                if not raw:
+                    continue
+                for _base in (16, 10):
+                    try:
+                        _ts = int(raw, _base)
+                    except (ValueError, OverflowError):
+                        continue
+                    if _ts > 0 and abs(_ts - now) < 48 * 3600 and now > _ts - threshold_sec:
+                        return True
     except Exception as exc:
         _log.debug("操作异常（已忽略）: %s", exc)
     return False

@@ -74,6 +74,8 @@ def _check_nvenc() -> bool:
             run_kwargs: dict = {
                 "capture_output": True,
                 "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
                 "timeout": 10,
                 "env": env,
             }
@@ -89,6 +91,10 @@ def _check_nvenc() -> bool:
                 **run_kwargs,
             )
             _nvenc_available = result.returncode == 0
+        except subprocess.TimeoutExpired as exc:
+            # 超时不落缓存：GPU 初始化/杀软可能暂时拖慢探测，本次不缓存以便下次重试
+            _log.warning("NVENC probe timed out, not caching result: %s", exc)
+            return False
         except Exception as exc:
             _log.warning("NVENC probe failed, falling back to libx264: %s", exc)
             _nvenc_available = False
@@ -266,12 +272,15 @@ class MseStreamer:
         # Build video filter chain
         vf_parts: list[str] = []
         if hwaccel_mode == "cuda_full":
-            # 全 GPU 管线：帧留在 CUDA 内存，scale_cuda 缩放后直接 NVENC 编码
+            # 全 GPU 管线：scale_cuda 缩放后 hwdownload 把帧下载回系统内存 nv12，
+            # 再交给 h264_nvenc 编码。若直接以 cuda 帧交给 auto_scale/-pix_fmt yuv420p，
+            # FFmpeg 无法在滤镜间转换会立即退出（历史多次 cuda_full 启动失败根因）。
             if self._width > 0 and self._height > 0:
                 vf_parts.append(
                     f"scale_cuda={self._width}:{self._height}"
                     f":force_original_aspect_ratio=decrease"
                 )
+            vf_parts.append("hwdownload,format=nv12")
         else:
             # CPU 滤镜路径（d3d11va 自动下载帧到系统内存）
             if self._width > 0 and self._height > 0:
@@ -345,8 +354,14 @@ class MseStreamer:
                 "-bufsize", str(int(bitrate.replace("k", "")) * 2) + "k",
             ]
 
+        # cuda_full 已 hwdownload 到系统内存 nv12，用 nv12 作为 NVENC 输入；
+        # 其余路径仍保持 yuv420p（软编/x264 及 d3d11va 下载帧的兼容格式）。
+        if hwaccel_mode == "cuda_full":
+            cmd += ["-pix_fmt", "nv12"]
+        else:
+            cmd += ["-pix_fmt", "yuv420p"]
+
         cmd += [
-            "-pix_fmt", "yuv420p",
             "-g", "30",  # keyframe every 30 frames (~1s at 30fps)
             "-c:a", "aac",
             "-b:a", "128k",

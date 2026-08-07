@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -48,6 +49,7 @@ _MIDSTREAM_DECREASE_SEC = 1.0
 _REFINE_WINDOW_SEC = 3.0
 _REFINE_FPS = 10.0
 _REFINE_RUN_FRAMES = 3       # 密扫连续帧确认阈值
+_REFINE_MAX_FRAMES_PER_BOUNDARY = 80  # 密扫单边界最大帧数：超限等距抽样兜底
 # 结算后 ≥此时长的非游戏段标注为回放（仅 broadcast 赛事流）
 _REPLAY_MIN_SEC = 5.0
 # SETTLE 内判定"新回合交战钟"的最小原始读数（残余外推钟通常 <90 且非 raw）
@@ -82,7 +84,10 @@ def _get_duration(video_path: str, ffmpeg_path: str) -> float:
 
     cmd = [ffmpeg_path, "-i", video_path, "-hide_banner"]
     try:
-        result = run_hidden(cmd, capture_output=True, text=True, errors="ignore", timeout=20)
+        result = run_hidden(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="ignore", timeout=20,
+        )
         for line in result.stderr.splitlines():
             m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", line)
             if m:
@@ -240,9 +245,10 @@ class _State(Enum):
 class OcrRoundFSM:
     """纯 OCR 相位状态机。
 
-    入点 = 交战第一帧（PREP→COMBAT 或中段切入）；出点 = 下一回合准备第一帧。
-    严格出点契约：无真·下回合准备第一帧（next_prep）绝不产出完整切片；
-    回合保持打开跨窗口，直到 next_prep 确认或 finalize 收尾例外（open_tail+pending）。
+    入点 = 交战第一帧（PREP→COMBAT 或中段切入）；出点优先 = 下一回合准备第一帧。
+    出点契约：有真·下回合准备（next_prep）→ vision_confirmed；
+    SETTLE 错过准备直接见新交战钟 → next_combat 降级闭合（pending，仍入列）；
+    finalize 收尾例外 → open_tail+pending。
     """
 
     def __init__(self) -> None:
@@ -348,16 +354,35 @@ class OcrRoundFSM:
                     self._state = _State.PREP
                 return closed
             if label == "combat":
-                # 错过准备信号直接见新交战钟：旧回合无真出点，不产出（严格契约），
-                # 只开新回合。仅"满钟"原始读数（≥85）或距结算 ≥45s 才认定新回合；
-                # 外推残余钟（timer_raw=False）永不触发。
+                # 错过准备信号直接见新交战钟：以降级出点 next_combat 闭合旧回合
+                # （pending，可入列待调），再开新回合——禁止整回合放弃造成长空窗漏检。
+                # 外推残余钟（timer_raw=False）永不触发；须原始读数：
+                #   - 满钟 ≥85，或
+                #   - 距结算 ≥45s 且仍为交战钟（>45）。
                 _since_result = (ts - self._result_ts) if self._result_ts is not None else None
-                _fresh_clock = timer_raw and timer is not None and float(timer) >= _NEW_ROUND_CLOCK_MIN
-                _late_enough = _since_result is not None and _since_result >= _NEW_ROUND_AFTER_RESULT_SEC
-                if (_fresh_clock or _late_enough) and (
+                if not timer_raw or timer is None:
+                    return closed
+                _fresh_clock = float(timer) >= _NEW_ROUND_CLOCK_MIN
+                _late_raw_combat = (
+                    _is_combat_timer(timer)
+                    and _since_result is not None
+                    and _since_result >= _NEW_ROUND_AFTER_RESULT_SEC
+                )
+                if (_fresh_clock or _late_raw_combat) and (
                     _since_result is None or _since_result >= _PREP_AFTER_RESULT_SEC
                 ):
-                    _log.info("SETTLE 错过准备直接见新交战钟: 旧回合无真出点，放弃（ts=%.1f）", ts)
+                    close = self._close(end=ts, end_by="next_combat")
+                    if close is not None:
+                        closed.append(close)
+                        _log.info(
+                            "SETTLE 错过准备直接见新交战钟: 旧回合降级闭合 next_combat（ts=%.1f）",
+                            ts,
+                        )
+                    else:
+                        _log.info(
+                            "SETTLE 错过准备直接见新交战钟: 旧回合过短未产出，开新回合（ts=%.1f）",
+                            ts,
+                        )
                     self._open_combat(ts)
                 return closed
 
@@ -387,8 +412,8 @@ class OcrRoundFSM:
         start = self._combat_start
         if start is None or end - start < _MIN_ROUND_SEC:
             return None
-        # 出点契约：只有真·下回合准备第一帧（next_prep）才算确认；
-        # 超时/下一交战/扫描结束的伪造出点一律 pending（等待升级或人工确认）
+        # 出点契约：真·下回合准备第一帧（next_prep）→ vision_confirmed；
+        # next_combat / open_tail 等降级出点 → pending（可入列待调，不自动导出）
         out = {
             "start": round(float(start), 3),
             "end": round(float(end), 3),
@@ -453,6 +478,11 @@ def _refine_boundary_ts(
     except Exception as exc:  # noqa: BLE001
         _log.debug("边界密扫抽帧失败: %s", exc)
         return None
+
+    if len(frames) > _REFINE_MAX_FRAMES_PER_BOUNDARY:
+        # 帧数超上限：等距抽样保住时间覆盖，避免极端场景每边界 60+ 帧 × 2 OCR 拖垮分析
+        _step = len(frames) / float(_REFINE_MAX_FRAMES_PER_BOUNDARY)
+        frames = [frames[int(i * _step)] for i in range(_REFINE_MAX_FRAMES_PER_BOUNDARY)]
 
     run = 0
     run_start: float | None = None
@@ -520,6 +550,57 @@ def _annotate_replay(round_data: dict[str, Any], labels: list[tuple[float, str, 
         round_data["replay_segments"] = segs
 
 
+def refine_valorant_round_boundaries(
+    rounds: list[dict[str, Any]],
+    video_path: str,
+    ffmpeg_path: str = "ffmpeg",
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str, float, str], None] | None = None,
+) -> list[dict[str, Any]]:
+    """对已闭合回合做边界局部密扫（±3s@10fps），返回新列表（原地亦可）。
+
+    持续分析增量路径：粗扫先入列，再异步调用本函数精修并 upsert。
+    """
+    if not rounds:
+        return []
+    out = [dict(r) for r in rounds]
+    total = len(out)
+    t0 = time.monotonic()
+    for idx, r in enumerate(out, 1):
+        if cancel_check and cancel_check():
+            break
+        if progress_callback and total:
+            progress_callback("refine", idx / max(total, 1), f"边界精修 {idx}/{total}")
+        start_ts = _refine_boundary_ts(
+            video_path, ffmpeg_path, float(r["start"]), "combat", cancel_check=cancel_check,
+        )
+        if start_ts is not None:
+            r["start"] = round(start_ts, 3)
+        if r.get("confirm_status") == "vision_confirmed" and r.get("end_by") == "next_prep":
+            _min_prep_ts = None
+            if r.get("result_ts") is not None:
+                _min_prep_ts = float(r["result_ts"]) + _PREP_AFTER_RESULT_SEC
+            end_ts = _refine_boundary_ts(
+                video_path, ffmpeg_path, float(r["end"]), "prep",
+                min_start_ts=_min_prep_ts, cancel_check=cancel_check,
+            )
+            if end_ts is not None and end_ts > float(r["start"]) + _MIN_ROUND_SEC:
+                r["end"] = round(end_ts, 3)
+        r["boundary_refined"] = True
+    # 相邻回合修整：出点不得越过下一回合入点
+    out.sort(key=lambda item: float(item["start"]))
+    kept: list[dict[str, Any]] = []
+    for r in out:
+        if kept and float(kept[-1]["end"]) > float(r["start"]):
+            kept[-1]["end"] = round(float(r["start"]), 3)
+            if float(kept[-1]["end"]) - float(kept[-1]["start"]) < _MIN_ROUND_SEC:
+                kept.pop()
+        kept.append(r)
+    _log.info("边界密扫耗时: %.1fs, %d 回合", time.monotonic() - t0, total)
+    return kept
+
+
 def detect_valorant_rounds_ocr(
     video_path: str,
     *,
@@ -530,13 +611,13 @@ def detect_valorant_rounds_ocr(
     runtime_state: dict[str, Any] | None = None,
     finalize: bool = False,
     source_profile: str | None = None,
+    ocr_sample_interval: float = 1.0,
+    refine_boundaries: bool = True,
 ) -> list[dict[str, Any]]:
-    """1fps 粗扫 → 双区域 OCR → 相位序列 → 循环先验 → 轻量 FSM → 边界密扫。
+    """ocr_sample_interval 秒抽一帧 → fps；默认 1.0 = 1fps，保持既有全量分析行为。
 
-    持续分析与录制后全量分析共用；增量窗口经 runtime_state 跨 tick 持久化
-    （FSM、交战钟锚点、计时器外推基准、比分确认、last_processed_ts 去重、
-    pending 回合待升级列表）。
-    source_profile: "pov" / "broadcast"（赛事流结算后长非游戏段标注为回放）。
+    refine_boundaries：是否立即做边界密扫。持续分析增量传 False，先入列粗边界，
+    再由 Worker 调用 refine_valorant_round_boundaries 异步精修。
     """
     if not os.path.isfile(video_path):
         _log.warning("视频文件不存在: %s", video_path)
@@ -568,11 +649,14 @@ def detect_valorant_rounds_ocr(
 
     from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
 
+    # 采样间隔 → fps：ocr_sample_interval 秒抽一帧，下限 0.25fps（4s/帧）
+    sample_fps = max(0.25, 1.0 / max(float(ocr_sample_interval), 0.1))
+
     frames = extract_frames_cancellable(
         video_path,
         start_sec=scan_start,
         end_sec=scan_end,
-        fps=1.0,
+        fps=sample_fps,
         ffmpeg_path=ffmpeg_path,
         cancel_check=cancel_check,
         overlap_sec=2.0,
@@ -595,6 +679,10 @@ def detect_valorant_rounds_ocr(
     timer_streak = int(state.get("timer_streak", 0) or 0)
     timer_streak_val: float | None = state.get("timer_streak_val")
     combat_raw_streak = int(state.get("combat_raw_streak", 0) or 0)
+    # 结算后抑制：残余交战钟不得重建锚点/标成 combat/prep，直到
+    # 出现空档（钟走完）后再见准备/交战，或中央准备横幅 / 满钟新回合。
+    post_settle_hold = bool(state.get("post_settle_hold", False))
+    post_settle_gap = bool(state.get("post_settle_gap", False))
 
     labels: list[tuple[float, str, float | None, bool]] = []
     closed_rounds: list[dict[str, Any]] = []
@@ -627,7 +715,13 @@ def detect_valorant_rounds_ocr(
                 # anchor 建立/刷新需连续 2 帧原始交战钟读数（单帧误读不得开局）
                 combat_raw_streak += 1
                 if combat_raw_streak >= 2:
-                    anchor = (float(raw_timer), ts)
+                    if post_settle_hold:
+                        # 结算后残余倒计时不得重建锚点；仅满钟原始读数开新回合
+                        if float(raw_timer) >= _NEW_ROUND_CLOCK_MIN:
+                            post_settle_hold = False
+                            anchor = (float(raw_timer), ts)
+                    else:
+                        anchor = (float(raw_timer), ts)
             else:
                 combat_raw_streak = 0
                 if (
@@ -708,7 +802,45 @@ def detect_valorant_rounds_ocr(
         timer_raw = raw_timer is not None
         if end_banner or score_confirmed:
             anchor = None
+            combat_raw_streak = 0
+            post_settle_hold = True
+            post_settle_gap = False
             label = "settle"
+        elif post_settle_hold:
+            # 结算后残余倒计时会从 50 连降到 ≤45，不得当成买枪准备（否则出点
+            # 提前切到非交战段）。须：准备横幅 / 满钟 / 钟走完空档后再见 prep·combat。
+            if prep_banner:
+                post_settle_hold = False
+                post_settle_gap = False
+                label = "prep"
+            elif (
+                timer_raw
+                and raw_timer is not None
+                and float(raw_timer) >= _NEW_ROUND_CLOCK_MIN
+            ):
+                post_settle_hold = False
+                post_settle_gap = False
+                label = "combat"
+            elif (
+                raw_timer is None
+                or (raw_timer is not None and float(raw_timer) <= 1.0)
+            ):
+                # 只用原始读数判空档：结算后 HUD 消失时外推钟仍会走秒，
+                # 不得把外推当成「残余倒计时还在」，否则永远等不到买枪准备。
+                post_settle_gap = True
+                label = "neutral"
+            elif post_settle_gap and timer_phase == "prep":
+                post_settle_hold = False
+                post_settle_gap = False
+                label = "prep"
+            elif post_settle_gap and timer_raw and raw_timer is not None and _is_combat_timer(
+                raw_timer
+            ):
+                post_settle_hold = False
+                post_settle_gap = False
+                label = "combat"
+            else:
+                label = "neutral"
         elif anchor is not None:
             label = "combat"
         elif prep_banner:
@@ -719,10 +851,16 @@ def detect_valorant_rounds_ocr(
             label = "neutral"
         labels.append((ts, label, timer, timer_raw))
 
-        _log.debug("ocr_label ts=%.1f label=%s timer=%s raw=%s anchor=%s",
-                   ts, label, f"{timer:.0f}" if timer else None,
-                   f"{raw_timer:.0f}" if raw_timer else None,
-                   f"{anchor[0]:.0f}@{anchor[1]:.1f}" if anchor else None)
+        _log.debug(
+            "ocr_label ts=%.1f label=%s timer=%s raw=%s anchor=%s hold=%s gap=%s",
+            ts,
+            label,
+            f"{timer:.0f}" if timer else None,
+            f"{raw_timer:.0f}" if raw_timer else None,
+            f"{anchor[0]:.0f}@{anchor[1]:.1f}" if anchor else None,
+            post_settle_hold,
+            post_settle_gap,
+        )
 
     # 循环先验平滑（帧级，仅删孤立 combat 噪点，不补缝——非游戏阶段透明）
     smoothed = _apply_phase_cycle_prior([label for _, label, _, _ in labels])
@@ -737,29 +875,27 @@ def detect_valorant_rounds_ocr(
         if closed:
             closed_rounds.extend(closed)
 
-    # ── 边界局部密扫：帧级精度（真实视频帧 PTS，非 1fps 网格） ──
-    total_refine = len(closed_rounds)
-    for idx, r in enumerate(closed_rounds, 1):
-        if cancel_check and cancel_check():
-            break
-        if progress_callback and total_refine:
-            progress_callback("refine", idx / max(total_refine, 1), f"边界精修 {idx}/{total_refine}")
-        start_ts = _refine_boundary_ts(
-            video_path, ffmpeg_path, float(r["start"]), "combat", cancel_check=cancel_check,
+    if refine_boundaries and closed_rounds:
+        closed_rounds = refine_valorant_round_boundaries(
+            closed_rounds,
+            video_path,
+            ffmpeg_path,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
         )
-        if start_ts is not None:
-            r["start"] = round(start_ts, 3)
-        if r.get("confirm_status") == "vision_confirmed" and r.get("end_by") == "next_prep":
-            # 出点密扫：准备游程必须出现在结算信号 ≥6s 之后（排除结算画面 5s 倒计时）
-            _min_prep_ts = None
-            if r.get("result_ts") is not None:
-                _min_prep_ts = float(r["result_ts"]) + _PREP_AFTER_RESULT_SEC
-            end_ts = _refine_boundary_ts(
-                video_path, ffmpeg_path, float(r["end"]), "prep",
-                min_start_ts=_min_prep_ts, cancel_check=cancel_check,
-            )
-            if end_ts is not None and end_ts > float(r["start"]) + _MIN_ROUND_SEC:
-                r["end"] = round(end_ts, 3)
+    else:
+        for r in closed_rounds:
+            r["boundary_refined"] = False
+        # 粗扫也做相邻不重叠修整（密扫路径已在 helper 内完成）
+        closed_rounds.sort(key=lambda r: float(r["start"]))
+        kept_rounds: list[dict[str, Any]] = []
+        for r in closed_rounds:
+            if kept_rounds and float(kept_rounds[-1]["end"]) > float(r["start"]):
+                kept_rounds[-1]["end"] = round(float(r["start"]), 3)
+                if float(kept_rounds[-1]["end"]) - float(kept_rounds[-1]["start"]) < _MIN_ROUND_SEC:
+                    kept_rounds.pop()
+            kept_rounds.append(r)
+        closed_rounds = kept_rounds
 
     # ── 非游戏阶段透明标注：结算后 ≥5s 的 neutral 段 = 回放（仅 broadcast 赛事流） ──
     if source_profile == "broadcast":
@@ -774,6 +910,8 @@ def detect_valorant_rounds_ocr(
     state["last_raw_ts"] = last_raw_ts
     state["combat_anchor"] = anchor
     state["combat_raw_streak"] = combat_raw_streak
+    state["post_settle_hold"] = post_settle_hold
+    state["post_settle_gap"] = post_settle_gap
     state["score_pending"] = score_pending
     state["prev_left"] = prev_left
     state["prev_right"] = prev_right
@@ -781,23 +919,12 @@ def detect_valorant_rounds_ocr(
     state["timer_streak_val"] = timer_streak_val
     state["last_processed_ts"] = max(last_processed_ts, float(frames[-1][0]))
 
-    # ── 相邻回合修整：出点（粗扫/兜底值）不得越过下一回合入点（密扫值） ──
-    closed_rounds.sort(key=lambda r: float(r["start"]))
-    kept_rounds: list[dict[str, Any]] = []
-    for r in closed_rounds:
-        if kept_rounds and float(kept_rounds[-1]["end"]) > float(r["start"]):
-            kept_rounds[-1]["end"] = round(float(r["start"]), 3)
-            if float(kept_rounds[-1]["end"]) - float(kept_rounds[-1]["start"]) < _MIN_ROUND_SEC:
-                kept_rounds.pop()  # 修整后过短：丢弃重叠前段
-        kept_rounds.append(r)
-    closed_rounds = kept_rounds
-
     for r in closed_rounds:
         if source_profile:
             r["source_profile"] = source_profile
 
-    _log.info("OCR 回合检测: %d 回合, %d 帧 (range=%.1f-%.1f)",
-              len(closed_rounds), len(frames), scan_start, scan_end)
+    _log.info("OCR 回合检测: %d 回合, %d 帧 (range=%.1f-%.1f, refine=%s)",
+              len(closed_rounds), len(frames), scan_start, scan_end, refine_boundaries)
     return closed_rounds
 
 

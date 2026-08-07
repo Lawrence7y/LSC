@@ -185,6 +185,18 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
   /** 点击「待调 / 去确认」时跳转切片列表 */
   onGoToClips?: () => void
 }) {
+  // F4: 停止/收尾过程的本地计时（后端无 stopping 起始时间戳，前端自计时）
+  // Hook 必须无条件声明：status 为 null / 无内容时提前 return 会造成 hook 数量跳变，
+  // React 18 会抛 "Rendered more hooks than during the previous render" 崩溃。
+  const [stoppingElapsed, setStoppingElapsed] = useState(0)
+  useEffect(() => {
+    if (status?.phase !== 'stopping' && status?.phase !== 'finalizing') return
+    const startedAt = Date.now()
+    setStoppingElapsed(0)
+    const t = setInterval(() => setStoppingElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000)
+    return () => clearInterval(t)
+  }, [status?.phase])
+
   if (!status) return null
   const current = status
   const summary = exportSummary ?? {
@@ -207,15 +219,6 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
 
   const ps = derivePrimaryStatus(current, summary)
   const isFinalizing = current.phase === 'finalizing'
-  // F4: 停止/收尾过程的本地计时（后端无 stopping 起始时间戳，前端自计时）
-  const [stoppingElapsed, setStoppingElapsed] = useState(0)
-  useEffect(() => {
-    if (current.phase !== 'stopping' && current.phase !== 'finalizing') return
-    const startedAt = Date.now()
-    setStoppingElapsed(0)
-    const t = setInterval(() => setStoppingElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000)
-    return () => clearInterval(t)
-  }, [current.phase])
   if (current.phase === 'stopping') {
     ps.verb = '停止中…'
     ps.detail = `正在停止并等待扫描退出 · 已等待 ${stoppingElapsed}s（通常 1–2 分钟）`

@@ -19,7 +19,12 @@ export default defineConfig(({ mode }) => {
       electron([
         {
           entry: 'electron/main.ts',
-          onstart: (options) => options.startup(),
+          onstart: (options) => {
+            // ELECTRON_RUN_AS_NODE=1 会导致 Electron 退化为纯 Node.js 进程，
+            // 使 require('electron') 返回 npm 包路径而非内置 API。启动前必须清除。
+            delete process.env.ELECTRON_RUN_AS_NODE
+            options.startup()
+          },
           vite: {
             build: {
               ...electronBuild,

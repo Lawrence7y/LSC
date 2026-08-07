@@ -24,10 +24,11 @@ let clockLoopRefs = 0
 /** Live 右沿插值基准（contentEnd 采样点） */
 let liveEdgeBase = { sec: 0, monoMs: 0 }
 
-/** 采样循环写入（高频调用安全：阈值过滤 + rAF 合帧通知） */
+/** 采样循环写入（高频调用安全：亚帧阈值过滤 + rAF 合帧通知） */
 export function writePlayhead(roomId: string, t: number): void {
   if (!roomId || typeof t !== 'number' || t < 0 || !Number.isFinite(t)) return
-  if (Math.abs((positions[roomId] ?? -1) - t) <= 0.01) return
+  // 0.001s：慢放（0.5x）时每显示帧约 8ms 媒体时间，旧阈值 0.01 会隔帧丢更新
+  if (Math.abs((positions[roomId] ?? -1) - t) <= 0.001) return
   positions[roomId] = t
   dirty = true
   scheduleFlush()

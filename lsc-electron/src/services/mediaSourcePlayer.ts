@@ -114,6 +114,12 @@ export class MsePlayer {
   private _stallRecoveryCount = 0
   private readonly _stallRecoveryLimit = 3
   private readonly _bufferStallTimeoutMs = 8000
+  // play() 已耗尽全部重试仍失败：media clock 可能冻结，stall recovery 应强制 seek 而非无限重试。
+  // 置位于 _tryPlay 重试耗尽；清除于 play() 成功 / playing / seeked / currentTime 前进。
+  private _playExhausted = false
+  // 强制 seek 恢复的次数：仅 currentTime 前进时重置（不受 buffer 增长重置），
+  // 防止"buffer 持续增长掩盖 media clock 冻结"时无限 seek 死循环。
+  private _forcedSeekRecoveryCount = 0
   private _currentBlobUrl: string | null = null
 
   constructor(options: MsePlayerOptions) {
@@ -151,6 +157,8 @@ export class MsePlayer {
     this._lastStallPosition = 0
     this._lastBufferEndTime = 0
     this._stallRecoveryCount = 0
+    this._playExhausted = false
+    this._forcedSeekRecoveryCount = 0
     this._setState('loading')
     this._initMediaSource()
     this._startStallDetection()
@@ -679,6 +687,7 @@ export class MsePlayer {
           clearTimeout(this._playRetryTimer)
           this._playRetryTimer = null
         }
+        this._playExhausted = false
         if (this._state !== 'error' && this._state !== 'paused') {
           this._markPlaying()
         }
@@ -687,6 +696,7 @@ export class MsePlayer {
       // seek 完成后 currentTime 已在缓冲区内，play() 应能快速 resolve。
       this._video.addEventListener('seeked', () => {
         this._log(`video seeked event, currentTime=${this._video?.currentTime?.toFixed(2)}`)
+        this._playExhausted = false
         if (this._state !== 'error' && this._state !== 'paused') {
           this._markPlaying()
         }
@@ -779,12 +789,15 @@ export class MsePlayer {
           this._tryPlay(retry + 1)
         } else {
           this._log('play() timeout, max retries reached')
+          // media clock 冻结：重试耗尽仍无法播放，交给 stall recovery 强制 seek
+          this._playExhausted = true
         }
       }, 300)
       this._video.play().then(() => {
         if (settled) return
         settled = true
         clearTimeout(playTimeout)
+        this._playExhausted = false
         this._log('play() succeeded')
       }).catch((err) => {
         if (settled) return
@@ -796,6 +809,7 @@ export class MsePlayer {
         } else {
           this._log(`play() failed after ${retry + 1} attempts: ${err.message}`)
           // 不改变 state 为 paused：数据流正常，用户交互后可恢复
+          this._playExhausted = true
         }
       })
     }, retry === 0 ? 50 : 200)
@@ -857,6 +871,9 @@ export class MsePlayer {
       if (Math.abs(ct - this._lastStallPosition) > 0.1) {
         this._lastStallPosition = ct
         this._lastStallTime = 0
+        // currentTime 真实前进：播放恢复正常，重置强制 seek 计数与冻结标志
+        this._forcedSeekRecoveryCount = 0
+        this._playExhausted = false
         return
       }
       if (this._lastStallTime === 0) {
@@ -897,13 +914,23 @@ export class MsePlayer {
       const bufEnd = video.buffered.end(video.buffered.length - 1)
       const bufStart = video.buffered.start(0)
 
-      if (ct < bufStart || ct > bufEnd - 0.3) {
+      // 强制 seek 恢复：currentTime 出界，或 media clock 冻结（play() 重试耗尽仍不动）。
+      // 此时 re-trigger play() 无效（日志表现为 play() timeout 无限循环），须 seek 回直播沿。
+      if (ct < bufStart || ct > bufEnd - 0.3 || this._playExhausted) {
         const target = Math.max(bufStart, bufEnd - 0.3)
-        this._log(`Stall recovery: seek ${ct.toFixed(2)} -> ${target.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
+        this._log(`Stall recovery: force seek ${ct.toFixed(2)} -> ${target.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
+        // 强制 seek 独立限流：不受 buffer 增长重置（否则"buffer 持续增长 + media clock 冻结"会无限循环）
+        this._forcedSeekRecoveryCount++
+        if (this._forcedSeekRecoveryCount > this._stallRecoveryLimit) {
+          this._log(`Forced seek recovery limit reached (${this._forcedSeekRecoveryCount}/${this._stallRecoveryLimit}), stopping auto-recovery`)
+          this._handleError('预览恢复失败，请手动重新开启预览')
+          return
+        }
         try {
           video.currentTime = target
         } catch {}
         this._liveEdgeAligned = false
+        this._playExhausted = false
         this._tryPlay(0)
       } else {
         this._log(`Stall recovery: re-trigger play() at ${ct.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)

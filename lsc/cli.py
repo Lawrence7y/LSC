@@ -50,7 +50,10 @@ def _get_video_duration(video_path: str, ffprobe: str) -> float:
             "-of", "default=noprint_wrappers=1:nokey=1",
             video_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
         output = (result.stdout or "").strip()
         if output:
             return float(output)
@@ -73,7 +76,10 @@ def _detect_scene_changes(video_path: str, ffmpeg: str,
             "-vsync", "vfr",
             "-f", "null", "-",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300,
+            encoding="utf-8", errors="replace",
+        )
 
         # 从 stderr 中解析 showinfo 输出的时间戳
         timestamps = []

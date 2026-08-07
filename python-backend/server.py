@@ -341,7 +341,10 @@ class LSCWebSocketServer:
                     _log.warning(f"Port {self.port} unavailable, trying fallback port {port}...")
                 async with websockets.serve(
                     self.handle_client, self.host, port,
-                    max_size=1 * 1024 * 1024,  # 1MB 消息体上限（JSON 消息通常 < 100KB）
+                    # 对齐 payload：单房 8s@16kHz float32 的 base64 ≈ 683KB，多房累计可达数 MB。
+                    # legacy websockets 对超 max_size 的消息直接关闭连接（1009 message too big），
+                    # 导致 align_preview_audio 整帧被拒 + 前端 WS 重连重建预览。
+                    max_size=16 * 1024 * 1024,
                     # Detect silent TCP drops (network partition, killed
                     # client). Without keepalive pings, a half-open socket
                     # stays in self.clients indefinitely (#98).

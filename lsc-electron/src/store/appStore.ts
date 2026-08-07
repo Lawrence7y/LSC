@@ -272,7 +272,31 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
 
   setTimelineContext: (timelineContext) => set({ timelineContext }),
   setTimelineInvalidated: (timelineInvalidated) => set({ timelineInvalidated }),
-  setContinuousAnalysisStatus: (continuousAnalysisStatus) => set({ continuousAnalysisStatus }),
+  setContinuousAnalysisStatus: (continuousAnalysisStatus) =>
+    set((state) => {
+      if (!continuousAnalysisStatus) return { continuousAnalysisStatus }
+      // 前端不消费 listed_clips（切片列表由 clip_queued 事件驱动），剔除大数组避免 store 膨胀
+      const { listed_clips: _ignored, ...rest } = continuousAnalysisStatus as unknown as Record<string, unknown>
+      const next = rest as unknown as ContinuousAnalysisStatus
+      const prev = state.continuousAnalysisStatus
+      // 字段级守卫：运行关键状态未变化时不更新，避免每 5s 轮询 / 每 tick 广播强制重渲染 Workbench
+      if (prev && (
+        prev.running === next.running
+        && prev.phase === next.phase
+        && prev.analysis_stage === next.analysis_stage
+        && prev.confirmed_rounds === next.confirmed_rounds
+        && prev.pending_rounds === next.pending_rounds
+        && prev.total_highlights === next.total_highlights
+        && prev.analyzed_duration === next.analyzed_duration
+        && prev.recorded_duration === next.recorded_duration
+        && prev.progress === next.progress
+        && prev.last_scan_error === next.last_scan_error
+        && prev.mapping_error === next.mapping_error
+      )) {
+        return state
+      }
+      return { continuousAnalysisStatus: next }
+    }),
   setSettingsDrawerOpen: (open) => set({ settingsDrawerOpen: open }),
   setPreviewDegradationBanner: (previewDegradationBanner) => set({ previewDegradationBanner }),
   dismissPreviewDegradationBanner: () => set({ previewDegradationBanner: null }),

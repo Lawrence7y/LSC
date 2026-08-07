@@ -13,6 +13,29 @@ _log = logging.getLogger(__name__)
 # 增量回看：FSM/锚点跨窗口持久化 + last_processed_ts 去重，回看窗只承担 seek 稳定性缓冲
 INCREMENTAL_LOOKBACK_SEC = 30.0
 MAX_CATCHUP_SEC = 480.0
+# 自适应追赶下限：旧 120s 在落后时窗偏大、难收敛到 ≤30s 滞后；45s ≈ lookback+一回合量级
+MIN_CATCHUP_SEC = 45.0
+
+
+def _adaptive_catchup_cap(
+    throughput_history: list[float] | None,
+    kick_interval: float,
+) -> float:
+    """自适应追赶上限：夹在 [MIN_CATCHUP_SEC, MAX_CATCHUP_SEC]，无历史时沿用默认 480s。
+
+    throughput_history：近 N 次扫描吞吐（媒体秒/墙钟秒）。
+    目标：追赶窗按 avg_throughput × kick_interval × 1.5 收缩，使单窗在间隔内可完成。
+    """
+    if not throughput_history:
+        return MAX_CATCHUP_SEC
+    history = [float(v) for v in throughput_history if float(v) > 0.0]
+    if not history:
+        return MAX_CATCHUP_SEC
+    avg = sum(history) / len(history)
+    return min(
+        MAX_CATCHUP_SEC,
+        max(MIN_CATCHUP_SEC, avg * max(1.0, float(kick_interval)) * 1.5),
+    )
 
 
 def window_scan_timeout(scan_duration_sec: float, *, use_ocr: bool) -> int:
@@ -28,8 +51,17 @@ def compute_valorant_scan_budget(
     last_analyzed: float,
     current_dur: float,
     pressure: dict[str, Any] | None = None,
+    *,
+    throughput_history: list[float] | None = None,
+    kick_interval: float = 60.0,
 ) -> tuple[tuple[float, float], bool, int, bool]:
-    """增量扫描预算：从已分析点回看 lookback 再向前追赶，绝不跳窗漏扫。"""
+    """增量扫描预算：从已分析点回看 lookback 再向前追赶，绝不跳窗漏扫。
+
+    throughput_history：近 N 次扫描吞吐（媒体秒/墙钟秒），用于自适应收缩追赶窗，
+    打破「滞后 → 窗更大 → 更慢 → 滞后更大」的反馈环。
+    kick_interval：两次扫描 kick 的名义间隔（秒）；追赶窗按
+    avg_throughput × kick_interval × 1.5 收缩，目标单窗在 ~1.5×kick_interval 内完成。
+    """
     del pressure
     full_rescan = last_analyzed <= 0.0
     if full_rescan:
@@ -37,7 +69,8 @@ def compute_valorant_scan_budget(
         scan_end = float(current_dur)
     else:
         scan_start = max(0.0, float(last_analyzed) - INCREMENTAL_LOOKBACK_SEC)
-        scan_end = min(float(current_dur), float(last_analyzed) + MAX_CATCHUP_SEC)
+        catchup_cap = _adaptive_catchup_cap(throughput_history, kick_interval)
+        scan_end = min(float(current_dur), float(last_analyzed) + catchup_cap)
         if scan_end < scan_start:
             scan_end = float(current_dur)
     scan_range = (round(scan_start, 3), round(float(scan_end), 3))
@@ -98,6 +131,8 @@ class ValorantAnalyzerPlugin:
             last_analyzed=float(state.get("last_analyzed", 0.0) or 0.0),
             current_dur=current_dur,
             pressure=pressure,
+            throughput_history=state.get("throughput_history"),
+            kick_interval=float(state.get("kick_interval") or 60.0),
         )
         state["full_rescan"] = full_rescan
         start, end = scan_range
@@ -128,6 +163,8 @@ class ValorantAnalyzerPlugin:
         from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
 
         try:
+            # 增量：粗扫先返回入列；收尾/全量仍同步密扫保证终态精度
+            _finalize = bool(state.get("finalize", False))
             rounds = detect_valorant_rounds_ocr(
                 video_path,
                 time_range=(window.start_sec, window.end_sec),
@@ -135,8 +172,10 @@ class ValorantAnalyzerPlugin:
                 cancel_check=cancel_check,
                 progress_callback=state.get("progress_callback"),
                 runtime_state=state.get("runtime_state"),
-                finalize=bool(state.get("finalize", False)),
+                finalize=_finalize,
                 source_profile=state.get("valorant_profile"),
+                ocr_sample_interval=float(state.get("ocr_sample_interval", 1.0)),
+                refine_boundaries=_finalize,
             )
         except Exception as exc:
             _log.warning("Valorant OCR scan_window failed: %s", exc)

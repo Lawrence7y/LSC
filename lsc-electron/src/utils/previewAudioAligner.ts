@@ -95,7 +95,8 @@ class PreviewAudioAligner {
         console.log('[PreviewAudioAligner] AudioWorklet module loaded')
         return true
       } catch (e) {
-        console.error('[PreviewAudioAligner] loadWorklet failed:', e)
+        const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
+        console.error('[PreviewAudioAligner] loadWorklet failed:', detail, e)
         this.workletPromise = null
         return false
       }
@@ -104,25 +105,163 @@ class PreviewAudioAligner {
     return this.workletPromise
   }
 
+  /** Worklet 不可用时回退到 ScriptProcessorNode（CSP/环境限制下仍可对齐）。 */
+  private captureWithScriptProcessor(
+    roomId: string,
+    source: AudioNode,
+    ctx: AudioContext,
+    duration: number,
+    video: HTMLVideoElement,
+    restoreMutedOverride: () => void,
+  ): Promise<Float32Array | null> {
+    const sampleRate = ctx.sampleRate
+    const targetSamples = Math.ceil(duration * sampleRate)
+    const bufferSize = 4096
+    // AudioWorklet 被 CSP 拦截时的必要回退（ScriptProcessor 已弃用但仍可用）
+    const processor = ctx.createScriptProcessor(bufferSize, 1, 1)
+    const collected = new Float32Array(targetSamples)
+    let offset = 0
+    let settled = false
+
+    const zeroGain = ctx.createGain()
+    zeroGain.gain.value = 0
+
+    return new Promise((resolve) => {
+      const cleanup = () => {
+        restoreMutedOverride()
+        try { processor.onaudioprocess = null } catch { /* ignore */ }
+        try { source.disconnect(processor) } catch { /* ignore */ }
+        try { processor.disconnect() } catch { /* ignore */ }
+        try { zeroGain.disconnect() } catch { /* ignore */ }
+      }
+
+      const finish = (samples: Float32Array | null, reason: string, extra?: Partial<PreviewAudioCaptureDiagnostics>) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        cleanup()
+        if (!samples) {
+          this.setCaptureDiagnostics(roomId, { reason, ready_state: video.readyState, ...extra })
+          resolve(null)
+          return
+        }
+        this.setCaptureDiagnostics(roomId, {
+          reason: 'ok',
+          ready_state: video.readyState,
+          has_audio_track: true,
+          ...extra,
+          sample_count: samples.length,
+        })
+        resolve(samples)
+      }
+
+      const timeout = setTimeout(() => {
+        finish(null, 'capture_timeout')
+      }, (duration + 4) * 1000)
+
+      processor.onaudioprocess = (ev) => {
+        if (settled) return
+        const input = ev.inputBuffer.getChannelData(0)
+        const len = Math.min(input.length, collected.length - offset)
+        if (len > 0) {
+          collected.set(input.subarray(0, len), offset)
+          offset += len
+        }
+        if (offset < collected.length) return
+
+        let sumSq = 0
+        let peak = 0
+        for (let i = 0; i < collected.length; i++) {
+          const v = collected[i]
+          const a = v < 0 ? -v : v
+          if (a > peak) peak = a
+          sumSq += v * v
+        }
+        const rms = Math.sqrt(sumSq / collected.length)
+        if (peak < 1e-5 || rms < 1e-5) {
+          console.warn(`[PreviewAudioAligner] ScriptProcessor silent for room ${roomId}`)
+          finish(null, 'silent_audio', { rms, sample_count: collected.length })
+          return
+        }
+        let normalized = collected
+        if (peak > 0 && peak < 0.2) {
+          const scale = 0.5 / peak
+          normalized = new Float32Array(collected.length)
+          for (let i = 0; i < collected.length; i++) normalized[i] = collected[i] * scale
+        }
+        const downsampled = this.downsample(normalized, sampleRate, 16000)
+        console.log(
+          `[PreviewAudioAligner] ScriptProcessor capture OK: room=${roomId}, samples=${downsampled.length}`,
+        )
+        finish(downsampled, 'ok', { rms, sample_count: downsampled.length })
+      }
+
+      try {
+        source.connect(processor)
+        processor.connect(zeroGain)
+        zeroGain.connect(ctx.destination)
+      } catch (e) {
+        console.error(`[PreviewAudioAligner] ScriptProcessor connect failed for ${roomId}:`, e)
+        finish(null, 'capture_exception')
+      }
+    })
+  }
+
   async captureAudio(
     roomId: string,
     video: HTMLVideoElement,
     duration: number = 5.0,
   ): Promise<Float32Array | null> {
-    const previousMuted = video.muted
+    const previousVolume = video.volume
     let mutedOverridden = false
-    // 捕获期间覆盖成的目标值（取消静音）。restore 前据此判断用户是否手动改过静音：
-    // 若当前值已被外部改变，尊重用户操作，不回写。
+    let volumeOverridden = false
+    // 捕获期间覆盖成的目标值（取消静音）。restore 不再 remute，避免卡死预览。
     const overriddenMutedValue = false
 
     const restoreMutedOverride = () => {
-      if (!mutedOverridden) return
-      if (video.muted === overriddenMutedValue) {
-        withMuteSyncSuppressed(video, () => {
-          video.muted = previousMuted
-        })
+      // 禁止 remute 回 true：Chromium + MediaElementSource 下会卡死 MSE play()。
+      // 扬声器静音始终由 VideoPreview 的 GainNode 控制。
+      if (mutedOverridden) {
+        if (video.muted) {
+          withMuteSyncSuppressed(video, () => {
+            video.muted = false
+          })
+        }
+        mutedOverridden = false
       }
-      mutedOverridden = false
+      if (volumeOverridden) {
+        if (Math.abs(video.volume - 1) < 1e-6) {
+          video.volume = previousVolume
+        }
+        volumeOverridden = false
+      }
+    }
+
+    /** Chromium：muted / volume=0 时 MediaElementSource 与 captureStream 都会出全零 PCM。 */
+    const ensureElementAudible = async () => {
+      if (video.muted) {
+        withMuteSyncSuppressed(video, () => {
+          video.muted = overriddenMutedValue
+        })
+        mutedOverridden = true
+      }
+      if (!(video.volume > 0.01)) {
+        video.volume = 1
+        volumeOverridden = true
+      }
+      // 已在播则不要 await play()：MSE 直播流上 play() Promise 可能长期 pending，拖死对齐。
+      if (video.paused) {
+        try {
+          const playP = video.play()
+          await Promise.race([
+            playP,
+            new Promise<void>((r) => setTimeout(r, 200)),
+          ])
+        } catch (e) {
+          console.warn(`[PreviewAudioAligner] video.play() failed for room ${roomId}:`, e)
+        }
+        await new Promise<void>((r) => setTimeout(r, 80))
+      }
     }
 
     // 捕获路径上可能已建立连接的节点，异常退出时统一断开，避免泄漏
@@ -139,50 +278,73 @@ class PreviewAudioAligner {
     try {
       const ctx = await this.getContext()
       const ok = await this.loadWorklet(ctx)
-      if (!ok) {
-        console.error(`[PreviewAudioAligner] Worklet not loaded for room ${roomId}`)
-        this.setCaptureDiagnostics(roomId, { reason: 'worklet_not_loaded', ready_state: video.readyState })
-        return null
-      }
+      await ensureElementAudible()
 
       // 优先使用 VideoPreview 创建的共享 MediaElementSourceNode
-      // 这样不受 video.muted 影响（音频已通过 Web Audio 路由，绕过 video 原生管线）
+      // 扬声器仍由 GainNode 控音；对齐只从 source 并联抽 PCM，不改扬声器增益
       const registry = window.__msePlayers
-      const sharedSource = registry?.[roomId]?.audioSource as MediaElementAudioSourceNode | undefined
+      let sharedSource = registry?.[roomId]?.audioSource as MediaElementAudioSourceNode | undefined
+
+      // 注册表丢了图但 video 尚未 createMediaElementSource：现场建图（gain=0，对齐时不外放）
+      if (!sharedSource) {
+        try {
+          const mes = ctx.createMediaElementSource(video)
+          const gain = ctx.createGain()
+          gain.gain.value = 0
+          mes.connect(gain)
+          gain.connect(ctx.destination)
+          sharedSource = mes
+          if (registry?.[roomId]) {
+            registry[roomId] = {
+              ...registry[roomId],
+              audioSource: mes,
+              gainNode: gain,
+            }
+          }
+          console.log(`[PreviewAudioAligner] Created on-the-fly MediaElementSource for room ${roomId}`)
+        } catch (e) {
+          console.warn(
+            `[PreviewAudioAligner] createMediaElementSource unavailable for ${roomId}, will try captureStream:`,
+            e,
+          )
+        }
+      }
 
       let source: AudioNode
 
       if (sharedSource) {
         source = sharedSource
-        // Chromium 下 video.muted=true 时 MediaElementSource 可能输出近静音，捕获期临时取消静音。
-        // GainNode 在 source 之后，不改扬声器增益，避免对齐时突然外放。
-        if (video.muted) {
-          withMuteSyncSuppressed(video, () => {
-            video.muted = overriddenMutedValue
-          })
-          mutedOverridden = true
-        }
-        video.play().catch((e) => {
-          console.warn(`[PreviewAudioAligner] video.play() failed for room ${roomId}:`, e)
-        })
         console.log(`[PreviewAudioAligner] Using shared MediaElementSource for room ${roomId}`)
       } else {
-        // 回退：captureStream（video.muted=true 时会产出全零数据）
-        const v = video as any
+        // 回退：captureStream（必须先 ensureElementAudible，否则 muted 时全零；可能短暂外放）
+        const v = video as HTMLVideoElement & {
+          captureStream?: () => MediaStream
+          mozCaptureStream?: () => MediaStream
+        }
         const stream: MediaStream | undefined = v.captureStream?.() ?? v.mozCaptureStream?.()
         if (!stream) {
           console.error(`[PreviewAudioAligner] captureStream() not available for room ${roomId}`)
           this.setCaptureDiagnostics(roomId, { reason: 'capture_stream_unavailable', ready_state: video.readyState })
+          restoreMutedOverride()
           return null
         }
         const audioTracks = stream.getAudioTracks()
         if (audioTracks.length === 0) {
           console.warn(`[PreviewAudioAligner] No audio tracks for room ${roomId}`)
           this.setCaptureDiagnostics(roomId, { reason: 'no_audio_track', ready_state: video.readyState, has_audio_track: false })
+          restoreMutedOverride()
           return null
         }
         const audioStream = new MediaStream(audioTracks)
         source = ctx.createMediaStreamSource(audioStream)
+        console.log(`[PreviewAudioAligner] Using captureStream fallback for room ${roomId}`)
+      }
+
+      if (!ok) {
+        console.warn(`[PreviewAudioAligner] Worklet unavailable, falling back to ScriptProcessor for room ${roomId}`)
+        return await this.captureWithScriptProcessor(
+          roomId, source, ctx, duration, video, restoreMutedOverride,
+        )
       }
 
       const sampleRate = ctx.sampleRate
@@ -287,6 +449,7 @@ class PreviewAudioAligner {
       // 异常路径：断开已建立的音频节点连接（source→node→zeroGain→destination），避免泄漏
       disconnectPartial()
       console.error(`[PreviewAudioAligner] captureAudio failed for room ${roomId}:`, e)
+      this.setCaptureDiagnostics(roomId, { reason: 'capture_exception', ready_state: video.readyState })
       return null
     }
   }

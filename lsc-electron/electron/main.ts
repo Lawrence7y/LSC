@@ -718,6 +718,9 @@ function spawnBackend(): void {
     SYSTEMROOT: process.env.SYSTEMROOT,
     PATHEXT: process.env.PATHEXT,
     PYTHONUNBUFFERED: '1',
+    // 强制后端 stdout/stderr 以 UTF-8 输出，与 consumeBackendOutput 的 UTF-8 解码一致，
+    // 否则 Python 在中文 Windows 上默认 GBK 写控制台导致 backend-stdout.log 中文乱码。
+    PYTHONIOENCODING: 'utf-8',
     LSC_LOG_DIR: path.join(backendDataDir, 'logs'),
     // 所有后端可变状态必须保存在用户数据目录，不能写入 Program Files/resources。
     LSC_DATA_DIR: backendDataDir,
@@ -1410,9 +1413,11 @@ function createWindow() {
   // S-1: Content-Security-Policy — 限制脚本/样式/连接来源，防止 XSS 加载外部资源
   // 开发模式 Vite 需要 unsafe-inline + unsafe-eval 用于 HMR/React Refresh
   // 生产模式使用严格策略（无 unsafe-eval，script-src 限 self + file:）
+  // blob: 必须允许：预览音频对齐用 Blob URL 加载 AudioWorklet（否则 addModule → DOMException，
+  // 表现为「音频 Worklet 未加载 / 有效音频不足」）。
   const csp = process.env.VITE_DEV_SERVER_URL
-    ? "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
-    : "default-src 'self' file:; script-src 'self' file:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
+    ? "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
+    : "default-src 'self' file:; script-src 'self' file: blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; img-src 'self' data: blob:; media-src 'self' blob:"
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {

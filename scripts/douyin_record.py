@@ -2,10 +2,14 @@
 """Minimal Douyin page parser reused by the platform adapter."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, getproxies
 
 log = logging.getLogger("lsc.douyin")
 logging.basicConfig(
@@ -18,6 +22,56 @@ _HTTP_TIMEOUT = 20
 _HTTP_RETRIES = 3
 
 
+def _is_private_ip(hostname: str) -> bool:
+    """Reject private/internal/reserved IP targets before network access.
+
+    198.18.0.0/15 intentionally excluded: Clash/FlClash TUN mode Fake IP range.
+    """
+    networks = [
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("169.254.0.0/16"),
+        ipaddress.ip_network("100.64.0.0/10"),
+        # 198.18.0.0/15 NOT blocked: Clash/FlClash TUN Fake IP, not real internal network
+        ipaddress.ip_network("0.0.0.0/8"),
+        ipaddress.ip_network("240.0.0.0/4"),
+        ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("fc00::/7"),
+        ipaddress.ip_network("fe80::/10"),
+        ipaddress.ip_network("::ffff:0:0/96"),
+    ]
+    try:
+        for _family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
+            ip = ipaddress.ip_address(sockaddr[0])
+            if any(ip in network for network in networks):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+class _SSRFRedirectHandler(HTTPRedirectHandler):
+    """Revalidate every redirect target before following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+        target = urlparse(new_req.full_url)
+        hostname = (target.hostname or "").lower()
+        if not hostname or target.scheme not in ("http", "https") or _is_private_ip(hostname):
+            return None
+        return new_req
+
+
+_SSRF_SAFE_OPENER = build_opener(
+    _SSRFRedirectHandler(),
+    ProxyHandler(getproxies()),  # explicit system proxy (env vars / Windows registry)
+)
+
+
 def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | None, str | None]:
     """Fetch the Douyin live page HTML with unified timeout and retry.
 
@@ -27,7 +81,12 @@ def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | N
     """
     import time
     from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None, "仅支持 http/https 链接"
+    if _is_private_ip(parsed.hostname):
+        return None, "不允许访问内网/保留地址"
 
     headers = {
         "User-Agent": (
@@ -39,12 +98,12 @@ def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | N
         "Referer": "https://live.douyin.com/",
     }
     if cookies:
-        # Cookie 头必须 latin-1 可编码；过滤解密失败产生的 \ufffd 等脏值
+        # Cookie 头必须 latin-1 可编码；过滤解密失败产生的 � 等脏值
         safe_pairs = []
         for k, v in cookies.items():
             if not isinstance(k, str) or not isinstance(v, str):
                 continue
-            if "\ufffd" in k or "\ufffd" in v:
+            if "�" in k or "�" in v:
                 continue
             try:
                 k.encode("latin-1")
@@ -60,7 +119,7 @@ def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | N
     for attempt in range(_HTTP_RETRIES + 1):
         try:
             request = Request(url, headers=headers)
-            with urlopen(request, timeout=_HTTP_TIMEOUT) as response:
+            with _SSRF_SAFE_OPENER.open(request, timeout=_HTTP_TIMEOUT) as response:
                 return response.read().decode("utf-8", errors="replace"), None
         except HTTPError as exc:
             last_exc = exc
@@ -228,7 +287,6 @@ def extract_ssr_data(html: str) -> dict[str, object]:
             try:
                 doc, end_idx = decoder.raw_decode(full_payload, start_pos)
 
-                # Extract meta info using recursive path finder
                 # Extract meta info using recursive path finder
                 if not info["title"]:
                     title_paths = [

@@ -247,6 +247,12 @@ def _clear_analysis_job(room_id: str) -> None:
 _continuous_tasks: dict[str, dict[str, Any]] = {}
 _VALORANT_INCREMENTAL_LOOKBACK_SEC = 30.0  # 纯 OCR 增量回看（与 valorant_plugin 一致）
 _VALORANT_MAX_CATCHUP_SEC = 480.0  # 单次 tick 最多向前追赶的新内容时长
+# 录制中可分析尖端 = 墙钟 − 写缓冲。frag_keyframe 下 15s 足够避开未落盘尾部；
+# 旧值 30s 导致启动后空等半分钟、UI 滞后地板也卡在 ~30s。
+_RECORDING_WRITE_BUFFER_SEC = 15.0
+_VALORANT_KICK_AHEAD_SEC = 8.0  # 增量 kick：相对 last_analyzed 至少攒够的新媒体秒
+# 停录后 ffprobe/码率缓存允许超出最后录制墙钟的容差；超过则钳制（防 open_tail 虚高出点）
+_POST_STOP_DURATION_SLACK_SEC = 30.0
 # OCR 扫描 TimeoutError 后：降级纯音频追赶，避免立刻再开超大 OCR 窗压垮 DirectML
 _OCR_DEGRADE_TICKS_AFTER_TIMEOUT = 5
 _POST_TIMEOUT_MAX_CATCHUP_SEC = 60.0
@@ -255,8 +261,10 @@ _SCAN_ABORT_HARD_SEC = 30.0  # 超时后继续等待线程释放 semaphore 的�
 _VALORANT_MIN_LIST_DURATION_SEC = 5.0  # list_only 入列下限（短 spike 回合也须进列表待确认）
 _OCR_BOUNDARY_SOURCE = "valorant_ocr_v1"  # 纯 OCR 路径产出（顶部条 + 中央横幅）
 _OCR_VALID_START_BY = frozenset({"ocr_combat"})
-_OCR_VALID_END_BY = frozenset({"next_prep", "open_tail"})
+_OCR_VALID_END_BY = frozenset({"next_prep", "open_tail", "next_combat"})
 _OCR_FINALIZE_OVERLAP_SEC = 120.0
+# 买枪+交战+结算(+赛事回放) 常见 90–130s；>150s 才视为异常合并/漏切
+_VALORANT_MAX_ROUND_DURATION_SEC = 150.0
 _MAX_SKIP_SLEEP_TICKS = 5  # 主循环连续跳过 sleep 的防御上限：超过强制 0.5s 节流，防忙循环广播风暴
 _SCAN_ERROR_BACKOFF_SEC = 30.0  # 持续分析 worker 失败后的重试退避（非收尾）
 _SCAN_MAX_TIMEOUT_RETRIES = 3  # 同一窗口连续超时重试上限：超过则跳过该窗口（防死循环）
@@ -275,7 +283,8 @@ _QUALITY_FIRST_NORMAL_PRESSURE: dict[str, Any] = {
     "pause_analysis": False,
     "degrade_analysis": False,
     "analysis_window_sec": 240,
-    "ocr_sample_interval": 2.0,
+    # 1.0fps：0.5fps（2.0）会漏短促准备/结算横幅，回合迟迟不闭合 → 滞后虽低但不出片
+    "ocr_sample_interval": 1.0,
 }
 
 
@@ -1234,6 +1243,17 @@ def _is_listable_ocr_round(round_data: dict[str, Any]) -> bool:
         return False
     if end <= start:
         return False
+                # 异常时长守卫：过长回合不得自动导出，降级 pending 待人工复核（仍入列）
+    if end - start > _VALORANT_MAX_ROUND_DURATION_SEC:
+        round_data['duration_anomaly'] = True
+        if round_data.get('confirm_status') == 'vision_confirmed':
+            round_data['confirm_status'] = 'pending'
+            _log.warning(
+                "OCR 回合时长异常 %.1fs > %.0fs，降级 pending 待复核: round=%s",
+                end - start,
+                _VALORANT_MAX_ROUND_DURATION_SEC,
+                _valorant_round_key(round_data),
+            )
     start_by = str(round_data.get("start_by", "") or "")
     end_by = str(round_data.get("end_by", "") or "")
     return start_by in _OCR_VALID_START_BY and end_by in _OCR_VALID_END_BY
@@ -1394,6 +1414,7 @@ def _build_continuous_status_payload(
     last_analyzed: float | None = None,
     current_dur: float | None = None,
     effective_interval: float | None = None,
+    include_listed: bool = True,
 ) -> dict[str, Any]:
     """构造 continuous_analysis_status / GET 共用载荷。"""
     highlights = all_highlights if all_highlights is not None else task.get("highlights", [])
@@ -1414,7 +1435,9 @@ def _build_continuous_status_payload(
         pending = max(0, len(highlights) - confirmed)
     finalizing = bool(task.get("finalizing") or phase == "finalizing")
     resolved_phase = phase or ("finalizing" if finalizing else "running")
-    listed_clips = _continuous_listed_clip_snapshot(task)
+    # 高频 tick 广播（include_listed=False）不带全量 listed_clips，仅 GET/恢复路径带权威快照，
+    # 避免每 3s 序列化整个 clip 列表（前端不消费该字段，切片列表由 clip_queued 事件驱动）。
+    listed_clips = _continuous_listed_clip_snapshot(task) if include_listed else []
     # stopping/completed/idle/error 对前端均视为非「分析运行中」；stopping 另由 phase 驱动忙碌态。
     running = resolved_phase in ("running", "finalizing")
     payload: dict[str, Any] = {
@@ -1431,7 +1454,6 @@ def _build_continuous_status_payload(
         # Full authoritative snapshot: reconnecting/reloaded renderers reconcile
         # their ephemeral clip store instead of relying on one-shot broadcasts.
         "listed_clip_count": len(listed_clips),
-        "listed_clips": listed_clips,
         "phase": resolved_phase,
         "updated_at": time.time(),
         "scan_mode": task.get("scan_phase", "incremental"),
@@ -1479,6 +1501,8 @@ def _build_continuous_status_payload(
         payload["shadow_vision_confirmed"] = int(task.get("shadow_vision_confirmed", 0) or 0)
     if effective_interval is not None:
         payload["effective_interval"] = effective_interval
+    if include_listed:
+        payload["listed_clips"] = listed_clips
     return payload
 
 
@@ -1628,6 +1652,21 @@ def _finalize_scan_timeout(duration_sec: float, attempt: int = 1) -> int:
     # 每分钟录像约 25s 预算 + 180s 基线；重试再加 120s；夹在 5–30 分钟
     base = int(dur / 60.0 * 25.0 + 180.0) + (attempt_n - 1) * 120
     return int(min(1800, max(300, base)))
+
+
+def _clamp_post_stop_duration(
+    probed_dur: float,
+    last_recording_wallclock: float,
+    *,
+    slack_sec: float = _POST_STOP_DURATION_SLACK_SEC,
+) -> float:
+    """停录后钳制虚高 probe/码率估算时长，避免 finalize open_tail 出点飞到未来。"""
+    probed = max(0.0, float(probed_dur or 0.0))
+    wall = max(0.0, float(last_recording_wallclock or 0.0))
+    slack = max(0.0, float(slack_sec))
+    if wall > 0.0 and probed > wall + slack:
+        return wall
+    return probed
 
 
 def _window_scan_timeout(*args, **kwargs):
@@ -1864,6 +1903,8 @@ def _get_video_duration(video_path: str) -> float:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         data = json.loads(result.stdout)
@@ -4036,6 +4077,9 @@ def register_room_handlers(server, bridge):
             _log.error("保存虎牙 Cookie 失败: %s", exc)
             return {'success': False, 'error': humanize_error(str(exc))}
 
+    # ⚠️ 死代码：本 handler 与 align_preview_audio 已被 alignment_handlers.py 后注册覆盖。
+    # 改动此处无效，须改 alignment_handlers.py（register_room_handlers 按顺序注册，
+    # server.on 后注册覆写前者）。保留仅供比对，勿改。
     @server.on('set_content_offset')
     async def handle_set_content_offset(data):
         """设置房间的音频互相关内容偏移量（由前端音频对齐后回传）。"""
@@ -4327,11 +4371,19 @@ def register_room_handlers(server, bridge):
             _align_log.error("预览音频对齐失败: %s", exc, exc_info=True)
             return {'success': False, 'error': str(exc)}
 
+    _DEPS_CHECK_CACHE_TTL = 30.0
+    _deps_cache: dict[str, Any] = {'data': None, 'at': 0.0}
+
     @server.on('check_dependencies')
     async def handle_check_dependencies(data):
         """检测系统依赖状态：FFmpeg / FFprobe / NVENC / Python"""
         from lsc.core.services.mse_streamer import _check_nvenc
         from lsc.utils.process_launcher import prepare_launch as _prepare_launch
+
+        # 依赖在 30s 内不会变化：SplashScreen 与 Settings 打开各发一次，
+        # 命中缓存避免重复跑 ffmpeg/ffprobe -version 子进程（各 5s 超时窗口）。
+        if _deps_cache['data'] is not None and time.time() - _deps_cache['at'] < _DEPS_CHECK_CACHE_TTL:
+            return _deps_cache['data']
 
         cfg = load_config()
         _log.info("检测依赖: ffmpeg=%s, ffprobe=%s, nvenc=%s",
@@ -4386,7 +4438,10 @@ def register_room_handlers(server, bridge):
         py_version = f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
         results['python'] = {'available': True, 'path': sys.executable, 'version': py_version}
 
-        return {'success': True, 'dependencies': results}
+        result = {'success': True, 'dependencies': results}
+        _deps_cache['data'] = result
+        _deps_cache['at'] = time.time()
+        return result
 
     @server.on('render_clip_preview')
     async def handle_render_clip_preview(data):
@@ -5012,18 +5067,55 @@ def register_room_handlers(server, bridge):
                             _mse_reconnect_state.pop(room_id, None)
                             return
 
-                        # 8. 刷新流 URL（优先缓存，失败回退强制刷新）
-                        try:
-                            refresh_ok = await loop.run_in_executor(
-                                _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=False)
-                            )
-                            if not refresh_ok:
+                        # 8. 刷新流 URL。403/签名类错误直接强制刷新（跳过缓存复用）：
+                        #    缓存 URL 时间戳可能未过期但 CDN 已拒绝（虎牙线路/IP 风控），
+                        #    force=False 复用缓存返回 True 会让 force=True 永不执行，
+                        #    导致重试继续用 403 的 URL 直到耗尽。虎牙额外拉黑当前 CDN 线路
+                        #    使重新解析时优选其它线路。
+                        if '403' in current_error:
+                            try:
+                                def _mark_bad_cdn_403():
+                                    room = mgr.get_room(room_id)
+                                    url = ''
+                                    if room and room.stream_info and room.stream_info.stream_url:
+                                        url = room.stream_info.stream_url
+                                    elif room and room.stream_url_cached:
+                                        url = room.stream_url_cached
+                                    if url and 'huya' in url:
+                                        from urllib.parse import urlparse as _up
+                                        host = _up(url).netloc.lower()
+                                        cdn = host.split('.')[0] if host else ''
+                                        if cdn:
+                                            from lsc.platforms.huya import mark_cdn_bad
+                                            mark_cdn_bad(cdn)
+                                            _log.info(
+                                                "MSE reconnect: marked Huya CDN '%s' bad for room %s",
+                                                cdn, room_id,
+                                            )
+                                await loop.run_in_executor(
+                                    _bridge_executor, lambda: bridge.manager.call(_mark_bad_cdn_403)
+                                )
+                            except Exception as exc:
+                                _log.debug("MSE reconnect mark_cdn_bad failed: %s", exc)
+                            try:
                                 refresh_ok = await loop.run_in_executor(
                                     _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=True)
                                 )
-                        except Exception as exc:
-                            _log.error("MSE reconnect URL refresh failed: %s", exc)
-                            refresh_ok = False
+                            except Exception as exc:
+                                _log.error("MSE reconnect URL refresh failed: %s", exc)
+                                refresh_ok = False
+                        else:
+                            try:
+                                refresh_ok = await loop.run_in_executor(
+                                    _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=False)
+                                )
+                                if not refresh_ok:
+                                    refresh_ok = await loop.run_in_executor(
+                                        _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=True)
+                                    )
+                            except Exception as exc:
+                                _log.error("MSE reconnect URL refresh failed: %s", exc)
+                                refresh_ok = False
 
                         if not refresh_ok:
                             try:
@@ -6086,6 +6178,16 @@ def register_room_handlers(server, bridge):
                         st = _continuous_tasks.get(room_id, {})
                         return bool(st.get('cancelled') or st.get('scan_abort'))
 
+                def _refine_cancel_check():
+                    # 粗扫即将抢占时置 refine_abort，密扫须尽快退出释放 semaphore
+                    with _analysis_jobs_lock:
+                        st = _continuous_tasks.get(room_id, {})
+                        return bool(
+                            st.get('cancelled')
+                            or st.get('scan_abort')
+                            or st.get('refine_abort')
+                        )
+
                 def _do_scan(
                     _vp=_vp,
                     _dur=current_dur,
@@ -6115,6 +6217,7 @@ def register_room_handlers(server, bridge):
                             'current_dur': _dur,
                             'finalize': _finalizing,
                             'valorant_profile': str(task_state.get('valorant_profile') or 'valorant'),
+                            'ocr_sample_interval': float(task_state.get('ocr_sample_interval', 1.0)),
                         }
                         return plugin.scan_window(
                             _vp, _window, _scan_state, cancel_check=_cancel,
@@ -6128,10 +6231,13 @@ def register_room_handlers(server, bridge):
                 task_state['scan_requested'] = False
                 task_state['scan_running'] = True
                 task_state['scan_abort'] = False
+                # 粗扫优先：打断仍占用 semaphore 的后台密扫，避免滞后螺旋
+                task_state['refine_abort'] = True
                 task_state['_scan_start_mono'] = time.monotonic()
                 try:
                     # 超时后仍须持锁等到线程经 cancel_check 退出，避免双 OCR 并发压垮 DirectML。
                     async with _analysis_semaphore:
+                        task_state['refine_abort'] = False
                         fut = loop.run_in_executor(_ai_executor, _do_scan)
                         try:
                             result = await asyncio.wait_for(
@@ -6157,22 +6263,141 @@ def register_room_handlers(server, bridge):
                                     room_id,
                                 )
                             raise
-                    completed_dur = (
-                        float(scan_range[1])
-                        if game == 'valorant' and mode == 'valorant_round'
-                        else current_dur
-                    )
-                    scan_result_container['result'] = result or []
-                    scan_result_container['error'] = None
-                    scan_result_container['video_path'] = video_path
-                    scan_result_container['current_dur'] = completed_dur
-                    scan_result_container['completed_at'] = time.time()
-                    scan_result_container['degraded_mode'] = None
-                    _log.info(
-                        "持续分析 Worker 完成: room_id=%s, %d 回合",
-                        room_id,
-                        len(result or []),
-                    )
+                        completed_dur = (
+                            float(scan_range[1])
+                            if game == 'valorant' and mode == 'valorant_round'
+                            else current_dur
+                        )
+                        # 粗结果先入列：唤醒主循环，消除密扫尖峰对入列延迟
+                        scan_result_container['result'] = result or []
+                        scan_result_container['error'] = None
+                        scan_result_container['video_path'] = video_path
+                        scan_result_container['current_dur'] = completed_dur
+                        scan_result_container['completed_at'] = time.time()
+                        scan_result_container['degraded_mode'] = None
+                        scan_result_container['boundary_refine_pass'] = False
+                        done_ev = task_state.get('scan_done_event')
+                        if done_ev is not None:
+                            try:
+                                done_ev.set()
+                            except Exception:
+                                _log.debug("scan_done_event.set 失败", exc_info=True)
+                        _log.info(
+                            "持续分析 Worker 完成: room_id=%s, %d 回合",
+                            room_id,
+                            len(result or []),
+                        )
+
+                        # 密扫改后台：粗结果已入列；密扫可被下一窗粗扫 refine_abort 抢占
+                        _need_refine = [
+                            r for r in (result or [])
+                            if isinstance(r, dict) and r.get('boundary_refined') is False
+                        ]
+                        # 已明显滞后时跳过密扫，优先追赶粗扫（密扫单回合可达 30–55s）
+                        _lag_now = max(0.0, float(current_dur) - float(completed_dur))
+                        if (
+                            _need_refine
+                            and game == 'valorant'
+                            and mode == 'valorant_round'
+                            and not _finalizing
+                            and not task_state.get('cancelled')
+                            and not task_state.get('scan_abort')
+                            and _lag_now <= 25.0
+                        ):
+                            _refine_vp = video_path
+                            _refine_rounds = [dict(r) for r in (result or [])]
+                            _refine_dur = completed_dur
+
+                            async def _boundary_refine_bg(
+                                _vp=_refine_vp,
+                                _rounds=_refine_rounds,
+                                _dur=_refine_dur,
+                            ):
+                                def _do_boundary_refine():
+                                    from lsc.analyzer.valorant_ocr_rounds import (
+                                        refine_valorant_round_boundaries,
+                                    )
+                                    _cfg = load_config()
+                                    _ffmpeg = (
+                                        _cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+                                    )
+                                    return refine_valorant_round_boundaries(
+                                        _rounds,
+                                        _vp,
+                                        _ffmpeg,
+                                        cancel_check=_refine_cancel_check,
+                                    )
+
+                                try:
+                                    async with _analysis_semaphore:
+                                        with _analysis_jobs_lock:
+                                            st = _continuous_tasks.get(room_id)
+                                            if (
+                                                not st
+                                                or st.get('cancelled')
+                                                or st.get('scan_abort')
+                                                or st.get('refine_abort')
+                                            ):
+                                                return
+                                            st['refine_running'] = True
+                                        try:
+                                            refined = await loop.run_in_executor(
+                                                _ai_executor, _do_boundary_refine,
+                                            )
+                                        finally:
+                                            with _analysis_jobs_lock:
+                                                st2 = _continuous_tasks.get(room_id)
+                                                if st2 is not None:
+                                                    st2['refine_running'] = False
+                                except Exception as refine_exc:
+                                    _log.warning(
+                                        "边界密扫失败（保留粗边界）: room_id=%s, err=%r",
+                                        room_id,
+                                        refine_exc,
+                                    )
+                                    return
+                                with _analysis_jobs_lock:
+                                    st = _continuous_tasks.get(room_id)
+                                    if (
+                                        not refined
+                                        or not st
+                                        or st.get('cancelled')
+                                        or st.get('scan_abort')
+                                        or st.get('refine_abort')
+                                    ):
+                                        return
+                                scan_result_container['result'] = refined
+                                scan_result_container['error'] = None
+                                scan_result_container['video_path'] = _vp
+                                scan_result_container['current_dur'] = _dur
+                                scan_result_container['completed_at'] = time.time()
+                                scan_result_container['boundary_refine_pass'] = True
+                                _ev = None
+                                with _analysis_jobs_lock:
+                                    st = _continuous_tasks.get(room_id)
+                                    if st is not None:
+                                        _ev = st.get('scan_done_event')
+                                if _ev is not None:
+                                    try:
+                                        _ev.set()
+                                    except Exception:
+                                        _log.debug("scan_done_event.set 失败", exc_info=True)
+                                _log.info(
+                                    "持续分析边界精修完成: room_id=%s, %d 回合",
+                                    room_id,
+                                    len(refined),
+                                )
+
+                            asyncio.create_task(
+                                _boundary_refine_bg(),
+                                name=f"boundary-refine-{room_id[:8]}",
+                            )
+                        elif _need_refine and _lag_now > 25.0:
+                            _log.info(
+                                "持续分析跳过密扫（优先追赶）: room_id=%s, lag=%.0fs",
+                                room_id,
+                                _lag_now,
+                            )
                 except Exception as exc:
                     # TimeoutError 的 str() 常为空，必须用 repr + exc_info
                     _log.warning(
@@ -6192,6 +6417,7 @@ def register_room_handlers(server, bridge):
                     )
                     # 写入 completed_at，让主循环能消费失败并触发收尾重试
                     scan_result_container['completed_at'] = time.time()
+                    scan_result_container['boundary_refine_pass'] = False
                 finally:
                     task_state['scan_running'] = False
                     task_state['scan_abort'] = False
@@ -6251,6 +6477,7 @@ def register_room_handlers(server, bridge):
         _finalize_max_attempts = 3
         _recording_was_active = False    # 录制是否曾经处于活跃状态
         _recording_stop_ticks = 0        # 录制停止后经过的 tick 数（延迟确认防抖）
+        _last_recording_wallclock = 0.0  # 录制中最后一次墙钟时长（停录后钳制 probe）
         video_path = ''
         current_dur = 0.0
         # 文件替换检测：重连会创建新录制文件，需重置分析游标避免反向区间
@@ -6460,11 +6687,16 @@ def register_room_handlers(server, bridge):
                     _finalize_pending = False
                     _finalize_started = False
                     _finalize_failures = 0
+                    _last_recording_wallclock = 0.0
                     _file_switch_cooldown = 3  # 冷却 3 个 tick，避免立即再次触发
                     with _analysis_jobs_lock:
                         if room_id in _continuous_tasks:
                             _continuous_tasks[room_id]['full_rescan'] = True
                             _continuous_tasks[room_id]['last_analyzed'] = 0.0
+                            # 文件切换必须重置 OCR 跨窗口状态（FSM/锚点/计时器外推）：
+                            # 否则旧文件 last_processed_ts 只增不减，会把新文件前 N 秒帧
+                            # 全部按"已处理过"过滤，导致重新开录的前几分钟回合静默漏检。
+                            _continuous_tasks[room_id]['ocr_runtime_state'] = {}
                 if video_path:
                     _last_video_path = video_path
 
@@ -6491,15 +6723,16 @@ def register_room_handlers(server, bridge):
                     if is_still_recording and recording_start
                     else 0.0
                 )
-                # 录制中时长校准（双向）：写入中的 MP4 无 moov，ffprobe 时长常取不到，
+                # 录制中时长校准（双向）：写入中的 MP4 无稳定 moov，ffprobe 时长常取不到，
                 # 而 _get_video_duration 的码率估算有两种失效方向：
                 #   虚高（自举漂移）→ scan_range 末端 seek 超出文件实际数据 → 抽帧 0 帧失败循环；
                 #   虚低（估算被物理校验拒绝后回退旧缓存）→ 窗口 end 被限制、分析追不上
                 #   录制 → 滞后持续增长（real 日志：probe 299s vs 墙钟 523s）。
-                # 录制中一律以墙钟为准并留 30s 写缓冲容差，两种偏差都不超界。
+                # 录制中一律以墙钟为准并留写缓冲容差（frag_keyframe 下 15s），两种偏差都不超界。
                 if wallclock_dur > 0:
+                    _last_recording_wallclock = wallclock_dur
                     recorded_duration = wallclock_dur
-                    buffered_wall = max(0.0, wallclock_dur - 30.0)
+                    buffered_wall = max(0.0, wallclock_dur - _RECORDING_WRITE_BUFFER_SEC)
                     if abs(current_dur - buffered_wall) > 15.0:
                         _log.debug(
                             "持续分析时长校准: room_id=%s, probed=%.1fs, wallclock=%.1fs, buffered=%.1fs",
@@ -6507,7 +6740,21 @@ def register_room_handlers(server, bridge):
                         )
                     current_dur = buffered_wall
                 else:
-                    recorded_duration = current_dur
+                    # 停录后：probe/码率缓存可能虚高（现场 1787s → 2226s），钳到最后录制墙钟
+                    _clamped = _clamp_post_stop_duration(
+                        current_dur, _last_recording_wallclock,
+                    )
+                    if _clamped < current_dur:
+                        _log.warning(
+                            "持续分析停录后时长虚高已钳制: room_id=%s, probed=%.1fs, last_wall=%.1fs",
+                            room_id, current_dur, _last_recording_wallclock,
+                        )
+                        current_dur = _clamped
+                    recorded_duration = (
+                        max(current_dur, _last_recording_wallclock)
+                        if _last_recording_wallclock > 0
+                        else current_dur
+                    )
                 state['video_path'] = video_path or ''
                 state['current_dur'] = current_dur
                 state['recorded_duration'] = recorded_duration
@@ -6551,6 +6798,7 @@ def register_room_handlers(server, bridge):
                 worker_dur = scan_result.get('current_dur', 0.0)
                 worker_result = scan_result.get('result', [])
                 worker_error = scan_result.get('error')
+                _boundary_refine_pass = bool(scan_result.get('boundary_refine_pass'))
                 _time_since_last_consume = time.time() - last_consumed_at
                 _min_consume_interval = 10.0 if _valorant_incremental_rounds else 0.0
                 can_consume = (
@@ -6561,8 +6809,11 @@ def register_room_handlers(server, bridge):
                         or bool(worker_error)
                         or not _valorant_incremental_rounds
                         or _time_since_last_consume > _min_consume_interval
+                        or _boundary_refine_pass  # 密扫二次结果立即 upsert，不受 10s 消费间隔限制
                     )
                 )
+                if can_consume and _boundary_refine_pass:
+                    scan_result['boundary_refine_pass'] = False
                 if can_consume and worker_error:
                     last_consumed_at = worker_completed_at
                     scan_result['error'] = None
@@ -6824,6 +7075,18 @@ def register_room_handlers(server, bridge):
                         if room_id in _continuous_tasks:
                             _continuous_tasks[room_id]['last_analyzed'] = last_analyzed
                             _continuous_tasks[room_id]['recorded_duration'] = max(recorded_duration, worker_dur)
+                            # 吞吐量跟踪（自适应追赶上限）：媒体秒 / 墙钟秒，保留最近 5 次
+                            if mode == 'valorant_round':
+                                _scan_in = float(_continuous_tasks[room_id].get('scan_in_sec') or 0.0)
+                                _scan_out = float(_continuous_tasks[room_id].get('scan_out_sec') or 0.0)
+                                _scan_wall = time.monotonic() - float(
+                                    _continuous_tasks[room_id].get('_scan_start_mono') or time.monotonic()
+                                )
+                                if _scan_out > _scan_in and _scan_wall > 0.0:
+                                    _thru = (_scan_out - _scan_in) / _scan_wall
+                                    _hist = list(_continuous_tasks[room_id].get('scan_throughput_history') or [])
+                                    _hist.append(round(_thru, 3))
+                                    _continuous_tasks[room_id]['scan_throughput_history'] = _hist[-5:]
                             confirmed_total = sum(
                                 1 for item in all_highlights
                                 if _is_auto_exportable_valorant_round(item)
@@ -6949,9 +7212,17 @@ def register_room_handlers(server, bridge):
                     elif _valorant_incremental_rounds:
                         # 文件时长可能滞后于墙钟录制时长；用二者较大值决定是否 kick
                         kick_dur = max(current_dur, float(state.get('recorded_duration', 0.0) or 0.0))
-                        should_kick = kick_dur > last_analyzed + 15.0
+                        should_kick = kick_dur > last_analyzed + _VALORANT_KICK_AHEAD_SEC
                     elif current_dur > last_analyzed + 12.0:
                         should_kick = True
+
+                    # 写缓冲期内 current_dur 仍为 0/极短：禁止 kick（避免 range=0-0 空扫烧 OCR）
+                    if (
+                        should_kick
+                        and not (_finalize_pending or _finalize_started)
+                        and current_dur <= 3.0
+                    ):
+                        should_kick = False
 
                     # 失败退避：worker 出错后 30s 内不重试（收尾除外），
                     # 避免「失败 → 立即重 kick → 再失败」的 3s 风暴。
@@ -6982,6 +7253,9 @@ def register_room_handlers(server, bridge):
                                 'mode': mode,
                                 'last_analyzed': last_analyzed,
                                 'tick_count': _scan_counter,
+                                # 吞吐历史 + kick 间隔：自适应追赶上限输入
+                                'throughput_history': list(state.get('scan_throughput_history') or []),
+                                'kick_interval': effective_interval,
                             }
                             _window = _analyzer.plan_scan_window(
                                 _plan_state, current_dur, pressure or {},
@@ -7044,10 +7318,10 @@ def register_room_handlers(server, bridge):
                         state['refine_with_ocr'] = use_ocr_this_tick
                         try:
                             _budget_ocr_iv = float(
-                                pressure.get('ocr_sample_interval', 2.0) or 2.0
+                                pressure.get('ocr_sample_interval', 1.0) or 1.0
                             )
                         except (TypeError, ValueError):
-                            _budget_ocr_iv = 2.0
+                            _budget_ocr_iv = 1.0
                         if _finalize_started or _finalize_pending:
                             _budget_ocr_iv = min(_budget_ocr_iv, 1.0)
                         state['ocr_sample_interval'] = _budget_ocr_iv
@@ -7096,6 +7370,7 @@ def register_room_handlers(server, bridge):
                             _log.info(f"持续分析 kick worker: room_id={room_id}, dur={current_dur:.0f}s, range={scan_range[0]:.0f}-{scan_range[1]:.0f}, OCR={use_ocr_this_tick}, full={full_rescan}, finalize={_finalize_started}")
 
                 # 每 tick 广播状态（含等待中），避免 UI 卡在 analyzed_duration /「等待新片段」
+                # 高频 tick 广播不带全量 listed_clips（前端不消费，切片列表由 clip_queued 驱动）
                 bridge.queue_broadcast({
                     'type': 'continuous_analysis_status',
                     'data': _build_continuous_status_payload(
@@ -7107,6 +7382,7 @@ def register_room_handlers(server, bridge):
                         all_highlights=all_highlights,
                         last_analyzed=last_analyzed,
                         current_dur=current_dur,
+                        include_listed=False,
                         effective_interval=effective_interval,
                     ),
                 })

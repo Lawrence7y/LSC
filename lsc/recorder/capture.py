@@ -40,6 +40,13 @@ def _friendly_ffmpeg_message(exit_code: int, stderr_tail: str) -> str:
     for needle, text in _FRIENDLY_STDERR_RULES:
         if needle.lower() in haystack:
             return f"{text} (code {exit_code})"
+    # 未匹配已知规则时附加 stderr 关键片段，保留可恢复性特征（如
+    # "Stream ends prematurely" / "I/O error" / "403"）。否则下游
+    # is_recoverable_error 只能看到笼统的 "(code 0)"，把可恢复的流中断
+    # 误判为不可恢复，既不重连也不拉黑虎牙 CDN 线路。
+    if stderr_tail:
+        snippet = stderr_tail.strip().replace("\n", " ")[:200]
+        return f"FFmpeg 异常退出 (code {exit_code})，{snippet}"
     return f"FFmpeg 异常退出 (code {exit_code})"
 
 
@@ -158,6 +165,7 @@ class StreamCapture:
         self._stderr_tail: deque[str] = deque(maxlen=20)
         self._stderr_future: Future[None] | None = None
         self._stderr_released = False
+        self._stderr_acquired = False
         self._last_error: str = ""
         # Orphan process detection (prevent retry loops on termination failure)
         self._terminated_with_orphan = False
@@ -209,6 +217,7 @@ class StreamCapture:
 
         proc = self._process
         executor = self._acquire_stderr_executor()
+        self._stderr_acquired = True
         self._stderr_future = executor.submit(self._stderr_reader_loop, proc)
 
     def _stderr_reader_loop(self, proc: subprocess.Popen) -> None:
@@ -245,6 +254,11 @@ class StreamCapture:
         """确保每个实例只释放一次共享 stderr executor，防止并发路径重复释放。"""
         with self._lock:
             if self._stderr_released:
+                return
+            # 从未成功 acquire 过（如 Popen 失败路径）不得 release，
+            # 否则会把其它活跃录制实例正在使用的共享池提前 shutdown。
+            if not self._stderr_acquired:
+                self._stderr_released = True
                 return
             self._stderr_released = True
         self._release_stderr_executor()
@@ -539,7 +553,7 @@ class StreamCapture:
                     # Final safety net: do not block forever.
                     orphaned_pid_final: int | str = "?"
                     try:
-                        orphaned_pid_final = proc.pid
+                        orphaned_pid = proc.pid
                     except Exception as exc:
                         _log.debug("操作异常（已忽略）: %s", exc)
                     _log.error(

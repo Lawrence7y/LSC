@@ -7,6 +7,8 @@ export interface TimelineClip {
   start: number
   end: number
   color?: string
+  /** 稳定唯一标识（round_key/clip_id），用于 React key，避免越窗 clip 塌缩成重复 key */
+  uid?: string
 }
 
 interface TimelineProps {
@@ -480,12 +482,10 @@ export function Timeline({
     if (progressFillRef.current) progressFillRef.current.style.width = `${clampedPct}%`
   }, [])
 
-  // seek / props 对齐；拖拽中走 dragTime 本地态
+  // 拖拽中走本地 dragTime；非拖拽由 subscribeDisplayPlayhead 直写。
+  // 禁止用低频 React progressPct 回写，否则每 500ms 会把 ~60fps 播放头拽回滞后位置。
   useEffect(() => {
-    if (dragTime != null) {
-      applyPlayheadPct(progressPct)
-      return
-    }
+    if (dragTime == null) return
     applyPlayheadPct(progressPct)
   }, [progressPct, dragTime, applyPlayheadPct])
 
@@ -501,9 +501,21 @@ export function Timeline({
       } else {
         rel = Math.min(Math.max(0, abs - windowS), dur)
       }
-      applyPlayheadPct((rel / dur) * 100)
+      applyPlayheadPct((rel / Math.max(dur, 1e-6)) * 100)
     })
   }, [applyPlayheadPct])
+
+  // 切房 / 窗长变化时用 props 做一次冷启动对齐（仅非拖拽）
+  useEffect(() => {
+    if (dragTime != null) return
+    if (followLive && !isScrubbing) {
+      applyPlayheadPct(100)
+      return
+    }
+    applyPlayheadPct(progressPct)
+    // 刻意不依赖 progressPct：避免 500ms React 更新反复覆盖 rAF
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followLive, isScrubbing, effectiveDuration, ws, applyPlayheadPct, dragTime])
 
   const selection = useMemo(() => {
     if (markIn === null || markOut === null) return null
@@ -720,9 +732,11 @@ export function Timeline({
             })()}
 
             {clips.map((clip) => {
+              // 完全越窗的切片不渲染：clamp 后坐标为 (0,0)，既无意义也会与其它越窗切片产生重复 key
+              if (clip.end <= 0) return null
               const left = clamp((clip.start / effectiveDuration) * 100, 0, 100)
               const width = clamp(((clip.end - clip.start) / effectiveDuration) * 100, 0, 100 - left)
-              const clipKey = clip.color ? `${clip.start}-${clip.end}-${clip.color}` : `${clip.start}-${clip.end}`
+              const clipKey = clip.uid || (clip.color ? `${clip.start}-${clip.end}-${clip.color}` : `${clip.start}-${clip.end}`)
               return (
                 <div
                   key={clipKey}

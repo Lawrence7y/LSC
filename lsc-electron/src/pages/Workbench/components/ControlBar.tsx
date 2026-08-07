@@ -21,6 +21,7 @@ import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
 import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
 import {
+  readDisplayPlayhead,
   readLiveEdgeDisplay,
   retainClockLoop,
   subscribeClock,
@@ -33,7 +34,7 @@ export interface TimelineViewModel {
   windowStart: number
   markIn: number | null
   markOut: number | null
-  clips: { start: number; end: number; color?: string }[]
+  clips: { start: number; end: number; color?: string; uid?: string }[]
   highlights?: TimelineHighlightBand[]
   waveformPeaks?: number[]
   contentEnd?: number
@@ -307,16 +308,17 @@ export const ControlBar = memo(function ControlBar({
     const unsub = subscribeClock(() => {
       const el = timeLabelRef.current
       if (!el) return
+      // Live：右沿插值；回看/非 Live：读 playheadStore（每帧采样），禁止读 React props（500ms 才变）
       const t = (followLive && !isScrubbing)
         ? readLiveEdgeDisplay(true)
-        : (timelineView ? timelineView.currentTime : currentTime)
+        : readDisplayPlayhead()
       el.textContent = formatTime(Math.max(0, t))
     })
     return () => {
       unsub()
       release()
     }
-  }, [followLive, isScrubbing, timelineView, currentTime])
+  }, [followLive, isScrubbing])
   // Timeline 内时间一律相对 windowStart；轨长 = 可视窗长度（无默认垫高）
   // 缩放时左缘 = windowStart（片段最左），未缩放短内容时 ws=0 即 0:00:00
   const trackDuration = Math.max(1, duration - windowStart)
@@ -372,11 +374,16 @@ export const ControlBar = memo(function ControlBar({
         start: Math.max(0, c.start - windowStart),
         end: Math.max(0, c.end - windowStart),
         color: c.color,
+        uid: c.uid,
       }))
     }
     return clips
       .filter(c => c.room_id === room?.room_id && c.end > c.start)
-      .map(c => ({ start: Math.max(0, c.start - windowStart), end: Math.max(0, c.end - windowStart) }))
+      .map(c => ({
+        start: Math.max(0, c.start - windowStart),
+        end: Math.max(0, c.end - windowStart),
+        uid: c.round_key ?? c.clip_id ?? '',
+      }))
   }, [timelineView, clips, room?.room_id, windowStart])
 
   const timelineHighlights = useMemo(() => {
@@ -399,41 +406,8 @@ export const ControlBar = memo(function ControlBar({
         flexShrink: 0,
         zIndex: 20,
       }}>
-      {/* 顶部信息行：三轴指示器 + 多选提示（P2: 三轴同步状态指示） */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-        {/* 三轴指示器 */}
-        <div style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          gap: 4,
-          padding: '2px 8px',
-          background: 'var(--bg-tertiary, #2c2c2e)',
-          borderRadius: 4,
-          fontSize: 11,
-        }}>
-          {(['preview', 'common', 'recording_review'] as const).map((ax) => {
-            const isActive = axis === ax
-            const label = ax === 'preview' ? '预览轴' : ax === 'common' ? '公共轴' : '录制轴'
-            return (
-              <span
-                key={ax}
-                style={{
-                  padding: '2px 8px',
-                  borderRadius: 3,
-                  background: isActive ? 'var(--brand-500, #31B3AE)' : 'transparent',
-                  color: isActive ? '#fff' : 'var(--text-400, #888780)',
-                  fontWeight: isActive ? 600 : 400,
-                  cursor: 'default',
-                  transition: 'all 150ms ease',
-                }}
-                title={`当前轴：${axisLabel}`}
-              >
-                {label}
-              </span>
-            )
-          })}
-        </div>
-        {multiSelectCount > 0 && (
+      {multiSelectCount > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8 }}>
           <div style={{
             display: 'inline-flex',
             alignItems: 'center',
@@ -448,8 +422,8 @@ export const ControlBar = memo(function ControlBar({
             <span style={{ display: 'inline-block', width: 5, height: 5, borderRadius: '50%', background: 'var(--brand-400, #4DC4BF)' }} />
             {multiSelectCount} 房间 · 全局控制
           </div>
-        )}
-      </div>
+        </div>
+      )}
       <Timeline
         duration={trackDuration}
         currentTime={displayCurrent}

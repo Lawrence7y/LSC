@@ -7,9 +7,9 @@ import { writeDisplayPlayhead, writePlayhead } from '@/utils/playheadStore'
 let _lastAxisFallbackWarnAt = 0
 
 /**
- * 预览播放头采样：100ms 读 MSE currentTime → playheadStore 直写；
- * setPreviewPositions 降频 500ms，确保 DVR 边界保持亚秒级更新，同时避免
- * 多路预览时 React 树以 4Hz 重渲染。
+ * 预览播放头采样：每帧读 MSE currentTime → playheadStore 直写（~60fps）；
+ * setPreviewPositions 仍降频 500ms，避免 React 树跟着播放头重渲染。
+ * 旧 100ms 采样会把回看播放头/时钟锁在 ~10fps，观感卡顿。
  */
 export function usePlayheadSampling(opts: {
   setPreviewPositions: Dispatch<SetStateAction<Record<string, number>>>
@@ -29,23 +29,36 @@ export function usePlayheadSampling(opts: {
   } = opts
 
   useEffect(() => {
-    let rafId: number
-    let lastTick = 0
+    let rafId = 0
+    let idleTimer: number | undefined
+    let alive = true
     let lastSetState = 0
-    const SAMPLE_INTERVAL_MS = 100  // 采样间隔
-    const SETSTATE_INTERVAL_MS = 500  // setState 间隔
+    const SETSTATE_INTERVAL_MS = 500  // setState 间隔（布局/DVR 逻辑通道）
+
+    const scheduleIdleProbe = () => {
+      // 无活跃预览播放器时停掉 60fps rAF 空转，降为低频探测（每 500ms）：
+      // 有 player 注册再恢复全速通道。Workbench 长期挂载时避免空闲期空占主线程。
+      if (!alive) return
+      idleTimer = window.setTimeout(() => {
+        const reg = window.__msePlayers
+        if (reg && Object.keys(reg).length > 0) {
+          rafId = requestAnimationFrame(tick)
+        } else {
+          scheduleIdleProbe()
+        }
+      }, 500)
+    }
 
     const tick = (now: number) => {
+      const registry = window.__msePlayers
+      if (!registry || Object.keys(registry).length === 0) {
+        scheduleIdleProbe()
+        return
+      }
       rafId = requestAnimationFrame(tick)
-
-      // 节流：按 SAMPLE_INTERVAL_MS 采样
-      if (now - lastTick < SAMPLE_INTERVAL_MS) return
-      lastTick = now
 
       // scrub 中跳过：光标走 Timeline 本地 dragTime，避免父级轮询重渲染抢帧
       if (timelineScrubbingRef.current) return
-      const registry = window.__msePlayers
-      if (!registry) return
       const next: Record<string, number> = { ...lastPreviewPositionsRef.current }
       let changed = false
       for (const rid of Object.keys(registry)) {
@@ -68,7 +81,7 @@ export function usePlayheadSampling(opts: {
           }
           continue
         }
-        // 高频视觉通道：播放头经 playheadStore rAF 直写 DOM（60fps），不进 React state
+        // 每帧视觉通道：播放头经 playheadStore 直写 DOM，不进 React state
         writePlayhead(rid, t)
         const prev = lastPreviewPositionsRef.current[rid]
         if (prev === undefined || Math.abs(t - prev) > 0.01) {
@@ -79,6 +92,7 @@ export function usePlayheadSampling(opts: {
       // 逻辑通道：500ms setState；视觉播放头仍由上面的 rAF 通道保持流畅。
       if (changed && now - lastSetState >= SETSTATE_INTERVAL_MS) {
         lastSetState = now
+        lastPositionsSetStateAtRef.current = now
         lastPreviewPositionsRef.current = next
         setPreviewPositions(next)
       } else if (changed) {
@@ -113,8 +127,17 @@ export function usePlayheadSampling(opts: {
       }
     }
 
-    rafId = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(rafId)
+    const reg0 = window.__msePlayers
+    if (reg0 && Object.keys(reg0).length > 0) {
+      rafId = requestAnimationFrame(tick)
+    } else {
+      scheduleIdleProbe()
+    }
+    return () => {
+      alive = false
+      cancelAnimationFrame(rafId)
+      if (idleTimer !== undefined) clearTimeout(idleTimer)
+    }
   }, [
     setPreviewPositions,
     lastPreviewPositionsRef,

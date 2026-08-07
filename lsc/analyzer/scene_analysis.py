@@ -48,6 +48,8 @@ def get_video_duration(video_path: str) -> float:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
         )
         data = _json.loads(result.stdout)

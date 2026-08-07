@@ -4,6 +4,7 @@ import { MsePlayer, MsePlayerState } from '@/services/mediaSourcePlayer'
 import { clearMseRoomCache, drainPendingMseSegments, getMseInitCache, wsClient } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
+import { isMuteSyncSuppressed, withMuteSyncSuppressed } from '@/utils/muteSyncGuard'
 
 interface VideoPreviewProps {
   /** Room ID for the video stream */
@@ -258,6 +259,12 @@ export function VideoPreview({
             gain.gain.value = (localMutedOverride ?? muted) ? 0 : 1
             source.connect(gain)
             gain.connect(ctx.destination)
+            // MES 建立后元素必须 unmuted，否则后续对齐/播放易卡死
+            if (videoRef.current.muted) {
+              withMuteSyncSuppressed(videoRef.current, () => {
+                videoRef.current!.muted = false
+              })
+            }
             audioSourceRef.current = source
             gainNodeRef.current = gain
           }
@@ -350,7 +357,16 @@ export function VideoPreview({
     if (active && videoRef.current) {
       // Register this room's player in a global registry for WS handler access
       const registry = window.__msePlayers || {}
-      registry[roomId] = { feedInit, feedMedia, player: playerRef.current, audioSource: audioSourceRef.current, gainNode: gainNodeRef.current }
+      const prev = registry[roomId]
+      registry[roomId] = {
+        ...(prev || {}),
+        feedInit,
+        feedMedia,
+        player: playerRef.current,
+        // feed 回调重建时勿用 null 冲掉已创建的 Web Audio 图（否则对齐走 captureStream 易采到静音）
+        audioSource: audioSourceRef.current ?? prev?.audioSource ?? null,
+        gainNode: gainNodeRef.current ?? prev?.gainNode ?? null,
+      }
       ;window.__msePlayers = registry
       // 主动请求后端补发 init 段，消除 mse_init 早于 rooms_updated 到达的竞态
       sendRef.current('request_mse_init', { room_id: roomId })
@@ -382,16 +398,19 @@ export function VideoPreview({
     }
   }, [active, roomId, feedInit, feedMedia, playerGeneration])
 
-  // 同步 muted prop 到 GainNode（替代 video.muted）
-  // GainNode 控制扬声器输出音量，不影响 MediaElementSource 的音频数据
+  // 同步 muted prop 到 GainNode（扬声器）。
+  // MediaElementSource 建立后元素必须保持 unmuted：Chromium 在 muted=true 时
+  // 会对 MES 输出全零，对齐结束后 remute 还可能卡死 MSE play()。
   useEffect(() => {
     const effectiveMuted = localMutedOverride ?? muted
     if (gainNodeRef.current) {
       gainNodeRef.current.gain.value = effectiveMuted ? 0 : 1
     }
-    // video.muted 仅用于原生控件的显示状态，不影响 Web Audio 路由
-    if (videoRef.current) {
-      videoRef.current.muted = effectiveMuted
+    const video = videoRef.current
+    if (video && video.muted) {
+      withMuteSyncSuppressed(video, () => {
+        video.muted = false
+      })
     }
     // 取消静音时显式 resume AudioContext，确保 Web Audio 路由有输出
     if (!effectiveMuted) {
@@ -412,23 +431,31 @@ export function VideoPreview({
     }
   }, [muted])
 
-  // 全屏时用户通过原生 controls 改变静音状态，需要同步回后端。
-  // volumechange 事件在 video.muted 被 React prop 设置和原生控件设置时都会触发，
-  // 通过 mutedRef 区分：若 video.muted !== mutedRef.current 说明是原生控件改的。
-  // 同时设置本地覆盖 + 乐观更新 store，避免 rooms_updated 用 stale prop 覆盖用户操作。
+  // 全屏原生 controls 改静音：偏好进 store，但元素保持 unmuted（GainNode 控声）。
   useEffect(() => {
     if (!active || !videoRef.current) return
     const video = videoRef.current
     const handleVolumeChange = () => {
-      if ((video as any).__lscSuppressMuteSync) return
-      if (video.muted !== mutedRef.current) {
-        // 设置本地覆盖，立即反映到 UI
-        localMutedOverrideRef.current = video.muted
-        setLocalMutedOverride(video.muted)
-        // 乐观更新 store，房间卡片的静音图标立即响应
-        useAppStore.getState().updateRoom(roomId, { preview_muted: video.muted })
-        // 同步到后端
-        sendRef.current('set_preview_muted', { room_id: roomId, muted: video.muted })
+      if (isMuteSyncSuppressed(video)) return
+      if (video.muted) {
+        // 用户点了静音：记偏好，强制元素 unmute，改用 GainNode=0
+        withMuteSyncSuppressed(video, () => {
+          video.muted = false
+        })
+        localMutedOverrideRef.current = true
+        setLocalMutedOverride(true)
+        useAppStore.getState().updateRoom(roomId, { preview_muted: true })
+        sendRef.current('set_preview_muted', { room_id: roomId, muted: true })
+        if (gainNodeRef.current) gainNodeRef.current.gain.value = 0
+        return
+      }
+      if (mutedRef.current) {
+        // 元素已 unmuted 且 UI 认为静音：用户在取消静音
+        localMutedOverrideRef.current = false
+        setLocalMutedOverride(false)
+        useAppStore.getState().updateRoom(roomId, { preview_muted: false })
+        sendRef.current('set_preview_muted', { room_id: roomId, muted: false })
+        if (gainNodeRef.current) gainNodeRef.current.gain.value = 1
       }
     }
     video.addEventListener('volumechange', handleVolumeChange)
@@ -472,6 +499,7 @@ export function VideoPreview({
     >
       <video
         ref={videoRef}
+        data-room-id={roomId}
         controls={controls}
         muted={false}
         playsInline
