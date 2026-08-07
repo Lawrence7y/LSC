@@ -30,3 +30,11 @@ def test_dependency_fast_path_requires_windows_gpu_provider_distribution() -> No
 
     assert "onnxruntime_(directml|gpu)" in guard
     assert "inferenceProviderReady" in guard
+
+
+def test_csp_allows_blob_audio_worklet() -> None:
+    """预览对齐用 Blob URL 加载 AudioWorklet；CSP 必须放行 blob script/worker。"""
+    source = (ROOT / "lsc-electron/electron/main.ts").read_text(encoding="utf-8")
+    assert "worker-src 'self' blob:" in source
+    assert "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:" in source
+    assert "script-src 'self' file: blob:" in source

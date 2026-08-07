@@ -99,6 +99,19 @@ def test_plan_scan_window_matches_budget_helper():
     assert full is False
 
 
+def test_adaptive_catchup_floor_is_45s():
+    """有吞吐历史时 catchup 下限 45s（旧 120s 过大，落后时难收敛到 ≤30s 滞后）。"""
+    from lsc.analyzer import valorant_plugin as vp
+
+    assert vp.MIN_CATCHUP_SEC == 45.0
+    # 吞吐很好时仍不低于下限
+    assert vp._adaptive_catchup_cap([3.0, 3.0, 3.0], kick_interval=5.0) == 45.0
+    # 无历史沿用 MAX
+    assert vp._adaptive_catchup_cap(None, kick_interval=5.0) == vp.MAX_CATCHUP_SEC
+    # 低吞吐时公式仍被下限托住（避免窗缩到无法覆盖 lookback 外新内容）
+    assert vp._adaptive_catchup_cap([0.2], kick_interval=5.0) == 45.0
+
+
 def test_status_payload_keys_stable():
     task = {
         "target_room_ids": ["r1"],

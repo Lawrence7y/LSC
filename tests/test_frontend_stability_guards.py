@@ -131,27 +131,63 @@ def test_preview_audio_capture_disconnects_only_current_recorder_from_shared_sou
 
 def test_preview_audio_capture_temporarily_unmutes_shared_media_element() -> None:
     source = (ROOT / "lsc-electron/src/utils/previewAudioAligner.ts").read_text(encoding="utf-8")
-    shared_branch = source.split("if (sharedSource) {", 1)[1].split("} else {", 1)[0]
     cleanup_body = source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
 
-    assert "const previousMuted = video.muted" in source
     assert "withMuteSyncSuppressed" in source
-    assert "mutedOverridden = true" in shared_branch
+    assert "ensureElementAudible" in source
+    assert "mutedOverridden = true" in source
+    assert "await ensureElementAudible()" in source
     assert (
-        "video.muted = false" in shared_branch
-        or "video.muted = overriddenMutedValue" in shared_branch
+        "video.muted = false" in source
+        or "video.muted = overriddenMutedValue" in source
     )
-    assert "video.muted = previousMuted" in source
+    # 采集结束后禁止 remute=true（会导致 Chromium+MES 预览卡死）
+    assert "video.muted = previousMuted" not in source
     assert "restoreMutedOverride()" in cleanup_body
+    assert "video.paused" in source
+    assert "captureStream fallback" in source or "Using captureStream fallback" in source
 
+
+def test_video_preview_keeps_element_unmuted_with_mes() -> None:
+    """有 MediaElementSource 时元素保持 unmuted，静音只走 GainNode。"""
+    source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    assert "video.muted = false" in source
+    assert "gain.gain.value = effectiveMuted ? 0 : 1" in source or "gainNodeRef.current.gain.value = effectiveMuted ? 0 : 1" in source
+    assert "isMuteSyncSuppressed" in source
+
+
+def test_align_resume_playback_after_capture() -> None:
+    """采集完成后须 resumePlayback，避免一端卡死导致对齐响应等超时。"""
+    source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    body = source.split("const captureAndSendAlignment = useCallback", 1)[1].split(
+        "const handleAlignLive = useCallback", 1
+    )[0]
+    assert "resumePlayback" in body
+    assert "align_preview_audio" in body
+
+def test_video_preview_registry_preserves_audio_graph() -> None:
+    """feed 回调重建注册表时不得用 null 冲掉已有 MediaElementSource。"""
+    source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    assert "audioSource: audioSourceRef.current ?? prev?.audioSource ?? null" in source
+    assert "gainNode: gainNodeRef.current ?? prev?.gainNode ?? null" in source
+
+
+def test_align_live_requires_preview_players() -> None:
+    """一键对齐前须拦截无预览播放器的房间，避免采到 no_video。"""
+    source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    body = source.split("const handleAlignLive = useCallback", 1)[1].split(
+        "const continuousAlignmentTargetKey", 1
+    )[0]
+    assert "missingPreview" in body
+    assert "未开预览" in body
+    assert "seekAlignmentRoomsToLive" in body
 
 def test_video_preview_ignores_internal_capture_mute_overrides() -> None:
     source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
     volumechange_body = source.split("const handleVolumeChange = () => {", 1)[1].split("video.addEventListener", 1)[0]
 
-    assert "__lscSuppressMuteSync" in volumechange_body
-    assert "return" in volumechange_body.split("__lscSuppressMuteSync", 1)[1].split("if (video.muted", 1)[0]
-
+    assert "isMuteSyncSuppressed" in volumechange_body
+    assert "return" in volumechange_body.split("isMuteSyncSuppressed", 1)[1].split("if (video.muted", 1)[0]
 
 def test_preview_audio_capture_restores_mute_override_on_setup_failure() -> None:
     source = (ROOT / "lsc-electron/src/utils/previewAudioAligner.ts").read_text(encoding="utf-8")
@@ -207,6 +243,37 @@ def test_mse_player_go_live_empty_buffer_waits_for_next_segment() -> None:
     assert "buffer empty" in go_live_body
     assert "this._liveEdgeAligned = false" in go_live_body
     assert "this._tryPlay(0)" in go_live_body
+
+
+def test_mse_player_stall_recovery_force_seeks_when_play_exhausted() -> None:
+    """media clock 冻结（play() 耗尽重试）时必须强制 seek 到直播沿，而非无限 re-trigger play()。
+
+    现场：对齐后某房间 currentTime 冻结，stall recovery 陷入 play() timeout 无限循环，
+    buffer 持续增长又不断重置恢复计数，画面永久卡住。
+    """
+    source = (ROOT / "lsc-electron/src/services/mediaSourcePlayer.ts").read_text(encoding="utf-8")
+    stall_body = source.split("private _startStallDetection(): void {", 1)[1]
+
+    assert "this._playExhausted" in stall_body
+    assert "ct < bufStart || ct > bufEnd - 0.3 || this._playExhausted" in stall_body
+    assert "force seek" in stall_body
+    # 强制 seek 独立限流：不被 buffer 增长重置，防止"buffer 持续增长掩盖冻结"的无限循环
+    assert "_forcedSeekRecoveryCount++" in stall_body
+    assert "_forcedSeekRecoveryCount > this._stallRecoveryLimit" in stall_body
+    # currentTime 真实前进时重置强制 seek 计数
+    assert "_forcedSeekRecoveryCount = 0" in stall_body
+
+
+def test_mse_player_marks_play_exhausted_after_retries() -> None:
+    source = (ROOT / "lsc-electron/src/services/mediaSourcePlayer.ts").read_text(encoding="utf-8")
+    try_play_body = source.split("private _tryPlay(retry: number): void {", 1)[1].split(
+        "private _handleError", 1
+    )[0]
+
+    # 重试耗尽须置位冻结标志（timeout 与 reject 两条路径）；play() 成功须清除
+    assert "this._playExhausted = true" in try_play_body
+    assert "this._playExhausted = false" in try_play_body
+    assert "play() timeout, max retries reached" in try_play_body
 
 
 def test_shared_preview_keeps_mse_event_names() -> None:

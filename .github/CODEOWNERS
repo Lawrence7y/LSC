@@ -1,0 +1,12 @@
+# Core code paths — changes require careful review
+# These paths are mechanically guarded by CI core-guard workflow.
+
+# Python core engine
+/lsc/core/          @project-core
+/lsc/analyzer/      @project-core
+
+# Python backend handlers
+/python-backend/handlers/   @project-core
+
+# Electron main process
+/lsc-electron/electron/     @project-core

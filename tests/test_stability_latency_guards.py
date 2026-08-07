@@ -148,3 +148,17 @@ def test_should_skip_kick_behavior_unit():
     assert _should_skip(state, scan, full_rescan=False, use_ocr=True, finalize=False) is False
     state["last_scan_error"] = None
     assert _should_skip(state, scan, full_rescan=False, use_ocr=True, finalize=False) is True
+
+
+def test_server_websocket_max_size_accommodates_align_payload() -> None:
+    """对齐 payload 单房 ≈683KB（8s@16kHz float32 base64），多房累计可达数 MB。
+
+    legacy websockets 对超 max_size 的消息以 1009 (message too big) 关闭连接，
+    无 close_on_message_too_big 开关。默认 1MB 上限会导致 align_preview_audio
+    整帧被拒收 + 前端 WS 重连重建预览（对齐超时 + 预览卡死）。"""
+    server = (ROOT / "python-backend" / "server.py").read_text(encoding="utf-8")
+    serve_body = server.split("websockets.serve(", 1)[1].split(") as srv", 1)[0]
+
+    assert "max_size=16 * 1024 * 1024" in serve_body
+    # legacy websockets 无 close_on_message_too_big 参数，误加会在运行时抛 TypeError
+    assert "close_on_message_too_big" not in serve_body

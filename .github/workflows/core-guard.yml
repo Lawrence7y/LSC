@@ -1,0 +1,96 @@
+name: Core Path Guard
+
+on:
+  pull_request:
+    paths:
+      - "lsc/core/**"
+      - "lsc/analyzer/**"
+      - "python-backend/handlers/**"
+      - "lsc-electron/electron/**"
+  push:
+    branches: [main, master]
+    paths:
+      - "lsc/core/**"
+      - "lsc/analyzer/**"
+      - "python-backend/handlers/**"
+      - "lsc-electron/electron/**"
+
+jobs:
+  core-change-detect:
+    name: Detect Core Path Changes
+    runs-on: ubuntu-latest
+    outputs:
+      core_python_changed: ${{ steps.filter.outputs.core_python }}
+      core_electron_changed: ${{ steps.filter.outputs.core_electron }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Classify changed core paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core_python:
+              - 'lsc/core/**'
+              - 'lsc/analyzer/**'
+              - 'python-backend/handlers/**'
+            core_electron:
+              - 'lsc-electron/electron/**'
+
+      - name: Report core path changes
+        run: |
+          echo "::notice::Core path change detected — enhanced review required."
+          echo "  Python core changed: ${{ steps.filter.outputs.core_python }}"
+          echo "  Electron core changed: ${{ steps.filter.outputs.core_electron }}"
+
+  lint-core-python:
+    name: Ruff Lint Core Python
+    needs: core-change-detect
+    if: needs.core-change-detect.outputs.core_python_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install "ruff>=0.5"
+
+      - name: Ruff check — lsc/core
+        run: ruff check lsc/core/
+
+      - name: Ruff check — lsc/analyzer
+        run: ruff check lsc/analyzer/
+
+      - name: Ruff check — python-backend/handlers
+        run: ruff check python-backend/handlers/
+
+      - name: Ruff format check — core paths
+        run: ruff format --check lsc/core/ lsc/analyzer/ python-backend/handlers/
+
+  lint-core-electron:
+    name: TypeScript Check Core Electron
+    needs: core-change-detect
+    if: needs.core-change-detect.outputs.core_electron_changed == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lsc-electron
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: lsc-electron/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript check electron/
+        run: npx tsc --noEmit --project tsconfig.electron.json

@@ -715,6 +715,64 @@ def test_vision_confirmed_is_exportable_gate() -> None:
     assert room_handler._is_listable_ocr_round(rd) is True
 
 
+def test_long_round_duration_anomaly_demotes_to_pending() -> None:
+    """过长回合须降级 pending，仍可入列不可自动导出（阈值 150s，覆盖买枪+交战+结算）。"""
+    assert room_handler._VALORANT_MAX_ROUND_DURATION_SEC == 150.0
+    # 93s（现场常见）不触发
+    ok = {
+        "start": 205.0, "end": 298.0, "phase": "combat",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_prep",
+        "confirm_status": "vision_confirmed",
+    }
+    assert room_handler._is_listable_ocr_round(ok) is True
+    assert ok.get("confirm_status") == "vision_confirmed"
+    assert not ok.get("duration_anomaly")
+    assert room_handler._is_auto_exportable_valorant_round(ok) is True
+
+    # 151s：触发守卫
+    long_rd = {
+        "start": 29.6, "end": 180.6, "phase": "combat",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_prep",
+        "confirm_status": "vision_confirmed",
+        "round_key": "round-000003",
+    }
+    assert room_handler._is_listable_ocr_round(long_rd) is True
+    assert long_rd.get("duration_anomaly") is True
+    assert long_rd.get("confirm_status") == "pending"
+    assert room_handler._is_auto_exportable_valorant_round(long_rd) is False
+
+
+def test_next_combat_end_by_listable_not_exportable() -> None:
+    """SETTLE 降级出点 next_combat：可入列待调，不可自动导出。"""
+    assert "next_combat" in room_handler._OCR_VALID_END_BY
+    rd = {
+        "start": 100.0, "end": 180.0, "phase": "combat",
+        "boundary_source": "valorant_ocr_v1",
+        "start_by": "ocr_combat",
+        "end_by": "next_combat",
+        "confirm_status": "pending",
+    }
+    assert room_handler._is_listable_ocr_round(rd) is True
+    assert room_handler._is_auto_exportable_valorant_round(rd) is False
+
+
+def test_clamp_post_stop_duration_caps_inflated_probe() -> None:
+    """停录后 probe 虚高须钳到最后录制墙钟（现场 1787→2226）。"""
+    assert room_handler._clamp_post_stop_duration(2225.8, 1786.9) == 1786.9
+    assert room_handler._clamp_post_stop_duration(1800.0, 1786.9) == 1800.0  # 容差内
+    assert room_handler._clamp_post_stop_duration(100.0, 0.0) == 100.0
+    assert "停录后时长虚高已钳制" in (
+        (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    )
+    assert "_last_recording_wallclock" in (
+        (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    )
+
+
 def test_hybrid_pending_listable_not_exportable() -> None:
     rd = {
         "start": 10.0, "end": 55.0, "phase": "combat",
@@ -995,7 +1053,8 @@ def test_loop_wallclock_calibrates_probed_duration() -> None:
     """持续分析循环必须用墙钟校准录制中时长（双向）。
 
     虚高 dur 导致抽帧 seek 超界；虚低 dur（估算被拒绝回退旧缓存）导致
-    分析窗口 end 被限制、滞后持续增长。录制中一律以墙钟 - 30s 缓冲为准。
+    分析窗口 end 被限制、滞后持续增长。录制中以墙钟 - 写缓冲为准
+    （15s：兼顾早启动与 frag MP4 可读尖端，避免旧 30s 地板空等）。
     """
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
@@ -1003,10 +1062,47 @@ def test_loop_wallclock_calibrates_probed_duration() -> None:
     )[0]
     assert "wallclock_dur" in loop
     assert "recorded_duration = wallclock_dur" in loop
-    assert "buffered_wall = max(0.0, wallclock_dur - 30.0)" in loop
+    assert "_RECORDING_WRITE_BUFFER_SEC" in src
+    assert room_handler._RECORDING_WRITE_BUFFER_SEC == 15.0
+    assert "buffered_wall = max(0.0, wallclock_dur - _RECORDING_WRITE_BUFFER_SEC)" in loop
     assert "current_dur = buffered_wall" in loop
     assert "abs(current_dur - buffered_wall) > 15.0" in loop
 
+
+def test_continuous_kick_threshold_and_skips_empty_scan() -> None:
+    """Valorant 增量 kick 门槛 8s；current_dur≤3 不得 kick（禁 0-0 空扫）。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _continuous_valorant_worker", 1
+    )[0]
+    assert room_handler._VALORANT_KICK_AHEAD_SEC == 8.0
+    assert "kick_dur > last_analyzed + _VALORANT_KICK_AHEAD_SEC" in loop
+    assert "current_dur <= 3.0" in loop
+    assert "should_kick = False" in loop
+
+
+def test_continuous_defers_boundary_refine_after_coarse_list() -> None:
+    """增量扫：粗结果先入列；密扫 create_task 后台跑，可被粗扫 refine_abort 抢占。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    worker = src.split("async def _continuous_valorant_worker", 1)[1].split(
+        "async def _continuous_analysis_loop", 1
+    )[0]
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _export_and_broadcast", 1
+    )[0]
+    plugin = (ROOT / "lsc/analyzer/valorant_plugin.py").read_text(encoding="utf-8")
+    assert "refine_boundaries=_finalize" in plugin
+    assert "refine_valorant_round_boundaries" in worker
+    assert "boundary_refine_pass" in worker
+    assert "asyncio.create_task" in worker
+    assert "_boundary_refine_bg" in worker
+    assert "refine_abort" in worker
+    assert "_refine_cancel_check" in worker
+    assert "跳过密扫（优先追赶）" in worker
+    assert "_boundary_refine_pass" in loop
+    assert "or _boundary_refine_pass" in loop
+    assert room_handler._QUALITY_FIRST_NORMAL_PRESSURE["ocr_sample_interval"] == 1.0
+    assert room_handler._VALORANT_MAX_ROUND_DURATION_SEC == 150.0
 
 def test_scan_error_backoff_guards_kick() -> None:
     """worker 失败后必须退避重试，防止失败-立即重 kick 风暴。"""
