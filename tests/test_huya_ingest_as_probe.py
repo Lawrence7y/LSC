@@ -304,6 +304,13 @@ def _room_handler():
     return room_handler
 
 
+def test_preview_encoder_failure_does_not_refresh_stream():
+    _should_refresh_failed_stream = _room_handler()._should_refresh_failed_stream
+    assert _should_refresh_failed_stream("preview encoder failed") is False
+    assert _should_refresh_failed_stream("shared preview stdout stalled (15s)") is False
+    assert _should_refresh_failed_stream("Server returned 403 Forbidden") is True
+
+
 def test_reconnect_budget_does_not_reset_on_accepted_or_media_ready():
     _reconnect_attempts_after_event = _room_handler()._reconnect_attempts_after_event
     now = 100.0

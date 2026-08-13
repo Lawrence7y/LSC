@@ -75,7 +75,12 @@ _MAX_ROOM_URLS_PER_ADD = 12
 
 def _should_refresh_failed_stream(error: object) -> bool:
     """Use typed media failures for candidate quarantine/URL refresh."""
-    kind = classify_failure(str(error or ""))
+    text = str(error or "")
+    if "preview stdout stalled" in text.lower():
+        return False
+    kind = classify_failure(text)
+    if kind is FailureKind.PREVIEW_ENCODER_FAILURE:
+        return False
     return kind in {
         FailureKind.CDN_FORBIDDEN,
         FailureKind.SIGNATURE_EXPIRED,
@@ -3097,8 +3102,7 @@ def register_room_handlers(server, bridge):
                 _mse_reconnect_state.pop(room_id, None)
                 return
 
-            # 强制刷新流地址，避免复用已 404 的 CDN 死链
-            # 403/签名错误由平台策略统一决定是否隔离候选线路。
+            # 403/签名错误才强制刷新；预览编码器/stdout 卡住只重启 sink。
             if _should_refresh_failed_stream(current_error):
                 try:
                     def _mark_failed_candidate():
@@ -3111,14 +3115,16 @@ def register_room_handlers(server, bridge):
                     )
                 except Exception as exc:
                     _log.debug("Shared MSE reconnect candidate policy failed: %s", exc)
-            try:
-                refresh_ok = await loop.run_in_executor(
-                    _recording_executor,
-                    lambda: manager.refresh_stream_url(room_id, force=True),
-                )
-            except Exception as exc:
-                _log.error("Shared MSE reconnect URL refresh failed: %s", exc)
-                refresh_ok = False
+                try:
+                    refresh_ok = await loop.run_in_executor(
+                        _recording_executor,
+                        lambda: manager.refresh_stream_url(room_id, force=True),
+                    )
+                except Exception as exc:
+                    _log.error("Shared MSE reconnect URL refresh failed: %s", exc)
+                    refresh_ok = False
+            else:
+                refresh_ok = True
 
             if not refresh_ok:
                 try:

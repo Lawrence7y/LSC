@@ -727,6 +727,51 @@ class IngestSupervisor:
         finally:
             self._recovery_lock.release()
 
+    def restart_preview_sink(self, reason: str = "preview encoder failure") -> bool:
+        """Restart only the preview encoder; do not open a new signed upstream."""
+        if self._stop_requested.is_set():
+            return False
+        with self._lock:
+            if self._state in {IngestState.STOPPING, IngestState.STOPPED}:
+                return False
+            self._preview_requested = True
+        stop = getattr(self.ingest, "stop_preview_sink", None)
+        if callable(stop):
+            try:
+                stop(reason)
+            except Exception as exc:
+                _log.debug(
+                    "preview sink stop before restart failed room=%s: %s",
+                    self.room_id,
+                    exc,
+                )
+        start_preview = getattr(self.ingest, "start_preview", None)
+        if not callable(start_preview):
+            return False
+        try:
+            result = start_preview()
+        except Exception as exc:
+            self.handle_failure("PREVIEW_ENCODER_FAILURE", error=redact_text(exc))
+            return False
+        ok = bool(
+            result is None
+            or getattr(result, "accepted", False)
+            or getattr(result, "ok", False)
+        )
+        if ok:
+            running = (
+                getattr(self.ingest, "process_id", None) is not None
+                or self._recording_requested
+            )
+            self._transition(
+                IngestState.RUNNING if running else IngestState.CONNECTING,
+                reason_code="PREVIEW_SINK_RESTARTED",
+            )
+            return True
+        error = redact_text(getattr(result, "error", "") or "preview restart failed")
+        self.handle_failure("PREVIEW_ENCODER_FAILURE", error=error)
+        return False
+
     def handle_failure(
         self,
         failure_kind: str,

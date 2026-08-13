@@ -3670,6 +3670,7 @@ class RoomOrchestrator:
         if supervisor is None or getattr(room, "_reconnect_in_progress", False):
             return False
         from lsc.platforms.failure import classify_failure
+        from lsc.platforms.recovery_policy import recovery_action
 
         room._cancel_reconnect.clear()
         room._reconnect_in_progress = True
@@ -3681,6 +3682,11 @@ class RoomOrchestrator:
             return bool(room.is_recording and not room.is_reconnecting)
 
         try:
+            action = recovery_action(getattr(room, "stream_info", None), error_msg)
+            if action == "restart_preview_sink":
+                restart = getattr(supervisor, "restart_preview_sink", None)
+                if callable(restart):
+                    return bool(restart())
             return bool(
                 supervisor.run_recovery(
                     recover,
