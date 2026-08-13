@@ -68,3 +68,21 @@ def test_shared_ingest_v2_gate_rejects_huya_even_when_global_shared_on(monkeypat
     )
     manager = SimpleNamespace(get_room=lambda _rid: room)
     assert _shared_ingest_v2_enabled(manager, "room-1") is False
+
+
+def test_huya_preview_auto_reconnect_is_disabled():
+    import os
+    import sys
+
+    from lsc.platforms.base import StreamInfo
+
+    backend_dir = os.path.join(os.path.dirname(__file__), "..", "python-backend")
+    if backend_dir not in sys.path:
+        sys.path.insert(0, backend_dir)
+
+    from handlers.room_handler import _preview_auto_reconnect_allowed
+
+    info = StreamInfo(platform="huya", room_url="https://www.huya.com/1")
+    assert _preview_auto_reconnect_allowed(info) is False
+    assert _preview_auto_reconnect_allowed("huya") is False
+    assert _preview_auto_reconnect_allowed("bilibili") is True

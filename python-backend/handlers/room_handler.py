@@ -84,6 +84,17 @@ def _should_refresh_failed_stream(error: object) -> bool:
     }
 
 
+def _preview_auto_reconnect_allowed(stream_info_or_platform: object) -> bool:
+    """Whether preview errors may enter the automatic MSE reconnect loop."""
+    if isinstance(stream_info_or_platform, str):
+        platform = stream_info_or_platform
+    else:
+        platform = str(getattr(stream_info_or_platform, "platform", "") or "")
+    from lsc.platforms.capabilities import get_platform_capabilities
+
+    return bool(get_platform_capabilities(platform).preview_auto_reconnect)
+
+
 async def queue_export(
     room_id,
     start_sec,
@@ -2901,6 +2912,31 @@ def register_room_handlers(server, bridge):
                 'data': {'rooms': _rooms_list(manager)},
             })
 
+        def _peek_reconnect_platform():
+            room = manager.get_room(room_id)
+            if room is None:
+                return ""
+            return str(
+                getattr(room, "platform", "")
+                or getattr(getattr(room, "stream_info", None), "platform", "")
+                or ""
+            )
+
+        try:
+            reconnect_platform = await loop.run_in_executor(
+                _bridge_executor, lambda: bridge.manager.call(_peek_reconnect_platform)
+            )
+        except Exception:
+            reconnect_platform = ""
+        if not _preview_auto_reconnect_allowed(reconnect_platform):
+            _mse_reconnect_state.pop(room_id, None)
+            await _finalize(
+                current_error or "预览失败",
+                mse_failure_reason,
+                f"mse_no_auto_reconnect:{room_id}",
+            )
+            return
+
         while True:
             def _check_preview():
                 room = manager.get_room(room_id)
@@ -5160,8 +5196,8 @@ def register_room_handlers(server, bridge):
                 # 先在后台线程刷新流 URL，避免阻塞编排线程（B站等平台耗时 10+ 秒）
                 # force=False：连接后 120s 内复用房间流缓存，显著加快预览启动
                 await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'refreshing_url'})
-                # 虎牙签名 URL 有并发连接限制：若房间正在录制，预览强制刷新获取
-                # 独立签名，避免与录制复用同一 wsSecret 导致其中一路被 CDN 403。
+                # 单连接签名平台预览挂同一条上游，禁止为“独立签名”强刷页面。
+                # 能力字段 preview_refresh_when_recording 为 False 时保持 force=False。
                 force_refresh = False
                 def _peek_room_state():
                     r = mgr.get_room(room_id)
@@ -5358,6 +5394,31 @@ def register_room_handlers(server, bridge):
                             'type': 'rooms_updated',
                             'data': {'rooms': _rooms_list(mgr)},
                         })
+
+                    def _peek_reconnect_platform():
+                        room = mgr.get_room(room_id)
+                        if room is None:
+                            return ""
+                        return str(
+                            getattr(room, "platform", "")
+                            or getattr(getattr(room, "stream_info", None), "platform", "")
+                            or ""
+                        )
+
+                    try:
+                        reconnect_platform = await loop.run_in_executor(
+                            _bridge_executor, lambda: bridge.manager.call(_peek_reconnect_platform)
+                        )
+                    except Exception:
+                        reconnect_platform = ""
+                    if not _preview_auto_reconnect_allowed(reconnect_platform):
+                        _mse_reconnect_state.pop(room_id, None)
+                        await _finalize_mse_error(
+                            current_error or "预览失败",
+                            mse_failure_reason,
+                            f"mse_no_auto_reconnect:{room_id}",
+                        )
+                        return
 
                     while True:
                         # 2. 检查是否仍需预览（用户可能已手动关闭）

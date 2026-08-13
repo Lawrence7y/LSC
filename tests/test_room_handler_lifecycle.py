@@ -294,6 +294,33 @@ def test_shutdown_room_handlers_cancels_tasks_streamers_and_executors(monkeypatc
     assert second["mse_streamers_stopped"] == 0
 
 
+def test_stop_idle_shared_ingest_skips_when_recording_starting(monkeypatch) -> None:
+    from lsc.core.services.ingest_registry import SharedIngestRegistry
+
+    registry = SharedIngestRegistry()
+    ingest = registry.get_or_create("room-1", url="http://example/live.flv", headers={})
+    monkeypatch.setattr(room_handler, "_shared_ingests", registry)
+    monkeypatch.setattr(room_handler, "_recording_starting", {"room-1"})
+
+    assert room_handler._stop_idle_shared_ingest("room-1", "shared mse error cleanup") is False
+    assert registry.get("room-1") is ingest
+    assert ingest.is_stopped is False
+
+
+def test_stop_idle_shared_ingest_skips_when_recording_process_exists(monkeypatch) -> None:
+    from lsc.core.services.ingest_registry import SharedIngestRegistry
+
+    registry = SharedIngestRegistry()
+    ingest = registry.get_or_create("room-1", url="http://example/live.flv", headers={})
+    ingest.recording_active = False
+    ingest._recording_process = object()
+    monkeypatch.setattr(room_handler, "_shared_ingests", registry)
+    monkeypatch.setattr(room_handler, "_recording_starting", set())
+
+    assert room_handler._stop_idle_shared_ingest("room-1", "shared mse error cleanup") is False
+    assert registry.get("room-1") is ingest
+
+
 def test_shutdown_room_handlers_stops_shared_ingests(monkeypatch) -> None:
     from lsc.core.services.ingest_registry import SharedIngestRegistry
 
@@ -414,6 +441,143 @@ def test_mse_preview_attaches_existing_shared_ingest_when_enabled(monkeypatch) -
         event == "mse_error" and payload.get("room_id") == "room-1"
         for event, payload in server.broadcasts
     )
+
+
+def test_supervisor_preview_handle_is_registered_for_mse_init(monkeypatch) -> None:
+    """ingest_supervisor_v2 attach must still register the MSE init handle."""
+    room = SimpleNamespace(
+        room_id="room-1",
+        streamer_name="Streamer",
+        platform="bilibili",
+        platform_name="B站",
+        room_url="https://live.bilibili.com/1",
+        stream_title="Title",
+        is_connecting=False,
+        is_connected=True,
+        is_recording=True,
+        is_reconnecting=False,
+        is_muted=False,
+        record_output_path="",
+        record_started_at=None,
+        record_size_mb=0.0,
+        last_error="",
+        preview_enabled=False,
+        preview_paused=False,
+        preview_muted=False,
+        mark_in=None,
+        mark_out=None,
+        mark_in_wallclock=None,
+        mark_out_wallclock=None,
+        recording_start_mono=0.0,
+        recording_media_start_mono=0.0,
+        preview_latency=0.0,
+        content_offset=0.0,
+        align_group_id="",
+        category="",
+        network_context={},
+        stream_info=SimpleNamespace(
+            stream_url="https://example.test/live.flv",
+            headers={},
+            quality_urls={},
+        ),
+    )
+    manager = _FakeManager([room])
+    server = _FakeServer()
+    bridge = _FakeBridge(manager)
+    ingest = SharedRoomIngest("room-1", "https://example.test/live.flv")
+    ingest.recording_active = True
+    ingest.is_stopped = False
+    ingest.publish_preview_segment(b"init-data", kind="init")
+
+    class _FakeSupervisor:
+        def __init__(self) -> None:
+            self.ingest = ingest
+            self.recording_requested = True
+
+        def attach_preview(self, **kwargs):
+            return SharedPreviewHandle(self.ingest, auto_start=True, **kwargs)
+
+        def health(self):
+            return {"last_error": ""}
+
+        def switch_upstream(self, *_args, **_kwargs):
+            return True
+
+    supervisor = _FakeSupervisor()
+
+    class _FakeSharedRegistry:
+        def get(self, room_id):
+            return ingest if room_id == "room-1" else None
+
+        def get_supervisor(self, *_args, **_kwargs):
+            return supervisor
+
+        def stop_room(self, room_id, reason: str = "") -> None:
+            return None
+
+    monkeypatch.setattr(room_handler, "_mse_streamers", {})
+    monkeypatch.setattr(room_handler, "_shared_ingests", _FakeSharedRegistry())
+    monkeypatch.setattr(
+        room_handler,
+        "load_config",
+        lambda: SimpleNamespace(shared_ingest_enabled=True),
+    )
+    monkeypatch.setattr(
+        room_handler,
+        "is_platform_pipeline_component_enabled",
+        lambda *_args, **_kwargs: True,
+    )
+
+    async def scenario():
+        room_handler.register_room_handlers(server, bridge)
+        result = await server.handlers["enable_preview"]({
+            "room_id": "room-1",
+            "enabled": True,
+            "mode": "mse",
+        })
+        init_result = await server.handlers["request_mse_init"]({"room_id": "room-1"})
+        return result, init_result, room_handler._preview_stream_registry().get("room-1")
+
+    result, init_result, handle = asyncio.run(scenario())
+
+    assert result["success"] is True
+    assert handle is not None
+    assert init_result.get("error") != "MSE 流未启动"
+
+
+def test_should_refresh_failed_stream_includes_huya_eof() -> None:
+    assert room_handler._should_refresh_failed_stream(
+        "shared ingest upstream ffmpeg exited: code=0 | stderr: "
+        "error=End of file. | Error during demuxing: I/O error"
+    ) is True
+
+
+def test_mse_preview_force_restart_refreshes_dead_lease() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    snippet = source.split("async def _handle_mse_preview", 1)[1]
+    preview_only = snippet.split("shared ingest preview-only started", 1)[0]
+    assert "refresh_stream_url(room_id, force=False)" not in preview_only
+    assert "force=force_restart" in preview_only or "force=bool(force_restart)" in preview_only
+
+
+def test_shared_mse_reconnect_tolerates_none_preview_result() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    snippet = source.split("Shared MSE reconnect start failed", 1)[1][:900]
+    assert "isinstance(result, dict)" in snippet or "result or {" in snippet
+
+def test_stop_idle_shared_ingest_skips_when_supervisor_wants_recording(monkeypatch) -> None:
+    from lsc.core.services.ingest_registry import SharedIngestRegistry
+
+    registry = SharedIngestRegistry()
+    ingest = registry.get_or_create("room-1", url="http://example/live.flv", headers={})
+    ingest.recording_active = False
+    supervisor = registry.get_supervisor("room-1", url="http://example/live.flv")
+    supervisor._recording_requested = True
+    monkeypatch.setattr(room_handler, "_shared_ingests", registry)
+    monkeypatch.setattr(room_handler, "_recording_starting", set())
+
+    assert room_handler._stop_idle_shared_ingest("room-1", "shared mse error cleanup") is False
+    assert registry.get("room-1") is ingest
 
 
 def test_ingest_diagnostics_reports_shared_registry_counts(monkeypatch) -> None:
