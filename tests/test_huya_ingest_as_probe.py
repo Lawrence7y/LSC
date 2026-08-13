@@ -290,3 +290,47 @@ def test_start_preview_live_process_is_not_media_ready_until_segments(monkeypatc
     assert ready.accepted is True
     assert ready.media_ready is True
     assert ready.ok is True
+
+
+def _room_handler():
+    import os
+    import sys
+
+    backend_dir = os.path.join(os.path.dirname(__file__), "..", "python-backend")
+    if backend_dir not in sys.path:
+        sys.path.insert(0, backend_dir)
+    from handlers import room_handler
+
+    return room_handler
+
+
+def test_reconnect_budget_does_not_reset_on_accepted_or_media_ready():
+    _reconnect_attempts_after_event = _room_handler()._reconnect_attempts_after_event
+    now = 100.0
+    state = {"attempts": 1, "running": True}
+    state = _reconnect_attempts_after_event(state, event="accepted", now=now)
+    state = _reconnect_attempts_after_event(state, event="media_ready", now=now)
+    assert state["attempts"] == 1
+    state = _reconnect_attempts_after_event(state, event="exit", now=now + 3)
+    assert state["attempts"] == 2
+
+
+def test_reconnect_budget_resets_only_after_durable_window():
+    _reconnect_attempts_after_event = _room_handler()._reconnect_attempts_after_event
+    state = {"attempts": 2, "running": True, "media_ready_at": 100.0}
+    state = _reconnect_attempts_after_event(
+        state, event="durable", now=130.0, durable_sec=30.0,
+    )
+    assert state["attempts"] == 0
+
+
+def test_begin_mse_reconnect_preserves_attempts_until_durable():
+    _begin_mse_reconnect = _room_handler()._begin_mse_reconnect
+    prev = {"attempts": 2, "running": False, "media_ready_at": 10.0}
+    state = _begin_mse_reconnect(prev)
+    assert state["attempts"] == 2
+    assert state["running"] is True
+    durable = {"attempts": 0, "durable": True}
+    fresh = _begin_mse_reconnect(durable)
+    assert fresh["attempts"] == 0
+    assert fresh["running"] is True

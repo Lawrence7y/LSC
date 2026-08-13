@@ -707,6 +707,90 @@ _mse_reconnect_state: dict[str, dict[str, Any]] = {}
 _MSE_MAX_RECONNECT = 3
 _MSE_RECONNECT_BASE_DELAY = 2.0
 _MSE_RECONNECT_MAX_DELAY = 30.0
+DURABLE_SUCCESS_SEC = 30.0
+
+
+def _reconnect_attempts_after_event(
+    state: dict | None,
+    *,
+    event: str,
+    durable_sec: float = DURABLE_SUCCESS_SEC,
+    now: float,
+) -> dict:
+    """Update MSE reconnect budget. event: accepted | media_ready | durable | exit | user_stop."""
+    next_state = dict(state or {})
+    next_state.setdefault("attempts", 0)
+    if event in {"accepted", "media_ready"}:
+        if event == "media_ready":
+            next_state["media_ready_at"] = now
+        next_state.pop("durable", None)
+        return next_state
+    if event == "durable":
+        ready_at = float(next_state.get("media_ready_at") or 0.0)
+        if ready_at and (now - ready_at) >= durable_sec:
+            next_state["attempts"] = 0
+            next_state["durable"] = True
+        return next_state
+    if event == "exit":
+        if not next_state.get("durable"):
+            next_state["attempts"] = int(next_state.get("attempts") or 0) + 1
+        return next_state
+    if event == "user_stop":
+        return {}
+    return next_state
+
+
+def _begin_mse_reconnect(prev_state: dict | None) -> dict:
+    """Keep the retry budget unless the previous session already went durable."""
+    if prev_state and not prev_state.get("durable"):
+        next_state = dict(prev_state)
+        next_state["running"] = True
+        return next_state
+    return {"attempts": 0, "running": True}
+
+
+def _note_mse_reconnect_event(room_id: str, event: str, *, now: float | None = None) -> dict:
+    stamp = time.monotonic() if now is None else now
+    state = _reconnect_attempts_after_event(
+        _mse_reconnect_state.get(room_id),
+        event=event,
+        now=stamp,
+    )
+    if event in {"accepted", "media_ready"}:
+        state["running"] = False
+    if event == "user_stop" or not state:
+        _mse_reconnect_state.pop(room_id, None)
+        return {}
+    _mse_reconnect_state[room_id] = state
+    return state
+
+
+async def _watch_mse_reconnect_durable(
+    room_id: str,
+    *,
+    ready_at: float,
+    broadcast,
+    durable_sec: float = DURABLE_SUCCESS_SEC,
+) -> None:
+    await asyncio.sleep(max(0.0, float(durable_sec)))
+    state = _mse_reconnect_state.get(room_id) or {}
+    if state.get("running"):
+        return
+    if float(state.get("media_ready_at") or 0.0) != float(ready_at):
+        return
+    updated = _reconnect_attempts_after_event(
+        state,
+        event="durable",
+        now=time.monotonic(),
+        durable_sec=durable_sec,
+    )
+    if not updated.get("durable"):
+        return
+    _mse_reconnect_state.pop(room_id, None)
+    try:
+        await broadcast()
+    except Exception as exc:
+        _log.debug("mse durable reconnect broadcast failed room=%s: %s", room_id, exc)
 
 
 def _is_stream_info_offline(info) -> bool:
@@ -2872,7 +2956,7 @@ def register_room_handlers(server, bridge):
                 "ignoring duplicate error: %s", room_id, err,
             )
             return
-        _mse_reconnect_state[room_id] = {'attempts': 0, 'running': True}
+        _mse_reconnect_state[room_id] = _begin_mse_reconnect(prev_state)
 
         old_handle = _preview_stream_registry().pop(room_id)
         if old_handle is not None:
@@ -3056,9 +3140,9 @@ def register_room_handlers(server, bridge):
             if not isinstance(result, dict):
                 result = {'success': False, 'error': '预览重连失败'}
             if result.get('success'):
-                _mse_reconnect_state.pop(room_id, None)
                 _mse_live_phase.discard(room_id)
                 _log.info("Shared MSE reconnect succeeded for room %s", room_id)
+                ready_state = _note_mse_reconnect_event(room_id, "media_ready")
 
                 def _rotate_shared_epoch_on_reconnect():
                     room = manager.get_room(room_id)
@@ -3076,7 +3160,13 @@ def register_room_handlers(server, bridge):
                 except Exception as exc:
                     _log.debug("Shared MSE reconnect epoch rotate failed: %s", exc)
 
-                await server.broadcast('mse_reconnected', {'room_id': room_id})
+                asyncio.create_task(
+                    _watch_mse_reconnect_durable(
+                        room_id,
+                        ready_at=float(ready_state.get("media_ready_at") or time.monotonic()),
+                        broadcast=lambda: server.broadcast('mse_reconnected', {'room_id': room_id}),
+                    )
+                )
                 _broadcast_rooms()
                 return
 
@@ -5044,7 +5134,7 @@ def register_room_handlers(server, bridge):
                         await asyncio.get_running_loop().run_in_executor(
                             _bridge_executor, lambda: bridge.manager.call(_set_shared_preview_on)
                         )
-                        _mse_reconnect_state.pop(room_id, None)
+                        _note_mse_reconnect_event(room_id, "accepted")
                         _broadcast_rooms()
                         return _mse_preview_success_response(
                             room_id, data, note='shared ingest preview attached',
@@ -5166,7 +5256,7 @@ def register_room_handlers(server, bridge):
                         await asyncio.get_running_loop().run_in_executor(
                             _bridge_executor, lambda: bridge.manager.call(_set_shared_preview_on)
                         )
-                        _mse_reconnect_state.pop(room_id, None)
+                        _note_mse_reconnect_event(room_id, "accepted")
                         _broadcast_rooms()
                         return _mse_preview_success_response(
                             room_id, data, note='shared ingest preview-only started',
@@ -5342,7 +5432,7 @@ def register_room_handlers(server, bridge):
                             "ignoring duplicate error: %s", room_id, err,
                         )
                         return
-                    _mse_reconnect_state[room_id] = {'attempts': 0, 'running': True}
+                    _mse_reconnect_state[room_id] = _begin_mse_reconnect(prev_state)
 
                     # 1. 从 _mse_streamers 移除并停止已失效的 streamer（仅首次执行）
                     old_streamer = _preview_stream_registry().pop(room_id)
@@ -5676,9 +5766,9 @@ def register_room_handlers(server, bridge):
                             success, error_detail = False, str(exc)
 
                         if success:
-                            _mse_reconnect_state.pop(room_id, None)
                             _mse_live_phase.discard(room_id)
                             _log.info("MSE reconnect succeeded for room %s", room_id)
+                            ready_state = _note_mse_reconnect_event(room_id, "media_ready")
 
                             def _rotate_epoch_on_reconnect():
                                 room = mgr.get_room(room_id)
@@ -5696,10 +5786,17 @@ def register_room_handlers(server, bridge):
                             except Exception as exc:
                                 _log.debug("MSE reconnect epoch rotate failed: %s", exc)
 
-                            await srv.broadcast('mse_reconnected', {
-                                'room_id': room_id,
-                                **_preview_quality_response_fields(preview_params),
-                            })
+                            quality_fields = _preview_quality_response_fields(preview_params)
+                            asyncio.create_task(
+                                _watch_mse_reconnect_durable(
+                                    room_id,
+                                    ready_at=float(ready_state.get("media_ready_at") or time.monotonic()),
+                                    broadcast=lambda: srv.broadcast(
+                                        'mse_reconnected',
+                                        {'room_id': room_id, **quality_fields},
+                                    ),
+                                )
+                            )
                             _broadcast_rooms()
                             return
                         else:
@@ -5827,7 +5924,7 @@ def register_room_handlers(server, bridge):
                         _stop_idle_shared_ingest(room_id, reason="preview state sync failed")
                     return {'success': False, 'room_id': room_id, 'error': f'预览状态同步失败：{exc}'}
 
-                _mse_reconnect_state.pop(room_id, None)
+                _note_mse_reconnect_event(room_id, "accepted")
                 # streaming phase 由首个 init 段到达时广播（_push_mse_segment），
                 # 此处仅重置 live 标志；启动期间 phase 保持 probing，避免
                 # 前端 watchdog 在流未连通时误触发重连
