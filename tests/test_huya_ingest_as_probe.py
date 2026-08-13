@@ -86,3 +86,35 @@ def test_huya_preview_auto_reconnect_is_disabled():
     assert _preview_auto_reconnect_allowed(info) is False
     assert _preview_auto_reconnect_allowed("huya") is False
     assert _preview_auto_reconnect_allowed("bilibili") is True
+
+
+def test_huya_tx_and_al_share_signature_family():
+    from lsc.platforms.signature_family import signature_family_id
+
+    secret = "abc123"
+    ws_time = "68f0aa00"
+    tx = f"https://tx.flv.huya.com/src/room.flv?wsSecret={secret}&wsTime={ws_time}&codec=264"
+    al = f"https://al.flv.huya.com/src/room.flv?wsSecret={secret}&wsTime={ws_time}&codec=264"
+    assert signature_family_id(tx) == signature_family_id(al)
+    assert signature_family_id(tx)
+    other = f"https://tx.flv.huya.com/src/room.flv?wsSecret=zzz&wsTime={ws_time}"
+    assert signature_family_id(tx) != signature_family_id(other)
+
+
+def test_candidate_from_url_sets_signature_family_id():
+    from lsc.platforms.resolver import _candidate_from_url
+    from lsc.platforms.signature_family import signature_family_id
+
+    url = "https://tx.flv.huya.com/src/room.flv?wsSecret=abc&wsTime=1"
+    candidate = _candidate_from_url(
+        platform="huya",
+        quality="source",
+        url=url,
+        headers={},
+        priority=0,
+        raw={},
+    )
+    assert candidate is not None
+    assert candidate.signature_family_id == signature_family_id(url)
+    assert candidate.signature_family_id
+    assert "abc" not in str(candidate.redacted())

@@ -128,6 +128,7 @@ class StreamCandidate:
     source_kind: str = "fallback"
     confidence: float = 0.0
     raw_metadata: Mapping[str, object] = field(default_factory=dict)
+    signature_family_id: str = ""
 
     def redacted(self) -> dict[str, object]:
         """Serializable view with the URL removed (logs/broadcast safe)."""
@@ -149,6 +150,7 @@ class StreamCandidate:
             "source_kind": self.source_kind,
             "confidence": self.confidence,
             "credential_ref": self.credential_ref,
+            "signature_family_id": self.signature_family_id,
         }
 
     @property
@@ -384,6 +386,7 @@ def stream_info_to_candidate(
 
     platform = str(getattr(info, "platform", "") or "unknown")
     quality_label = str(getattr(info, "selected_quality", "") or "")
+    from .signature_family import signature_family_id as _family_id
 
     return StreamCandidate(
         candidate_id=candidate_id or f"{platform}|{quality_label or 'legacy'}",
@@ -400,6 +403,7 @@ def stream_info_to_candidate(
             "streamer": str(getattr(info, "streamer", "") or ""),
             "raw": dict(getattr(info, "raw", {}) or {}),
         },
+        signature_family_id=_family_id(stream_url),
     )
 
 
