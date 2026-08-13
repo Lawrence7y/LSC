@@ -85,6 +85,7 @@ def test_huya_connect_timeout_quarantines_cdn():
         info,
         "Connection to tcp://tx.flv.huya.com:443 failed: Error number -138 occurred",
         room_id="https://www.huya.com/1",
+        saw_first_ts=True,
     ) is True
     assert _is_cdn_blacklisted("tx", room_key="https://www.huya.com/1")
     clear_cdn_blacklist()

@@ -118,3 +118,53 @@ def test_candidate_from_url_sets_signature_family_id():
     assert candidate.signature_family_id == signature_family_id(url)
     assert candidate.signature_family_id
     assert "abc" not in str(candidate.redacted())
+
+
+def test_huya_403_invalidates_family_and_does_not_quarantine_cdn():
+    from lsc.platforms.base import StreamInfo
+    from lsc.platforms.huya import _is_cdn_blacklisted, clear_cdn_blacklist
+    from lsc.platforms.recovery_policy import mark_failed_candidate, recovery_action
+
+    clear_cdn_blacklist()
+    info = StreamInfo(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        stream_url="https://tx.flv.huya.com/src/live.flv?wsSecret=abc&wsTime=1",
+        raw={"v2": True, "candidate_id": "huya|source|0", "candidate_cdn_id": "tx"},
+    )
+    action = recovery_action(info, "Server returned 403 Forbidden", saw_first_ts=False)
+    assert action == "invalidate_family"
+    assert mark_failed_candidate(info, "Server returned 403 Forbidden") is False
+    assert not _is_cdn_blacklisted("tx", room_key="https://www.huya.com/1")
+    clear_cdn_blacklist()
+
+
+def test_huya_connect_timeout_after_media_quarantines_cdn():
+    from lsc.platforms.base import StreamInfo
+    from lsc.platforms.huya import _is_cdn_blacklisted, clear_cdn_blacklist
+    from lsc.platforms.recovery_policy import mark_failed_candidate, recovery_action
+
+    clear_cdn_blacklist()
+    info = StreamInfo(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        stream_url="https://tx.flv.huya.com/src/live.flv?wsSecret=abc&wsTime=1",
+    )
+    error = "Connection to tcp://tx.flv.huya.com:443 failed: Error number -138 occurred"
+    assert recovery_action(info, error, saw_first_ts=True) == "quarantine_cdn"
+    assert mark_failed_candidate(info, error, room_id="https://www.huya.com/1", saw_first_ts=True) is True
+    assert _is_cdn_blacklisted("tx", room_key="https://www.huya.com/1")
+    clear_cdn_blacklist()
+
+
+def test_huya_eof_before_first_ts_invalidates_family():
+    from lsc.platforms.base import StreamInfo
+    from lsc.platforms.recovery_policy import recovery_action
+
+    info = StreamInfo(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        stream_url="https://tx.flv.huya.com/src/live.flv",
+    )
+    assert recovery_action(info, "End of file", saw_first_ts=False) == "invalidate_family"
+    assert recovery_action(info, "preview encoder failed", saw_first_ts=True) == "restart_preview_sink"
