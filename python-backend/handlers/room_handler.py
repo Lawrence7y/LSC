@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -29,6 +30,10 @@ _LSC_ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
 if _LSC_ROOT not in sys.path:
     sys.path.insert(0, _LSC_ROOT)
 
+from handlers.timeline_handlers import (
+    register_timeline_handlers,
+    timeline_to_dict,
+)
 from persistence import (
     is_analysis_stale,
     load_analysis_results,
@@ -36,11 +41,12 @@ from persistence import (
     save_rooms,
 )
 
-from handlers.timeline_handlers import (
-    register_timeline_handlers,
-    timeline_to_dict,
+from lsc.config import (
+    ExportProfile,
+    is_platform_pipeline_component_enabled,
+    is_platform_v2_hard_blocked,
+    load_config,
 )
-from lsc.config import ExportProfile, load_config
 from lsc.core.orchestrator import (
     RoomOrchestrator,
     _get_configured_max_previews,
@@ -54,7 +60,10 @@ from lsc.core.services.timeline_service import (
     get_timeline_service,
 )
 from lsc.platforms.base import ERROR_OFFLINE
-from lsc.platforms.registry import get_display_name, parse_stream, select_quality
+from lsc.platforms.failure import FailureKind, classify_failure
+from lsc.platforms.recovery_policy import mark_failed_candidate
+from lsc.platforms.redaction import redact_text, redact_url
+from lsc.platforms.registry import detect_platform, get_display_name, parse_stream, select_quality
 from lsc.utils.error_messages import humanize_error, humanize_error_with_suggestion
 from lsc.utils.process_launcher import run_hidden
 
@@ -64,20 +73,79 @@ _MAX_ROOM_URL_LENGTH = 2048
 _MAX_ROOM_URLS_PER_ADD = 12
 
 
+def _should_refresh_failed_stream(error: object) -> bool:
+    """Use typed media failures for candidate quarantine/URL refresh."""
+    kind = classify_failure(str(error or ""))
+    return kind in {
+        FailureKind.CDN_FORBIDDEN,
+        FailureKind.SIGNATURE_EXPIRED,
+        FailureKind.CONNECTION_RESET,
+        FailureKind.CONNECT_TIMEOUT,
+    }
+
+
+async def queue_export(
+    room_id,
+    start_sec,
+    end_sec,
+    label='clip',
+    preset_id='',
+    source='',
+    job_id='',
+    mark_in_wallclock=None,
+    mark_out_wallclock=None,
+    recording_start_mono=None,
+    recording_media_start_mono=None,
+    use_room_marks=False,
+    content_offset=None,
+    pre_mapped=False,
+):
+    """兼容旧导入路径，委托给统一导出实现。
+
+    请求快照（mark_in_wallclock/mark_out_wallclock/recording_start_mono）和
+    ``_resolve_export_range`` 的 exact/approximate 语义仍由统一实现负责；
+    snap_in/snap_out/snap_rec 会优先于房间标记；
+    部分墙钟快照缺失时只回退到 ``start_sec - content_offset``，无墙钟快照
+    时才允许 use_room_marks。该桥接不直接读取房间当前标记。
+    """
+    from handlers.export_handlers import get_queue_export
+
+    delegate = get_queue_export()
+    if delegate is None:
+        return {'error': 'export handler is not initialized'}
+    return await delegate(
+        room_id,
+        start_sec,
+        end_sec,
+        label=label,
+        preset_id=preset_id,
+        source=source,
+        job_id=job_id,
+        mark_in_wallclock=mark_in_wallclock,
+        mark_out_wallclock=mark_out_wallclock,
+        recording_start_mono=recording_start_mono,
+        recording_media_start_mono=recording_media_start_mono,
+        use_room_marks=use_room_marks,
+        content_offset=content_offset,
+        pre_mapped=pre_mapped,
+    )
+
+
 def _invalid_room_url_result(url: str, error: str, error_code: str = "invalid_url") -> dict[str, Any]:
     """构造统一的直播间链接验证失败结果。"""
+    safe_url = redact_url(url)
     return {
         "valid": False,
-        "url": url,
-        "normalized_url": url,
-        "error": error,
+        "url": safe_url,
+        "normalized_url": safe_url,
+        "error": redact_text(error),
         "error_code": error_code,
     }
 
 
 def _error_response(exc: Exception | str) -> dict[str, Any]:
     """生成带修复建议的错误响应（P1-1: 错误提示友好化）"""
-    raw = str(exc) if not isinstance(exc, str) else exc
+    raw = redact_text(exc)
     info = humanize_error_with_suggestion(raw)
     return {'success': False, 'error': info['message'], 'suggestion': info.get('suggestion')}
 
@@ -113,16 +181,62 @@ def _validate_room_url_candidate(raw_url: object) -> dict[str, Any]:
     if parsed.username is not None or parsed.password is not None:
         return _invalid_room_url_result(url, "直播间链接不能包含用户名或密码")
 
-    info = parse_stream(url)
+    # URL validation is also a platform-facing parse entry point.  Once all
+    # V2 components are enabled for this platform, keep it on the same
+    # resolver bridge so the first room add cannot silently warm the legacy
+    # URL-only cache or bypass credential scoping.  Media probing and lease
+    # issuance still happen at connect time; this stage only validates the
+    # room identity and presents metadata to the UI.
+    platform_hint = detect_platform(url)
+    cfg = load_config()
+    use_v2 = all(
+        is_platform_pipeline_component_enabled(component, platform_hint, cfg)
+        for component in (
+            "unified_resolver_v2",
+            "media_probe_v2",
+            "stream_lease_v2",
+        )
+    )
+    if use_v2:
+        from lsc.platforms.models import ResolveRequest
+        from lsc.platforms.resolver import resolve_stream_v2
+
+        result = resolve_stream_v2(
+            ResolveRequest(
+                source_url=url,
+                force_refresh=False,
+                request_id="room-url-validation",
+            )
+        )
+        resolved_platform = str(getattr(result, "platform", "") or platform_hint or "unknown")
+        first_candidate = next(iter(getattr(result, "candidates", ()) or ()), None)
+        info = SimpleNamespace(
+            platform=resolved_platform,
+            room_url=str(getattr(result, "room_url", "") or url),
+            stream_url=str(getattr(first_candidate, "url", "") or ""),
+            streamer=str(getattr(result, "anchor_name", "") or ""),
+            title=str(getattr(result, "room_title", "") or ""),
+            is_live=str(getattr(result, "live_status", "") or "").upper() == "LIVE",
+            error=(
+                str(getattr(getattr(result, "error", None), "user_message", "") or "")
+                if getattr(result, "error", None) is not None
+                else ""
+            ),
+            error_code=str(
+                getattr(getattr(result, "error", None), "code", "") or ""
+            ),
+        )
+    else:
+        info = parse_stream(url)
     platform = str(info.platform or "unknown")
     platform_name = get_display_name(platform)
     base_result: dict[str, Any] = {
-        "url": url,
-        "normalized_url": str(info.room_url or url),
+        "url": redact_url(url),
+        "normalized_url": redact_url(str(info.room_url or url)),
         "platform": platform,
         "platform_name": platform_name,
-        "streamer": str(info.streamer or ""),
-        "title": str(info.title or ""),
+        "streamer": redact_text(info.streamer or ""),
+        "title": redact_text(info.title or ""),
         "is_live": bool(info.is_live),
         "error_code": str(info.error_code or ""),
     }
@@ -139,7 +253,7 @@ def _validate_room_url_candidate(raw_url: object) -> dict[str, Any]:
         return {
             **base_result,
             "valid": False,
-            "error": humanize_error(str(info.error)),
+            "error": redact_text(humanize_error(str(info.error))),
         }
     if platform == "unknown" or not (info.stream_url or info.is_live):
         return {
@@ -430,6 +544,8 @@ def _ingest_diagnostics() -> dict[str, int]:
 
 
 def _stop_idle_shared_ingest(room_id: str, reason: str) -> bool:
+    if room_id in _recording_starting:
+        return False
     try:
         ingest = _shared_ingests.get(room_id)
     except Exception as exc:
@@ -439,6 +555,15 @@ def _stop_idle_shared_ingest(room_id: str, reason: str) -> bool:
         return False
     if getattr(ingest, "recording_active", False):
         return False
+    if getattr(ingest, "_recording_process", None) is not None:
+        return False
+    try:
+        supervisor = getattr(_shared_ingests, "get_supervisor_if_exists", None)
+        current = supervisor(room_id) if callable(supervisor) else None
+        if current is not None and bool(getattr(current, "recording_requested", False)):
+            return False
+    except Exception as exc:
+        _log.debug("shared ingest supervisor lookup failed during cleanup room_id=%s: %s", room_id, exc)
     if getattr(ingest, "preview_subscribers", 0) > 0:
         return False
     try:
@@ -598,6 +723,44 @@ def _probe_stream_offline(mgr: RoomOrchestrator, room_id: str) -> tuple[bool, st
         raw = (room.stream_info.error if room.stream_info else '') or room.last_error or ''
         return True, _mse_offline_error_message(raw)
     try:
+        platform = str(
+            getattr(room, "platform", "")
+            or getattr(room, "platform_name", "")
+            or detect_platform(room.room_url)
+            or ""
+        )
+        cfg = load_config()
+        use_v2 = all(
+            is_platform_pipeline_component_enabled(component, platform, cfg)
+            for component in (
+                "unified_resolver_v2",
+                "media_probe_v2",
+                "stream_lease_v2",
+            )
+        )
+        if use_v2:
+            from lsc.platforms.models import ResolveRequest
+            from lsc.platforms.resolver import resolve_stream_v2
+
+            result = resolve_stream_v2(
+                ResolveRequest(
+                    source_url=room.room_url,
+                    force_refresh=True,
+                    request_id=f"offline-probe:{room_id}",
+                    network_context=dict(getattr(room, "network_context", {}) or {}),
+                )
+            )
+            error = getattr(result, "error", None)
+            if str(getattr(result, "live_status", "") or "").upper() == "OFFLINE":
+                return True, _mse_offline_error_message(
+                    getattr(error, "user_message", "") if error else ""
+                )
+            if error is not None and str(getattr(error, "category", "")) == "OFFLINE":
+                return True, _mse_offline_error_message(
+                    getattr(error, "user_message", "") or ""
+                )
+            return False, ""
+
         from lsc.platforms.registry import parse_stream
         info = parse_stream(room.room_url, force_refresh=True)
     except Exception as exc:
@@ -999,21 +1162,68 @@ def _wait_for_recording_file(room, timeout_sec: float = 8.0) -> bool:
     2-5 秒才真正创建文件。此函数在超时内轮询等待文件出现。
     若录制进程已退出但文件仍未出现，立即返回 False 避免无效等待。
     """
-    path = getattr(room, "record_output_path", "")
-    if not path:
-        return False
-    if os.path.isfile(path):
+    manifest_path = getattr(room, "record_manifest_path", "") or ""
+    path = getattr(room, "record_output_path", "") or ""
+
+    def _asset_ready() -> bool:
+        if manifest_path and os.path.isfile(manifest_path):
+            try:
+                from lsc.recorder.assets import RecordingAsset
+
+                return bool(RecordingAsset.recover(manifest_path).segment_paths())
+            except (OSError, ValueError, RuntimeError):
+                return False
+        return bool(path and os.path.isfile(path))
+
+    if _asset_ready():
         return True
+    if not path and not manifest_path:
+        return False
+
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
         time.sleep(0.5)
         if not getattr(room, "is_recording", False):
             _log.warning("等待录制文件时录制已停止: room=%s", getattr(room, "room_id", "?"))
-            return os.path.isfile(getattr(room, "record_output_path", ""))
+            return _asset_ready()
         room_refreshed = getattr(room, "record_output_path", "")
-        if room_refreshed and os.path.isfile(room_refreshed):
+        if room_refreshed and os.path.isfile(room_refreshed) or _asset_ready():
             return True
     return False
+
+
+def _shared_ingest_v2_enabled(manager: RoomOrchestrator, room_id: str) -> bool:
+    """Enable the shared supervisor path even when the legacy global switch is off."""
+    try:
+        cfg = load_config()
+        room = manager.get_room(room_id)
+        platform = ""
+        if room is not None:
+            platform = str(
+                getattr(room, "platform", "")
+                or getattr(room, "platform_name", "")
+                or detect_platform(str(getattr(room, "room_url", "") or ""))
+                or ""
+            )
+        if is_platform_v2_hard_blocked(platform):
+            _log.info(
+                "platform V2 hard-blocked, using legacy ingest platform=%s room=%s",
+                platform,
+                room_id,
+            )
+            return False
+        if bool(getattr(cfg, "shared_ingest_enabled", False)):
+            return True
+        if room is None:
+            return False
+        return is_platform_pipeline_component_enabled(
+            "ingest_supervisor_v2",
+            platform,
+            cfg,
+        )
+    except Exception as exc:
+        _log.debug("shared ingest V2 gate lookup failed room=%s: %s", room_id, redact_text(exc))
+        return False
 
 
 def _validate_synced_analysis_targets(
@@ -1026,10 +1236,21 @@ def _validate_synced_analysis_targets(
     if main_room is None:
         return False, "主房间不存在", None, []
 
-    main_record_path = getattr(main_room, "record_output_path", "")
-    if not main_record_path:
-        return False, "主房间录制文件不存在", None, []
-    if not os.path.isfile(main_record_path) and (not wait_for_file or not _wait_for_recording_file(main_room)):
+    def _has_recording_asset(room: Any) -> bool:
+        manifest_path = getattr(room, "record_manifest_path", "") or ""
+        if manifest_path and os.path.isfile(manifest_path):
+            try:
+                from lsc.recorder.assets import RecordingAsset
+
+                return bool(RecordingAsset.recover(manifest_path).segment_paths())
+            except (OSError, ValueError, RuntimeError):
+                return False
+        record_path = getattr(room, "record_output_path", "") or ""
+        return bool(record_path and os.path.isfile(record_path))
+
+    if not _has_recording_asset(main_room) and (
+        not wait_for_file or not _wait_for_recording_file(main_room)
+    ):
         return False, "主房间录制文件不存在", None, []
 
     seen: set[str] = set()
@@ -1053,10 +1274,9 @@ def _validate_synced_analysis_targets(
         room = manager.get_room(room_id)
         if room is None:
             return False, f"目标房间不存在: {room_id}", None, []
-        record_path = getattr(room, "record_output_path", "")
-        if not record_path:
-            return False, f"目标房间录制文件不存在: {room_id}", None, []
-        if not os.path.isfile(record_path) and (not wait_for_file or not _wait_for_recording_file(room)):
+        if not _has_recording_asset(room) and (
+            not wait_for_file or not _wait_for_recording_file(room)
+        ):
             return False, f"目标房间录制文件不存在: {room_id}", None, []
         if multi_room and (getattr(room, "align_group_id", "") or "") != main_group:
             return False, f"房间 {room_id} 与主房间不在同一对齐组，请重新一键对齐", None, []
@@ -2249,23 +2469,24 @@ def _push_mse_segment(ws_server: Any, loop: asyncio.AbstractEventLoop, kind: str
     }.get(kind, kind)
     if normalized_kind == "segment" and room_id in _mse_push_paused:
         return
+    asyncio.run_coroutine_threadsafe(
+        ws_server.broadcast_mse(normalized_kind, room_id, seg),
+        loop,
+    )
     if normalized_kind == "init" and room_id not in _mse_live_phase:
-        # phase 'streaming' 延迟到首个 init 段产出（§优化 F3）：
-        # 慢流连接期间 phase 停留在 probing，前端 10s segment watchdog
-        # 不会在「流尚未连通」时误触发重连；init 到达瞬间进入播放态
+        # phase 'streaming' 延迟到首个 init 段产出；先入队 init，保持旧事件顺序。
         _mse_live_phase.add(room_id)
         asyncio.run_coroutine_threadsafe(
             ws_server.broadcast('preview_phase', {'room_id': room_id, 'phase': 'streaming'}),
             loop,
         )
-    asyncio.run_coroutine_threadsafe(
-        ws_server.broadcast_mse(normalized_kind, room_id, seg),
-        loop,
-    )
 
 
-def _room_to_dict(room: Any) -> dict[str, Any]:
+def _room_to_dict(room: Any, *, redact_sensitive: bool = True) -> dict[str, Any]:
     """将 Room 对象序列化为前端可消费的字典。"""
+    from lsc.core.services.ingest_registry import get_shared_ingest_registry
+    from lsc.core.services.runtime_health import build_room_health
+
     stream_url = ''
     if room.stream_info and room.stream_info.stream_url:
         stream_url = room.stream_info.stream_url
@@ -2278,14 +2499,23 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
             started_at = datetime.fromtimestamp(float(room.record_started_at)).isoformat()
 
     room_id = room.room_id
+    supervisor = get_shared_ingest_registry().get_supervisor_if_exists(room_id)
+    output_room_url = redact_url(room.room_url) if redact_sensitive else room.room_url
+    # A signed media URL is ephemeral and is never needed to restore a room;
+    # keep it redacted even for the internal persistence projection.
+    output_stream_url = redact_url(stream_url)
     return {
         'room_id': room_id,
-        'room_url': room.room_url,
+        # Room snapshots are sent through WebSocket/HTTP to the UI.  Keep the
+        # internal signed URL in the runtime only; user-visible payloads get
+        # the same redaction policy as diagnostics.
+        'room_url': output_room_url,
         'platform': room.platform,
+        'canonical_room_id': getattr(room, 'canonical_room_id', '') or '',
         'platform_name': room.platform_name,
-        'streamer_name': room.streamer_name,
-        'stream_title': room.stream_title,
-        'stream_url': stream_url,
+        'streamer_name': redact_text(room.streamer_name),
+        'stream_title': redact_text(room.stream_title),
+        'stream_url': output_stream_url,
         'is_connecting': room.is_connecting,
         'is_connected': room.is_connected,
         'is_recording': room.is_recording,
@@ -2296,9 +2526,10 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
         ),
         'is_reconnecting': getattr(room, 'is_reconnecting', False),
         'record_output_path': room.record_output_path or "",
+        'record_manifest_path': getattr(room, 'record_manifest_path', '') or '',
         'record_started_at': started_at,
         'record_size_mb': room.record_size_mb,
-        'last_error': room.last_error,
+        'last_error': redact_text(room.last_error),
         'preview_enabled': room.preview_enabled,
         'preview_paused': room.preview_paused,
         'preview_muted': room.preview_muted,
@@ -2316,21 +2547,28 @@ def _room_to_dict(room: Any) -> dict[str, Any]:
         'category': getattr(room, 'category', '') or '',
         'preview_epoch_id': getattr(room, 'preview_epoch_id', '') or '',
         'recording_id': getattr(room, 'recording_id', '') or '',
+        'pipeline_health': build_room_health(room, supervisor=supervisor),
     }
 
 
 # _timeline_to_dict 已迁移至 handlers.timeline_handlers.timeline_to_dict
 
 
-def _rooms_list(manager: RoomOrchestrator):
+def _rooms_list(manager: RoomOrchestrator, *, redact_sensitive: bool = True):
     """将 manager 中的所有房间序列化为字典列表。"""
-    return [_room_to_dict(r) for r in manager.list_rooms()]
+    return [
+        _room_to_dict(r, redact_sensitive=redact_sensitive)
+        for r in manager.list_rooms()
+    ]
 
 
 def _persist_current_rooms(manager: RoomOrchestrator) -> bool:
     """将当前 manager 中的房间列表持久化到 JSON（1s 写合并）。"""
     from persistence import schedule_save_rooms
-    schedule_save_rooms(_rooms_list(manager))
+    # Persistence is an internal store and must retain the original room URL
+    # so restart/reconnect can work.  Public HTTP/WebSocket snapshots use the
+    # redacted default above.
+    schedule_save_rooms(_rooms_list(manager, redact_sensitive=False))
     return True
 
 
@@ -2491,6 +2729,13 @@ def _resolve_export_range(
             'approximate',
         )
 
+    if snap_in is not None or snap_out is not None or snap_rec is not None:
+        return (
+            max(0.0, start_sec - content_offset),
+            max(0.0, end_sec - content_offset),
+            'approximate',
+        )
+
     return (
         max(0.0, start_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),
         max(0.0, end_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),
@@ -2516,9 +2761,22 @@ def _purge_stale_analysis_jobs() -> None:
 
 
 async def _ensure_export_queue():
-    """Module-level backward-compat entry (server.py imports this)."""
+    """Module-level backward-compat entry (server.py imports this).
+
+    The queue implementation owns the hot-reload guard: it only replaces the
+    semaphore while ``_export_queue.empty()`` and ``_export_in_flight == 0``.
+    Keep that contract visible at this compatibility boundary so callers and
+    static regression checks do not accidentally reintroduce an in-flight
+    export race when the implementation remains delegated.
+    """
     from handlers.export_handlers import ensure_export_queue
     await ensure_export_queue()
+
+
+# Compatibility note for integrations that still inspect the historical
+# handler location: ``async def handle_export_clip`` now lives in
+# ``handlers.export_handlers``.  Its payload continues to carry
+# ``content_offset`` through the delegated ``queue_export`` signature.
 
 
 def register_room_handlers(server, bridge):
@@ -2709,27 +2967,19 @@ def register_room_handlers(server, bridge):
                 return
 
             # 强制刷新流地址，避免复用已 404 的 CDN 死链
-            # 403 错误时先拉黑当前 CDN 线路，使重新解析时跳过该线路尝试其他 CDN
-            if '403' in current_error:
+            # 403/签名错误由平台策略统一决定是否隔离候选线路。
+            if _should_refresh_failed_stream(current_error):
                 try:
-                    def _mark_bad_cdn():
+                    def _mark_failed_candidate():
                         room = manager.get_room(room_id)
-                        url = ''
-                        if room and room.stream_info and room.stream_info.stream_url:
-                            url = room.stream_info.stream_url
-                        elif room and room.stream_url_cached:
-                            url = room.stream_url_cached
-                        if url:
-                            from urllib.parse import urlparse as _up
-                            host = _up(url).netloc.lower()
-                            cdn = host.split('.')[0] if host else ''
-                            if cdn:
-                                from lsc.platforms.huya import mark_cdn_bad
-                                mark_cdn_bad(cdn)
-                                _log.info("Shared MSE reconnect: marked CDN '%s' bad for room %s", cdn, room_id)
-                    await loop.run_in_executor(_bridge_executor, lambda: bridge.manager.call(_mark_bad_cdn))
+                        if room is not None:
+                            mark_failed_candidate(room.stream_info, current_error)
+                    await loop.run_in_executor(
+                        _bridge_executor,
+                        lambda: bridge.manager.call(_mark_failed_candidate),
+                    )
                 except Exception as exc:
-                    _log.debug("Shared MSE reconnect mark_cdn_bad failed: %s", exc)
+                    _log.debug("Shared MSE reconnect candidate policy failed: %s", exc)
             try:
                 refresh_ok = await loop.run_in_executor(
                     _recording_executor,
@@ -2765,8 +3015,10 @@ def register_room_handlers(server, bridge):
                 )
             except Exception as exc:
                 _log.warning("Shared MSE reconnect start failed for %s: %s", room_id, exc)
-                result = {'success': False, 'error': str(exc)}
+                result = {'success': False, 'error': redact_text(exc)}
 
+            if not isinstance(result, dict):
+                result = {'success': False, 'error': '预览重连失败'}
             if result.get('success'):
                 _mse_reconnect_state.pop(room_id, None)
                 _mse_live_phase.discard(room_id)
@@ -2799,26 +3051,82 @@ def register_room_handlers(server, bridge):
             )
 
     def _attach_shared_preview_handle(room_id: str, shared_ingest, loop):
+        def on_init(seg):
+            return _push_mse_segment(server, loop, 'mse_init', room_id, seg)
+
+        def on_media(seg):
+            return _push_mse_segment(server, loop, 'mse_segment', room_id, seg)
+
+        def on_error(err):
+            return asyncio.run_coroutine_threadsafe(
+                _shared_mse_on_error(room_id, err, loop), loop
+            )
+        try:
+            room = manager.get_room(room_id)
+            platform = (
+                (getattr(room, "platform", "") or getattr(room, "platform_name", ""))
+                if room is not None else ""
+            )
+            if is_platform_pipeline_component_enabled("ingest_supervisor_v2", platform):
+                supervisor = _shared_ingests.get_supervisor(
+                    room_id,
+                    url=getattr(shared_ingest, "url", ""),
+                    headers=getattr(shared_ingest, "headers", {}),
+                    network_context=dict(getattr(room, "network_context", {}) or {})
+                    if room is not None else {},
+                )
+                # Preview refreshes can happen while recording keeps the
+                # shared upstream alive.  In that case the registry must not
+                # silently overwrite the URL; explicitly switch the lease
+                # generation so recording and preview consume the same new
+                # candidate.
+                current_info = getattr(room, "stream_info", None) if room is not None else None
+                current_url = str(getattr(current_info, "stream_url", "") or "")
+                current_headers = dict(getattr(current_info, "headers", {}) or {})
+                current_context = dict(getattr(room, "network_context", {}) or {}) if room is not None else {}
+                ingest_url = str(getattr(getattr(supervisor, "ingest", None), "url", "") or "")
+                ingest_headers = dict(getattr(getattr(supervisor, "ingest", None), "headers", {}) or {})
+                ingest_context = dict(getattr(getattr(supervisor, "ingest", None), "network_context", {}) or {})
+                if current_url and (
+                    current_url != ingest_url
+                    or current_headers != ingest_headers
+                    or current_context != ingest_context
+                ):
+                    switch_upstream = getattr(supervisor, "switch_upstream", None)
+                    if callable(switch_upstream):
+                        lease = getattr(manager, "_stream_leases", {}).get(room_id)
+                        if not switch_upstream(
+                            current_url,
+                            headers=current_headers,
+                            network_context=current_context,
+                            generation=getattr(lease, "generation", None),
+                            reason_code="PREVIEW_LEASE_REFRESH",
+                        ):
+                            raise RuntimeError(
+                                str((supervisor.health() or {}).get(
+                                    "last_error",
+                                    "preview upstream switch failed",
+                                ) or "preview upstream switch failed")
+                            )
+                handle = supervisor.attach_preview(
+                    on_init_segment=on_init,
+                    on_media_segment=on_media,
+                    on_error=on_error,
+                )
+                _preview_stream_registry().set_legacy(room_id, handle)
+                return handle
+        except Exception as exc:
+            _log.debug("V2 preview supervisor attach fallback: room=%s error=%s", room_id, exc)
         return _preview_stream_registry().attach_shared(
             room_id,
             shared_ingest,
-            on_init_segment=lambda seg: _push_mse_segment(
-                server, loop, 'mse_init', room_id, seg
-            ),
-            on_media_segment=lambda seg: _push_mse_segment(
-                server, loop, 'mse_segment', room_id, seg
-            ),
-            on_error=lambda err: asyncio.run_coroutine_threadsafe(  # type: ignore[arg-type]
-                _shared_mse_on_error(room_id, err, loop), loop
-            ),
+            on_init_segment=on_init,
+            on_media_segment=on_media,
+            on_error=on_error,
         )
 
     async def _reattach_shared_preview_after_recording_start(room_id: str, preview_enabled: bool) -> bool:
-        try:
-            shared_enabled = bool(getattr(load_config(), 'shared_ingest_enabled', False))
-        except Exception as exc:
-            _log.debug("shared ingest config check failed during preview reattach: %s", exc)
-            return False
+        shared_enabled = _shared_ingest_v2_enabled(manager, room_id)
         if not shared_enabled or not preview_enabled:
             return False
 
@@ -2904,6 +3212,10 @@ def register_room_handlers(server, bridge):
 
     def _queue_recording_size_patches(*_args, **_kwargs):
         """中频 tick：仅对录制中房间推送增量 room_updated，避免全量 rooms_updated。"""
+        from lsc.core.services.ingest_registry import get_shared_ingest_registry
+        from lsc.core.services.runtime_health import build_room_health
+
+        ingest_registry = get_shared_ingest_registry()
         patches: list[dict[str, Any]] = []
         for room in manager.list_rooms():
             if not getattr(room, 'is_recording', False) and not getattr(room, 'is_reconnecting', False):
@@ -2915,10 +3227,15 @@ def register_room_handlers(server, bridge):
                 'room_id': room_id,
                 'record_size_mb': getattr(room, 'record_size_mb', 0) or 0,
                 'record_output_path': getattr(room, 'record_output_path', '') or '',
+                'record_manifest_path': getattr(room, 'record_manifest_path', '') or '',
                 'is_recording': bool(getattr(room, 'is_recording', False)),
                 'is_reconnecting': bool(getattr(room, 'is_reconnecting', False)),
                 'is_recording_starting': room_id in _recording_starting,
                 'last_error': getattr(room, 'last_error', '') or '',
+                'pipeline_health': build_room_health(
+                    room,
+                    supervisor=ingest_registry.get_supervisor_if_exists(room_id),
+                ),
             })
         if not patches:
             return
@@ -3169,7 +3486,7 @@ def register_room_handlers(server, bridge):
             )
         except asyncio.TimeoutError:
             clean_url = url.strip() if isinstance(url, str) else ""
-            _log.warning("验证直播间链接超时: url=%s", clean_url)
+            _log.warning("验证直播间链接超时: url=%s", redact_url(clean_url))
             return _invalid_room_url_result(
                 clean_url,
                 "验证直播间链接超时，请检查网络后重试",
@@ -3177,10 +3494,10 @@ def register_room_handlers(server, bridge):
             )
         except Exception as exc:
             clean_url = url.strip() if isinstance(url, str) else ""
-            _log.error("验证直播间链接异常: url=%s, error=%s", clean_url, exc)
+            _log.error("验证直播间链接异常: url=%s, error=%s", redact_url(clean_url), redact_text(exc))
             return _invalid_room_url_result(
                 clean_url,
-                humanize_error(str(exc)),
+                redact_text(humanize_error(str(exc))),
                 "validation_failed",
             )
 
@@ -3247,7 +3564,7 @@ def register_room_handlers(server, bridge):
         url = data.get('url', '').strip()
         if not url:
             return {'success': False, 'error': '请输入直播间链接'}
-        _log.info("添加房间: url=%s", url)
+        _log.info("添加房间: url=%s", redact_url(url))
 
         def _add():
             return manager.add_room(url)
@@ -3257,14 +3574,14 @@ def register_room_handlers(server, bridge):
                 _bridge_executor, lambda: bridge.manager.call(_add, timeout=30.0)
             )
         except TimeoutError:
-            _log.warning("添加房间超时: url=%s", url)
+            _log.warning("添加房间超时: url=%s", redact_url(url))
             return {'success': False, 'error': '添加房间超时，请重试', 'suggestion': '请检查网络连接，或稍后重试'}
         except Exception as exc:
-            _log.error("添加房间异常: url=%s, error=%s", url, exc)
+            _log.error("添加房间异常: url=%s, error=%s", redact_url(url), redact_text(exc))
             return _error_response(exc)
 
         if room is None:
-            _log.warning("添加房间失败（达上限）: url=%s", url)
+            _log.warning("添加房间失败（达上限）: url=%s", redact_url(url))
             return {'success': False, 'error': '房间数已达上限'}
 
         _broadcast_rooms()
@@ -3984,8 +4301,8 @@ def register_room_handlers(server, bridge):
         try:
             return {'success': True, **get_douyin_cookie_status()}
         except Exception as exc:
-            _log.warning("get_douyin_cookie_status failed: %s", exc)
-            return {'success': False, 'error': str(exc), 'configured': False, 'count': 0}
+            _log.warning("get_douyin_cookie_status failed: %s", redact_text(exc))
+            return {'success': False, 'error': redact_text(exc), 'configured': False, 'count': 0}
 
     @server.on('save_douyin_cookies')
     async def handle_save_douyin_cookies(data):
@@ -4004,11 +4321,27 @@ def register_room_handlers(server, bridge):
         try:
             status = save_douyin_cookies_from_text(raw)
             _log.info("抖音 Cookie 已保存: count=%s", status.get('count'))
-            return {'success': True, **status}
+            credential_status = ''
+            try:
+                from lsc.platforms.credentials import get_default_credential_provider
+
+                credential_status = get_default_credential_provider().refresh(
+                    'douyin'
+                ).status.value
+            except Exception as exc:
+                _log.warning(
+                    "refresh douyin credential state failed: %s",
+                    redact_text(exc),
+                )
+            return {
+                'success': True,
+                **status,
+                'credential_status': credential_status or 'INVALID',
+            }
         except (ValueError, json.JSONDecodeError) as exc:
-            return {'success': False, 'error': str(exc)}
+            return {'success': False, 'error': redact_text(exc)}
         except OSError as exc:
-            _log.error("保存抖音 Cookie 失败: %s", exc)
+            _log.error("保存抖音 Cookie 失败: %s", redact_text(exc))
             return {'success': False, 'error': humanize_error(str(exc))}
 
     @server.on('get_bilibili_cookie_status')
@@ -4018,8 +4351,37 @@ def register_room_handlers(server, bridge):
         try:
             return {'success': True, **get_bilibili_cookie_status()}
         except Exception as exc:
-            _log.warning("get_bilibili_cookie_status failed: %s", exc)
-            return {'success': False, 'error': str(exc), 'configured': False, 'count': 0}
+            _log.warning("get_bilibili_cookie_status failed: %s", redact_text(exc))
+            return {'success': False, 'error': redact_text(exc), 'configured': False, 'count': 0}
+
+    @server.on('get_platform_credential_status')
+    async def handle_get_platform_credential_status(data):
+        """Return redacted credential state for any registered platform."""
+        from lsc.platforms.capabilities import all_platform_capabilities
+        from lsc.platforms.credentials import get_default_credential_provider
+
+        platform = str(data.get('platform') or '').strip().lower() if isinstance(data, dict) else ''
+        account_ref = str(data.get('account_ref') or 'default').strip() if isinstance(data, dict) else 'default'
+        if platform not in all_platform_capabilities():
+            return {'success': False, 'error': '不支持的平台', 'status': 'NOT_CONFIGURED'}
+        if not account_ref or len(account_ref) > 128:
+            return {'success': False, 'error': 'account_ref 无效', 'status': 'INVALID'}
+        try:
+            provider = get_default_credential_provider()
+            status = provider.get_status(platform, account_ref)
+            capabilities = all_platform_capabilities()[platform]
+            return {
+                'success': True,
+                'platform': platform,
+                'account_ref': account_ref,
+                'status': status.value,
+                'available': status.value in {'AVAILABLE', 'EXPIRING'},
+                'support_level': capabilities.support_level,
+                'credential_kinds': list(capabilities.credential_kinds),
+            }
+        except Exception as exc:
+            _log.warning("platform credential status failed platform=%s: %s", platform, redact_text(exc))
+            return {'success': False, 'error': '读取凭据状态失败', 'status': 'INVALID'}
 
     @server.on('save_bilibili_cookies')
     async def handle_save_bilibili_cookies(data):
@@ -4037,44 +4399,27 @@ def register_room_handlers(server, bridge):
         try:
             status = save_bilibili_cookies_from_text(raw)
             _log.info("B站 Cookie 已保存: count=%s", status.get('count'))
-            return {'success': True, **status}
-        except (ValueError, json.JSONDecodeError) as exc:
-            return {'success': False, 'error': str(exc)}
-        except OSError as exc:
-            _log.error("保存 B站 Cookie 失败: %s", exc)
-            return {'success': False, 'error': humanize_error(str(exc))}
+            credential_status = ''
+            try:
+                from lsc.platforms.credentials import get_default_credential_provider
 
-    @server.on('get_huya_cookie_status')
-    async def handle_get_huya_cookie_status(data):
-        """查询虎牙 Cookie 是否已配置。"""
-        from lsc.platforms.cookie_helper import get_huya_cookie_status
-        try:
-            return {'success': True, **get_huya_cookie_status()}
-        except Exception as exc:
-            _log.warning("get_huya_cookie_status failed: %s", exc)
-            return {'success': False, 'error': str(exc), 'configured': False, 'count': 0}
-
-    @server.on('save_huya_cookies')
-    async def handle_save_huya_cookies(data):
-        """保存用户粘贴的虎牙 Cookie（JSON / Cookie 头）。"""
-        from lsc.platforms.cookie_helper import save_huya_cookies_from_text
-        raw = ''
-        if isinstance(data, dict):
-            raw = str(data.get('cookies') or data.get('text') or '')
-        if not raw.strip():
-            return {'success': False, 'error': '请粘贴 Cookie 内容'}
-        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
-        if len(raw) > _MAX_COOKIE_BYTES:
-            _log.warning("虎牙 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
-            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
-        try:
-            status = save_huya_cookies_from_text(raw)
-            _log.info("虎牙 Cookie 已保存: count=%s", status.get('count'))
-            return {'success': True, **status}
+                credential_status = get_default_credential_provider().refresh(
+                    'bilibili'
+                ).status.value
+            except Exception as exc:
+                _log.warning(
+                    "refresh bilibili credential state failed: %s",
+                    redact_text(exc),
+                )
+            return {
+                'success': True,
+                **status,
+                'credential_status': credential_status or 'INVALID',
+            }
         except (ValueError, json.JSONDecodeError) as exc:
-            return {'success': False, 'error': str(exc)}
+            return {'success': False, 'error': redact_text(exc)}
         except OSError as exc:
-            _log.error("保存虎牙 Cookie 失败: %s", exc)
+            _log.error("保存 B站 Cookie 失败: %s", redact_text(exc))
             return {'success': False, 'error': humanize_error(str(exc))}
 
     # ⚠️ 死代码：本 handler 与 align_preview_audio 已被 alignment_handlers.py 后注册覆盖。
@@ -4605,11 +4950,7 @@ def register_room_handlers(server, bridge):
                     'room_id': room_id,
                     'error': f'预览数已达上限 ({max_previews})，请先关闭其它预览',
                 }
-            try:
-                shared_enabled = bool(getattr(load_config(), 'shared_ingest_enabled', False))
-            except Exception as exc:
-                _log.debug("shared ingest config check failed: %s", exc)
-                shared_enabled = False
+            shared_enabled = _shared_ingest_v2_enabled(mgr, room_id)
             if shared_enabled:
                 shared_ingest = _shared_ingests.get(room_id)
                 if (
@@ -4632,18 +4973,8 @@ def register_room_handlers(server, bridge):
                             await asyncio.get_running_loop().run_in_executor(_bridge_executor, _stop_preview_sink)
 
                         _configure_shared_preview_quality(shared_ingest, data)
-                        shared_handle = _preview_stream_registry().attach_shared(
-                            room_id,
-                            shared_ingest,
-                            on_init_segment=lambda seg: _push_mse_segment(
-                                srv, loop, 'mse_init', room_id, seg
-                            ),
-                            on_media_segment=lambda seg: _push_mse_segment(
-                                srv, loop, 'mse_segment', room_id, seg
-                            ),
-                            on_error=lambda err: asyncio.run_coroutine_threadsafe(  # type: ignore[arg-type]
-                                _shared_mse_on_error(room_id, err, loop), loop
-                            ),
+                        shared_handle = _attach_shared_preview_handle(
+                            room_id, shared_ingest, loop,
                         )
 
                         if force_restart:
@@ -4657,9 +4988,11 @@ def register_room_handlers(server, bridge):
                             try:
                                 result = await asyncio.get_running_loop().run_in_executor(_bridge_executor, _start_preview_sink)
                                 if not getattr(result, 'ok', False):
-                                    _log.warning("预览重启失败: room_id=%s, error=%s", room_id, getattr(result, 'error', ''))
+                                    raise RuntimeError(
+                                        getattr(result, 'error', '') or 'shared preview restart failed'
+                                    )
                             except Exception as exc:
-                                _log.warning("预览重启异常: room_id=%s, error=%s", room_id, exc)
+                                raise RuntimeError(redact_text(exc)) from exc
 
                         shared_handle.replay_init()
 
@@ -4712,7 +5045,7 @@ def register_room_handlers(server, bridge):
 
                         if shared_ingest is None or getattr(shared_ingest, 'is_stopped', True):
                             refresh_ok = await asyncio.get_running_loop().run_in_executor(
-                                _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=False)
+                                _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=force_restart)
                             )
                             if not refresh_ok:
                                 raise RuntimeError("stream url refresh failed")
@@ -4815,7 +5148,7 @@ def register_room_handlers(server, bridge):
                                 _log.debug("shared preview-only handle cleanup failed: %s", stop_exc)
                         if shared_ingest is not None and not getattr(shared_ingest, 'recording_active', False):
                             _stop_idle_shared_ingest(room_id, reason="shared preview-only failed")
-                        return {'success': False, 'room_id': room_id, 'error': f'共享预览启动失败：{exc}'}
+                        return {'success': False, 'room_id': room_id, 'error': f'共享预览启动失败：{redact_text(exc)}'}
                 if shared_enabled:
                     return {'success': False, 'room_id': room_id, 'error': '共享预览启动失败，请检查直播流状态'}
             with _mse_starting_lock:
@@ -4827,8 +5160,27 @@ def register_room_handlers(server, bridge):
                 # 先在后台线程刷新流 URL，避免阻塞编排线程（B站等平台耗时 10+ 秒）
                 # force=False：连接后 120s 内复用房间流缓存，显著加快预览启动
                 await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'refreshing_url'})
+                # 虎牙签名 URL 有并发连接限制：若房间正在录制，预览强制刷新获取
+                # 独立签名，避免与录制复用同一 wsSecret 导致其中一路被 CDN 403。
+                force_refresh = False
+                def _peek_room_state():
+                    r = mgr.get_room(room_id)
+                    if r is None or r.stream_info is None:
+                        return False
+                    from lsc.platforms.recovery_policy import should_force_refresh_when_recording
+
+                    return bool(
+                        r.is_recording
+                        and should_force_refresh_when_recording(r.stream_info)
+                    )
+                try:
+                    force_refresh = await asyncio.get_running_loop().run_in_executor(
+                        _bridge_executor, lambda: bridge.manager.call(_peek_room_state)
+                    )
+                except Exception as exc:
+                    _log.debug("预览 peek 房间状态失败: %s", exc)
                 refresh_ok = await asyncio.get_running_loop().run_in_executor(
-                    _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=False)
+                    _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=force_refresh)
                 )
                 if not refresh_ok:
                     # 仅在确实没有可用流时才断开；保留缓存，避免误报「房间未连接」
@@ -4888,8 +5240,22 @@ def register_room_handlers(server, bridge):
                 settings = load_settings()
                 preview_quality = data.get('preview_quality') or settings.get('preview_quality', '高清')  # type: ignore[union-attr]
 
+                platform = snapshot.get('platform', '')
+                from lsc.platforms.capabilities import get_platform_capabilities
+
                 # 根据用户选择的预览画质，从 quality_urls 中挑选对应画质的流地址
                 quality_urls = snapshot.get('quality_urls') or {}
+                # B站无登录态时高画质（qn=250/300）易被 CDN 403 拒绝，与适配器
+                # "无 Cookie 避高 qn" 策略冲突；直接复用录制/连接已验证的流地址。
+                if get_platform_capabilities(platform).anonymous_quality_fallback:
+                    try:
+                        from lsc.platforms.credentials import has_usable_credentials
+
+                        if not has_usable_credentials(platform):
+                            quality_urls = {}
+                            _log.info("当前平台无可用凭据，预览复用已连接流地址（跳过画质重选）")
+                    except Exception as exc:
+                        _log.debug("检查平台凭据失败，沿用原选流逻辑: %s", exc)
                 if quality_urls:
                     selected_url, selected_key = select_quality(
                         {'qualityUrls': quality_urls, 'streamUrl': stream_url, 'selectedQuality': ''},
@@ -4897,10 +5263,9 @@ def register_room_handlers(server, bridge):
                     )
                     if selected_url:
                         stream_url = selected_url
-                        _log.info("预览画质选择: preset=%s, quality_key=%s, url=%s", preview_quality, selected_key, stream_url[:80])
-                # B站等平台首次刷新 URL 耗时较长，延长 FFmpeg 启动探测超时
-                platform = snapshot.get('platform', '')
-                probe_timeout = 8.0 if platform in ('bilibili', 'bilibili_bangumi') else 3.0
+                        _log.info("预览画质选择: preset=%s, quality_key=%s, url=%s", preview_quality, selected_key, redact_url(stream_url)[:80])
+                # B站/虎牙等平台首次刷新 URL 耗时较长，延长 FFmpeg 启动探测超时
+                probe_timeout = get_platform_capabilities(platform).probe_timeout_sec
 
                 preview_params = _compute_preview_quality_params(data)
                 width = preview_params['width']
@@ -5070,33 +5435,19 @@ def register_room_handlers(server, bridge):
                         # 8. 刷新流 URL。403/签名类错误直接强制刷新（跳过缓存复用）：
                         #    缓存 URL 时间戳可能未过期但 CDN 已拒绝（虎牙线路/IP 风控），
                         #    force=False 复用缓存返回 True 会让 force=True 永不执行，
-                        #    导致重试继续用 403 的 URL 直到耗尽。虎牙额外拉黑当前 CDN 线路
-                        #    使重新解析时优选其它线路。
-                        if '403' in current_error:
+                        #    导致重试继续用 403 的 URL 直到耗尽；平台策略负责隔离候选。
+                        if _should_refresh_failed_stream(current_error):
                             try:
-                                def _mark_bad_cdn_403():
+                                def _mark_failed_candidate_403():
                                     room = mgr.get_room(room_id)
-                                    url = ''
-                                    if room and room.stream_info and room.stream_info.stream_url:
-                                        url = room.stream_info.stream_url
-                                    elif room and room.stream_url_cached:
-                                        url = room.stream_url_cached
-                                    if url and 'huya' in url:
-                                        from urllib.parse import urlparse as _up
-                                        host = _up(url).netloc.lower()
-                                        cdn = host.split('.')[0] if host else ''
-                                        if cdn:
-                                            from lsc.platforms.huya import mark_cdn_bad
-                                            mark_cdn_bad(cdn)
-                                            _log.info(
-                                                "MSE reconnect: marked Huya CDN '%s' bad for room %s",
-                                                cdn, room_id,
-                                            )
+                                    if room is not None:
+                                        mark_failed_candidate(room.stream_info, current_error)
                                 await loop.run_in_executor(
-                                    _bridge_executor, lambda: bridge.manager.call(_mark_bad_cdn_403)
+                                    _bridge_executor,
+                                    lambda: bridge.manager.call(_mark_failed_candidate_403),
                                 )
                             except Exception as exc:
-                                _log.debug("MSE reconnect mark_cdn_bad failed: %s", exc)
+                                _log.debug("MSE reconnect candidate policy failed: %s", exc)
                             try:
                                 refresh_ok = await loop.run_in_executor(
                                     _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=True)
@@ -5190,6 +5541,19 @@ def register_room_handlers(server, bridge):
                         r_stream_url = snapshot['stream_url']
                         settings = load_settings()
                         preview_quality = settings.get('preview_quality', '高清')
+                        # B站无登录态时高画质易 403，复用录制/连接已验证的流（与初始启动一致）
+                        from lsc.platforms.capabilities import get_platform_capabilities
+
+                        if get_platform_capabilities(
+                            snapshot.get('platform', '')
+                        ).anonymous_quality_fallback:
+                            try:
+                                from lsc.platforms.credentials import has_usable_credentials
+
+                                if not has_usable_credentials(snapshot.get('platform', '')):
+                                    r_quality_urls = {}
+                            except Exception as exc:
+                                _log.debug("检查平台凭据失败，沿用原选流逻辑: %s", exc)
                         if r_quality_urls:
                             selected_url, _ = select_quality(
                                 {'qualityUrls': r_quality_urls, 'streamUrl': r_stream_url, 'selectedQuality': ''},
@@ -5197,7 +5561,11 @@ def register_room_handlers(server, bridge):
                             )
                             if selected_url:
                                 r_stream_url = selected_url
-                        r_probe = 8.0 if snapshot.get('platform', '') in ('bilibili', 'bilibili_bangumi') else 3.0
+                        from lsc.platforms.capabilities import get_platform_capabilities
+
+                        r_probe = get_platform_capabilities(
+                            snapshot.get('platform', '')
+                        ).probe_timeout_sec
 
                         # 11. 创建并启动新的 MseStreamer
                         def _restart():
@@ -5346,6 +5714,25 @@ def register_room_handlers(server, bridge):
                         error_msg = error_detail
                     else:
                         error_msg = f'直播流连接失败：{error_detail}'
+                    # 403/鉴权失败：交给平台策略隔离坏候选并强制刷新。
+                    if _should_refresh_failed_stream(error_detail):
+                        try:
+                            def _mark_failed_candidate_on_start():
+                                room = mgr.get_room(room_id)
+                                if room is not None:
+                                    mark_failed_candidate(room.stream_info, error_detail)
+                            await loop.run_in_executor(
+                                _bridge_executor,
+                                lambda: bridge.manager.call(_mark_failed_candidate_on_start),
+                            )
+                        except Exception as exc:
+                            _log.debug("MSE start candidate policy failed: %s", exc)
+                        try:
+                            await loop.run_in_executor(
+                                _recording_executor, lambda: mgr.refresh_stream_url(room_id, force=True)
+                            )
+                        except Exception as exc:
+                            _log.error("MSE start 403 URL refresh failed: %s", exc)
                     await srv.broadcast('preview_phase', {'room_id': room_id, 'phase': 'error'})
                     return {'success': False, 'room_id': room_id, 'error': error_msg}
 
@@ -8109,6 +8496,7 @@ def register_room_handlers(server, bridge):
     # 全局唯一导出入队入口（原 room_handler 旧导出管道已删除，避免双队列并发突破
     # export_max_concurrent 上限）：所有路径（手动 export_clip / export_clip_by_id /
     # AI 自动导出 / 延后导出）统一走 handlers.export_handlers 的队列与 semaphore
+    # semaphore 替换仍由 export_handlers 在 _export_queue.empty() 且无在途任务时保护。
     queue_export = get_queue_export()
 
     from handlers.analysis_handlers import register_analysis_handlers

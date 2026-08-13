@@ -7,7 +7,7 @@ import os
 import shutil
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, get_args, get_origin
 
 _log = logging.getLogger(__name__)
 
@@ -212,6 +212,23 @@ class LscConfig:
     shared_ingest_preview_drop_policy: str = "drop_oldest"
     shared_ingest_preview_crf: int = 23
     shared_ingest_preview_preset: str = "veryfast"
+    # 多平台 V2 管线默认关闭，通过平台 allowlist 灰度启用。
+    platform_pipeline_v2_enabled: bool = False
+    platform_pipeline_v2_allowlist: list[str] = field(default_factory=list)
+    # Optional rollout dimensions. Empty means unrestricted for that
+    # dimension; once configured, a caller must provide a matching context.
+    platform_pipeline_v2_room_allowlist: list[str] = field(default_factory=list)
+    platform_pipeline_v2_user_allowlist: list[str] = field(default_factory=list)
+    platform_pipeline_v2_account_allowlist: list[str] = field(default_factory=list)
+    platform_pipeline_v2_app_version_allowlist: list[str] = field(default_factory=list)
+    segmented_recording_enabled: bool = False
+    # 子能力开关默认开启，但仍受上面的全局开关与平台 allowlist 约束。
+    unified_resolver_v2: bool = True
+    media_probe_v2: bool = True
+    stream_lease_v2: bool = True
+    ingest_supervisor_v2: bool = True
+    segmented_recording_v2: bool = False
+    runtime_events_v2: bool = True
     # 资源限制（可通过 settings.json 覆盖）
     max_rooms: int = 12
     max_concurrent_previews: int = 4
@@ -288,10 +305,150 @@ def _load_config_overrides() -> dict:
         "shared_ingest_preview_drop_policy",
         "shared_ingest_preview_crf",
         "shared_ingest_preview_preset",
+        "platform_pipeline_v2_enabled",
+        "platform_pipeline_v2_allowlist",
+        "platform_pipeline_v2_room_allowlist",
+        "platform_pipeline_v2_user_allowlist",
+        "platform_pipeline_v2_account_allowlist",
+        "platform_pipeline_v2_app_version_allowlist",
+        "segmented_recording_enabled",
+        "unified_resolver_v2",
+        "media_probe_v2",
+        "stream_lease_v2",
+        "ingest_supervisor_v2",
+        "segmented_recording_v2",
+        "runtime_events_v2",
         "max_rooms",
         "max_concurrent_previews",
     }
     return {key: data[key] for key in allowed if key in data}
+
+
+_V2_PLATFORM_HARD_BLOCKLIST = frozenset({"huya"})
+
+
+def is_platform_v2_hard_blocked(platform: str) -> bool:
+    """Return True when a platform must not enter the V2 media pipeline.
+
+    This is stronger than the allowlist: operators cannot re-enable a blocked
+    platform by editing ``platform_pipeline_v2_allowlist`` or turning on
+    ``shared_ingest_enabled``.
+    """
+    key = str(platform or "").strip().lower()
+    if not key:
+        return False
+    if key in _V2_PLATFORM_HARD_BLOCKLIST:
+        return True
+    try:
+        from lsc.platforms.capabilities import all_platform_capabilities
+        from lsc.platforms.registry import get_display_name
+
+        return any(
+            platform_id in _V2_PLATFORM_HARD_BLOCKLIST
+            and get_display_name(platform_id).strip().lower() == key
+            for platform_id in all_platform_capabilities()
+        )
+    except Exception:
+        return False
+
+
+def is_platform_pipeline_v2_enabled(
+    platform: str,
+    config: LscConfig | None = None,
+    *,
+    room_id: str | None = None,
+    user_id: str | None = None,
+    account_ref: str | None = None,
+    app_version: str | None = None,
+) -> bool:
+    """Return whether a platform is allowed to use the V2 media pipeline.
+
+    The global switch is intentionally required even when the allowlist
+    contains a platform.  This gives operators one safe kill switch while
+    preserving per-platform rollback.
+    """
+    cfg = config or load_config()
+    if is_platform_v2_hard_blocked(platform):
+        return False
+    if not bool(getattr(cfg, "platform_pipeline_v2_enabled", False)):
+        return False
+    normalized = str(platform or "").strip().lower()
+    if not normalized:
+        return False
+    allowlist = {
+        str(item or "").strip().lower()
+        for item in getattr(cfg, "platform_pipeline_v2_allowlist", [])
+        if str(item or "").strip()
+    }
+    if normalized in allowlist:
+        platform_allowed = True
+    else:
+        # Callers may only have the user-facing display name (e.g. "B站").
+        # Resolve it back to the canonical adapter id without importing the
+        # registry at module import time, avoiding a config/registry cycle.
+        try:
+            from lsc.platforms.capabilities import all_platform_capabilities
+            from lsc.platforms.registry import get_display_name
+
+            platform_allowed = any(
+                get_display_name(platform_id).strip().lower() == normalized
+                and platform_id in allowlist
+                for platform_id in all_platform_capabilities()
+            )
+        except Exception:
+            platform_allowed = False
+    if not platform_allowed:
+        return False
+
+    def matches(attribute: str, value: str | None) -> bool:
+        configured = {
+            str(item or "").strip().lower()
+            for item in getattr(cfg, attribute, [])
+            if str(item or "").strip()
+        }
+        if not configured:
+            return True
+        return bool(value) and str(value).strip().lower() in configured
+
+    return (
+        matches("platform_pipeline_v2_room_allowlist", room_id)
+        and matches("platform_pipeline_v2_user_allowlist", user_id)
+        and matches("platform_pipeline_v2_account_allowlist", account_ref)
+        and matches("platform_pipeline_v2_app_version_allowlist", app_version)
+    )
+
+
+def is_platform_pipeline_component_enabled(
+    component: str,
+    platform: str,
+    config: LscConfig | None = None,
+    *,
+    room_id: str | None = None,
+    user_id: str | None = None,
+    account_ref: str | None = None,
+    app_version: str | None = None,
+) -> bool:
+    """Gate a V2 sub-capability while retaining the global kill switch."""
+    cfg = config or load_config()
+    if not is_platform_pipeline_v2_enabled(
+        platform,
+        cfg,
+        room_id=room_id,
+        user_id=user_id,
+        account_ref=account_ref,
+        app_version=app_version,
+    ):
+        return False
+    normalized = str(component or "").strip().lower()
+    attribute = normalized if normalized.endswith("_v2") else f"{normalized}_v2"
+    if not bool(getattr(cfg, attribute, True)):
+        return False
+    # Segmented recording has a legacy top-level switch as well as the V2
+    # component switch.  Both must be enabled before any recorder can create
+    # segment files, which keeps the feature opt-in and easy to roll back.
+    if attribute == "segmented_recording_v2":
+        return bool(getattr(cfg, "segmented_recording_enabled", False))
+    return True
 
 
 def preferred_hw_video_codec() -> str:
@@ -350,7 +507,20 @@ def _load_config_unlocked(force_reload: bool = False) -> LscConfig:
                 else:
                     _log.warning("config type mismatch: %s=%r expected %s, skipped", key, val, expected.__name__)
                 continue
-            if not isinstance(val, expected):
+            origin = get_origin(expected)
+            if origin is list:
+                item_type = get_args(expected)[0] if get_args(expected) else object
+                if not isinstance(val, list) or not all(
+                    isinstance(item, item_type) for item in val
+                ):
+                    _log.warning(
+                        "config type mismatch: %s=%r expected list[%s], skipped",
+                        key,
+                        val,
+                        getattr(item_type, "__name__", item_type),
+                    )
+                    continue
+            elif not isinstance(val, expected):
                 _log.warning("config type mismatch: %s=%r expected %s, skipped", key, val, expected.__name__)
                 continue
             validated[key] = val
