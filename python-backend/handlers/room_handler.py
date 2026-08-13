@@ -5023,7 +5023,7 @@ def register_room_handlers(server, bridge):
                                 return shared_ingest.start_preview(**filtered)  # type: ignore[union-attr]
                             try:
                                 result = await asyncio.get_running_loop().run_in_executor(_bridge_executor, _start_preview_sink)
-                                if not getattr(result, 'ok', False):
+                                if not (getattr(result, 'accepted', False) or getattr(result, 'ok', False)):
                                     raise RuntimeError(
                                         getattr(result, 'error', '') or 'shared preview restart failed'
                                     )
@@ -5114,7 +5114,7 @@ def register_room_handlers(server, bridge):
                             filtered = {k: v for k, v in preview_params.items() if k in valid_keys}
                             shared_ingest.configure_preview(**filtered)
                             result = shared_ingest.start_preview(**filtered)
-                            if not getattr(result, 'ok', False):
+                            if not (getattr(result, 'accepted', False) or getattr(result, 'ok', False)):
                                 first_error = getattr(result, 'error', '') or "shared preview start failed"
                                 # code=0 表示 CDN 返回空响应（虎牙反爬签名过期），强制刷新流地址后重试一次
                                 if 'code=0' in first_error:
@@ -5147,7 +5147,7 @@ def register_room_handlers(server, bridge):
                                             )
                                             shared_ingest.configure_preview(**filtered)
                                             result = shared_ingest.start_preview(**filtered)
-                                if not getattr(result, 'ok', False):
+                                if not (getattr(result, 'accepted', False) or getattr(result, 'ok', False)):
                                     raise RuntimeError(getattr(result, 'error', '') or first_error)
 
                         _configure_shared_preview_quality(shared_ingest, data)

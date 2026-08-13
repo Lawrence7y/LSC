@@ -243,3 +243,50 @@ def test_resolve_playable_lease_skips_probe_candidates_for_ingest(monkeypatch):
     )
     assert lease is not None
     assert calls["n"] == 0
+
+
+def test_start_preview_without_subscribers_is_not_media_ready():
+    from lsc.core.services.shared_ingest import SharedRoomIngest
+
+    ingest = SharedRoomIngest(room_id="r", url="https://example/live.flv")
+    result = ingest.start_preview()
+    assert result.accepted is True
+    assert result.media_ready is False
+    assert result.ok is False
+
+
+def test_start_preview_live_process_is_not_media_ready_until_segments(monkeypatch):
+    from lsc.core.services.shared_ingest import PreviewSubscriber, SharedRoomIngest
+
+    ingest = SharedRoomIngest(room_id="r", url="https://example/live.flv")
+    ingest._preview_subscribers.append(PreviewSubscriber(1024))
+
+    class _LiveProc:
+        pid = 42
+        returncode = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    monkeypatch.setattr(ingest, "_launch_process", lambda _command: _LiveProc())
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", lambda: "")
+    monkeypatch.setattr(ingest, "_start_stderr_reader", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ingest, "_start_thread", lambda *_args, **_kwargs: None)
+
+    result = ingest.start_preview()
+    assert result.accepted is True
+    assert result.media_ready is False
+    assert result.ok is False
+
+    ingest.publish_preview_segment(b"init", kind="init")
+    ingest.publish_preview_segment(b"seg", kind="media")
+    ready = ingest.start_preview()
+    assert ready.accepted is True
+    assert ready.media_ready is True
+    assert ready.ok is True
