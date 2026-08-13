@@ -2,10 +2,10 @@ from lsc.platforms.capabilities import get_platform_capabilities, uses_ingest_pr
 from lsc.platforms.models import PlatformCapabilities
 
 
-def test_huya_capabilities_are_ingest_probe_and_no_auto_reconnect():
+def test_huya_capabilities_are_ingest_probe():
     caps = get_platform_capabilities("huya")
     assert caps.probe_profile == "ingest"
-    assert caps.preview_auto_reconnect is False
+    assert caps.preview_auto_reconnect is True
     assert caps.preview_refresh_when_recording is False
     assert caps.max_connect_concurrency == 1
     assert caps.signed_url is True
@@ -28,21 +28,19 @@ def test_bilibili_keeps_remote_probe():
     assert uses_ingest_probe(caps) is False
 
 
-def test_huya_v2_hard_blocklist_wins_over_allowlist_and_shared_ingest():
+def test_huya_v2_allowlist_enables_ingest_pipeline():
     from lsc.config import LscConfig, is_platform_pipeline_v2_enabled
 
     cfg = LscConfig(
         platform_pipeline_v2_enabled=True,
-        platform_pipeline_v2_allowlist=["bilibili", "huya"],
-        shared_ingest_enabled=True,
-        ingest_supervisor_v2=True,
+        platform_pipeline_v2_allowlist=["huya"],
+        shared_ingest_enabled=False,
     )
-    assert is_platform_pipeline_v2_enabled("huya", cfg) is False
-    assert is_platform_pipeline_v2_enabled("bilibili", cfg) is True
-    assert is_platform_pipeline_v2_enabled("虎牙", cfg) is False
+    assert is_platform_pipeline_v2_enabled("huya", cfg) is True
+    assert is_platform_pipeline_v2_enabled("虎牙", cfg) is True
 
 
-def test_shared_ingest_v2_gate_rejects_huya_even_when_global_shared_on(monkeypatch):
+def test_shared_ingest_v2_gate_allows_huya_on_allowlist(monkeypatch):
     import os
     import sys
     from types import SimpleNamespace
@@ -67,10 +65,10 @@ def test_shared_ingest_v2_gate_rejects_huya_even_when_global_shared_on(monkeypat
         room_url="https://www.huya.com/1",
     )
     manager = SimpleNamespace(get_room=lambda _rid: room)
-    assert _shared_ingest_v2_enabled(manager, "room-1") is False
+    assert _shared_ingest_v2_enabled(manager, "room-1") is True
 
 
-def test_huya_preview_auto_reconnect_is_disabled():
+def test_huya_preview_auto_reconnect_uses_durable_window():
     import os
     import sys
 
@@ -83,8 +81,8 @@ def test_huya_preview_auto_reconnect_is_disabled():
     from handlers.room_handler import _preview_auto_reconnect_allowed
 
     info = StreamInfo(platform="huya", room_url="https://www.huya.com/1")
-    assert _preview_auto_reconnect_allowed(info) is False
-    assert _preview_auto_reconnect_allowed("huya") is False
+    assert _preview_auto_reconnect_allowed(info) is True
+    assert _preview_auto_reconnect_allowed("huya") is True
     assert _preview_auto_reconnect_allowed("bilibili") is True
 
 

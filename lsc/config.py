@@ -326,7 +326,7 @@ def _load_config_overrides() -> dict:
     return {key: data[key] for key in allowed if key in data}
 
 
-_V2_PLATFORM_HARD_BLOCKLIST = frozenset({"huya"})
+_V2_PLATFORM_HARD_BLOCKLIST: frozenset[str] = frozenset()
 
 
 def is_platform_v2_hard_blocked(platform: str) -> bool:
