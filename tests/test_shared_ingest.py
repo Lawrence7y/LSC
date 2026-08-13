@@ -128,6 +128,16 @@ def _wait_until(predicate, timeout_sec: float = 0.5) -> bool:
     return predicate()
 
 
+def _start_recording_writer(ingest: SharedRoomIngest, recording) -> None:
+    ingest._recording_generation = getattr(ingest, "_recording_generation", 0) + 1
+    generation = ingest._recording_generation
+    ingest._recording_input_thread = ingest._start_thread(
+        ingest._write_recording_input_loop,
+        (recording, generation),
+        f"test-recording-input-{ingest.room_id}",
+    )
+
+
 def _disable_preview_start(ingest: SharedRoomIngest, monkeypatch) -> None:
     monkeypatch.setattr(
         ingest,
@@ -390,11 +400,15 @@ def test_upstream_reader_dispatches_only_complete_ts_packets_and_keeps_order():
     ingest._process = process
     ingest._recording_process = recording
     ingest.recording_active = True
+    _start_recording_writer(ingest, recording)
 
     ingest._read_upstream_stdout_loop(process)
+    expected = (first + second)[:TS_PACKET_SIZE]
+    assert _wait_until(lambda: bytes(recording.stdin.data) == expected)
 
-    assert bytes(recording.stdin.data) == (first + second)[:TS_PACKET_SIZE]
+    assert bytes(recording.stdin.data) == expected
     assert len(recording.stdin.data) % TS_PACKET_SIZE == 0
+    ingest._stop_recording_process()
 
 
 @pytest.mark.parametrize(
@@ -423,14 +437,18 @@ def test_preview_overflow_drops_whole_batches_while_recording_receives_all(
     ingest._preview_process = preview
     ingest.recording_active = True
     ingest._preview_subscribers.append(PreviewSubscriber(1024))
+    _start_recording_writer(ingest, recording)
 
     ingest._read_upstream_stdout_loop(upstream)
+    expected_recording = b"".join(batches)
+    assert _wait_until(lambda: bytes(recording.stdin.data) == expected_recording)
 
-    assert bytes(recording.stdin.data) == b"".join(batches)
+    assert bytes(recording.stdin.data) == expected_recording
     assert b"".join(ingest._preview_ts_queue) == expected_preview
     assert all(len(batch) % TS_PACKET_SIZE == 0 for batch in ingest._preview_ts_queue)
     assert ingest.preview_dropped_bytes == TS_PACKET_SIZE
     assert ingest.preview_dropped_batches == 1
+    ingest._stop_recording_process()
 
 
 def test_preview_then_recording_reuses_same_upstream(monkeypatch):

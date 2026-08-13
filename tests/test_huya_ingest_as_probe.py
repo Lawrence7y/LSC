@@ -334,3 +334,34 @@ def test_begin_mse_reconnect_preserves_attempts_until_durable():
     fresh = _begin_mse_reconnect(durable)
     assert fresh["attempts"] == 0
     assert fresh["running"] is True
+
+
+def test_recording_stdin_backpressure_does_not_block_upstream_dispatch():
+    import time
+
+    from lsc.core.services.shared_ingest import SharedRoomIngest
+
+    class _BlockingStdin:
+        def write(self, data):
+            time.sleep(2.0)
+            return len(data)
+
+        def flush(self):
+            return None
+
+    class _RecordingProc:
+        pid = 7
+        returncode = None
+        stdin = _BlockingStdin()
+
+        def poll(self):
+            return None
+
+    ingest = SharedRoomIngest(room_id="r", url="https://example/a.flv")
+    ingest._recording_process = _RecordingProc()
+    ingest.recording_active = True
+    packet = b"\x47" * 188 * 8
+    started = time.monotonic()
+    ingest._dispatch_ts_batch(packet)
+    ingest._dispatch_ts_batch(packet)
+    assert time.monotonic() - started < 1.0

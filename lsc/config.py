@@ -212,6 +212,7 @@ class LscConfig:
     shared_ingest_preview_drop_policy: str = "drop_oldest"
     shared_ingest_preview_crf: int = 23
     shared_ingest_preview_preset: str = "veryfast"
+    shared_ingest_recording_queue_bytes: int = 2 * 1024 * 1024
     # 多平台 V2 管线默认关闭，通过平台 allowlist 灰度启用。
     platform_pipeline_v2_enabled: bool = False
     platform_pipeline_v2_allowlist: list[str] = field(default_factory=list)
@@ -305,6 +306,7 @@ def _load_config_overrides() -> dict:
         "shared_ingest_preview_drop_policy",
         "shared_ingest_preview_crf",
         "shared_ingest_preview_preset",
+        "shared_ingest_recording_queue_bytes",
         "platform_pipeline_v2_enabled",
         "platform_pipeline_v2_allowlist",
         "platform_pipeline_v2_room_allowlist",

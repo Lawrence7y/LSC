@@ -32,6 +32,7 @@ _RECORDING_START_STABLE_SEC = 1.0
 _UPSTREAM_NO_DATA_FAST_FAIL_SEC = 13.0
 TS_PACKET_SIZE = 188
 _WRITE_TIMEOUT_SEC = 10.0
+_RECORDING_OVERFLOW_SEC = 5.0
 # 预览 stdout 超过该秒数无数据视为挂死，触发 on_error / 进程恢复
 _PREVIEW_STDOUT_STALL_SEC = 15.0
 
@@ -290,6 +291,7 @@ class SharedRoomIngest:
         network_context: Mapping[str, object] | None = None,
         preview_queue_bytes: int = 2 * 1024 * 1024,
         preview_drop_policy: str = "drop_oldest",
+        recording_queue_bytes: int = 2 * 1024 * 1024,
     ):
         self.room_id = room_id
         self.url = url
@@ -297,6 +299,7 @@ class SharedRoomIngest:
         self.network_context = dict(network_context or {})
         self.preview_queue_bytes = max(1, int(preview_queue_bytes))
         self.preview_drop_policy = preview_drop_policy
+        self.recording_queue_bytes = max(1, int(recording_queue_bytes))
         self.is_stopped = False
         self.stop_reason = ""
         self.preview_error = ""
@@ -308,6 +311,8 @@ class SharedRoomIngest:
         self.last_init_segment: bytes | None = None
         self.preview_dropped_bytes = 0
         self.preview_dropped_batches = 0
+        self.recording_dropped_bytes = 0
+        self.recording_dropped_batches = 0
         # Monotonic media-progress counters used by runtime health and the
         # real-platform acceptance runner.  They are deliberately cumulative
         # for the room session so a sink restart cannot hide a stalled source.
@@ -317,10 +322,15 @@ class SharedRoomIngest:
 
         self._lock = threading.RLock()
         self._preview_condition = threading.Condition(self._lock)
+        self._recording_condition = threading.Condition(self._lock)
         self._preview_subscribers: list[PreviewSubscriber] = []
         self._error_callbacks: list[Callable[[str, str], None]] = []
         self._preview_ts_queue: deque[bytes] = deque()
         self._preview_queued_bytes = 0
+        self._recording_ts_queue: deque[bytes] = deque()
+        self._recording_queued_bytes = 0
+        self._recording_generation = 0
+        self._recording_overflow_since = 0.0
 
         self._process: _FfmpegProcess | None = None
         # Every upstream process owns a generation.  Reader/watchdog threads
@@ -354,6 +364,7 @@ class SharedRoomIngest:
         self._upstream_thread: threading.Thread | None = None
         self._upstream_watch_thread: threading.Thread | None = None
         self._recording_watch_thread: threading.Thread | None = None
+        self._recording_input_thread: threading.Thread | None = None
         self._preview_input_thread: threading.Thread | None = None
         self._preview_thread: threading.Thread | None = None
         self._preview_watch_thread: threading.Thread | None = None
@@ -864,7 +875,17 @@ class SharedRoomIngest:
             self.recording_active = True
             self.is_stopped = False
             self.stop_reason = ""
+            self._recording_generation += 1
+            recording_generation = self._recording_generation
+            self._recording_ts_queue.clear()
+            self._recording_queued_bytes = 0
+            self._recording_overflow_since = 0.0
         self._start_stderr_reader(proc, self._recording_stderr_buffer, "recording")
+        self._recording_input_thread = self._start_thread(
+            self._write_recording_input_loop,
+            (proc, recording_generation),
+            f"shared-recording-input-{self.room_id}",
+        )
         self._recording_watch_thread = self._start_thread(
             self._watch_recording_process_loop,
             (proc,),
@@ -1342,13 +1363,7 @@ class SharedRoomIngest:
         with self._lock:
             recording = self._recording_process if self.recording_active else None
         if recording is not None:
-            try:
-                self._write_all(recording, batch)
-            except Exception as exc:
-                self._handle_recording_process_exit(
-                    recording,
-                    f"recording ffmpeg input failed: {exc}",
-                )
+            self._enqueue_recording_ts(batch)
         self._enqueue_preview_ts(batch)
 
     @staticmethod
@@ -1401,6 +1416,74 @@ class SharedRoomIngest:
     def _record_preview_drop(self, size: int) -> None:
         self.preview_dropped_bytes += size
         self.preview_dropped_batches += 1
+
+    def _enqueue_recording_ts(self, batch: bytes) -> None:
+        overflow_proc = None
+        with self._recording_condition:
+            if self._recording_process is None or not self.recording_active:
+                return
+            batch_size = len(batch)
+            dropped = False
+            if batch_size > self.recording_queue_bytes:
+                self._record_recording_drop(batch_size)
+                dropped = True
+            else:
+                while (
+                    self._recording_ts_queue
+                    and self._recording_queued_bytes + batch_size > self.recording_queue_bytes
+                ):
+                    old = self._recording_ts_queue.popleft()
+                    self._recording_queued_bytes -= len(old)
+                    self._record_recording_drop(len(old))
+                    dropped = True
+                if self._recording_queued_bytes + batch_size > self.recording_queue_bytes:
+                    self._record_recording_drop(batch_size)
+                    dropped = True
+                else:
+                    self._recording_ts_queue.append(batch)
+                    self._recording_queued_bytes += batch_size
+                    self._recording_overflow_since = 0.0
+                    self._recording_condition.notify()
+                    return
+            now = time.monotonic()
+            if self._recording_overflow_since <= 0:
+                self._recording_overflow_since = now
+            elif now - self._recording_overflow_since >= _RECORDING_OVERFLOW_SEC:
+                overflow_proc = self._recording_process
+        if overflow_proc is not None:
+            self._handle_recording_process_exit(
+                overflow_proc,
+                "RECORDING_SINK_FAILURE: recording stdin queue overflow",
+            )
+
+    def _record_recording_drop(self, size: int) -> None:
+        self.recording_dropped_bytes += size
+        self.recording_dropped_batches += 1
+
+    def _write_recording_input_loop(self, proc: _FfmpegProcess, generation: int) -> None:
+        while True:
+            with self._recording_condition:
+                while (
+                    self._recording_process is proc
+                    and self._recording_generation == generation
+                    and not self._recording_ts_queue
+                ):
+                    self._recording_condition.wait()
+                if (
+                    self._recording_process is not proc
+                    or self._recording_generation != generation
+                ):
+                    return
+                batch = self._recording_ts_queue.popleft()
+                self._recording_queued_bytes -= len(batch)
+            try:
+                self._write_all(proc, batch)
+            except Exception as extra:
+                self._handle_recording_process_exit(
+                    proc,
+                    f"recording ffmpeg input failed: {extra}",
+                )
+                return
 
     def _write_preview_input_loop(self, proc: _FfmpegProcess) -> None:
         while True:
@@ -1541,13 +1624,17 @@ class SharedRoomIngest:
             time.sleep(0.25)
 
     def _handle_recording_process_exit(self, proc: _FfmpegProcess, error: str) -> None:
-        with self._lock:
+        with self._recording_condition:
             if self._recording_process is not proc:
                 return
             tail = self._stderr_tail(self._recording_stderr_buffer)
             self.recording_error = f"{error} | stderr: {tail}" if tail else error
             self._recording_process = None
             self.recording_active = False
+            self._recording_generation += 1
+            self._recording_ts_queue.clear()
+            self._recording_queued_bytes = 0
+            self._recording_condition.notify_all()
             segmented = self._recording_segmented
             manifest_store = self._recording_manifest_store
             segments_dir = self._recording_segments_dir
@@ -1638,10 +1725,14 @@ class SharedRoomIngest:
         self._stop_upstream_if_idle(reason=reason)
 
     def _stop_recording_process(self) -> None:
-        with self._lock:
+        with self._recording_condition:
             proc = self._recording_process
             self._recording_process = None
             self.recording_active = False
+            self._recording_generation += 1
+            self._recording_ts_queue.clear()
+            self._recording_queued_bytes = 0
+            self._recording_condition.notify_all()
             segmented = self._recording_segmented
             manifest_store = self._recording_manifest_store
             segments_dir = self._recording_segments_dir
@@ -1654,6 +1745,7 @@ class SharedRoomIngest:
                     segments_dir,
                     unclean=return_code not in (None, 0),
                 )
+        self._join_thread(self._recording_input_thread)
         self._join_thread(self._recording_watch_thread)
 
     @staticmethod
