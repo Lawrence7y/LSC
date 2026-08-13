@@ -168,3 +168,78 @@ def test_huya_eof_before_first_ts_invalidates_family():
     )
     assert recovery_action(info, "End of file", saw_first_ts=False) == "invalidate_family"
     assert recovery_action(info, "preview encoder failed", saw_first_ts=True) == "restart_preview_sink"
+
+
+def test_select_ingest_lease_does_not_require_probe_ok():
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import ResolveResult, StreamCandidate
+    from lsc.platforms.resolver import select_ingest_lease
+
+    caps = get_platform_capabilities("huya")
+    tx = StreamCandidate(
+        candidate_id="huya|source|0",
+        url="https://tx.flv.huya.com/src/a.flv?wsSecret=abc&wsTime=1",
+        quality_id="source",
+        cdn_id="tx",
+        protocol="flv",
+        signature_family_id="fam1",
+    )
+    al = StreamCandidate(
+        candidate_id="huya|al|1",
+        url="https://al.flv.huya.com/src/a.flv?wsSecret=abc&wsTime=1",
+        quality_id="al",
+        cdn_id="al",
+        protocol="flv",
+        signature_family_id="fam1",
+    )
+    result = ResolveResult(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        candidates=(al, tx),
+        capabilities=caps,
+        live_status="LIVE",
+    )
+    lease = select_ingest_lease(result, room_id="r1", lease_manager=LeaseManager(), now=0.0)
+    assert lease is not None
+    assert lease.candidate.cdn_id == "tx"
+    assert lease.probe_summary.get("mode") == "ingest"
+    assert lease.consumed is False
+
+
+def test_resolve_playable_lease_skips_probe_candidates_for_ingest(monkeypatch):
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import ResolveResult, StreamCandidate
+    from lsc.platforms.resolver import resolve_playable_lease
+
+    calls = {"n": 0}
+
+    def _boom(*_args, **_kwargs):
+        calls["n"] += 1
+        raise AssertionError("probe_candidates must not run for ingest-probe platforms")
+
+    monkeypatch.setattr("lsc.platforms.resolver.probe_candidates", _boom)
+    caps = get_platform_capabilities("huya")
+    candidate = StreamCandidate(
+        candidate_id="huya|source|0",
+        url="https://tx.flv.huya.com/src/a.flv?wsSecret=abc&wsTime=1",
+        quality_id="source",
+        cdn_id="tx",
+        protocol="flv",
+    )
+    result = ResolveResult(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        candidates=(candidate,),
+        capabilities=caps,
+        live_status="LIVE",
+    )
+    lease = resolve_playable_lease(
+        result,
+        room_id="r1",
+        lease_manager=LeaseManager(),
+        now=0.0,
+    )
+    assert lease is not None
+    assert calls["n"] == 0

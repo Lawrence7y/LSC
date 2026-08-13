@@ -21,6 +21,7 @@ from .douyu import DouyuAdapter
 from .generic import GenericPageAdapter
 from .huya import HuyaAdapter
 from .kuaishou import KuaishouAdapter
+from .redaction import redact_text, redact_url
 from .weibo import WeiboAdapter
 from .xiaohongshu import XiaohongshuAdapter
 
@@ -64,15 +65,20 @@ _URL_ROUTER: dict[str, tuple[str, ...]] = {
     "douyin.com": ("douyin",),
     "www.huya.com": ("huya",),
     "huya.com": ("huya",),
+    "m.huya.com": ("huya",),
     "live.kuaishou.com": ("kuaishou",),
     "kuaishou.com": ("kuaishou",),
+    "www.kuaishou.com": ("kuaishou",),
+    "v.kuaishou.com": ("kuaishou",),
     "www.douyu.com": ("douyu",),
     "douyu.com": ("douyu",),
+    "m.douyu.com": ("douyu",),
     "www.xiaohongshu.com": ("xiaohongshu",),
     "xhslink.com": ("xiaohongshu",),
     "weibo.com": ("weibo",),
     "www.weibo.com": ("weibo",),
     "live.weibo.com": ("weibo",),
+    "m.weibo.cn": ("weibo",),
 }
 
 
@@ -130,7 +136,7 @@ class _ParseCache:
                 if now > ts - 60:
                     return True
         except Exception as exc:
-            _log.debug("操作异常（已忽略）: %s", exc)
+            _log.debug("操作异常（已忽略）: %s", redact_text(exc))
         return False
 
     def _cleanup(self) -> None:
@@ -156,7 +162,7 @@ class _ParseCache:
                 self._cleanup()
             except Exception as exc:
                 # 清理失败不能静默：持续失败会导致缓存无限增长（内存泄漏）
-                _log.warning("cleanup worker error (cache may grow unbounded): %s", exc)
+                _log.warning("cleanup worker error (cache may grow unbounded): %s", redact_text(exc))
 
     def get(self, url: str, platform: str) -> StreamInfo | None:
         with self._lock:
@@ -185,7 +191,7 @@ class _ParseCache:
     def set(self, url: str, platform: str, info: StreamInfo) -> None:
         with self._lock:
             self._store[(url, platform)] = (time.monotonic(), info)
-        _log.debug("cached parse result for %s (%s) ttl=%.0fs", url[:60], platform, self._ttl_for(info))
+        _log.debug("cached parse result for %s (%s) ttl=%.0fs", redact_url(url)[:60], platform, self._ttl_for(info))
 
 
 _parse_cache = _ParseCache()
@@ -199,7 +205,7 @@ def _candidate_platforms_for_url(url: str) -> tuple[str, ...] | None:
     """
     try:
         parsed = urlparse((url or "").strip())
-        host = parsed.netloc.lower()
+        host = (parsed.hostname or parsed.netloc or "").lower()
         return _URL_ROUTER.get(host)
     except Exception:
         return None
@@ -277,11 +283,14 @@ def parse_stream(
     adapter_list = get_adapters(adapters)
 
     # Try host-based routing first to avoid probing irrelevant adapters.
+    # If the routed adapter rejects the path, continue with the remaining
+    # adapters so share/short links are not stuck as unsupported_url.
     candidate_platforms = _candidate_platforms_for_url(clean_url)
     if candidate_platforms is not None:
-        candidate_set = set(candidate_platforms)
-        candidates = [a for a in adapter_list if a.platform in candidate_set]
-        _log.debug("host routing matched %s for %s", candidate_platforms, clean_url[:60])
+        routed = set(candidate_platforms)
+        candidates = [a for a in adapter_list if a.platform in routed]
+        candidates.extend(a for a in adapter_list if a.platform not in routed)
+        _log.debug("host routing matched %s for %s", candidate_platforms, redact_url(clean_url)[:60])
     else:
         candidates = list(adapter_list)
         _log.debug("no host route match, scanning all %d adapters", len(candidates))
@@ -292,7 +301,7 @@ def parse_stream(
 
         cached = None if force_refresh else _parse_cache.get(clean_url, adapter.platform)
         if cached is not None:
-            _log.debug("Using cached parse result for %s via %s", clean_url, adapter.platform)
+            _log.debug("Using cached parse result for %s via %s", redact_url(clean_url), adapter.platform)
             return cached
 
         try:
@@ -302,13 +311,13 @@ def parse_stream(
                 platform=adapter.platform,
                 room_url=clean_url,
                 is_live=False,
-                error=f"解析失败: {exc}",
+                error=redact_text(f"解析失败: {exc}"),
                 error_code=ERROR_PARSE_FAILED,
             )
         _parse_cache.set(clean_url, adapter.platform, info)
         return info
 
-    _log.warning("no adapter could handle URL: %s", clean_url[:100])
+    _log.warning("no adapter could handle URL: %s", redact_url(clean_url)[:100])
     return StreamInfo(
         platform="unknown",
         room_url=clean_url,
@@ -348,3 +357,38 @@ def select_quality(info: StreamInfo | Mapping[str, object], quality_preset: str)
             return url, quality_key
     _log.debug("no quality matched preset '%s', falling back to '%s'", quality_preset, selected_quality)
     return stream_url, selected_quality
+
+
+def resolve_stream_v2(*args, **kwargs):
+    """Lazy Registry entry for the V2 compatibility resolver."""
+    from .resolver import resolve_stream_v2 as _resolve_stream_v2
+
+    return _resolve_stream_v2(*args, **kwargs)
+
+
+def probe_candidates(*args, **kwargs):
+    """Lazy Registry entry for bounded real-media probing."""
+    from .resolver import probe_candidates as _probe_candidates
+
+    return _probe_candidates(*args, **kwargs)
+
+
+def select_stream_lease(*args, **kwargs):
+    """Lazy Registry entry for selecting a lease after probing."""
+    from .resolver import select_stream_lease as _select_stream_lease
+
+    return _select_stream_lease(*args, **kwargs)
+
+
+def select_ingest_lease(*args, **kwargs):
+    """Lazy Registry entry for issuing a lease without a remote media probe."""
+    from .resolver import select_ingest_lease as _select_ingest_lease
+
+    return _select_ingest_lease(*args, **kwargs)
+
+
+def resolve_playable_lease(*args, **kwargs):
+    """Lazy Registry entry for ingest-or-probe lease selection."""
+    from .resolver import resolve_playable_lease as _resolve_playable_lease
+
+    return _resolve_playable_lease(*args, **kwargs)

@@ -268,6 +268,7 @@ class StreamLease:
     generation: int = 0
     invalidation_reason: str = ""
     probe_summary: Mapping[str, object] = field(default_factory=dict)
+    consumed: bool = False
 
     def redacted(self) -> dict[str, object]:
         return {
@@ -282,6 +283,7 @@ class StreamLease:
             "generation": self.generation,
             "invalidation_reason": self.invalidation_reason,
             "probe_summary": dict(self.probe_summary),
+            "consumed": self.consumed,
         }
 
     @property

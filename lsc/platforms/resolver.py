@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .candidate_health import CandidateHealthStore, get_default_candidate_health_store
-from .capabilities import get_platform_capabilities
+from .capabilities import get_platform_capabilities, uses_ingest_probe
 from .credentials import (
     CredentialContext,
     CredentialProvider,
@@ -800,10 +800,119 @@ def select_stream_lease(
     return lease
 
 
+def _ingest_candidate_blocked(
+    result: ResolveResult,
+    candidate: StreamCandidate,
+    room_id: str,
+) -> bool:
+    if str(result.platform or "").strip().lower() != "huya":
+        return False
+    from .huya import _is_cdn_blacklisted
+
+    return _is_cdn_blacklisted(
+        str(candidate.cdn_id or ""),
+        room_key=str(result.room_url or room_id or ""),
+    )
+
+
+def select_ingest_lease(
+    result: ResolveResult,
+    *,
+    room_id: str,
+    lease_manager: LeaseManager,
+    now: float | None = None,
+    requested_quality: str = "",
+) -> StreamLease | None:
+    """Issue a lease without opening the signed URL for a media probe."""
+    if not result.capabilities:
+        return None
+    candidates = [
+        item
+        for item in limit_probe_candidates(result.candidates, result.capabilities)
+        if item is not None and str(getattr(item, "url", "") or "").startswith(("http://", "https://"))
+        and not _ingest_candidate_blocked(result, item, room_id)
+    ]
+    if not candidates:
+        candidates = [
+            item
+            for item in result.candidates
+            if item is not None and str(getattr(item, "url", "") or "").startswith(("http://", "https://"))
+        ]
+    if requested_quality:
+        wanted = str(requested_quality).strip().lower()
+        matching = [
+            item
+            for item in candidates
+            if str(item.quality_id or "").strip().lower() == wanted
+            or str(item.quality_label or "").strip().lower() == wanted
+        ]
+        if matching:
+            candidates = matching
+    candidates.sort(
+        key=lambda item: (
+            str(item.cdn_id or "").strip().lower() == "al",
+            -float(item.confidence or 0.0),
+            int(item.priority or 0),
+        )
+    )
+    if not candidates:
+        return None
+    stamp = time.monotonic() if now is None else now
+    lease = lease_manager.issue(
+        room_id,
+        candidates[0],
+        result.capabilities,
+        now=stamp,
+    )
+    lease.probe_summary = {
+        "mode": "ingest",
+        "has_video": False,
+        "has_audio": False,
+        "timestamp_ok": False,
+        "cdn_id": candidates[0].cdn_id,
+    }
+    lease.consumed = False
+    return lease
+
+
+def resolve_playable_lease(
+    result: ResolveResult,
+    *,
+    room_id: str,
+    lease_manager: LeaseManager,
+    probes: Mapping[str, ProbeResult] | None = None,
+    now: float | None = None,
+    requested_quality: str = "",
+    probe_kwargs: Mapping[str, Any] | None = None,
+) -> StreamLease | None:
+    """Select a lease, skipping remote probes for ingest-probe platforms."""
+    if uses_ingest_probe(result.capabilities):
+        return select_ingest_lease(
+            result,
+            room_id=room_id,
+            lease_manager=lease_manager,
+            now=now,
+            requested_quality=requested_quality,
+        )
+    if probes is None:
+        limited = limit_probe_candidates(result.candidates, result.capabilities)
+        probes = probe_candidates(limited, **dict(probe_kwargs or {}))
+    return select_stream_lease(
+        result,
+        probes,
+        room_id=room_id,
+        lease_manager=lease_manager,
+        now=now,
+        requested_quality=requested_quality,
+    )
+
+
 __all__ = [
     "limit_probe_candidates",
     "probe_candidates",
     "resolve_candidates",
+    "resolve_playable_lease",
     "resolve_stream_v2",
+    "select_ingest_lease",
     "select_stream_lease",
 ]
