@@ -96,6 +96,7 @@ class LeaseManager:
         self._policy = policy or LeasePolicy()
         self._active: dict[str, StreamLease] = {}
         self._room_generations: dict[str, int] = {}
+        self._consumed_families: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -245,11 +246,22 @@ class LeaseManager:
         if lease is None:
             return False
         lease.consumed = True
+        family = str(getattr(lease.candidate, "signature_family_id", "") or "")
+        if not family:
+            from .signature_family import signature_family_id
+
+            family = signature_family_id(str(getattr(lease.candidate, "url", "") or ""))
+        if family:
+            self._consumed_families.add(family)
         return True
 
     def is_consumed(self, lease_id: str) -> bool:
         lease = self._active.get(lease_id)
         return bool(lease is not None and lease.consumed)
+
+    def is_family_consumed(self, family_id: str) -> bool:
+        family = str(family_id or "")
+        return bool(family) and family in self._consumed_families
 
     def drop(self, lease_id: str) -> None:
         self._active.pop(lease_id, None)

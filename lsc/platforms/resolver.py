@@ -800,11 +800,25 @@ def select_stream_lease(
     return lease
 
 
+def _candidate_signature_family_id(candidate: StreamCandidate) -> str:
+    family = str(getattr(candidate, "signature_family_id", "") or "")
+    if family:
+        return family
+    from .signature_family import signature_family_id as _signature_family_id
+
+    return _signature_family_id(str(getattr(candidate, "url", "") or ""))
+
+
 def _ingest_candidate_blocked(
     result: ResolveResult,
     candidate: StreamCandidate,
     room_id: str,
+    *,
+    lease_manager: LeaseManager | None = None,
 ) -> bool:
+    family = _candidate_signature_family_id(candidate)
+    if lease_manager is not None and family and lease_manager.is_family_consumed(family):
+        return True
     if str(result.platform or "").strip().lower() != "huya":
         return False
     from .huya import _is_cdn_blacklisted
@@ -830,13 +844,17 @@ def select_ingest_lease(
         item
         for item in limit_probe_candidates(result.candidates, result.capabilities)
         if item is not None and str(getattr(item, "url", "") or "").startswith(("http://", "https://"))
-        and not _ingest_candidate_blocked(result, item, room_id)
+        and not _ingest_candidate_blocked(
+            result, item, room_id, lease_manager=lease_manager
+        )
     ]
     if not candidates:
         candidates = [
             item
             for item in result.candidates
-            if item is not None and str(getattr(item, "url", "") or "").startswith(("http://", "https://"))
+            if item is not None
+            and str(getattr(item, "url", "") or "").startswith(("http://", "https://"))
+            and not lease_manager.is_family_consumed(_candidate_signature_family_id(item))
         ]
     if requested_quality:
         wanted = str(requested_quality).strip().lower()

@@ -89,6 +89,8 @@ def mark_failed_candidate(
     capabilities = get_platform_capabilities(platform)
     kind = classify_failure(str(error or ""))
     action = recovery_action(stream_info, error, saw_first_ts=saw_first_ts)
+    if action in {"restart_preview_sink", "restart_recording_sink"}:
+        return False
     if action == "invalidate_family":
         kind = FailureKind.SIGNATURE_EXPIRED
     url = str(getattr(stream_info, "stream_url", "") or "")

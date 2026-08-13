@@ -585,3 +585,149 @@ def test_acceptance_ingest_skips_remote_probe(monkeypatch):
     assert report.probe_count == 0
     assert report.selected_lease
     assert not any(item["code"] == "NO_PLAYABLE_CANDIDATE" for item in report.failures)
+
+
+def test_preview_encoder_failure_does_not_mark_cdn_or_family():
+    from lsc.platforms.base import StreamInfo
+    from lsc.platforms.huya import _is_cdn_blacklisted, clear_cdn_blacklist
+    from lsc.platforms.recovery_policy import mark_failed_candidate, recovery_action
+
+    clear_cdn_blacklist()
+    info = StreamInfo(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        stream_url="https://tx.flv.huya.com/src/live.flv?wsSecret=abc&wsTime=1",
+        raw={"v2": True, "candidate_id": "huya|source|0", "candidate_cdn_id": "tx"},
+    )
+    assert recovery_action(info, "preview encoder failed") == "restart_preview_sink"
+    assert recovery_action(info, "shared preview stdout stalled (15s)") == "restart_preview_sink"
+    assert mark_failed_candidate(info, "preview encoder failed") is False
+    assert not _is_cdn_blacklisted("tx", room_key="https://www.huya.com/1")
+    clear_cdn_blacklist()
+
+
+def test_huya_403_does_not_issue_sibling_cdn_with_same_secret():
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import ResolveResult, StreamCandidate
+    from lsc.platforms.resolver import select_ingest_lease
+    from lsc.platforms.signature_family import signature_family_id
+
+    caps = get_platform_capabilities("huya")
+    tx_url = "https://tx.flv.huya.com/src/a.flv?wsSecret=abc&wsTime=1"
+    al_url = "https://al.flv.huya.com/src/a.flv?wsSecret=abc&wsTime=1"
+    family = signature_family_id(tx_url)
+    result = ResolveResult(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        live_status="LIVE",
+        capabilities=caps,
+        candidates=(
+            StreamCandidate(
+                candidate_id="huya|source|0",
+                url=tx_url,
+                quality_id="source",
+                cdn_id="tx",
+                signature_family_id=family,
+            ),
+            StreamCandidate(
+                candidate_id="huya|al|1",
+                url=al_url,
+                quality_id="source",
+                cdn_id="al",
+                signature_family_id=family,
+            ),
+        ),
+    )
+    manager = LeaseManager()
+    lease = select_ingest_lease(result, room_id="r1", lease_manager=manager, now=0.0)
+    assert lease is not None
+    assert lease.candidate.cdn_id == "tx"
+    assert manager.mark_consumed(lease.lease_id) is True
+    next_lease = select_ingest_lease(result, room_id="r1", lease_manager=manager, now=1.0)
+    assert next_lease is None
+
+
+def test_huya_line_failure_allows_other_cdn_with_new_secret():
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.huya import clear_cdn_blacklist, mark_cdn_bad
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import ResolveResult, StreamCandidate
+    from lsc.platforms.resolver import select_ingest_lease
+
+    clear_cdn_blacklist()
+    mark_cdn_bad("tx", room_key="https://www.huya.com/1")
+    caps = get_platform_capabilities("huya")
+    result = ResolveResult(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        live_status="LIVE",
+        capabilities=caps,
+        candidates=(
+            StreamCandidate(
+                candidate_id="huya|source|0",
+                url="https://tx.flv.huya.com/src/a.flv?wsSecret=old&wsTime=1",
+                quality_id="source",
+                cdn_id="tx",
+                signature_family_id="old-family",
+            ),
+            StreamCandidate(
+                candidate_id="huya|hs|1",
+                url="https://hs.flv.huya.com/src/a.flv?wsSecret=new&wsTime=2",
+                quality_id="source",
+                cdn_id="hs",
+                signature_family_id="new-family",
+            ),
+        ),
+    )
+    lease = select_ingest_lease(
+        result, room_id="r1", lease_manager=LeaseManager(), now=0.0,
+    )
+    assert lease is not None
+    assert lease.candidate.cdn_id == "hs"
+    assert "wsSecret=new" in lease.candidate.url
+    clear_cdn_blacklist()
+
+
+def test_bilibili_resolve_playable_lease_still_probes(monkeypatch):
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import ProbeResult, ResolveResult, StreamCandidate
+    from lsc.platforms.resolver import resolve_playable_lease
+
+    calls = {"n": 0}
+
+    def fake_probe(candidates, **_kwargs):
+        calls["n"] += 1
+        item = candidates[0]
+        return {
+            item.candidate_id: ProbeResult(
+                item.candidate_id,
+                reachable=True,
+                has_video=True,
+                timestamp_ok=True,
+                protocol="flv",
+                container="flv",
+            )
+        }
+
+    monkeypatch.setattr("lsc.platforms.resolver.probe_candidates", fake_probe)
+    candidate = StreamCandidate(
+        candidate_id="bili|0",
+        url="https://example.com/live.flv",
+        quality_id="origin",
+        cdn_id="gotcha",
+    )
+    result = ResolveResult(
+        platform="bilibili",
+        room_url="https://live.bilibili.com/1",
+        live_status="LIVE",
+        capabilities=get_platform_capabilities("bilibili"),
+        candidates=(candidate,),
+    )
+    lease = resolve_playable_lease(
+        result, room_id="r1", lease_manager=LeaseManager(), now=0.0,
+    )
+    assert calls["n"] == 1
+    assert lease is not None
+    assert lease.candidate.candidate_id == "bili|0"
