@@ -247,6 +247,10 @@ class LeaseManager:
         lease.consumed = True
         return True
 
+    def is_consumed(self, lease_id: str) -> bool:
+        lease = self._active.get(lease_id)
+        return bool(lease is not None and lease.consumed)
+
     def drop(self, lease_id: str) -> None:
         self._active.pop(lease_id, None)
 

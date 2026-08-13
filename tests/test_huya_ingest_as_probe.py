@@ -365,3 +365,216 @@ def test_recording_stdin_backpressure_does_not_block_upstream_dispatch():
     ingest._dispatch_ts_batch(packet)
     ingest._dispatch_ts_batch(packet)
     assert time.monotonic() - started < 1.0
+
+
+def test_consumed_lease_cannot_open_again():
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import StreamCandidate
+
+    manager = LeaseManager()
+    caps = get_platform_capabilities("huya")
+    candidate = StreamCandidate(
+        candidate_id="huya|source|0",
+        url="https://tx.flv.huya.com/src/a.flv?wsSecret=abc&wsTime=1",
+    )
+    lease = manager.issue("r1", candidate, caps, now=0.0)
+    assert manager.mark_consumed(lease.lease_id) is True
+    assert manager.is_consumed(lease.lease_id) is True
+
+
+def test_ensure_upstream_marks_and_refuses_consumed_lease(monkeypatch):
+    from lsc.core.services.shared_ingest import SharedRoomIngest
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import StreamCandidate
+
+    class _LiveProc:
+        pid = 9
+        returncode = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    launched: list[list[str]] = []
+    ingest = SharedRoomIngest(room_id="r", url="https://example/live.flv?wsSecret=abc")
+    monkeypatch.setattr(ingest, "_launch_process", lambda cmd: launched.append(list(cmd)) or _LiveProc())
+    monkeypatch.setattr(ingest, "_start_stderr_reader", lambda *_a, **_k: None)
+    monkeypatch.setattr(ingest, "_start_thread", lambda *_a, **_k: None)
+    manager = LeaseManager()
+    lease = manager.issue(
+        "r",
+        StreamCandidate(candidate_id="huya|0", url=ingest.url),
+        get_platform_capabilities("huya"),
+        now=0.0,
+    )
+    ingest.bind_lease(manager, lease.lease_id)
+    assert ingest._ensure_upstream_started() == ""
+    assert manager.is_consumed(lease.lease_id) is True
+    ingest._process = None
+    error = ingest._ensure_upstream_started()
+    assert "consumed" in error.lower()
+    assert len(launched) == 1
+
+
+def test_same_wssecret_second_http_get_is_403():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.error import HTTPError
+    from urllib.parse import parse_qs, urlparse
+    from urllib.request import urlopen
+
+    counts: dict[str, int] = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            secret = (parse_qs(urlparse(self.path).query).get("wsSecret") or [""])[0]
+            counts[secret] = counts.get(secret, 0) + 1
+            if counts[secret] == 1:
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp2t")
+                self.end_headers()
+                self.wfile.write(b"\x47" * 188)
+                return
+            self.send_response(403)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/live.flv?wsSecret=abc&wsTime=1"
+        with urlopen(url, timeout=1) as response:
+            assert response.status == 200
+            assert response.read() == b"\x47" * 188
+        try:
+            urlopen(url, timeout=1)
+            raise AssertionError("second GET should be 403")
+        except HTTPError as exc:
+            assert exc.code == 403
+    finally:
+        server.shutdown()
+        thread.join(timeout=1)
+
+
+def test_ingest_path_then_one_open_matches_single_use_secret(monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.error import HTTPError
+    from urllib.parse import parse_qs, urlparse
+    from urllib.request import urlopen
+
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import ResolveResult, StreamCandidate
+    from lsc.platforms.resolver import resolve_playable_lease
+
+    counts: dict[str, int] = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            secret = (parse_qs(urlparse(self.path).query).get("wsSecret") or [""])[0]
+            counts[secret] = counts.get(secret, 0) + 1
+            if counts[secret] == 1:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"\x47" * 188)
+                return
+            self.send_response(403)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/live.flv?wsSecret=abc&wsTime=1"
+        calls = {"n": 0}
+
+        def _boom(*_a, **_k):
+            calls["n"] += 1
+            raise AssertionError("probe_candidates must not run")
+
+        monkeypatch.setattr("lsc.platforms.resolver.probe_candidates", _boom)
+        caps = get_platform_capabilities("huya")
+        result = ResolveResult(
+            platform="huya",
+            room_url="https://www.huya.com/1",
+            candidates=(
+                StreamCandidate(
+                    candidate_id="huya|source|0",
+                    url=url,
+                    quality_id="source",
+                    cdn_id="tx",
+                    protocol="flv",
+                ),
+            ),
+            capabilities=caps,
+            live_status="LIVE",
+        )
+        lease = resolve_playable_lease(
+            result, room_id="r1", lease_manager=LeaseManager(), now=0.0,
+        )
+        assert lease is not None
+        assert calls["n"] == 0
+        with urlopen(lease.candidate.url, timeout=1) as response:
+            assert response.status == 200
+        try:
+            urlopen(lease.candidate.url, timeout=1)
+            raise AssertionError("second open must 403")
+        except HTTPError as exc:
+            assert exc.code == 403
+    finally:
+        server.shutdown()
+        thread.join(timeout=1)
+
+
+def test_acceptance_ingest_skips_remote_probe(monkeypatch):
+    from lsc.platforms.acceptance import AcceptanceOptions, run_acceptance
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.models import ResolveResult, StreamCandidate
+
+    calls = {"n": 0}
+
+    def probe(*_args, **_kwargs):
+        calls["n"] += 1
+        raise AssertionError("probe_candidates must not run for ingest platforms")
+
+    result = ResolveResult(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        live_status="LIVE",
+        capabilities=get_platform_capabilities("huya"),
+        candidates=(
+            StreamCandidate(
+                candidate_id="huya|source|0",
+                url="https://tx.flv.huya.com/src/a.flv?wsSecret=abc&wsTime=1",
+                quality_id="source",
+                cdn_id="tx",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "lsc.platforms.acceptance._run_lifecycle",
+        lambda *_args, **_kwargs: {"status": "SKIPPED"},
+    )
+    report = run_acceptance(
+        AcceptanceOptions(source_url="https://www.huya.com/1"),
+        resolve_fn=lambda _request: result,
+        probe_fn=probe,
+    )
+    assert calls["n"] == 0
+    assert report.probe_count == 0
+    assert report.selected_lease
+    assert not any(item["code"] == "NO_PLAYABLE_CANDIDATE" for item in report.failures)

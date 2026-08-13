@@ -377,6 +377,8 @@ class SharedRoomIngest:
         # Bytes read while preflighting a replacement upstream are handed to
         # the normal generation-checked reader instead of being discarded.
         self._upstream_prefetch: dict[int, bytes] = {}
+        self._lease_manager = None
+        self._bound_lease_id = ""
 
     @property
     def preview_subscribers(self) -> int:
@@ -405,6 +407,27 @@ class SharedRoomIngest:
     def upstream_generation(self) -> int:
         with self._lock:
             return self._upstream_generation
+
+    def bind_lease(self, manager, lease_id: str) -> None:
+        self._lease_manager = manager
+        self._bound_lease_id = str(lease_id or "")
+
+    def _lease_is_consumed(self) -> bool:
+        manager = self._lease_manager
+        lease_id = self._bound_lease_id
+        if manager is None or not lease_id:
+            return False
+        checker = getattr(manager, "is_consumed", None)
+        return bool(callable(checker) and checker(lease_id))
+
+    def _consume_bound_lease(self) -> None:
+        manager = self._lease_manager
+        lease_id = self._bound_lease_id
+        if manager is None or not lease_id:
+            return
+        marker = getattr(manager, "mark_consumed", None)
+        if callable(marker):
+            marker(lease_id)
 
     @property
     def recording_size_bytes(self) -> int:
@@ -1059,7 +1082,10 @@ class SharedRoomIngest:
             self.handle_upstream_error(error, current)
             return error
 
+        if self._lease_is_consumed():
+            return "signed lease already consumed"
         command = self.build_upstream_command()
+        self._consume_bound_lease()
         try:
             proc = self._launch_process(command)
         except Exception as exc:
@@ -1173,6 +1199,8 @@ class SharedRoomIngest:
         network_context: Mapping[str, object] | None = None,
     ) -> tuple[_FfmpegProcess | None, bytes, str]:
         """Start a candidate upstream and require a valid MPEG-TS packet."""
+        if self._lease_is_consumed():
+            return None, b"", "signed lease already consumed"
         with self._lock:
             old_url, old_headers, old_context = self.url, self.headers, self.network_context
             self.url = str(url or "")
@@ -1182,6 +1210,7 @@ class SharedRoomIngest:
                 command = self.build_upstream_command()
             finally:
                 self.url, self.headers, self.network_context = old_url, old_headers, old_context
+        self._consume_bound_lease()
         try:
             candidate = self._launch_process(command)
         except Exception as exc:

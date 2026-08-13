@@ -2778,6 +2778,11 @@ class RoomOrchestrator:
                         expires_at=getattr(lease, "expires_at", None),
                         refresh_at=getattr(lease, "refresh_at", None),
                     )
+                    ingest = getattr(supervisor, "ingest", None)
+                    bind_lease = getattr(ingest, "bind_lease", None)
+                    lease_manager = self._lease_managers.get(room.room_id)
+                    if callable(bind_lease) and lease_manager is not None:
+                        bind_lease(lease_manager, getattr(lease, "lease_id", ""))
                 # A refreshed lease must replace the remote upstream before a
                 # new recording sink is attached.  Keep an existing preview
                 # subscriber alive while the shared ingest swaps processes;

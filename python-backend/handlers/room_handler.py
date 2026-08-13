@@ -695,6 +695,17 @@ def _configure_shared_preview_quality(shared_ingest, data: dict | None = None) -
     shared_ingest.configure_preview(**filtered)
 
 
+def _bind_shared_ingest_lease(mgr, room_id: str, ingest) -> None:
+    bind = getattr(ingest, "bind_lease", None)
+    if ingest is None or not callable(bind):
+        return
+    lease = getattr(mgr, "_stream_leases", {}).get(room_id)
+    lease_manager = getattr(mgr, "_lease_managers", {}).get(room_id)
+    if lease is None or lease_manager is None:
+        return
+    bind(lease_manager, getattr(lease, "lease_id", ""))
+
+
 # 正在启动 MSE 的 room_id 集合，防止启动过程中重复请求
 _mse_starting: set[str] = set()
 _mse_starting_lock = threading.Lock()
@@ -5196,6 +5207,7 @@ def register_room_handlers(server, bridge):
                                 url=stream_url,
                                 headers=snapshot.get('headers') or {},
                             )
+                            _bind_shared_ingest_lease(mgr, room_id, shared_ingest)
 
                         if getattr(shared_ingest, 'process_id', None) is None or getattr(shared_ingest, 'is_stopped', True):
                             preview_params = _compute_preview_quality_params(data)
@@ -5235,6 +5247,7 @@ def register_room_handlers(server, bridge):
                                                 url=retry_url,
                                                 headers=retry_snapshot.get('headers') or {},
                                             )
+                                            _bind_shared_ingest_lease(mgr, room_id, shared_ingest)
                                             shared_ingest.configure_preview(**filtered)
                                             result = shared_ingest.start_preview(**filtered)
                                 if not (getattr(result, 'accepted', False) or getattr(result, 'ok', False)):
