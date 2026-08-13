@@ -13,6 +13,7 @@ from threading import Lock, Thread
 
 from lsc import get_logger
 from lsc.config import LscConfig
+from lsc.platforms.redaction import redact_text
 
 _log = get_logger(__name__)
 
@@ -45,7 +46,7 @@ def _friendly_ffmpeg_message(exit_code: int, stderr_tail: str) -> str:
     # is_recoverable_error 只能看到笼统的 "(code 0)"，把可恢复的流中断
     # 误判为不可恢复，既不重连也不拉黑虎牙 CDN 线路。
     if stderr_tail:
-        snippet = stderr_tail.strip().replace("\n", " ")[:200]
+        snippet = redact_text(stderr_tail.strip().replace("\n", " ")[:200])
         return f"FFmpeg 异常退出 (code {exit_code})，{snippet}"
     return f"FFmpeg 异常退出 (code {exit_code})"
 
@@ -156,6 +157,7 @@ class StreamCapture:
         self.ffmpeg = config.ffmpeg_path
         self._lock = Lock()
         self._process: subprocess.Popen | None = None
+        self._generation = 0
         self._status = CaptureStatus.IDLE
         self._output_path = ""
         self._start_time = 0.0
@@ -443,6 +445,7 @@ class StreamCapture:
             set_stream_nonblocking(proc.stderr)
             with self._lock:
                 self._process = proc
+                self._generation += 1
                 self._output_path = output_path
                 self._start_time = time.time()
                 self._last_file_size = 0
@@ -482,16 +485,17 @@ class StreamCapture:
             if self._status != CaptureStatus.RECORDING or not self._process:
                 return
             self._status = CaptureStatus.STOPPING
+            generation = self._generation
 
         def _stop_in_background() -> None:
             try:
-                self.stop()
+                self.stop(generation=generation)
             except Exception as exc:
                 _log.error("Async stop failed: %s", exc)
 
         Thread(target=_stop_in_background, daemon=True).start()
 
-    def stop(self) -> CaptureResult:
+    def stop(self, generation: int | None = None) -> CaptureResult:
         """停止当前录制，采用三级优雅停止策略。
 
         三级停止机制确保 FFmpeg 有充分机会完成文件写入和元数据刷新：
@@ -510,7 +514,10 @@ class StreamCapture:
         with self._lock:
             if self._status not in (CaptureStatus.RECORDING, CaptureStatus.STOPPING) or not self._process:
                 return CaptureResult(False, "", error="Not recording")
+            if generation is not None and self._generation != generation:
+                return CaptureResult(True, self._output_path)
             proc = self._process
+            generation = self._generation
 
         _log.info("Stopping capture...")
         orphaned_pid: int | None = None
@@ -562,17 +569,22 @@ class StreamCapture:
                         orphaned_pid_final,
                     )
                     # 标记孤儿进程，防止外部停止循环反复重试
-                    self._terminated_with_orphan = True
+                    if self._generation == generation:
+                        self._terminated_with_orphan = True
 
         duration = self.duration
         output_path = ""
         with self._lock:
-            proc = self._process
-            self._process = None
+            superseded = self._generation != generation
+            if not superseded and self._process is proc:
+                self._process = None
             output_path = self._output_path
 
-        # 关闭所有管道，防止文件描述符泄漏
+        # Close pipes of the process this stop() actually waited on.
         self._close_proc_pipes(proc)
+
+        if superseded:
+            return CaptureResult(True, output_path)
 
         self._release_stderr_executor_once()
 
@@ -620,6 +632,14 @@ class StreamCapture:
             self._set_status(CaptureStatus.ERROR)
             return exit_code
         return None
+
+    def crash_message(self, exit_code: int) -> str:
+        """将 FFmpeg 异常退出码 + stderr 尾部映射为带可恢复特征的文案。
+
+        保留 stderr 中的 403/鉴权/I/O error 特征，供下游 is_recoverable_error
+        与 _mark_failed_cdn_if_huya 正确触发换线重连（而非只看到笼统的 code）。
+        """
+        return _friendly_ffmpeg_message(exit_code, self.stderr_tail)
 
     @staticmethod
     def _close_proc_pipes(proc: subprocess.Popen | None) -> None:

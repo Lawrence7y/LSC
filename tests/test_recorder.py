@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from collections import deque
 from unittest.mock import MagicMock
 
@@ -67,6 +68,31 @@ class TestStreamCaptureExtended:
         capture._status = CaptureStatus.ERROR
         result = capture.stop()
         assert not result.success
+
+    def test_stop_does_not_close_a_newer_generation(self, capture):
+        old = MagicMock()
+        old.poll.return_value = None
+        old.stdin = MagicMock()
+        old.pid = 111
+        new = MagicMock()
+        new.poll.return_value = None
+        new.stdin = MagicMock()
+        new.pid = 222
+        capture._status = CaptureStatus.STOPPING
+        capture._process = old
+        capture._generation = 1
+        capture._output_path = "x.mp4"
+
+        def fake_wait(timeout):
+            capture._process = new
+            capture._generation = 2
+            capture._status = CaptureStatus.RECORDING
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout)
+
+        old.wait.side_effect = fake_wait
+        capture.stop()
+        assert capture._process is new
+        new.stdin.close.assert_not_called()
 
     def test_check_health_reports_stall_after_six_static_size_checks(self, capture, tmp_path):
         output = tmp_path / "stalled.mp4"
@@ -184,3 +210,18 @@ class TestStderrDiagnostics:
 
         assert "直播流鉴权失败" in message
         assert "403" in message
+
+    def test_crash_message_preserves_403_stderr(self, sample_config):
+        """crash_message 保留 stderr 尾部，供下游识别可恢复 403（回归 #3a）。"""
+        capture = StreamCapture(sample_config)
+        capture._status = CaptureStatus.RECORDING
+        capture._process = MagicMock()
+        capture._process.poll.return_value = 0
+        capture._stderr_tail = deque(
+            ["Server returned 403 Forbidden for stream request"],
+            maxlen=80,
+        )
+
+        message = capture.crash_message(0)
+
+        assert "直播流鉴权失败" in message
