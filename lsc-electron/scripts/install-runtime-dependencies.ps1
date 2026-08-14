@@ -11,6 +11,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ── 国内镜像配置 ──────────────────────────────────────────────────────
+# pypi 走清华镜像（国内直连 pypi 官方极慢/易超时）
+$PipIndexUrl = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+# FFmpeg 走 GitHub 加速代理回退链（按顺序尝试，全部失败才报错）
+$FfmpegUrls = @(
+    'https://ghfast.top/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip',
+    'https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip',
+    'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
+)
+
 # Use the interactive user's Roaming AppData, matching Electron userData.
 $appData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
 $runtimeHome = Join-Path $appData 'lsc-electron'
@@ -40,6 +50,7 @@ try {
         --python $PythonExe `
         --target $packageDir `
         --torch-backend cpu `
+        --index-url $PipIndexUrl `
         --requirements $Requirements `
         --requirements $RequirementsAi 2>&1 | ForEach-Object {
             $_ | Out-File -FilePath $logPath -Encoding utf8 -Append
@@ -67,6 +78,7 @@ try {
         --python $PythonExe `
         --target $packageDir `
         --upgrade `
+        --index-url $PipIndexUrl `
         --reinstall-package onnxruntime-directml `
         'onnxruntime-directml>=1.18,<2' 2>&1 | ForEach-Object {
             $_ | Out-File -FilePath $logPath -Encoding utf8 -Append
@@ -91,9 +103,24 @@ try {
     if (-not (Test-Path $ffmpegExe) -or -not (Test-Path $ffprobeExe)) {
         $ffmpegZip = Join-Path $env:TEMP 'lsc-ffmpeg.zip'
         $ffmpegExtract = Join-Path $env:TEMP 'lsc-ffmpeg-extract'
-        Invoke-WebRequest -UseBasicParsing `
-            -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip' `
-            -OutFile $ffmpegZip
+        # 国内镜像链下载：加速代理优先，GitHub 直连兜底
+        $downloaded = $false
+        foreach ($ffUrl in $FfmpegUrls) {
+            try {
+                "Downloading FFmpeg from: $ffUrl" | Out-File -FilePath $logPath -Encoding utf8 -Append
+                Invoke-WebRequest -UseBasicParsing -Uri $ffUrl -OutFile $ffmpegZip -TimeoutSec 300
+                if ((Get-Item -LiteralPath $ffmpegZip).Length -gt 1MB) {
+                    $downloaded = $true
+                    break
+                }
+                "FFmpeg download too small, trying next mirror..." | Out-File -FilePath $logPath -Encoding utf8 -Append
+            } catch {
+                "FFmpeg mirror failed ($ffUrl): $_" | Out-File -FilePath $logPath -Encoding utf8 -Append
+            }
+        }
+        if (-not $downloaded) {
+            throw 'FFmpeg download failed (all mirrors and official source tried)'
+        }
         if (Test-Path $ffmpegExtract) {
             Remove-Item -LiteralPath $ffmpegExtract -Recurse -Force
         }

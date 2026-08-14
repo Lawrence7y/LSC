@@ -66,11 +66,20 @@ os.environ["PYTHONPATH"] = os.pathsep.join(
     part for part in (_site_packages_text, _existing_pythonpath) if part
 )
 
-# FFmpeg 下载源（BtbN GPL shared build）
-_FFMPEG_URL = (
+# FFmpeg 下载源：GitHub 加速代理回退链（国内直连 GitHub 极慢/易超时）
+# ghfast.top → gh-proxy.com → GitHub 直连兜底
+_FFMPEG_URLS = [
+    "https://ghfast.top/https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+    "latest/ffmpeg-master-latest-win64-gpl-shared.zip",
+    "https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+    "latest/ffmpeg-master-latest-win64-gpl-shared.zip",
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/"
-    "latest/ffmpeg-master-latest-win64-gpl-shared.zip"
-)
+    "latest/ffmpeg-master-latest-win64-gpl-shared.zip",
+]
+_FFMPEG_URL = _FFMPEG_URLS[-1]  # 兼容旧引用（单 URL）
+
+# Python 包国内镜像（pypi 官方在国内极慢/易超时）
+_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # ──────────────────────────────────────────────────────────────────────
 # 进度报告
@@ -295,6 +304,7 @@ def _pip_install_requirements(requirements_path: Path, phase_name: str) -> bool:
         python_exe, "-c", pip_runner, "install",
         "--no-warn-script-location",
         "--use-feature=truststore",
+        "--index-url", _PIP_INDEX_URL,
         "--target", str(_SITE_PACKAGES),
         "-r", str(requirements_path),
     ]
@@ -386,6 +396,7 @@ def _install_windows_directml(phase_name: str) -> bool:
         _get_python_exe(), "-c", pip_runner, "install",
         "--no-warn-script-location",
         "--use-feature=truststore",
+        "--index-url", _PIP_INDEX_URL,
         "--target", str(_SITE_PACKAGES),
         "--upgrade",
         "--force-reinstall",
@@ -490,7 +501,7 @@ def download_ffmpeg() -> bool:
     zip_path = tmp_dir / "ffmpeg.zip"
 
     try:
-        # 下载
+        # 下载（镜像回退链）
         _emit_progress(phase, 0, 100, "正在下载 FFmpeg...")
 
         def _progress_hook(block_num: int, block_size: int, total_size: int) -> None:
@@ -498,7 +509,23 @@ def download_ffmpeg() -> bool:
                 percent = min(block_num * block_size / total_size * 100, 99)
                 _emit_progress(phase, int(percent), 100, f"下载中... {percent:.0f}%")
 
-        urllib.request.urlretrieve(_FFMPEG_URL, zip_path, reporthook=_progress_hook)
+        last_error: Exception | None = None
+        for url in _FFMPEG_URLS:
+            try:
+                urllib.request.urlretrieve(url, zip_path, reporthook=_progress_hook)
+                if zip_path.stat().st_size > 1024 * 1024:  # 至少 1MB，过滤错误页
+                    break
+                last_error = RuntimeError(f"下载内容过小: {zip_path.stat().st_size} bytes")
+                zip_path.unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                _emit_progress(phase, 0, 100, f"镜像不可用，尝试下一个源: {url}")
+                try:
+                    zip_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            raise RuntimeError(f"全部下载源失败: {last_error}")
         _emit_progress(phase, 99, 100, "下载完成，正在解压...")
 
         # 解压
