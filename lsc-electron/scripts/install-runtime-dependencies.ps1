@@ -41,6 +41,43 @@ $env:UV_LINK_MODE = 'copy'
 "Packages: $packageDir" | Out-File -FilePath $logPath -Encoding utf8 -Append
 
 try {
+    # ── VC++ 2015-2022 运行库检测与安装 ────────────────────────────────
+    # torch / numpy / onnxruntime 的 C 扩展 DLL 都依赖 msvcp140/vcruntime140。
+    # 干净/精简的 Windows（尤其是虚拟机）通常没有 → DLL load failed。
+    # 检测注册表，缺失则静默安装 vc_redist.x64.exe（微软官方 CDN）。
+    $vcKey = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'
+    $vcInstalled = $false
+    try {
+        $vcInfo = Get-ItemProperty -Path $vcKey -ErrorAction Stop
+        if ($vcInfo.Version) { $vcInstalled = $true }
+    } catch {
+        $vcInstalled = $false
+    }
+    if (-not $vcInstalled) {
+        "VC++ 2015-2022 runtime NOT detected, installing..." | Out-File -FilePath $logPath -Encoding utf8 -Append
+        Write-Host "VC++ runtime not found, installing..."
+        $vcRedist = Join-Path $env:TEMP 'lsc-vc_redist.x64.exe'
+        try {
+            Invoke-WebRequest -UseBasicParsing `
+                -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' `
+                -OutFile $vcRedist -TimeoutSec 300
+            $vcProc = Start-Process -FilePath $vcRedist `
+                -ArgumentList '/install','/quiet','/norestart' `
+                -Verb RunAs -Wait -PassThru
+            $vcExit = $vcProc.ExitCode
+            # 3010 = 安装成功需重启；0 = 成功
+            if ($vcExit -eq 0 -or $vcExit -eq 3010) {
+                "VC++ runtime installed (exit $vcExit)" | Out-File -FilePath $logPath -Encoding utf8 -Append
+            } else {
+                "VC++ runtime install failed (exit $vcExit), continuing anyway" | Out-File -FilePath $logPath -Encoding utf8 -Append
+            }
+        } catch {
+            "VC++ runtime install error: $_" | Out-File -FilePath $logPath -Encoding utf8 -Append
+        }
+    } else {
+        "VC++ 2015-2022 runtime already present: $($vcInfo.Version)" | Out-File -FilePath $logPath -Encoding utf8 -Append
+    }
+
     # uv writes normal status output to stderr. PowerShell 5.1 must not promote
     # those lines to terminating NativeCommandError exceptions.
     $ErrorActionPreference = 'Continue'
