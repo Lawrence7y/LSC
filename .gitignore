@@ -121,6 +121,7 @@ verify_fixes.py
 # Screenshots & visual audit artifacts (root-level)
 *.png
 !docs/**/*.png
+!lsc-v5-*.png
 verify_output/
 docs/_test_shots/
 

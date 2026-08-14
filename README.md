@@ -1,378 +1,330 @@
-# Live Stream Clipper (LSC 直播切片)
+# 🎬 Live Stream Clipper (LSC 直播切片)
 
-基于 **Electron + React + TypeScript + Python** 的多直播间录制切片系统。面向电竞 / 直播多视角场景，提供多路同步录制、低延迟预览、墙钟精确切片、音频对齐批量导出，以及无畏契约等场景的持续高光分析。
+> 多直播间**录制 + 切片**一体化工具 —— 同时录制多视角直播，跨房间同步预览，一键标记、对齐、批量导出精彩片段。
 
-当前版本：**v3.0.21**
+![version](https://img.shields.io/badge/version-v3.0.22-31B3AE)
+![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
+![license](https://img.shields.io/badge/license-GPL%20v2-blue)
+![frontend](https://img.shields.io/badge/frontend-Electron%20%2B%20React%20%2B%20TypeScript-61DAFB)
+![backend](https://img.shields.io/badge/backend-Python%20%2B%20FFmpeg-3776AB)
 
-仓库：[https://github.com/Lawrence7y/LSC](https://github.com/Lawrence7y/LSC)
+面向电竞 / 多视角直播场景：支持 **12 路并发录制**、**4 路并发预览**、墙钟精确切片、音频互相关多视角对齐，以及无畏契约（Valorant）等场景的 **AI 持续高光分析**，可一键生成剪映草稿继续精剪。
 
-> 安装包在安装过程中联网下载运行依赖（国内镜像），安装完成即可使用，无需首次启动再下载。
+📦 下载安装包：[GitHub Releases](https://github.com/Lawrence7y/LSC/releases) · 📖 隐私说明：[PRIVACY.md](./PRIVACY.md)
 
 ---
 
-## 1. 产品定位
+## 📸 界面预览
 
-LSC 是一款 **直播录制 + 快速切片工具**，不是 NLE 剪辑软件。
+### 多房间工作台
 
-**核心目标：**
+多房间卡片（预览 / 录制状态 / 画质 / 时长）、底部同步时间线、右侧 AI 高光切片列表、左上角批量操作与系统资源监控：
 
-| 目标 | 说明 |
+![多房间工作台](./lsc-v5-workbench.png)
+
+### 设置中心
+
+通用 / 预览体验 / 录制与编码 / AI 分析 / 存储与草稿 / 平台账号 / 快捷键 / 关于与更新 / 日志，全部可视化配置：
+
+![设置中心](./lsc-v5-settings.png)
+
+### 全屏预览
+
+沉浸式全屏观看 + 画质切换 + 音量控制：
+
+![全屏预览](./lsc-v5-fullscreen.png)
+
+---
+
+## ✨ 特性总览
+
+| 特性 | 说明 |
 | :--- | :--- |
-| 多路同步录制 | 最多 **12 路** 并发录制，适配多主播 / 多视角同场 |
-| 跨房同步预览 | 最多 **4 路** MSE 预览，统一时间线标记入出点 |
-| 精确切片导出 | 墙钟时间映射到录制文件，亚毫秒级对齐能力 |
-| 一键多视角导出 | 预览流音频互相关对齐后，批量导出对齐片段 |
-| 持续高光分析 | Valorant 回合切割 / 通用场景检测，入列后人工确认再导出 |
-
-**明确不做：**
-
-- 多轨道非线性编辑（视频 / 音频 / 字幕轨）
-- 特效、转场、调色、字幕轨编排
-- 实时直播推流
+| 🎥 **多路并发录制** | 最多 **12 路** 同时录制；`copy` 直拷或 libx264 / NVENC / QSV / AMF 编码；断流自动重连 |
+| 📺 **低延迟预览** | 最多 **4 路** MSE（fMP4）并发预览，压力升高自动降分辨率 / 帧率 |
+| 🎯 **精确切片** | 按 `i` / `o` 标记入出点，墙钟时间映射录制文件，亚毫秒级对齐能力 |
+| 🔀 **多视角一键对齐** | 预览流音频 FFT 互相关对齐，批量导出画面内容同步的多视角切片 |
+| 🤖 **AI 持续高光分析** | Valorant 回合自动切割（OCR 权威边界），副房时间映射，人工确认后导出 |
+| ✂️ **剪映衔接** | 一键生成剪映草稿（.draft），无缝继续精剪 |
+| 📱 **竖屏导出** | 9:16 letterbox 等比缩放 + 补黑边，保留完整画面 |
+| 🌐 **多平台支持** | 抖音 / B站 / 虎牙 / 斗鱼 / 快手 / 小红书 / 微博 / 直链 / 通用页面 |
+| 🔐 **本地优先** | 无账户、无遥测，所有数据本地存储，敏感信息自动脱敏 |
 
 ---
 
-## 2. 核心设计理念
+## 🚀 快速开始
 
-### 2.1 三层分层架构
+### 方式一：安装包（推荐）
 
-```
-+----------------------------------------------------------------------------------+
-| 1. 前端层 (Electron Render)                                                      |
-|    React + TypeScript + Vite + Ant Design + Zustand                              |
-|    职责：工作台 UI、MSE 预览、快捷键、切片列表、导出队列、持续分析进度             |
-+----------------------------------------------------------------------------------+
-                                      │ WebSocket (localhost:9876，端口可回退)
-+----------------------------------------------------------------------------------+
-| 2. 桥接服务层 (Python Backend)                                                   |
-|    编排线程（RoomOrchestrator）+ WebSocket 工作线程                              |
-|    职责：orchestrator.call 同步调用 + BroadcastHub 线程安全广播、房间/录制/导出/分析生命周期管理 |
-+----------------------------------------------------------------------------------+
-                                      │ 线程安全队列 / 广播
-+----------------------------------------------------------------------------------+
-| 3. 核心业务层 (lsc Python 包)                                                    |
-|    平台解析、FFmpeg 录制/导出、MSE 转码、音频对齐、回合/OCR 分析管线               |
-+----------------------------------------------------------------------------------+
-```
+1. 从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `LSC 直播切片系统 Setup x.y.z.exe`
+2. 运行安装 —— 安装过程中自动下载运行依赖（国内镜像加速），自动检测 / 升级 VC++ 运行库
+3. 首次启动即可使用；若机器不支持 DirectML（如虚拟机），AI 分析自动降级 CPU，不影响录制
 
-### 2.2 三条时间路径汇合（切片精度的根基）
+### 方式二：开发模式
 
-切片准确性依赖三条独立路径，通过 `time.monotonic()` 单调时钟统一对齐：
-
-1. **预览流**：独立 FFmpeg → MSE → `<video>`，用于观看与音频对齐（产出 `content_offset`）
-2. **标记路径**：用户按 `i` / `o` 时记录 `mark_in/out_wallclock`（墙钟基准）
-3. **录制流**：独立 FFmpeg → 磁盘文件，启动时记录 `recording_start_mono`
-
-导出映射：
-
-```text
-export_start = mark_in_wallclock - recording_start_mono - content_offset
-export_end   = mark_out_wallclock - recording_start_mono - content_offset
-```
-
-> 禁止把前端 MSE `currentTime` 直接当作 FFmpeg `-ss`。预览与录制是独立拉流，存在不定延迟。
-
-### 2.3 预览 / 录制双模式
-
-| 模式 | 配置 | 行为 |
-| :--- | :--- | :--- |
-| 独立双进程（默认） | `shared_ingest_enabled=false` | 预览与录制各一条 CDN 连接、各一个 FFmpeg，互不牵连 |
-| 共享进样 | `shared_ingest_enabled=true` | 一个远端上游 FFmpeg + 独立录制/预览 sink；共享连接但故障隔离 |
-
-共享进样的当前实现是一个远端上游 FFmpeg 加独立录制/预览 sink；录制 sink 与预览 sink 可分别停止和恢复。旧版“单 FFmpeg 双输出”仅是历史描述，运行时契约以 `SharedRoomIngest`/`IngestSupervisor` 为准。
-
-### 2.4 时间线三坐标系契约
-
-| 坐标系 | 典型来源 | 用途 |
-| :--- | :--- | :--- |
-| `preview_local` | MSE `currentTime` | 单房预览播放头 |
-| `common` | 对齐后的公共轴 | 多房同步进度条 / 公共标记 |
-| `recording_local` | 录制文件秒 / 墙钟差 | 导出映射、分析进度 |
-
-进度条 `windowStart` **禁止**用 `record_started_at` 或 `recorded_duration` 直接参与，避免录制已久、预览较晚时播放头被钳到 0%。
-
----
-
-## 3. 已实现功能一览
-
-### 3.1 多房间工作台
-
-- 房间添加 / 连接 / 批量开停录制（最多 12 路）
-- 房间卡片：预览、静音、画质、放大预览、录制状态
-- 多选目标房：同步分析、同步导出、对齐组
-- Dashboard / 工作台 / 设置页切换（`Ctrl+1/2/3`）
-- 亮色 / 暗色主题；v3 起工作台以浅色 + 品牌色 `#31B3AE` 收敛 UI 溢出与布局
-
-### 3.2 实时预览（MSE fMP4）
-
-- 浏览器原生 `<video>` + Media Source Extensions 播放
-- 后端 FFmpeg 输出 fragmented MP4（`empty_moov+default_base_moof+frag_keyframe`）
-- 最多 4 路并发预览；压力升高时自动降分辨率 / 帧率
-- `mse_init` 竞态补发：`request_mse_init` + `replay_init`
-- 预览源切换（直播 / 录制回看）时重建播放器，避免丢弃新 init
-- 断线队列策略：可安全重放消息入队，热路径消息不堆积
-
-### 3.3 录制引擎
-
-- FFmpeg 录制：`copy` 直拷或 `libx264` / NVENC / QSV / AMF
-- 磁盘满保护：剩余空间 < 2GB 强制安全停录
-- 录制文件三层校验：路径存在、体积 > 0.1MB、格式头（MP4/FLV/MKV）
-- 可恢复网络错误自动重连；权限 / 磁盘类错误不重连
-- 共享进样模式下录制故障与预览统一错误广播
-
-### 3.4 切片与导出
-
-- `i` / `o` 标记入出点（墙钟 + 预览时间）
-- 切片列表：手动切片 + AI 高光入列
-- AI 回合默认 **待确认**（`confirm_status=pending`），不自动 FFmpeg 导出
-- 精修：拖时间线调入出点 → 确认 / 确认并导出
-- 全局导出队列：并发上限 1 或 2（`export_max_concurrent`）
-- 支持转码、直拷、竖屏 9:16 裁剪、缩略图
-- 导出失败友好中文提示；提交失败回滚「排队中」状态，避免按钮永久灰掉
-
-### 3.5 多房间音频对齐
-
-- 前端从各房预览 `<video>` 捕获约 **8 秒** PCM（Web Audio / AudioWorklet，16kHz）
-- 后端 FFT 互相关计算 `content_offset`，置信度 < 0.3 不写入对齐组（防止误对齐）
-- 以「进度最慢 / 延迟最大」房间为基准
-- 对齐成功建立公共时间轴（`timeline_ready`），导出时按墙钟映射 + offset 对齐多视角
-
-### 3.6 持续分析（v3 重点）
-
-**主房分析 → 副房映射：**
-
-- 只分析主房录制文件
-- 副房通过 `recording_start_mono` + `content_offset` 差值映射后 `clip_queued`
-- 映射失败时广播 `mapping_fallback`，前端 toast 提示
-
-**无畏契约回合切割（`valorant_round`）：**
-
-- 音频能量 + 回合结束钟声分割战斗段
-- OCR（RapidOCR）识别购买阶段 / 胜负结算，校正权威边界
-- 相位调度器（buy / combat / post_combat / intermission）控制 OCR 预算，降低功耗
-- 质量优先：OCR 确认回合可自动升格为可导出；仍需用户确认后再导出
-- 录制结束后全文件 OCR 收尾精修
-
-**通用模式（`generic` / `scene`）：**
-
-- 场景切换 / 音频节奏等高光检测
-- 片段去重与近邻合并
-
-**功耗相关设计：**
-
-- OCR 采样间隔与相位预算，避免全时段满负荷扫帧
-- 预览路数压力感知降分辨率 / 帧率
-- 共享进样减少重复 CDN 拉流
-- OCR 加速：`ocr_accel` 支持 `auto` / `dml` / `cuda` / `cpu`（Windows 默认 DirectML）
-
-### 3.7 平台适配
-
-| 平台 | 适配器 | 说明 |
-| :--- | :--- | :--- |
-| 抖音 | DouyinAdapter | 签名拉流 |
-| B站 | BilibiliAdapter | API + Cookie 鉴权 |
-| 虎牙 | HuyaAdapter | JS 签名流地址 |
-| 快手 / 斗鱼 / 小红书 / 微博 | 对应 Adapter | 平台 API / 页面解析 |
-| 直链 | DirectAdapter | 直接媒体 URL |
-| 通用页面 | GenericPageAdapter | HTML `<video>` 兜底 |
-
-- Protocol + Registry，适配器无状态，可多线程安全并发解析
-- 解析成功缓存 30s、失败 10s，防止平台 API 熔断
-
-平台适配统一经过 `Resolver → Probe → Lease → IngestSupervisor`。V2 默认关闭，需通过 `platform_pipeline_v2_enabled` 与平台 allowlist 灰度启用；除抖音外的各平台当前支持级别以运行时 `pipeline_health.support_level` 为准，未经真实授权流和长时稳定性验收不得标记为 `STABLE`。
-
-### 3.8 交互与运维
-
-- 全局快捷键：播放/暂停、标记、录制、静音、全屏、批量开停录、导出等
-- **新手引导**：首次进入工作台弹出四步引导（添加房间 → 预览录制 → 标记切片 → 导出）
-- 设置页：编码器、码率、画质、共享进样、导出并发、OCR 加速等
-- 依赖检测：FFmpeg / ffprobe / NVENC / Python
-- 手动「检查更新」（GitHub Releases API，5 分钟缓存，展示发布说明）
-- 日志滚动：`%APPDATA%\lsc-electron\logs\`（单文件约 2MB × 5）
-
-### 3.9 安全与鲁棒性
-
-- 打开文件路径白名单 + 可执行后缀黑名单
-- 子进程环境变量白名单；Windows 下 detached 启动后端
-- WebSocket Origin 校验（仅 localhost / Electron）
-- Handler 注册期不依赖脆弱的 `get_event_loop()`（兼容 Python 3.12+）
-- 同连接消息顺序执行，避免 `set_mark_in` 与 `export_clip` 竞态
-- 错误消息中英正则友好化（权限、磁盘、CDN 403/404、共享进样中断等）
-
----
-
-## 4. 切片业务流程（简图）
-
-```text
-录制开始 ──► recording_start_mono
-                │
-预览观看 ──► 按 i/o 标记 ──► mark_*_wallclock
-                │
-一键对齐 ──► 预览 PCM ──► content_offset
-                │
-导出 / AI入列确认 ──► 墙钟映射 ──► FFmpeg -ss/-to ──► 切片文件
-```
-
-持续分析额外路径：
-
-```text
-主房录制文件 ──► 回合/场景检测 (+ OCR) ──► clip_queued(pending)
-                      │
-                 副房时间映射 ──► 各房切片入列
-                      │
-                 用户精修确认 ──► 导出队列
-```
-
----
-
-## 5. 技术架构细节
-
-### 5.1 通信
-
-- WebSocket 主端口 `9876`，占用时回退 `19877`–`19880`
-- `rooms_updated` 等高频消息合并 / 日志降级
-- 编排线程（RoomOrchestrator）执行核心逻辑；WS 线程通过 `orchestrator.call` 同步调用 + `BroadcastHub` 广播（上限 1000，满时按类型驱逐/扩容）
-
-### 5.2 领域模型（节选）
-
-- `RoomInfo`：平台流元数据
-- `RecordingSession`：一次录制上下文
-- `Clip`：片段定义（含墙钟、content_offset、确认状态）
-- `ExportOptions`：编码 / 码率 / 竖屏等导出参数
-
-### 5.3 项目结构
-
-```text
-├── lsc/                         # 核心 Python 包
-│   ├── analyzer/                # 持续分析：回合检测、OCR、相位调度、onset
-│   ├── core/models.py           # DTO
-│   ├── core/services/           # 录制 / 导出 / MSE / 共享进样
-│   ├── core/orchestrator.py     # 编排线程（同步调用 + tick 调度）
-│   ├── platforms/               # 平台适配器
-│   ├── recorder/ · exporter/    # FFmpeg 控制
-│   ├── editor/audio_aligner.py  # 音频互相关对齐
-│   └── gui/multi_room/manager.py
-├── python-backend/              # WebSocket 桥接服务
-│   ├── main.py · server.py · broadcast_hub.py
-│   └── handlers/                # 房间 / 时间线 / 分析 / 导出 / 对齐
-├── lsc-electron/                # Electron 前端
-│   ├── electron/                # 主进程 / preload
-│   └── src/                     # 工作台 / 预览 / 时间线 / 设置
-├── tests/                       # pytest 套件
-├── data/                        # rooms.json 等运行时数据
-└── docs/                        # 设计规格与提示词
-```
-
----
-
-## 6. 运行要求
-
-- Windows 10/11（64 位）
-- Python 3.10+（开发）或安装包内嵌 Python
-- FFmpeg（PATH 或安装包内嵌）
-- Node.js 18+（仅开发 / 打包）
-- 可选：NVIDIA / Intel / AMD 硬件编码；DirectML / CUDA 加速 OCR
-
----
-
-## 7. 快速开始
-
-### 安装包（推荐）
-
-从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `LSC 直播切片系统 Setup x.y.z.exe` 安装即可。
-
-安装过程中会**自动下载运行依赖**（Python 库 + FFmpeg，走国内镜像），并自动检测 / 升级 VC++ 运行库；完成后首次启动即可直接使用。若机器不支持 DirectML（如虚拟机），分析会自动降级为 CPU，不影响安装与录制。
-
-### 前置条件
-
-开发模式需要 **Python 3.10+** 和 **Node.js 18+**：
+前置要求：**Python 3.10+**、**Node.js 18+**、FFmpeg（PATH 中）。
 
 ```bash
-# 1. 安装 Python 依赖（后端需要）
+# 1. 后端依赖
 pip install -r requirements.txt
 
-# 2. 安装 Node 依赖（前端需要）
+# 2. 前端依赖
 cd lsc-electron && npm install
 ```
 
-> 缺少 Python 依赖会导致后端启动失败。如果 `npm run dev` 后端报错，请先运行 `python -c "import PySide6, numpy, websockets; print('OK')"` 验证。
-
-### 开发模式
-
 ```bash
-# 一键拉起后端 + Electron（需先完成前置条件）
-cd lsc-electron
-npm run dev
+# 一键拉起后端 + Electron
+cd lsc-electron && npm run dev
 ```
 
+仅调试后端 / 仅调试前端：
+
 ```bash
-# 仅 Python 后端
-pip install -r requirements.txt
+# 仅 Python 后端（WebSocket 服务，端口 9876）
 cd python-backend && python main.py
+
+# 仅前端 Vite（纯 UI 页面）
+cd lsc-electron && npx vite --config vite.dev.config.ts
 ```
 
-```bash
-# 仅前端 Vite（纯 UI）
-cd lsc-electron
-npx vite --config vite.dev.config.ts
-```
-
-### 测试
+### 测试与代码检查
 
 ```bash
 set QT_QPA_PLATFORM=offscreen
-pytest -v
-
-cd lsc-electron && npx tsc --noEmit
-ruff check lsc/
+pytest -v                        # Python 测试套件
+ruff check lsc/                  # Python 静态检查
+cd lsc-electron && npx tsc --noEmit   # TypeScript 类型检查
 ```
 
-### 打包
+---
+
+## 🧭 使用指南
+
+### 新手四步（应用内有引导）
+
+| 步骤 | 操作 | 快捷键 |
+| :--- | :--- | :--- |
+| ① 添加房间 | 输入直播间链接，自动解析平台与画质 | — |
+| ② 预览 / 录制 | 点击「预览」低延迟观看；点击「录制」落盘保存 | `r` 切换录制 |
+| ③ 标记切片 | 播放到精彩处按 `i` / `o` 标记入出点，加入切片列表 | `i` / `o` |
+| ④ 导出片段 | 选择切片点击「导出」（可先「一键对齐」多视角） | `Ctrl + e` |
+
+### 全局快捷键
+
+| 功能 | 快捷键 | 功能 | 快捷键 |
+| :--- | :--- | :--- | :--- |
+| 切换页面：工作台 / 设置 | `Ctrl+1` / `Ctrl+2` | 标记入点 / 出点 | `i` / `o` |
+| 播放 / 暂停 | `Space` | 切换录制状态 | `r` |
+| 静音 / 取消静音 | `m` | 全屏预览 | `f` |
+| 批量开始录制 | `Ctrl+r` | 批量停止录制 | `Ctrl+Shift+r` |
+| 多房间卡片全选 | `Ctrl+Shift+A` | 触发当前导出 | `Ctrl+e` |
+| 刷新页面 | `F5` | | |
+
+> 输入框聚焦时快捷键自动释放，不会误触发切片操作；`Ctrl` 组合键均不影响浏览器系统快捷键。
+
+### 多视角对齐导出流程
+
+```text
+各房间预览 <video> ──► 捕获 8s 音频 (16kHz PCM)
+        │
+        ▼
+后端 FFT 互相关 ──► 各房 content_offset（以进度最慢房间为基准）
+        │
+        ▼
+公共时间轴建立 ──► 同时标记 i/o ──► 批量导出（墙钟映射 + offset）
+```
+
+---
+
+## 🛠 核心功能详解
+
+### 1. 录制引擎
+
+- **编码**：`copy` 直拷（无损） / `libx264` / `libx265` / `h264_nvenc`（NVIDIA）/ `h264_qsv`（Intel）/ `h264_amf`（AMD）
+- **磁盘满保护**：剩余空间 < 2GB 自动安全停录，防止系统与录制文件损毁
+- **三层校验**：录制停止 / 重连时验证 路径存在 → 体积 > 0.1MB → 格式头（MP4 `ftyp` / FLV / MKV EBML）
+- **智能重连**：网络抖动类错误自动重连，权限 / 磁盘类错误不重连并给出中文提示
+
+### 2. 实时预览（MSE fMP4）
+
+- 独立 FFmpeg 转码输出 fragmented MP4，WebSocket 分片推送，浏览器原生 `<video>` 播放
+- 每片段约 1s，30fps 推送节奏；首帧 `init` 段 + 后续 `media` 段
+- ≥3 路预览自动降为 ≤854×480@20fps，≥4 路降为 ≤640×360@15fps
+- 断流自动重连（最多 3 次，指数退避），10s 无数据触发前端 watchdog
+
+### 3. 切片与导出
+
+- **墙钟映射**：`export_start = mark_in_wallclock - recording_start_mono - content_offset`，杜绝预览 / 录制双流延迟造成的偏移
+- **全局导出队列**：并发上限 1 或 2，超限自动排队；随时可取消
+- **导出选项**：转码 / 直拷、分辨率缩放、帧率、码率、竖屏 9:16、缩略图
+- **失败兜底**：FFmpeg 底层报错自动转中文友好提示；提交失败回滚「排队中」状态
+
+### 4. 多房间音频对齐
+
+- 前端 Web Audio（AudioWorklet）从各房预览流捕获 **8 秒** PCM（16kHz mono float32）
+- 后端 FFT 互相关（抛物线插值，亚毫秒精度）计算各房相对基准房的 `content_offset`
+- **置信度防线**：相似度 < 0.3 判定内容不相关，自动降级 0 偏移，防止误对齐
+- 对齐成功后建立公共时间轴，播放头 / 切片 / 进度条在同一坐标系
+
+### 5. AI 持续高光分析（Valorant）
+
+- **纯 OCR 架构**：顶部计分板 + 回合计时器 + 中央回合横幅（准备 / 结算关键词），1fps 双区域扫描
+- **切片语义**：入点 = 交战阶段第一帧（交战钟 >45s 连续确认）；出点 = 下回合购买阶段第一帧
+- **主房分析 → 副房映射**：只分析主房录制文件，副房按时间差映射入列
+- **待确认机制**：AI 回合默认 `pending`，人工确认或精修后才导出，防止误检污染成品
+- **功耗控制**：OCR 采样间隔与预算调度、预览路数压力降级、DirectML 加速（无 GPU 自动降 CPU）
+
+### 6. 剪映草稿导出
+
+- 分析完成 / 切片确认后一键生成**剪映草稿**（`pyJianYingDraft`），打开剪映即可继续精剪
+- 草稿目录白名单安全校验，防止路径穿越
+
+### 7. 平台支持
+
+| 平台 | 说明 |
+| :--- | :--- |
+| 抖音 | 签名拉流 |
+| B站 | API 解析 + Cookie / BiliSession 鉴权 |
+| 虎牙 | 原始 JS 签名函数匹配生成流地址 |
+| 斗鱼 / 快手 / 小红书 / 微博 | 平台 API / 页面解析 |
+| 直链 | 直接媒体 URL |
+| 通用页面 | HTML `<video>` 标签兜底 |
+
+解析缓存：成功 30s / 失败 10s，防止高频轮询触发平台熔断。
+
+---
+
+## 🏗 技术架构
+
+### 三层分离
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│ ① 前端层 (Electron Render)                                  │
+│    React + TypeScript + Vite + Ant Design + Zustand         │
+│    工作台 UI · MSE 播放器 · 快捷键 · 切片列表 · 导出队列      │
+└──────────────────────────┬─────────────────────────────────┘
+                           │ WebSocket (localhost:9876，端口可回退)
+┌──────────────────────────┴─────────────────────────────────┐
+│ ② 桥接服务层 (Python Backend)                               │
+│    RoomOrchestrator 编排线程 + WebSocket 工作线程            │
+│    orchestrator.call 同步调用 · BroadcastHub 线程安全广播    │
+└──────────────────────────┬─────────────────────────────────┘
+                           │ 线程安全队列 / 广播
+┌──────────────────────────┴─────────────────────────────────┐
+│ ③ 核心业务层 (lsc Python 包)                                │
+│    平台解析 · FFmpeg 录制/导出 · MSE 转码 · 音频对齐 · OCR   │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 切片精度原理：三条时间路径汇合
+
+| 路径 | 数据流 | 产出 |
+| :--- | :--- | :--- |
+| ① 预览流 | CDN → FFmpeg → MSE → `<video>` | 观看 + 音频对齐 `content_offset` |
+| ② 标记路径 | 用户按 `i`/`o` 时刻 | `mark_in/out_wallclock`（单调时钟） |
+| ③ 录制流 | CDN → FFmpeg → 磁盘文件 | `recording_start_mono` |
+
+三条路径通过 `time.monotonic()` 统一锚定，导出时做差即可将预览标记精确映射到录制文件物理位置。v3.0.22 起支持 **预览 PTS 锚点**：公共轴零点取最早录制起点，播放头与切片不再错位，时间线最大值为真实会话时长。
+
+### 目录结构
+
+```text
+├── lsc/                       # 核心 Python 包
+│   ├── analyzer/              # 持续分析：OCR 回合检测、相位调度
+│   ├── core/models.py         # 领域 DTO（RoomInfo/Clip/ExportOptions...）
+│   ├── core/services/         # 录制 / 导出 / MSE / 共享进样 / 时间线
+│   ├── platforms/             # 平台适配器（Protocol + Registry）
+│   ├── recorder/ · exporter/  # FFmpeg 控制
+│   ├── editor/audio_aligner.py# 音频互相关对齐
+│   └── gui/multi_room/        # 多房间管理编排
+├── python-backend/            # WebSocket 桥接服务
+│   ├── main.py · server.py    # 入口 / WS 服务器
+│   └── handlers/              # 房间 / 时间线 / 分析 / 导出 / 对齐 / 剪映
+├── lsc-electron/              # Electron 前端
+│   ├── electron/              # 主进程 / preload
+│   └── src/                   # 工作台 / 预览 / 时间线 / 设置
+├── tests/                     # pytest 测试套件
+├── data/                      # rooms.json 等运行时数据
+└── docs/                      # 设计文档与提示词
+```
+
+---
+
+## ⚙️ 配置与数据
+
+| 项 | 位置 | 说明 |
+| :--- | :--- | :--- |
+| 录制 / 编码 / 预览 / OCR 设置 | 根目录 `settings.json` | GUI 设置页可视化修改 |
+| 房间列表 | `data/rooms.json` | 原子写入（`.tmp` + replace）防损坏 |
+| 录制历史 | `recording_history.json` | 会话历史记录 |
+| 日志 | `%APPDATA%\lsc-electron\logs\` | 单文件 ~2MB × 5 自动滚动 |
+| 日志级别 | 环境变量 `LSC_LOG_LEVEL` | 默认 `INFO` |
+
+常用设置键：`encoder`（编码器）、`crf`（质量）、`bitrate`（码率）、`quality`（画质）、`shared_ingest_enabled`（共享进样）、`export_max_concurrent`（导出并发 1/2）、`ocr_accel`（OCR 加速 auto/dml/cuda/cpu）、`preview_quality`（预览画质）。
+
+---
+
+## 📦 构建打包
 
 ```powershell
 cd lsc-electron
 .\build-installer.ps1
 ```
 
-依次：嵌入式 Python + FFmpeg → npm install → `tsc --noEmit` → Vite → electron-builder。
+流程：嵌入式 Python + FFmpeg → `npm install` → `tsc --noEmit` → `vite build` → `electron-builder`（NSIS）。
+
+产物位于 `lsc-electron/release/`：`LSC 直播切片系统 Setup x.y.z.exe`（约 118MB，运行依赖首次启动时国内镜像下载）。
 
 ---
 
-## 8. 配置与数据
+## 📜 版本历史
 
-| 项 | 位置 | 说明 |
-| :--- | :--- | :--- |
-| 录制 / 编码 / 共享进样 / OCR | `settings.json` | GUI 设置页可改 |
-| 房间列表 | `data/rooms.json` | 原子写入（`.tmp` + replace） |
-| 录制历史 | `recording_history.json` | 会话历史 |
-| 日志 | `%APPDATA%\lsc-electron\logs\` | `backend.log` / `debug.log` |
-| 日志级别 | 环境变量 `LSC_LOG_LEVEL` | 默认 `INFO` |
+### v3.0.22（2026-08-14）
 
-常用设置键：`encoder`、`crf`、`bitrate`、`shared_ingest_enabled`、`export_max_concurrent`、`ocr_accel`、`preview_quality` 等。
-
----
-
-## 9. 版本摘要
+- **时间线锚点系统**：公共轴零点取最早录制起点，MSE 预览 PTS 与录制媒体起点统一锚定，修复播放头与切片错位、时间线默认最大值异常
+- **剪映草稿增强**：草稿生成与校验逻辑重构，支持更多切片场景
+- **前端稳定性**：刷新按钮防误触重构、房间卡片增强（竖屏/对齐状态）、批量操作体验优化
+- **对齐链路**：`preview_current_time` 元数据随对齐请求上报，旧数据自动退化兼容
+- 新增 `docs/CERTIFICATION_DESCRIPTION.md` 认证说明
 
 ### v3.0.21（2026-08-14）
 
-- **稳定性（长期挂机）**：录制重连后台化（不再全局冻结 20-60s）、编排线程防死亡、导出防挂死（终态必达 + 6h 兜底）、OCR 抽帧子窗化（内存尖峰 330MB → 40MB）、MSE watchdog 恢复上限、心跳定时器泄漏修复、广播 1s 超时剔除、backend-stdout 日志轮转、FFmpeg `-headers` 超长防御
+- **稳定性（长期挂机）**：录制重连后台化、编排线程防死亡、导出防挂死（终态必达 + 6h 兜底）、OCR 抽帧子窗化（内存尖峰 330MB → 40MB）、MSE watchdog 恢复上限、心跳定时器泄漏修复、广播超时剔除、日志轮转、FFmpeg `-headers` 超长防御
 - **功能**：新手引导、设置页检查更新显示发布说明
-- **安装体验**：安装期依赖走国内镜像（清华 pypi + GitHub 加速代理）、VC++ 运行库自动检测/升级、DirectML 不可用自动降级 CPU
-- 修复：刷新按钮长按粒子卡死/误触短按、对齐拦截诊断日志等
+- **安装体验**：安装期依赖国内镜像、VC++ 运行库自动检测 / 升级、DirectML 不可用自动降级 CPU
 
-### v3.0.0
+### v3.0.0（2026-07-28）
 
 - **持续分析**：Valorant OCR 权威边界、相位调度、副房映射、待确认再导出
 - **页面优化**：工作台 UI 统一、Modal / 设置抽屉溢出修复、分析进度与导出摘要
-- **功耗优化**：OCR / 预览压力调度、共享进样可选、加速后端可选 DirectML
+- **功耗优化**：OCR / 预览压力调度、共享进样可选、DirectML 加速
+
+完整更新说明见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 
-## 10. 许可证
+## ❓ 常见问题
 
-本项目基于 **GPL v2** 许可证。
+**Q：安装后首次启动需要联网吗？**
+需要联网下载运行依赖（走国内镜像加速）；录制 / 分析本身仅需能访问直播间。
 
-## 11. 隐私
+**Q：虚拟机 / 无 GPU 机器能用 AI 分析吗？**
+可以。DirectML 不可用时自动降级 CPU，仅分析速度变慢，录制功能不受影响。
 
-数据处理方式详见 [PRIVACY.md](./PRIVACY.md)（本地存储、无遥测、敏感信息自动脱敏）。
+**Q：预览与录制的画质一致吗？**
+录制是独立 FFmpeg 进程，按设置参数（`copy` 直拷或指定编码器）落盘，**画质无损**；预览是为低延迟转码的 MSE 流，两者互不影响。
+
+**Q：导出片段时间不准怎么办？**
+确认已执行「一键对齐」（多房场景）；单房场景墙钟映射自动补偿预览延迟，若仍偏移可检查录制是否发生过重连（重连会生成新的录制段）。
+
+**Q：数据存哪里？会上传吗？**
+所有数据本地存储，无遥测、无上报。网络仅用于：下载依赖、拉取直播流、手动检查更新。
+
+---
+
+## 🔒 隐私与许可
+
+- **隐私**：本地存储、无遥测、敏感信息脱敏，详见 [PRIVACY.md](./PRIVACY.md)
+- **许可证**：本项目基于 **GPL v2** 发布
+- **技术栈**：Electron · React · TypeScript · Vite · Ant Design · Zustand · Python · FFmpeg · WebSocket
