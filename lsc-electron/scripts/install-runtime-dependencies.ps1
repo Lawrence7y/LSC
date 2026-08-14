@@ -43,19 +43,32 @@ $env:UV_LINK_MODE = 'copy'
 try {
     # ── VC++ 2015-2022 运行库检测与安装 ────────────────────────────────
     # torch / numpy / onnxruntime 的 C 扩展 DLL 都依赖 msvcp140/vcruntime140。
-    # 干净/精简的 Windows（尤其是虚拟机）通常没有 → DLL load failed。
-    # 检测注册表，缺失则静默安装 vc_redist.x64.exe（微软官方 CDN）。
+    # 干净/精简的 Windows（尤其是虚拟机）通常没有 → DLL load failed；
+    # 版本过旧（< 14.40，2024 年中）时新版 onnxruntime（1.24+）的 DLL 也可能
+    # 加载失败（缺新导出符号）。检测注册表，缺失或过旧则静默升级 vc_redist。
     $vcKey = 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'
-    $vcInstalled = $false
+    $vcNeedInstall = $false
+    $vcInstalledVersion = ''
     try {
         $vcInfo = Get-ItemProperty -Path $vcKey -ErrorAction Stop
-        if ($vcInfo.Version) { $vcInstalled = $true }
+        if ($vcInfo.Version) {
+            $vcInstalledVersion = $vcInfo.Version
+            try {
+                $vcVer = [version]($vcInstalledVersion.TrimStart('v'))
+                $vcNeedInstall = ($vcVer -lt [version]'14.40.30817')
+            } catch {
+                $vcNeedInstall = $false
+            }
+        } else {
+            $vcNeedInstall = $true
+        }
     } catch {
-        $vcInstalled = $false
+        $vcNeedInstall = $true
     }
-    if (-not $vcInstalled) {
-        "VC++ 2015-2022 runtime NOT detected, installing..." | Out-File -FilePath $logPath -Encoding utf8 -Append
-        Write-Host "VC++ runtime not found, installing..."
+    if ($vcNeedInstall) {
+        $reason = if ($vcInstalledVersion) { "too old ($vcInstalledVersion < 14.40)" } else { 'missing' }
+        "VC++ 2015-2022 runtime $reason, installing/upgrading..." | Out-File -FilePath $logPath -Encoding utf8 -Append
+        Write-Host "VC++ runtime $reason, installing..."
         $vcRedist = Join-Path $env:TEMP 'lsc-vc_redist.x64.exe'
         try {
             Invoke-WebRequest -UseBasicParsing `
@@ -67,7 +80,7 @@ try {
             $vcExit = $vcProc.ExitCode
             # 3010 = 安装成功需重启；0 = 成功
             if ($vcExit -eq 0 -or $vcExit -eq 3010) {
-                "VC++ runtime installed (exit $vcExit)" | Out-File -FilePath $logPath -Encoding utf8 -Append
+                "VC++ runtime installed/upgraded (exit $vcExit)" | Out-File -FilePath $logPath -Encoding utf8 -Append
             } else {
                 "VC++ runtime install failed (exit $vcExit), continuing anyway" | Out-File -FilePath $logPath -Encoding utf8 -Append
             }
@@ -75,7 +88,7 @@ try {
             "VC++ runtime install error: $_" | Out-File -FilePath $logPath -Encoding utf8 -Append
         }
     } else {
-        "VC++ 2015-2022 runtime already present: $($vcInfo.Version)" | Out-File -FilePath $logPath -Encoding utf8 -Append
+        "VC++ 2015-2022 runtime already up-to-date: $vcInstalledVersion" | Out-File -FilePath $logPath -Encoding utf8 -Append
     }
 
     # uv writes normal status output to stderr. PowerShell 5.1 must not promote
@@ -133,11 +146,16 @@ try {
             "uv install failed for $dmlSpec (exit $dmlExitCode), trying next..." | Out-File -FilePath $logPath -Encoding utf8 -Append
             continue
         }
+        # probe 前必须切回 Continue：PS 5.1 在 Stop 模式下会把外部命令的
+        # stderr 行（Python traceback）提升为终止性错误，导致降级链不执行
+        $ErrorActionPreference = 'Continue'
         $packageDirLiteral = $packageDir.Replace("'", "''")
         $providerProbe = "import sys; sys.path.insert(0, r'$packageDirLiteral'); import onnxruntime as ort; providers=ort.get_available_providers(); print(providers); raise SystemExit(0 if 'DmlExecutionProvider' in providers or 'CUDAExecutionProvider' in providers else 42)"
         $providerOutput = & $PythonExe -c $providerProbe 2>&1
         $providerOutput | Out-File -FilePath $logPath -Encoding utf8 -Append
-        if ($LASTEXITCODE -eq 0) {
+        $probeExit = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        if ($probeExit -eq 0) {
             $directmlOk = $true
             break
         }
