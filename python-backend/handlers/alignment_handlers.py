@@ -13,8 +13,8 @@ import logging
 import time
 
 import numpy as np
-
 from handlers.timeline_handlers import timeline_to_dict
+
 from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
     get_timeline_service,

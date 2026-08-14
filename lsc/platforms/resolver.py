@@ -174,8 +174,8 @@ def _candidate_from_url(
 ) -> StreamCandidate | None:
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return None
-    from .url_policy import validate_public_url
     from .signature_family import signature_family_id as _signature_family_id
+    from .url_policy import validate_public_url
 
     safe, _reason = validate_public_url(url)
     if not safe:

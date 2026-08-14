@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from .candidate_health import get_default_candidate_health_store
-from .failure import normalize_failure_kind
 from .capabilities import uses_ingest_probe
+from .failure import normalize_failure_kind
 from .lease_manager import LeaseManager
 from .models import ProbeResult, ResolveRequest, StreamCandidate, StreamLease
 from .redaction import redact_mapping, redact_text, redact_url

@@ -237,9 +237,7 @@ class SharedPreviewHandle:
     def is_running(self) -> bool:
         if self._stopped or self._ingest.is_stopped or self._ingest.preview_error:
             return False
-        if self._ingest.upstream_error and not self._ingest.is_lease_rotating():
-            return False
-        return True
+        return not (self._ingest.upstream_error and not self._ingest.is_lease_rotating())
 
     def replay_init(self) -> bool:
         segment = self._ingest.last_init_segment
@@ -1722,10 +1720,8 @@ class SharedRoomIngest:
             if self._recording_process is None or not self.recording_active:
                 return
             batch_size = len(batch)
-            dropped = False
             if batch_size > self.recording_queue_bytes:
                 self._record_recording_drop(batch_size)
-                dropped = True
             else:
                 while (
                     self._recording_ts_queue
@@ -1734,10 +1730,8 @@ class SharedRoomIngest:
                     old = self._recording_ts_queue.popleft()
                     self._recording_queued_bytes -= len(old)
                     self._record_recording_drop(len(old))
-                    dropped = True
                 if self._recording_queued_bytes + batch_size > self.recording_queue_bytes:
                     self._record_recording_drop(batch_size)
-                    dropped = True
                 else:
                     self._recording_ts_queue.append(batch)
                     self._recording_queued_bytes += batch_size

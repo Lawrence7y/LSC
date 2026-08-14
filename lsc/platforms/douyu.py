@@ -266,7 +266,7 @@ class DouyuAdapter(BasePlatformAdapter):
         if not rid.isdigit():
             return ""
         t13 = str(int(time.time() * 1000))
-        auth = hashlib.md5(f"{rid}{t13}".encode("utf-8")).hexdigest()
+        auth = hashlib.md5(f"{rid}{t13}".encode()).hexdigest()
         url = f"https://playweb.douyucdn.cn/lapi/live/hlsH5Preview/{rid}"
         req_headers = dict(headers or DOUYU_HEADERS)
         req_headers.update({

@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from lsc.config import is_platform_pipeline_v2_enabled, load_config
 from lsc.platforms.capabilities import get_platform_capabilities
