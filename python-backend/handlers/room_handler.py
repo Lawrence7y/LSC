@@ -61,7 +61,7 @@ from lsc.core.services.timeline_service import (
 )
 from lsc.platforms.base import ERROR_OFFLINE
 from lsc.platforms.failure import FailureKind, classify_failure
-from lsc.platforms.recovery_policy import mark_failed_candidate
+from lsc.platforms.recovery_policy import mark_failed_candidate, recovery_action
 from lsc.platforms.redaction import redact_text, redact_url
 from lsc.platforms.registry import detect_platform, get_display_name, parse_stream, select_quality
 from lsc.utils.error_messages import humanize_error, humanize_error_with_suggestion
@@ -76,7 +76,10 @@ _MAX_ROOM_URLS_PER_ADD = 12
 def _should_refresh_failed_stream(error: object) -> bool:
     """Use typed media failures for candidate quarantine/URL refresh."""
     text = str(error or "")
-    if "preview stdout stalled" in text.lower():
+    lowered = text.lower()
+    if "preview stdout stalled" in lowered:
+        return False
+    if "signed http remote eof after media" in lowered:
         return False
     kind = classify_failure(text)
     if kind is FailureKind.PREVIEW_ENCODER_FAILURE:
@@ -98,6 +101,16 @@ def _preview_auto_reconnect_allowed(stream_info_or_platform: object) -> bool:
     from lsc.platforms.capabilities import get_platform_capabilities
 
     return bool(get_platform_capabilities(platform).preview_auto_reconnect)
+
+
+def _is_lease_rotation_error(
+    stream_info: object | None,
+    error: object,
+    *,
+    saw_first_ts: bool = False,
+) -> bool:
+    """True when a shared-upstream clean EOF should rotate the signed lease."""
+    return recovery_action(stream_info, error, saw_first_ts=saw_first_ts) == "rotate_lease"
 
 
 async def queue_export(
@@ -709,6 +722,16 @@ def _bind_shared_ingest_lease(mgr, room_id: str, ingest) -> None:
     if lease is None or lease_manager is None:
         return
     bind(lease_manager, getattr(lease, "lease_id", ""))
+
+
+def _shared_preview_reconnect_ready(result: object, ingest: object | None) -> bool:
+    """Reconnect is ready only when the handler succeeded and upstream is live."""
+    if not isinstance(result, dict) or not result.get("success") or ingest is None:
+        return False
+    checker = getattr(ingest, "upstream_is_live", None)
+    if callable(checker):
+        return bool(checker())
+    return getattr(ingest, "process_id", None) is not None
 
 
 # 正在启动 MSE 的 room_id 集合，防止启动过程中重复请求
@@ -2964,6 +2987,53 @@ def register_room_handlers(server, bridge):
             )
             return
 
+        def _lease_rotation_decision():
+            room = manager.get_room(room_id)
+            if room is None:
+                return False
+            ingest = get_shared_ingest_registry().get(room_id)
+            saw_first_ts = bool(getattr(ingest, "_upstream_has_produced_data", False))
+            rotating = bool(
+                callable(getattr(ingest, "is_lease_rotating", None))
+                and ingest.is_lease_rotating()
+            )
+            return _is_lease_rotation_error(
+                getattr(room, "stream_info", None),
+                err,
+                saw_first_ts=saw_first_ts or rotating,
+            )
+
+        try:
+            rotating = await loop.run_in_executor(
+                _bridge_executor, lambda: bridge.manager.call(_lease_rotation_decision)
+            )
+        except Exception:
+            rotating = False
+        if rotating:
+            _log.info(
+                "Shared MSE lease rotation for room %s; keep preview sink: %s",
+                room_id,
+                err,
+            )
+
+            def _rotate_lease():
+                room = manager.get_room(room_id)
+                if room is None:
+                    return False
+                start = getattr(manager, "_start_supervised_recovery", None)
+                if callable(start):
+                    return bool(start(room, err))
+                recover = getattr(manager, "_recover_shared_upstream_in_place", None)
+                return bool(callable(recover) and recover(room))
+
+            try:
+                await loop.run_in_executor(
+                    _bridge_executor, lambda: bridge.manager.call(_rotate_lease)
+                )
+            except Exception as exc:
+                _log.debug("Shared MSE lease rotation coordinator failed: %s", exc)
+            return
+
         # 防重入：与 legacy 版一致，退避等待期间重复 on_error 由在途循环接管
         prev_state = _mse_reconnect_state.get(room_id)
         if prev_state and prev_state.get('running'):
@@ -3156,7 +3226,12 @@ def register_room_handlers(server, bridge):
 
             if not isinstance(result, dict):
                 result = {'success': False, 'error': '预览重连失败'}
-            if result.get('success'):
+            ingest = None
+            try:
+                ingest = _shared_ingests.get(room_id)
+            except Exception as exc:
+                _log.debug("Shared MSE reconnect ingest lookup failed: %s", exc)
+            if _shared_preview_reconnect_ready(result, ingest):
                 _mse_live_phase.discard(room_id)
                 _log.info("Shared MSE reconnect succeeded for room %s", room_id)
                 ready_state = _note_mse_reconnect_event(room_id, "media_ready")
@@ -3187,7 +3262,7 @@ def register_room_handlers(server, bridge):
                 _broadcast_rooms()
                 return
 
-            current_error = result.get('error') or '重连失败'
+            current_error = result.get('error') or '预览重连未拉起上游'
             _log.warning(
                 "Shared MSE reconnect failed for room %s: %s",
                 room_id, current_error,
@@ -3218,6 +3293,7 @@ def register_room_handlers(server, bridge):
                     network_context=dict(getattr(room, "network_context", {}) or {})
                     if room is not None else {},
                 )
+                _bind_shared_ingest_lease(manager, room_id, shared_ingest)
                 # Preview refreshes can happen while recording keeps the
                 # shared upstream alive.  In that case the registry must not
                 # silently overwrite the URL; explicitly switch the lease
@@ -3258,6 +3334,8 @@ def register_room_handlers(server, bridge):
                 )
                 _preview_stream_registry().set_legacy(room_id, handle)
                 return handle
+        except RuntimeError:
+            raise
         except Exception as exc:
             _log.debug("V2 preview supervisor attach fallback: room=%s error=%s", room_id, exc)
         return _preview_stream_registry().attach_shared(
@@ -3282,7 +3360,11 @@ def register_room_handlers(server, bridge):
             return False
 
         existing = _preview_stream_registry().get(room_id)
-        if existing is not None and getattr(existing, '_ingest', None) is shared_ingest:
+        if (
+            existing is not None
+            and getattr(existing, '_ingest', None) is shared_ingest
+            and getattr(shared_ingest, 'last_init_segment', None)
+        ):
             try:
                 existing.replay_init()
             except Exception as exc:
@@ -4565,6 +4647,55 @@ def register_room_handlers(server, bridge):
             _log.error("保存 B站 Cookie 失败: %s", redact_text(exc))
             return {'success': False, 'error': humanize_error(str(exc))}
 
+    @server.on('get_huya_cookie_status')
+    async def handle_get_huya_cookie_status(data):
+        """查询虎牙 Cookie 是否已配置。"""
+        from lsc.platforms.cookie_helper import get_huya_cookie_status
+        try:
+            return {'success': True, **get_huya_cookie_status()}
+        except Exception as exc:
+            _log.warning("get_huya_cookie_status failed: %s", redact_text(exc))
+            return {'success': False, 'error': redact_text(exc), 'configured': False, 'count': 0}
+
+    @server.on('save_huya_cookies')
+    async def handle_save_huya_cookies(data):
+        """保存用户粘贴的虎牙 Cookie（JSON / Cookie 头）。"""
+        from lsc.platforms.cookie_helper import save_huya_cookies_from_text
+        raw = ''
+        if isinstance(data, dict):
+            raw = str(data.get('cookies') or data.get('text') or '')
+        if not raw.strip():
+            return {'success': False, 'error': '请粘贴 Cookie 内容'}
+        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
+        if len(raw) > _MAX_COOKIE_BYTES:
+            _log.warning("虎牙 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
+            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
+        try:
+            status = save_huya_cookies_from_text(raw)
+            _log.info("虎牙 Cookie 已保存: count=%s", status.get('count'))
+            credential_status = ''
+            try:
+                from lsc.platforms.credentials import get_default_credential_provider
+
+                credential_status = get_default_credential_provider().refresh(
+                    'huya'
+                ).status.value
+            except Exception as exc:
+                _log.warning(
+                    "refresh huya credential state failed: %s",
+                    redact_text(exc),
+                )
+            return {
+                'success': True,
+                **status,
+                'credential_status': credential_status or 'INVALID',
+            }
+        except (ValueError, json.JSONDecodeError) as exc:
+            return {'success': False, 'error': redact_text(exc)}
+        except OSError as exc:
+            _log.error("保存虎牙 Cookie 失败: %s", redact_text(exc))
+            return {'success': False, 'error': humanize_error(str(exc))}
+
     # ⚠️ 死代码：本 handler 与 align_preview_audio 已被 alignment_handlers.py 后注册覆盖。
     # 改动此处无效，须改 alignment_handlers.py（register_room_handlers 按顺序注册，
     # server.on 后注册覆写前者）。保留仅供比对，勿改。
@@ -5115,6 +5246,7 @@ def register_room_handlers(server, bridge):
                                     _log.debug("stop_preview_sink 失败: %s", exc)
                             await asyncio.get_running_loop().run_in_executor(_bridge_executor, _stop_preview_sink)
 
+                        _bind_shared_ingest_lease(mgr, room_id, shared_ingest)
                         _configure_shared_preview_quality(shared_ingest, data)
                         shared_handle = _attach_shared_preview_handle(
                             room_id, shared_ingest, loop,
@@ -5215,7 +5347,16 @@ def register_room_handlers(server, bridge):
                             )
                             _bind_shared_ingest_lease(mgr, room_id, shared_ingest)
 
-                        if getattr(shared_ingest, 'process_id', None) is None or getattr(shared_ingest, 'is_stopped', True):
+                        _bind_shared_ingest_lease(mgr, room_id, shared_ingest)
+                        upstream_dead = (
+                            getattr(shared_ingest, 'process_id', None) is None
+                            or getattr(shared_ingest, 'is_stopped', True)
+                            or (
+                                callable(getattr(shared_ingest, 'upstream_is_live', None))
+                                and not shared_ingest.upstream_is_live()
+                            )
+                        )
+                        if upstream_dead:
                             preview_params = _compute_preview_quality_params(data)
                             # 过滤掉不接受的参数
                             valid_keys = {'width', 'height', 'use_nvenc', 'video_bitrate', 'crf_value', 'fps'}

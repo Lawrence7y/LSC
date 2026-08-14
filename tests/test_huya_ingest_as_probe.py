@@ -168,6 +168,58 @@ def test_huya_eof_before_first_ts_invalidates_family():
     assert recovery_action(info, "preview encoder failed", saw_first_ts=True) == "restart_preview_sink"
 
 
+def test_huya_clean_eof_after_media_is_lease_rotation():
+    from lsc.platforms.base import StreamInfo
+    from lsc.platforms.recovery_policy import mark_failed_candidate, recovery_action
+
+    info = StreamInfo(
+        platform="huya",
+        room_url="https://www.huya.com/1",
+        stream_url="https://hs.flv.huya.com/src/live.flv?wsSecret=abc&wsTime=1",
+        raw={"v2": True, "candidate_cdn_id": "hs"},
+    )
+    eof = "signed http remote EOF after media"
+    code0 = "shared ingest upstream ffmpeg exited: code=0"
+    assert recovery_action(info, eof, saw_first_ts=True) == "rotate_lease"
+    assert recovery_action(info, code0, saw_first_ts=True) == "rotate_lease"
+    assert mark_failed_candidate(info, eof, saw_first_ts=True) is False
+
+
+def test_huya_http_session_prefetch_window_covers_150s():
+    from lsc.core.services.shared_ingest import SharedRoomIngest, lease_rotate_lead_sec
+    from lsc.platforms.capabilities import get_platform_capabilities
+
+    caps = get_platform_capabilities("huya")
+    ttl = float(caps.expected_ttl_seconds or 0.0)
+    lead = lease_rotate_lead_sec(ttl)
+    assert ttl == 120.0
+    assert lead == 15.0
+    ingest = SharedRoomIngest(
+        "room-ttl",
+        "https://hs.flv.huya.com/src/live.flv?wsSecret=abc",
+        network_context={"http_session_ttl_sec": ttl, "lease_rotate_lead_sec": lead},
+    )
+    ingest.mark_signed_http_opened(now=1000.0)
+    assert ingest.needs_lease_prefetch(now=1090.0) is False
+    assert ingest.needs_lease_prefetch(now=1105.0) is True
+    assert ingest.needs_lease_prefetch(now=1150.0) is True
+    first_eof = 1000.0 + ttl
+    second_prefetch = first_eof + (ttl - lead)
+    assert first_eof == 1120.0
+    assert second_prefetch == 1225.0
+    assert 1000.0 + 150.0 > first_eof
+    assert 1000.0 + 150.0 < second_prefetch
+
+
+def test_shared_mse_skips_reconnect_loop_on_lease_rotation():
+    import inspect
+
+    room_handler = _room_handler()
+    source = inspect.getsource(room_handler)
+    snippet = source.split("async def _shared_mse_on_error", 1)[1].split("while True:", 1)[0]
+    assert "rotate_lease" in snippet or "_is_lease_rotation_error" in snippet
+
+
 def test_select_ingest_lease_does_not_require_probe_ok():
     from lsc.platforms.capabilities import get_platform_capabilities
     from lsc.platforms.lease_manager import LeaseManager
@@ -426,6 +478,85 @@ def test_ensure_upstream_marks_and_refuses_consumed_lease(monkeypatch):
     error = ingest._ensure_upstream_started()
     assert "consumed" in error.lower()
     assert len(launched) == 1
+
+
+def test_ensure_upstream_starts_after_rebinding_fresh_lease(monkeypatch):
+    from lsc.core.services.shared_ingest import SharedRoomIngest
+    from lsc.platforms.capabilities import get_platform_capabilities
+    from lsc.platforms.lease_manager import LeaseManager
+    from lsc.platforms.models import StreamCandidate
+
+    class _LiveProc:
+        pid = 11
+        returncode = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    launched: list[list[str]] = []
+    ingest = SharedRoomIngest(room_id="r", url="https://example/live.flv?wsSecret=old")
+    monkeypatch.setattr(ingest, "_launch_process", lambda cmd: launched.append(list(cmd)) or _LiveProc())
+    monkeypatch.setattr(ingest, "_start_stderr_reader", lambda *_a, **_k: None)
+    monkeypatch.setattr(ingest, "_start_thread", lambda *_a, **_k: None)
+    manager = LeaseManager()
+    caps = get_platform_capabilities("huya")
+    old_lease = manager.issue(
+        "r",
+        StreamCandidate(candidate_id="huya|0", url=ingest.url),
+        caps,
+        now=0.0,
+    )
+    ingest.bind_lease(manager, old_lease.lease_id)
+    assert ingest._ensure_upstream_started() == ""
+    ingest._process = None
+
+    ingest.url = "https://example/live.flv?wsSecret=new"
+    new_lease = manager.issue(
+        "r",
+        StreamCandidate(candidate_id="huya|1", url=ingest.url),
+        caps,
+        now=1.0,
+    )
+    ingest.bind_lease(manager, new_lease.lease_id)
+    assert ingest._ensure_upstream_started() == ""
+    assert manager.is_consumed(new_lease.lease_id) is True
+    assert len(launched) == 2
+
+
+def test_shared_preview_reconnect_ready_requires_live_upstream():
+    from types import SimpleNamespace
+
+    _shared_preview_reconnect_ready = _room_handler()._shared_preview_reconnect_ready
+    dead = SimpleNamespace(upstream_is_live=lambda: False, process_id=None)
+    live = SimpleNamespace(upstream_is_live=lambda: True, process_id=99)
+    assert _shared_preview_reconnect_ready({"success": True}, dead) is False
+    assert _shared_preview_reconnect_ready({"success": False}, live) is False
+    assert _shared_preview_reconnect_ready({"success": True}, live) is True
+    assert _shared_preview_reconnect_ready({"success": True}, None) is False
+
+
+def test_mse_preview_attach_while_recording_rebinds_lease():
+    import inspect
+
+    room_handler = _room_handler()
+    source = inspect.getsource(room_handler)
+    attached = source.split("shared ingest preview attached", 1)[0]
+    attach_while_recording = attached.rsplit("recording_active", 1)[-1]
+    assert "_bind_shared_ingest_lease" in attach_while_recording
+    handle_src = source.split("def _attach_shared_preview_handle", 1)[1].split(
+        "async def _reattach_shared_preview_after_recording_start", 1
+    )[0]
+    bind_at = handle_src.find("_bind_shared_ingest_lease")
+    switch_at = handle_src.find("switch_upstream")
+    assert bind_at != -1
+    assert switch_at != -1
+    assert bind_at < switch_at
 
 
 def test_same_wssecret_second_http_get_is_403():

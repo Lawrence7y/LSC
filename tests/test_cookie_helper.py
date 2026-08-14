@@ -126,6 +126,58 @@ def test_save_bilibili_cookies_from_text_writes_file(tmp_path, monkeypatch):
     assert saved["SESSDATA"] == "s1"
 
 
+def test_get_huya_cookie_status_reads_saved_file(tmp_path, monkeypatch):
+    import os
+
+    from lsc.platforms import cookie_helper
+
+    cookie_dir = tmp_path / ".lsc" / "cookies"
+    cookie_dir.mkdir(parents=True)
+    (cookie_dir / "huya.json").write_text(
+        json.dumps({"udb_uid": "1", "udb_guid": "abc"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("LSC_HUYA_COOKIES", raising=False)
+
+    def _expand(path: str) -> str:
+        if path.startswith("~"):
+            return str(tmp_path / path[2:].lstrip("/\\").replace("/", os.sep))
+        return path
+
+    monkeypatch.setattr(cookie_helper.os.path, "expanduser", _expand)
+    monkeypatch.setattr(cookie_helper, "get_chrome_cookies_for_domain", lambda _d: {})
+    monkeypatch.setattr(cookie_helper, "get_edge_cookies_for_domain", lambda _d: {})
+
+    status = cookie_helper.get_huya_cookie_status()
+    assert status["configured"] is True
+    assert status["count"] >= 2
+    assert "udb_uid" in status["keys"]
+
+
+def test_save_huya_cookies_from_text_writes_file(tmp_path, monkeypatch):
+    import os
+
+    from lsc.platforms import cookie_helper
+
+    def _expand(path: str) -> str:
+        if path.startswith("~"):
+            return str(tmp_path / path[2:].lstrip("/\\").replace("/", os.sep))
+        return path
+
+    monkeypatch.setattr(cookie_helper.os.path, "expanduser", _expand)
+    monkeypatch.delenv("LSC_HUYA_COOKIES", raising=False)
+    monkeypatch.setattr(cookie_helper, "get_chrome_cookies_for_domain", lambda _d: {})
+    monkeypatch.setattr(cookie_helper, "get_edge_cookies_for_domain", lambda _d: {})
+
+    status = cookie_helper.save_huya_cookies_from_text(
+        '{"udb_uid":"1","udb_guid":"g1"}'
+    )
+    assert status["configured"] is True
+    assert status["count"] == 2
+    saved = json.loads((tmp_path / ".lsc" / "cookies" / "huya.json").read_text(encoding="utf-8"))
+    assert saved["udb_uid"] == "1"
+
+
 def test_fetch_page_cookie_header_ignores_replacement_chars(monkeypatch):
     """脏 Cookie 不得导致 urllib latin-1 编码异常。"""
     import scripts.douyin_record as douyin_record

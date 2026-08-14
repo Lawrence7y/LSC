@@ -1,7 +1,7 @@
 import { useEffect, useCallback } from 'react'
 import { message } from 'antd'
 import { wsClient as _wsClient } from '@/services/websocket'
-import type { RoomSession } from '@/types'
+import type { RoomPipelineHealth, RoomSession, RuntimeEventPayload } from '@/types'
 
 // 导出 wsClient 供需要在组件外订阅事件的场景使用
 export const wsClient = _wsClient
@@ -18,6 +18,94 @@ let _sharedHandlersCleanup: (() => void) | null = null
 // 广播序列号追踪：检测丢消息并触发强制同步
 let _lastBroadcastSeq: number | null = null
 
+// Runtime events may arrive after a reconnect or alongside a room snapshot.
+// Keep the newest generation/timestamp per room so stale events cannot roll
+// the visible health state backwards.
+const _lastRuntimeEventByRoom = new Map<string, { generation: number; occurredAt: number; eventId: string }>()
+
+function _isStaleRuntimeEvent(payload: RuntimeEventPayload): boolean {
+  const roomId = String(payload.room_id || '')
+  if (!roomId) return true
+  const generation = Number(payload.lease_generation ?? payload.generation ?? 0)
+  const occurredAt = Number(payload.occurred_at || 0)
+  const previous = _lastRuntimeEventByRoom.get(roomId)
+  if (
+    previous
+    && (
+      generation < previous.generation
+      || (generation === previous.generation && occurredAt < previous.occurredAt)
+      || (generation === previous.generation && occurredAt === previous.occurredAt && payload.event_id === previous.eventId)
+    )
+  ) {
+    return true
+  }
+  _lastRuntimeEventByRoom.set(roomId, {
+    generation,
+    occurredAt,
+    eventId: String(payload.event_id || ''),
+  })
+  return false
+}
+
+function _applyRuntimeEvent(payload: RuntimeEventPayload): void {
+  if (_isStaleRuntimeEvent(payload)) return
+  const store = useAppStore.getState()
+  const room = store.rooms.find((item) => item.room_id === payload.room_id)
+  if (!room) return
+
+  const previous = room.pipeline_health
+  const state = String(payload.state_to || payload.state || '').toUpperCase()
+  const component = String(payload.component || payload.stage || '').toLowerCase()
+  const safeContext = payload.safe_context || payload.context || {}
+  const sink = String(safeContext.sink || '').toLowerCase()
+  const health: RoomPipelineHealth = {
+    schema_version: Number(payload.schema_version || previous?.schema_version || 1),
+    platform_id: payload.platform_id || previous?.platform_id || room.platform,
+    pipeline_mode: previous?.pipeline_mode,
+    platform: previous?.platform || 'UNKNOWN',
+    resolver: previous?.resolver || 'IDLE',
+    ingest: (state || previous?.ingest || 'IDLE') as RoomPipelineHealth['ingest'],
+    recording: previous?.recording || 'IDLE',
+    preview: previous?.preview || 'IDLE',
+    error: previous?.error,
+    failure_kind: payload.failure_kind || previous?.failure_kind,
+    support_level: previous?.support_level,
+    connection_policy: previous?.connection_policy,
+    credential_status: previous?.credential_status,
+    credential_kinds: previous?.credential_kinds,
+    lease_id: payload.lease_id || previous?.lease_id,
+    candidate_id: payload.candidate_id || previous?.candidate_id,
+    quality_id: previous?.quality_id,
+    protocol: previous?.protocol,
+    cdn_id: previous?.cdn_id,
+    lease_expires_at: previous?.lease_expires_at,
+    lease_refresh_at: previous?.lease_refresh_at,
+    generation: Number(payload.lease_generation ?? payload.generation ?? previous?.generation ?? 0),
+    upstream_generation: previous?.upstream_generation,
+    recovery_attempt: payload.attempt ?? previous?.recovery_attempt,
+    max_recovery_attempts: payload.max_attempts ?? previous?.max_recovery_attempts,
+    resources: previous?.resources,
+    updated_at: Number(payload.occurred_at || Date.now() / 1000),
+  }
+
+  if (component === 'recording' || sink === 'recording' || payload.event_type.includes('RECORDING')) {
+    health.recording = payload.event_type === 'SINK_DETACHED' || payload.event_type === 'RECORDING_STOPPED'
+      ? 'IDLE'
+      : state === 'RUNNING' || payload.event_type === 'RECORDING_STARTED'
+        ? 'RECORDING'
+        : state === 'FAILED' || state === 'DEGRADED' ? 'ERROR' : health.recording
+  }
+  if (component === 'preview' || sink === 'preview' || payload.event_type.includes('PREVIEW')) {
+    health.preview = payload.event_type === 'SINK_DETACHED'
+      ? 'IDLE'
+      : state === 'RUNNING' || payload.event_type === 'PREVIEW_ATTACHED'
+        ? 'PLAYING'
+        : state === 'FAILED' || state === 'DEGRADED' ? 'ERROR' : health.preview
+  }
+
+  store.updateRoom(payload.room_id, { pipeline_health: health })
+}
+
 // 按房间跟踪 mse_init 重试定时器（对象写法，便于测试与清理）
 const _mseInitRetryTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 
@@ -32,6 +120,8 @@ const _mseInitCacheTime: Record<string, number> = {}
 const _mseSegmentCache: Record<string, ArrayBuffer[]> = {}
 const _mseSegmentCacheTime: Record<string, number> = {}
 const _MSE_SEGMENT_CACHE_MAX = 10
+const _MSE_SEGMENT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+let _mseSegmentCacheBytes = 0
 const _MSE_CACHE_TTL_MS = 5 * 60 * 1000
 // mse_segment 接收 watchdog：按房间记录最后接收时间，超时按房间恢复预览
 const _lastMseSegmentTimePerRoom: Map<string, number> = new Map()
@@ -52,6 +142,11 @@ let _lastSystemStatsAt = 0
 export function clearMseRoomCache(roomId: string): void {
   delete _mseInitCache[roomId]
   delete _mseInitCacheTime[roomId]
+  const segments = _mseSegmentCache[roomId]
+  if (segments) {
+    _mseSegmentCacheBytes -= segments.reduce((sum, item) => sum + item.byteLength, 0)
+    _mseSegmentCacheBytes = Math.max(0, _mseSegmentCacheBytes)
+  }
   delete _mseSegmentCache[roomId]
   delete _mseSegmentCacheTime[roomId]
   if (_mseInitRetryTimers[roomId]) {
@@ -77,16 +172,19 @@ function _pruneExpiredMseCache(): void {
   for (const roomId of Object.keys(_mseSegmentCache)) {
     const ts = _mseSegmentCacheTime[roomId] ?? 0
     if (now - ts > _MSE_CACHE_TTL_MS) {
+      const segments = _mseSegmentCache[roomId]
+      _mseSegmentCacheBytes -= segments?.reduce((sum, item) => sum + item.byteLength, 0) ?? 0
       delete _mseSegmentCache[roomId]
       delete _mseSegmentCacheTime[roomId]
     }
   }
+  _mseSegmentCacheBytes = Math.max(0, _mseSegmentCacheBytes)
 }
 
 // 定期清理过期 MSE 缓存，避免 segment 缓存先过期时需等待下次 cache 调用才清理
 setInterval(_pruneExpiredMseCache, 60_000)
 
-function _cacheMseInit(roomId: string, buffer: ArrayBuffer): void {
+export function _cacheMseInit(roomId: string, buffer: ArrayBuffer): void {
   _pruneExpiredMseCache()
   _mseInitCache[roomId] = buffer
   _mseInitCacheTime[roomId] = Date.now()
@@ -98,7 +196,7 @@ function _cacheMseInit(roomId: string, buffer: ArrayBuffer): void {
   }
 }
 
-function _cacheMseSegment(roomId: string, buffer: ArrayBuffer): void {
+export function _cacheMseSegment(roomId: string, buffer: ArrayBuffer): void {
   _pruneExpiredMseCache()
   if (!_mseSegmentCache[roomId]) {
     _mseSegmentCache[roomId] = []
@@ -106,9 +204,19 @@ function _cacheMseSegment(roomId: string, buffer: ArrayBuffer): void {
   _mseSegmentCacheTime[roomId] = Date.now()
   const arr = _mseSegmentCache[roomId]
   arr.push(buffer)
+  _mseSegmentCacheBytes += buffer.byteLength
   // 超出上限丢弃最旧
   while (arr.length > _MSE_SEGMENT_CACHE_MAX) {
-    arr.shift()
+    const removed = arr.shift()
+    if (removed) _mseSegmentCacheBytes -= removed.byteLength
+  }
+  // 跨房间总量也受限，优先淘汰最久未更新的房间。
+  while (_mseSegmentCacheBytes > _MSE_SEGMENT_CACHE_MAX_BYTES) {
+    const oldest = Object.keys(_mseSegmentCacheTime)
+      .filter(key => (_mseSegmentCache[key]?.length ?? 0) > 0)
+      .sort((a, b) => (_mseSegmentCacheTime[a] ?? 0) - (_mseSegmentCacheTime[b] ?? 0))[0]
+    if (!oldest) break
+    clearMseRoomCache(oldest)
   }
 }
 
@@ -117,6 +225,8 @@ function _drainMseSegmentCache(roomId: string): ArrayBuffer[] {
   const arr = _mseSegmentCache[roomId]
   if (!arr || arr.length === 0) return []
   delete _mseSegmentCache[roomId]
+  _mseSegmentCacheBytes -= arr.reduce((sum, item) => sum + item.byteLength, 0)
+  _mseSegmentCacheBytes = Math.max(0, _mseSegmentCacheBytes)
   return arr
 }
 
@@ -200,6 +310,12 @@ function _attachSharedWebSocketHandlers(): () => void {
 
   const unsubConnected = wsClient.on('connected', () => {
     useAppStore.getState().setConnectionStatus('connected')
+    // Reconcile the authoritative room snapshot before consuming incremental
+    // runtime events after a reconnect; this prevents event gaps from leaving
+    // health dimensions stuck in an old generation.
+    setTimeout(() => {
+      wsClient.send('get_rooms', {})
+    }, 100)
     // 后端 on_connect 已主动推送 settings_loaded，无需重复请求
     // 延迟非关键请求，不阻塞首屏渲染
     setTimeout(() => {
@@ -238,6 +354,7 @@ function _attachSharedWebSocketHandlers(): () => void {
       for (const prev of useAppStore.getState().rooms) {
         if (!incomingIds.has(prev.room_id)) {
           clearMseRoomCache(prev.room_id)
+          _lastRuntimeEventByRoom.delete(prev.room_id)
         }
       }
       const retryCounts = window.__mseInitRetryCount
@@ -285,6 +402,12 @@ function _attachSharedWebSocketHandlers(): () => void {
         const { room_id, ...updates } = data as { room_id: string } & Partial<RoomSession>
         useAppStore.getState().updateRoom(room_id, updates)
       }
+    }
+  })
+
+  const unsubRuntimeEvent = wsClient.on('runtime_event', (data: RuntimeEventPayload) => {
+    if (data && data.room_id) {
+      _applyRuntimeEvent(data)
     }
   })
 
@@ -583,6 +706,7 @@ function _attachSharedWebSocketHandlers(): () => void {
     unsubRoomsUpdated()
     unsubRoomsLoaded()
     unsubRoomUpdated()
+    unsubRuntimeEvent()
     unsubClipCompleted()
     unsubClipFailed()
     unsubExportProgress()
@@ -610,6 +734,7 @@ function _attachSharedWebSocketHandlers(): () => void {
     for (const key of Object.keys(_mseInitRetryTimers)) {
       delete _mseInitRetryTimers[key]
     }
+    _lastRuntimeEventByRoom.clear()
   }
 }
 

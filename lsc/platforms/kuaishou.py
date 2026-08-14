@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,6 +26,7 @@ from .base import (
     fetch_url,
     sanitize_undefined_to_null,
 )
+from .redaction import redact_url
 
 _log = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ KUAISHOU_HEADERS = {
 #   https://live.kuaishou.com/w/<id>
 #   https://live.kuaishou.com/profile/<user_id> (may redirect to live)
 _ROOM_PATH_RE = re.compile(r"^/(u|w|profile)/(?P<user_id>[^/?#]+)/?$")
+_LIVE_HOSTS = {"live.kuaishou.com", "kuaishou.com", "www.kuaishou.com"}
+_SHORT_LINK_HOSTS = {"v.kuaishou.com"}
 
 
 class KuaishouAdapter(BasePlatformAdapter):
@@ -48,18 +52,48 @@ class KuaishouAdapter(BasePlatformAdapter):
     display_name = "快手"
 
     def can_handle(self, url: str) -> bool:
-        _log.debug("Kuaishou: checking %s", url[:60])
+        _log.debug("Kuaishou: checking %s", redact_url(url)[:60])
         parsed = urlparse((url or "").strip())
         host = parsed.netloc.lower()
-        return host in {"live.kuaishou.com", "kuaishou.com"} and bool(
-            _ROOM_PATH_RE.fullmatch(parsed.path)
-        )
+        if host in _SHORT_LINK_HOSTS:
+            return bool(parsed.path.strip("/"))
+        return host in _LIVE_HOSTS and bool(_ROOM_PATH_RE.fullmatch(parsed.path))
 
     def parse(self, url: str) -> StreamInfo:
-        _log.info("Kuaishou: parsing %s", url[:80])
+        return self._parse(url)
+
+    def parse_with_context(self, url: str, context: object) -> StreamInfo:
+        """Use the resolver's scoped headers, proxy and timeout budget."""
+        headers = dict(KUAISHOU_HEADERS)
+        headers.update(dict(getattr(context, "headers", {}) or {}))
+        return self._parse(
+            url,
+            request_headers=headers,
+            network_context=getattr(context, "network_context", {}) or {},
+        )
+
+    def _parse(
+        self,
+        url: str,
+        *,
+        request_headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
+        _log.info("Kuaishou: parsing %s", redact_url(url)[:80])
         clean_url = (url or "").strip()
+        headers = dict(request_headers or KUAISHOU_HEADERS)
+        context = dict(network_context or {})
         try:
-            html = self._fetch_page(clean_url)
+            if request_headers is None and not context:
+                # Preserve the small legacy/test seam for callers that do not
+                # provide a scoped context.
+                html = self._fetch_page(clean_url)
+            else:
+                html = self._fetch_page(
+                    clean_url,
+                    headers=headers,
+                    network_context=context,
+                )
             data = self._extract_initial_state(html)
         except Exception as exc:
             return self._failed(clean_url, f"快手页面解析失败: {exc}", ERROR_PARSE_FAILED)
@@ -88,7 +122,14 @@ class KuaishouAdapter(BasePlatformAdapter):
         is_living = bool(item.get("isLiving") or author.get("living"))
         status = item.get("status") or {}
         forbidden_state = int(status.get("forbiddenState") or 0) if isinstance(status, dict) else 0
-        if not is_living or forbidden_state:
+        if forbidden_state:
+            return self._failed(
+                clean_url,
+                "快手直播间当前受访问限制或需要登录。",
+                ERROR_RESTRICTED,
+                raw=data,
+            )
+        if not is_living:
             return self._failed(
                 clean_url,
                 "快手直播间未开播或当前不可访问。",
@@ -129,13 +170,39 @@ class KuaishouAdapter(BasePlatformAdapter):
             is_live=True,
             quality_urls=quality_urls,
             selected_quality=selected_quality,
-            headers=dict(KUAISHOU_HEADERS),
-            raw={},  # discard large page payload on success to save memory
+            headers=headers,
+            raw={
+                "source_kind": "official",
+                "confidence": 0.8,
+                "state_source": "window.__INITIAL_STATE__",
+            },
             category=category,
         )
 
-    def _fetch_page(self, url: str) -> str:
-        return fetch_url(url, headers=KUAISHOU_HEADERS)
+    def _fetch_page(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> str:
+        context = dict(network_context or {})
+        proxy_url = str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+        try:
+            timeout = max(1, min(300, int(float(context.get("timeout_sec", 12)))))
+        except (TypeError, ValueError):
+            timeout = 12
+        return fetch_url(
+            url,
+            headers=dict(headers or KUAISHOU_HEADERS),
+            timeout=timeout,
+            proxy_url=proxy_url,
+        )
 
     def _extract_initial_state(self, html: str) -> dict[str, Any]:
         """Extract and sanitize ``window.__INITIAL_STATE__`` from the HTML."""

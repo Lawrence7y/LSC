@@ -14,21 +14,25 @@ def should_force_refresh_when_recording(stream_info: object | None) -> bool:
 
 
 def should_force_recovery(stream_info: object | None, error: object) -> bool:
-    """Return the adapter policy decision for an otherwise non-recoverable exit."""
+    """Return the adapter policy decision for an otherwise non-recoverable exit.
+
+    Preview must not refresh a signed URL while recording, but recording
+    itself still has to recover from FFmpeg ``code 0`` / 异常退出 on
+    ingest-as-probe platforms. Those two policies are independent.
+    """
     platform = str(getattr(stream_info, "platform", "") or "")
     capabilities = get_platform_capabilities(platform)
-    if not capabilities.preview_refresh_when_recording:
-        return False
     text = str(error or "")
     kind = classify_failure(text)
-    # ``code=0`` is a common FFmpeg symptom of a Huya CDN/signature exit;
-    # classify it centrally instead of making the generic runtime inspect
-    # platform-specific stderr text.  Keep the old wording as a bounded
-    # compatibility fallback for adapters that emit no typed signal.
-    return is_recoverable_failure(kind) or any(
+    abnormal = is_recoverable_failure(kind) or any(
         marker in text.lower()
         for marker in ("abnormal", "异常退出")
     )
+    if uses_ingest_probe(capabilities):
+        return abnormal
+    if not capabilities.preview_refresh_when_recording:
+        return False
+    return abnormal
 
 
 def recovery_action(
@@ -53,6 +57,16 @@ def recovery_action(
         return "restart_recording_sink"
     if kind is FailureKind.OFFLINE:
         return "offline"
+    if ingest and "signed http remote eof after media" in lowered:
+        return "rotate_lease"
+    if (
+        ingest
+        and saw_first_ts
+        and kind is FailureKind.CONNECTION_RESET
+        and "code=0" in lowered.replace(" ", "")
+        and "remote eof before media" not in lowered
+    ):
+        return "rotate_lease"
     family_kinds = {
         FailureKind.AUTH_EXPIRED,
         FailureKind.SIGNATURE_EXPIRED,
@@ -89,7 +103,7 @@ def mark_failed_candidate(
     capabilities = get_platform_capabilities(platform)
     kind = classify_failure(str(error or ""))
     action = recovery_action(stream_info, error, saw_first_ts=saw_first_ts)
-    if action in {"restart_preview_sink", "restart_recording_sink"}:
+    if action in {"restart_preview_sink", "restart_recording_sink", "rotate_lease"}:
         return False
     if action == "invalidate_family":
         kind = FailureKind.SIGNATURE_EXPIRED

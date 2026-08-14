@@ -25,6 +25,10 @@ _JPEG_EOI = b"\xff\xd9"
 _MAX_RETRY = 3
 _RETRY_DELAY_SEC = 5.0
 _READ_CHUNK = 65536
+# A malformed/upstream stream can omit JPEG EOI forever.  Bound the parser
+# buffer so preview capture cannot grow without limit while waiting for a
+# complete frame.
+_MAX_BUFFER_BYTES = 4 * 1024 * 1024
 
 
 class FrameCaptureWorker:
@@ -137,6 +141,18 @@ class FrameCaptureWorker:
                 # 已重启：下一轮循环读新 process 的 stdout
                 continue
             buffer.extend(chunk)
+            if len(buffer) > _MAX_BUFFER_BYTES:
+                # Retain only a possible frame start.  If that incomplete
+                # frame is itself oversized, fail closed and let the normal
+                # retry/error path handle the capture instead of allocating
+                # unbounded memory.
+                soi = buffer.rfind(_JPEG_SOI)
+                if soi >= 0:
+                    del buffer[:soi]
+                if len(buffer) > _MAX_BUFFER_BYTES:
+                    buffer.clear()
+                    self._error = "预览抓帧失败：JPEG 帧超过缓冲上限"
+                    break
             # 提取所有完整 JPEG 帧，保留最后一个到 _latest_frame
             while True:
                 soi = buffer.find(_JPEG_SOI)

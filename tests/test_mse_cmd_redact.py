@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from lsc.core.services.mse_streamer import _redact_ffmpeg_cmd
+from lsc.platforms.redaction import redact_text
 
 
 def test_redact_ffmpeg_cmd_hides_headers_value() -> None:
@@ -38,3 +39,16 @@ def test_redact_ffmpeg_cmd_hides_authorization() -> None:
 def test_redact_ffmpeg_cmd_preserves_safe_args() -> None:
     cmd = ["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-f", "mp4", "pipe:1"]
     assert _redact_ffmpeg_cmd(cmd) == cmd
+
+
+def test_redact_text_hides_complete_escaped_cookie_header() -> None:
+    detail = (
+        "Command [... '-headers', "
+        "'Referer: https://live.example/\\r\\n"
+        "Cookie: SESSDATA=secret; bili_jct=another-secret; foo=bar\\r\\n']"
+    )
+    redacted = redact_text(detail)
+    assert "secret" not in redacted
+    assert "another-secret" not in redacted
+    assert "foo=bar" not in redacted
+    assert "Cookie: <redacted>" in redacted

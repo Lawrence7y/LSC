@@ -8,6 +8,8 @@ _log = logging.getLogger(__name__)
 from urllib.parse import ParseResult, parse_qsl, urlparse
 
 from .base import BasePlatformAdapter, StreamInfo
+from .redaction import redact_url
+from .url_policy import validate_public_url
 
 _DIRECT_SUFFIXES = (".m3u8", ".flv")
 _DIRECT_QUERY_FORMAT_KEYS = {"type", "format", "container", "ext"}
@@ -20,18 +22,22 @@ class DirectAdapter(BasePlatformAdapter):
     display_name = "直链"
 
     def can_handle(self, url: str) -> bool:
-        _log.debug("Direct: checking %s", url[:60])
+        _log.debug("Direct: checking %s", redact_url(url)[:60])
         clean_url = (url or "").strip()
         parsed = urlparse(clean_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        safe, _reason = validate_public_url(clean_url)
+        if not safe or not parsed.netloc:
             return False
         if parsed.path.lower().endswith(_DIRECT_SUFFIXES):
             return True
         return self._has_direct_query_hint(parsed)
 
     def parse(self, url: str) -> StreamInfo:
-        _log.info("Direct: parsing %s", url[:80])
+        _log.info("Direct: parsing %s", redact_url(url)[:80])
         clean_url = (url or "").strip()
+        safe, reason = validate_public_url(clean_url)
+        if not safe:
+            return self._failed(clean_url, reason, "restricted")
         return self._success(
             clean_url,
             stream_url=clean_url,
@@ -40,6 +46,12 @@ class DirectAdapter(BasePlatformAdapter):
             is_live=True,
             quality_urls={"origin": clean_url},
             selected_quality="origin",
+            raw={
+                "source_kind": "official",
+                "confidence": 0.95,
+                "state_source": "direct_url",
+                "validate_redirects": True,
+            },
         )
 
     def _has_direct_query_hint(self, parsed: ParseResult) -> bool:

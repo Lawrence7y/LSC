@@ -3,8 +3,11 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+from lsc.config import LscConfig
 from lsc.platforms.base import ERROR_OFFLINE, StreamInfo
+from lsc.platforms.models import PlatformError, ResolveResult, StreamCandidate
 
 BACKEND_DIR = Path(__file__).resolve().parents[1] / "python-backend"
 if str(BACKEND_DIR) not in sys.path:
@@ -84,3 +87,80 @@ def test_room_url_validation_rejects_parse_failure(monkeypatch) -> None:
     assert result["valid"] is False
     assert result["error_code"] == "unsupported_url"
 
+
+def test_room_url_validation_uses_v2_resolver_when_platform_is_allowlisted(monkeypatch) -> None:
+    url = "https://live.bilibili.com/456"
+    cfg = LscConfig(
+        platform_pipeline_v2_enabled=True,
+        platform_pipeline_v2_allowlist=["bilibili"],
+    )
+    monkeypatch.setattr(room_handler, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "lsc.platforms.resolver.resolve_stream_v2",
+        lambda request: ResolveResult(
+            platform="bilibili",
+            room_url=request.source_url,
+            room_title="V2 房间",
+            anchor_name="V2 主播",
+            live_status="LIVE",
+            candidates=(
+                StreamCandidate(
+                    candidate_id="bilibili|origin|0",
+                    url="https://cdn.example/live.m3u8",
+                    quality_id="origin",
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        room_handler,
+        "parse_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("V2 room validation must not call legacy parse_stream")
+        ),
+    )
+
+    result = room_handler._validate_room_url_candidate(url)
+
+    assert result["valid"] is True
+    assert result["platform"] == "bilibili"
+    assert result["streamer"] == "V2 主播"
+
+
+def test_mse_offline_probe_uses_v2_result_when_platform_is_allowlisted(monkeypatch) -> None:
+    room = SimpleNamespace(
+        room_id="room-v2-offline",
+        room_url="https://live.bilibili.com/123",
+        platform="bilibili",
+        platform_name="bilibili",
+        stream_info=None,
+        last_error="",
+        network_context={},
+    )
+    manager = SimpleNamespace(get_room=lambda room_id: room)
+    cfg = LscConfig(
+        platform_pipeline_v2_enabled=True,
+        platform_pipeline_v2_allowlist=["bilibili"],
+    )
+    monkeypatch.setattr(room_handler, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "lsc.platforms.resolver.resolve_stream_v2",
+        lambda _request: ResolveResult(
+            platform="bilibili",
+            room_url=room.room_url,
+            live_status="OFFLINE",
+            error=PlatformError(code="OFFLINE", category="OFFLINE", user_message="offline"),
+        ),
+    )
+    monkeypatch.setattr(
+        room_handler,
+        "parse_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("V2 offline probe must not call legacy parse_stream")
+        ),
+    )
+
+    offline, message = room_handler._probe_stream_offline(manager, room.room_id)
+
+    assert offline is True
+    assert message

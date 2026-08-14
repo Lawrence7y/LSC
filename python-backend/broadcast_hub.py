@@ -9,6 +9,8 @@ import queue
 import threading
 from typing import Any
 
+from lsc.platforms.redaction import redact_mapping, redact_text
+
 _log = logging.getLogger(__name__)
 
 _TERMINAL_TYPES = frozenset({
@@ -45,6 +47,7 @@ class BroadcastHub:
         bus.subscribe("room_connect_finished", self._on_connect_finished)
         bus.subscribe("batch_record_progress", self._on_batch_record_progress)
         bus.subscribe("recording_stopped", self._on_recording_stopped)
+        bus.subscribe("runtime_event", self._on_runtime_event)
 
     def bind_async_wake(self, loop: Any, event: Any) -> None:
         """绑定 asyncio 事件循环与 Event，供 queue_broadcast 跨线程唤醒。"""
@@ -65,10 +68,11 @@ class BroadcastHub:
 
     def _on_connect_finished(self, room_id: str, success: bool, error: str) -> None:
         """房间连接完成，将结果推入广播队列。"""
-        _log.debug("room_connect_finished: room_id=%s success=%s error=%s", room_id, success, error)
+        safe_error = redact_text(error)
+        _log.debug("room_connect_finished: room_id=%s success=%s error=%s", room_id, success, safe_error)
         self.queue_broadcast({
             'type': 'room_connect_finished',
-            'data': {'room_id': room_id, 'success': success, 'error': error},
+            'data': {'room_id': room_id, 'success': success, 'error': safe_error},
         })
 
     def _on_batch_record_progress(self, room_id: str, success: bool) -> None:
@@ -84,11 +88,31 @@ class BroadcastHub:
 
     def _on_recording_stopped(self, room_id: str, reason: str, message: str) -> None:
         """录制停止（含磁盘满、断流等），前端据此更新状态并强提示。"""
-        _log.debug("recording_stopped: room_id=%s reason=%s", room_id, reason)
+        safe_reason = redact_text(reason)
+        safe_message = redact_text(message)
+        _log.debug("recording_stopped: room_id=%s reason=%s", room_id, safe_reason)
         self.queue_broadcast({
             'type': 'recording_stopped',
-            'data': {'room_id': room_id, 'reason': reason, 'message': message},
+            'data': {'room_id': room_id, 'reason': safe_reason, 'message': safe_message},
         })
+
+    def _on_runtime_event(self, event: Any) -> None:
+        payload = event.to_dict() if hasattr(event, "to_dict") else dict(event or {})
+        # Runtime events can originate from compatibility plugins that return
+        # a plain mapping rather than IngestEvent. Apply the same final public
+        # redaction boundary in both cases before the payload enters the WS
+        # queue.
+        safe = redact_mapping(payload)
+        _log.info(
+            "runtime_event room=%s type=%s component=%s %s->%s failure=%s",
+            safe.get("room_id", ""),
+            safe.get("event_type", ""),
+            safe.get("component", ""),
+            safe.get("state_from", ""),
+            safe.get("state_to") or safe.get("state", ""),
+            safe.get("failure_kind", ""),
+        )
+        self.queue_broadcast({"type": "runtime_event", "data": safe})
 
     def get_broadcast(self, block: bool = False, timeout: float | None = None) -> dict[str, Any] | None:
         """从广播队列获取一条待发送的消息。"""

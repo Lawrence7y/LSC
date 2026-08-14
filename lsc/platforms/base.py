@@ -5,11 +5,13 @@ import abc
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, getproxies, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+from .redaction import redact_text, redact_url
 
 ERROR_UNSUPPORTED_URL = "unsupported_url"
 ERROR_OFFLINE = "offline"
@@ -59,9 +61,49 @@ def _is_private_ip(hostname: str) -> bool:
     return False
 
 
+def _validate_network_url(url: str) -> None:
+    """Validate every URL before it is requested, including redirects."""
+    from .url_policy import validate_public_url
+
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"Only public HTTP/HTTPS URLs are supported, got: {url}")
+    safe, reason = validate_public_url(url)
+    if not safe:
+        raise ValueError(reason)
+    if _is_private_ip(parsed.hostname):
+        raise ValueError(f"Access to private/internal IP is forbidden: {parsed.hostname}")
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    """Reject unsafe redirect targets before urllib opens the next hop."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_network_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = build_opener(_SafeRedirectHandler())
+
+
+def _opener_for_proxy(proxy_url: str = ""):
+    """Build a safe redirect-checking opener with an optional scoped proxy."""
+    proxy = str(proxy_url or "").strip()
+    if not proxy:
+        return _SAFE_OPENER
+    parsed = urlparse(proxy)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("network proxy must be an explicit proxy URL")
+    return build_opener(
+        _SafeRedirectHandler(),
+        ProxyHandler({"http": proxy, "https": proxy}),
+    )
+
+
 def fetch_url(url: str, *, headers: dict[str, str] | None = None,
               timeout: int = DEFAULT_HTTP_TIMEOUT,
-              retries: int = DEFAULT_HTTP_RETRIES) -> str:
+              retries: int = DEFAULT_HTTP_RETRIES,
+              proxy_url: str = "") -> str:
     """Fetch a URL with unified timeout and retry policy.
 
     Returns the response body as text. Raises on final failure.
@@ -81,34 +123,64 @@ def fetch_url(url: str, *, headers: dict[str, str] | None = None,
     for attempt in range(retries + 1):
         try:
             request = Request(url, headers=headers or {})
-            with urlopen(request, timeout=timeout) as response:
+            with _opener_for_proxy(proxy_url).open(request, timeout=timeout) as response:
+                final_url = response.geturl() or url
+                _validate_network_url(final_url)
                 raw_bytes: bytes = response.read()
                 return raw_bytes.decode("utf-8", errors="replace")
         except Exception as exc:
             last_exc = exc
             if attempt < retries:
                 wait = 0.5 * (attempt + 1)
-                _log.debug("fetch_url retry %d/%d for %s: %s", attempt + 1, retries, url, exc)
+                _log.debug("fetch_url retry %d/%d for %s: %s", attempt + 1, retries, redact_url(url), redact_text(exc))
                 time.sleep(wait)
     raise last_exc  # type: ignore[misc]
+
+
+def open_http_stream(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = 15.0,
+    proxy_url: str = "",
+):
+    """Open a public HTTP(S) URL for binary streaming. Caller must close."""
+    _validate_network_url(url)
+    request = Request(url, headers=headers or {})
+    response = _opener_for_proxy(proxy_url).open(request, timeout=timeout)
+    try:
+        _validate_network_url(response.geturl() or url)
+    except Exception:
+        response.close()
+        raise
+    return response
+
 
 
 def fetch_json(url: str, *, headers: dict[str, str] | None = None,
                params: dict[str, str] | None = None,
                timeout: int = DEFAULT_HTTP_TIMEOUT,
-               retries: int = DEFAULT_HTTP_RETRIES) -> dict[str, Any]:
+               retries: int = DEFAULT_HTTP_RETRIES,
+               proxy_url: str = "") -> dict[str, Any]:
     """Fetch a URL and parse JSON response with unified timeout/retry."""
     import json
     query = urlencode(params or {})
     request_url = f"{url}?{query}" if query else url
-    body = fetch_url(request_url, headers=headers, timeout=timeout, retries=retries)
+    body = fetch_url(
+        request_url,
+        headers=headers,
+        timeout=timeout,
+        retries=retries,
+        proxy_url=proxy_url,
+    )
     data = json.loads(body)
     return data if isinstance(data, dict) else {}
 
 
 def fetch_head(url: str, *, headers: dict[str, str] | None = None,
                timeout: int = DEFAULT_HTTP_TIMEOUT,
-               retries: int = DEFAULT_HTTP_RETRIES) -> str:
+               retries: int = DEFAULT_HTTP_RETRIES,
+               proxy_url: str = "") -> str:
     """Issue a HEAD request and return the final URL after redirects.
 
     Useful for expanding short links without downloading the response body.
@@ -116,22 +188,31 @@ def fetch_head(url: str, *, headers: dict[str, str] | None = None,
     """
     # 安全检查：只允许 HTTP/HTTPS 协议
     if not url.startswith(("http://", "https://")):
-        _log.warning("fetch_head called with non-HTTP URL: %s", url)
+        _log.warning("fetch_head called with non-HTTP URL: %s", redact_url(url))
+        return url
+    try:
+        _validate_network_url(url)
+    except ValueError:
         return url
 
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
             request = Request(url, headers=headers or {}, method="HEAD")
-            with urlopen(request, timeout=timeout) as response:
-                return response.geturl() or url
+            with _opener_for_proxy(proxy_url).open(request, timeout=timeout) as response:
+                final_url = response.geturl() or url
+                try:
+                    _validate_network_url(final_url)
+                except ValueError:
+                    return url
+                return final_url
         except Exception as exc:
             last_exc = exc
             if attempt < retries:
                 wait = 0.5 * (attempt + 1)
-                _log.debug("fetch_head retry %d/%d for %s: %s", attempt + 1, retries, url, exc)
+                _log.debug("fetch_head retry %d/%d for %s: %s", attempt + 1, retries, redact_url(url), redact_text(exc))
                 time.sleep(wait)
-    _log.debug("fetch_head failed for %s: %s", url, last_exc)
+    _log.debug("fetch_head failed for %s: %s", redact_url(url), redact_text(last_exc))
     return url
 
 
@@ -224,8 +305,60 @@ def headers_to_ffmpeg_input_args(headers: dict[str, str] | None) -> list[str]:
     if not clean_headers:
         return []
 
+    user_agent = ""
+    for key, value in clean_headers.items():
+        if key.lower() == "user-agent" and not user_agent:
+            user_agent = value
+
+    args: list[str] = []
+    if user_agent:
+        # FFmpeg HTTP ignores User-Agent inside -headers and sends Lavf/* unless
+        # this dedicated option is set.
+        args.extend(["-user_agent", user_agent])
     header_blob = "".join(f"{key}: {value}\r\n" for key, value in clean_headers.items())
-    return ["-headers", header_blob]
+    args.extend(["-headers", header_blob])
+    return args
+
+
+def network_timeout_args(
+    network_context: Mapping[str, object] | None = None,
+    *,
+    default_connect_sec: float = 10.0,
+    default_read_sec: float = 15.0,
+) -> list[str]:
+    """Build bounded FFmpeg network timeout arguments from one request context.
+
+    ``connect_timeout_sec`` and ``read_timeout_sec`` are deliberately kept in
+    the non-secret network context so ffprobe and the real ingest process can
+    consume the same timeout policy.  A single ``timeout_sec`` is accepted as
+    a convenient override for both phases.  Values are clamped to prevent a
+    malformed platform response from disabling the deadline entirely.
+    """
+    context = dict(network_context or {})
+
+    def _value(key: str, fallback: float) -> float:
+        raw = context.get(key, fallback)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = fallback
+        return max(0.1, min(300.0, value))
+
+    shared = context.get("timeout_sec")
+    try:
+        shared_value = float(shared) if shared not in (None, "") else None
+    except (TypeError, ValueError):
+        shared_value = None
+    connect_default = shared_value if shared_value is not None else default_connect_sec
+    read_default = shared_value if shared_value is not None else default_read_sec
+    connect_sec = _value("connect_timeout_sec", connect_default)
+    read_sec = _value("read_timeout_sec", read_default)
+    return [
+        "-timeout",
+        str(max(100_000, int(connect_sec * 1_000_000))),
+        "-rw_timeout",
+        str(max(100_000, int(read_sec * 1_000_000))),
+    ]
 
 
 @dataclass(slots=True)
@@ -243,6 +376,10 @@ class StreamInfo:
     error: str = ""
     error_code: str = ""
     category: str = ""
+    # Optional V2-only alternatives.  Legacy consumers continue to see the
+    # stable ``quality_urls`` mapping; Resolver consumes this richer list so
+    # multiple CDN hosts for the same quality are not collapsed prematurely.
+    candidate_urls: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
     def to_legacy_dict(self) -> dict[str, Any]:
         """Return the dictionary shape consumed by the current GUI code."""
@@ -282,6 +419,7 @@ class PlatformAdapter(Protocol):
 
     platform: str
     display_name: str
+    capabilities: Any
 
     def can_handle(self, url: str) -> bool:
         """Return whether this adapter owns the URL."""
@@ -308,6 +446,13 @@ class BasePlatformAdapter(abc.ABC):
     def display_name(self) -> str:
         """Human-readable platform name (e.g. '哔哩哔哩')."""
 
+    @property
+    def capabilities(self) -> Any:
+        """Return declarative capabilities without creating adapter state."""
+        from .capabilities import get_platform_capabilities
+
+        return get_platform_capabilities(self.platform)
+
     def _failed(
         self,
         url: str,
@@ -321,7 +466,7 @@ class BasePlatformAdapter(abc.ABC):
         return StreamInfo(
             platform=self.platform,
             room_url=url,
-            error=error,
+            error=redact_text(error),
             error_code=error_code,
             headers=headers or {},
             raw=raw or {},
@@ -380,6 +525,20 @@ class BasePlatformAdapter(abc.ABC):
     @abc.abstractmethod
     def parse(self, url: str) -> StreamInfo:
         """Parse a room URL or stream URL into StreamInfo."""
+
+    def parse_with_context(self, url: str, context: object) -> StreamInfo:
+        """Parse without the registry cache under a scoped request context.
+
+        Platform adapters that need credentials can override this method and
+        consume ``context.headers`` directly.  The default deliberately calls
+        ``parse`` on the adapter instance instead of ``registry.parse_stream``:
+        V2 requests must not reuse a URL-only legacy cache entry across
+        accounts, proxies or credential generations.  The resolver merges the
+        scoped headers into the normalized candidates for adapters that do not
+        need custom parsing.
+        """
+        del context
+        return self.parse(url)
 
     def can_handle(self, url: str) -> bool:
         """Default implementation: subclasses should override this.

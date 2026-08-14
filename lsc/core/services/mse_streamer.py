@@ -25,6 +25,7 @@ from lsc import get_logger
 from lsc.config import load_config
 from lsc.core.services.fmp4_segments import Fmp4SegmentParser
 from lsc.platforms.base import headers_to_ffmpeg_input_args
+from lsc.platforms.redaction import redact_command, redact_text
 from lsc.utils.gpu_ffmpeg import scale_cuda_available
 from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
 
@@ -32,26 +33,25 @@ _log = get_logger(__name__)
 
 
 def _redact_ffmpeg_cmd(cmd: list[str]) -> list[str]:
-    out: list[str] = []
-    hide_next = False
-    for c in cmd:
-        if hide_next:
-            out.append("<redacted>")
-            hide_next = False
-            continue
-        if c in ("-headers", "-headers:"):
-            out.append(str(c))
-            hide_next = True
-            continue
-        s = str(c)
-        if "cookie" in s.lower() or "authorization" in s.lower():
-            out.append("<redacted>")
-        else:
-            out.append(s)
-    return out
+    """Compatibility wrapper around the repository-wide command redactor."""
+    redacted = redact_command(cmd)
+    # Preserve the historical contract for inline header arguments while the
+    # shared helper handles URLs, proxy values and ``-headers`` payloads.
+    for index, item in enumerate(cmd):
+        lowered = str(item).lower()
+        if lowered.startswith(("cookie:", "authorization:", "proxy-authorization:")):
+            redacted[index] = "<redacted>"
+    return redacted
 
 # Max segment size before forcing a split (512KB)
 _MAX_SEGMENT_BYTES = 512 * 1024
+
+# 启动探测超时后判定启动失败的 stderr 特征（CDN 403/鉴权过期等）。
+# 命中时即便 FFmpeg 未退出也判失败，避免"假成功"导致预览停在 probing。
+_STARTUP_FAILURE_HINTS = (
+    "403", "forbidden", "鉴权失败", "链接已过期",
+    "unauthorized", "401", "access denied",
+)
 
 # NVENC availability cache (checked once per process lifetime)
 _nvenc_available: bool | None = None
@@ -239,7 +239,7 @@ class MseStreamer:
         return self._try_start(
             hwaccel_mode="",
             use_nvenc=use_nvenc,
-            startup_probe_timeout=startup_probe_timeout,
+            startup_probe_timeout=min(2.0, startup_probe_timeout),
         )
 
     def _cleanup_after_failed_start(self) -> None:
@@ -402,7 +402,6 @@ class MseStreamer:
         try:
             env, creation_flags, cwd = prepare_launch(self._ffmpeg_path)
             # 诊断：INFO 脱敏，完整命令仅 DEBUG
-            _log.debug("FFmpeg command: %s", [str(c) for c in cmd])
             _log.info("FFmpeg command: %s", _redact_ffmpeg_cmd(cmd))
             popen_kwargs: dict = {
                 "stdout": subprocess.PIPE,
@@ -455,7 +454,19 @@ class MseStreamer:
                 return False
             time.sleep(0.15)
 
-        # 超时但未退出 → 假定成功（init 可能在探测后才产出）
+        # 超时但未退出 → 检查 stderr 是否已含明确的连接失败特征（CDN 403 等），
+        # 有则判失败避免"假成功"，否则假定成功（init 可能在探测后才产出）
+        stderr = self._last_stderr or ""
+        if any(hint in stderr.lower() for hint in _STARTUP_FAILURE_HINTS):
+            self._running = False
+            self._cleanup_process()
+            if not self._error_reported:
+                self._error_reported = True
+                err_msg = stderr.strip()[:500]
+                _log.error("FFmpeg probe timeout with error: %s", err_msg)
+                if self._on_error:
+                    self._on_error(f"流连接失败: {err_msg}")
+            return False
         return True
 
     def _read_stderr(self) -> None:
@@ -472,9 +483,9 @@ class MseStreamer:
                 if len(buf) > 100:
                     buf.pop(0)
         except Exception as exc:
-            _log.warning("Error reading FFmpeg stderr: %s", exc)
+            _log.warning("Error reading FFmpeg stderr: %s", redact_text(exc))
         finally:
-            self._last_stderr = "\n".join(buf[-20:])
+            self._last_stderr = redact_text("\n".join(buf[-20:]))
 
     def _cleanup_process(self) -> None:
         """清理 FFmpeg 进程（不停止读取线程），用于启动失败时的进程回收。"""
@@ -610,10 +621,10 @@ class MseStreamer:
                             _log.info("File MSE playback finished: %s", self._url[:80])
                         elif self._running and not self._error_reported and self._on_error:
                             self._error_reported = True
-                            err_msg = (
+                            err_msg = redact_text((
                                 self._last_stderr
                                 or stderr_output.decode("utf-8", errors="replace")
-                            )[:500]
+                            )[:500])
                             _log.error("FFmpeg exited unexpectedly: %s", err_msg)
                             self._on_error(
                                 f"流编码异常终止: {err_msg}" if err_msg else "流编码异常终止"

@@ -530,6 +530,13 @@ class IngestSupervisor:
     ) -> Callable[[str], None]:
         def on_error(error: str) -> None:
             safe = redact_text(error)
+            rotating = bool(
+                getattr(self.ingest, "is_lease_rotating", lambda: False)()
+            )
+            if rotating:
+                if callback is not None:
+                    callback(safe)
+                return
             with self._lock:
                 self._last_error = safe
                 self._state = (

@@ -221,12 +221,15 @@ def test_three_commands_keep_network_input_only_in_upstream(tmp_path):
 
 
 def test_upstream_omits_http_reconnect_for_signed_huya_url():
-    command = SharedRoomIngest(
-        "room-a",
-        "https://al.flv.huya.com/src/live.flv?wsSecret=abc&wsTime=6a75d2c7",
-    ).build_upstream_command()
+    url = "https://al.flv.huya.com/src/live.flv?wsSecret=abc&wsTime=6a75d2c7"
+    command = SharedRoomIngest("room-a", url).build_upstream_command()
     assert "-reconnect" not in command
     assert "-reconnect_streamed" not in command
+    assert url not in command
+    assert "wsSecret" not in " ".join(command)
+    input_index = command.index("-i")
+    assert command[input_index - 2:input_index] == ["-f", "flv"]
+    assert command[input_index + 1] == "pipe:0"
 
 
 def test_upstream_omits_network_options_for_file_input(tmp_path):
@@ -609,6 +612,69 @@ def test_upstream_failure_keeps_sinks_for_supervised_recovery():
     assert recording.terminated is False
     assert preview.terminated is False
     assert ingest.process_id is None
+    assert ingest.upstream_is_live() is False
+    assert ingest.recording_sink_is_live() is True
+
+
+def test_signed_http_empty_read_after_media_reports_remote_eof(monkeypatch):
+    ingest = SharedRoomIngest("room-a", "https://hs.flv.huya.com/src/live.flv?wsSecret=abc")
+    proc = _FakeProcess(pid=1001)
+    ingest._process = proc
+    ingest._upstream_generation = 3
+
+    class _Response:
+        status = 200
+        headers = {"Content-Length": None}
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, _size: int = -1) -> bytes:
+            self.reads += 1
+            if self.reads == 1:
+                return b"flv-payload"
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "lsc.core.services.shared_ingest.open_http_stream",
+        lambda *_args, **_kwargs: _Response(),
+    )
+    ingest._feed_signed_http_loop(proc, 3, url=ingest.url, headers={}, network_context={})
+    assert "remote EOF after media" in ingest.upstream_error
+    assert ingest._upstream_has_produced_data is True
+
+
+def test_preview_handle_keeps_sink_during_lease_rotation():
+    ingest = SharedRoomIngest("room-a", "https://hs.flv.huya.com/src/live.flv?wsSecret=abc")
+    ingest.upstream_error = "signed http remote EOF after media"
+    ingest._upstream_has_produced_data = True
+    handle = SharedPreviewHandle(
+        ingest,
+        on_init_segment=lambda _data: None,
+        on_media_segment=lambda _data: None,
+        auto_start=False,
+    )
+    assert ingest.is_lease_rotating() is True
+    assert handle._should_stop_for_upstream_error() is False
+    handle.stop()
+
+
+def test_stash_pending_lease_skips_refresh_on_rotate():
+    ingest = SharedRoomIngest("room-a", "https://old.example/live.flv?wsSecret=old")
+    ingest.stash_pending_lease(
+        url="https://new.example/live.flv?wsSecret=new",
+        headers={"Referer": "https://www.huya.com/"},
+        network_context={"http_session_ttl_sec": 0.2},
+        lease_id="lease-new",
+        generation=4,
+    )
+    pending = ingest.take_pending_lease()
+    assert pending is not None
+    assert pending["url"].endswith("wsSecret=new")
+    assert ingest.take_pending_lease() is None
 
 
 def test_replace_upstream_invalidates_old_generation_without_detaching_sinks(monkeypatch):

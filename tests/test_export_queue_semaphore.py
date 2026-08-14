@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_ensure_export_queue_does_not_touch_waiters_len() -> None:
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    export_source = (ROOT / "python-backend/handlers/export_handlers.py").read_text(encoding="utf-8")
     ensure_body = source.split("async def _ensure_export_queue(", 1)[1].split("async def ", 1)[0]
+    ensure_body += export_source.split("async def _ensure_export_queue_impl(", 1)[1].split("async def ", 1)[0]
     assert "_waiters.__len__" not in ensure_body
     assert "len(_export_semaphore._waiters)" not in ensure_body
     assert "_export_semaphore_limit" in ensure_body

@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any, ClassVar
@@ -19,6 +20,7 @@ from .base import (
     fetch_json,
     fetch_url,
 )
+from .redaction import redact_text, redact_url
 
 _log = logging.getLogger(__name__)
 
@@ -54,6 +56,16 @@ DOUYIN_HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
 }
 
+
+def _cookie_header_to_map(value: object) -> dict[str, str]:
+    """Convert a scoped HTTP Cookie header back to the script's cookie map."""
+    result: dict[str, str] = {}
+    for part in str(value or "").split(";"):
+        name, separator, cookie_value = part.strip().partition("=")
+        if separator and name.strip() and cookie_value.strip():
+            result[name.strip()] = cookie_value.strip()
+    return result
+
 # 用户主页URL模式: https://www.douyin.com/user/xxx
 _USER_PROFILE_RE = re.compile(r"^/user/(?P<sec_uid>[^/?#]+)/?$")
 # 直播间URL模式: https://live.douyin.com/xxx
@@ -87,8 +99,27 @@ class DouyinAdapter(BasePlatformAdapter):
         return host in self._USER_HOSTS and bool(_FOLLOW_LIVE_RE.fullmatch(path))
 
     def parse(self, url: str) -> StreamInfo:
+        return self._parse(url)
+
+    def parse_with_context(self, url: str, context: object) -> StreamInfo:
+        """Use the V2 scoped Cookie header instead of re-reading cookie files."""
+        headers = dict(getattr(context, "headers", {}) or {})
+        cookies = _cookie_header_to_map(headers.get("Cookie"))
+        return self._parse(
+            url,
+            cookies=cookies,
+            network_context=getattr(context, "network_context", {}) or {},
+        )
+
+    def _parse(
+        self,
+        url: str,
+        *,
+        cookies: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
         clean_url = (url or "").strip()
-        _log.info("Douyin: parsing %s", clean_url[:80])
+        _log.info("Douyin: parsing %s", redact_url(clean_url)[:80])
         parsed = urlparse(clean_url)
         host = parsed.netloc.lower()
         path = parsed.path.rstrip("/")
@@ -98,23 +129,47 @@ class DouyinAdapter(BasePlatformAdapter):
             match = _USER_PROFILE_RE.fullmatch(path)
             if match:
                 sec_uid = match.group("sec_uid")
-                return self._parse_user_profile(clean_url, sec_uid)
+                return self._parse_user_profile(
+                    clean_url,
+                    sec_uid,
+                    cookies=cookies,
+                    network_context=network_context,
+                )
 
             # 关注直播URL - 提取房间ID
             match = _FOLLOW_LIVE_RE.fullmatch(path)
             if match:
                 room_id = match.group("room_id")
                 live_url = f"https://live.douyin.com/{room_id}"
-                return self._parse_live_room(live_url)
+                return self._parse_live_room(
+                    live_url,
+                    cookies=cookies,
+                    network_context=network_context,
+                )
 
         # 直播间URL - 直接解析
-        return self._parse_live_room(clean_url)
+        return self._parse_live_room(
+            clean_url,
+            cookies=cookies,
+            network_context=network_context,
+        )
 
-    def _parse_user_profile(self, url: str, sec_uid: str) -> StreamInfo:
+    def _parse_user_profile(
+        self,
+        url: str,
+        sec_uid: str,
+        *,
+        cookies: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
         """从用户主页获取直播信息。"""
         try:
             # 尝试通过API获取用户直播状态
-            live_room_id = self._get_user_live_room(sec_uid)
+            live_room_id = self._get_user_live_room(
+                sec_uid,
+                cookies=cookies,
+                network_context=network_context,
+            )
             if not live_room_id:
                 return self._failed(
                     url,
@@ -124,14 +179,32 @@ class DouyinAdapter(BasePlatformAdapter):
 
             # 使用获取到的直播间ID构造直播URL并解析
             live_url = f"https://live.douyin.com/{live_room_id}"
-            return self._parse_live_room(live_url)
+            return self._parse_live_room(
+                live_url,
+                cookies=cookies,
+                network_context=network_context,
+            )
 
         except Exception as exc:
             return self._failed(url, f"获取用户直播信息失败: {exc}", ERROR_PARSE_FAILED)
 
-    def _get_user_live_room(self, sec_uid: str) -> str:
+    def _get_user_live_room(
+        self,
+        sec_uid: str,
+        *,
+        cookies: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> str:
         """通过用户sec_uid获取直播间ID。"""
         from urllib.error import HTTPError, URLError
+        context = dict(network_context or {})
+        proxy_url = str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+        timeout = self._context_timeout(context, default=12)
         try:
             # 使用抖音API获取用户信息
             api_url = (
@@ -141,7 +214,12 @@ class DouyinAdapter(BasePlatformAdapter):
                 f"&browser_name=Chrome&browser_version=120.0.0.0&sec_uid={sec_uid}"
             )
 
-            data = fetch_json(api_url, headers=DOUYIN_HEADERS)
+            request_kwargs: dict[str, object] = {
+                "headers": self._headers_with_cookies(cookies),
+            }
+            if context:
+                request_kwargs.update({"timeout": timeout, "proxy_url": proxy_url})
+            data = fetch_json(api_url, **request_kwargs)
 
             # 从返回数据中提取直播间ID
             room_id = data.get("data", {}).get("room_id", "")
@@ -149,23 +227,48 @@ class DouyinAdapter(BasePlatformAdapter):
                 return str(room_id)
 
         except HTTPError as exc:
-            _log.warning("抖音API HTTP错误 %d: %s", exc.code, exc)
+            _log.warning("抖音API HTTP错误 %d: %s", exc.code, redact_text(exc))
         except (URLError, Exception) as exc:
-            _log.warning("抖音API获取直播间ID失败: %s", exc)
+            _log.warning("抖音API获取直播间ID失败: %s", redact_text(exc))
 
         # 备用方案: 尝试从用户页面HTML中提取
         try:
-            return self._extract_room_from_page(sec_uid)
+            return self._extract_room_from_page(
+                sec_uid,
+                cookies=cookies,
+                network_context=network_context,
+            )
         except Exception as exc:
-            _log.warning("抖音页面提取直播间ID失败: %s", exc)
+            _log.warning("抖音页面提取直播间ID失败: %s", redact_text(exc))
 
         return ""
 
-    def _extract_room_from_page(self, sec_uid: str) -> str:
+    def _extract_room_from_page(
+        self,
+        sec_uid: str,
+        *,
+        cookies: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> str:
         """从用户页面HTML中提取直播间ID。"""
         url = f"https://www.douyin.com/user/{sec_uid}"
         try:
-            html = fetch_url(url, headers=DOUYIN_HEADERS)
+            context = dict(network_context or {})
+            request_kwargs: dict[str, object] = {
+                "headers": self._headers_with_cookies(cookies),
+            }
+            if context:
+                proxy_url = str(
+                    context.get("proxy_url")
+                    or context.get("http_proxy")
+                    or context.get("https_proxy")
+                    or ""
+                ).strip()
+                request_kwargs.update({
+                    "timeout": self._context_timeout(context, default=12),
+                    "proxy_url": proxy_url,
+                })
+            html = fetch_url(url, **request_kwargs)
 
             # 尝试从HTML中提取直播间ID
             # 常见模式: "room_id":"123456" 或 roomId:123456
@@ -181,33 +284,57 @@ class DouyinAdapter(BasePlatformAdapter):
                     return match.group(1)
 
         except Exception as exc:
-            _log.debug("抖音页面提取房间号失败: %s", exc)
+            _log.debug("抖音页面提取房间号失败: %s", redact_text(exc))
 
         return ""
 
-    def _parse_live_room(self, url: str) -> StreamInfo:
+    def _parse_live_room(
+        self,
+        url: str,
+        *,
+        cookies: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
         """解析直播间URL。"""
         try:
             # 获取抖音登录态 Cookie，绕过反爬验证页面（验证中间页/CAPTCHA）
-            cookies = self._get_douyin_cookies()
-            if not cookies:
-                _log.warning("Douyin parse aborted: no usable cookies url=%s", url[:80])
+            request_cookies = (
+                self._get_douyin_cookies() if cookies is None else dict(cookies)
+            )
+            if not request_cookies:
+                _log.warning("Douyin parse aborted: no usable cookies url=%s", redact_url(url)[:80])
                 return self._failed(
                     url,
                     _cookie_required_error(reason="未检测到有效的抖音登录 Cookie"),
                     ERROR_RESTRICTED,
                 )
             module = self._load_script_module()
-            html, fetch_err = module.fetch_page(url, cookies=cookies)
+            context = dict(network_context or {})
+            if context:
+                proxy_url = str(
+                    context.get("proxy_url")
+                    or context.get("http_proxy")
+                    or context.get("https_proxy")
+                    or ""
+                ).strip()
+                html, fetch_err = module.fetch_page(
+                    url,
+                    cookies=request_cookies,
+                    proxy_url=proxy_url,
+                    timeout_sec=self._context_timeout(context, default=20),
+                )
+            else:
+                # Preserve the legacy monkeypatch seam used by existing callers/tests.
+                html, fetch_err = module.fetch_page(url, cookies=request_cookies)
             if not html:
                 if fetch_err:
                     msg = f"无法获取抖音直播间页面：{fetch_err}。请检查网络连接或稍后重试。"
                 else:
                     msg = "无法获取抖音直播间页面。请检查网络连接或稍后重试。"
-                _log.warning("Douyin fetch failed url=%s err=%s", url[:80], fetch_err)
+                _log.warning("Douyin fetch failed url=%s err=%s", redact_url(url)[:80], fetch_err)
                 return self._failed(url, msg, ERROR_PARSE_FAILED)
             if _is_douyin_verify_page(html):
-                _log.warning("Douyin verify/captcha page url=%s cookies=%d", url[:80], len(cookies))
+                _log.warning("Douyin verify/captcha page url=%s cookies=%d", redact_url(url)[:80], len(request_cookies))
                 return self._failed(
                     url,
                     _cookie_required_error(reason="抖音返回了验证中间页，当前 Cookie 无效或已过期"),
@@ -302,8 +429,16 @@ class DouyinAdapter(BasePlatformAdapter):
             is_live=True,
             quality_urls=quality_urls,
             selected_quality=str(data.get("selectedQuality", "") or next(iter(quality_urls), "")),
-            headers=dict(DOUYIN_HEADERS),
-            raw={},  # discard extracted SSR payload on success to save memory
+            # Preserve the scoped credential context for the downstream
+            # probe/ingest request.  The page fetch above may use a
+            # compatibility cookie source, but the resulting candidate must
+            # carry the exact controlled headers used for that parse.
+            headers=self._headers_with_cookies(request_cookies),
+            raw={
+                "source_kind": "official",
+                "confidence": 0.9,
+                "state_source": "ssr_data",
+            },
             category=category,
         )
 
@@ -317,8 +452,26 @@ class DouyinAdapter(BasePlatformAdapter):
             from .cookie_helper import get_douyin_cookies
             return get_douyin_cookies()
         except Exception as exc:
-            _log.debug("获取抖音Cookie失败: %s", exc)
+            _log.debug("获取抖音Cookie失败: %s", redact_text(exc))
             return {}
+
+    @staticmethod
+    def _headers_with_cookies(cookies: dict[str, str] | None) -> dict[str, str]:
+        headers = dict(DOUYIN_HEADERS)
+        if cookies:
+            headers["Cookie"] = "; ".join(
+                f"{key}={value}" for key, value in cookies.items()
+            )
+        return headers
+
+    @staticmethod
+    def _context_timeout(context: Mapping[str, object], *, default: int) -> int:
+        """Return a bounded adapter timeout without leaking untrusted values."""
+        raw = context.get("timeout_sec", context.get("read_timeout_sec", default))
+        try:
+            return max(1, min(300, int(float(raw))))
+        except (TypeError, ValueError):
+            return default
 
     def _failed(
         self,

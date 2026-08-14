@@ -6,10 +6,8 @@ common stream patterns (.m3u8, .flv, rtmp://) in HTML source.
 from __future__ import annotations
 
 import logging
-
-_log = logging.getLogger(__name__)
-
 import re
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -21,6 +19,10 @@ from .base import (
     StreamInfo,
     fetch_url,
 )
+from .redaction import redact_url
+from .url_policy import validate_public_url
+
+_log = logging.getLogger(__name__)
 
 GENERIC_HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
@@ -42,11 +44,12 @@ class GenericPageAdapter(BasePlatformAdapter):
     display_name = "通用"
 
     def can_handle(self, url: str) -> bool:
-        _log.debug("Generic: checking %s", url[:60])
+        _log.debug("Generic: checking %s", redact_url(url)[:60])
         """Match any http(s) URL that looks like a web page (not a direct stream)."""
         clean_url = (url or "").strip()
         parsed = urlparse(clean_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        safe, _reason = validate_public_url(clean_url)
+        if not safe or not parsed.netloc:
             return False
         # Skip direct stream URLs (handled by DirectAdapter)
         if parsed.path.lower().endswith(_DIRECT_SUFFIXES):
@@ -55,11 +58,50 @@ class GenericPageAdapter(BasePlatformAdapter):
         return not any(k in parsed.query.lower() for k in ("stream=", "video=", "m3u8", ".flv"))
 
     def parse(self, url: str) -> StreamInfo:
-        _log.info("Generic: parsing %s", url[:80])
+        return self._parse(url)
+
+    def parse_with_context(self, url: str, context: object) -> StreamInfo:
+        """Resolve the page with the same scoped network context as media use."""
+        network_context = getattr(context, "network_context", {}) or {}
+        request_headers = dict(GENERIC_HEADERS)
+        request_headers.update(dict(getattr(context, "headers", {}) or {}))
+        return self._parse(
+            url,
+            headers=request_headers,
+            network_context=network_context,
+        )
+
+    def _parse(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
+        _log.info("Generic: parsing %s", redact_url(url)[:80])
         clean_url = (url or "").strip()
+        request_headers = dict(headers or GENERIC_HEADERS)
+        context = dict(network_context or {})
+        proxy_url = str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+        timeout_raw = context.get("timeout_sec", context.get("read_timeout_sec", 10))
+        try:
+            timeout = max(1, min(300, int(float(timeout_raw))))
+        except (TypeError, ValueError):
+            timeout = 10
 
         try:
-            html = fetch_url(clean_url, headers=GENERIC_HEADERS, timeout=10, retries=1)
+            html = fetch_url(
+                clean_url,
+                headers=request_headers,
+                timeout=timeout,
+                retries=1,
+                proxy_url=proxy_url,
+            )
         except Exception as exc:
             return self._failed(clean_url, f"页面加载失败: {exc}", ERROR_PARSE_FAILED)
 
@@ -90,7 +132,13 @@ class GenericPageAdapter(BasePlatformAdapter):
             is_live=True,
             quality_urls={"source": stream_url},
             selected_quality="source",
-            headers=dict(GENERIC_HEADERS),
+            headers=request_headers,
+            raw={
+                "source_kind": "fallback",
+                "confidence": 0.25,
+                "state_source": "page_pattern",
+                "validate_redirects": True,
+            },
         )
 
     def _find_stream_url(self, html: str) -> str:
@@ -146,7 +194,8 @@ class GenericPageAdapter(BasePlatformAdapter):
         """Clean and validate a URL."""
         url = url.strip().rstrip("\\").rstrip('"').rstrip("'")
         url = url.replace("\\u002F", "/").replace("\\/", "/")
-        if (url.startswith("http://") or url.startswith("https://")) and len(url) > 20 and "." in url:
+        safe, _reason = validate_public_url(url)
+        if safe and (url.startswith("http://") or url.startswith("https://")) and len(url) > 20 and "." in url:
             return url
         return ""
 

@@ -28,9 +28,15 @@ class RoomSession:
     room_url: str
     platform: str = ""
     platform_name: str = ""
+    # Redacted credential state projected to the UI; plaintext cookies never
+    # belong in a room session or persisted room snapshot.
+    credential_status: str = "NOT_CONFIGURED"
     streamer_name: str = ""
     stream_title: str = ""
     stream_info: StreamInfo | None = None
+    # Shared request context (proxy/transport hints) reused by resolver,
+    # ffprobe and the eventual FFmpeg ingest process.
+    network_context: dict[str, object] = field(default_factory=dict)
     selected_quality: str = ""
     preview_muted: bool = True
     preview_enabled: bool = False
@@ -43,6 +49,10 @@ class RoomSession:
     is_connected: bool = False
     is_recording: bool = False
     record_output_path: str = ""
+    # Segmented V2 recordings expose their durable asset separately from the
+    # legacy single-file path; the latter remains untouched during migration.
+    record_manifest_path: str = ""
+    canonical_room_id: str = ""
     record_started_at: datetime | None = None
     last_error: str = ""
     controller: Any | None = None
@@ -136,6 +146,11 @@ class RoomSession:
         self.streamer_name = getattr(info, "streamer", "") or ""
         self.stream_title = getattr(info, "title", "") or ""
         self.category = getattr(info, "category", "") or ""
+        raw = getattr(info, "raw", {}) or {}
+        if isinstance(raw, dict):
+            self.canonical_room_id = str(
+                raw.get("room_id") or raw.get("roomId") or raw.get("roomid") or ""
+            )
         self.last_error = ""
 
     def set_error(self, message: str) -> None:

@@ -59,7 +59,8 @@ def test_platform_recovery_policy_is_capability_driven():
     )
     assert should_force_refresh_when_recording(huya) is False
     assert should_force_refresh_when_recording(bilibili) is False
-    assert should_force_recovery(huya, "ffmpeg abnormal exit code=0") is False
+    assert should_force_recovery(huya, "ffmpeg abnormal exit code=0") is True
+    assert should_force_recovery(huya, "FFmpeg 异常退出 (code 0)") is True
     assert should_force_recovery(bilibili, "ffmpeg abnormal exit code=0") is False
 
 

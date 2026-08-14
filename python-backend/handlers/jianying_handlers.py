@@ -101,6 +101,7 @@ def _collect_draft_inputs(
                     room_id=rid,
                     name=_room_display_name(room, rid),
                     record_output_path=getattr(room, "record_output_path", "") or "",
+                    record_manifest_path=getattr(room, "record_manifest_path", "") or "",
                     recording_to_common_delta=float(snap.recording_to_common_delta),
                     is_main=(rid == main_id),
                 )
@@ -151,6 +152,7 @@ def _collect_draft_inputs(
                 room_id=rid,
                 name=_room_display_name(room, rid),
                 record_output_path=getattr(room, "record_output_path", "") or "",
+                record_manifest_path=getattr(room, "record_manifest_path", "") or "",
                 recording_to_common_delta=0.0,
                 is_main=True,
             )

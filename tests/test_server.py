@@ -20,7 +20,7 @@ _backend_dir = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-from server import LSCWebSocketServer, _json_dumps, _truncate_for_log
+from server import LSCWebSocketServer, _json_dumps, _redact_public_payload, _truncate_for_log
 from ws_auth import is_origin_allowed
 
 
@@ -235,6 +235,27 @@ class TestBroadcastQueue:
             data = json.loads(call_args)
             assert data["type"] == "rooms_updated"
             assert data["data"]["count"] == 5
+        finally:
+            loop.close()
+
+    def test_public_payload_redacts_urls_and_headers(self):
+        payload = _redact_public_payload({
+            "stream_url": "https://cdn.example/live.flv?token=ws-secret",
+            "headers": {"Cookie": "SESSDATA=cookie-secret"},
+            "nested": [{"url": "https://cdn.example/x?signature=nested-secret"}],
+        })
+        assert "ws-secret" not in str(payload)
+        assert "cookie-secret" not in str(payload)
+        assert "nested-secret" not in str(payload)
+
+        srv = self._make_mock_server()
+        client = AsyncMock()
+        srv.clients.add(client)
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(srv.broadcast("diagnostic", payload))
+            sent = json.loads(client.send.call_args[0][0])
+            assert "secret" not in str(sent)
         finally:
             loop.close()
 

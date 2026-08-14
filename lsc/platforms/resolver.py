@@ -6,6 +6,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 
 from .candidate_health import CandidateHealthStore, get_default_candidate_health_store
@@ -33,7 +34,7 @@ from .models import (
     StreamLease,
 )
 from .probe import ProbeService, select_best_candidate
-from .redaction import redact_text
+from .redaction import redact_text, redact_url
 from .registry import detect_platform, get_adapters, parse_stream
 
 _log = logging.getLogger(__name__)
@@ -103,6 +104,18 @@ def _error_from_stream_info(info: Any) -> PlatformError | None:
             kind = FailureKind.REGION_RESTRICTED
     if kind is None:
         kind = classify_failure(raw_error, _status_from_raw(info))
+    elif kind == FailureKind.PLATFORM_SCHEMA_CHANGED and raw_error:
+        text_kind = classify_failure(raw_error, _status_from_raw(info))
+        if text_kind in {
+            FailureKind.CONNECT_TIMEOUT,
+            FailureKind.CONNECTION_RESET,
+            FailureKind.DNS_FAILURE,
+            FailureKind.RATE_LIMITED,
+            FailureKind.CDN_FORBIDDEN,
+        }:
+            kind = text_kind
+            if normalized_code == "PARSE_FAILED":
+                error_code = kind.value
     category = {
         FailureKind.AUTH_REQUIRED: "AUTH",
         FailureKind.AUTH_EXPIRED: "AUTH",
@@ -135,7 +148,7 @@ def _error_from_stream_info(info: Any) -> PlatformError | None:
             FailureKind.SIGNATURE_EXPIRED,
         },
         retry_after_seconds=extract_retry_after(raw_error),
-        user_message=failure_kind_to_message(kind),
+        user_message=raw_error.strip() or failure_kind_to_message(kind),
     )
 
 
@@ -520,8 +533,17 @@ def resolve_stream_v2(
         if isinstance(credential_context, CredentialContext):
             info = _merge_credential_headers(info, credential_context)
     except Exception as exc:
-        safe_error = redact_text(exc)
-        kind = classify_failure(safe_error)
+        safe_error = redact_text(exc) or type(exc).__name__
+        http_status = exc.code if isinstance(exc, HTTPError) else None
+        kind = classify_failure(safe_error, http_status)
+        if kind == FailureKind.UNKNOWN and isinstance(exc, TimeoutError):
+            kind = FailureKind.CONNECT_TIMEOUT
+        _log.warning(
+            "resolve_stream_v2 parse failed platform=%s url=%s: %s",
+            platform,
+            redact_url(source_url),
+            safe_error,
+        )
         _invalidate_credentials_on_auth_failure(
             provider,
             platform,

@@ -27,7 +27,7 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
      "直播流地址失效（404）。可能是 CDN 链接过期，系统将尝试自动刷新。"),
     (re.compile(r"Connection refused|ECONNREFUSED|连接被拒绝|拒绝连接", re.I),
      "无法连接到直播服务器。请检查网络或稍后重试。"),
-    (re.compile(r"Connection timed out|ETIMEDOUT|连接超时|操作超时", re.I),
+    (re.compile(r"Connection timed out|ETIMEDOUT|连接超时|操作超时|连接直播服务器超时|TimeoutError", re.I),
      "连接直播服务器超时。网络不稳定或服务器无响应。"),
     (re.compile(r"Name or service not known|getaddrinfo|不知道这样的主机|主机名无法解析", re.I),
      "域名解析失败。请检查网络连接。"),
@@ -57,6 +57,11 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
      "无法解析直播流地址。平台可能已更新协议。"),
 
     # Shared ingest / continuous analysis
+    (re.compile(
+        r"startup probe failed|录制文件未开始写入|stdin write timed out",
+        re.I,
+    ),
+     "录制未能启动。直播流已接通，但录制文件还没有开始写入，请重试。"),
     (re.compile(r"shared ingest|upstream ffmpeg exited", re.I),
      "共享进样预览中断。录制可能仍在继续，请尝试重新开启预览。"),
     (re.compile(r"stream url refresh failed|refresh.*stream", re.I),

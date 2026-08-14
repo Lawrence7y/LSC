@@ -12,11 +12,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
+from urllib.error import HTTPError, URLError
 
 from lsc import get_logger
 from lsc.config import ExportProfile, load_config, preferred_hw_video_codec
 from lsc.core.services.fmp4_segments import Fmp4SegmentParser
-from lsc.platforms.base import headers_to_ffmpeg_input_args, network_timeout_args
+from lsc.platforms.base import headers_to_ffmpeg_input_args, network_timeout_args, open_http_stream
 from lsc.platforms.failure import FailureKind, classify_failure
 from lsc.platforms.redaction import redact_text
 from lsc.recorder.manifest import ManifestStore, RecordingManifest
@@ -60,6 +61,29 @@ def _is_h264_startup_noise(stderr: str) -> bool:
     return all(_H264_STARTUP_NOISE_RE.search(part) for part in parts)
 
 
+def lease_rotate_lead_sec(ttl: float) -> float:
+    """Seconds before a bounded HTTP session TTL to pre-parse the next lease."""
+    try:
+        value = float(ttl or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    return min(15.0, value * 0.125)
+
+
+def _uses_signed_http_pipe(url: str, network_context: Mapping[str, object] | None = None) -> bool:
+    """True when FFmpeg must not open the signed URL itself.
+
+    Huya's FLV CDN 403s FFmpeg's HTTP client even with the same Range/Referer/
+    User-Agent that urllib uses successfully. Python performs the single GET
+    and FFmpeg remuxes FLV from stdin.
+    """
+    if not _is_signed_network_url(url, network_context):
+        return False
+    return str(url or "").split("?", 1)[0].lower().endswith(".flv")
+
+
 def _is_signed_network_url(url: str, network_context: Mapping[str, object] | None = None) -> bool:
     context = dict(network_context or {})
     if bool(context.get("signed_url") or context.get("disable_http_reconnect")):
@@ -93,6 +117,10 @@ def _network_input_args(
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5",
         ])
+    else:
+        # Signed FLV leases are single-GET. Default HTTP seekable=-1 makes
+        # FFmpeg open the URL a second time after probing, which returns 403.
+        args.extend(["-seekable", "0", "-icy", "0"])
     proxy = str(
         context.get("proxy_url")
         or context.get("http_proxy")
@@ -207,12 +235,11 @@ class SharedPreviewHandle:
 
     @property
     def is_running(self) -> bool:
-        return (
-            not self._stopped
-            and not self._ingest.is_stopped
-            and not self._ingest.preview_error
-            and not self._ingest.upstream_error
-        )
+        if self._stopped or self._ingest.is_stopped or self._ingest.preview_error:
+            return False
+        if self._ingest.upstream_error and not self._ingest.is_lease_rotating():
+            return False
+        return True
 
     def replay_init(self) -> bool:
         segment = self._ingest.last_init_segment
@@ -250,14 +277,28 @@ class SharedPreviewHandle:
     def _pump_loop(self) -> None:
         """使用条件通知的 preview pump — 有新数据时立即唤醒，避免固定轮询开销。"""
         while not self._stop_event.is_set():
-            if self._ingest.preview_error or self._ingest.upstream_error or self._ingest.is_stopped:
+            if not self._ingest.upstream_error and not self._ingest.preview_error:
+                self._error_reported = False
+            if self._ingest.is_stopped or self._ingest.preview_error:
                 self._report_error_if_needed()
                 self.stop()
                 return
+            if self._ingest.upstream_error:
+                self._report_error_if_needed()
+                if self._should_stop_for_upstream_error():
+                    self.stop()
+                    return
             # 等待新数据或停止信号
             has_data = self._subscriber.wait_for_data(timeout=self._pump_interval_sec)
             if has_data:
                 self.drain()
+
+    def _should_stop_for_upstream_error(self) -> bool:
+        if self._ingest.is_stopped or self._ingest.preview_error:
+            return True
+        if not self._ingest.upstream_error:
+            return False
+        return not self._ingest.is_lease_rotating()
 
     def _report_error_if_needed(self) -> None:
         if self._error_reported or self._stopped or self._on_error is None:
@@ -379,6 +420,8 @@ class SharedRoomIngest:
         self._upstream_prefetch: dict[int, bytes] = {}
         self._lease_manager = None
         self._bound_lease_id = ""
+        self._signed_http_opened_at = 0.0
+        self._pending_lease: dict[str, Any] | None = None
 
     @property
     def preview_subscribers(self) -> int:
@@ -390,6 +433,100 @@ class SharedRoomIngest:
         with self._lock:
             proc = self._process
         return getattr(proc, "pid", None) if proc is not None else None
+
+    def upstream_is_live(self) -> bool:
+        with self._lock:
+            proc = self._process
+        return proc is not None and self._poll(proc) is None
+
+    def recording_sink_is_live(self) -> bool:
+        with self._lock:
+            proc = self._recording_process
+            active = self.recording_active
+        return bool(active and proc is not None and self._poll(proc) is None)
+
+    def preview_sink_is_live(self) -> bool:
+        with self._lock:
+            proc = self._preview_process
+            subscribers = len(self._preview_subscribers)
+        if subscribers <= 0:
+            return False
+        return proc is None or self._poll(proc) is None
+
+    def mark_signed_http_opened(self, now: float | None = None) -> None:
+        stamp = time.monotonic() if now is None else float(now)
+        with self._lock:
+            self._signed_http_opened_at = stamp
+
+    def _http_session_ttl_and_lead(self) -> tuple[float, float]:
+        context = dict(self.network_context or {})
+        try:
+            ttl = float(context.get("http_session_ttl_sec") or 0.0)
+        except (TypeError, ValueError):
+            ttl = 0.0
+        try:
+            lead = float(context.get("lease_rotate_lead_sec") or 0.0)
+        except (TypeError, ValueError):
+            lead = 0.0
+        if ttl <= 0 and "huya.com" in str(self.url or "").lower():
+            from lsc.platforms.capabilities import get_platform_capabilities
+
+            ttl = float(get_platform_capabilities("huya").expected_ttl_seconds or 0.0)
+        if ttl <= 0:
+            return 0.0, 0.0
+        if lead <= 0:
+            lead = lease_rotate_lead_sec(ttl)
+        return ttl, lead
+
+    def needs_lease_prefetch(self, now: float | None = None) -> bool:
+        with self._lock:
+            if self._pending_lease is not None or self.is_stopped:
+                return False
+            opened_at = self._signed_http_opened_at
+            error = self.upstream_error
+        if opened_at <= 0 or error:
+            return False
+        ttl, lead = self._http_session_ttl_and_lead()
+        if ttl <= 0:
+            return False
+        stamp = time.monotonic() if now is None else float(now)
+        return stamp >= opened_at + max(0.0, ttl - lead)
+
+    def stash_pending_lease(
+        self,
+        url: str,
+        headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+        lease_id: str = "",
+        generation: int | None = None,
+    ) -> None:
+        pending = {
+            "url": str(url or ""),
+            "headers": dict(headers or {}),
+            "network_context": dict(network_context or {}),
+            "lease_id": str(lease_id or ""),
+            "generation": generation,
+        }
+        with self._lock:
+            self._pending_lease = pending
+
+    def take_pending_lease(self) -> dict[str, Any] | None:
+        with self._lock:
+            pending = self._pending_lease
+            self._pending_lease = None
+        return pending
+
+    def is_lease_rotating(self) -> bool:
+        with self._lock:
+            produced = self._upstream_has_produced_data
+            text = str(self.upstream_error or "").lower()
+        if not produced or not text:
+            return False
+        if "signed http remote eof after media" in text:
+            return True
+        if "remote eof before media" in text:
+            return False
+        return "code=0" in text.replace(" ", "") and "exited" in text
 
     @property
     def recording_process_id(self) -> int | None:
@@ -620,12 +757,33 @@ class SharedRoomIngest:
             "-fflags", "+genpts",
             "-thread_queue_size", "1024",
         ]
+        if _uses_signed_http_pipe(self.url, self.network_context):
+            command += [
+                "-probesize", "2000000",
+                "-analyzeduration", "5000000",
+                "-f", "flv",
+                "-i", "pipe:0",
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-ac", "2",
+                "-ar", "44100",
+                "-b:a", "128k",
+                "-f", "mpegts",
+                "-mpegts_flags", "+resend_headers",
+                "-pat_period", "0.1",
+                "pipe:1",
+            ]
+            return command
         command += _network_input_args(self.url, self.network_context)
         if self.headers:
             command += headers_to_ffmpeg_input_args(self.headers)
         command += [
             "-protocol_whitelist",
             "file,http,https,tcp,tls,crypto",
+        ]
+        command += [
             "-i", self.url,
             "-map", "0:v",
             "-map", "0:a?",
@@ -644,8 +802,8 @@ class SharedRoomIngest:
         # and never create an output file during the 15s startup probe.
         return [
             "-fflags", "+genpts+discardcorrupt",
-            "-probesize", "32768",
-            "-analyzeduration", "500000",
+            "-probesize", "1000000",
+            "-analyzeduration", "2000000",
             "-thread_queue_size", "1024",
             "-f", "mpegts",
             "-i", "pipe:0",
@@ -1103,6 +1261,7 @@ class SharedRoomIngest:
             self.upstream_error = ""
             self.is_stopped = False
             self.stop_reason = ""
+            self._signed_http_opened_at = 0.0
         self._upstream_has_produced_data = False
         self._start_stderr_reader(proc, self._stderr_buffer, "upstream")
         self._upstream_thread = self._start_thread(
@@ -1115,6 +1274,12 @@ class SharedRoomIngest:
             (proc, generation),
             f"shared-upstream-watch-{self.room_id}",
         )
+        if _uses_signed_http_pipe(self.url, self.network_context):
+            self._start_thread(
+                self._feed_signed_http_loop,
+                (proc, generation),
+                f"shared-upstream-http-{self.room_id}",
+            )
         return ""
 
     def replace_upstream(
@@ -1147,7 +1312,12 @@ class SharedRoomIngest:
             self._stop_upstream_process()
             return ""
 
-        if preflight and old_process is not None:
+        use_preflight = (
+            preflight
+            and old_process is not None
+            and not _uses_signed_http_pipe(str(url or ""), network_context)
+        )
+        if use_preflight:
             candidate, prefetched, error = self._preflight_upstream(
                 url,
                 headers=headers,
@@ -1394,6 +1564,106 @@ class SharedRoomIngest:
         if recording is not None:
             self._enqueue_recording_ts(batch)
         self._enqueue_preview_ts(batch)
+
+    def _signed_http_timeout_sec(self, network_context: Mapping[str, object] | None = None) -> float:
+        context = dict(network_context or self.network_context or {})
+        try:
+            return max(5.0, float(context.get("read_timeout_sec") or 15.0))
+        except (TypeError, ValueError):
+            return 15.0
+
+    def _signed_http_proxy(self, network_context: Mapping[str, object] | None = None) -> str:
+        context = dict(network_context or self.network_context or {})
+        return str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+
+    def _feed_signed_http_loop(
+        self,
+        proc: _FfmpegProcess,
+        generation: int | None,
+        url: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> None:
+        source = str(url if url is not None else self.url)
+        hdrs = dict(headers if headers is not None else self.headers)
+        context = dict(network_context if network_context is not None else self.network_context)
+        response = None
+        try:
+            response = open_http_stream(
+                source,
+                headers=hdrs,
+                timeout=self._signed_http_timeout_sec(context),
+                proxy_url=self._signed_http_proxy(context),
+            )
+            _log.info(
+                "signed http ingest opened room=%s status=%s length=%s range=%s",
+                self.room_id,
+                getattr(response, "status", None),
+                response.headers.get("Content-Length"),
+                response.headers.get("Content-Range"),
+            )
+            self.mark_signed_http_opened()
+            received_any = False
+            while True:
+                with self._lock:
+                    if self._process is not proc:
+                        return
+                    if generation is not None and self._upstream_generation != generation:
+                        return
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    if received_any:
+                        _log.info(
+                            "signed http remote EOF after media room=%s",
+                            self.room_id,
+                        )
+                        self.handle_upstream_error(
+                            "signed http remote EOF after media",
+                            proc,
+                        )
+                    else:
+                        self.handle_upstream_error(
+                            "signed http remote EOF before media",
+                            proc,
+                        )
+                    return
+                received_any = True
+                if not self._upstream_has_produced_data:
+                    self._upstream_has_produced_data = True
+                self._write_all(proc, chunk)
+        except HTTPError as exc:
+            self.handle_upstream_error(
+                f"HTTP error {exc.code} {exc.reason or 'Forbidden'}",
+                proc,
+            )
+        except (URLError, OSError, TimeoutError, ValueError) as exc:
+            self.handle_upstream_error(
+                f"signed http ingest failed: {redact_text(exc)}",
+                proc,
+            )
+        except Exception as exc:
+            _log.error("signed http ingest crashed: %s", redact_text(exc), exc_info=True)
+            self.handle_upstream_error(
+                f"signed http ingest failed: {redact_text(exc)}",
+                proc,
+            )
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception as exc:
+                    _log.debug("signed http response close failed: %s", redact_text(exc))
+            stdin = getattr(proc, "stdin", None)
+            if stdin is not None:
+                try:
+                    stdin.close()
+                except Exception as exc:
+                    _log.debug("signed http stdin close failed: %s", redact_text(exc))
 
     @staticmethod
     def _write_all(proc: _FfmpegProcess, data: bytes) -> None:
@@ -1840,6 +2110,7 @@ class SharedRoomIngest:
             proc = self._process
             self._process = None
             self._upstream_generation += 1
+            self._signed_http_opened_at = 0.0
             if proc is not None:
                 self._upstream_prefetch.pop(id(proc), None)
         if proc is not None:
@@ -1979,5 +2250,6 @@ __all__ = [
     "SharedPreviewHandle",
     "SharedRoomIngest",
     "ingest_start_result",
+    "lease_rotate_lead_sec",
     "preview_start_accepted",
 ]

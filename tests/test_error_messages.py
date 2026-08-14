@@ -110,6 +110,17 @@ class TestHumanizeErrorPatterns:
         result = humanize_error("shared ingest upstream ffmpeg exited unexpectedly")
         assert "共享进样" in result or "预览中断" in result
 
+    def test_recording_startup_probe_failed(self):
+        result = humanize_error("recording ffmpeg startup probe failed")
+        assert "发生错误" not in result
+        assert "录制" in result
+        assert "写入" in result or "启动" in result
+
+    def test_recording_file_not_written(self):
+        result = humanize_error("录制启动失败：录制文件未开始写入")
+        assert "发生错误" not in result
+        assert "录制" in result
+
     def test_stream_refresh_failed(self):
         result = humanize_error("stream url refresh failed")
         assert "刷新" in result or "流地址" in result
@@ -191,6 +202,17 @@ class TestIsRecoverableError:
 
     def test_nothing_matches(self):
         assert is_recoverable_error("some random message") is False
+
+    def test_crash_message_with_403_is_recoverable(self):
+        """watchdog 文案保留 stderr 403 特征后应判可恢复（回归 #3a）。
+
+        此前 watchdog 只返回 "FFmpeg 异常退出 (code 0)" 丢 403，导致
+        可恢复的 CDN 鉴权失败被误判为不可恢复而不重连。
+        """
+        from lsc.recorder.capture import _friendly_ffmpeg_message
+
+        msg = _friendly_ffmpeg_message(0, "Server returned 403 Forbidden for stream request")
+        assert is_recoverable_error(msg) is True
 
 
 class TestFriendlyConnectError:

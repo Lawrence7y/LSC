@@ -31,9 +31,9 @@ _CAPABILITIES: dict[str, PlatformCapabilities] = {
         platform="huya",
         support_level="PREVIEW",
         auth_mode="signed",
-        # The adapter obtains signed public CDN URLs from the room page; it
-        # does not depend on a persisted user Cookie.
-        credential_kinds=(),
+        # Public rooms resolve without login. Optional Cookie is used on the
+        # room page fetch and does not change anonymous availability.
+        credential_kinds=("cookie",),
         preferred_protocols=("flv", "hls"),
         qualities=("原画", "高清", "标清", "流畅"),
         quality_mapping=_QUALITY_MAPPING,

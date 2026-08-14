@@ -63,7 +63,7 @@ function formatTime(seconds: number): string {
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
 }
 
-function formatTickTime(seconds: number): string {
+export function formatTickTime(seconds: number): string {
   const total = Math.max(0, Math.floor(seconds + 1e-6))
   if (total >= 3600) {
     const h = Math.floor(total / 3600)
@@ -81,11 +81,11 @@ function formatTickTime(seconds: number): string {
   return `${total}s`
 }
 
-function clamp(value: number, min: number, max: number): number {
+export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-function chooseTickInterval(duration: number, zoom: number, targetSpacingPx: number, trackWidthPx: number, visibleWidthPx: number): number {
+export function chooseTickInterval(duration: number, zoom: number, targetSpacingPx: number, trackWidthPx: number, visibleWidthPx: number): number {
   const visibleDuration = duration / zoom
   // 使用可见区域宽度计算秒/像素，而非 trackWidthPx（放大后 trackWidthPx 是 zoom 倍宽度）
   const effectiveWidth = Math.max(visibleWidthPx || trackWidthPx / zoom, 1)
@@ -98,7 +98,7 @@ function chooseTickInterval(duration: number, zoom: number, targetSpacingPx: num
 }
 
 /** 主刻度间隔：落在关键阶段上，约为次刻度 4～8 倍，保证约每窗 3～6 个标签 */
-function chooseMajorInterval(minor: number, visibleDuration: number): number {
+export function chooseMajorInterval(minor: number, visibleDuration: number): number {
   const target = Math.max(minor * 4, visibleDuration / 5)
   for (const c of MAJOR_LANDMARKS) {
     if (c % minor === 0 && c >= target) return c
@@ -110,7 +110,7 @@ function chooseMajorInterval(minor: number, visibleDuration: number): number {
 }
 
 /** 10 分钟 / 整点小时：强化竖线 */
-function isKeyStage(absSec: number): boolean {
+export function isKeyStage(absSec: number): boolean {
   const t = Math.round(absSec)
   if (t <= 0) return false
   return t % 3600 === 0 || t % 600 === 0
@@ -124,7 +124,7 @@ interface SnapTarget {
   type?: SnapType
 }
 
-function findSnapTarget(
+export function findSnapTarget(
   rawTime: number,
   duration: number,
   markIn: number | null,

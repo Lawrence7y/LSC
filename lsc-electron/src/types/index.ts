@@ -1,14 +1,94 @@
 // 预览来源模式
 export type PreviewMode = 'live_mse' | 'recording_review' | 'degraded'
 
+export type RoomHealthStatus =
+  | 'IDLE' | 'CONNECTING' | 'READY' | 'LIVE' | 'RESTRICTED' | 'UNKNOWN' | 'ERROR' | 'OFFLINE' | 'PENDING'
+  | 'RUNNING' | 'DEGRADED' | 'REFRESHING' | 'RECONNECTING' | 'BACKING_OFF' | 'STOPPED' | 'FAILED' | 'AUTH_REQUIRED'
+  | 'STARTING' | 'RECORDING' | 'PLAYING' | 'PAUSED'
+
+export interface RoomPipelineHealth {
+  schema_version: number
+  platform_id?: string
+  pipeline_mode?: 'V2' | 'LEGACY'
+  platform: RoomHealthStatus
+  resolver: RoomHealthStatus
+  ingest: RoomHealthStatus
+  recording: RoomHealthStatus
+  preview: RoomHealthStatus
+  error?: string
+  failure_kind?: string
+  support_level?: 'EXPERIMENTAL' | 'PREVIEW' | 'STABLE' | 'DEGRADED' | 'DISABLED'
+  connection_policy?: string
+  credential_status?: string
+  credential_kinds?: string[]
+  lease_id?: string
+  candidate_id?: string
+  quality_id?: string
+  protocol?: string
+  cdn_id?: string
+  lease_expires_at?: number | null
+  lease_refresh_at?: number | null
+  manifest_path?: string
+  generation?: number
+  upstream_generation?: number
+  recovery_attempt?: number
+  max_recovery_attempts?: number
+  resources?: {
+    upstream_pid?: number | null
+    recording_pid?: number | null
+    preview_pid?: number | null
+    preview_subscribers?: number
+    upstream_bytes?: number
+    recording_size_bytes?: number
+    preview_segment_count?: number
+    preview_media_bytes?: number
+  }
+  updated_at?: number
+}
+
+export interface RuntimeEventPayload {
+  schema_version: number
+  event_id?: string
+  event_type: string
+  room_id: string
+  room_session_id?: string
+  recording_session_id?: string
+  platform_id?: string
+  component?: string
+  state: string
+  state_from?: string
+  state_to?: string
+  severity?: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL' | string
+  occurred_at: number
+  session_id?: string
+  lease_id?: string
+  candidate_id?: string
+  stage?: string
+  failure_kind?: string
+  attempt?: number
+  max_attempts?: number
+  next_retry_at?: number | null
+  user_action?: string
+  reason_code?: string
+  recovery_id?: string
+  generation?: number
+  lease_generation?: number
+  retry_after_seconds?: number | null
+  context?: Record<string, unknown>
+  safe_context?: Record<string, unknown>
+}
+
 // 房间相关
 export interface RoomSession {
   room_id: string
   room_url: string
   platform: string
   platform_name: string
+  canonical_room_id?: string
   streamer_name: string
+  streamer?: string
   stream_title: string
+  title?: string
   is_connecting: boolean
   is_connected: boolean
   is_recording: boolean
@@ -20,6 +100,7 @@ export interface RoomSession {
   recording_queue_position?: number
   is_reconnecting?: boolean
   record_output_path: string
+  record_manifest_path?: string
   record_started_at: string | null
   record_size_mb: number
   last_error: string
@@ -62,6 +143,8 @@ export interface RoomSession {
   // 直播分区分类
   category?: string
   align_group_id?: string
+  /** 后端只读健康投影：平台/解析/进样/录制/预览五个维度。 */
+  pipeline_health?: RoomPipelineHealth
 }
 
 // 切片确认状态（与导出状态正交：确认管可信度，export 管导出队列）
@@ -183,6 +266,7 @@ export interface WSPayloadMap {
   recording_queue: { room_id?: string; position?: number; waiting?: boolean }
   system_stats: { cpu_percent: number; memory: { total: number; used: number; percent: number }; disks: unknown[] }
   preview_phase: { room_id: string; phase: string }
+  runtime_event: RuntimeEventPayload
   clip_confirm_status: { room_id: string; round_key: string; confirm_status: string; start?: number; end?: number; label?: string }
   timeline_ready: { timeline: unknown }
   timeline_invalidated: { timeline_id: string; reason: string }

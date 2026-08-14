@@ -342,8 +342,10 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 
 #### 7.3.2 共享进程模式（`shared_ingest_enabled=True`）
 
+> 当前实现不是“单个 FFmpeg 双输出”：它是**单个远端上游 FFmpeg + 独立录制 sink + 独立预览 sink**。以下历史拓扑仅用于说明共享上游的设计意图，实际生命周期以 `SharedRoomIngest` 和 `IngestSupervisor` 代码为准。
+
 > [!WARNING]
-> 开启后，预览和录制共享同一个 FFmpeg 进程。录制故障会同时导致预览中断，预览转码负载可能影响录制稳定性。预览画质由 `shared_ingest_preview_crf` 控制，与录制画质（`-c copy`）不同。
+> 当前运行时不是单个 FFmpeg 双输出：预览和录制共享一个远端上游 FFmpeg，但各自使用独立 sink。录制 sink 故障不得停止预览，预览 sink 故障不得停止录制；旧版单进程双输出仅作为历史拓扑记录。
 
 ```
 直播 CDN
@@ -355,14 +357,16 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
          └── 输出2: libx264 -crf {shared_ingest_preview_crf} → pipe:1 → SharedPreviewHandle → WebSocket → MSE播放器
 ```
 
-*   **核心实现**：`lsc/core/services/shared_ingest.py` — `SharedRoomIngest` 类，单进程双输出 FFmpeg 命令。
+*   **核心实现**：`lsc/core/services/shared_ingest.py` — `SharedRoomIngest` 类，维护共享远端上游与独立录制/预览 sink。
 *   **录制输出**：`-c copy` 直拷到磁盘文件，保证录制画质无损。
 *   **预览输出**：`libx264` 软件编码，参数由 `shared_ingest_preview_crf`（默认 23）和 `shared_ingest_preview_preset`（默认 `veryfast`）控制。
-*   **进程生命周期**：`start_recording_and_preview()` 启动双输出；`stop_recording_sink()` 停止录制后自动重启为纯预览模式；`start_preview_only()` 启动纯预览进程。
+*   **进程生命周期**：`start_recording()` 和 `start_preview()` 可独立启动；停止任一 sink 不会关闭仍在使用的上游或另一 sink；`IngestSupervisor` 负责统一恢复。
 *   **错误检测**：`_read_preview_stdout_loop` 通过 `_planned_stop` 标志区分计划内关闭和意外退出，确保预览独享模式下进程死亡也能正确触发 `mse_error` 广播。
 *   **重连优化**：`_attempt_recording_reconnect` 对共享进程走快速路径（直接终止旧进程 + 创建新进程），避免 `stop_recording_sink` → preview-only → dual-output 的双重重启链。
 
 #### 7.3.3 通用约束（两种模式均适用）
+
+> 实现口径更新：`SharedRoomIngest` 复用的是一个远端上游 FFmpeg，录制和预览各自拥有独立的 sink FFmpeg/管道。上游断流由 `IngestSupervisor` 统一恢复；单个录制或预览 sink 故障不得直接停止另一个健康 sink。旧版“双输出单 FFmpeg”描述仅作为历史设计记录，不应作为当前运行时契约。
 
 *   **独立启动时机**：用户点击"开始录制"触发 `start_recording`；用户点击"预览"触发 `enable_preview {mode: "mse"}`。两者完全解耦，可以只录不看、只看不录、或同时进行。
 *   **并发上限**：

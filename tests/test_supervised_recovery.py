@@ -175,3 +175,225 @@ def test_preview_encoder_failure_does_not_switch_upstream(monkeypatch):
     assert ingest.preview_starts == 1
     assert ingest.switches == 0
     assert reconnects == []
+
+
+def test_upstream_eof_recovery_keeps_recording_clock(monkeypatch):
+    from datetime import datetime, timedelta
+
+    from lsc.platforms.base import StreamInfo
+
+    started = datetime.now() - timedelta(seconds=125)
+    switches: list[str] = []
+    start_recording_calls: list[str] = []
+    ingest = SimpleNamespace(
+        recording_active=True,
+        is_stopped=False,
+        preview_subscribers=1,
+        upstream_error="shared ingest upstream ffmpeg exited: code=0",
+        recording_error="",
+        url="https://hs.flv.huya.com/src/old.flv?wsSecret=old",
+        headers={},
+        network_context={},
+        recording_sink_is_live=lambda: True,
+        upstream_is_live=lambda: False,
+        bind_lease=lambda *_args, **_kwargs: None,
+        replace_upstream=lambda url, **_kwargs: switches.append(url) or "",
+    )
+
+    class _Supervisor:
+        def stop_recording(self, _reason):
+            raise AssertionError("healthy recording sink must not be stopped")
+
+        def switch_upstream(self, url, **_kwargs):
+            switches.append(url)
+            ingest.upstream_is_live = lambda: True
+            ingest.upstream_error = ""
+            return True
+
+    class _Registry:
+        def get(self, room_id):
+            return ingest if room_id == "room-clock" else None
+
+        def get_supervisor_if_exists(self, room_id):
+            return _Supervisor() if room_id == "room-clock" else None
+
+        def stop_room(self, *_args, **_kwargs):
+            raise AssertionError("in-place upstream recovery must not stop the room")
+
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.get_shared_ingest_registry",
+        lambda: _Registry(),
+    )
+    orchestrator = RoomOrchestrator()
+    room = RoomSession("room-clock", "https://www.huya.com/lpl", platform="huya")
+    room.is_connected = True
+    room.is_recording = True
+    room.is_reconnecting = True
+    room.record_started_at = started
+    room.recording_id = "epoch-keep"
+    room.recording_start_mono = 100.0
+    room.reconnect_output_dir = "/tmp/keep"
+    room.reconnect_encoder = "copy"
+    room.reconnect_crf = 23
+    room.reconnect_attempts = 0
+    room.reconnect_next_attempt_at = 0.0
+    room.stream_info = StreamInfo(
+        platform="huya",
+        room_url=room.room_url,
+        stream_url="https://hs.flv.huya.com/src/new.flv?wsSecret=new",
+        is_live=True,
+        headers={"Referer": "https://www.huya.com/"},
+    )
+    monkeypatch.setattr(orchestrator, "refresh_stream_url", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "start_recording",
+        lambda *_args, **_kwargs: start_recording_calls.append("start") or True,
+    )
+
+    room.reconnect_next_attempt_at = 1.0
+    orchestrator._attempt_recording_reconnect(
+        room,
+        "shared ingest upstream ffmpeg exited: code=0",
+    )
+
+    assert switches
+    assert start_recording_calls == []
+    assert room.record_started_at == started
+    assert room.recording_id == "epoch-keep"
+    assert room.is_recording is True
+    assert room.is_reconnecting is False
+
+
+def test_recover_uses_pending_lease_without_refreshing(monkeypatch):
+    from datetime import datetime, timedelta
+
+    from lsc.platforms.base import StreamInfo
+
+    started = datetime.now() - timedelta(seconds=125)
+    switches: list[str] = []
+    refresh_calls: list[str] = []
+    ingest = SimpleNamespace(
+        recording_active=True,
+        is_stopped=False,
+        preview_subscribers=1,
+        upstream_error="signed http remote EOF after media",
+        recording_error="",
+        url="https://hs.flv.huya.com/src/old.flv?wsSecret=old",
+        headers={},
+        network_context={},
+        recording_sink_is_live=lambda: True,
+        upstream_is_live=lambda: False,
+        bind_lease=lambda *_args, **_kwargs: None,
+        take_pending_lease=lambda: {
+            "url": "https://hs.flv.huya.com/src/new.flv?wsSecret=new",
+            "headers": {"Referer": "https://www.huya.com/"},
+            "network_context": {},
+            "lease_id": "lease-pending",
+            "generation": 3,
+        },
+    )
+
+    class _Supervisor:
+        def stop_recording(self, _reason):
+            raise AssertionError("lease rotation must not stop recording")
+
+        def switch_upstream(self, url, **_kwargs):
+            switches.append(url)
+            ingest.upstream_is_live = lambda: True
+            ingest.upstream_error = ""
+            return True
+
+    class _Registry:
+        def get(self, room_id):
+            return ingest if room_id == "room-pending" else None
+
+        def get_supervisor_if_exists(self, room_id):
+            return _Supervisor() if room_id == "room-pending" else None
+
+        def stop_room(self, *_args, **_kwargs):
+            raise AssertionError("lease rotation must not stop the room")
+
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.get_shared_ingest_registry",
+        lambda: _Registry(),
+    )
+    orchestrator = RoomOrchestrator()
+    room = RoomSession("room-pending", "https://www.huya.com/lpl", platform="huya")
+    room.is_connected = True
+    room.is_recording = True
+    room.record_started_at = started
+    room.recording_id = "epoch-keep"
+    room.stream_info = StreamInfo(
+        platform="huya",
+        room_url=room.room_url,
+        stream_url="https://hs.flv.huya.com/src/old.flv?wsSecret=old",
+        is_live=True,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "refresh_stream_url",
+        lambda *_args, **_kwargs: refresh_calls.append("refresh") or True,
+    )
+
+    assert orchestrator._recover_shared_upstream_in_place(room) is True
+    assert switches == ["https://hs.flv.huya.com/src/new.flv?wsSecret=new"]
+    assert refresh_calls == []
+    assert room.record_started_at == started
+    assert room.recording_id == "epoch-keep"
+
+
+def test_supervised_recovery_rotate_lease_uses_in_place_path(monkeypatch):
+    from lsc.platforms.base import StreamInfo
+
+    rotates: list[str] = []
+    ingest = SimpleNamespace(_upstream_has_produced_data=True)
+
+    class _Supervisor:
+        def run_recovery(self, callback, *, reason_code):
+            rotates.append(reason_code)
+            return bool(callback("rot-1"))
+
+        def restart_preview_sink(self):
+            raise AssertionError("lease rotation is not a preview encoder failure")
+
+    class _Registry:
+        def get(self, room_id):
+            return ingest if room_id == "room-rot" else None
+
+        def get_supervisor_if_exists(self, room_id):
+            return _Supervisor() if room_id == "room-rot" else None
+
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.get_shared_ingest_registry",
+        lambda: _Registry(),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.is_platform_pipeline_component_enabled",
+        lambda component, platform: component == "ingest_supervisor_v2",
+    )
+    orchestrator = RoomOrchestrator()
+    room = RoomSession("room-rot", "https://www.huya.com/1", platform="huya")
+    room.stream_info = StreamInfo(
+        platform="huya",
+        room_url=room.room_url,
+        stream_url="https://hs.flv.huya.com/src/live.flv?wsSecret=abc",
+    )
+    room.is_recording = True
+    monkeypatch.setattr(
+        orchestrator,
+        "_recover_shared_upstream_in_place",
+        lambda target: rotates.append("in-place") or True,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_attempt_recording_reconnect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("rotate_lease must not restart the recording session")
+        ),
+    )
+    assert orchestrator._start_supervised_recovery(
+        room,
+        "signed http remote EOF after media",
+    ) is True
+    assert "in-place" in rotates

@@ -10,11 +10,15 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from ws_auth import expected_ws_token, is_origin_allowed, validate_ws_token
 
+from lsc.platforms.redaction import redact_mapping, redact_text
+
 _log = logging.getLogger('lsc.server')
 
 
 def _truncate_for_log(data: Any, str_limit: int = 200, list_limit: int = 10) -> Any:
     """截断超大日志字段，避免日志文件暴增。"""
+    if isinstance(data, dict):
+        data = redact_mapping(data)
     if isinstance(data, dict):
         result = {}
         for k, v in data.items():
@@ -28,6 +32,19 @@ def _truncate_for_log(data: Any, str_limit: int = 200, list_limit: int = 10) -> 
     if isinstance(data, str) and len(data) > str_limit:
         return f"<str of length {len(data)}>"
     return data
+
+
+def _redact_public_payload(data: Any) -> Any:
+    """Redact values before they cross the WebSocket boundary."""
+    if isinstance(data, dict):
+        return redact_mapping(data)
+    if isinstance(data, list):
+        return [
+            _redact_public_payload(item) if isinstance(item, (dict, list))
+            else redact_text(item) if isinstance(item, str) else item
+            for item in data
+        ]
+    return redact_text(data) if isinstance(data, str) else data
 
 
 class _NumpyJSONEncoder(json.JSONEncoder):
@@ -203,14 +220,23 @@ class LSCWebSocketServer:
                     result['request_id'] = request_id
                 if msg_type not in high_freq_types:
                     _log.info("Sending WS response: type=%s_response, data=%s", msg_type, _truncate_for_log(result))
-                await websocket.send(_json_dumps({'type': f'{msg_type}_response', 'data': result}))
+                await websocket.send(_json_dumps({
+                    'type': f'{msg_type}_response',
+                    'data': _redact_public_payload(result),
+                }))
             except json.JSONDecodeError:
-                _log.warning("Invalid JSON format received (truncated): %s", message[:500])
+                _log.warning(
+                    "Invalid JSON format received (truncated): %s",
+                    redact_text(message[:500]),
+                )
             except Exception as exc:
-                _log.error("Error handling message: %s", exc, exc_info=True)
+                _log.error("Error handling message: %s", redact_text(exc), exc_info=True)
                 if msg_type is not None:
                     try:
-                        error_data: dict[str, Any] = {'success': False, 'error': str(exc)}
+                        error_data: dict[str, Any] = {
+                            'success': False,
+                            'error': redact_text(exc),
+                        }
                         if request_id is not None:
                             error_data['request_id'] = request_id
                         await websocket.send(_json_dumps({
@@ -218,7 +244,7 @@ class LSCWebSocketServer:
                             'data': error_data,
                         }))
                     except Exception as send_exc:
-                        _log.debug("Failed to send error response: %s", send_exc)
+                        _log.debug("Failed to send error response: %s", redact_text(send_exc))
 
         # Process messages sequentially per connection to guarantee in-order
         # handler execution. Previously each message spawned an independent
@@ -257,9 +283,10 @@ class LSCWebSocketServer:
         if not self.clients:
             return
 
+        safe_data = _redact_public_payload(data)
         message = _json_dumps({
             'type': message_type,
-            'data': data
+            'data': safe_data
         })
 
         # 发送并检测慢客户端，超时客户端移出广播集合
@@ -288,7 +315,7 @@ class LSCWebSocketServer:
             'export_progress', 'medium_tick',
         })
         if message_type not in _HIGH_FREQ_BROADCASTS:
-            log_data = _truncate_for_log(data)
+            log_data = _truncate_for_log(safe_data)
             _log.debug(f"Broadcasted WS message: type={message_type}, data={log_data}")
 
     async def broadcast_bytes(self, payload: bytes) -> None:

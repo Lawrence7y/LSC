@@ -49,9 +49,6 @@ export function VideoPreview({
   const previewPhase = useAppStore(
     (s) => s.uiState[roomId]?.preview_phase
   )
-  const platform = useAppStore(
-    (s) => s.rooms.find((r) => r.room_id === roomId)?.platform
-  )
   const previewMode = useAppStore(
     (s) => s.rooms.find((r) => r.room_id === roomId)?.preview_mode,
   )
@@ -471,14 +468,14 @@ export function VideoPreview({
     !showError &&
     state !== 'playing'
 
-  // 阶段进度文案：B站等平台首次刷新流地址耗时较长，单独提示
+  // 阶段进度文案：首次刷新流地址可能需要等待上游解析完成
   const phaseText =
     previewPhase === 'refreshing_url' ? '正在刷新流地址…' :
     previewPhase === 'probing' ? '正在探测/转码…' :
     '正在拉流/转码…'
   const phaseHint =
-    previewPhase === 'refreshing_url' && platform && /bilibili/i.test(platform)
-      ? '首次刷新通常需要 10–30 秒'
+    previewPhase === 'refreshing_url'
+      ? '首次刷新可能需要 10–30 秒'
       : null
 
   return (
