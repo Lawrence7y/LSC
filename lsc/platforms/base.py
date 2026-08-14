@@ -294,6 +294,10 @@ def sanitize_undefined_to_null(text: str) -> str:
 
 def headers_to_ffmpeg_input_args(headers: dict[str, str] | None) -> list[str]:
     """Convert request headers to FFmpeg input arguments."""
+    # FFmpeg libavformat/http.c 对 -headers 参数有 32768 字节硬限制，
+    # 超限直接报 "overlong headers" + EINVAL（code -22）。留余量取 30KB。
+    _FFMPEG_HEADERS_MAX_BYTES = 30_000
+
     def _sanitize_header_part(value: object) -> str:
         return str(value).replace("\r", "").replace("\n", "").strip()
 
@@ -310,12 +314,38 @@ def headers_to_ffmpeg_input_args(headers: dict[str, str] | None) -> list[str]:
         if key.lower() == "user-agent" and not user_agent:
             user_agent = value
 
+    def _blob_for(hdrs: dict[str, str]) -> str:
+        return "".join(f"{key}: {value}\r\n" for key, value in hdrs.items())
+
+    header_blob = _blob_for(clean_headers)
+    blob_bytes = len(header_blob.encode("utf-8", errors="replace"))
+    if blob_bytes > _FFMPEG_HEADERS_MAX_BYTES:
+        # 超限保护：优先丢弃 Cookie（拉流鉴权基本不需要），仍超则逐项丢弃
+        # 最长的头，绝不让 FFmpeg 因 "overlong headers" 直接失败。
+        dropped: list[str] = []
+        trimmed = {k: v for k, v in clean_headers.items() if k.lower() != "cookie"}
+        if len(trimmed) != len(clean_headers):
+            dropped.append("Cookie")
+        while trimmed:
+            candidate = _blob_for(trimmed)
+            if len(candidate.encode("utf-8", errors="replace")) <= _FFMPEG_HEADERS_MAX_BYTES:
+                header_blob = candidate
+                break
+            longest = max(trimmed, key=lambda k: len(trimmed[k]))
+            dropped.append(longest)
+            del trimmed[longest]
+        if dropped:
+            _log.warning(
+                "FFmpeg -headers 超长（%d 字节 > 32KB 限制），已丢弃: %s",
+                blob_bytes,
+                ", ".join(dropped),
+            )
+
     args: list[str] = []
     if user_agent:
         # FFmpeg HTTP ignores User-Agent inside -headers and sends Lavf/* unless
         # this dedicated option is set.
         args.extend(["-user_agent", user_agent])
-    header_blob = "".join(f"{key}: {value}\r\n" for key, value in clean_headers.items())
     args.extend(["-headers", header_blob])
     return args
 
