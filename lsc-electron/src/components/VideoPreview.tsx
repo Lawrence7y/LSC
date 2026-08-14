@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
-import { LoadingOutlined, PlayCircleOutlined } from '@ant-design/icons'
+import { LoadingOutlined, PlayCircleOutlined, PauseCircleOutlined } from '@ant-design/icons'
 import { MsePlayer, MsePlayerState } from '@/services/mediaSourcePlayer'
 import { clearMseRoomCache, drainPendingMseSegments, getMseInitCache, wsClient } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
@@ -461,11 +461,14 @@ export function VideoPreview({
 
   const showError = state === 'error' || error
   const showIdle = state === 'idle'
+  // 暂停态是用户主动操作，不算"未出画"：不得显示"正在拉流/转码…"
+  const isPaused = state === 'paused'
   // 预览已启用但尚未出画（拉流/转码中）
   const showStarting =
     active &&
     !mseReconnecting &&
     !showError &&
+    !isPaused &&
     state !== 'playing'
 
   // 阶段进度文案：首次刷新流地址可能需要等待上游解析完成
@@ -532,6 +535,30 @@ export function VideoPreview({
           {phaseHint && (
             <span style={{ fontSize: 11, color: 'var(--text-400)' }}>{phaseHint}</span>
           )}
+        </div>
+      )}
+
+      {/* 用户主动暂停：轻提示（非"拉流/转码"误报） */}
+      {isPaused && !showError && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 8,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            background: 'rgba(0, 0, 0, 0.55)',
+            backdropFilter: 'blur(6px)',
+            borderRadius: 999,
+            padding: '3px 10px',
+            zIndex: 3,
+            pointerEvents: 'none',
+          }}
+        >
+          <PauseCircleOutlined style={{ fontSize: 13, color: 'var(--text-200, #c7c7cc)' }} />
+          <span style={{ fontSize: 11, color: 'var(--text-200, #c7c7cc)' }}>已暂停</span>
         </div>
       )}
 

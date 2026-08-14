@@ -406,6 +406,12 @@ _OCR_BOUNDARY_SOURCE = "valorant_ocr_v1"  # 纯 OCR 路径产出（顶部条 + �
 _OCR_VALID_START_BY = frozenset({"ocr_combat"})
 _OCR_VALID_END_BY = frozenset({"next_prep", "open_tail", "next_combat"})
 _OCR_FINALIZE_OVERLAP_SEC = 120.0
+# 收尾完成判定容差：worker_dur（= 收尾扫描终点）与录制终点相差小于该值视为已扫到尾部。
+# 过大则尾部回合漏检；过小则码率估算/墙钟钳制的微小误差导致收尾扫描反复重扫。
+_OCR_FINALIZE_TAIL_EPS = 8.0
+# 副房映射越界容差：映射出点超出副房定格录制时长该值以上时跳过该副房切片
+# （副房先停录、主房继续分析时，后续回合按 content_offset 映射必然越过副房文件末尾）。
+_RECORDING_MAPPING_BOUNDS_EPS = 1.0
 # 买枪+交战+结算(+赛事回放) 常见 90–130s；>150s 才视为异常合并/漏切
 _VALORANT_MAX_ROUND_DURATION_SEC = 150.0
 _MAX_SKIP_SLEEP_TICKS = 5  # 主循环连续跳过 sleep 的防御上限：超过强制 0.5s 节流，防忙循环广播风暴
@@ -4731,6 +4737,8 @@ def register_room_handlers(server, bridge):
         rooms_data = data.get('rooms', [])
         _align_log = logging.getLogger('lsc.align')
         _align_log.info("收到预览音频对齐请求: rooms=%d", len(rooms_data))
+        # 与 alignment_handlers.py 保持一致：记录接收时刻作为预览 PTS → 公共轴锚点基准。
+        align_received_mono = time.monotonic()
         if len(rooms_data) < 2:
             _align_log.warning("预览音频对齐请求房间数不足: %d", len(rooms_data))
             return {'success': False, 'error': '至少需要 2 个房间'}
@@ -4747,6 +4755,7 @@ def register_room_handlers(server, bridge):
 
             # 解码 PCM 数据
             audio_map: dict[str, np.ndarray] = {}
+            preview_cur_time: dict[str, float] = {}
             for rd in rooms_data:
                 room_id = rd.get('room_id', '')
                 sample_rate = int(rd.get('sample_rate', 16000))
@@ -4766,6 +4775,12 @@ def register_room_handlers(server, bridge):
                     diagnostics.get('sample_count'),
                     diagnostics.get('capture_reason'),
                 )
+                try:
+                    _pct = float(diagnostics.get('current_time'))
+                except (TypeError, ValueError):
+                    _pct = 0.0
+                if room_id and _pct > 0.0:
+                    preview_cur_time[room_id] = _pct
                 if not room_id or not pcm_b64:
                     _align_log.warning("预览音频对齐跳过: room_id=%s, 缺少数据", room_id)
                     continue
@@ -4899,6 +4914,7 @@ def register_room_handlers(server, bridge):
                         'preview_epoch_id': getattr(room, 'preview_epoch_id', '') or '',
                         'recording_id': getattr(room, 'recording_id', '') or '',
                         'media_start_mono': float(media_start or 0.0),
+                        'preview_current_time': preview_cur_time.get(rid, 0.0),
                     }
 
                 snapshots = build_room_snapshots_from_align(
@@ -4907,6 +4923,7 @@ def register_room_handlers(server, bridge):
                     scores=scores,
                     room_meta=room_meta,
                     confidence_threshold=_ALIGN_TRUST_THRESHOLD,
+                    align_mono=align_received_mono,
                 )
                 if len(snapshots) < 2:
                     _align_log.warning(
@@ -6574,6 +6591,31 @@ def register_room_handlers(server, bridge):
         submitted_jobs = set()
 
         min_dur = _min_highlight_duration_for_queue(list_only=list_only)
+
+        # 副房停录后录制文件已定格：时长上限用于映射越界校验（仅对非录制房探测一次，
+        # ffprobe 卸载到 _probe_executor 避免阻塞编排线程）。
+        target_dur_cache: dict[str, float | None] = {}
+
+        async def _target_recording_limit(target_room: Any) -> float | None:
+            rid = getattr(target_room, 'room_id', '') or ''
+            if rid in target_dur_cache:
+                return target_dur_cache[rid]
+            limit: float | None = None
+            if not getattr(target_room, 'is_recording', False):
+                _tpath = getattr(target_room, 'record_output_path', '') or ''
+                if _tpath and os.path.isfile(_tpath):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        _tdur = await loop.run_in_executor(
+                            _probe_executor, _get_video_duration, _tpath,
+                        )
+                        if _tdur and _tdur > 0:
+                            limit = float(_tdur)
+                    except Exception as exc:
+                        _log.debug("副房录制时长探测失败，跳过越界校验: room=%s, %s", rid, exc)
+            target_dur_cache[rid] = limit
+            return limit
+
         for idx, hl in enumerate(highlights):
             source_start = float(hl.get('start', 0) or 0)
             source_end = float(hl.get('end', 0) or 0)
@@ -6603,6 +6645,15 @@ def register_room_handlers(server, bridge):
                 if export_start >= export_end:
                     continue
                 if export_end - export_start < min_dur:
+                    continue
+                # 多房间收尾：副房已停录时其录制文件定格，映射出点不得越过文件末尾，
+                # 否则列出/导出的切片内容缺失（副房先停、主房继续分析时必然触发）。
+                _tlimit = await _target_recording_limit(target_room)
+                if _tlimit is not None and export_end > _tlimit + _RECORDING_MAPPING_BOUNDS_EPS:
+                    _log.warning(
+                        "副房已停录，映射越界跳过: room=%s, %.1f-%.1f > dur=%.1fs",
+                        rid, export_start, export_end, _tlimit,
+                    )
                     continue
 
                 room_name = getattr(target_room, 'streamer_name', '') or rid
@@ -7814,7 +7865,19 @@ def register_room_handlers(server, bridge):
                     _log.info("持续分析增量: room_id=%s, mode=%s, 新增 %d 段, 累计 %d 段 (已分析到 %.1fs)",
                               room_id, mode, len(new_hl), len(all_highlights), worker_dur)
 
-                    if _finalize_started and _finalize_pending and worker_dur <= last_analyzed + 5.0:
+                    # 收尾完成判定：必须由「真正覆盖到录制尾部」的扫描触发。
+                    # 旧判定 `worker_dur <= last_analyzed + 5.0` 在 last_analyzed 刚被
+                    # 更新为 worker_dur 之后恒真，会把停录前在途的增量窗口（扫描终点
+                    # 远早于录制终点）误判为收尾完成，导致尾部 ~200s 内容从未被扫描。
+                    _finalize_target = max(
+                        float(recorded_duration or 0.0),
+                        float(current_dur or 0.0),
+                    )
+                    if (
+                        _finalize_started
+                        and _finalize_pending
+                        and worker_dur >= _finalize_target - _OCR_FINALIZE_TAIL_EPS
+                    ):
                         _finalize_pending = False
                         _finalize_failures = 0
                         _log.info("持续分析收尾完成: room_id=%s, 累计 %d 段", room_id, len(all_highlights))
@@ -7909,11 +7972,15 @@ def register_room_handlers(server, bridge):
                 if video_path:
                     should_kick = False
                     if _finalize_pending and not _finalize_started:
-                        should_kick = True
-                        _finalize_started = True
-                        with _analysis_jobs_lock:
-                            if room_id in _continuous_tasks:
-                                _continuous_tasks[room_id]['finalizing'] = True
+                        # 有在途扫描时先不置 _finalize_started：等其完成后，下一 tick
+                        # 再 kick 以「停录后最终时长」为终点的真正收尾扫描，否则在途
+                        # 增量窗口（终点冻结在停录前）会被当作收尾结果消费。
+                        if not state.get('scan_running'):
+                            should_kick = True
+                            _finalize_started = True
+                            with _analysis_jobs_lock:
+                                if room_id in _continuous_tasks:
+                                    _continuous_tasks[room_id]['finalizing'] = True
                     elif _valorant_incremental_rounds:
                         # 文件时长可能滞后于墙钟录制时长；用二者较大值决定是否 kick
                         kick_dur = max(current_dur, float(state.get('recorded_duration', 0.0) or 0.0))

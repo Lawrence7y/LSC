@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -33,6 +34,7 @@ class ClipDraftSource:
     label: str
     precision: str = "exact"  # exact | approximate
     confirm_status: str | None = None
+    room_id: str | None = None
 
 
 def sanitize_draft_token(name: str) -> str:
@@ -274,11 +276,22 @@ def build_session_draft(
     )
 
     width, height = (1080, 1920) if options.vertical else (1920, 1080)
-    folder = draft.DraftFolder(draft_root)
-    existed = folder.has_draft(name)
-    script = folder.create_draft(name, width, height, allow_replace=True)
-    if existed:
-        warnings.append("已覆盖同名草稿，若剪映中已打开请先关闭")
+    draft_dir = os.path.join(draft_root, name)
+    try:
+        folder = draft.DraftFolder(draft_root)
+        existed = folder.has_draft(name)
+        script = folder.create_draft(name, width, height, allow_replace=True)
+        if existed:
+            warnings.append("已覆盖同名草稿，若剪映中已打开请先关闭")
+    except Exception as exc:
+        _log.warning("剪映草稿初始化失败，清理半成品目录: %s", exc, exc_info=True)
+        shutil.rmtree(draft_dir, ignore_errors=True)
+        return JianyingDraftResult(
+            success=False,
+            error=f"剪映草稿初始化失败: {exc}",
+            error_code="draft_failed",
+            warnings=warnings,
+        )
 
     non_main = [r for r in usable if not r.is_main]
     ordered_rec = list(reversed(non_main)) + [main]
@@ -294,13 +307,24 @@ def build_session_draft(
     if options.text_labels and options.include_clips:
         specs.append(TrackSpec(TrackType.text, "回合标签"))
     if not specs:
+        shutil.rmtree(draft_dir, ignore_errors=True)
         return JianyingDraftResult(
             success=False,
             error="没有可生成的轨道",
             error_code="invalid_state",
             warnings=warnings,
         )
-    script.append_tracks(specs)
+    try:
+        script.append_tracks(specs)
+    except Exception as exc:
+        _log.warning("剪映草稿轨道创建失败，清理半成品目录: %s", exc, exc_info=True)
+        shutil.rmtree(draft_dir, ignore_errors=True)
+        return JianyingDraftResult(
+            success=False,
+            error=f"剪映草稿轨道创建失败: {exc}",
+            error_code="draft_failed",
+            warnings=warnings,
+        )
 
     SEC = draft.SEC
     segments = 0
@@ -335,60 +359,16 @@ def build_session_draft(
         materials[room.room_id] = mat
         return mat
 
-    if options.include_recordings:
-        for r in ordered_rec:
-            mat = _material_for(r)
-            dur_sec = mat.duration / SEC
-            t0, td, s0, sd = map_recording_timeranges(
-                recording_to_common_delta=r.recording_to_common_delta,
-                draft_origin=origin,
-                dur_sec=dur_sec,
-            )
-            vol = 0.0 if (options.non_main_volume_zero and not r.is_main) else 1.0
-            seg = draft.VideoSegment(
-                mat,
-                seconds_trange(t0, td),
-                source_timerange=seconds_trange(s0, sd),
-                volume=vol,
-            )
-            script.add_segment(seg, _track_label(r, "录制"))
-            segments += 1
-
-    usable_clips = [
-        c
-        for c in clips
-        if clip_source_usable(
-            precision=c.precision,
-            confirm_status=c.confirm_status,
-            include_pending=options.include_pending,
-        )
-    ]
-    skipped = len(clips) - len(usable_clips)
-    if skipped:
-        warnings.append(f"已排除 {skipped} 条 pending/approximate 切片")
-
-    if options.include_clips:
-        for r in ordered_rec:
-            mat = _material_for(r)
-            dur_sec = mat.duration / SEC
-            for c in usable_clips:
-                mapped = map_clip_timeranges(
-                    c.common_start,
-                    c.common_end,
-                    r.recording_to_common_delta,
-                    origin,
+    try:
+        if options.include_recordings:
+            for r in ordered_rec:
+                mat = _material_for(r)
+                dur_sec = mat.duration / SEC
+                t0, td, s0, sd = map_recording_timeranges(
+                    recording_to_common_delta=r.recording_to_common_delta,
+                    draft_origin=origin,
                     dur_sec=dur_sec,
                 )
-                if mapped is None:
-                    warnings.append(
-                        f"房间 {r.name} 无此时段素材或片段过短，已跳过「{c.label}」"
-                    )
-                    continue
-                t0, td, s0, sd, clamped = mapped
-                if clamped:
-                    warnings.append(
-                        f"房间 {r.name} 片段「{c.label}」已按当前文件时长裁剪"
-                    )
                 vol = 0.0 if (options.non_main_volume_zero and not r.is_main) else 1.0
                 seg = draft.VideoSegment(
                     mat,
@@ -396,23 +376,104 @@ def build_session_draft(
                     source_timerange=seconds_trange(s0, sd),
                     volume=vol,
                 )
-                script.add_segment(seg, _track_label(r, "切片"))
+                script.add_segment(seg, _track_label(r, "录制"))
                 segments += 1
 
-        if options.text_labels:
-            for c in usable_clips:
-                t0 = c.common_start - origin
-                td = c.common_end - c.common_start
-                if td <= _MIN_SEG_SEC:
-                    continue
-                script.add_segment(
-                    draft.TextSegment(c.label or "回合", seconds_trange(t0, td)),
-                    "回合标签",
-                )
-                segments += 1
+        usable_clips = [
+            c
+            for c in clips
+            if clip_source_usable(
+                precision=c.precision,
+                confirm_status=c.confirm_status,
+                include_pending=options.include_pending,
+            )
+        ]
+        skipped = len(clips) - len(usable_clips)
+        if skipped:
+            warnings.append(f"已排除 {skipped} 条 pending/approximate 切片")
 
-    script.save()
-    draft_dir = os.path.join(draft_root, name)
+        if options.include_clips:
+            # 每条切片只进「其所属房间」的切片轨：主/副房同回合切片在公共轴上的
+            # 位置相差 media_start 差（秒级），若全部房间轨都添加全部切片，必然
+            # 相互重叠 → pyJianYingDraft SegmentOverlap → save() 未执行 → 草稿
+            # 目录不完整，剪映能看到但打不开。room_id 缺失的旧数据仅进主房轨。
+            for r in ordered_rec:
+                mat = _material_for(r)
+                dur_sec = mat.duration / SEC
+                for c in usable_clips:
+                    if c.room_id is not None and c.room_id != r.room_id:
+                        continue
+                    if c.room_id is None and not r.is_main:
+                        continue
+                    mapped = map_clip_timeranges(
+                        c.common_start,
+                        c.common_end,
+                        r.recording_to_common_delta,
+                        origin,
+                        dur_sec=dur_sec,
+                    )
+                    if mapped is None:
+                        warnings.append(
+                            f"房间 {r.name} 无此时段素材或片段过短，已跳过「{c.label}」"
+                        )
+                        continue
+                    t0, td, s0, sd, clamped = mapped
+                    if clamped:
+                        warnings.append(
+                            f"房间 {r.name} 片段「{c.label}」已按当前文件时长裁剪"
+                        )
+                    vol = 0.0 if (options.non_main_volume_zero and not r.is_main) else 1.0
+                    seg = draft.VideoSegment(
+                        mat,
+                        seconds_trange(t0, td),
+                        source_timerange=seconds_trange(s0, sd),
+                        volume=vol,
+                    )
+                    try:
+                        script.add_segment(seg, _track_label(r, "切片"))
+                    except Exception as exc:
+                        # 防御：未知边界的重叠段跳过并告警，保证草稿仍可保存打开
+                        warnings.append(
+                            f"房间 {r.name} 片段「{c.label}」与其它片段重叠，已跳过: {exc}"
+                        )
+                        continue
+                    segments += 1
+
+            if options.text_labels:
+                # 回合标签轨：主/副房同回合标签在公共轴上错位（media_start 差），
+                # 按时间去重只保留第一条，避免同轨重叠导致草稿保存失败。
+                text_segs: list[tuple[float, float, str]] = []
+                for c in usable_clips:
+                    t0 = c.common_start - origin
+                    td = c.common_end - c.common_start
+                    if td <= _MIN_SEG_SEC:
+                        continue
+                    overlap = False
+                    for et0, etd, _elabel in text_segs:
+                        if not (t0 + td <= et0 or et0 + etd <= t0):
+                            overlap = True
+                            break
+                    if overlap:
+                        continue
+                    text_segs.append((t0, td, c.label or "回合"))
+                for t0, td, label in text_segs:
+                    script.add_segment(
+                        draft.TextSegment(label, seconds_trange(t0, td)),
+                        "回合标签",
+                    )
+                    segments += 1
+
+        script.save()
+    except Exception as exc:
+        # 任何构建/保存失败都要清理半成品目录，避免剪映注册损坏草稿
+        _log.warning("剪映草稿生成失败，清理半成品目录: %s", exc, exc_info=True)
+        shutil.rmtree(draft_dir, ignore_errors=True)
+        return JianyingDraftResult(
+            success=False,
+            error=f"剪映草稿生成失败: {exc}",
+            error_code="draft_failed",
+            warnings=warnings,
+        )
     return JianyingDraftResult(
         success=True,
         draft_name=name,

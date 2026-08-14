@@ -126,6 +126,12 @@ class RoomTimeSnapshot:
     记录房间在某一时刻的时间轴参数，用于双向时间转换。
     common = preview_local + preview_to_common_delta
     common = recording_local + recording_to_common_delta
+
+    preview_to_common_delta 可包含预览流 PTS 轴→公共轴的锚点（见
+    timeline_service.build_room_snapshots_from_align）；preview_rel_delta 保存
+    去掉锚点后的纯房间相对偏移，供录制起步时重建 recording_to_common_delta 使用。
+    origin_mono 为公共轴零点（最早录制起点），使时间线从 0 起算会话时长，
+    而不是显示 time.monotonic() 的系统开机基座。
     """
     room_id: str
     preview_epoch_id: str = ""
@@ -134,6 +140,8 @@ class RoomTimeSnapshot:
     recording_to_common_delta: float = 0.0
     align_confidence: float = 0.0
     media_start_mono: float = 0.0
+    preview_rel_delta: float | None = None
+    origin_mono: float = 0.0
 
 
 @dataclass(slots=True)

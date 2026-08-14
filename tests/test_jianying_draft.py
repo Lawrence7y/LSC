@@ -252,3 +252,33 @@ def test_build_rejects_missing_library(monkeypatch, tmp_path: Path):
     )
     assert r.success is False
     assert r.error_code == "library_missing"
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg required")
+def test_build_cleans_partial_folder_on_save_failure(monkeypatch, tmp_path: Path):
+    """save() 失败时必须清理半成品草稿目录，避免剪映注册损坏草稿。"""
+    a = tmp_path / "a.mp4"
+    _make_color_mp4(a, 2.0, "teal")
+    draft_root = tmp_path / "drafts"
+    draft_root.mkdir()
+    rooms = [RoomDraftSource("r1", "nobody", str(a), 0.0, is_main=True)]
+    opt = JianyingDraftOptions(draft_name="LSC_cleanup", include_clips=False, text_labels=False)
+
+    import lsc.exporter.jianying_draft as mod
+    import pyJianYingDraft.script_file as sf
+
+    def boom_save(self):
+        raise RuntimeError("simulated save failure")
+
+    monkeypatch.setattr(sf.ScriptFile, "save", boom_save)
+    r = build_session_draft(rooms=rooms, clips=[], options=opt, draft_root=str(draft_root))
+    assert r.success is False
+    assert r.error_code == "draft_failed"
+    # 半成品目录必须被清理
+    assert not (draft_root / "LSC_cleanup").exists()
+    monkeypatch.undo()
+    # 恢复后再次生成成功
+    r2 = build_session_draft(rooms=rooms, clips=[], options=opt, draft_root=str(draft_root))
+    assert r2.success, r2.error
+    content = Path(r2.draft_dir) / "draft_content.json"
+    assert content.is_file()

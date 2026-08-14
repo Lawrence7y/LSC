@@ -1217,7 +1217,10 @@ def test_timeline_scrub_can_leave_live_edge() -> None:
     assert "TIMELINE_MAX_WINDOW * 0.15" not in timeline_window
 
     seek_body = workbench.split("const mseSeek = useCallback", 1)[1].split("const mseTogglePlayPause", 1)[0]
-    assert "bufEnd - 0.5" not in seek_body
+    # 非拖动回放（点击切片/标记）缓冲外 clamp 到最近可回放位置，保证回放有响应；
+    # quiet（scrub 拖动中）禁止强制 seek 视频，防止拖拽时被拽回 live edge
+    assert "bufEnd - 0.5" in seek_body
+    assert "else if (!quiet)" in seek_body
     assert "scrubOverrideRef.current[roomId]" in seek_body
 
     seek_handler = workbench.split("const handleTimelineSeek = useCallback", 1)[1].split(

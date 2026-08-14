@@ -4,15 +4,14 @@ import { ReloadOutlined } from '@ant-design/icons'
 
 /* ── Types ── */
 
-interface EnteringParticle {
+interface BubbleParticle {
   id: number
-  edgeX: number
-  edgeY: number
-  targetX: number
-  targetY: number
+  x: number
+  startY: number
+  riseY: number
   size: number
-  color: string
   opacity: number
+  delay: number
 }
 
 interface ShatterParticle {
@@ -33,17 +32,18 @@ interface RefreshButtonProps {
   tooltip?: string
 }
 
-/* ── Constants ── */
+/* ── Constants（主题色：accent-primary 青绿 #4dc4bf / #31b3ae） ── */
 
 const PROGRESS_MS = 800
-const MAX_PARTICLES = 30
+const MAX_BUBBLES = 22
 const SHATTER_COUNT_MIN = 18
-const SHATTER_COUNT_MAX = 28
-const COLORS = [
-  'hsla(207, 100%, 60%,',
-  'hsla(210, 100%, 55%,',
-  'hsla(220, 100%, 65%,',
-  'hsla(200, 100%, 70%,',
+const SHATTER_COUNT_MAX = 26
+const FILL_TOP = '#5ad8c7'     // 填充顶（亮青绿）
+const FILL_BOTTOM = '#2bb5a8'  // 填充底（主题 accent 深一档）
+const BUBBLE_COLORS = [
+  'hsla(172, 62%, 72%,',
+  'hsla(168, 70%, 66%,',
+  'hsla(176, 78%, 74%,',
 ]
 
 /* ── CSS ── */
@@ -57,7 +57,7 @@ function injectCss() {
   s.textContent = `
     @keyframes rfbFlash {
       0% { background: rgba(255,255,255,0); }
-      40% { background: rgba(255,255,255,0.6); }
+      40% { background: rgba(255,255,255,0.65); }
       100% { background: rgba(255,255,255,0); }
     }
   `
@@ -66,14 +66,15 @@ function injectCss() {
 
 /* ── Helpers ── */
 
-function randomColor(): string {
-  return COLORS[Math.floor(Math.random() * COLORS.length)]
+function randomBubbleColor(): string {
+  return BUBBLE_COLORS[Math.floor(Math.random() * BUBBLE_COLORS.length)]
 }
 
 function randomShatterColor(): string {
-  const h = 207 + Math.floor(Math.random() * 15)
-  const s = 80 + Math.floor(Math.random() * 20)
-  const l = 40 + Math.floor(Math.random() * 25)
+  // 主题青绿色系
+  const h = 168 + Math.floor(Math.random() * 12)
+  const s = 65 + Math.floor(Math.random() * 25)
+  const l = 42 + Math.floor(Math.random() * 26)
   return `hsl(${h}, ${s}%, ${l}%)`
 }
 
@@ -90,34 +91,28 @@ function generateShatterPolygon(): string {
   return `polygon(${pts.join(', ')})`
 }
 
-function spawnEnteringParticle(id: number, w: number, h: number): EnteringParticle {
-  const size = 2 + Math.random() * 3.5
-  const pad = 3
-  const edge = Math.floor(Math.random() * 4)
-  let edgeX: number, edgeY: number
-  switch (edge) {
-    case 0: edgeX = pad + Math.random() * (w - pad * 2); edgeY = -size - 2; break
-    case 1: edgeX = w + size + 2; edgeY = pad + Math.random() * (h - pad * 2); break
-    case 2: edgeX = pad + Math.random() * (w - pad * 2); edgeY = h + size + 2; break
-    default: edgeX = -size - 2; edgeY = pad + Math.random() * (h - pad * 2); break
-  }
+/** 在填充液面处生成上浮气泡（长按进度视觉：按钮从底部变绿，光点随液面上升） */
+function spawnBubble(id: number, w: number, h: number, liquidPct: number): BubbleParticle {
+  const size = 2 + Math.random() * 3
+  const pad = 4
+  const liquidY = h - (h * Math.min(100, liquidPct)) / 100
   return {
     id,
-    edgeX, edgeY,
-    targetX: pad + Math.random() * (w - pad * 2),
-    targetY: pad + Math.random() * (h - pad * 2),
+    x: pad + Math.random() * (w - pad * 2),
+    startY: Math.max(0, liquidY - 2),
+    riseY: Math.max(0, liquidY - 2 - (14 + Math.random() * 30)),
     size,
-    color: randomColor(),
-    opacity: 0.5 + Math.random() * 0.5,
+    opacity: 0.45 + Math.random() * 0.45,
+    delay: Math.random() * 60,
   }
 }
 
-/* ── Sub component: entering particle ── */
+/* ── Sub component: rising bubble ── */
 
-const EnteringParticleDiv = memo(function EnteringParticleDiv({
+const BubbleParticleDiv = memo(function BubbleParticleDiv({
   particle,
 }: {
-  particle: EnteringParticle
+  particle: BubbleParticle
 }) {
   const divRef = useRef<HTMLDivElement>(null)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -126,28 +121,25 @@ const EnteringParticleDiv = memo(function EnteringParticleDiv({
     const el = divRef.current
     if (!el) return
 
-    // 放在边缘（无动画）
     el.style.transition = 'none'
-    el.style.left = `${particle.edgeX}px`
-    el.style.top = `${particle.edgeY}px`
+    el.style.left = `${particle.x}px`
+    el.style.top = `${particle.startY}px`
     el.style.opacity = '0'
-    el.style.transform = 'scale(0)'
     void el.offsetHeight
 
-    // 飞入目标位
-    el.style.transition = 'left 0.45s cubic-bezier(.34,1.56,.64,1), top 0.45s cubic-bezier(.34,1.56,.64,1), transform 0.3s ease-out, opacity 0.2s ease-out'
-    el.style.left = `${particle.targetX}px`
-    el.style.top = `${particle.targetY}px`
-    el.style.transform = 'scale(1)'
-    el.style.opacity = `${particle.opacity}`
-
-    // 短暂停留后淡出（融入蓝色填充）
+    const delay = particle.delay
     timerRef.current = setTimeout(() => {
       if (!el) return
-      el.style.transition = 'opacity 0.12s ease-out, transform 0.12s ease-out'
-      el.style.opacity = '0'
-      el.style.transform = 'scale(0.3)'
-    }, 150 + Math.random() * 100)
+      el.style.transition = `top 0.45s ease-out, opacity 0.45s ease-out`
+      el.style.top = `${particle.riseY}px`
+      el.style.opacity = `${particle.opacity}`
+      // 上升结束后淡出
+      setTimeout(() => {
+        if (!el) return
+        el.style.transition = 'opacity 0.15s ease-out'
+        el.style.opacity = '0'
+      }, 380)
+    }, delay)
 
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current)
@@ -162,11 +154,11 @@ const EnteringParticleDiv = memo(function EnteringParticleDiv({
         width: particle.size,
         height: particle.size,
         borderRadius: '50%',
-        background: `${particle.color} ${particle.opacity})`,
-        boxShadow: `0 0 ${particle.size + 2}px ${particle.color} 0.4)`,
+        background: `${randomBubbleColor()} ${particle.opacity})`,
+        boxShadow: `0 0 ${particle.size + 2}px ${randomBubbleColor()} 0.5)`,
         pointerEvents: 'none',
         zIndex: 2,
-        willChange: 'left, top, opacity, transform',
+        willChange: 'top, opacity',
       }}
     />
   )
@@ -225,8 +217,10 @@ export const RefreshButton = memo(function RefreshButton({
   tooltip = '点按刷新预览；长按 0.8s 刷新全部（将停止录制，需确认）',
 }: RefreshButtonProps) {
   // ── Render state ──
+  // 长按进度 = 按钮从底部向上整体填充主题青绿（按键全绿），
+  // 液面处生成上浮光点；完成时白光一闪 + 主题色碎片向外爆发。
   const [fillProgress, setFillProgress] = useState(0)
-  const [enteringParticles, setEnteringParticles] = useState<EnteringParticle[]>([])
+  const [bubbles, setBubbles] = useState<BubbleParticle[]>([])
   const [shatterParticles, setShatterParticles] = useState<ShatterParticle[]>([])
   const [showFlash, setShowFlash] = useState(false)
 
@@ -236,7 +230,7 @@ export const RefreshButton = memo(function RefreshButton({
   const phaseRef = useRef<'idle' | 'triggered'>('idle')
   const particleIdRef = useRef(0)
   const progressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const spawnTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const bubbleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const shatterPolygonRef = useRef<string>('inset(0)')
   const shatterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -260,11 +254,11 @@ export const RefreshButton = memo(function RefreshButton({
   // 'triggered'，后续所有 mousedown 都会被拦截（按钮「失灵」）。
   const cleanupTimers = useCallback(() => {
     if (progressTimerRef.current) { clearTimeout(progressTimerRef.current); progressTimerRef.current = null }
-    if (spawnTimerRef.current) { clearTimeout(spawnTimerRef.current); spawnTimerRef.current = null }
+    if (bubbleTimerRef.current) { clearTimeout(bubbleTimerRef.current); bubbleTimerRef.current = null }
     if (flashTimerRef.current) { clearTimeout(flashTimerRef.current); flashTimerRef.current = null }
   }, [])
 
-  // ── Trigger shatter (solid blue → particles fly outward) ──
+  // ── Trigger shatter (solid green → particles fly outward) ──
   const triggerShatter = useCallback(() => {
     const rect = buttonRef.current?.getBoundingClientRect() ?? { width: 72, height: 24 }
 
@@ -291,6 +285,7 @@ export const RefreshButton = memo(function RefreshButton({
       })
     }
     setShatterParticles(particles)
+    setBubbles([])
 
     // After 380ms, clean up everything
     shatterTimerRef.current = setTimeout(() => {
@@ -312,16 +307,8 @@ export const RefreshButton = memo(function RefreshButton({
     phaseRef.current = 'triggered' // prevent double entry
     fillProgressRef.current = 0
     setFillProgress(0)
-    setEnteringParticles([])
+    setBubbles([])
     setShatterParticles([])
-
-    // Spawn initial burst
-    const rect = buttonRef.current?.getBoundingClientRect() ?? { width: 72, height: 24 }
-    const initial: EnteringParticle[] = []
-    for (let i = 0; i < 8; i++) {
-      initial.push(spawnEnteringParticle(particleIdRef.current++, rect.width, rect.height))
-    }
-    setEnteringParticles(initial)
 
     // Start progress timer (800ms → triggered)
     progressTimerRef.current = setTimeout(() => {
@@ -335,40 +322,38 @@ export const RefreshButton = memo(function RefreshButton({
       flashTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return
         setShowFlash(false)
-        setEnteringParticles([])
         longPressFiredRef.current = true
         triggerShatter()
         onLongPress()
       }, 200)
     }, PROGRESS_MS)
 
-    // Spawn particles & increase fill
+    // 填充进度：按钮从底部向上整体变绿（16 tick × 6.25% = 800ms 满），
+    // 液面处持续生成上浮光点
     const tick = () => {
       if (progressTimerRef.current === null && flashTimerRef.current === null) return
-
       const current = fillProgressRef.current
       if (current >= 100) return
-
       const next = Math.min(100, current + 6.25)
       fillProgressRef.current = next
       setFillProgress(next)
 
-      // Spawn new particles based on progress
-      const count = next < 30 ? 1 : next < 60 ? 2 : 3
-      setEnteringParticles(prev => {
-        if (prev.length >= MAX_PARTICLES) return prev
-        const rect = buttonRef.current?.getBoundingClientRect() ?? { width: 72, height: 24 }
-        const news: EnteringParticle[] = []
+      // 按进度生成气泡（液面附近）
+      const rect = buttonRef.current?.getBoundingClientRect() ?? { width: 72, height: 24 }
+      setBubbles(prev => {
+        if (prev.length >= MAX_BUBBLES) return prev
+        const count = next < 30 ? 1 : next < 70 ? 2 : 2
+        const news: BubbleParticle[] = []
         for (let i = 0; i < count; i++) {
-          if (prev.length + news.length >= MAX_PARTICLES) break
-          news.push(spawnEnteringParticle(particleIdRef.current++, rect.width, rect.height))
+          if (prev.length + news.length >= MAX_BUBBLES) break
+          news.push(spawnBubble(particleIdRef.current++, rect.width, rect.height, next))
         }
         return [...prev, ...news]
       })
 
-      spawnTimerRef.current = setTimeout(tick, 50)
+      bubbleTimerRef.current = setTimeout(tick, 50)
     }
-    spawnTimerRef.current = setTimeout(tick, 50)
+    bubbleTimerRef.current = setTimeout(tick, 50)
   }, [disabled, triggerShatter, onLongPress])
 
   // ── Handle mouse up ──
@@ -390,11 +375,11 @@ export const RefreshButton = memo(function RefreshButton({
     // Short click: shatter + callback
     const progress = fillProgressRef.current
     if (progress > 0) {
-      setEnteringParticles([])
       triggerShatter()
     }
     fillProgressRef.current = 0
     setFillProgress(0)
+    setBubbles([])
     phaseRef.current = 'idle'
     onShortClick()
   }, [cleanupTimers, triggerShatter, onShortClick])
@@ -417,11 +402,11 @@ export const RefreshButton = memo(function RefreshButton({
     // Cancel: shatter without callback
     const progress = fillProgressRef.current
     if (progress > 0) {
-      setEnteringParticles([])
       triggerShatter()
     }
     fillProgressRef.current = 0
     setFillProgress(0)
+    setBubbles([])
     phaseRef.current = 'idle'
   }, [cleanupTimers, triggerShatter])
 
@@ -467,20 +452,22 @@ export const RefreshButton = memo(function RefreshButton({
           userSelect: 'none',
         }}
       >
-        {/* ① Blue fill layer */}
+        {/* ① Green fill layer：从底部向上整体填充（主题青绿），长按过程按键逐渐全绿 */}
         <div
           style={{
             position: 'absolute',
-            inset: 0,
-            background: 'linear-gradient(135deg, #31B3AE, #4DC4BF)',
-            opacity: fillProgress / 100,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: `${fillProgress}%`,
+            background: `linear-gradient(180deg, ${FILL_TOP}, ${FILL_BOTTOM})`,
             borderRadius: 'inherit',
             pointerEvents: 'none',
             zIndex: 1,
             clipPath,
             transition: isShattering
-              ? 'clip-path 0.35s ease-out, opacity 0.3s ease-out'
-              : 'opacity 0.05s linear',
+              ? 'clip-path 0.35s ease-out'
+              : 'height 0.05s linear',
           }}
         />
 
@@ -498,9 +485,9 @@ export const RefreshButton = memo(function RefreshButton({
           />
         )}
 
-        {/* ③ Entering particles (briefly visible then dissolve into fill) */}
-        {enteringParticles.map(p => (
-          <EnteringParticleDiv key={p.id} particle={p} />
+        {/* ③ Rising bubbles（沿填充液面上浮的主题色光点） */}
+        {bubbles.map(p => (
+          <BubbleParticleDiv key={p.id} particle={p} />
         ))}
 
         {/* ④ Shatter particles (fly outward) */}

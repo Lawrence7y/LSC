@@ -162,6 +162,8 @@ type AnalysisDraftSession = {
   sawRunning: boolean
   lastError?: string
   autoFired: boolean
+  /** 应用重启/刷新后补武装：clip_queued 不会重放，允许按目标房回退收集切片 */
+  rearmed?: boolean
 }
 
 type CaptureFailure = {
@@ -334,7 +336,14 @@ export default function Workbench() {
   // 本地拖拽 marker 的即时显示值（拖拽中覆盖 room mark，松手清除）
   const [localDragMark, setLocalDragMark] = useState<{ type: 'in' | 'out'; time: number } | null>(null)
 
-  const [wantAnalysisDraft, setWantAnalysisDraft] = useState(false)
+  const [wantAnalysisDraft, setWantAnalysisDraft] = useState<boolean>(() => {
+    // 持久化：用户选择跨应用重启保留，避免重启后「完成后生成剪映草稿」被静默关闭
+    try {
+      return localStorage.getItem('lsc.wantAnalysisDraft') === '1'
+    } catch {
+      return false
+    }
+  })
   const [draftSessionStatus, setDraftSessionStatus] = useState<DraftSessionStatus>('idle')
   const draftSessionRef = useRef<AnalysisDraftSession>({
     wantDraft: false,
@@ -399,6 +408,8 @@ export default function Workbench() {
   const alignmentBackgroundRef = useRef(false)
   const alignmentWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const alignButtonRef = useRef<HTMLButtonElement | null>(null)
+  // 公共轴失效（预览重启/画质切换）后自动重新对齐的入口（由 timeline_invalidated 触发）
+  const autoRealignRef = useRef<() => void>(() => {})
   const loopRafRef = useRef<number | null>(null)
   const loopBoundsRef = useRef<{ in: number; out: number; common: boolean } | null>(null)
   // 长按刷新：由 RefreshButton 组件内部管理粒子动效
@@ -448,6 +459,8 @@ export default function Workbench() {
   /** 拖拽 scrub 中：冻结 windowStart，避免窗跟着播放头平移导致圆点「拖不动」 */
   const [timelineScrubbing, setTimelineScrubbing] = useState(false)
   const timelineScrubbingRef = useRef(false)
+  /** 收尾阶段只触发一次的后台复核对齐防抖（防止 effect 重跑重复复核） */
+  const finalizeRecheckRef = useRef(false)
   const [frozenWindowStart, setFrozenWindowStart] = useState<number | null>(null)
   const lastWindowStartRef = useRef(0)
   /** 时间线内容右沿（只增不减）：回看时不得随播放头收缩，否则光标会「钉」在缩短后的最右 */
@@ -482,12 +495,51 @@ export default function Workbench() {
   useEffect(() => {
     const unsubReady = on('timeline_ready', (data: { timeline?: typeof timelineContext }) => {
       if (data?.timeline) {
+        const prevCtx = useAppStore.getState().timelineContext
+        const prevTimelineId = prevCtx?.timeline_id ?? null
         setTimelineContext(data.timeline)
         setTimelineInvalidated(false)
         setCommonMarkIn(null)
         setCommonMarkOut(null)
         setRefiningClipId(null)
         setLocalDragMark(null)
+        // 后台重对齐会更换 TimelineContext：旧 AI 切片的 common_start/end 冻结在旧
+        // 上下文的 recording_to_common_delta 上。录制未变（recording_id 相同）时按新
+        // 上下文重算，否则时间线会把旧切片显示在漂移后的位置（对齐延迟再次放大）。
+        if (prevTimelineId) {
+          const st = useAppStore.getState()
+          const ctx = data.timeline
+          const needRecompute = st.clips.some(
+            c => c.is_ai_highlight && c.timeline_id === prevTimelineId,
+          )
+          if (needRecompute) {
+            const next = st.clips.map(c => {
+              if (!c.is_ai_highlight || c.timeline_id !== prevTimelineId) return c
+              if (!ctx || !c.room_id) return c
+              const snap = ctx.room_snapshots?.[c.room_id]
+              if (!snap) return c
+              // 录制重启/重连（recording_id 变化）后旧切片的录制标记属于旧文件，
+              // 禁止用新上下文重算公共轴，避免旧切片被错误摆放。
+              if (c.recording_id && snap.recording_id && c.recording_id !== snap.recording_id) {
+                return c
+              }
+              if (typeof c.start !== 'number' || typeof c.end !== 'number') return c
+              try {
+                const cs = recordingToCommon(ctx, c.room_id, c.start)
+                const ce = recordingToCommon(ctx, c.room_id, c.end)
+                if (c.common_start === cs && c.common_end === ce && c.timeline_id === ctx.timeline_id) {
+                  return c
+                }
+                return { ...c, common_start: cs, common_end: ce, timeline_id: ctx.timeline_id }
+              } catch {
+                return c
+              }
+            })
+            if (next.some((c, i) => c !== st.clips[i])) {
+              st.setClips(next)
+            }
+          }
+        }
       }
     })
     const unsubInvalid = on('timeline_invalidated', () => {
@@ -512,6 +564,11 @@ export default function Workbench() {
       }
       setRefiningClipId(null)
       setLocalDragMark(null)
+      // 持续分析运行中自动重新对齐，尽快恢复公共轴（预览重启/画质切换导致失效时，
+      // 等待新预览缓冲就绪再采集，避免 seek 打断）
+      setTimeout(() => {
+        autoRealignRef.current()
+      }, 1200)
       message.warning(
         '公共轴已失效，请重新对齐。各房间本地入出点仍保留；多房间精确切片需对齐后重标公共轴',
         5,
@@ -537,9 +594,12 @@ export default function Workbench() {
     const out: TimelineHighlightBand[] = []
     for (const c of clips) {
       if (!c.is_ai_highlight) continue
+      // 无公共轴（失效/未对齐）时 AI 切片不显示：其坐标（录制秒/旧公共轴）与
+      // 当前预览轴错位，点击回放必然 seek 出缓冲 → "时间线回放不能用"。
+      if (!commonMode || !timelineContext) continue
       let start = c.common_start ?? c.start
       let end = c.common_end ?? c.end
-      if (commonMode && timelineContext && c.room_id && c.common_start == null) {
+      if (c.room_id && c.common_start == null) {
         try {
           // AI 切片的 start/end 是录制文件时间轴（recording）
           start = recordingToCommon(timelineContext, c.room_id, c.start)
@@ -1194,8 +1254,16 @@ export default function Workbench() {
       const bufEnd = video.buffered.end(video.buffered.length - 1)
       if (t >= bufStart && t <= bufEnd) {
         try { video.currentTime = t } catch { /* seek 可能被浏览器拒绝 */ }
+      } else if (!quiet) {
+        // 非拖动回放（点击切片/标记/跳转）缓冲外：clamp 到最近可回放位置，
+        // 保证回放有响应；否则旧实现静默忽略 → "时间线回放不能用"。
+        const fallback = Math.max(bufStart, bufEnd - 0.5)
+        try { video.currentTime = fallback } catch { /* ignore */ }
+        console.info(
+          `[Workbench] seek ${t.toFixed(1)}s 超出缓冲 [${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}]，回退到 ${fallback.toFixed(1)}s`,
+        )
       }
-      // 缓冲外：只动时间线 UI，不把 video 拽回 live edge
+      // quiet（scrub 拖动中）缓冲外：只动时间线 UI，不把 video 拽回 live edge
     }
     // scrub 中不刷 WebSocket seek，松手后再同步
     if (!quiet) {
@@ -1215,6 +1283,21 @@ export default function Workbench() {
     }
     send('toggle_play_pause', { room_id: roomId })
   }, [send])
+
+  /** 浏览器原生全屏：对房间的 <video> 元素 requestFullscreen / exitFullscreen 切换 */
+  const handleBrowserFullscreen = useCallback((roomId: string) => {
+    const video = window.__msePlayers?.[roomId]?.player?.videoElement
+    if (!video) return
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {
+        console.warn('[Workbench] exitFullscreen failed', roomId)
+      })
+    } else if (typeof video.requestFullscreen === 'function') {
+      video.requestFullscreen().catch((err) => {
+        console.warn('[Workbench] requestFullscreen failed:', roomId, err)
+      })
+    }
+  }, [])
 
   // 时间线跳转（多选时按 content_offset 调整每房间 seek 位置）
   const resolveSeekTargets = useCallback((): Set<string> => {
@@ -2001,6 +2084,35 @@ export default function Workbench() {
     }
   }, [send])
 
+  // 公共轴失效后的自动重新对齐：持续分析运行中且所有目标房都在直播沿时，
+  // 静默重新采集音频对齐，尽快恢复公共轴（预览重启/画质切换会导致失效）。
+  useEffect(() => {
+    autoRealignRef.current = () => {
+      const ca = useAppStore.getState().continuousAnalysisStatus
+      if (!ca?.running) return
+      const targets = (ca.target_room_ids || []).filter(Boolean)
+      if (targets.length < 2) return
+      if (alignmentInFlightRef.current) return
+      const registry = window.__msePlayers
+      const allAtLiveEdge = targets.every(rid => {
+        const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
+        if (!video || video.buffered.length === 0) return false
+        const liveEdge = video.buffered.end(video.buffered.length - 1)
+        const room = useAppStore.getState().rooms.find(item => item.room_id === rid)
+        const allowedLag = Math.max(2.5, Math.abs(room?.content_offset ?? 0) + 1.5)
+        return liveEdge - video.currentTime <= allowedLag
+      })
+      if (!allAtLiveEdge) return
+      void (async () => {
+        const roomSet = new Set(targets)
+        const ready = await seekAlignmentRoomsToLive(roomSet)
+        if (ready) {
+          await captureAndSendAlignment(roomSet, true)
+        }
+      })()
+    }
+  }, [captureAndSendAlignment, seekAlignmentRoomsToLive])
+
   const handleAlignLive = useCallback(async () => {
     if (selectedRoomIds.size === 0) return
     if (alignmentInFlightRef.current) {
@@ -2065,10 +2177,10 @@ export default function Workbench() {
 
     const refreshAlignment = () => {
       if (alignmentInFlightRef.current) return
-      if (!document.hidden && document.hasFocus()) {
-        console.info('[Workbench] 跳过持续分析后台重对齐：窗口正在使用中')
-        return
-      }
+      // 不再要求窗口失焦：聚焦时也允许后台复核对齐。直播沿门槛（allAtLiveEdge）已
+      // 保证用户 DVR 回看/精修时自动跳过；音频采集为无声 AudioWorklet，不打扰观看。
+      // 旧逻辑仅在窗口隐藏/失焦时复核，实测多房间持续分析全程窗口聚焦 → 对齐漂移
+      // 从不对齐复核，副房 content_offset 长期过期，映射切片随时间再次错位。
       const registry = window.__msePlayers
       const allAtLiveEdge = targetRoomIds.every(rid => {
         const video = registry?.[rid]?.player?.videoElement as HTMLVideoElement | undefined
@@ -2093,9 +2205,18 @@ export default function Workbench() {
     }
 
     const interval = setInterval(refreshAlignment, 10 * 60 * 1000)
+    // 停录收尾（finalizing）时立即复核一次：尾部回合的副房映射使用最新偏移，
+    // 避免「最后几回合入列即错位」（用户收尾时通常正在窗口内操作，旧逻辑必跳过）。
+    if (continuousAnalysisStatus?.phase === 'finalizing' && !finalizeRecheckRef.current) {
+      finalizeRecheckRef.current = true
+      refreshAlignment()
+    } else if (continuousAnalysisStatus?.phase !== 'finalizing') {
+      finalizeRecheckRef.current = false
+    }
     return () => clearInterval(interval)
   }, [
     continuousAnalysisStatus?.running,
+    continuousAnalysisStatus?.phase,
     continuousAlignmentTargetKey,
     captureAndSendAlignment,
     seekAlignmentRoomsToLive,
@@ -2506,6 +2627,7 @@ export default function Workbench() {
     s.sawRunning = false
     s.autoFired = false
     s.lastError = undefined
+    s.rearmed = false
     s.status = 'armed'
     syncDraftSessionUi('armed')
   }, [wantAnalysisDraft, syncDraftSessionUi])
@@ -2535,10 +2657,18 @@ export default function Workbench() {
     if (reason === 'auto' && s.status !== 'armed' && s.status !== 'failed') return
     if (reason === 'auto' && s.autoFired && s.status !== 'failed') return
 
-    const sessionClips = useAppStore.getState().clips.filter(c =>
+    let sessionClips = useAppStore.getState().clips.filter(c =>
       (c.clip_id && s.clipKeys.has(c.clip_id))
       || (c.round_key && s.clipKeys.has(c.round_key)),
     )
+    // 会话补武装场景（应用重启后分析仍在运行）：clip_queued 不会重放，
+    // clipKeys 为空 → 按目标房回退收集当前已入列的切片。
+    if (sessionClips.length === 0 && s.clipKeys.size === 0
+      && s.rearmed && s.targetRoomIds.length > 0) {
+      sessionClips = useAppStore.getState().clips.filter(c =>
+        c.room_id != null && s.targetRoomIds.includes(c.room_id),
+      )
+    }
     if (sessionClips.length === 0) {
       message.info('无切片，跳过草稿')
       s.status = 'done'
@@ -3203,6 +3333,10 @@ export default function Workbench() {
         }
       }
       // 同 room_id+round_key 已存在则 update 边界/状态，不重复 add；upsert 不弹「新切片」
+      // 记录入列时的 timeline_id / recording_id：重对齐更换 TimelineContext 后，
+      // 旧切片据此判定能否按新上下文重算公共轴（录制未变才可重算）。
+      const ctxTimelineId = ctx?.timeline_id ?? data.timeline_id ?? undefined
+      const ctxRecordingId = ctx?.room_snapshots?.[data.room_id]?.recording_id ?? undefined
       if (data.round_key) {
         const existing = st.clips.find(
           c => c.room_id === data.room_id && c.round_key === data.round_key
@@ -3222,6 +3356,8 @@ export default function Workbench() {
                 label: data.label || c.label,
                 clip_id: data.clip_id || c.clip_id,
                 job_id: data.job_id || c.job_id,
+                timeline_id: ctxTimelineId || c.timeline_id,
+                recording_id: ctxRecordingId || c.recording_id,
               }
             }
             return c
@@ -3243,7 +3379,8 @@ export default function Workbench() {
           room_name: data.room_name,
           clip_id: data.clip_id,
           clip_snapshot_id: data.clip_snapshot_id,
-          timeline_id: data.timeline_id,
+          timeline_id: ctxTimelineId,
+          recording_id: ctxRecordingId,
           job_id: data.job_id,
           export_status: data.export_deferred ? 'pending' : 'queued',
           is_ai_highlight: true,
@@ -3267,7 +3404,8 @@ export default function Workbench() {
         room_name: data.room_name,
         clip_id: data.clip_id,
         clip_snapshot_id: data.clip_snapshot_id,
-        timeline_id: data.timeline_id,
+        timeline_id: ctxTimelineId,
+        recording_id: ctxRecordingId,
         job_id: data.job_id,
         export_status: data.export_deferred ? 'pending' : 'queued',
         is_ai_highlight: true,
@@ -3381,6 +3519,19 @@ export default function Workbench() {
       s.sawRunning = true
     }
 
+    // 会话未武装（如应用重启后分析仍在运行）：开关开着时按状态就地补武装，
+    // 保证收尾后仍能自动生成草稿；已武装则保持原路径。
+    if (wantAnalysisDraft && !s.wantDraft && s.status === 'idle' && !status.running
+      && (phase === 'idle' || phase === 'completed') && status.room_id) {
+      const targets = Array.isArray(status.target_room_ids) && status.target_room_ids.length > 0
+        ? status.target_room_ids
+        : [status.room_id]
+      armDraftSession(status.room_id, targets)
+      // 补武装发生在终态之后，sawRunning 不会再由 running 阶段置位，这里直接确认
+      s.sawRunning = true
+      s.rearmed = true
+    }
+
     if (!s.wantDraft || s.status !== 'armed' || s.autoFired) return
     if (!s.sawRunning) return
     if (status.running) return
@@ -3388,7 +3539,7 @@ export default function Workbench() {
 
     // autoFired 仅由 runAnalysisDraftIfNeeded 置位；此处预置会导致函数内立即 return
     void runAnalysisDraftIfNeeded('auto')
-  }, [continuousAnalysisStatus, runAnalysisDraftIfNeeded])
+  }, [continuousAnalysisStatus, runAnalysisDraftIfNeeded, wantAnalysisDraft, armDraftSession])
 
   // ── 导出文件操作 ──
   const handleOpenExportFolder = (outputPath: string) => {
@@ -4155,6 +4306,7 @@ export default function Workbench() {
                         onTogglePreview={handleTogglePreview}
                         onToggleMute={handleToggleMute}
                         onFullscreen={handleExpandRoom}
+                        onBrowserFullscreen={handleBrowserFullscreen}
                         onToggleMultiSelect={handleToggleMultiSelect}
                         expandedRoomId={expandedRoomId}
                         onCollapse={handleCollapse}
@@ -4478,7 +4630,14 @@ export default function Workbench() {
               <strong>完成后生成剪映草稿</strong>
               <Switch
                 checked={wantAnalysisDraft}
-                onChange={setWantAnalysisDraft}
+                onChange={(checked) => {
+                  setWantAnalysisDraft(checked)
+                  try {
+                    localStorage.setItem('lsc.wantAnalysisDraft', checked ? '1' : '0')
+                  } catch {
+                    /* localStorage 不可用时静默降级 */
+                  }
+                }}
                 disabled={continuousAnalyzing || continuousSubmitting}
               />
             </div>

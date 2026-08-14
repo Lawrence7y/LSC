@@ -80,6 +80,10 @@ def register_alignment_handlers(
         rooms_data = data.get('rooms', [])
         _align_log = logging.getLogger('lsc.align')
         _align_log.info("收到预览音频对齐请求: rooms=%d", len(rooms_data))
+        # 预览音频请求的接收时刻（单调时钟）：作为预览 PTS 轴 → 公共轴的锚点基准，
+        # 与前端 diagnostics.current_time（各房捕获结束时的 MSE currentTime）配合，
+        # 使 preview_to_common_delta 携带预览流 PTS 基座偏移（见 timeline_service）。
+        align_received_mono = time.monotonic()
         if len(rooms_data) < 2:
             _align_log.warning("预览音频对齐请求房间数不足: %d", len(rooms_data))
             return {'success': False, 'error': '至少需要 2 个房间'}
@@ -97,6 +101,7 @@ def register_alignment_handlers(
             # 解码 PCM 数据
             audio_map: dict[str, np.ndarray] = {}
             align_sample_rate: int | None = None
+            preview_cur_time: dict[str, float] = {}
             for rd in rooms_data:
                 room_id = rd.get('room_id', '')
                 sample_rate = int(rd.get('sample_rate', 16000))
@@ -116,6 +121,12 @@ def register_alignment_handlers(
                     diagnostics.get('sample_count'),
                     diagnostics.get('capture_reason'),
                 )
+                try:
+                    _pct = float(diagnostics.get('current_time'))
+                except (TypeError, ValueError):
+                    _pct = 0.0
+                if room_id and _pct > 0.0:
+                    preview_cur_time[room_id] = _pct
                 if not room_id or not pcm_b64:
                     _align_log.warning("预览音频对齐跳过: room_id=%s, 缺少数据", room_id)
                     continue
@@ -288,6 +299,7 @@ def register_alignment_handlers(
                         'preview_epoch_id': getattr(room, 'preview_epoch_id', '') or '',
                         'recording_id': getattr(room, 'recording_id', '') or '',
                         'media_start_mono': float(media_start or 0.0),
+                        'preview_current_time': preview_cur_time.get(rid, 0.0),
                     }
 
                 snapshots = build_room_snapshots_from_align(
@@ -296,6 +308,7 @@ def register_alignment_handlers(
                     scores=scores,
                     room_meta=room_meta,
                     confidence_threshold=_ALIGN_TRUST_THRESHOLD,
+                    align_mono=align_received_mono,
                 )
                 if len(snapshots) < 2:
                     _align_log.warning(

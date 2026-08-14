@@ -35,33 +35,80 @@ def build_room_snapshots_from_align(
     scores: dict[str, float],
     room_meta: dict[str, dict[str, Any]],
     confidence_threshold: float = _ALIGN_CONFIDENCE_THRESHOLD,
+    align_mono: float | None = None,
 ) -> dict[str, RoomTimeSnapshot]:
     """从对齐 offsets/scores 构建 RoomTimeSnapshot 映射。
 
     Delta 约定（锁定）::
 
-        preview_to_common_delta[room] = content_offset[room] - content_offset[reference]
-        recording_to_common_delta = media_start_mono + preview_to_common_delta
+        preview_to_common_delta[room] = (align_mono - origin_mono) - preview_current_time[room]
+                                          + content_offset[room] - content_offset[reference]
+        recording_to_common_delta = media_start_mono + content_offset[room] - content_offset[reference]
+                                      - origin_mono
+
+    其中 ``origin_mono`` = 各可信房间 ``media_start_mono`` 的最小值（最早录制起点，
+    公共轴零点）。``align_mono`` = 对齐请求接收时刻（单调时钟）。
+
+    设计要点：
+    - ``preview_current_time`` 是 MSE 预览流 currentTime，基座为流相关任意值
+      （常见 0 或流起始 PTS），与录制轴基座 ``media_start_mono`` 相差数百~数千秒；
+      不锚定时公共轴上「播放头（preview→common）」与「切片（recording→common）」
+      错位 ~media_start_mono 秒，时间线显示播放头与切片相距极远、点击切片 seek
+      到预览缓冲范围之外。
+    - 公共轴零点取最早录制起点而非对齐时刻：若录制早于对齐开始，对齐时刻之前的
+      内容仍落在正轴；且时间线最大值 = 会话时长，而不是 time.monotonic() 的
+      系统开机基座（Windows 下可达数小时，导致时间线默认最大值为“两个多小时”）。
+
+    仅当 ``align_mono`` 与 room_meta 内 ``preview_current_time`` 均可用时锚定；
+    否则退化为旧行为（仅相对偏移，供旧前端/旧数据兼容）。
 
     仅包含置信度 >= threshold 的房间。
     """
     ref_offset = float(offsets.get(reference_room_id, 0.0) or 0.0)
+
+    # 先收集锚点数据：所有可信房间的预览 PTS 与媒体起点
+    anchored_rooms: dict[str, tuple[float, float]] = {}  # room_id -> (pct, media_start)
+    for room_id, offset in offsets.items():
+        score = float(scores.get(room_id, 0.0) or 0.0)
+        if score < confidence_threshold:
+            continue
+        meta = room_meta.get(room_id) or {}
+        pct = meta.get("preview_current_time")
+        if align_mono is None or not isinstance(pct, (int, float)) or float(pct) <= 0:
+            continue
+        media_start = float(meta.get("media_start_mono", 0.0) or 0.0)
+        anchored_rooms[room_id] = (float(pct), media_start)
+    origin_mono = 0.0
+    if anchored_rooms:
+        valid_starts = [ms for _, ms in anchored_rooms.values() if ms > 0.0]
+        if valid_starts:
+            origin_mono = min(valid_starts)
+
     snapshots: dict[str, RoomTimeSnapshot] = {}
     for room_id, offset in offsets.items():
         score = float(scores.get(room_id, 0.0) or 0.0)
         if score < confidence_threshold:
             continue
         meta = room_meta.get(room_id) or {}
-        preview_delta = float(offset) - ref_offset
+        rel_delta = float(offset) - ref_offset
         media_start = float(meta.get("media_start_mono", 0.0) or 0.0)
+        preview_delta = rel_delta
+        rec_delta = media_start + rel_delta
+        anchored = room_id in anchored_rooms
+        if anchored:
+            pct, _ms = anchored_rooms[room_id]
+            preview_delta = (float(align_mono) - origin_mono - pct) + rel_delta
+            rec_delta = media_start + rel_delta - origin_mono
         snapshots[room_id] = RoomTimeSnapshot(
             room_id=room_id,
             preview_epoch_id=str(meta.get("preview_epoch_id", "") or ""),
             recording_id=str(meta.get("recording_id", "") or ""),
             preview_to_common_delta=preview_delta,
-            recording_to_common_delta=media_start + preview_delta,
+            recording_to_common_delta=rec_delta,
             align_confidence=score,
             media_start_mono=media_start,
+            preview_rel_delta=rel_delta,
+            origin_mono=origin_mono,
         )
     return snapshots
 
@@ -281,8 +328,17 @@ class TimelineService:
                     media_start = float(media_start_mono or 0.0)
                     if media_start > 0.0:
                         snap.media_start_mono = media_start
+                        # 只叠加房间相对偏移（preview_rel_delta）；若快照来自旧版本
+                        # （无该字段），回退到 preview_to_common_delta（旧版无锚点，
+                        # p2c 即相对偏移，回退等价）。锚点快照额外减去公共轴零点
+                        # origin_mono（最早录制起点），保持时间线从 0 起算会话时长。
+                        rel = (
+                            snap.preview_rel_delta
+                            if snap.preview_rel_delta is not None
+                            else snap.preview_to_common_delta
+                        )
                         snap.recording_to_common_delta = (
-                            media_start + snap.preview_to_common_delta
+                            media_start + rel - snap.origin_mono
                         )
                     ctx.clip_ready = all(
                         bool(item.recording_id) for item in ctx.room_snapshots.values()

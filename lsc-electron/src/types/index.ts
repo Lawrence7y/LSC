@@ -188,6 +188,8 @@ export interface ClipSegment {
   common_start?: number
   common_end?: number
   timeline_id?: string
+  /** 入列时所在 TimelineContext 的录制 ID（重对齐后用于校验旧切片可否重算公共轴） */
+  recording_id?: string
   clip_snapshot_id?: string
   highlight_reason?: string
   highlight_score?: number

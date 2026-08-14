@@ -13,6 +13,7 @@ import {
   SoundOutlined,
   MutedOutlined,
   FullscreenOutlined,
+  FullscreenExitOutlined,
   ShrinkOutlined,
 } from '@ant-design/icons'
 import { RoomSession } from '@/types'
@@ -113,6 +114,8 @@ interface RoomCardProps {
   onTogglePreview: (roomId: string, enabled: boolean) => void
   onToggleMute: (roomId: string) => void
   onFullscreen: (roomId: string) => void
+  /** 浏览器原生全屏（video.requestFullscreen / exitFullscreen）切换 */
+  onBrowserFullscreen?: (roomId: string) => void
   /** 点击 checkbox 切换多选状态（无需 Ctrl 键） */
   onToggleMultiSelect?: (roomId: string, e: React.MouseEvent) => void
   /** 当前区域放大的 roomId */
@@ -156,6 +159,7 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
   if (prev.onTogglePreview !== next.onTogglePreview) return false
   if (prev.onToggleMute !== next.onToggleMute) return false
   if (prev.onFullscreen !== next.onFullscreen) return false
+  if (prev.onBrowserFullscreen !== next.onBrowserFullscreen) return false
   if (prev.onToggleMultiSelect !== next.onToggleMultiSelect) return false
   if (prev.expandedRoomId !== next.expandedRoomId) return false
   if (prev.onCollapse !== next.onCollapse) return false
@@ -233,6 +237,7 @@ export const RoomCard = memo(function RoomCard({
   onTogglePreview,
   onToggleMute,
   onFullscreen,
+  onBrowserFullscreen,
   onToggleMultiSelect,
   expandedRoomId,
   onCollapse,
@@ -251,6 +256,9 @@ export const RoomCard = memo(function RoomCard({
   const tick = recordingTick
   const [disconnecting, setDisconnecting] = useState(false)
   const [localMuted, setLocalMuted] = useState(room.preview_muted)
+  const [localVolume, setLocalVolume] = useState(1.0)
+  const [volumeOpen, setVolumeOpen] = useState(false)
+  const [isBrowserFullscreen, setIsBrowserFullscreen] = useState(false)
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isExpanded = expandedRoomId === room.room_id
 
@@ -258,6 +266,24 @@ export const RoomCard = memo(function RoomCard({
   useEffect(() => {
     setLocalMuted(room.preview_muted)
   }, [room.preview_muted])
+
+  // 音量本地控制：初始化/跟随 video.volume（后端无音量接口，仅前端生效）
+  useEffect(() => {
+    const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
+    if (video && typeof video.volume === 'number') {
+      setLocalVolume(video.volume)
+    }
+  }, [room.room_id, room.preview_enabled])
+
+  // 浏览器全屏状态监听（video 元素全屏时图标切换为“退出全屏”）
+  useEffect(() => {
+    const onChange = () => {
+      const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
+      setIsBrowserFullscreen(Boolean(video && document.fullscreenElement === video))
+    }
+    document.addEventListener('fullscreenchange', onChange)
+    return () => document.removeEventListener('fullscreenchange', onChange)
+  }, [room.room_id])
 
   useEffect(() => {
     return () => {
@@ -425,21 +451,84 @@ export const RoomCard = memo(function RoomCard({
       ]}
     />
   )
+  /** 音量控制：点击切换静音；悬停向上弹出竖向音量滑条（仅前端本地生效） */
   const muteBtn = (
-    <Tooltip title={localMuted ? '取消静音' : '静音'}>
-      <Button
-        type="text"
-        size="small"
-        icon={localMuted ? <MutedOutlined /> : <SoundOutlined />}
-        style={overlayBtnStyle}
-        onClick={(e) => {
-          e.stopPropagation()
-          // 本地图标即时翻转；store/后端由 onToggleMute 乐观更新
-          setLocalMuted(!localMuted)
-          onToggleMute(room.room_id)
-        }}
-      />
-    </Tooltip>
+    <div
+      style={{ position: 'relative', display: 'flex', alignItems: 'center' }}
+      onMouseEnter={() => setVolumeOpen(true)}
+      onMouseLeave={() => setVolumeOpen(false)}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <Tooltip title={localMuted ? '取消静音' : '静音'}>
+        <Button
+          type="text"
+          size="small"
+          icon={localMuted ? <MutedOutlined /> : <SoundOutlined />}
+          style={overlayBtnStyle}
+          onClick={(e) => {
+            e.stopPropagation()
+            // 本地图标即时翻转；store/后端由 onToggleMute 乐观更新
+            setLocalMuted(!localMuted)
+            onToggleMute(room.room_id)
+          }}
+        />
+      </Tooltip>
+      {volumeOpen && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 'calc(100% + 8px)',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 5,
+            background: 'rgba(20, 22, 26, 0.92)',
+            backdropFilter: 'blur(10px)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 10,
+            padding: '8px 6px',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
+            zIndex: 30,
+          }}
+        >
+          <SoundOutlined style={{ color: 'var(--overlay-text, #f5f5f7)', fontSize: 12 }} />
+          {/* 竖向滑条：垂直方向调节音量 */}
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={Math.round(localVolume * 100)}
+            onChange={(e) => {
+              e.stopPropagation()
+              const v = Number(e.target.value) / 100
+              setLocalVolume(v)
+              const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
+              if (video) {
+                video.volume = v
+                if (localMuted) {
+                  video.muted = false
+                  setLocalMuted(false)
+                  if (room.preview_muted) onToggleMute(room.room_id)
+                }
+              }
+            }}
+            style={{
+              width: 4,
+              height: 84,
+              accentColor: 'var(--accent-primary, #4dc4bf)',
+              cursor: 'pointer',
+              writingMode: 'vertical-lr',
+              direction: 'rtl',
+            }}
+          />
+          <span style={{ color: 'var(--overlay-text, #f5f5f7)', fontSize: 11, minWidth: 30, textAlign: 'center', fontVariantNumeric: 'tabular-nums' }}>
+            {Math.round(localVolume * 100)}%
+          </span>
+        </div>
+      )}
+    </div>
   )
   const stopPreviewBtn = (
     <Tooltip title="取消预览">
@@ -851,8 +940,17 @@ export const RoomCard = memo(function RoomCard({
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                     {muteBtn}
-                    <Tooltip title="缩小">
+                    <Tooltip title="缩小（窗口播放）">
                       <Button type="text" size="small" icon={<ShrinkOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onCollapse?.(room.room_id) }} />
+                    </Tooltip>
+                    <Tooltip title={isBrowserFullscreen ? '退出全屏' : '全屏放大'}>
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={isBrowserFullscreen ? <FullscreenExitOutlined /> : <FullscreenOutlined />}
+                        style={overlayBtnStyle}
+                        onClick={(e) => { e.stopPropagation(); onBrowserFullscreen?.(room.room_id) }}
+                      />
                     </Tooltip>
                     {stopPreviewBtn}
                   </div>

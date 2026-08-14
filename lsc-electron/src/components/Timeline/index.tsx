@@ -683,10 +683,7 @@ export function Timeline({
                 statusLabel,
                 precisionLabel,
               ].filter(Boolean).join(' · ')
-              // 动态信息密度（P2: 色带动态信息密度）
-              const showLabel = width >= 4 && h.label
-              const showDuration = width >= 7
-              const showStatus = width >= 12
+              // 切片/高光条不渲染文字（纯色带），信息走 hover title
               // 样式类：audio_pending 使用橙色虚线，pending 使用蓝色虚线，confirmed 使用实色
               const highlightClass = isAudioPending ? 'lsc-timeline__highlight--audio-pending'
                 : isPending ? 'lsc-timeline__highlight--pending'
@@ -701,14 +698,7 @@ export function Timeline({
                     e.stopPropagation()
                     onHighlightClick?.(h)
                   }}
-                >
-                  {showLabel && (
-                    <span className="lsc-timeline__highlight-label">
-                      {h.label}{showDuration ? ` · ${formatTickTime(dur)}` : ''}
-                      {showStatus ? ` · ${statusLabel}` : ''}
-                    </span>
-                  )}
-                </div>
+                />
               )
             })}
 

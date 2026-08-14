@@ -27,16 +27,23 @@ def test_skip_sleep_has_ceiling() -> None:
 
 
 def test_continuous_alignment_has_safe_periodic_refresh_guard() -> None:
-    """持续分析须定期重对齐，且前台使用/DVR 回看时不得强制跳直播沿。"""
+    """持续分析须定期重对齐，且 DVR 回看时不得强制跳直播沿。
+
+    2026-08 修订：旧实现要求窗口隐藏/失焦才复核（document.hidden/hasFocus），
+    实测多房间持续分析全程窗口聚焦 → 复核永不触发 → content_offset 漂移长期
+    不过期。新契约：聚焦时也复核（音频采集为无声 AudioWorklet），只保留
+    「至少一路不在直播沿则跳过」门槛，并新增收尾(finalizing)一次性复核。
+    """
     source = (
         ROOT / "lsc-electron" / "src" / "pages" / "Workbench" / "index.tsx"
     ).read_text(encoding="utf-8")
 
     assert "10 * 60 * 1000" in source
-    assert "document.hidden" in source
-    assert "document.hasFocus()" in source
+    assert "document.hidden" not in source
     assert "seekAlignmentRoomsToLive(roomSet)" in source
     assert "Math.abs(room?.content_offset ?? 0) + 1.5" in source
+    assert "finalizeRecheckRef" in source
+    assert "phase === 'finalizing'" in source
 
 
 def test_continuous_analysis_requires_growing_recording_file_shape() -> None:
