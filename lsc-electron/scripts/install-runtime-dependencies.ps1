@@ -64,38 +64,75 @@ try {
 
     # rapidocr-onnxruntime 会拉取仅 CPU 的 onnxruntime。Windows 持续分析需要
     # DirectML，否则视觉分类器会退回 CPU 并在录制增长时不断超时。
-    $ErrorActionPreference = 'Continue'
-    Get-ChildItem -LiteralPath $packageDir -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Name -eq 'onnxruntime' -or
-            $_.Name -like 'onnxruntime-*.dist-info' -or
-            $_.Name -like 'onnxruntime_directml-*.dist-info'
-        } |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    & $UvExe pip install `
-        --system-certs `
-        --no-python-downloads `
-        --python $PythonExe `
-        --target $packageDir `
-        --upgrade `
-        --index-url $PipIndexUrl `
-        --reinstall-package onnxruntime-directml `
-        'onnxruntime-directml>=1.18,<2' 2>&1 | ForEach-Object {
-            $_ | Out-File -FilePath $logPath -Encoding utf8 -Append
-            Write-Host $_
+    # 新版 onnxruntime-directml（1.24.x）在部分旧环境 DLL 加载失败（缺系统
+    # DirectML 组件/VC++ 运行库较旧）→ 回退旧版 1.21.1 再校验；
+    # 仍失败则降级 CPU onnxruntime 并继续安装（分析降速但应用可用，不中止安装）。
+    $directmlOk = $false
+    foreach ($dmlSpec in @('onnxruntime-directml>=1.18,<2', 'onnxruntime-directml==1.21.1')) {
+        $ErrorActionPreference = 'Continue'
+        Get-ChildItem -LiteralPath $packageDir -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq 'onnxruntime' -or
+                $_.Name -like 'onnxruntime-*.dist-info' -or
+                $_.Name -like 'onnxruntime_directml-*.dist-info'
+            } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        "Installing DirectML: $dmlSpec" | Out-File -FilePath $logPath -Encoding utf8 -Append
+        & $UvExe pip install `
+            --system-certs `
+            --no-python-downloads `
+            --python $PythonExe `
+            --target $packageDir `
+            --upgrade `
+            --index-url $PipIndexUrl `
+            --reinstall-package onnxruntime-directml `
+            $dmlSpec 2>&1 | ForEach-Object {
+                $_ | Out-File -FilePath $logPath -Encoding utf8 -Append
+                Write-Host $_
+            }
+        $dmlExitCode = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        if ($dmlExitCode -ne 0) {
+            "uv install failed for $dmlSpec (exit $dmlExitCode), trying next..." | Out-File -FilePath $logPath -Encoding utf8 -Append
+            continue
         }
-    $directmlExitCode = $LASTEXITCODE
-    $ErrorActionPreference = 'Stop'
-    if ($directmlExitCode -ne 0) {
-        exit $directmlExitCode
+        $packageDirLiteral = $packageDir.Replace("'", "''")
+        $providerProbe = "import sys; sys.path.insert(0, r'$packageDirLiteral'); import onnxruntime as ort; providers=ort.get_available_providers(); print(providers); raise SystemExit(0 if 'DmlExecutionProvider' in providers or 'CUDAExecutionProvider' in providers else 42)"
+        $providerOutput = & $PythonExe -c $providerProbe 2>&1
+        $providerOutput | Out-File -FilePath $logPath -Encoding utf8 -Append
+        if ($LASTEXITCODE -eq 0) {
+            $directmlOk = $true
+            break
+        }
+        "DirectML probe failed for $dmlSpec, trying next..." | Out-File -FilePath $logPath -Encoding utf8 -Append
     }
-
-    $packageDirLiteral = $packageDir.Replace("'", "''")
-    $providerProbe = "import sys; sys.path.insert(0, r'$packageDirLiteral'); import onnxruntime as ort; providers=ort.get_available_providers(); print(providers); raise SystemExit(0 if 'DmlExecutionProvider' in providers or 'CUDAExecutionProvider' in providers else 42)"
-    $providerOutput = & $PythonExe -c $providerProbe 2>&1
-    $providerOutput | Out-File -FilePath $logPath -Encoding utf8 -Append
-    if ($LASTEXITCODE -ne 0) {
-        throw "GPU inference provider verification failed: $providerOutput"
+    if (-not $directmlOk) {
+        # 降级 CPU：恢复 CPU onnxruntime（rapidocr 可用），安装继续。
+        "WARNING: DirectML unavailable on this machine, falling back to CPU onnxruntime. AI analysis will run on CPU (slower)." | Out-File -FilePath $logPath -Encoding utf8 -Append
+        Write-Host "WARNING: DirectML unavailable, falling back to CPU onnxruntime..."
+        $ErrorActionPreference = 'Continue'
+        Get-ChildItem -LiteralPath $packageDir -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -eq 'onnxruntime' -or
+                $_.Name -like 'onnxruntime-*.dist-info' -or
+                $_.Name -like 'onnxruntime_directml-*.dist-info'
+            } |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        & $UvExe pip install `
+            --system-certs `
+            --no-python-downloads `
+            --python $PythonExe `
+            --target $packageDir `
+            --index-url $PipIndexUrl `
+            'onnxruntime>=1.18,<2' 2>&1 | ForEach-Object {
+                $_ | Out-File -FilePath $logPath -Encoding utf8 -Append
+                Write-Host $_
+            }
+        $cpuExitCode = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
+        if ($cpuExitCode -ne 0) {
+            exit $cpuExitCode
+        }
     }
 
     $ffmpegExe = Join-Path $ffmpegDir 'ffmpeg.exe'

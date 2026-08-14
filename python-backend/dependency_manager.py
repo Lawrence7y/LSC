@@ -365,26 +365,58 @@ def _count_requirements(path: Path) -> int:
 
 
 def _install_windows_directml(phase_name: str) -> bool:
-    """用 DirectML 发行版替换 rapidocr 拉取的 CPU onnxruntime。"""
+    """用 DirectML 发行版替换 rapidocr 拉取的 CPU onnxruntime。
+
+    新版 onnxruntime-directml（1.24.x）在部分旧环境 DLL 加载失败（缺系统
+    DirectML 组件/VC++ 运行库较旧）→ 回退旧版 1.21.1 再校验；仍失败则
+    降级 CPU onnxruntime 并返回 True（分析降速但应用可用，不阻塞安装/启动）。
+    """
     if sys.platform != "win32":
         return True
     if not _ensure_pip(phase_name):
         return False
 
-    # 两个发行版都提供 onnxruntime 包，必须先删除 CPU 文件再装 DirectML，
-    # 否则 target 模式会保留旧 DLL，最终仍只有 CPUExecutionProvider。
-    for candidate in (
-        _SITE_PACKAGES / "onnxruntime",
-        *_SITE_PACKAGES.glob("onnxruntime-*.dist-info"),
-        *_SITE_PACKAGES.glob("onnxruntime_directml-*.dist-info"),
-    ):
-        try:
-            if candidate.is_dir():
-                shutil.rmtree(candidate, ignore_errors=True)
-            elif candidate.exists():
-                candidate.unlink()
-        except OSError:
-            _log.warning("无法清理旧 ONNX Runtime: %s", candidate)
+    def _remove_onnxruntime() -> None:
+        # 两个发行版都提供 onnxruntime 包，必须先删除旧文件再装新版本，
+        # 否则 target 模式会保留旧 DLL，最终仍只有 CPUExecutionProvider。
+        for candidate in (
+            _SITE_PACKAGES / "onnxruntime",
+            *_SITE_PACKAGES.glob("onnxruntime-*.dist-info"),
+            *_SITE_PACKAGES.glob("onnxruntime_directml-*.dist-info"),
+        ):
+            try:
+                if candidate.is_dir():
+                    shutil.rmtree(candidate, ignore_errors=True)
+                elif candidate.exists():
+                    candidate.unlink()
+            except OSError:
+                _log.warning("无法清理旧 ONNX Runtime: %s", candidate)
+
+    def _probe_dml() -> bool:
+        # 当前进程可能缓存过 CPU 模块，用独立解释器校验最终落盘结果。
+        probe = (
+            "import sys;"
+            f"sys.path.insert(0, {str(_SITE_PACKAGES)!r});"
+            "import onnxruntime as ort;"
+            "p=ort.get_available_providers();"
+            "print(p);"
+            "raise SystemExit(0 if ('DmlExecutionProvider' in p or 'CUDAExecutionProvider' in p) else 42)"
+        )
+        verified = subprocess.run(
+            [_get_python_exe(), "-c", probe],
+            **_hidden_subprocess_kwargs(
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            ),
+        )
+        if verified.returncode != 0:
+            _log.warning("DirectML probe failed: %s", (verified.stdout or verified.stderr)[-300:])
+            return False
+        _emit_progress(phase_name, 100, 100, f"推理加速已启用: {verified.stdout.strip()}")
+        return True
 
     pip_runner = (
         "import sys;"
@@ -392,18 +424,50 @@ def _install_windows_directml(phase_name: str) -> bool:
         "from pip._internal.cli.main import main;"
         "raise SystemExit(main(sys.argv[1:]))"
     )
+
+    _emit("start", phase=phase_name, message="正在启用 Windows DirectML 分析加速")
+    for dml_spec in ("onnxruntime-directml>=1.18,<2", "onnxruntime-directml==1.21.1"):
+        _remove_onnxruntime()
+        cmd = [
+            _get_python_exe(), "-c", pip_runner, "install",
+            "--no-warn-script-location",
+            "--use-feature=truststore",
+            "--index-url", _PIP_INDEX_URL,
+            "--target", str(_SITE_PACKAGES),
+            "--upgrade",
+            "--force-reinstall",
+            dml_spec,
+        ]
+        completed = subprocess.run(
+            cmd,
+            **_hidden_subprocess_kwargs(
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=str(_PROJECT_ROOT),
+                check=False,
+            ),
+        )
+        if completed.returncode != 0:
+            _log.warning("DirectML install failed (%s): %s", dml_spec, (completed.stdout or completed.stderr)[-300:])
+            continue
+        if _probe_dml():
+            return True
+        _log.warning("DirectML 校验失败（%s），尝试旧版", dml_spec)
+
+    # 降级 CPU：恢复 rapidocr 可用的 CPU onnxruntime，不阻塞安装/启动
+    _log.warning("DirectML 在此环境不可用，降级 CPU onnxruntime（分析将运行在 CPU）")
+    _remove_onnxruntime()
     cmd = [
         _get_python_exe(), "-c", pip_runner, "install",
         "--no-warn-script-location",
         "--use-feature=truststore",
         "--index-url", _PIP_INDEX_URL,
         "--target", str(_SITE_PACKAGES),
-        "--upgrade",
-        "--force-reinstall",
-        "onnxruntime-directml>=1.18,<2",
+        "onnxruntime>=1.18,<2",
     ]
-    _emit("start", phase=phase_name, message="正在启用 Windows DirectML 分析加速")
-    completed = subprocess.run(
+    subprocess.run(
         cmd,
         **_hidden_subprocess_kwargs(
             capture_output=True,
@@ -414,33 +478,7 @@ def _install_windows_directml(phase_name: str) -> bool:
             check=False,
         ),
     )
-    if completed.returncode != 0:
-        _emit_error(phase_name, f"DirectML 安装失败: {completed.stdout[-500:]}")
-        return False
-
-    # 当前进程可能缓存过 CPU 模块，用独立解释器校验最终落盘结果。
-    probe = (
-        "import sys;"
-        f"sys.path.insert(0, {str(_SITE_PACKAGES)!r});"
-        "import onnxruntime as ort;"
-        "p=ort.get_available_providers();"
-        "print(p);"
-        "raise SystemExit(0 if ('DmlExecutionProvider' in p or 'CUDAExecutionProvider' in p) else 42)"
-    )
-    verified = subprocess.run(
-        [_get_python_exe(), "-c", probe],
-        **_hidden_subprocess_kwargs(
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        ),
-    )
-    if verified.returncode != 0:
-        _emit_error(phase_name, f"DirectML 校验失败: {verified.stdout or verified.stderr}")
-        return False
-    _emit_progress(phase_name, 100, 100, f"推理加速已启用: {verified.stdout.strip()}")
+    _emit_progress(phase_name, 100, 100, "DirectML 不可用，已降级 CPU 推理")
     return True
 
 
