@@ -762,7 +762,14 @@ class ClipExporter:
             return ExportResult(False, output_path, clip_index, safe_title,
                                 error="Output file not created")
 
-        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        try:
+            file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        except OSError as exc:
+            # isfile 与 getsize 之间存在删除竞态时不得抛裸异常：
+            # 异常会沿 ExportWorker.run 逃逸导致 on_done 永不触发（导出槽位挂死）
+            _cleanup_tmp(tmp_output_path)
+            return ExportResult(False, output_path, clip_index, safe_title,
+                                error=f"Output file vanished: {exc}")
 
         # FFmpeg 已按 -t 精确生成目标时长，此处不再同步调用 ffprobe。
         # 在虚拟机或系统高负载时，额外探测可能阻塞最长 10 秒，导致文件已经

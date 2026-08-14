@@ -43,6 +43,9 @@ _MIN_ROUND_SEC = 10.0        # 最短切片时长（过短视为假回合）
 _PREP_AFTER_RESULT_SEC = 6.0        # 结算后等待下回合准备的窗口（结算画面 5s 倒计时）
 _MIN_PREP_AFTER_COMBAT_SEC = 30.0   # 无结算信号时 prep 闭合所需最小交战时长
 _PREP_RUN_FRAMES = 4                # 无结算信号时 prep 连续帧数要求（防交战尾段误读）
+# 抽帧子窗口（秒）：持续分析追赶窗最大 480s @1fps ≈ 330MB 帧驻留（640×360×3 ≈ 0.66MB/帧）。
+# 拆成 ≤60s 子窗逐块扫描后峰值降到 ~40MB，跨窗状态经函数局部变量与 runtime_state 传递。
+_SUB_WINDOW_SEC = 60.0
 _MIDSTREAM_STREAK = 3        # 中段切入：连续 N 帧交战钟且递减才开局
 _MIDSTREAM_DECREASE_SEC = 1.0
 # 边界局部密扫：粗扫（1fps）定位候选后，±3s @10fps 精确定位转换首帧
@@ -652,19 +655,6 @@ def detect_valorant_rounds_ocr(
     # 采样间隔 → fps：ocr_sample_interval 秒抽一帧，下限 0.25fps（4s/帧）
     sample_fps = max(0.25, 1.0 / max(float(ocr_sample_interval), 0.1))
 
-    frames = extract_frames_cancellable(
-        video_path,
-        start_sec=scan_start,
-        end_sec=scan_end,
-        fps=sample_fps,
-        ffmpeg_path=ffmpeg_path,
-        cancel_check=cancel_check,
-        overlap_sec=2.0,
-    )
-    frames = [item for item in frames if item[0] > last_processed_ts + 0.001]
-    if not frames:
-        return []
-
     fsm = state.get("ocr_fsm")
     fsm = fsm.clone() if isinstance(fsm, OcrRoundFSM) else OcrRoundFSM()
     # 信号持久化（相近相似原则的载体）
@@ -687,180 +677,210 @@ def detect_valorant_rounds_ocr(
     labels: list[tuple[float, str, float | None, bool]] = []
     closed_rounds: list[dict[str, Any]] = []
 
-    for _, (ts, img) in enumerate(frames):
-        if cancel_check and cancel_check():
-            raise FFmpegCancelled("cancelled during ocr scan")
-        raw_timer, left, right = _read_top_anchors(img)
-        prep_banner, end_banner = _read_center_banner(img)
-
-        # ── 计时器可信度（相近相似原则） ──
-        timer = raw_timer
-        extrapolated: float | None = None
-        if last_timer is not None and last_timer_ts > 0:
-            extrapolated = float(last_timer) - (ts - last_timer_ts)
-            if extrapolated <= 0.0:
-                extrapolated = None
-        # 冻结读数：锚点解除后读数几乎不变 → 回放/非实时画面残留，
-        # 不得建立锚点、不得判准备（回放画面冻结的 90s+ 钟会误开假回合）
-        frozen = (
-            anchor is None
-            and raw_timer is not None
-            and last_raw_timer is not None
-            and last_raw_ts > 0
-            and ts - last_raw_ts > 2.5
-            and abs(float(raw_timer) - float(last_raw_timer)) < 0.5
+    # 子窗口分块扫描：整窗抽帧会把追赶窗（最长 480s @1fps ≈ 330MB）帧全部驻留
+    # 内存。按 _SUB_WINDOW_SEC 分块逐窗抽帧 + OCR，峰值降到 ~40MB；
+    # 跨窗状态由本函数局部变量（anchor/streak 等）与 runtime_state 承载。
+    # 相邻窗 overlap_sec=2s 的重叠帧由 last_processed_ts 过滤（与增量语义一致）。
+    sub_start = scan_start
+    total_frames = 0
+    any_frames = False
+    while sub_start < scan_end:
+        sub_end = min(scan_end, sub_start + _SUB_WINDOW_SEC)
+        frames = extract_frames_cancellable(
+            video_path,
+            start_sec=sub_start,
+            end_sec=sub_end,
+            fps=sample_fps,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            overlap_sec=2.0,
         )
-        if raw_timer is not None and not frozen:
-            if _is_combat_timer(raw_timer):
-                # anchor 建立/刷新需连续 2 帧原始交战钟读数（单帧误读不得开局）
-                combat_raw_streak += 1
-                if combat_raw_streak >= 2:
-                    if post_settle_hold:
-                        # 结算后残余倒计时不得重建锚点；仅满钟原始读数开新回合
-                        if float(raw_timer) >= _NEW_ROUND_CLOCK_MIN:
-                            post_settle_hold = False
-                            anchor = (float(raw_timer), ts)
-                    else:
-                        anchor = (float(raw_timer), ts)
-            else:
-                combat_raw_streak = 0
-                if (
-                    anchor is not None
-                    and extrapolated is not None
-                    and float(raw_timer) < float(extrapolated) - _OCR_TIMER_JUMP_TOL_SEC
-                ):
-                    # 明显跳变重置（远小于外推轨迹）：回合结束，解除锚点
-                    anchor = None
-            # 跳向更大值且偏差超容差 → 误读丢弃
-            if (
-                extrapolated is not None
-                and float(raw_timer) > float(extrapolated) + _OCR_TIMER_JUMP_TOL_SEC
-            ):
-                timer = None
-            else:
-                last_timer = float(raw_timer)
-                last_timer_ts = ts
-            last_raw_timer = float(raw_timer)
-            last_raw_ts = ts
-        else:
-            if raw_timer is None:
-                combat_raw_streak = 0
-            if extrapolated is not None:
-                timer = extrapolated  # 外推 1:1 走秒
-            else:
-                timer = None
+        frames = [item for item in frames if item[0] > last_processed_ts + 0.001]
+        if not frames:
+            sub_start = sub_end
+            continue
+        any_frames = True
+        total_frames += len(frames)
+        for _, (ts, img) in enumerate(frames):
+            if cancel_check and cancel_check():
+                raise FFmpegCancelled("cancelled during ocr scan")
+            raw_timer, left, right = _read_top_anchors(img)
+            prep_banner, end_banner = _read_center_banner(img)
 
-        # 锚点 stale：长时间读不到计时器，外推不再可信
-        if anchor is not None:
-            anchor_timer, anchor_ts = anchor
-            if (last_timer_ts > 0 and ts - last_timer_ts > _OCR_TIMER_STALE_SEC) or (
-                anchor_timer - (ts - anchor_ts) <= 0.0
-            ):
-                anchor = None
-
-        # 两帧确认：timer 相位需要连续 2 帧一致读数（递减轨迹中 val 每帧更新）
-        timer_phase: str | None = None
-        if timer is not None and not frozen:
-            new_val = float(timer)
-            if timer_streak_val is not None and abs(new_val - timer_streak_val) <= 1.0:
-                timer_streak += 1
-                timer_streak_val = new_val
-            else:
-                timer_streak = 1
-                timer_streak_val = new_val
-            if timer_streak >= 2:
-                if _is_combat_timer(new_val):
-                    timer_phase = "combat"
-                elif _is_prep_timer(new_val):
-                    timer_phase = "prep"
-        else:
-            timer_streak = 0
-            timer_streak_val = None
-
-        # 比分两帧确认 → 结算信号（变化帧建立 pending，下一帧同值才确认）
-        score_confirmed = False
-        if left is not None and right is not None:
-            if score_pending is not None:
-                if (left, right) == score_pending:
-                    score_confirmed = True
-                    score_pending = None
-                else:
-                    # 读数变化/回落 → 上一帧是误读，清除待确认
-                    score_pending = None
-            elif (prev_left, prev_right) != (left, right):
-                score_pending = (left, right)
-        elif score_pending is not None and (left is not None or right is not None):
-            score_pending = None
-        if left is not None:
-            prev_left = left
-        if right is not None:
-            prev_right = right
-
-        # ── 相位判定：锚点存活 = 交战延续（交战是唯一确定相位） ──
-        # 结算信号（比分两帧确认/结算横幅）优先于锚点：提前团灭时钟未走完，
-        # 结算画面仍须解除锚点进入结算，否则回合被压到锚点归零才结束。
-        timer_raw = raw_timer is not None
-        if end_banner or score_confirmed:
-            anchor = None
-            combat_raw_streak = 0
-            post_settle_hold = True
-            post_settle_gap = False
-            label = "settle"
-        elif post_settle_hold:
-            # 结算后残余倒计时会从 50 连降到 ≤45，不得当成买枪准备（否则出点
-            # 提前切到非交战段）。须：准备横幅 / 满钟 / 钟走完空档后再见 prep·combat。
-            if prep_banner:
-                post_settle_hold = False
-                post_settle_gap = False
-                label = "prep"
-            elif (
-                timer_raw
+            # ── 计时器可信度（相近相似原则） ──
+            timer = raw_timer
+            extrapolated: float | None = None
+            if last_timer is not None and last_timer_ts > 0:
+                extrapolated = float(last_timer) - (ts - last_timer_ts)
+                if extrapolated <= 0.0:
+                    extrapolated = None
+            # 冻结读数：锚点解除后读数几乎不变 → 回放/非实时画面残留，
+            # 不得建立锚点、不得判准备（回放画面冻结的 90s+ 钟会误开假回合）
+            frozen = (
+                anchor is None
                 and raw_timer is not None
-                and float(raw_timer) >= _NEW_ROUND_CLOCK_MIN
-            ):
-                post_settle_hold = False
+                and last_raw_timer is not None
+                and last_raw_ts > 0
+                and ts - last_raw_ts > 2.5
+                and abs(float(raw_timer) - float(last_raw_timer)) < 0.5
+            )
+            if raw_timer is not None and not frozen:
+                if _is_combat_timer(raw_timer):
+                    # anchor 建立/刷新需连续 2 帧原始交战钟读数（单帧误读不得开局）
+                    combat_raw_streak += 1
+                    if combat_raw_streak >= 2:
+                        if post_settle_hold:
+                            # 结算后残余倒计时不得重建锚点；仅满钟原始读数开新回合
+                            if float(raw_timer) >= _NEW_ROUND_CLOCK_MIN:
+                                post_settle_hold = False
+                                anchor = (float(raw_timer), ts)
+                        else:
+                            anchor = (float(raw_timer), ts)
+                else:
+                    combat_raw_streak = 0
+                    if (
+                        anchor is not None
+                        and extrapolated is not None
+                        and float(raw_timer) < float(extrapolated) - _OCR_TIMER_JUMP_TOL_SEC
+                    ):
+                        # 明显跳变重置（远小于外推轨迹）：回合结束，解除锚点
+                        anchor = None
+                # 跳向更大值且偏差超容差 → 误读丢弃
+                if (
+                    extrapolated is not None
+                    and float(raw_timer) > float(extrapolated) + _OCR_TIMER_JUMP_TOL_SEC
+                ):
+                    timer = None
+                else:
+                    last_timer = float(raw_timer)
+                    last_timer_ts = ts
+                last_raw_timer = float(raw_timer)
+                last_raw_ts = ts
+            else:
+                if raw_timer is None:
+                    combat_raw_streak = 0
+                if extrapolated is not None:
+                    timer = extrapolated  # 外推 1:1 走秒
+                else:
+                    timer = None
+
+            # 锚点 stale：长时间读不到计时器，外推不再可信
+            if anchor is not None:
+                anchor_timer, anchor_ts = anchor
+                if (last_timer_ts > 0 and ts - last_timer_ts > _OCR_TIMER_STALE_SEC) or (
+                    anchor_timer - (ts - anchor_ts) <= 0.0
+                ):
+                    anchor = None
+
+            # 两帧确认：timer 相位需要连续 2 帧一致读数（递减轨迹中 val 每帧更新）
+            timer_phase: str | None = None
+            if timer is not None and not frozen:
+                new_val = float(timer)
+                if timer_streak_val is not None and abs(new_val - timer_streak_val) <= 1.0:
+                    timer_streak += 1
+                    timer_streak_val = new_val
+                else:
+                    timer_streak = 1
+                    timer_streak_val = new_val
+                if timer_streak >= 2:
+                    if _is_combat_timer(new_val):
+                        timer_phase = "combat"
+                    elif _is_prep_timer(new_val):
+                        timer_phase = "prep"
+            else:
+                timer_streak = 0
+                timer_streak_val = None
+
+            # 比分两帧确认 → 结算信号（变化帧建立 pending，下一帧同值才确认）
+            score_confirmed = False
+            if left is not None and right is not None:
+                if score_pending is not None:
+                    if (left, right) == score_pending:
+                        score_confirmed = True
+                        score_pending = None
+                    else:
+                        # 读数变化/回落 → 上一帧是误读，清除待确认
+                        score_pending = None
+                elif (prev_left, prev_right) != (left, right):
+                    score_pending = (left, right)
+            elif score_pending is not None and (left is not None or right is not None):
+                score_pending = None
+            if left is not None:
+                prev_left = left
+            if right is not None:
+                prev_right = right
+
+            # ── 相位判定：锚点存活 = 交战延续（交战是唯一确定相位） ──
+            # 结算信号（比分两帧确认/结算横幅）优先于锚点：提前团灭时钟未走完，
+            # 结算画面仍须解除锚点进入结算，否则回合被压到锚点归零才结束。
+            timer_raw = raw_timer is not None
+            if end_banner or score_confirmed:
+                anchor = None
+                combat_raw_streak = 0
+                post_settle_hold = True
                 post_settle_gap = False
+                label = "settle"
+            elif post_settle_hold:
+                # 结算后残余倒计时会从 50 连降到 ≤45，不得当成买枪准备（否则出点
+                # 提前切到非交战段）。须：准备横幅 / 满钟 / 钟走完空档后再见 prep·combat。
+                if prep_banner:
+                    post_settle_hold = False
+                    post_settle_gap = False
+                    label = "prep"
+                elif (
+                    timer_raw
+                    and raw_timer is not None
+                    and float(raw_timer) >= _NEW_ROUND_CLOCK_MIN
+                ):
+                    post_settle_hold = False
+                    post_settle_gap = False
+                    label = "combat"
+                elif (
+                    raw_timer is None
+                    or (raw_timer is not None and float(raw_timer) <= 1.0)
+                ):
+                    # 只用原始读数判空档：结算后 HUD 消失时外推钟仍会走秒，
+                    # 不得把外推当成「残余倒计时还在」，否则永远等不到买枪准备。
+                    post_settle_gap = True
+                    label = "neutral"
+                elif post_settle_gap and timer_phase == "prep":
+                    post_settle_hold = False
+                    post_settle_gap = False
+                    label = "prep"
+                elif post_settle_gap and timer_raw and raw_timer is not None and _is_combat_timer(
+                    raw_timer
+                ):
+                    post_settle_hold = False
+                    post_settle_gap = False
+                    label = "combat"
+                else:
+                    label = "neutral"
+            elif anchor is not None:
                 label = "combat"
-            elif (
-                raw_timer is None
-                or (raw_timer is not None and float(raw_timer) <= 1.0)
-            ):
-                # 只用原始读数判空档：结算后 HUD 消失时外推钟仍会走秒，
-                # 不得把外推当成「残余倒计时还在」，否则永远等不到买枪准备。
-                post_settle_gap = True
-                label = "neutral"
-            elif post_settle_gap and timer_phase == "prep":
-                post_settle_hold = False
-                post_settle_gap = False
+            elif prep_banner:
                 label = "prep"
-            elif post_settle_gap and timer_raw and raw_timer is not None and _is_combat_timer(
-                raw_timer
-            ):
-                post_settle_hold = False
-                post_settle_gap = False
-                label = "combat"
+            elif timer_phase is not None:
+                label = timer_phase
             else:
                 label = "neutral"
-        elif anchor is not None:
-            label = "combat"
-        elif prep_banner:
-            label = "prep"
-        elif timer_phase is not None:
-            label = timer_phase
-        else:
-            label = "neutral"
-        labels.append((ts, label, timer, timer_raw))
+            labels.append((ts, label, timer, timer_raw))
 
-        _log.debug(
-            "ocr_label ts=%.1f label=%s timer=%s raw=%s anchor=%s hold=%s gap=%s",
-            ts,
-            label,
-            f"{timer:.0f}" if timer else None,
-            f"{raw_timer:.0f}" if raw_timer else None,
-            f"{anchor[0]:.0f}@{anchor[1]:.1f}" if anchor else None,
-            post_settle_hold,
-            post_settle_gap,
-        )
+            _log.debug(
+                "ocr_label ts=%.1f label=%s timer=%s raw=%s anchor=%s hold=%s gap=%s",
+                ts,
+                label,
+                f"{timer:.0f}" if timer else None,
+                f"{raw_timer:.0f}" if raw_timer else None,
+                f"{anchor[0]:.0f}@{anchor[1]:.1f}" if anchor else None,
+                post_settle_hold,
+                post_settle_gap,
+            )
+
+            last_processed_ts = max(last_processed_ts, float(frames[-1][0]))
+        sub_start = sub_end
+
+    if not any_frames:
+        return []
 
     # 循环先验平滑（帧级，仅删孤立 combat 噪点，不补缝——非游戏阶段透明）
     smoothed = _apply_phase_cycle_prior([label for _, label, _, _ in labels])
@@ -917,14 +937,14 @@ def detect_valorant_rounds_ocr(
     state["prev_right"] = prev_right
     state["timer_streak"] = timer_streak
     state["timer_streak_val"] = timer_streak_val
-    state["last_processed_ts"] = max(last_processed_ts, float(frames[-1][0]))
+    state["last_processed_ts"] = last_processed_ts
 
     for r in closed_rounds:
         if source_profile:
             r["source_profile"] = source_profile
 
     _log.info("OCR 回合检测: %d 回合, %d 帧 (range=%.1f-%.1f, refine=%s)",
-              len(closed_rounds), len(frames), scan_start, scan_end, refine_boundaries)
+              len(closed_rounds), total_frames, scan_start, scan_end, refine_boundaries)
     return closed_rounds
 
 

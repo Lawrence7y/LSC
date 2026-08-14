@@ -24,6 +24,7 @@ except ImportError:
         return logging.getLogger(name)
 
 from lsc.config import is_platform_pipeline_component_enabled, load_config
+from lsc.exporter.clip import ExportResult
 from lsc.platforms.registry import detect_platform, parse_stream, select_quality
 from lsc.recorder.capture import validate_recording
 from lsc.utils.process_launcher import hidden_run_kwargs
@@ -107,10 +108,19 @@ class ExportWorker(QThread):
                   "on_process": self._on_process}
         if self._profile is not None:
             kwargs["profile"] = self._profile
-        result = self._exporter.export_clip(
-            self._video_path, self._start, self._end, self._output_dir,
-            **kwargs,
-        )
+        try:
+            result = self._exporter.export_clip(
+                self._video_path, self._start, self._end, self._output_dir,
+                **kwargs,
+            )
+        except Exception as exc:
+            # 导出实现抛异常（如输出文件竞态删除导致 OSError）时绝不能静默：
+            # on_done 若不调用，handler 的 done_event.wait() 会永久挂起并占死导出槽位
+            _log.exception("export_clip raised (will report as failure): %s", exc)
+            result = ExportResult(
+                False, "", "", "",
+                error=f"导出异常：{exc}", file_size_mb=0.0, thumbnail_path="",
+            )
         # 如果被取消，覆盖错误信息以让前端识别为取消
         if self._cancelled and not result.success:
             import dataclasses

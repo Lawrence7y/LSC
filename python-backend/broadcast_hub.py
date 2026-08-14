@@ -157,7 +157,14 @@ class BroadcastHub:
                 survivors.append(item)
 
         for item in survivors:
-            self._broadcast_queue.put_nowait(item)
+            try:
+                self._broadcast_queue.put_nowait(item)
+            except queue.Full:
+                # 排空→重放窗口内其他生产者并发填回了队列：
+                # 放不下的幸存者直接丢弃并记日志，绝不能让异常沿
+                # queue_broadcast 逃逸杀死调用线程（executor 线程会直接死亡）。
+                _log.warning("broadcast queue refill race, dropping survivor: type=%s", item.get('type'))
+                break
 
         try:
             self._broadcast_queue.put_nowait(msg)

@@ -273,6 +273,8 @@ export class WebSocketClient {
           console.log('WebSocket disconnected')
           this.isConnected = false
           this.pendingConnect = null
+          // 断连期间停止心跳检测，避免旧 interval 在断连 15s 后误报 backend_crashed
+          this._stopHeartbeatCheck()
           this.emit('disconnected', null)
           // 手动关闭时不重连
           if (!this.manualClose) {
@@ -325,6 +327,9 @@ export class WebSocketClient {
 
   // P3-2: 后端心跳检测
   private _startHeartbeatCheck(): void {
+    // 先停旧 interval：每次重连成功都会调用本方法，直接覆盖引用会泄漏
+    // 旧 interval（断连→重连循环后累积多个 5s 定时器，且断连期间会重复 emit）
+    this._stopHeartbeatCheck()
     this.lastHeartbeat = Date.now()
     this.heartbeatCheckTimer = setInterval(() => {
       if (Date.now() - this.lastHeartbeat > 15000) {

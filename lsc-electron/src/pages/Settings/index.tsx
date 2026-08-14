@@ -279,6 +279,7 @@ export default function Settings() {
   useEffect(() => {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+      if (savedFlashTimerRef.current) clearTimeout(savedFlashTimerRef.current)
       if (depCheckTimerRef.current) clearTimeout(depCheckTimerRef.current)
     }
   }, [])
@@ -931,7 +932,7 @@ export default function Settings() {
                     <span style={{ fontSize: 12, color: 'var(--brand-400)', fontWeight: 500 }}>
                       发现新版本 v{updateStatus.version}
                     </span>
-                    {updateStatus.message && (
+                    {updateStatus.releaseNotes && (
                       <span style={{
                         fontSize: 11,
                         color: 'var(--text-400)',
@@ -940,7 +941,7 @@ export default function Settings() {
                         wordBreak: 'break-word',
                         lineHeight: 1.5,
                       }}>
-                        {String(updateStatus.message).slice(0, 120)}{String(updateStatus.message).length > 120 ? '...' : ''}
+                        {String(updateStatus.releaseNotes).slice(0, 120)}{String(updateStatus.releaseNotes).length > 120 ? '...' : ''}
                       </span>
                     )}
                     <Button

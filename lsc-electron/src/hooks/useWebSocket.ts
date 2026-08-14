@@ -129,6 +129,9 @@ const _mseWatchdogLastRecovery: Record<string, number> = {}
 const _mseWatchdogFailCount: Record<string, number> = {}
 const _MSE_WATCHDOG_TIMEOUT_MS = 10000
 const _MSE_WATCHDOG_RECOVERY_COOLDOWN_MS = 15000
+// 断流恢复尝试硬上限：连续超过该次数仍无分片则停止自动恢复并置 error 态，
+// 防止挂机时对死流房间每 15s 无限重发 enable_preview（后端反复启停 FFmpeg）
+const _MSE_WATCHDOG_MAX_FAILS = 3
 let _mseWatchdogTimer: ReturnType<typeof setInterval> | null = null
 
 /** 断连时写操作被丢弃的用户可见提示（useWebSocket.send 统一弹出） */
@@ -688,7 +691,20 @@ function _attachSharedWebSocketHandlers(): () => void {
       _mseWatchdogFailCount[r.room_id] = fails
       console.warn(`[WS] Stall detected for room ${r.room_id} (${(stall / 1000).toFixed(1)}s), recovering preview...`)
 
-      if (fails >= 2) {
+      if (fails >= _MSE_WATCHDOG_MAX_FAILS) {
+        // 恢复尝试耗尽：停止自动恢复，置 error 态提示用户手动处理。
+        // phase 变更为 error 后本 watchdog 会跳过该房间（非 streaming），不再触发。
+        console.warn(`[WS] Preview stall recovery exhausted for room ${r.room_id} (${fails}/${_MSE_WATCHDOG_MAX_FAILS}), disabling auto-recovery`)
+        message.warning({ content: '预览持续中断，请手动重新开启预览', key: `mse-stall-${r.room_id}`, duration: 5 })
+        useAppStore.getState().updateRoom(r.room_id, {
+          preview_phase: 'error' as const,
+          mse_error: '预览持续中断，请手动重新开启预览',
+        })
+        // 清理 watchdog 记录，用户手动重开后重新计数
+        _lastMseSegmentTimePerRoom.delete(r.room_id)
+        delete _mseWatchdogLastRecovery[r.room_id]
+        delete _mseWatchdogFailCount[r.room_id]
+      } else if (fails >= 2) {
         message.warning({ content: '预览恢复中', key: `mse-stall-${r.room_id}`, duration: 3 })
         wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
       } else if (_mseInitCache[r.room_id]) {

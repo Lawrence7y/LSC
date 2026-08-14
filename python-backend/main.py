@@ -286,8 +286,25 @@ class LSCWebSocketBackend:
                     clients = list(self.server.clients)
                     if not clients:
                         continue
+
+                    async def _send_with_timeout(client, payload: str) -> bool:
+                        """带超时发送：慢客户端/半开连接不得阻塞整个广播队列。
+
+                        与 server.py broadcast 的 1s 超时 + 剔除策略保持一致。
+                        """
+                        try:
+                            await asyncio.wait_for(client.send(payload), timeout=1.0)
+                            return True
+                        except Exception as exc:
+                            self.server.clients.discard(client)
+                            _log.warning(
+                                "Removed slow WebSocket client (broadcast coroutine): %s",
+                                type(exc).__name__,
+                            )
+                            return False
+
                     await asyncio.gather(
-                        *[client.send(data) for client in clients],
+                        *[_send_with_timeout(c, data) for c in clients],
                         return_exceptions=True,
                     )
             except Exception:

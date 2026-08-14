@@ -59,6 +59,8 @@ def test_recording_stopped_offline_emit_in_manager() -> None:
     marker = "reconnect stopped because stream is offline"
     idx = source.find(marker)
     assert idx != -1
-    chunk = source[idx:idx + 400]
-    assert 'bus.emit("recording_stopped"' in chunk
+    chunk = source[idx:idx + 500]
+    # 后台落地段经 self.submit(self.bus.emit, ...) 回投编排线程，同步路径直接 emit
+    assert "bus.emit" in chunk
+    assert "recording_stopped" in chunk
     assert "'offline'" in chunk or '"offline"' in chunk

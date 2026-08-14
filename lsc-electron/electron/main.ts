@@ -47,6 +47,40 @@ function _rotateLogFile(logFile: string): void {
   }
 }
 
+// backend-stdout.log 专用轮转：该文件由常驻 WriteStream 持续写入，
+// 直接 rename 后流仍指向旧文件（Windows 共享删除语义），导致新文件永不增长、
+// 旧文件无限膨胀。必须先关流 → 轮转 → 重新打开。
+let _backendStdoutWriteCount = 0
+
+function _rotateBackendStdoutLog(): void {
+  try {
+    const logPath = getBackendLogPath()
+    if (!fs.existsSync(logPath)) return
+    const stats = fs.statSync(logPath)
+    if (stats.size < _MAX_LOG_SIZE) return
+    if (backendLogStream) {
+      try { backendLogStream.end() } catch { /* ignore */ }
+      backendLogStream = null
+    }
+    for (let i = _MAX_LOG_BACKUPS; i >= 1; i--) {
+      const oldPath = `${logPath}.${i}`
+      const newPath = `${logPath}.${i + 1}`
+      if (i === _MAX_LOG_BACKUPS) {
+        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath)
+      } else {
+        if (fs.existsSync(oldPath)) fs.renameSync(oldPath, newPath)
+      }
+    }
+    fs.renameSync(logPath, `${logPath}.1`)
+    backendLogStream = fs.createWriteStream(logPath, { flags: 'a' })
+    backendLogStream.on('error', () => {
+      backendLogStream = null
+    })
+  } catch {
+    // 轮转失败不应影响后端启动与日志写入
+  }
+}
+
 function _scheduleLogFlush(logFile: string): void {
   if (_logFlushTimer) return
   _logFlushTimer = setTimeout(() => {
@@ -262,6 +296,11 @@ function cleanupLegacyOrphanBackendsOnce(): void {
 function writeLog(line: string): void {
   try {
     backendLogStream?.write(line)
+    // backend-stdout.log 永不轮转会无限增长（挂机数天可达数百 MB）：
+    // 按写入次数节流检查大小并轮转（每次 stat 太频繁，500 次写 ≈ 数百 KB）
+    if (++_backendStdoutWriteCount % 500 === 0) {
+      _rotateBackendStdoutLog()
+    }
   } catch (err) {
     // 使用 console.error 避免递归调用 writeLog
     console.error('[writeLog] 日志写入失败:', err)

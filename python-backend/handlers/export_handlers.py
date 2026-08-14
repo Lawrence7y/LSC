@@ -365,7 +365,22 @@ async def _process_export_job_impl(job):
             'room_id': room_id, 'job_id': job_id, 'error': result['error'] or '导出启动失败',
         })
 
-    await done_event.wait()
+    # 兜底超时：on_done 理论上必被调用（ExportWorker.run 已保证 finally 语义），
+    # 但任何意外路径都不得让 worker 在 semaphore 槽位内永久挂起——
+    # 2 次卡死即占满全部导出槽位，其余导出全部永久失败。
+    try:
+        await asyncio.wait_for(done_event.wait(), timeout=6 * 3600)
+    except asyncio.TimeoutError:
+        _log.error(
+            "导出任务超时放弃: room=%s, job=%s（6h 无完成回调）",
+            room_id, job_id,
+        )
+        with _export_jobs_lock:
+            export_jobs.pop(job_id, None)
+        _set_export_job_state(job_id, 'failed', room_id=room_id, label=label, error='导出超时（6 小时无完成回调）')
+        await server.broadcast('clip_failed', {
+            'room_id': room_id, 'job_id': job_id, 'error': '导出超时（6 小时无完成回调）',
+        })
 
 
 def _get_export_preset(preset_id: str, load_settings) -> dict[str, Any] | None:

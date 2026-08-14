@@ -155,7 +155,9 @@ export class MsePlayer {
     this._liveEdgeAligned = false
     this._lastStallTime = 0
     this._lastStallPosition = 0
+    this._lastBufferEnd = 0
     this._lastBufferEndTime = 0
+    this._isTrimming = false
     this._stallRecoveryCount = 0
     this._playExhausted = false
     this._forcedSeekRecoveryCount = 0

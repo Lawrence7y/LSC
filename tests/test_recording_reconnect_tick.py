@@ -40,7 +40,8 @@ def test_global_tick_runs_due_recording_reconnect(monkeypatch, tmp_path) -> None
             self.start_calls += 1
             return True, str(tmp_path / "new.mp4"), encoder, ""
 
-    # Reconnect now runs on the orchestrator thread (no extra worker Thread).
+    # Reconnect landing (stop → refresh → restart) now runs in the worker
+    # pool so the orchestrator thread is never blocked by 10-20s URL refresh.
     monkeypatch.setattr("lsc.gui.multi_room.manager.MultiRoomManager.save_rooms", lambda self: 0)
     monkeypatch.setattr("lsc.core.orchestrator.RoomOrchestrator.save_rooms", lambda self: 0)
 
@@ -61,6 +62,13 @@ def test_global_tick_runs_due_recording_reconnect(monkeypatch, tmp_path) -> None
     manager._tick_counter = manager_module._MEDIUM_FREQ_INTERVAL - 1
 
     manager._on_global_tick()
+
+    # 落地段异步执行：轮询等待 worker 完成（最长 5s）
+    deadline = manager_module._time.monotonic() + 5.0
+    while manager_module._time.monotonic() < deadline:
+        if room.controller.stop_calls >= 1 and room.controller.start_calls >= 1:
+            break
+        manager_module._time.sleep(0.02)
 
     assert room.controller.watchdog_calls == 0
     assert room.controller.stop_calls == 1

@@ -18,6 +18,7 @@ import { RoomCard } from './components/RoomCard'
 import { ControlBar } from './components/ControlBar'
 import { ClipList, getClipStableId, type ExportProgressInfo } from './components/ClipList'
 import { RefreshButton } from './components/RefreshButton'
+import { Onboarding } from './components/Onboarding'
 import { ClipSegment, ContinuousAnalysisStatus, TimelineHighlightBand, JianyingDraftResult } from '@/types'
 import { EXPORT_PRESETS, getDefaultPreset } from '@/services/exportPresets'
 import { formatTime } from '@/utils/time'
@@ -422,6 +423,26 @@ export default function Workbench() {
   const lastPositionsSetStateAtRef = useRef(0)
   /** 用户拖拽/步进后的 UI 播放头；超出 MSE 缓冲时仍保持，避免被拽回直播沿 */
   const scrubOverrideRef = useRef<Record<string, number>>({})
+  // 房间移除时清理播放头快照键：ref 与 state 均以 room_id 为键，
+  // 长期添加/删除房间会残留陈旧键（rAF 热路径展开成本线性增长）
+  useEffect(() => {
+    const roomIds = new Set(rooms.map(r => r.room_id))
+    for (const rid of Object.keys(lastPreviewPositionsRef.current)) {
+      if (!roomIds.has(rid)) delete lastPreviewPositionsRef.current[rid]
+    }
+    for (const rid of Object.keys(scrubOverrideRef.current)) {
+      if (!roomIds.has(rid)) delete scrubOverrideRef.current[rid]
+    }
+    setPreviewPositions(prev => {
+      let changed = false
+      const next: Record<string, number> = {}
+      for (const [rid, v] of Object.entries(prev)) {
+        if (roomIds.has(rid)) next[rid] = v
+        else changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [rooms])
   /** 跟随直播沿：窗口贴右、播放头可顶在最右；用户 scrub 后关闭，点「直播」恢复 */
   const [timelineFollowLive, setTimelineFollowLive] = useState(true)
   /** 拖拽 scrub 中：冻结 windowStart，避免窗跟着播放头平移导致圆点「拖不动」 */
@@ -1988,9 +2009,13 @@ export default function Workbench() {
     }
     // 一键对齐
     const registry = window.__msePlayers
-    if (!registry) return
+    if (!registry) {
+      console.warn('[Workbench] 一键对齐被拦截：window.__msePlayers 注册表不存在')
+      return
+    }
 
     if (selectedRoomIds.size < 2) {
+      console.warn('[Workbench] 一键对齐被拦截：选中房间 < 2，仅同步预览进度', [...selectedRoomIds])
       message.info('已同步预览进度（单房间无需音频对齐）')
       return
     }
@@ -2008,6 +2033,7 @@ export default function Workbench() {
         const room = rooms.find((r) => r.room_id === rid)
         return room?.streamer || room?.title || rid.slice(0, 8)
       })
+      console.warn('[Workbench] 一键对齐被拦截：以下房间无预览 <video>', missingPreview, names)
       message.warning(
         `未精确对齐：以下房间未开预览（需先点预览出画面）：${names.join('、')}`,
         6,
@@ -2018,6 +2044,7 @@ export default function Workbench() {
     // Phase 1: 各房间独立跳到自己的直播沿。禁止共用 currentTime 绝对值。
     const anyBuffered = await seekAlignmentRoomsToLive(new Set(selectedRoomIds))
     if (!anyBuffered && selectedRoomIds.size >= 2) {
+      console.warn('[Workbench] 一键对齐被拦截：所有选中房间预览均无缓冲（buffered.length === 0）')
       message.warning('未精确对齐：预览缓冲未就绪，请等画面开始播放后再试')
       return
     }
@@ -3830,6 +3857,8 @@ export default function Workbench() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+      {/* 首次使用引导（localStorage 记忆，完成后不再弹出） */}
+      <Onboarding />
       {/* WebSocket 连接状态提示（防抖：仅在断开超过 2 秒后显示） */}
       {showDisconnectAlert && (
         <Alert

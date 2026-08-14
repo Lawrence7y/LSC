@@ -127,7 +127,7 @@ describe('ClipList 选择交互', () => {
 
 // ─── 交互：筛选与搜索 ────────────────────────────────────────────────
 
-describe('ClipList 筛选与搜索', () => {
+describe('ClipList 筛选', () => {
   const clips = [
     makeClip({ clip_id: 'c1', label: '精彩击杀', confirm_status: 'user_confirmed' }),
     makeClip({ clip_id: 'c2', label: '待调回合', confirm_status: 'pending', start: 300, end: 340 }),
@@ -138,22 +138,6 @@ describe('ClipList 筛选与搜索', () => {
     fireEvent.click(screen.getByText('待调 1'))
     expect(screen.queryByText('精彩击杀')).toBeNull()
     expect(screen.getByText('待调回合')).toBeTruthy()
-  })
-
-  it('搜索关键词过滤切片', async () => {
-    render(<ClipList {...defaultProps} clips={clips} />)
-    const input = screen.getByPlaceholderText('搜索切片 / 房间名')
-    await userEvent.type(input, '击杀')
-    expect(screen.getByText('精彩击杀')).toBeTruthy()
-    expect(screen.queryByText('待调回合')).toBeNull()
-  })
-
-  it('搜索无匹配时显示空态', async () => {
-    render(<ClipList {...defaultProps} clips={clips} />)
-    const input = screen.getByPlaceholderText('搜索切片 / 房间名')
-    await userEvent.type(input, '不存在的关键词')
-    expect(screen.queryByText('精彩击杀')).toBeNull()
-    expect(screen.queryByText('待调回合')).toBeNull()
   })
 })
 

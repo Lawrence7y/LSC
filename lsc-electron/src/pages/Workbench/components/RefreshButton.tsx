@@ -240,6 +240,9 @@ export const RefreshButton = memo(function RefreshButton({
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const shatterPolygonRef = useRef<string>('inset(0)')
   const shatterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 长按已触发标记：粒子动画结束后 phaseRef 复位，但本次按压尚未松手，
+  // 用该标记吞掉后续 mouseup/mouseleave，防止长按后松手误触发短按。
+  const longPressFiredRef = useRef(false)
   const mountedRef = useRef(true)
 
   // Inject CSS once
@@ -252,11 +255,13 @@ export const RefreshButton = memo(function RefreshButton({
   }, [])
 
   // ── Cleanup timers ──
+  // ⚠️ 不要清理 shatterTimerRef：粒子动画的清理定时器属于「已触发」展示阶段。
+  // 若被 mouseup/mouseleave 清掉，shatter 粒子将永不消失，且 phaseRef 卡在
+  // 'triggered'，后续所有 mousedown 都会被拦截（按钮「失灵」）。
   const cleanupTimers = useCallback(() => {
     if (progressTimerRef.current) { clearTimeout(progressTimerRef.current); progressTimerRef.current = null }
     if (spawnTimerRef.current) { clearTimeout(spawnTimerRef.current); spawnTimerRef.current = null }
     if (flashTimerRef.current) { clearTimeout(flashTimerRef.current); flashTimerRef.current = null }
-    if (shatterTimerRef.current) { clearTimeout(shatterTimerRef.current); shatterTimerRef.current = null }
   }, [])
 
   // ── Trigger shatter (solid blue → particles fly outward) ──
@@ -303,6 +308,7 @@ export const RefreshButton = memo(function RefreshButton({
     if (disabled) return
     if (phaseRef.current !== 'idle') return
 
+    longPressFiredRef.current = false // 新一轮按压开始，重置长按标记
     phaseRef.current = 'triggered' // prevent double entry
     fillProgressRef.current = 0
     setFillProgress(0)
@@ -330,6 +336,7 @@ export const RefreshButton = memo(function RefreshButton({
         if (!mountedRef.current) return
         setShowFlash(false)
         setEnteringParticles([])
+        longPressFiredRef.current = true
         triggerShatter()
         onLongPress()
       }, 200)
@@ -373,6 +380,13 @@ export const RefreshButton = memo(function RefreshButton({
       return
     }
 
+    if (longPressFiredRef.current) {
+      // 长按已触发（粒子动画结束、phaseRef 已复位），本次按压的松手
+      // 只负责结束按压，不得再触发短按
+      longPressFiredRef.current = false
+      return
+    }
+
     // Short click: shatter + callback
     const progress = fillProgressRef.current
     if (progress > 0) {
@@ -391,6 +405,12 @@ export const RefreshButton = memo(function RefreshButton({
 
     if (phaseRef.current === 'triggered' && fillProgressRef.current >= 100) {
       // Long press already handled
+      return
+    }
+
+    if (longPressFiredRef.current) {
+      // 长按已触发，鼠标移出只结束按压，不触发短按
+      longPressFiredRef.current = false
       return
     }
 
@@ -416,7 +436,11 @@ export const RefreshButton = memo(function RefreshButton({
   }, [disabled, onShortClick])
 
   // ── Unmount cleanup ──
-  useEffect(() => () => cleanupTimers(), [cleanupTimers])
+  // 卸载时需完整清理（含 shatter 粒子动画定时器，防止卸载后 setState）
+  useEffect(() => () => {
+    cleanupTimers()
+    if (shatterTimerRef.current) { clearTimeout(shatterTimerRef.current); shatterTimerRef.current = null }
+  }, [cleanupTimers])
 
   // ── Determine button text color based on fill depth ──
   const textColor = fillProgress > 55 ? 'var(--overlay-text, #f5f5f7)' : undefined

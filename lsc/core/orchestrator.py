@@ -796,7 +796,7 @@ class RoomOrchestrator:
             try:
                 item = self._cmd_queue.get(timeout=timeout)
             except queue.Empty:
-                self._on_deadlines()
+                self._safe_on_deadlines()
                 continue
             if item is None:
                 break
@@ -807,7 +807,19 @@ class RoomOrchestrator:
                     item()
                 except Exception:
                     _log.exception("orchestrator command failed")
+            self._safe_on_deadlines()
+
+    def _safe_on_deadlines(self) -> None:
+        """执行到期 tick，任何异常都不得杀死编排线程。
+
+        编排线程死亡 = 全部房间的录制/预览/重连/磁盘守卫整体冻结且无法自动恢复。
+        单房 controller tick 已有内部兜底，这里再包一层防御全局 tick
+        （文件竞态 OSError、lease 刷新异常等）不预期的异常。
+        """
+        try:
             self._on_deadlines()
+        except Exception:
+            _log.exception("orchestrator global tick crashed, continuing")
 
     def _compute_wait_timeout(self) -> float | None:
         now = time.monotonic()
@@ -1931,15 +1943,21 @@ class RoomOrchestrator:
         widget.play_live(stream_url)
         widget.set_muted(room.preview_muted)
 
-    def refresh_stream_url(self, room_id: str, *, force: bool = False) -> bool:
+    def refresh_stream_url(self, room_id: str, *, force: bool = False,
+                           _run_in_background: bool = False) -> bool:
         """Re-parse the stream to get a fresh CDN URL. Returns True on success.
 
         Args:
             force: If True, bypass the 30s parse cache and force a fresh
                    HTTP request. Used by MSE reconnect to avoid getting
                    a cached (possibly expired) stream URL.
+            _run_in_background: 允许在后台线程直接执行（跳过 call 回编守卫），
+                   与 start_recording 的 _run_in_background 语义一致——录制重连
+                   落地段在 worker 池执行时 URL 刷新（10s+ 网络/探测）不能再
+                   排队回编排线程阻塞全局 tick。
         """
-        if self._thread is not None and threading.current_thread() is not self._thread:
+        if (self._thread is not None and threading.current_thread() is not self._thread
+                and not _run_in_background):
             return self.call(lambda: type(self).refresh_stream_url(self, room_id=room_id, force=force))
         room = self.get_room(room_id)
         if room is None:
@@ -3440,7 +3458,8 @@ class RoomOrchestrator:
             return True
         return bool(error and is_recoverable_error(error))
 
-    def _recover_shared_upstream_in_place(self, room: RoomSession) -> bool:
+    def _recover_shared_upstream_in_place(self, room: RoomSession, *,
+                                          _run_in_background: bool = False) -> bool:
         """Replace a dead remote upstream while keeping the recording sink and clock."""
         registry = get_shared_ingest_registry()
         ingest = registry.get(room.room_id)
@@ -3485,7 +3504,8 @@ class RoomOrchestrator:
         if not stream_url:
             room.stream_parsed_at = 0.0
             try:
-                if not self.refresh_stream_url(room.room_id, force=True):
+                if not self.refresh_stream_url(room.room_id, force=True,
+                                               _run_in_background=_run_in_background):
                     return False
             except Exception as exc:
                 _log.warning(
@@ -3537,7 +3557,8 @@ class RoomOrchestrator:
         )
         return not str(error or "")
 
-    def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str) -> None:
+    def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str,
+                                     *, _background: bool = False) -> bool:
         """Attempt to reconnect a failed recording with exponential backoff.
 
         The reconnection strategy is:
@@ -3551,12 +3572,23 @@ class RoomOrchestrator:
         4. On each attempt, stop the failed FFmpeg process, optionally
            flag the old file as corrupt (if < 1KB), re-parse the CDN URL,
            and call ``start_recording`` with the saved parameters.
+
+        Args:
+            _background: True 时落地段（原地恢复→stop→刷新→重启录制）整体提交到
+                worker 池执行——URL 刷新与 FFmpeg 首帧探测可达 10-20s，不能再
+                在编排线程同步跑（全局 tick 冻结、orchestrator.call 批量超时）。
+                ``_reconnect_in_progress`` 由落地段结束时复位。
+
+        Returns:
+            True 表示已进入落地段（后台模式为已调度，落地完成时自复位
+            ``_reconnect_in_progress``）；False 表示提前返回（未进入落地段，
+            调用方须立即复位 ``_reconnect_in_progress``）。
         """
         from lsc.utils.error_messages import is_recoverable_error
 
         # 用户已断开/删除房间，取消重连
         if room._cancel_reconnect.is_set():
-            return
+            return False
 
         # Check if error is recoverable
         if not is_recoverable_error(error_msg):
@@ -3585,7 +3617,7 @@ class RoomOrchestrator:
                         controller.stop_recording()
                     except Exception as exc:
                         _log.warning("Reconnect stop failed (non-recoverable) room=%s: %s", room.room_id, exc)
-                return
+                return False
 
         if room.reconnect_attempts >= _MAX_RECONNECT_ATTEMPTS:
             room.last_error = error_msg
@@ -3603,7 +3635,7 @@ class RoomOrchestrator:
             if room.preview_enabled:
                 self.stop_preview(room.room_id)
                 _log.info("Room %s preview stopped after reconnect exhausted", room.room_id)
-            return
+            return False
 
         # Calculate exponential backoff delay
         delay = min(
@@ -3617,14 +3649,14 @@ class RoomOrchestrator:
             room.last_error = f"{error_msg}，{delay:.0f}秒后尝试恢复..."
             _log.info("Room %s scheduling reconnect attempt %d/%d (delay=%.1fs)",
                       room.room_id, room.reconnect_attempts + 1, _MAX_RECONNECT_ATTEMPTS, delay)
-            return
+            return False
 
         if _time.monotonic() < room.reconnect_next_attempt_at:
-            return
+            return False
 
         # 用户已断开/删除房间，取消重连
         if room._cancel_reconnect.is_set():
-            return
+            return False
 
         room.reconnect_attempts += 1
         room.reconnect_next_attempt_at = 0.0
@@ -3632,116 +3664,153 @@ class RoomOrchestrator:
                   room.room_id, room.reconnect_attempts, _MAX_RECONNECT_ATTEMPTS)
         room.last_error = f"正在尝试恢复录制 ({room.reconnect_attempts}/{_MAX_RECONNECT_ATTEMPTS})..."
 
-        if self._recover_shared_upstream_in_place(room):
-            _log.info("Room %s recovered shared upstream without resetting recording", room.room_id)
-            room.reconnect_attempts = 0
-            room.reconnect_next_attempt_at = 0.0
-            room.is_reconnecting = False
-            room.last_error = ""
-            return
-
-        # 保存原始错误信息和旧文件路径
-        original_error = error_msg
-        old_output_path = room.record_output_path
-
-        # Stop the failed recording gracefully
-        # ponytail: shared ingest 走快速路径，避免 stop_recording_sink 先重启为 preview-only 再被 start_recording 杀死的双重重启
-        registry = get_shared_ingest_registry()
-        shared_ingest = registry.get(room.room_id)
-        if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
-            lookup_supervisor = getattr(registry, "get_supervisor_if_exists", None)
-            supervisor = (
-                lookup_supervisor(room.room_id)
-                if callable(lookup_supervisor)
-                else None
+        if _background:
+            # 落地段（原地恢复 → stop → 刷新 → 重启录制）整体在 worker 池执行，
+            # 不在编排线程同步跑。落地段结束时自行复位 _reconnect_in_progress。
+            room_id = room.room_id
+            err = error_msg
+            self._submit_worker(
+                lambda: self._run_reconnect_landing(room, err, background=True)
             )
-            if supervisor is not None:
-                # V2 recovery is sink-scoped: recording may restart while
-                # an attached preview keeps consuming the same upstream.
-                supervisor.stop_recording("reconnect fast path")
-                if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
+            return True
+
+        self._run_reconnect_landing(room, error_msg, background=False)
+        return True
+
+    def _run_reconnect_landing(self, room: RoomSession, error_msg: str, *,
+                               background: bool) -> None:
+        """重连落地段：原地恢复优先，否则停止旧 FFmpeg → 刷新流 → 重启录制。
+
+        Args:
+            background: True 时本方法运行在 worker 池线程。内部所有耗时调用
+                （refresh_stream_url / start_recording）必须传
+                ``_run_in_background=True`` 跳过 call 回编守卫，否则会排队回
+                编排线程造成同样的全局冻结。结束时复位 ``_reconnect_in_progress``
+                （同步模式由 _start_supervised_recovery 的 finally 管理）。
+        """
+        try:
+            if self._recover_shared_upstream_in_place(room, _run_in_background=background):
+                _log.info("Room %s recovered shared upstream without resetting recording", room.room_id)
+                room.reconnect_attempts = 0
+                room.reconnect_next_attempt_at = 0.0
+                room.is_reconnecting = False
+                room.last_error = ""
+                return
+
+            # 保存原始错误信息和旧文件路径
+            original_error = error_msg
+            old_output_path = room.record_output_path
+
+            # Stop the failed recording gracefully
+            # ponytail: shared ingest 走快速路径，避免 stop_recording_sink 先重启为 preview-only 再被 start_recording 杀死的双重重启
+            registry = get_shared_ingest_registry()
+            shared_ingest = registry.get(room.room_id)
+            if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
+                lookup_supervisor = getattr(registry, "get_supervisor_if_exists", None)
+                supervisor = (
+                    lookup_supervisor(room.room_id)
+                    if callable(lookup_supervisor)
+                    else None
+                )
+                if supervisor is not None:
+                    # V2 recovery is sink-scoped: recording may restart while
+                    # an attached preview keeps consuming the same upstream.
+                    supervisor.stop_recording("reconnect fast path")
+                    if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
+                        registry.stop_room(room.room_id, reason="reconnect fast path")
+                else:
+                    shared_ingest.stop(reason="reconnect fast path")
                     registry.stop_room(room.room_id, reason="reconnect fast path")
             else:
-                shared_ingest.stop(reason="reconnect fast path")
-                registry.stop_room(room.room_id, reason="reconnect fast path")
-        else:
-            controller = room.controller
-            if controller is not None:
+                controller = room.controller
+                if controller is not None:
+                    try:
+                        controller.stop_recording()
+                    except Exception as exc:
+                        _log.warning("Reconnect attempt stop failed room=%s: %s", room.room_id, exc)
+            room.is_recording = False
+
+            # 标记旧文件可能损坏（如果存在且大小异常小）
+            if old_output_path and os.path.isfile(old_output_path):
                 try:
-                    controller.stop_recording()
-                except Exception as exc:
-                    _log.warning("Reconnect attempt stop failed room=%s: %s", room.room_id, exc)
-        room.is_recording = False
+                    file_size = os.path.getsize(old_output_path)
+                    if file_size < 1024:  # 小于 1KB 可能是损坏的
+                        _log.warning("Room %s old recording file may be corrupted: %s (%d bytes)",
+                                     room.room_id, old_output_path, file_size)
+                except OSError:
+                    pass
 
-        # 标记旧文件可能损坏（如果存在且大小异常小）
-        if old_output_path and os.path.isfile(old_output_path):
-            try:
-                file_size = os.path.getsize(old_output_path)
-                if file_size < 1024:  # 小于 1KB 可能是损坏的
-                    _log.warning("Room %s old recording file may be corrupted: %s (%d bytes)",
-                                 room.room_id, old_output_path, file_size)
-            except OSError:
-                pass
-
-        # Re-parse the stream URL and restart recording
-        if not room.reconnect_output_dir:
-            room.last_error = f"恢复失败：缺少录制参数（原始错误: {original_error}）"
-            return
-
-        # CDN 地址失效后必须强制刷新，禁止复用 120s 内的死链缓存
-        room.stream_parsed_at = 0.0
-        try:
-            if not self.refresh_stream_url(room.room_id, force=True):
-                _log.warning(
-                    "Room %s reconnect URL refresh failed, start_recording will retry parse",
-                    room.room_id,
-                )
-        except Exception as exc:
-            _log.warning("Room %s reconnect URL refresh error: %s", room.room_id, exc)
-
-        ok = self.start_recording(
-            room.room_id,
-            room.reconnect_output_dir,
-            room.reconnect_encoder,
-            room.reconnect_crf,
-            param_mode=room.reconnect_param_mode,
-            bitrate=room.reconnect_bitrate,
-            bitrate_unit=room.reconnect_bitrate_unit,
-            resolution=room.reconnect_resolution or None,
-            framerate=room.reconnect_framerate or None,
-            audio_bitrate=room.reconnect_audio_bitrate or None,
-        )
-        if ok:
-            _log.info("Room %s reconnect succeeded", room.room_id)
-            room.reconnect_attempts = 0
-            room.reconnect_next_attempt_at = 0.0
-            room.is_reconnecting = False
-        else:
-            if _is_stream_offline_error(room.last_error):
-                room.is_recording = False
-                room.is_reconnecting = False
-                room.record_started_at = None
-                room.reconnect_next_attempt_at = 0.0
-                offline_msg = room.last_error or _offline_stream_error_message()
-                _log.info("Room %s reconnect stopped because stream is offline: %s",
-                          room.room_id, offline_msg)
-                try:
-                    self.bus.emit("recording_stopped", room.room_id, 'offline', offline_msg)
-                except Exception as exc:
-                    _log.debug("recording_stopped emit failed: %s", exc)
+            # Re-parse the stream URL and restart recording
+            if not room.reconnect_output_dir:
+                room.last_error = f"恢复失败：缺少录制参数（原始错误: {original_error}）"
                 return
-            _log.warning("Room %s reconnect attempt %d failed: %s",
-                         room.room_id, room.reconnect_attempts, room.last_error)
-            # 保留原始错误信息
-            if not room.last_error or room.last_error == "录制启动失败":
-                room.last_error = f"恢复失败（原始错误: {original_error}）"
-            # Calculate next delay with exponential backoff
-            next_delay = min(
-                _RECONNECT_DELAY_SEC * (_RECONNECT_BACKOFF_FACTOR ** room.reconnect_attempts),
-                _RECONNECT_MAX_DELAY_SEC,
+
+            # CDN 地址失效后必须强制刷新，禁止复用 120s 内的死链缓存
+            room.stream_parsed_at = 0.0
+            try:
+                if not self.refresh_stream_url(room.room_id, force=True, _run_in_background=True):
+                    _log.warning(
+                        "Room %s reconnect URL refresh failed, start_recording will retry parse",
+                        room.room_id,
+                    )
+            except Exception as exc:
+                _log.warning("Room %s reconnect URL refresh error: %s", room.room_id, exc)
+
+            ok = self.start_recording(
+                room.room_id,
+                room.reconnect_output_dir,
+                room.reconnect_encoder,
+                room.reconnect_crf,
+                param_mode=room.reconnect_param_mode,
+                bitrate=room.reconnect_bitrate,
+                bitrate_unit=room.reconnect_bitrate_unit,
+                resolution=room.reconnect_resolution or None,
+                framerate=room.reconnect_framerate or None,
+                audio_bitrate=room.reconnect_audio_bitrate or None,
+                _run_in_background=True,
             )
-            room.reconnect_next_attempt_at = _time.monotonic() + next_delay
-            room.is_reconnecting = True
+            if ok:
+                _log.info("Room %s reconnect succeeded", room.room_id)
+                room.reconnect_attempts = 0
+                room.reconnect_next_attempt_at = 0.0
+                room.is_reconnecting = False
+            else:
+                if _is_stream_offline_error(room.last_error):
+                    room.is_recording = False
+                    room.is_reconnecting = False
+                    room.record_started_at = None
+                    room.reconnect_next_attempt_at = 0.0
+                    offline_msg = room.last_error or _offline_stream_error_message()
+                    _log.info("Room %s reconnect stopped because stream is offline: %s",
+                              room.room_id, offline_msg)
+                    try:
+                        # EventBus.emit 仅允许编排线程；后台落地段须回投队列执行
+                        if background:
+                            self.submit(
+                                self.bus.emit, "recording_stopped",
+                                room.room_id, 'offline', offline_msg,
+                            )
+                        else:
+                            self.bus.emit("recording_stopped", room.room_id, 'offline', offline_msg)
+                    except Exception as exc:
+                        _log.debug("recording_stopped emit failed: %s", exc)
+                    return
+                _log.warning("Room %s reconnect attempt %d failed: %s",
+                             room.room_id, room.reconnect_attempts, room.last_error)
+                # 保留原始错误信息
+                if not room.last_error or room.last_error == "录制启动失败":
+                    room.last_error = f"恢复失败（原始错误: {original_error}）"
+                # Calculate next delay with exponential backoff
+                next_delay = min(
+                    _RECONNECT_DELAY_SEC * (_RECONNECT_BACKOFF_FACTOR ** room.reconnect_attempts),
+                    _RECONNECT_MAX_DELAY_SEC,
+                )
+                room.reconnect_next_attempt_at = _time.monotonic() + next_delay
+                room.is_reconnecting = True
+        finally:
+            if background:
+                room._reconnect_in_progress = False
+                self._dirty_recording = True
 
     def _do_proactive_reconnect(self, room: RoomSession) -> None:
         """URL 过期前在 Qt 主线程重启录制（由 global tick 调用）。
@@ -3807,9 +3876,11 @@ class RoomOrchestrator:
         self._start_recording_reconnect_thread(room, reconnect_error)
 
     def _start_recording_reconnect_thread(self, room: RoomSession, error_msg: str) -> bool:
-        """在 Qt 主线程执行重连（由 global tick 调用），禁止后台线程改房间状态。
+        """调度录制重连（由 global tick 调用）。
 
-        URL 刷新可能短暂阻塞主线程，但跨线程写 RoomSession/controller 的风险更高。
+        重连落地段（原地恢复 → stop → 刷新 URL → 重启录制）在 worker 池执行，
+        URL 刷新与 FFmpeg 首帧探测（可达 10-20s）不再阻塞编排线程——
+        全局 tick、其他房间录制/预览、orchestrator.call 全部保持响应。
         """
         if getattr(room, "_reconnect_in_progress", False):
             return False
@@ -3818,10 +3889,15 @@ class RoomOrchestrator:
         room._cancel_reconnect.clear()
         room._reconnect_in_progress = True
         try:
-            self._attempt_recording_reconnect(room, error_msg)
+            entered = self._attempt_recording_reconnect(room, error_msg, _background=True)
         except Exception as exc:
             _log.error("Room %s reconnect failed: %s", room.room_id, exc)
-        finally:
+            room._reconnect_in_progress = False
+            self._dirty_recording = True
+            return True
+        if not entered:
+            # 提前返回路径（不可恢复/重连耗尽/退避等待中）：落地段未调度，
+            # 在此立即复位；后台落地段结束时由 _run_reconnect_landing 自行复位。
             room._reconnect_in_progress = False
             self._dirty_recording = True
         return True
