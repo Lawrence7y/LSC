@@ -158,6 +158,15 @@ def _resolve_export_range(
             'approximate',
         )
 
+    # A partial wall-clock snapshot still anchors the request to the current
+    # recording timeline; do not apply the generic preview-latency fallback.
+    if snap_in is not None or snap_out is not None or snap_rec is not None:
+        return (
+            max(0.0, start_sec - content_offset),
+            max(0.0, end_sec - content_offset),
+            'approximate',
+        )
+
     return (
         max(0.0, start_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),
         max(0.0, end_sec - content_offset - _PREVIEW_LATENCY_FALLBACK),

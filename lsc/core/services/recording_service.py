@@ -22,7 +22,12 @@ from threading import Lock
 from uuid import uuid4
 
 from lsc import get_logger
-from lsc.config import ExportProfile, LscConfig, load_config
+from lsc.config import (
+    ExportProfile,
+    LscConfig,
+    is_platform_pipeline_component_enabled,
+    load_config,
+)
 from lsc.core.models import (
     RecordingSession,
     RecordingStatus,
@@ -32,7 +37,7 @@ from lsc.core.models import (
 from lsc.core.services.ingest_registry import get_shared_ingest_registry
 from lsc.core.services.shared_ingest import SharedRoomIngest
 from lsc.platforms.base import StreamInfo
-from lsc.platforms.registry import parse_stream
+from lsc.platforms.registry import detect_platform, parse_stream
 from lsc.recorder.capture import CaptureResult, StreamCapture, validate_recording
 
 _log = get_logger(__name__)
@@ -101,7 +106,29 @@ class RecordingService:
         这是录制服务的第一步：先解析出直播流地址，
         再调用 start_recording() 开始录制。
         """
-        info = parse_stream(url, force_refresh=force_refresh)
+        platform = detect_platform(url)
+        use_v2 = all(
+            is_platform_pipeline_component_enabled(component, platform, self._config)
+            for component in (
+                "unified_resolver_v2",
+                "media_probe_v2",
+                "stream_lease_v2",
+            )
+        )
+        if use_v2:
+            from lsc.platforms.models import ResolveRequest, resolve_result_to_stream_info
+            from lsc.platforms.resolver import resolve_stream_v2
+
+            result = resolve_stream_v2(
+                ResolveRequest(
+                    source_url=url,
+                    force_refresh=force_refresh,
+                    request_id=f"recording-service:{hashlib.sha1(url.encode('utf-8', 'ignore')).hexdigest()[:12]}",
+                )
+            )
+            info = resolve_result_to_stream_info(result)
+        else:
+            info = parse_stream(url, force_refresh=force_refresh)
         return self._stream_info_to_room_info(info)
 
     @staticmethod

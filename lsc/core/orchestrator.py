@@ -21,14 +21,20 @@ from datetime import datetime
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from lsc.config import ExportProfile, load_config
+from lsc.config import (
+    ExportProfile,
+    is_platform_pipeline_component_enabled,
+    load_config,
+)
 from lsc.core.events import EventBus
 from lsc.core.services.ingest_registry import get_shared_ingest_registry
 from lsc.core.services.recording_service import RecordingService
 from lsc.core.services.timeline_service import get_timeline_service
 from lsc.core.session import RoomSession
 from lsc.platforms.base import StreamInfo
-from lsc.platforms.registry import parse_stream, select_quality
+from lsc.platforms.failure import FailureKind, classify_failure, normalize_failure_kind
+from lsc.platforms.redaction import redact_text
+from lsc.platforms.registry import detect_platform, parse_stream, select_quality
 
 _log = logging.getLogger(__name__)
 
@@ -66,6 +72,28 @@ def _get_configured_max_previews() -> int:
         return int(getattr(cfg, "max_concurrent_previews", MAX_CONCURRENT_PREVIEWS))
     except Exception:
         return MAX_CONCURRENT_PREVIEWS
+
+
+def _room_platform_key(room: Any) -> str:
+    """Return a canonical platform id before a room has been resolved.
+
+    Newly added rooms do not have ``RoomSession.platform`` populated yet.  A
+    pure adapter ``can_handle`` check is enough to route the feature flag and
+    does not perform page/network parsing, so an allowlisted platform cannot
+    accidentally take the legacy path on its first connection.
+    """
+    current = str(
+        getattr(room, "platform", "")
+        or getattr(room, "platform_name", "")
+        or ""
+    ).strip()
+    if current:
+        return current
+    try:
+        return str(detect_platform(str(getattr(room, "room_url", "") or "")) or "")
+    except Exception as exc:
+        _log.debug("platform pre-routing failed: %s", redact_text(exc))
+        return ""
 
 # ── Reconnect strategy ───────────────────────────────────────
 _MAX_RECONNECT_ATTEMPTS = 3
@@ -106,6 +134,8 @@ _OFFLINE_STREAM_ERROR_PATTERNS = (
 def _is_stream_offline_error(message: str) -> bool:
     if not message:
         return False
+    if classify_failure(message) is FailureKind.OFFLINE:
+        return True
     lowered = message.lower()
     return any(pattern in lowered for pattern in _OFFLINE_STREAM_ERROR_PATTERNS)
 
@@ -176,6 +206,16 @@ def _room_stream_is_reusable(room: RoomSession) -> bool:
         return False
     if _is_stream_url_expiring(url):
         return False
+    last_error = str(getattr(room, "last_error", "") or "")
+    if last_error:
+        kind = classify_failure(last_error)
+        if kind in {
+            FailureKind.CDN_FORBIDDEN,
+            FailureKind.SIGNATURE_EXPIRED,
+            FailureKind.CONNECTION_RESET,
+            FailureKind.CONNECT_TIMEOUT,
+        }:
+            return False
     age = time.time() - float(room.stream_parsed_at)
     return age <= _STREAM_CACHE_REUSE_SEC
 
@@ -317,31 +357,6 @@ _LOW_FREQ_INTERVAL = 4
 # 交错轮询：同一次 tick 只处理 1/N 房间的 medium 工作
 _STAGGER_GROUPS = 3
 
-_OFFLINE_STREAM_ERROR_PATTERNS = (
-    "下播",
-    "未开播",
-    "未直播",
-    "直播已结束",
-    "直播间已结束",
-    "不在直播",
-    "not live",
-    "offline",
-)
-
-
-def _is_stream_offline_error(message: str) -> bool:
-    if not message:
-        return False
-    lowered = message.lower()
-    return any(pattern in lowered for pattern in _OFFLINE_STREAM_ERROR_PATTERNS)
-
-
-def _offline_stream_error_message(raw: str = "") -> str:
-    if raw and _is_stream_offline_error(raw):
-        return f"{raw}，录制已停止"
-    return "直播间已下播或未开播，录制已停止"
-
-
 def _is_stream_url_expiring(url: str, threshold_sec: int = _STREAM_URL_REFRESH_THRESHOLD_SEC) -> bool:
     """检查流 URL 是否即将过期。
 
@@ -403,6 +418,16 @@ def _room_stream_is_reusable(room: RoomSession) -> bool:
         return False
     if _is_stream_url_expiring(url):
         return False
+    last_error = str(getattr(room, "last_error", "") or "")
+    if last_error:
+        kind = classify_failure(last_error)
+        if kind in {
+            FailureKind.CDN_FORBIDDEN,
+            FailureKind.SIGNATURE_EXPIRED,
+            FailureKind.CONNECTION_RESET,
+            FailureKind.CONNECT_TIMEOUT,
+        }:
+            return False
     age = _time.time() - float(room.stream_parsed_at)
     return age <= _STREAM_CACHE_REUSE_SEC
 
@@ -585,34 +610,93 @@ class _CallRequest:
         self.cancelled = False
 
 
-def _mark_failed_cdn_if_huya(room, error_msg: str) -> None:
-    """当虎牙录制遇到 403/连接失败时，标记当前 CDN 线路为坏线路。
+def _mark_failed_candidate(room, error_msg: str) -> None:
+    """Delegate failed-candidate handling to the owning platform policy."""
+    try:
+        from lsc.platforms.recovery_policy import mark_failed_candidate
 
-    下次 re-parse 时 Huya adapter 会跳过该线路，尝试其他 CDN（al/tx/hs）。
-    """
-    if not error_msg or not room.stream_info:
-        return
-    if room.stream_info.platform != "huya":
-        return
-    lowered = error_msg.lower()
-    if "403" not in lowered and "forbidden" not in lowered and "i/o error" not in lowered:
-        return
-    stream_url = room.stream_info.stream_url or ""
-    if not stream_url:
+        network_context = getattr(room, "network_context", {}) or {}
+        network_profile = ""
+        if isinstance(network_context, dict):
+            network_profile = str(
+                network_context.get("profile")
+                or network_context.get("proxy_url")
+                or ""
+            )
+        ingest = None
+        registry = get_shared_ingest_registry()
+        getter = getattr(registry, "get", None)
+        if callable(getter):
+            ingest = getter(str(getattr(room, "room_id", "") or ""))
+        saw_first_ts = bool(getattr(ingest, "_upstream_has_produced_data", False))
+        mark_failed_candidate(
+            getattr(room, "stream_info", None),
+            error_msg,
+            room_id=str(getattr(room, "room_id", "") or ""),
+            network_profile=network_profile,
+            saw_first_ts=saw_first_ts,
+        )
+    except Exception as exc:
+        _log.debug("mark_failed_cdn policy failed: %s", exc)
+
+
+_QUARANTINE_PROBE_KINDS = {
+    "CDN_FORBIDDEN",
+    "SIGNATURE_EXPIRED",
+    "CONNECT_TIMEOUT",
+    "CONNECTION_RESET",
+}
+
+
+def _quarantine_failed_probe_candidates(room, resolve_result, probes) -> None:
+    """Isolate probed-dead CDN lines before the next parse/retry."""
+    if str(getattr(resolve_result, "platform", "") or "") != "huya":
         return
     try:
-        from urllib.parse import urlparse as _urlparse
-        host = _urlparse(stream_url).netloc.lower()
-        cdn_name = host.split(".")[0] if host else ""
-        if cdn_name:
-            from lsc.platforms.huya import mark_cdn_bad
-            mark_cdn_bad(cdn_name)
+        from lsc.platforms.huya import mark_cdn_bad
     except Exception as exc:
-        _log.debug("mark_failed_cdn failed: %s", exc)
+        _log.debug("huya CDN quarantine import failed: %s", exc)
+        return
+    network_context = getattr(room, "network_context", {}) or {}
+    network_profile = ""
+    if isinstance(network_context, dict):
+        network_profile = str(
+            network_context.get("profile")
+            or network_context.get("proxy_url")
+            or ""
+        )
+    candidates = {
+        str(getattr(item, "candidate_id", "") or ""): item
+        for item in tuple(getattr(resolve_result, "candidates", ()) or ())
+    }
+    room_key = str(getattr(room, "room_url", "") or "")
+    for item in (probes or {}).values():
+        kind = str(getattr(item, "failure_kind", "") or "")
+        if kind not in _QUARANTINE_PROBE_KINDS:
+            continue
+        cdn_id = str(getattr(item, "cdn_id", "") or "")
+        if not cdn_id:
+            candidate = candidates.get(str(getattr(item, "candidate_id", "") or ""))
+            cdn_id = str(getattr(candidate, "cdn_id", "") or "") if candidate else ""
+        if not cdn_id:
+            continue
+        try:
+            mark_cdn_bad(
+                cdn_id,
+                room_key=room_key,
+                network_profile=network_profile,
+            )
+        except Exception as exc:
+            _log.debug("huya CDN quarantine failed: %s", exc)
 
 
 class RoomOrchestrator:
     _MAX_PENDING_REQUESTS = 8
+    # Bound the command mailbox so producer threads cannot exhaust memory
+    # when a room controller or UI client floods the orchestrator.  Keep this
+    # separate from the synchronous pending-request cap: fire-and-forget
+    # callbacks are allowed to queue more work, but still have a hard limit.
+    _MAX_QUEUED_COMMANDS = 1024
 
     def __init__(
         self,
@@ -622,7 +706,7 @@ class RoomOrchestrator:
         self._controller_factory = controller_factory
         self._preview_factory = preview_factory
         self.bus = EventBus()
-        self._cmd_queue: queue.Queue[Any] = queue.Queue()
+        self._cmd_queue: queue.Queue[Any] = queue.Queue(maxsize=self._MAX_QUEUED_COMMANDS)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._pending_count = 0
@@ -634,6 +718,10 @@ class RoomOrchestrator:
         self._metadata_probe_jobs: dict[str, _MetadataProbeJob] = {}
         self._batch_record_job: _BatchRecordJob | None = None
         self._refresh_cancels: dict[str, threading.Event] = {}
+        self._lease_managers: dict[str, Any] = {}
+        self._stream_leases: dict[str, Any] = {}
+        self._pending_stream_infos: dict[str, StreamInfo] = {}
+        self._lease_refresh_inflight: set[str] = set()
         self._tick_counter = 0
         self._next_tick_deadline: float | None = None
         self._loop_deadline: float | None = None
@@ -650,6 +738,47 @@ class RoomOrchestrator:
     def thread_ident(self) -> int | None:
         t = self._thread
         return t.ident if t else None
+
+    @staticmethod
+    def _pipeline_component_enabled(
+        component: str,
+        room: RoomSession,
+        config: Any | None = None,
+    ) -> bool:
+        """Evaluate a V2 gate with the room's rollout context."""
+        context = getattr(room, "network_context", {}) or {}
+        if not isinstance(context, dict):
+            context = {}
+        platform = _room_platform_key(room)
+        try:
+            return is_platform_pipeline_component_enabled(
+                component,
+                platform,
+                config,
+                room_id=room.room_id,
+                user_id=str(context.get("user_id", "") or "") or None,
+                account_ref=str(
+                    getattr(room, "account_ref", "")
+                    or context.get("account_ref", "")
+                    or ""
+                ) or None,
+                app_version=str(
+                    context.get("app_version", "")
+                    or os.environ.get("LSC_APP_VERSION", "")
+                    or ""
+                ) or None,
+            )
+        except TypeError as exc:
+            # Preserve test/third-party gate shims that still implement the
+            # original three-argument callable.
+            if not any(name in str(exc) for name in ("room_id", "user_id", "account_ref", "app_version")):
+                raise
+            try:
+                return is_platform_pipeline_component_enabled(component, platform, config)
+            except TypeError as legacy_exc:
+                if "positional argument" not in str(legacy_exc):
+                    raise
+                return is_platform_pipeline_component_enabled(component, platform)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -725,7 +854,12 @@ class RoomOrchestrator:
                 )
             self._pending_count += 1
         req = _CallRequest(fn, args, kwargs)
-        self._cmd_queue.put(req)
+        try:
+            self._cmd_queue.put_nowait(req)
+        except queue.Full as exc:
+            with self._pending_lock:
+                self._pending_count -= 1
+            raise RuntimeError("command queue full") from exc
         if not req.event.wait(timeout=timeout):
             req.cancelled = True
             raise TimeoutError("orchestrator call timed out")
@@ -740,7 +874,59 @@ class RoomOrchestrator:
             except Exception:
                 _log.exception("submit on orch thread failed")
             return
-        self._cmd_queue.put(lambda: fn(*args, **kwargs))
+        try:
+            self._cmd_queue.put_nowait(lambda: fn(*args, **kwargs))
+        except queue.Full as exc:
+            raise RuntimeError("command queue full") from exc
+
+    def _submit_worker(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> bool:
+        """Submit background work unless shutdown has started.
+
+        The orchestrator loop can still finish one deadline tick while
+        ``shutdown()`` is joining it.  Guarding the executor boundary avoids
+        ``cannot schedule new futures after shutdown`` and treats late
+        maintenance work as safely discarded.
+        """
+        if self._stop.is_set():
+            return False
+        if bool(getattr(self._worker_pool, "_shutdown", False)):
+            return False
+        try:
+            self._worker_pool.submit(fn, *args, **kwargs)
+            return True
+        except RuntimeError as exc:
+            # Executor shutdown is an expected teardown race; avoid logging
+            # against a test/application stream that may already be closed.
+            if not self._stop.is_set() and not bool(
+                getattr(self._worker_pool, "_shutdown", False)
+            ):
+                _log.warning("worker submission rejected: %s", redact_text(exc))
+            return False
+
+    def _on_ingest_event(self, event: Any) -> None:
+        """Publish supervisor events on the orchestrator-owned EventBus."""
+        room = self.get_room(str(getattr(event, "room_id", "") or ""))
+        platform = str(
+            getattr(event, "platform_id", "")
+            or getattr(room, "platform", "")
+            or getattr(room, "platform_name", "")
+            or ""
+        ) if room is not None else ""
+        if not platform:
+            platform = str(getattr(event, "platform_id", "") or "")
+        runtime_gate = (
+            self._pipeline_component_enabled("runtime_events_v2", room)
+            if room is not None
+            else is_platform_pipeline_component_enabled(
+                "runtime_events_v2", platform, load_config()
+            )
+        )
+        if not runtime_gate:
+            return
+        if self._thread is not None and threading.current_thread() is self._thread:
+            self.bus.emit("runtime_event", event)
+        else:
+            self.submit(self.bus.emit, "runtime_event", event)
 
     def _ensure_tick_armed(self) -> None:
         if self._next_tick_deadline is None:
@@ -906,6 +1092,10 @@ class RoomOrchestrator:
             room = self._rooms.pop(room_id, None)
         if room is None:
             return False
+        self._pending_stream_infos.pop(room_id, None)
+        self._stream_leases.pop(room_id, None)
+        self._lease_managers.pop(room_id, None)
+        self._lease_refresh_inflight.discard(room_id)
         self._missing_controller_tick_warned.discard(room_id)
         # 若正在循环试听这个房间,停止 timer,避免删房后空转。
         if self._loop_room_id == room_id:
@@ -1184,6 +1374,18 @@ class RoomOrchestrator:
         return self._connect_room_sync(room, quality_preset=quality_preset)
 
     def _connect_room_sync(self, room: RoomSession, quality_preset: str = "原画") -> bool:
+        try:
+            cfg = load_config()
+            if (
+                self._pipeline_component_enabled("unified_resolver_v2", room, cfg)
+                and self._pipeline_component_enabled("media_probe_v2", room, cfg)
+                and self._pipeline_component_enabled("stream_lease_v2", room, cfg)
+            ):
+                info = self._resolve_v2_stream_info(room, cfg, quality_preset=quality_preset)
+                return bool(info and self._apply_stream_info(room, info))
+        except Exception as exc:
+            room.set_error(f"V2 直播流连接失败: {exc}")
+            return False
         info = parse_stream(room.room_url)
         if info.is_live and quality_preset:
             stream_url, selected_quality = select_quality(info, quality_preset)
@@ -1203,10 +1405,32 @@ class RoomOrchestrator:
         self._connect_jobs[room.room_id] = job
 
         def _run() -> None:
-            result = job.run()
+            try:
+                cfg = load_config()
+                if (
+                    self._pipeline_component_enabled("unified_resolver_v2", room, cfg)
+                    and self._pipeline_component_enabled("media_probe_v2", room, cfg)
+                    and self._pipeline_component_enabled("stream_lease_v2", room, cfg)
+                ):
+                    info = self._resolve_v2_stream_info(
+                        room,
+                        cfg,
+                        quality_preset=job.quality_preset,
+                        cancellation=job.cancel,
+                    )
+                    result = (
+                        room.room_id,
+                        bool(info),
+                        "" if info else (room.last_error or "V2 直播流连接失败"),
+                        info,
+                    )
+                else:
+                    result = job.run()
+            except Exception as exc:
+                result = (room.room_id, False, str(exc), None)
             self.submit(self._on_connect_finished, *result)
 
-        self._worker_pool.submit(_run)
+        self._submit_worker(_run)
         return True
 
     def _on_connect_finished(self, room_id: str, success: bool, error: str,
@@ -1221,7 +1445,13 @@ class RoomOrchestrator:
             self._apply_stream_info(room, info)
             # 异步探测分辨率/帧率回填详情面板（原详情面板"帧率"恒为 --）。
             if info.stream_url:
-                self._probe_metadata_async(room_id, info.stream_url)
+                from lsc.platforms.capabilities import (
+                    get_platform_capabilities,
+                    uses_ingest_probe,
+                )
+
+                if not uses_ingest_probe(get_platform_capabilities(info.platform)):
+                    self._probe_metadata_async(room_id, info.stream_url)
         else:
             room.set_error(error or "连接失败")
 
@@ -1244,7 +1474,7 @@ class RoomOrchestrator:
             if result is not None:
                 self.submit(self._on_probe_finished, *result)
 
-        self._worker_pool.submit(_run)
+        self._submit_worker(_run)
 
     def _on_probe_finished(self, room_id: str, resolution: str, fps: str) -> None:
         """ffprobe 探测完成回调（主线程执行）：回填分辨率/帧率并刷新 UI。"""
@@ -1260,6 +1490,11 @@ class RoomOrchestrator:
     def _apply_stream_info(self, room: RoomSession, info: StreamInfo) -> bool:
         """Apply parsed StreamInfo to room session and controller."""
         room.apply_stream_info(info)
+        raw_context = getattr(info, "raw", {}) or {}
+        if isinstance(raw_context, dict):
+            context = raw_context.get("network_context")
+            if isinstance(context, dict):
+                room.network_context = dict(context)
         room.preview_error = ""
         # Mark state changed for UI refresh
         self._dirty_connection = True
@@ -1715,6 +1950,44 @@ class RoomOrchestrator:
             _sync_controller_stream(room)
             _log.info("refresh_stream_url reuse cached stream for %s (age<=%.0fs)", room_id, _STREAM_CACHE_REUSE_SEC)
             return True
+
+        # Once a platform is admitted to the V2 pipeline, every refresh and
+        # reconnect must keep the Resolver -> Probe -> Lease contract.  The
+        # legacy branch below remains the explicit rollback path when the
+        # global/platform gate is disabled; silently calling parse_stream here
+        # would reintroduce an unprobed URL during recovery.
+        try:
+            cfg = load_config()
+            use_v2 = all(
+                self._pipeline_component_enabled(component, room, cfg)
+                for component in (
+                    "unified_resolver_v2",
+                    "media_probe_v2",
+                    "stream_lease_v2",
+                )
+            )
+        except Exception as exc:
+            _log.debug("V2 refresh gate lookup failed room=%s: %s", room_id, redact_text(exc))
+            use_v2 = False
+
+        if use_v2:
+            try:
+                info = self._resolve_v2_stream_info(
+                    room,
+                    cfg,
+                    quality_preset=getattr(room, "selected_quality", "") or None,
+                )
+            except Exception as exc:
+                _log.warning("V2 refresh_stream_url failed for %s: %s", room_id, redact_text(exc))
+                room.set_error(redact_text(exc))
+                return False
+            if info is None or not info.is_live or not info.stream_url:
+                _log.warning("V2 refresh_stream_url returned no playable stream for %s", room_id)
+                return False
+            room.apply_stream_info(info)
+            _sync_controller_stream(room, info)
+            return True
+
         try:
             # 利用 30 秒缓存避免每次预览都重新发 HTTP 请求；
             # 缓存过期或 URL 失效时自动重新解析
@@ -1763,7 +2036,7 @@ class RoomOrchestrator:
             finally:
                 self.submit(lambda: self._refresh_cancels.pop(key, None))
 
-        self._worker_pool.submit(_run)
+        self._submit_worker(_run)
 
     # ── Mute ─────────────────────────────────────────────────
 
@@ -1776,6 +2049,38 @@ class RoomOrchestrator:
 
     def _refresh_room_stream_for_recording(self, room: RoomSession) -> bool:
         """Refresh short-lived CDN URLs before starting FFmpeg recording."""
+        try:
+            cfg = load_config()
+            if (
+                self._pipeline_component_enabled("unified_resolver_v2", room, cfg)
+                and self._pipeline_component_enabled("media_probe_v2", room, cfg)
+                and self._pipeline_component_enabled("stream_lease_v2", room, cfg)
+            ):
+                pending = self._pending_stream_infos.pop(room.room_id, None)
+                pending_lease = self._stream_leases.get(room.room_id)
+                pending_manager = self._lease_managers.get(room.room_id)
+                if pending is not None and pending_lease is not None and pending_manager is not None:
+                    try:
+                        if not pending_manager.is_expired(
+                            pending_lease,
+                            now=_time.monotonic(),
+                        ):
+                            return self._apply_stream_info(room, pending)
+                    except Exception as exc:
+                        _log.debug(
+                            "pending V2 lease rejected room=%s: %s",
+                            room.room_id,
+                            exc,
+                        )
+                info = self._resolve_v2_stream_info(room, cfg)
+                if info is None:
+                    return False
+                return self._apply_stream_info(room, info)
+        except Exception as exc:
+            room.set_error(f"V2 直播流解析失败: {exc}")
+            _log.warning("V2 stream refresh failed room=%s: %s", room.room_id, exc)
+            return False
+
         # 共享进样已在 preview-only：切录制会重建上游，强制刷流避免缓存 URL 触发 CDN 断流
         force_fresh = False
         try:
@@ -1829,6 +2134,309 @@ class RoomOrchestrator:
 
         return self._apply_stream_info(room, info)
 
+    def _resolve_v2_stream_info(
+        self,
+        room: RoomSession,
+        cfg: Any,
+        *,
+        quality_preset: str | None = None,
+        deadline_monotonic: float | None = None,
+        cancellation: Any | None = None,
+    ) -> StreamInfo | None:
+        """Resolve, probe and lease a stream before it reaches FFmpeg."""
+        from lsc.platforms.capabilities import uses_ingest_probe
+        from lsc.platforms.lease_manager import LeaseManager
+        from lsc.platforms.models import ResolveRequest
+        from lsc.platforms.probe import summarize_probe_failures
+        from lsc.platforms.resolver import (
+            limit_probe_candidates,
+            probe_candidates,
+            resolve_stream_v2,
+            select_ingest_lease,
+            select_stream_lease,
+        )
+
+        deadline = deadline_monotonic or (_time.monotonic() + 20.0)
+        result = resolve_stream_v2(
+            ResolveRequest(
+                source_url=room.room_url,
+                requested_quality=quality_preset or room.selected_quality,
+                account_ref=str(
+                    getattr(room, "account_ref", "")
+                    or (getattr(room, "network_context", {}) or {}).get("account_ref", "")
+                    or "default"
+                ),
+                force_refresh=True,
+                request_id=f"recording:{room.room_id}",
+                deadline_monotonic=deadline,
+                cancellation=cancellation,
+                network_context=dict(getattr(room, "network_context", {}) or {}),
+            )
+        )
+        credential_status = getattr(result, "credential_status", None)
+        room.credential_status = str(
+            getattr(credential_status, "value", credential_status)
+            or "NOT_CONFIGURED"
+        )
+        if not result.candidates:
+            message = result.error.user_message if result.error else "未找到直播流候选"
+            room.set_error(message)
+            return None
+        capabilities = result.capabilities
+        manager = self._lease_managers.setdefault(room.room_id, LeaseManager())
+        probes: dict = {}
+        if uses_ingest_probe(capabilities):
+            lease = select_ingest_lease(
+                result,
+                room_id=room.room_id,
+                lease_manager=manager,
+                requested_quality=quality_preset or room.selected_quality,
+            )
+        else:
+            probe_timeout = capabilities.probe_timeout_sec if capabilities else 8.0
+            max_concurrency = capabilities.max_connect_concurrency if capabilities else 1
+            limited = limit_probe_candidates(result.candidates, capabilities)
+            if deadline_monotonic is None and int(max_concurrency or 1) <= 1:
+                # Serial signed-CDN failover needs wall time for each line,
+                # plus parse overhead already consumed above.
+                needed = _time.monotonic() + (
+                    float(probe_timeout) * max(1, len(limited))
+                ) + 5.0
+                deadline = max(deadline, needed)
+            probes = probe_candidates(
+                limited,
+                ffprobe_path=getattr(cfg, "ffprobe_path", "") or "ffprobe",
+                timeout_sec=probe_timeout,
+                max_concurrency=max_concurrency,
+                request_id=f"probe:{room.room_id}",
+                deadline_monotonic=deadline,
+                cancellation=cancellation,
+                network_context=dict(getattr(room, "network_context", {}) or {}),
+                platform=result.platform,
+                account_ref=str(
+                    getattr(room, "account_ref", "")
+                    or (getattr(room, "network_context", {}) or {}).get("account_ref", "")
+                    or "default"
+                ),
+            )
+            lease = select_stream_lease(
+                result,
+                probes,
+                room_id=room.room_id,
+                lease_manager=manager,
+                requested_quality=quality_preset or room.selected_quality,
+            )
+        if lease is None:
+            if uses_ingest_probe(capabilities):
+                message = (
+                    result.error.user_message
+                    if result.error and result.error.user_message
+                    else "未找到可播放的直播流"
+                )
+            else:
+                message = summarize_probe_failures(probes)
+                _log.warning(
+                    "V2 probe selected no lease room=%s platform=%s probes=%s",
+                    room.room_id,
+                    result.platform,
+                    {
+                        candidate_id: getattr(item, "failure_kind", "")
+                        for candidate_id, item in probes.items()
+                    },
+                )
+                _quarantine_failed_probe_candidates(room, result, probes)
+            room.set_error(message)
+            return None
+        self._stream_leases[room.room_id] = lease
+        # A V2 StreamInfo represents one probed lease, not the entire
+        # resolver response. Publishing every candidate through the legacy
+        # quality map lets preview code silently replace the leased URL with
+        # an unprobed (and often 403ing) CDN line. Quality changes must run a
+        # new resolve -> probe -> lease cycle; compatibility consumers may
+        # only reuse the selected lease here.
+        quality_urls = (
+            {lease.candidate.quality_id: lease.candidate.url}
+            if lease.candidate.quality_id
+            else {}
+        )
+        selected_quality = lease.candidate.quality_id or room.selected_quality
+        account_ref = str(
+            getattr(room, "account_ref", "")
+            or (getattr(room, "network_context", {}) or {}).get("account_ref", "")
+            or "default"
+        )
+        return StreamInfo(
+            platform=result.platform,
+            room_url=room.room_url,
+            stream_url=lease.candidate.url,
+            title=result.room_title,
+            streamer=result.anchor_name,
+            is_live=result.live_status == "LIVE",
+            quality_urls=quality_urls,
+            selected_quality=selected_quality,
+            headers=dict(lease.candidate.request_headers),
+            raw={
+                "v2": True,
+                "lease_id": lease.lease_id,
+                "lease_generation": lease.generation,
+                "candidate_id": lease.candidate.candidate_id,
+                "candidate_cdn_id": lease.candidate.cdn_id,
+                "candidate_protocol": lease.candidate.protocol,
+                "candidate_quality_id": lease.candidate.quality_id,
+                "account_ref": account_ref,
+                "probe": probes.get(lease.candidate.candidate_id).failure_detail
+                if probes.get(lease.candidate.candidate_id)
+                else "",
+                "network_context": dict(getattr(room, "network_context", {}) or {}),
+            },
+        )
+
+    def _schedule_v2_lease_refresh(self, room: RoomSession) -> None:
+        """Resolve/probe the next lease in the worker pool without stopping sinks.
+
+        The current upstream keeps running while the next signed URL is
+        resolved and probed.  The pending result is consumed only by the next
+        reconnect/sink restart, so a successful pre-refresh cannot interrupt a
+        healthy recording or preview.
+        """
+        room_id = room.room_id
+        lease = self._stream_leases.get(room_id)
+        manager = self._lease_managers.get(room_id)
+        if lease is None or manager is None:
+            return
+        try:
+            if not manager.needs_refresh(lease, now=_time.monotonic()):
+                return
+        except Exception as exc:
+            _log.debug("lease refresh eligibility failed room=%s: %s", room_id, exc)
+            return
+        if room_id in self._lease_refresh_inflight:
+            return
+        if not self._pipeline_component_enabled("stream_lease_v2", room):
+            return
+        self._lease_refresh_inflight.add(room_id)
+        registry = get_shared_ingest_registry()
+        supervisor = registry.get_supervisor_if_exists(room_id)
+        if supervisor is not None:
+            supervisor.begin_refresh("LEASE_REFRESH_PROACTIVE")
+
+        old_lease_id = str(getattr(lease, "lease_id", ""))
+
+        def _refresh() -> None:
+            cfg = load_config()
+            try:
+                info = self._resolve_v2_stream_info(
+                    room,
+                    cfg,
+                    quality_preset=getattr(room, "selected_quality", "") or None,
+                )
+                refreshed_lease = self._stream_leases.get(room_id)
+                self.submit(
+                    self._finish_v2_lease_refresh,
+                    room_id,
+                    old_lease_id,
+                    str(getattr(refreshed_lease, "lease_id", "")),
+                    info,
+                    None,
+                )
+            except Exception as exc:
+                self.submit(
+                    self._finish_v2_lease_refresh,
+                    room_id,
+                    old_lease_id,
+                    "",
+                    None,
+                    exc,
+                )
+
+        self._submit_worker(_refresh)
+
+    def _finish_v2_lease_refresh(
+        self,
+        room_id: str,
+        old_lease_id: str,
+        refreshed_lease_id: str,
+        info: StreamInfo | None,
+        error: Exception | None,
+    ) -> None:
+        self._lease_refresh_inflight.discard(room_id)
+        supervisor = get_shared_ingest_registry().get_supervisor_if_exists(room_id)
+        room = self._rooms.get(room_id)
+        success = bool(info is not None and error is None and room is not None)
+        if success and room is not None:
+            current = self._stream_leases.get(room_id)
+            # Resolver may have been superseded by a reconnect while the worker
+            # was running.  Never overwrite a newer generation.
+            current_id = str(getattr(current, "lease_id", "")) if current is not None else ""
+            if current is not None and current_id == refreshed_lease_id:
+                self._pending_stream_infos[room_id] = info
+                success = True
+            else:
+                success = False
+        if supervisor is not None:
+            supervisor.finish_refresh(
+                success,
+                reason_code=(
+                    "LEASE_REFRESH_READY"
+                    if success
+                    else "LEASE_REFRESH_FAILED"
+                ),
+            )
+        if not success:
+            _log.warning(
+                "V2 lease refresh failed room=%s error=%s",
+                room_id,
+                redact_text(error) if error else "superseded",
+            )
+
+    def _maybe_prefetch_http_session_lease(self, room: RoomSession) -> None:
+        """Parse the next signed URL before a bounded HTTP session ends."""
+        ingest = get_shared_ingest_registry().get(room.room_id)
+        needs = getattr(ingest, "needs_lease_prefetch", None)
+        if ingest is None or not callable(needs) or not needs():
+            return
+        if room.room_id in self._lease_refresh_inflight:
+            return
+        self._lease_refresh_inflight.add(room.room_id)
+        room_id = room.room_id
+
+        def _refresh() -> None:
+            ok = False
+            try:
+                ok = bool(self.refresh_stream_url(room_id, force=True))
+            except Exception as exc:
+                _log.warning(
+                    "HTTP session lease prefetch failed room=%s: %s",
+                    room_id,
+                    redact_text(exc),
+                )
+            self.submit(self._finish_http_session_lease_prefetch, room_id, ok)
+
+        self._submit_worker(_refresh)
+
+    def _finish_http_session_lease_prefetch(self, room_id: str, ok: bool) -> None:
+        self._lease_refresh_inflight.discard(room_id)
+        if not ok:
+            return
+        room = self._rooms.get(room_id)
+        ingest = get_shared_ingest_registry().get(room_id)
+        stash = getattr(ingest, "stash_pending_lease", None)
+        if room is None or ingest is None or not callable(stash):
+            return
+        info = getattr(room, "stream_info", None)
+        url = str(getattr(info, "stream_url", "") or "")
+        if not url:
+            return
+        lease = self._stream_leases.get(room_id)
+        stash(
+            url=url,
+            headers=dict(getattr(info, "headers", {}) or {}),
+            network_context=dict(getattr(room, "network_context", {}) or {}),
+            lease_id=str(getattr(lease, "lease_id", "") or ""),
+            generation=getattr(lease, "generation", None) if lease is not None else None,
+        )
+        _log.info("Room %s stashed next signed HTTP lease for rotation", room_id)
+
     def start_recording(self, room_id: str, output_dir: str, encoder: str, crf: int,
                         param_mode: str = "CRF 质量", bitrate: str | None = None,
                         bitrate_unit: str = "kbps",
@@ -1873,6 +2481,7 @@ class RoomOrchestrator:
             _log.warning("[录制诊断] room not found: %s", room_id)
             return False
         previous_recording_id = str(getattr(room, "recording_id", "") or "")
+        keep_started_at = room.record_started_at if room.is_reconnecting else None
 
         def _commit_recording_epoch(media_start_mono: float | None) -> None:
             """提交新录制 epoch；重启时清除旧音频对齐，禁止复用陈旧 offset。"""
@@ -1961,13 +2570,16 @@ class RoomOrchestrator:
         #   - Appends a numeric suffix if the directory already exists, which can
         #     happen when two rooms point at the same streamer/short_id combo.
         #   - Falls back to ~/.lsc/output on OSError (e.g. sandboxed environments).
-        room_output_dir = _make_room_output_dir(output_dir, room)
-        # 若可读目录名已存在（同名主播+同 short_id 概率极低），追加序号避免覆盖
-        original_room_output_dir = room_output_dir
-        suffix = 1
-        while os.path.exists(room_output_dir):
-            room_output_dir = f"{original_room_output_dir}_{suffix}"
-            suffix += 1
+        if room.is_reconnecting and room.reconnect_output_dir and os.path.isdir(room.reconnect_output_dir):
+            room_output_dir = room.reconnect_output_dir
+        else:
+            room_output_dir = _make_room_output_dir(output_dir, room)
+            # 若可读目录名已存在（同名主播+同 short_id 概率极低），追加序号避免覆盖
+            original_room_output_dir = room_output_dir
+            suffix = 1
+            while os.path.exists(room_output_dir):
+                room_output_dir = f"{original_room_output_dir}_{suffix}"
+                suffix += 1
         try:
             os.makedirs(room_output_dir, exist_ok=True)
         except OSError:
@@ -1994,7 +2606,7 @@ class RoomOrchestrator:
             media_start_mono = shared_media_start
             room.is_recording = True
             room.record_output_path = output_path
-            room.record_started_at = datetime.now()
+            room.record_started_at = keep_started_at or datetime.now()
             # 共享进样模式也需要同步 controller.video_path，否则导出时找不到文件
             if controller is not None:
                 controller.video_path = output_path
@@ -2021,6 +2633,28 @@ class RoomOrchestrator:
             return True
         if shared_error:
             room.last_error = shared_error
+            _mark_failed_candidate(room, shared_error)
+            if self._pipeline_component_enabled("ingest_supervisor_v2", room):
+                # Once a room enters the V2 ownership model the supervisor is
+                # the only component allowed to own its upstream and sinks.
+                # Falling through to StreamCapture here reuses the candidate
+                # that just failed (typically a 403/expired signature),
+                # creates a second lifecycle owner and can report a false
+                # recording success before that process exits.
+                _log.warning(
+                    "V2 shared ingest recording failed; legacy fallback is disabled: "
+                    "room=%s, error=%s",
+                    room_id,
+                    shared_error,
+                )
+                room.is_recording = False
+                room.record_output_path = ""
+                room.record_started_at = None
+                room.recording_start_mono = None
+                room.recording_media_start_mono = None
+                room.recording_id = ""
+                self._dirty_recording = True
+                return False
             # 共享进样只是性能优化，不应成为录制可用性的单点故障。尤其在 VMware
             # 等环境中，pipe sink 可能启动后立即退出；此时改用常规 StreamCapture。
             _log.warning(
@@ -2045,7 +2679,7 @@ class RoomOrchestrator:
         _log.info("[录制诊断] start_recording_with_crf returned ok=%s, error_msg=%s", ok, error_msg)
         room.is_recording = ok
         room.record_output_path = output_path
-        room.record_started_at = datetime.now() if ok else None
+        room.record_started_at = (keep_started_at or datetime.now()) if ok else None
         if ok:
             room.recording_start_mono = getattr(controller, 'recording_start_mono', 0.0) or _time.monotonic()
             room.recording_media_start_mono = None
@@ -2077,6 +2711,8 @@ class RoomOrchestrator:
             room.reconnect_next_attempt_at = 0.0
         if not ok:
             room.last_error = error_msg or "录制启动失败"
+            # Platform policy decides family invalidation vs CDN quarantine.
+            _mark_failed_candidate(room, room.last_error)
         return ok
 
     @staticmethod
@@ -2144,7 +2780,13 @@ class RoomOrchestrator:
         except Exception as exc:
             _log.debug("shared ingest config unavailable: %s", exc)
             return "", 0.0, ""
-        if not getattr(cfg, "shared_ingest_enabled", False):
+        use_v2_ingest = self._pipeline_component_enabled(
+            "ingest_supervisor_v2", room, cfg
+        )
+        use_segmented_recording = self._pipeline_component_enabled(
+            "segmented_recording_v2", room, cfg
+        )
+        if not getattr(cfg, "shared_ingest_enabled", False) and not use_v2_ingest:
             return "", 0.0, ""
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2155,14 +2797,122 @@ class RoomOrchestrator:
             headers = dict(getattr(room.stream_info, "headers", {}) or {})
 
         registry = get_shared_ingest_registry()
-        ingest = registry.get_or_create(room.room_id, url=stream_url, headers=headers)
         try:
-            result = ingest.start_recording(output_path, profile=profile)
+            if use_v2_ingest:
+                supervisor = registry.get_supervisor(
+                    room.room_id,
+                    url=stream_url,
+                    headers=headers,
+                    network_context=dict(getattr(room, "network_context", {}) or {}),
+                    event_callback=self._on_ingest_event,
+                )
+                lease = self._stream_leases.get(room.room_id)
+                set_lease_context = getattr(supervisor, "set_lease_context", None)
+                if callable(set_lease_context) and lease is not None:
+                    set_lease_context(
+                        session_id=getattr(room, "recording_id", "") or room.room_id,
+                        platform_id=str(
+                            getattr(room, "platform", "")
+                            or getattr(room, "platform_name", "")
+                            or ""
+                        ),
+                        lease_id=getattr(lease, "lease_id", ""),
+                        candidate_id=getattr(
+                            getattr(lease, "candidate", None), "candidate_id", ""
+                        ),
+                        generation=getattr(lease, "generation", 0),
+                        quality_id=str(
+                            getattr(getattr(lease, "candidate", None), "quality_id", "")
+                            or ""
+                        ),
+                        protocol=str(
+                            getattr(getattr(lease, "candidate", None), "protocol", "")
+                            or ""
+                        ),
+                        cdn_id=str(
+                            getattr(getattr(lease, "candidate", None), "cdn_id", "")
+                            or ""
+                        ),
+                        expires_at=getattr(lease, "expires_at", None),
+                        refresh_at=getattr(lease, "refresh_at", None),
+                    )
+                    ingest = getattr(supervisor, "ingest", None)
+                    bind_lease = getattr(ingest, "bind_lease", None)
+                    lease_manager = self._lease_managers.get(room.room_id)
+                    if callable(bind_lease) and lease_manager is not None:
+                        bind_lease(lease_manager, getattr(lease, "lease_id", ""))
+                # A refreshed lease must replace the remote upstream before a
+                # new recording sink is attached.  Keep an existing preview
+                # subscriber alive while the shared ingest swaps processes;
+                # the supervisor/generation guard prevents late bytes from
+                # the expired URL reaching either sink.
+                existing_ingest = getattr(supervisor, "ingest", None)
+                existing_context = dict(
+                    getattr(existing_ingest, "network_context", {}) or {}
+                )
+                existing_headers = dict(getattr(existing_ingest, "headers", {}) or {})
+                if (
+                    existing_ingest is not None
+                    and (
+                        str(getattr(existing_ingest, "url", "") or "") != str(stream_url)
+                        or existing_headers != headers
+                        or existing_context != dict(getattr(room, "network_context", {}) or {})
+                    )
+                ):
+                    switch_upstream = getattr(supervisor, "switch_upstream", None)
+                    if callable(switch_upstream):
+                        switched = switch_upstream(
+                            stream_url,
+                            headers=headers,
+                            network_context=dict(getattr(room, "network_context", {}) or {}),
+                            generation=getattr(lease, "generation", None) if lease is not None else None,
+                        )
+                        if not switched:
+                            error = str(supervisor.health().get("last_error", "upstream switch failed"))
+                            return "", 0.0, error
+                if use_segmented_recording:
+                    result_ok = supervisor.start_recording(
+                        output_path,
+                        profile=profile,
+                        segmented=True,
+                        platform_id=getattr(room, "platform", "") or room.platform_name,
+                        canonical_room_id=getattr(room, "canonical_room_id", "") or "",
+                    )
+                else:
+                    result_ok = supervisor.start_recording(output_path, profile=profile)
+                result_error = supervisor.health().get("last_error", "")
+            else:
+                ingest = registry.get_or_create(
+                    room.room_id,
+                    url=stream_url,
+                    headers=headers,
+                    network_context=dict(getattr(room, "network_context", {}) or {}),
+                )
+                if use_segmented_recording:
+                    result = ingest.start_recording(
+                        output_path,
+                        profile=profile,
+                        segmented=True,
+                        platform_id=getattr(room, "platform", "") or room.platform_name,
+                        canonical_room_id=getattr(room, "canonical_room_id", "") or "",
+                    )
+                else:
+                    result = ingest.start_recording(output_path, profile=profile)
+                result_ok = result.ok
+                result_error = result.error
         except Exception as exc:
             registry.stop_room(room.room_id, reason="shared recording start exception")
             _log.warning("shared ingest recording failed room=%s: %s", room.room_id, exc)
             return "", 0.0, str(exc)
-        if result.ok:
+        if result_ok:
+            ingest = registry.get(room.room_id)
+            if use_segmented_recording and ingest is not None:
+                room.record_manifest_path = str(
+                    getattr(ingest, "recording_manifest_path", "") or ""
+                )
+                controller = getattr(room, "controller", None)
+                if controller is not None:
+                    controller.record_manifest_path = room.record_manifest_path
             # _wait_for_startup_data 已确保录制进程稳定存活 1 秒以上；
             # 此处仅检查 recording_active 作为最终确认，不再额外检�� PID，
             # 避免在 mock/测试环境中因无真实进程而误判。
@@ -2173,8 +2923,8 @@ class RoomOrchestrator:
                 return "", 0.0, error
             return output_path, getattr(ingest, "recording_media_start_mono", 0.0), ""
         registry.stop_room(room.room_id, reason="shared recording start failed")
-        _log.warning("shared ingest recording failed room=%s: %s", room.room_id, result.error)
-        return "", 0.0, result.error
+        _log.warning("shared ingest recording failed room=%s: %s", room.room_id, result_error)
+        return "", 0.0, str(result_error)
 
     def stop_recording(self, room_id: str) -> bool:
         """Stop FFmpeg recording for a room and reset reconnect state.
@@ -2196,7 +2946,15 @@ class RoomOrchestrator:
         shared_ingest = registry.get(room_id)
         if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
             output_path = room.record_output_path or getattr(shared_ingest, "_recording_path", "")
-            shared_ingest.stop_recording_sink(reason="manager stop recording")
+            if self._pipeline_component_enabled("ingest_supervisor_v2", room):
+                registry.get_supervisor(
+                    room_id,
+                    url=getattr(shared_ingest, "url", ""),
+                    headers=getattr(shared_ingest, "headers", {}),
+                    network_context=dict(getattr(room, "network_context", {}) or {}),
+                ).stop_recording(reason="manager stop recording")
+            else:
+                shared_ingest.stop_recording_sink(reason="manager stop recording")
             if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
                 registry.stop_room(room_id, reason="manager stop recording")
             room.is_recording = False
@@ -2245,7 +3003,15 @@ class RoomOrchestrator:
         shared_ingest = registry.get(room_id)
         if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
             output_path = room.record_output_path or getattr(shared_ingest, "_recording_path", "")
-            shared_ingest.stop_recording_sink(reason="manager async stop recording")
+            if self._pipeline_component_enabled("ingest_supervisor_v2", room):
+                registry.get_supervisor(
+                    room_id,
+                    url=getattr(shared_ingest, "url", ""),
+                    headers=getattr(shared_ingest, "headers", {}),
+                    network_context=dict(getattr(room, "network_context", {}) or {}),
+                ).stop_recording(reason="manager async stop recording")
+            else:
+                shared_ingest.stop_recording_sink(reason="manager async stop recording")
             if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
                 registry.stop_room(room_id, reason="manager async stop recording")
             room.is_recording = False
@@ -2363,7 +3129,7 @@ class RoomOrchestrator:
             bitrate_unit=bitrate_unit,
         )
         self._batch_record_job = job
-        self._worker_pool.submit(job.run)
+        self._submit_worker(job.run)
         return True
 
     def stop_recording_all(self) -> dict[str, bool]:
@@ -2385,7 +3151,17 @@ class RoomOrchestrator:
             stats = self._shutdown_resources(timeout_sec)
 
         self._stop.set()
-        self._cmd_queue.put(None)
+        # Shutdown must still be able to wake the loop if a producer filled
+        # the bounded mailbox.  Drop one queued callback when necessary; the
+        # normal resource cleanup has already run synchronously above.
+        try:
+            self._cmd_queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._cmd_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._cmd_queue.put_nowait(None)
         if self._thread:
             self._thread.join(timeout=timeout_sec)
         self._worker_pool.shutdown(wait=False, cancel_futures=True)
@@ -2393,10 +3169,12 @@ class RoomOrchestrator:
 
     def _shutdown_resources(self, timeout_sec: float = 10.0) -> dict[str, int]:
         """Manager-parity resource cleanup (runs on orchestrator thread)."""
+        shutdown_deadline = _time.monotonic() + max(0.1, float(timeout_sec))
         stats = {
             "rooms": len(self._rooms),
             "recordings_stopped": 0,
             "previews_stopped": 0,
+            "shared_ingests_stopped": 0,
             "workers_cancelled": 0,
             "controllers_cleaned": 0,
             "previews_cleaned": 0,
@@ -2467,6 +3245,29 @@ class RoomOrchestrator:
                 except Exception as exc:
                     _log.warning("Recording stop failed for room %s: %s", room.room_id, exc)
 
+            # V2/shared-ingest recording can run without a legacy controller.
+            # Always release the room-owned upstream here so application
+            # restart cannot leave an ffmpeg process or preview queue alive.
+            try:
+                registry = get_shared_ingest_registry()
+                if registry.get(room.room_id) is not None:
+                    try:
+                        registry.stop_room(
+                            room.room_id,
+                            reason="orchestrator shutdown",
+                            deadline_monotonic=shutdown_deadline,
+                        )
+                    except TypeError as exc:
+                        if "deadline_monotonic" not in str(exc):
+                            raise
+                        registry.stop_room(
+                            room.room_id,
+                            reason="orchestrator shutdown",
+                        )
+                    stats["shared_ingests_stopped"] += 1
+            except Exception as exc:
+                _log.warning("Shared ingest cleanup failed for room %s: %s", room.room_id, exc)
+
             if controller is not None:
                 cleanup_fn = getattr(controller, "cleanup", None)
                 if callable(cleanup_fn):
@@ -2494,6 +3295,10 @@ class RoomOrchestrator:
             room.preview_paused = False
 
         self._rooms.clear()
+        self._pending_stream_infos.clear()
+        self._stream_leases.clear()
+        self._lease_managers.clear()
+        self._lease_refresh_inflight.clear()
         self._dirty_recording = False
         self._dirty_connection = False
         _log.info("RoomOrchestrator shutdown complete: %s", stats)
@@ -2602,6 +3407,136 @@ class RoomOrchestrator:
             return "输出文件长时间未增长，录制可能已卡住"
         return ""
 
+    def _shared_ingest_recovery_allowed(
+        self,
+        room: RoomSession,
+        ingest: Any,
+        error: str,
+    ) -> bool:
+        """Use typed supervisor failure state before legacy text heuristics."""
+        from lsc.platforms.failure import is_recoverable_failure
+        from lsc.utils.error_messages import is_recoverable_error
+
+        failure_kind = ""
+        supervisor = get_shared_ingest_registry().get_supervisor_if_exists(room.room_id)
+        if supervisor is not None:
+            try:
+                raw_failure_kind = supervisor.health().get("failure_kind", "") or ""
+                failure_kind = (
+                    normalize_failure_kind(raw_failure_kind).value
+                    if raw_failure_kind
+                    else ""
+                )
+            except Exception as exc:
+                _log.debug("shared ingest typed failure lookup failed: %s", redact_text(exc))
+        if failure_kind:
+            typed = normalize_failure_kind(failure_kind)
+            if typed is not FailureKind.UNKNOWN:
+                return is_recoverable_failure(typed)
+        from lsc.platforms.recovery_policy import recovery_action
+
+        saw_first_ts = bool(getattr(ingest, "_upstream_has_produced_data", False))
+        if recovery_action(getattr(room, "stream_info", None), error, saw_first_ts=saw_first_ts) == "rotate_lease":
+            return True
+        return bool(error and is_recoverable_error(error))
+
+    def _recover_shared_upstream_in_place(self, room: RoomSession) -> bool:
+        """Replace a dead remote upstream while keeping the recording sink and clock."""
+        registry = get_shared_ingest_registry()
+        ingest = registry.get(room.room_id)
+        if ingest is None:
+            return False
+        recording_live = getattr(ingest, "recording_sink_is_live", None)
+        if callable(recording_live):
+            recording_ok = bool(recording_live())
+        else:
+            recording_ok = bool(getattr(ingest, "recording_active", False))
+        preview_live = getattr(ingest, "preview_sink_is_live", None)
+        if callable(preview_live):
+            preview_ok = bool(preview_live())
+        else:
+            preview_ok = int(getattr(ingest, "preview_subscribers", 0) or 0) > 0
+        if not recording_ok and not preview_ok:
+            return False
+        upstream_live = getattr(ingest, "upstream_is_live", None)
+        if callable(upstream_live) and upstream_live():
+            return True
+        pending = None
+        take_pending = getattr(ingest, "take_pending_lease", None)
+        if callable(take_pending):
+            try:
+                pending = take_pending()
+            except Exception as exc:
+                _log.debug(
+                    "Room %s pending lease lookup failed: %s",
+                    room.room_id,
+                    redact_text(exc),
+                )
+                pending = None
+        stream_url = str((pending or {}).get("url") or "")
+        headers = dict((pending or {}).get("headers") or {})
+        network_context = dict(
+            (pending or {}).get("network_context")
+            or getattr(room, "network_context", {})
+            or {}
+        )
+        generation = (pending or {}).get("generation")
+        lease_id = str((pending or {}).get("lease_id") or "")
+        if not stream_url:
+            room.stream_parsed_at = 0.0
+            try:
+                if not self.refresh_stream_url(room.room_id, force=True):
+                    return False
+            except Exception as exc:
+                _log.warning(
+                    "Room %s in-place upstream refresh failed: %s",
+                    room.room_id,
+                    redact_text(exc),
+                )
+                return False
+            stream_url = _get_room_stream_url(room)
+            if not stream_url:
+                return False
+            stream_info = getattr(room, "stream_info", None)
+            headers = dict(getattr(stream_info, "headers", {}) or {})
+            network_context = dict(getattr(room, "network_context", {}) or {})
+            lease = self._stream_leases.get(room.room_id)
+            generation = getattr(lease, "generation", None) if lease is not None else None
+            lease_id = str(getattr(lease, "lease_id", "") or "")
+        lease = self._stream_leases.get(room.room_id)
+        lease_manager = self._lease_managers.get(room.room_id)
+        bind_lease = getattr(ingest, "bind_lease", None)
+        if callable(bind_lease) and lease_manager is not None and lease_id:
+            bind_lease(lease_manager, lease_id)
+        elif callable(bind_lease) and lease is not None and lease_manager is not None:
+            bind_lease(lease_manager, getattr(lease, "lease_id", ""))
+        supervisor = (
+            registry.get_supervisor_if_exists(room.room_id)
+            if callable(getattr(registry, "get_supervisor_if_exists", None))
+            else None
+        )
+        if supervisor is not None:
+            switch_upstream = getattr(supervisor, "switch_upstream", None)
+            if callable(switch_upstream):
+                return bool(
+                    switch_upstream(
+                        stream_url,
+                        headers=headers,
+                        network_context=network_context,
+                        generation=generation,
+                        reason_code="UPSTREAM_EOF_RECOVERY",
+                    )
+                )
+        replace = getattr(ingest, "replace_upstream", None)
+        if not callable(replace):
+            return False
+        error = replace(
+            stream_url,
+            headers=headers,
+            network_context=network_context,
+        )
+        return not str(error or "")
+
     def _attempt_recording_reconnect(self, room: RoomSession, error_msg: str) -> None:
         """Attempt to reconnect a failed recording with exponential backoff.
 
@@ -2625,18 +3560,32 @@ class RoomOrchestrator:
 
         # Check if error is recoverable
         if not is_recoverable_error(error_msg):
-            room.last_error = error_msg
-            room.is_recording = False
-            room.is_reconnecting = False
-            room.record_started_at = None
-            _log.warning("Room %s non-recoverable error: %s", room.room_id, error_msg)
-            controller = room.controller
-            if controller is not None:
-                try:
-                    controller.stop_recording()
-                except Exception as exc:
-                    _log.warning("Reconnect stop failed (non-recoverable) room=%s: %s", room.room_id, exc)
-            return
+            # 虎牙 FFmpeg 异常退出（尤其 code 0）多为 CDN 签名/线路问题，值得换线重连；
+            # 403/鉴权特征已在 watchdog 文案中保留，is_recoverable_error 仍优先匹配。
+            from lsc.platforms.recovery_policy import should_force_recovery
+
+            force_recovery = should_force_recovery(
+                getattr(room, "stream_info", None),
+                error_msg,
+            )
+            if force_recovery:
+                _log.info(
+                    "Room %s platform policy requested recovery: %s",
+                    room.room_id, error_msg,
+                )
+            else:
+                room.last_error = error_msg
+                room.is_recording = False
+                room.is_reconnecting = False
+                room.record_started_at = None
+                _log.warning("Room %s non-recoverable error: %s", room.room_id, error_msg)
+                controller = room.controller
+                if controller is not None:
+                    try:
+                        controller.stop_recording()
+                    except Exception as exc:
+                        _log.warning("Reconnect stop failed (non-recoverable) room=%s: %s", room.room_id, exc)
+                return
 
         if room.reconnect_attempts >= _MAX_RECONNECT_ATTEMPTS:
             room.last_error = error_msg
@@ -2683,6 +3632,14 @@ class RoomOrchestrator:
                   room.room_id, room.reconnect_attempts, _MAX_RECONNECT_ATTEMPTS)
         room.last_error = f"正在尝试恢复录制 ({room.reconnect_attempts}/{_MAX_RECONNECT_ATTEMPTS})..."
 
+        if self._recover_shared_upstream_in_place(room):
+            _log.info("Room %s recovered shared upstream without resetting recording", room.room_id)
+            room.reconnect_attempts = 0
+            room.reconnect_next_attempt_at = 0.0
+            room.is_reconnecting = False
+            room.last_error = ""
+            return
+
         # 保存原始错误信息和旧文件路径
         original_error = error_msg
         old_output_path = room.record_output_path
@@ -2692,8 +3649,21 @@ class RoomOrchestrator:
         registry = get_shared_ingest_registry()
         shared_ingest = registry.get(room.room_id)
         if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
-            shared_ingest.stop(reason="reconnect fast path")
-            registry.stop_room(room.room_id, reason="reconnect fast path")
+            lookup_supervisor = getattr(registry, "get_supervisor_if_exists", None)
+            supervisor = (
+                lookup_supervisor(room.room_id)
+                if callable(lookup_supervisor)
+                else None
+            )
+            if supervisor is not None:
+                # V2 recovery is sink-scoped: recording may restart while
+                # an attached preview keeps consuming the same upstream.
+                supervisor.stop_recording("reconnect fast path")
+                if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
+                    registry.stop_room(room.room_id, reason="reconnect fast path")
+            else:
+                shared_ingest.stop(reason="reconnect fast path")
+                registry.stop_room(room.room_id, reason="reconnect fast path")
         else:
             controller = room.controller
             if controller is not None:
@@ -2784,8 +3754,19 @@ class RoomOrchestrator:
             registry = get_shared_ingest_registry()
             shared_ingest = registry.get(room.room_id)
             if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
-                shared_ingest.stop(reason="proactive reconnect")
-                registry.stop_room(room.room_id, reason="proactive reconnect")
+                lookup_supervisor = getattr(registry, "get_supervisor_if_exists", None)
+                supervisor = (
+                    lookup_supervisor(room.room_id)
+                    if callable(lookup_supervisor)
+                    else None
+                )
+                if supervisor is not None:
+                    supervisor.stop_recording("proactive reconnect")
+                    if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
+                        registry.stop_room(room.room_id, reason="proactive reconnect")
+                else:
+                    shared_ingest.stop(reason="proactive reconnect")
+                    registry.stop_room(room.room_id, reason="proactive reconnect")
             else:
                 controller = room.controller
                 if controller is not None:
@@ -2832,6 +3813,8 @@ class RoomOrchestrator:
         """
         if getattr(room, "_reconnect_in_progress", False):
             return False
+        if self._use_supervised_recovery(room):
+            return self._start_supervised_recovery(room, error_msg)
         room._cancel_reconnect.clear()
         room._reconnect_in_progress = True
         try:
@@ -2842,6 +3825,65 @@ class RoomOrchestrator:
             room._reconnect_in_progress = False
             self._dirty_recording = True
         return True
+
+    def _use_supervised_recovery(self, room: RoomSession) -> bool:
+        """Return whether this room is running the V2 single-recovery path."""
+        if not self._pipeline_component_enabled("ingest_supervisor_v2", room):
+            return False
+        return get_shared_ingest_registry().get_supervisor_if_exists(room.room_id) is not None
+
+    def _start_supervised_recovery(self, room: RoomSession, error_msg: str) -> bool:
+        """Run one reconnect through IngestSupervisor's unique coordinator."""
+        supervisor = get_shared_ingest_registry().get_supervisor_if_exists(room.room_id)
+        if supervisor is None or getattr(room, "_reconnect_in_progress", False):
+            return False
+        from lsc.platforms.failure import classify_failure
+        from lsc.platforms.recovery_policy import recovery_action
+
+        room._cancel_reconnect.clear()
+        room._reconnect_in_progress = True
+        original_next = room.reconnect_next_attempt_at
+        room.reconnect_next_attempt_at = _time.monotonic()
+
+        def recover(_recovery_id: str) -> bool:
+            self._attempt_recording_reconnect(room, error_msg)
+            return bool(room.is_recording and not room.is_reconnecting)
+
+        try:
+            registry = get_shared_ingest_registry()
+            getter = getattr(registry, "get", None)
+            ingest = getter(room.room_id) if callable(getter) else None
+            saw_first_ts = bool(getattr(ingest, "_upstream_has_produced_data", False))
+            action = recovery_action(
+                getattr(room, "stream_info", None),
+                error_msg,
+                saw_first_ts=saw_first_ts,
+            )
+            if action == "restart_preview_sink":
+                restart = getattr(supervisor, "restart_preview_sink", None)
+                if callable(restart):
+                    return bool(restart())
+            if action == "rotate_lease":
+                def rotate(_recovery_id: str) -> bool:
+                    return self._recover_shared_upstream_in_place(room)
+
+                return bool(
+                    supervisor.run_recovery(
+                        rotate,
+                        reason_code=classify_failure(error_msg).value,
+                    )
+                )
+            return bool(
+                supervisor.run_recovery(
+                    recover,
+                    reason_code=classify_failure(error_msg).value,
+                )
+            )
+        finally:
+            room._reconnect_in_progress = False
+            if not room.is_reconnecting and not room.is_recording:
+                room.reconnect_next_attempt_at = original_next if original_next > 0 else 0.0
+            self._dirty_recording = True
 
     def _start_global_timer(self) -> None:
         self._ensure_tick_armed()
@@ -2880,19 +3922,27 @@ class RoomOrchestrator:
             room_medium = is_medium_tick and (room_idx % _STAGGER_GROUPS == stagger_slot)
 
             # ── Shared ingest health check (controller is None in Electron) ──
-            if controller is None and room.is_recording:
-                registry = get_shared_ingest_registry()
-                ingest = registry.get(room.room_id)
+            registry = get_shared_ingest_registry()
+            ingest = registry.get(room.room_id)
+            use_shared_health = ingest is not None and (
+                room.is_recording or room.preview_enabled
+            )
+            if use_shared_health:
+                self._maybe_prefetch_http_session_lease(room)
                 if ingest is not None:
                     # 关键修复：上游退出后 recording_active 会立即变为 False。
                     # 如果错误可恢复（403/网络断开），先尝试重连再放弃；
                     # 仅在不可恢复或重连耗尽时才标记录制停止。
-                    if not getattr(ingest, "recording_active", False) and not room.is_reconnecting:
+                    if (
+                        room.is_recording
+                        and not getattr(ingest, "recording_active", False)
+                        and not room.is_reconnecting
+                    ):
                         err = getattr(ingest, "recording_error", "") or getattr(ingest, "upstream_error", "")
                         # 标记失败的 CDN 线路，让下次 re-parse 跳过它
-                        _mark_failed_cdn_if_huya(room, err)
-                        from lsc.utils.error_messages import is_recoverable_error
-                        if err and is_recoverable_error(err) and room.reconnect_attempts < _MAX_RECONNECT_ATTEMPTS:
+                        _mark_failed_candidate(room, err)
+                        recoverable = self._shared_ingest_recovery_allowed(room, ingest, err)
+                        if err and recoverable and room.reconnect_attempts < _MAX_RECONNECT_ATTEMPTS:
                             _log.warning(
                                 "Room %s shared ingest 已停止（可恢复），触发重连: %s",
                                 room.room_id, err[:120],
@@ -2916,10 +3966,55 @@ class RoomOrchestrator:
                             )
                             continue
                     ingest_error = getattr(ingest, "recording_error", "") or getattr(ingest, "upstream_error", "")
-                    if ingest_error and not room.is_reconnecting:
+                    rotate_lease = False
+                    if ingest_error:
+                        from lsc.platforms.recovery_policy import recovery_action as _recovery_action
+
+                        rotate_lease = (
+                            _recovery_action(
+                                getattr(room, "stream_info", None),
+                                ingest_error,
+                                saw_first_ts=bool(
+                                    getattr(ingest, "_upstream_has_produced_data", False)
+                                ),
+                            )
+                            == "rotate_lease"
+                        )
+                    if rotate_lease and not room.is_reconnecting:
+                        _log.info(
+                            "Room %s rotating signed HTTP lease: %s",
+                            room.room_id,
+                            ingest_error[:120],
+                        )
+                        if self._use_supervised_recovery(room):
+                            self._start_supervised_recovery(room, ingest_error)
+                        else:
+                            self._recover_shared_upstream_in_place(room)
+                    elif ingest_error and not room.is_reconnecting and not self._shared_ingest_recovery_allowed(room, ingest, ingest_error):
+                        if not room.is_recording:
+                            continue
+                        _log.warning(
+                            "Room %s shared ingest terminal failure; skip reconnect: %s",
+                            room.room_id,
+                            ingest_error,
+                        )
+                        room.is_recording = False
+                        room.is_reconnecting = False
+                        room.last_error = ingest_error
+                        self._dirty_recording = True
+                        self.bus.emit(
+                            "recording_stopped",
+                            room.room_id,
+                            "shared_ingest_terminal_failure",
+                            ingest_error,
+                        )
+                    elif ingest_error and not room.is_reconnecting:
                         _log.warning("Room %s shared ingest error: %s", room.room_id, ingest_error)
-                        _mark_failed_cdn_if_huya(room, ingest_error)
-                        self._start_recording_reconnect_thread(room, ingest_error)
+                        if room.is_recording:
+                            _mark_failed_candidate(room, ingest_error)
+                            self._start_recording_reconnect_thread(room, ingest_error)
+                        elif room.preview_enabled and self._use_supervised_recovery(room):
+                            self._start_supervised_recovery(room, ingest_error)
                     elif room_medium and not room.is_reconnecting:
                         if getattr(ingest, "recording_active", False) and room.record_output_path:
                             stall_msg = self._check_shared_ingest_file_stall(room)
@@ -3008,7 +4103,7 @@ class RoomOrchestrator:
                         pass
 
                 if room.is_recording and room.record_output_path:
-                    self._worker_pool.submit(
+                    self._submit_worker(
                         SizeUpdateJob(room, room.record_output_path).run
                     )
 
@@ -3025,7 +4120,7 @@ class RoomOrchestrator:
                         error_msg = None
                     if error_msg:
                         _log.warning("Room %s watchdog: %s", room.room_id, error_msg)
-                        _mark_failed_cdn_if_huya(room, error_msg)
+                        _mark_failed_candidate(room, error_msg)
                         self._start_recording_reconnect_thread(room, error_msg)
 
             # 重连到期必须每 tick 检查，不得被交错轮询推迟
@@ -3039,6 +4134,8 @@ class RoomOrchestrator:
 
             # ── Low-frequency (~12s): disk space check ──
             if is_low_tick and room.is_recording:
+                if self._pipeline_component_enabled("stream_lease_v2", room):
+                    self._schedule_v2_lease_refresh(room)
                 try:
                     rec_dir = (
                         getattr(controller, "output_dir", "")

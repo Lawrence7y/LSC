@@ -18,29 +18,85 @@ import {
 import { RoomSession } from '@/types'
 import { VideoPreview } from '@/components/VideoPreview'
 import { formatTime } from '@/utils/time'
-import { computeDvrLeftEdge } from '@/utils/timelineWindow'
-import { retainClockLoop, subscribeClock } from '@/utils/playheadStore'
+import { computeExpandedPreviewWindow } from '@/utils/timelineWindow'
+import { isNoDvrPreviewMode } from '@/utils/timelineCoords'
+import { readPlayhead, retainClockLoop, subscribeClock } from '@/utils/playheadStore'
 import { useAppStore } from '@/store/appStore'
 
-function openDouyinCookieSettings(e: React.MouseEvent) {
+function openCredentialSettings(e: React.MouseEvent) {
   e.stopPropagation()
   useAppStore.getState().setSettingsDrawerOpen(true)
 }
 
-/** 抖音缺 Cookie / 验证页类错误，引导用户去设置页配置 Cookie */
-function isDouyinCookieError(room: RoomSession): boolean {
+/** 根据统一 pipeline health 提示任何平台的凭据失效。 */
+function isCredentialError(room: RoomSession): boolean {
+  const health = room.pipeline_health
+  const failureKind = String(health?.failure_kind || '').toUpperCase()
+  if (failureKind === 'AUTH_REQUIRED' || failureKind === 'AUTH_EXPIRED') return true
+  const credentialStatus = String(health?.credential_status || '').toUpperCase()
+  if (
+    ['NOT_CONFIGURED', 'INVALID', 'EXPIRED', 'INTERACTION_REQUIRED'].includes(credentialStatus) &&
+    (health?.credential_kinds || []).length > 0
+  ) return true
   const text = `${room.last_error || ''} ${room.mse_error || ''}`.toLowerCase()
   if (!text.trim()) return false
-  const isDouyin = room.platform === 'douyin' || (room.platform_name || '').includes('抖音')
-  if (!isDouyin) return false
   return (
     text.includes('cookie') ||
     text.includes('验证中间页') ||
     text.includes('验证码') ||
-    text.includes('抖音 cookie') ||
-    text.includes('设置 → 抖音') ||
-    text.includes('设置页')
+    text.includes('login required') ||
+    text.includes('auth_required') ||
+    text.includes('auth expired') ||
+    text.includes('需要登录') ||
+    text.includes('登录态已过期')
   )
+}
+
+function credentialSettingsAvailable(room: RoomSession): boolean {
+  // The capability declaration, rather than a platform-name branch, owns
+  // whether the configured Cookie/credential provider has a settings surface.
+  return (room.pipeline_health?.credential_kinds || []).length > 0
+}
+
+function credentialErrorTitle(room: RoomSession): string {
+  const label = room.platform_name || room.platform || '平台'
+  return `需要${label}凭据`
+}
+
+function readMseBuffered(video: HTMLVideoElement | undefined | null): { start: number; end: number } {
+  try {
+    const ranges = video?.buffered
+    if (ranges && ranges.length > 0) {
+      return { start: ranges.start(0), end: ranges.end(ranges.length - 1) }
+    }
+  } catch {
+    // SourceBuffer 更新中可能抛 InvalidStateError
+  }
+  return { start: 0, end: 0 }
+}
+
+function expandedWindowFromVideo(opts: {
+  liveDvr: boolean
+  previewPos: number
+  previewDuration: number
+  markIn?: number | null
+  markOut?: number | null
+  video?: HTMLVideoElement | null
+  followLive?: boolean
+}) {
+  const buffered = readMseBuffered(opts.video)
+  const duration = opts.video?.duration
+  return computeExpandedPreviewWindow({
+    liveDvr: opts.liveDvr,
+    previewPos: opts.previewPos,
+    bufferedStart: buffered.start,
+    bufferedEnd: buffered.end,
+    previewDuration: opts.previewDuration,
+    fileDuration: Number.isFinite(duration) ? duration as number : 0,
+    markIn: opts.markIn,
+    markOut: opts.markOut,
+    followLive: opts.followLive,
+  })
 }
 
 interface RoomCardProps {
@@ -68,6 +124,8 @@ interface RoomCardProps {
   /** 放大态播放器控制：预览播放位置（秒，仅放大房间传入实时值） */
   previewPos?: number
   previewDuration?: number
+  /** 放大预览条跟播：true 时播放头钉在右沿 */
+  followLive?: boolean
   onPlayPause?: () => void
   onSeekBack?: () => void
   onSeekFwd?: () => void
@@ -107,6 +165,7 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
   if (prev.onSeekFwd !== next.onSeekFwd) return false
   if (prev.onSeekTo !== next.onSeekTo) return false
   if (prev.previewDuration !== next.previewDuration) return false
+  if (prev.followLive !== next.followLive) return false
   if (prev.detectedRounds !== next.detectedRounds) return false
   // previewPos 高频变化：仅当本卡处于放大态才参与比较，避免普通卡片每秒重渲染
   if (prev.previewPos !== next.previewPos && next.expandedRoomId != null && next.expandedRoomId === next.room.room_id) return false
@@ -138,6 +197,25 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
     a.mark_out === b.mark_out &&
     a.stream_url === b.stream_url &&
     a.preview_mode === b.preview_mode
+    && a.pipeline_health?.platform_id === b.pipeline_health?.platform_id
+    && a.pipeline_health?.pipeline_mode === b.pipeline_health?.pipeline_mode
+    && a.pipeline_health?.platform === b.pipeline_health?.platform
+    && a.pipeline_health?.support_level === b.pipeline_health?.support_level
+    && a.pipeline_health?.connection_policy === b.pipeline_health?.connection_policy
+    && a.pipeline_health?.credential_status === b.pipeline_health?.credential_status
+    && JSON.stringify(a.pipeline_health?.credential_kinds) === JSON.stringify(b.pipeline_health?.credential_kinds)
+    && a.pipeline_health?.resolver === b.pipeline_health?.resolver
+    && a.pipeline_health?.ingest === b.pipeline_health?.ingest
+    && a.pipeline_health?.recording === b.pipeline_health?.recording
+    && a.pipeline_health?.preview === b.pipeline_health?.preview
+    && a.pipeline_health?.error === b.pipeline_health?.error
+    && a.pipeline_health?.failure_kind === b.pipeline_health?.failure_kind
+    && a.pipeline_health?.lease_id === b.pipeline_health?.lease_id
+    && a.pipeline_health?.candidate_id === b.pipeline_health?.candidate_id
+    && a.pipeline_health?.generation === b.pipeline_health?.generation
+    && a.pipeline_health?.recovery_attempt === b.pipeline_health?.recovery_attempt
+    && a.pipeline_health?.max_recovery_attempts === b.pipeline_health?.max_recovery_attempts
+    && JSON.stringify(a.pipeline_health?.resources) === JSON.stringify(b.pipeline_health?.resources)
   )
 }
 
@@ -161,6 +239,7 @@ export const RoomCard = memo(function RoomCard({
   recordingTick = 0,
   previewPos = 0,
   previewDuration = 0,
+  followLive = true,
   onPlayPause,
   onSeekBack,
   onSeekFwd,
@@ -219,6 +298,10 @@ export const RoomCard = memo(function RoomCard({
   }, [room.is_recording, room.record_started_at, tick])
 
   const recordedLabelRef = useRef<HTMLSpanElement>(null)
+  const expStartLabelRef = useRef<HTMLSpanElement>(null)
+  const expEndLabelRef = useRef<HTMLSpanElement>(null)
+  const expThumbRef = useRef<HTMLSpanElement>(null)
+  const expFillRef = useRef<HTMLSpanElement>(null)
   useEffect(() => {
     if (!room.is_recording || !room.record_started_at) return
     const startedAt = new Date(room.record_started_at).getTime()
@@ -238,62 +321,80 @@ export const RoomCard = memo(function RoomCard({
   /** 放大态播放控制所需派生量 */
   const isPreviewPlaying = room.preview_enabled && !room.preview_paused
   const videoElement = window.__msePlayers?.[room.room_id]?.player?.videoElement
-  const playerDuration = videoElement?.duration ?? 0
-  const finitePlayerDuration = Number.isFinite(playerDuration) ? playerDuration : 0
-  const isFileReview = room.preview_mode === 'recording_review'
-  const supportsLiveDvr = !isFileReview && room.preview_mode !== 'degraded'
-  let bufferedStart = 0
-  let bufferedEnd = 0
-  try {
-    const ranges = videoElement?.buffered
-    if (ranges && ranges.length > 0) {
-      bufferedStart = ranges.start(0)
-      bufferedEnd = ranges.end(ranges.length - 1)
-    }
-  } catch {
-    bufferedStart = 0
-    bufferedEnd = 0
-  }
-  const fallbackEnd = Math.max(
-    previewDuration,
-    finitePlayerDuration,
+  const supportsLiveDvr = !isNoDvrPreviewMode(room.preview_mode)
+  const expandedWindow = expandedWindowFromVideo({
+    liveDvr: supportsLiveDvr,
     previewPos,
-    recordingElapsedSeconds,
-    room.mark_in ?? 0,
-    room.mark_out ?? 0,
-    1,
-  )
-  const hasLiveDvrRange = supportsLiveDvr && bufferedEnd - bufferedStart > 1
-  const liveEdge = hasLiveDvrRange ? bufferedEnd : fallbackEnd
-  const purple = hasLiveDvrRange ? computeDvrLeftEdge(liveEdge) : 0
-  // 预览条左端 = 紫线 = liveEdge − 120s（不再在紫线左侧留 lead）
-  const expTimelineStart = hasLiveDvrRange ? purple : 0
-  const expTimelineEnd = hasLiveDvrRange
-    ? bufferedEnd
-    : fallbackEnd
-  const expTimelineSpan = Math.max(1, expTimelineEnd - expTimelineStart)
-  const replayBoundary = purple
-  const replayBoundaryPct = Math.max(
-    0,
-    Math.min(100, ((replayBoundary - expTimelineStart) / expTimelineSpan) * 100),
-  )
-  const expProgressPct = Math.max(
-    0,
-    Math.min(100, ((previewPos - expTimelineStart) / expTimelineSpan) * 100),
-  )
-  const progressFillLeftPct = hasLiveDvrRange ? replayBoundaryPct : 0
-  const progressFillWidthPct = Math.max(0, expProgressPct - progressFillLeftPct)
+    previewDuration,
+    markIn: room.mark_in,
+    markOut: room.mark_out,
+    video: videoElement,
+    followLive: supportsLiveDvr && followLive,
+  })
+  const expTimelineStart = expandedWindow.start
+  const expTimelineEnd = expandedWindow.end
+  const expTimelineSpan = Math.max(1e-6, expTimelineEnd - expTimelineStart)
+  const replayBoundary = expandedWindow.purple
+  const replayBoundaryPct = 0
+  const expProgressPct = expandedWindow.playheadPct
+  const progressFillLeftPct = expandedWindow.fillLeftPct
+  const progressFillWidthPct = expandedWindow.fillWidthPct
+  const hasLiveDvrRange = expandedWindow.hasLiveDvr
+
+  useEffect(() => {
+    if (!isExpanded) return
+    const release = retainClockLoop()
+    const unsub = subscribeClock(() => {
+      const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
+      const pos = video && Number.isFinite(video.currentTime)
+        ? Math.max(0, video.currentTime)
+        : readPlayhead(room.room_id)
+      const win = expandedWindowFromVideo({
+        liveDvr: supportsLiveDvr,
+        previewPos: pos,
+        previewDuration,
+        markIn: room.mark_in,
+        markOut: room.mark_out,
+        video,
+        followLive: supportsLiveDvr && followLive,
+      })
+      if (expStartLabelRef.current) expStartLabelRef.current.textContent = formatTime(win.start)
+      if (expEndLabelRef.current) expEndLabelRef.current.textContent = formatTime(win.end)
+      if (expThumbRef.current) expThumbRef.current.style.left = `${win.playheadPct}%`
+      if (expFillRef.current) {
+        expFillRef.current.style.left = `${win.fillLeftPct}%`
+        expFillRef.current.style.width = `${win.fillWidthPct}%`
+      }
+    })
+    return () => {
+      unsub()
+      release()
+    }
+  }, [isExpanded, room.room_id, supportsLiveDvr, previewDuration, room.mark_in, room.mark_out, followLive])
+
   const seekExpandedTimeline = (clientX: number, track: HTMLElement) => {
-    if (!onSeekTo || expTimelineSpan <= 0) return
+    if (!onSeekTo) return
+    const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
+    const pos = video && Number.isFinite(video.currentTime)
+      ? Math.max(0, video.currentTime)
+      : previewPos
+    const win = expandedWindowFromVideo({
+      liveDvr: supportsLiveDvr,
+      previewPos: pos,
+      previewDuration,
+      markIn: room.mark_in,
+      markOut: room.mark_out,
+      video,
+      followLive: supportsLiveDvr && followLive,
+    })
+    const span = Math.max(1e-6, win.end - win.start)
     const rect = track.getBoundingClientRect()
     const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)))
-    let target = expTimelineStart + ratio * expTimelineSpan
-    if (hasLiveDvrRange) {
-      const boundaryRatio = replayBoundaryPct / 100
+    let target = win.start + ratio * span
+    if (win.hasLiveDvr) {
       const snapRatio = Math.min(0.08, 14 / Math.max(1, rect.width))
-      // 左侧整体不可回放；边界右侧 14px 内也吸附到最早可回放位置。
-      if (ratio <= boundaryRatio + snapRatio) {
-        target = replayBoundary
+      if (ratio <= snapRatio) {
+        target = win.purple
       }
     }
     onSeekTo(room.room_id, target)
@@ -573,7 +674,7 @@ export const RoomCard = memo(function RoomCard({
                 marginBottom: 4,
               }}
             >
-              {isDouyinCookieError(room) ? '需要抖音 Cookie' : '连接失败'}
+              {isCredentialError(room) ? credentialErrorTitle(room) : '连接失败'}
             </div>
             <Tooltip title={room.last_error}>
               <div
@@ -585,15 +686,15 @@ export const RoomCard = memo(function RoomCard({
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
-                  marginBottom: isDouyinCookieError(room) ? 8 : 0,
+                  marginBottom: isCredentialError(room) && credentialSettingsAvailable(room) ? 8 : 0,
                 }}
               >
                 {room.last_error}
               </div>
             </Tooltip>
-            {isDouyinCookieError(room) && (
-              <Button size="small" type="primary" onClick={openDouyinCookieSettings}>
-                去设置 Cookie
+            {isCredentialError(room) && credentialSettingsAvailable(room) && (
+              <Button size="small" type="primary" onClick={openCredentialSettings}>
+                去设置凭据
               </Button>
             )}
           </div>
@@ -631,7 +732,7 @@ export const RoomCard = memo(function RoomCard({
             {isExpanded ? (
               <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, display: 'flex', flexDirection: 'column', background: 'linear-gradient(transparent, rgba(0,0,0,0.78))', zIndex: 9 }}>
                 <div className="room-card__expanded-timeline">
-                  <span className="room-card__expanded-time">{formatTime(expTimelineStart)}</span>
+                  <span ref={expStartLabelRef} className="room-card__expanded-time">{formatTime(expTimelineStart)}</span>
                   <div
                     role="slider"
                     tabIndex={0}
@@ -718,6 +819,7 @@ export const RoomCard = memo(function RoomCard({
                       )
                     })}
                     <span
+                      ref={expFillRef}
                       className="room-card__expanded-track-fill"
                       style={{
                         left: `${progressFillLeftPct}%`,
@@ -725,11 +827,12 @@ export const RoomCard = memo(function RoomCard({
                       }}
                     />
                     <span
+                      ref={expThumbRef}
                       className="room-card__expanded-track-thumb"
                       style={{ left: `${expProgressPct}%` }}
                     />
                   </div>
-                  <span className="room-card__expanded-time room-card__expanded-time--end">
+                  <span ref={expEndLabelRef} className="room-card__expanded-time room-card__expanded-time--end">
                     {formatTime(expTimelineEnd)}
                   </span>
                 </div>

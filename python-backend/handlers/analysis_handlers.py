@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +22,8 @@ from persistence import (
     load_analysis_results,
     save_analysis_results,
 )
+
+from lsc.recorder.assets import RecordingAsset
 
 _log = logging.getLogger('lsc.handlers')
 
@@ -41,6 +44,29 @@ _refined_round_keys: set[str] = set()
 _refined_round_keys_lock = threading.Lock()
 
 _CLIP_KEY_CACHE_MAX = 20000
+
+
+@contextmanager
+def _room_recording_input(room):
+    """Yield a single media path for both legacy and manifest recordings."""
+    manifest_path = getattr(room, 'record_manifest_path', '') or ''
+    if manifest_path and os.path.isfile(manifest_path):
+        from lsc.config import load_config
+
+        cfg = load_config()
+        asset = RecordingAsset.recover(manifest_path)
+        with asset.materialized_input(
+            ffmpeg_path=cfg.ffmpeg_path,
+            ffprobe_path=cfg.ffprobe_path,
+            cleanup=False,
+        ) as media_path:
+            yield media_path
+        return
+
+    media_path = getattr(room, 'record_output_path', '') or ''
+    if not media_path or not os.path.isfile(media_path):
+        raise FileNotFoundError('录制文件不存在')
+    yield media_path
 
 
 def _bounded_clip_key_add(cache: dict, key: str, value: Any = None) -> None:
@@ -179,13 +205,19 @@ def register_analysis_handlers(
                 with _analysis_jobs_lock:
                     _analysis_jobs[room_id].update(completed_at=time.time(), error='房间不存在')
                 return {'success': False, 'error': '房间不存在'}
-            if not room.record_output_path or not os.path.isfile(room.record_output_path):
+            if not (
+                (getattr(room, 'record_manifest_path', '') and os.path.isfile(room.record_manifest_path))
+                or (getattr(room, 'record_output_path', '') and os.path.isfile(room.record_output_path))
+            ):
                 with _analysis_jobs_lock:
                     _analysis_jobs[room_id].update(completed_at=time.time(), error='录制文件不存在')
                 return {'success': False, 'error': '录制文件不存在'}
 
-            video_path = room.record_output_path
             t0 = time.monotonic()
+            analysis_storage_path = (
+                getattr(room, 'record_manifest_path', '')
+                or getattr(room, 'record_output_path', '')
+            )
 
             def _progress_cb(stage, progress, detail):
                 with _analysis_jobs_lock:
@@ -199,10 +231,11 @@ def register_analysis_handlers(
                 with _analysis_jobs_lock:
                     return _analysis_jobs.get(room_id, {}).get('cancelled', False)
 
-            highlights = analyze_scene_or_rounds(
-                video_path, game=game, threshold=threshold,
-                progress_callback=_progress_cb, cancel_check=_cancel_check,
-            )
+            with _room_recording_input(room) as video_path:
+                highlights = analyze_scene_or_rounds(
+                    video_path, game=game, threshold=threshold,
+                    progress_callback=_progress_cb, cancel_check=_cancel_check,
+                )
             if highlights is None:
                 return {'success': False, 'error': '分析已取消', 'cancelled': True}
             with _analysis_jobs_lock:
@@ -220,7 +253,13 @@ def register_analysis_handlers(
                     "completed_at": time.time(),
                 }
             analysis_time = time.monotonic() - t0
-            save_analysis_results(video_path, room_id, mode, highlights, analysis_time_sec=analysis_time)
+            save_analysis_results(
+                analysis_storage_path,
+                room_id,
+                mode,
+                highlights,
+                analysis_time_sec=analysis_time,
+            )
             _log.info("分析完成: room_id=%s, mode=%s, highlights=%d", room_id, mode, len(highlights))
             return {'success': True, 'mode': mode, 'highlights': highlights}
 
@@ -306,8 +345,11 @@ def register_analysis_handlers(
                     )
                 return {'success': False, 'error': error}
 
-            video_path = main_room.record_output_path
             t0 = time.monotonic()
+            analysis_storage_path = (
+                getattr(main_room, 'record_manifest_path', '')
+                or getattr(main_room, 'record_output_path', '')
+            )
 
             def _progress_cb(stage, progress, detail):
                 with _analysis_jobs_lock:
@@ -321,27 +363,30 @@ def register_analysis_handlers(
                 with _analysis_jobs_lock:
                     return _analysis_jobs.get(main_room_id, {}).get('cancelled', False)
 
-            highlights = analyze_scene_or_rounds(
-                video_path, game=game, threshold=threshold,
-                progress_callback=_progress_cb, cancel_check=_cancel_check,
-            )
+            with _room_recording_input(main_room) as video_path:
+                highlights = analyze_scene_or_rounds(
+                    video_path, game=game, threshold=threshold,
+                    progress_callback=_progress_cb, cancel_check=_cancel_check,
+                )
+                if highlights is None:
+                    return {'success': False, 'error': '分析已取消', 'cancelled': True}
+                with _analysis_jobs_lock:
+                    if _analysis_jobs.get(main_room_id, {}).get('cancelled'):
+                        return {'success': False, 'error': '分析已取消', 'cancelled': True}
+
+                for _h in highlights:
+                    _h.setdefault("reason", "场景切换频繁")
+                    _h.setdefault("speech_score", 0.0)
+                    _h.setdefault("visual_score", 0.0)
+                    _h.setdefault("transcript", "")
+
+                analysis_time = time.monotonic() - t0
+                save_analysis_results(
+                    analysis_storage_path, main_room_id, mode, highlights,
+                    analysis_time_sec=analysis_time, weights=weights if weights else None,
+                )
             if highlights is None:
                 return {'success': False, 'error': '分析已取消', 'cancelled': True}
-            with _analysis_jobs_lock:
-                if _analysis_jobs.get(main_room_id, {}).get('cancelled'):
-                    return {'success': False, 'error': '分析已取消', 'cancelled': True}
-
-            for _h in highlights:
-                _h.setdefault("reason", "场景切换频繁")
-                _h.setdefault("speech_score", 0.0)
-                _h.setdefault("visual_score", 0.0)
-                _h.setdefault("transcript", "")
-
-            analysis_time = time.monotonic() - t0
-            save_analysis_results(
-                video_path, main_room_id, mode, highlights,
-                analysis_time_sec=analysis_time, weights=weights if weights else None,
-            )
             with _analysis_jobs_lock:
                 _analysis_jobs[main_room_id] = {
                     "progress": 1.0, "highlights": highlights, "mode": mode, "completed_at": time.time(),
@@ -433,10 +478,15 @@ def register_analysis_handlers(
                 job = dict(job)
         if job is None:
             room = manager.get_room(room_id)
-            video_path = getattr(room, 'record_output_path', '') if room else ''
-            if video_path and os.path.isfile(video_path):
-                stored = load_analysis_results(video_path)
-                if stored and not is_analysis_stale(video_path, stored):
+            storage_path = ""
+            if room is not None:
+                storage_path = (
+                    getattr(room, 'record_manifest_path', '')
+                    or getattr(room, 'record_output_path', '')
+                )
+            if storage_path and os.path.isfile(storage_path):
+                stored = load_analysis_results(storage_path)
+                if stored and not is_analysis_stale(storage_path, stored):
                     return {
                         'progress': 1.0,
                         'highlights': stored.get('highlights', []),

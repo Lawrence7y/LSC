@@ -16,6 +16,41 @@ def test_websocket_defines_disconnected_queue_policy() -> None:
     assert "return false" in source
 
 
+def test_pipeline_health_nested_values_use_structural_equality() -> None:
+    """健康投影每次更新都会创建新对象，比较器不能按引用触发整树刷新。"""
+    source = (ROOT / "lsc-electron/src/store/appStore.ts").read_text(encoding="utf-8")
+    health_block = source.split("const healthKeys = [", 1)[1].split("continue", 1)[0]
+    assert "healthKey === 'credential_kinds' || healthKey === 'resources'" in health_block
+    assert "JSON.stringify(leftValue) !== JSON.stringify(rightValue)" in health_block
+
+
+def test_pipeline_health_comparator_tracks_failure_kind() -> None:
+    source = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "pipeline_health?.failure_kind" in source
+    assert "healthLabels" not in source
+    assert "房间管线健康状态" not in source
+
+
+def test_runtime_events_are_ordered_and_projected_into_room_health() -> None:
+    source = (ROOT / "lsc-electron/src/hooks/useWebSocket.ts").read_text(encoding="utf-8")
+
+    assert "_lastRuntimeEventByRoom" in source
+    assert "_isStaleRuntimeEvent" in source
+    assert "lease_generation" in source
+    assert "occurred_at" in source
+    assert "wsClient.on('runtime_event'" in source
+    assert "pipeline_health: health" in source
+    assert "_lastRuntimeEventByRoom.clear()" in source
+
+
+def test_websocket_reconciles_rooms_after_reconnect_before_incremental_events() -> None:
+    source = (ROOT / "lsc-electron/src/hooks/useWebSocket.ts").read_text(encoding="utf-8")
+    connected_body = source.split("const unsubConnected", 1)[1].split("const unsubDisconnected", 1)[0]
+    assert "wsClient.send('get_rooms', {})" in connected_body
+
+
 def test_disconnected_write_ops_surface_user_warning() -> None:
     """断线写操作须在 useWebSocket 封装层提示用户，而非静默丢弃。"""
     hook = (ROOT / "lsc-electron/src/hooks/useWebSocket.ts").read_text(encoding="utf-8")
@@ -122,7 +157,10 @@ def test_video_preview_resets_player_on_preview_source_change() -> None:
 
 def test_preview_audio_capture_disconnects_only_current_recorder_from_shared_source() -> None:
     source = (ROOT / "lsc-electron/src/utils/previewAudioAligner.ts").read_text(encoding="utf-8")
-    cleanup_body = source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
+    # The ScriptProcessor fallback has its own cleanup; inspect the worklet
+    # cleanup that owns the shared MediaElementSource edge.
+    worklet_source = source.split("const disconnectPartial = () => {", 1)[1]
+    cleanup_body = worklet_source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
 
     assert "disconnectPartial()" in cleanup_body
     assert "connectedSource.disconnect(workletNode)" in source
@@ -131,7 +169,8 @@ def test_preview_audio_capture_disconnects_only_current_recorder_from_shared_sou
 
 def test_preview_audio_capture_temporarily_unmutes_shared_media_element() -> None:
     source = (ROOT / "lsc-electron/src/utils/previewAudioAligner.ts").read_text(encoding="utf-8")
-    cleanup_body = source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
+    worklet_source = source.split("const disconnectPartial = () => {", 1)[1]
+    cleanup_body = worklet_source.split("const cleanup = () => {", 1)[1].split("const timeout = setTimeout", 1)[0]
 
     assert "withMuteSyncSuppressed" in source
     assert "ensureElementAudible" in source
@@ -824,12 +863,37 @@ def test_douyin_cookie_error_shows_settings_guidance() -> None:
     assert "setSettingsDrawerOpen" in room_card or "settingsDrawerOpen" in room_card
 
 
+def test_room_card_uses_platform_health_for_credential_errors() -> None:
+    room_card = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    assert "isCredentialError" in room_card
+    assert "failure_kind" in room_card
+    assert "credential_status" in room_card
+    assert "isDouyinCookieError" not in room_card
+
+
+def test_video_preview_phase_hint_is_platform_agnostic() -> None:
+    """预览等待提示由统一阶段驱动，不在前端按平台名称分支。"""
+    source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    phase_block = source.split("const phaseHint", 1)[1].split("return (", 1)[0]
+    assert "previewPhase === 'refreshing_url'" in phase_block
+    assert "bilibili" not in phase_block.lower()
+    assert "platform" not in phase_block.lower()
+
+
 def test_settings_has_bilibili_cookie_management() -> None:
     """设置页须提供与抖音同款的 B 站 Cookie 粘贴/保存入口。"""
     settings = (ROOT / "lsc-electron/src/pages/Settings/index.tsx").read_text(encoding="utf-8")
     assert "B站 Cookie" in settings or "B 站 Cookie" in settings
     assert "get_bilibili_cookie_status" in settings
     assert "save_bilibili_cookies" in settings
+
+
+def test_settings_has_huya_cookie_management() -> None:
+    """设置页须提供与抖音/B 站同款的虎牙 Cookie 粘贴/保存入口。"""
+    settings = (ROOT / "lsc-electron/src/pages/Settings/index.tsx").read_text(encoding="utf-8")
+    assert "虎牙 Cookie" in settings
+    assert "get_huya_cookie_status" in settings
+    assert "save_huya_cookies" in settings
 
 
 def test_connect_does_not_restore_persisted_rooms() -> None:
@@ -1605,12 +1669,18 @@ def test_timeline_1x_zero_and_dvr_lookback_contract() -> None:
     assert "DVR_LOOKBACK_SEC = 120" in window
     assert "export function computeTimelineWindow" in window
     assert "export function computeDvrLeftEdge" in window
+    assert "export function computeExpandedPreviewWindow" in window
     assert "zoom <= 1 && input.followLive && !input.scrubbing" in window
     room = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
     assert "boundaryLeadSeconds" not in room
-    assert "computeDvrLeftEdge" in room
+    assert "computeExpandedPreviewWindow" in room
+    assert "recordingElapsedSeconds," not in room
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     assert "computeDvrLeftEdge" in workbench
+    assert "expandedRoomId === room.room_id && isNoDvrPreviewMode(room.preview_mode)" in workbench
+    assert "readPlayhead" in room
+    assert "retainClockLoop" in room
+    assert "followLive" in room
     store = (ROOT / "lsc-electron/src/utils/playheadStore.ts").read_text(encoding="utf-8")
     assert "retainClockLoop" in store
     assert "writeLiveEdgeBase" in store

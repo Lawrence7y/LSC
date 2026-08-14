@@ -141,7 +141,10 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
             return {'success': False, 'error': '房间不存在'}
         if room.recording_id != snap.recording_id:
             return {'success': False, 'error': '录制文件已变化，请重新创建切片'}
-        if not room.record_output_path or not os.path.isfile(room.record_output_path):
+        if not (
+            (getattr(room, 'record_manifest_path', '') and os.path.isfile(room.record_manifest_path))
+            or (getattr(room, 'record_output_path', '') and os.path.isfile(room.record_output_path))
+        ):
             return {'success': False, 'error': '该房间没有录制文件'}
 
         content_offset = getattr(room, 'content_offset', 0.0)

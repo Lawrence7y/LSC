@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -16,6 +17,7 @@ from .base import (
     fetch_head,
     fetch_json,
 )
+from .redaction import redact_text, redact_url
 
 _log = logging.getLogger(__name__)
 
@@ -66,7 +68,7 @@ def _sort_quality_urls(quality_urls: dict[str, str], *, prefer_high: bool) -> li
     return items
 
 
-_ROOM_PATH_RE = re.compile(r"^/(?P<room_id>\d+)/?$")
+_ROOM_PATH_RE = re.compile(r"^/(?:(?:h5|blanc)/)?(?P<room_id>\d+)/?$")
 _SHORT_LINK_HOSTS = {"b23.tv", "www.b23.tv"}
 
 
@@ -81,15 +83,48 @@ class BilibiliAdapter(BasePlatformAdapter):
             return True
         result = host == "live.bilibili.com" and bool(_ROOM_PATH_RE.fullmatch(parsed.path))
         if result:
-            _log.debug("BilibiliAdapter accepted: %s", url[:80])
+            _log.debug("BilibiliAdapter accepted: %s", redact_url(url)[:80])
         return result
 
     def parse(self, url: str) -> StreamInfo:
+        """Legacy entry point backed by the context-aware implementation."""
+        return self._parse(url)
+
+    def parse_with_context(self, url: str, context: object) -> StreamInfo:
+        """Resolve with the scoped CredentialContext supplied by V2.
+
+        The compatibility ``parse`` path still reads the legacy cookie helper,
+        but V2 callers must be able to provide one controlled header set that
+        is reused by resolution, probing and connection.
+        """
+        headers = dict(BILIBILI_HEADERS)
+        headers.update(dict(getattr(context, "headers", {}) or {}))
+        return self._parse(
+            url,
+            request_headers=headers,
+            network_context=getattr(context, "network_context", {}) or {},
+        )
+
+    def _parse(
+        self,
+        url: str,
+        *,
+        request_headers: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
         clean_url = (url or "").strip()
+        headers = dict(request_headers or _build_headers_with_cookies())
         is_short_link = self._is_short_link(clean_url)
         if is_short_link:
-            _log.info("Bilibili: expanding short link: %s", clean_url[:80])
-            expanded = self._expand_short_link(clean_url)
+            _log.info("Bilibili: expanding short link: %s", redact_url(clean_url)[:80])
+            if request_headers is None and not network_context:
+                expanded = self._expand_short_link(clean_url)
+            else:
+                expanded = self._expand_short_link(
+                    clean_url,
+                    headers=headers,
+                    network_context=network_context,
+                )
             if expanded:
                 clean_url = expanded
             else:
@@ -110,58 +145,56 @@ class BilibiliAdapter(BasePlatformAdapter):
             return self._failed(clean_url, "无法识别 B 站直播间号。", ERROR_PARSE_FAILED)
 
         _log.info("Bilibili: parsing room %s", room_id)
-        room_init = self._fetch_json(ROOM_INIT_URL, params={"id": room_id})
+
+        def _json_kwargs(params: dict[str, str]) -> dict[str, Any]:
+            kwargs: dict[str, Any] = {"params": params}
+            if request_headers is not None:
+                kwargs["headers"] = headers
+            if network_context:
+                kwargs["network_context"] = dict(network_context)
+            return kwargs
+
+        try:
+            room_init = self._fetch_json(ROOM_INIT_URL, **_json_kwargs({"id": room_id}))
+        except Exception as exc:
+            return self._failed(clean_url, self._describe_error(exc), ERROR_PARSE_FAILED)
         room_data = room_init.get("data")
         if room_init.get("code") != 0 or not isinstance(room_data, dict):
-            return self._failed(clean_url, "B 站直播间初始化接口返回异常。", ERROR_PARSE_FAILED)
+            return self._failed(
+                clean_url,
+                self._describe_api_error("B 站直播间初始化接口返回异常。", room_init),
+                ERROR_PARSE_FAILED,
+            )
 
         real_room_id = str(room_data.get("room_id") or room_id)
         title = str(room_data.get("title") or "")
         streamer = str(room_data.get("uname") or "")
         category = str(room_data.get("area_name") or room_data.get("parent_area_name") or "")
 
-        # getInfo 和 play_info 都只需要 real_room_id，并行请求节省 0.5-2 秒
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            # getInfo 获取主播名/标题/分区名称（room_init 不返回这些字段）
-            info_future = None
-            if not title or not streamer or not category:
-                info_future = pool.submit(
-                    self._fetch_json, GET_INFO_URL, params={"room_id": real_room_id}
+        # Sequential fetches avoid nested ThreadPoolExecutor under the shared
+        # recording executor (thread exhaustion → opaque UNKNOWN parse errors).
+        if not title or not streamer or not category or int(room_data.get("live_status") or 0) != 1:
+            try:
+                room_info = self._fetch_json(
+                    GET_INFO_URL,
+                    **_json_kwargs({"room_id": real_room_id}),
                 )
-            # play_info 获取播放地址
-            play_future = pool.submit(
-                self._fetch_json,
-                PLAY_INFO_URL,
-                params={
-                    "room_id": real_room_id,
-                    "protocol": "0,1",
-                    "format": "0,1,2",
-                    "codec": "0,1",
-                    "qn": "10000",
-                    "platform": "web",
-                    "dolby": "5",
-                    "panorama": "1",
-                },
-            )
-
-            if info_future is not None:
-                try:
-                    room_info = info_future.result(timeout=12)
-                    info_data = room_info.get("data") if room_info.get("code") == 0 else None
-                    if isinstance(info_data, dict):
-                        if not title:
-                            title = str(info_data.get("title") or "")
-                        if not streamer:
-                            streamer = str(info_data.get("uname") or "")
-                        if not category:
-                            category = str(info_data.get("area_v2_name") or info_data.get("parent_area_name") or "")
-                        if int(room_data.get("live_status") or 0) != 1 and int(info_data.get("live_status") or 0) == 1:
-                                room_data["live_status"] = 1
-                except Exception as exc:
-                    _log.debug("B站 getInfo 请求失败: %s", exc)
-
-            play_info = play_future.result(timeout=12)
+                info_data = room_info.get("data") if room_info.get("code") == 0 else None
+                if isinstance(info_data, dict):
+                    if not title:
+                        title = str(info_data.get("title") or "")
+                    if not streamer:
+                        streamer = str(info_data.get("uname") or "")
+                    if not category:
+                        category = str(
+                            info_data.get("area_v2_name")
+                            or info_data.get("parent_area_name")
+                            or ""
+                        )
+                    if int(room_data.get("live_status") or 0) != 1 and int(info_data.get("live_status") or 0) == 1:
+                        room_data["live_status"] = 1
+            except Exception as exc:
+                _log.debug("B站 getInfo 请求失败: %s", redact_text(exc) or type(exc).__name__)
 
         if int(room_data.get("live_status") or 0) != 1:
             return self._failed(
@@ -171,11 +204,30 @@ class BilibiliAdapter(BasePlatformAdapter):
                 raw={"room_init": room_init},
             )
 
+        play_params = {
+            "room_id": real_room_id,
+            "protocol": "0,1",
+            "format": "0,1,2",
+            "codec": "0,1",
+            "qn": "10000",
+            "platform": "web",
+            "dolby": "5",
+            "panorama": "1",
+        }
+        try:
+            play_info = self._fetch_json(PLAY_INFO_URL, **_json_kwargs(play_params))
+        except Exception as exc:
+            return self._failed(clean_url, self._describe_error(exc), ERROR_PARSE_FAILED)
+
         play_data = play_info.get("data")
         if play_info.get("code") != 0 or not isinstance(play_data, dict):
-            return self._failed(clean_url, "B 站播放信息接口返回异常。", ERROR_PARSE_FAILED)
+            return self._failed(
+                clean_url,
+                self._describe_api_error("B 站播放信息接口返回异常。", play_info),
+                ERROR_PARSE_FAILED,
+            )
 
-        stream_url, quality_urls = self._extract_play_urls(play_data)
+        stream_url, quality_urls, candidate_urls = self._extract_play_urls(play_data)
         if not quality_urls:
             return self._failed(
                 clean_url,
@@ -186,7 +238,7 @@ class BilibiliAdapter(BasePlatformAdapter):
 
         # 无登录态时高画质（qn=10000/400）容易被 CDN 拒绝，优先返回最低画质；
         # 有 Cookie 时按原顺序使用最高画质。
-        has_cookies = bool(_get_bilibili_cookies())
+        has_cookies = bool(headers.get("Cookie"))
         sorted_qualities = _sort_quality_urls(quality_urls, prefer_high=has_cookies)
         quality_urls = {k: v for k, v in sorted_qualities}
         selected_quality = next(iter(quality_urls), "")
@@ -201,9 +253,14 @@ class BilibiliAdapter(BasePlatformAdapter):
             is_live=True,
             quality_urls=quality_urls,
             selected_quality=selected_quality,
-            headers=_build_headers_with_cookies(),
+            headers=headers,
             category=category,
-            raw={},  # discard large API responses on success to save memory
+            candidate_urls=tuple(candidate_urls),
+            raw={
+                "source_kind": "official",
+                "confidence": 0.9,
+                "state_source": "room_api",
+            },
         )
 
     def _extract_room_id(self, url: str) -> str:
@@ -216,35 +273,104 @@ class BilibiliAdapter(BasePlatformAdapter):
     def _is_short_link(self, url: str) -> bool:
         return urlparse(url).netloc.lower() in _SHORT_LINK_HOSTS
 
-    def _expand_short_link(self, url: str) -> str:
+    def _expand_short_link(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> str:
         """Follow HTTP redirects on b23.tv short links to obtain the real URL.
 
         Returns the final URL on success, or an empty string on failure.
         Uses a HEAD request with no redirect following to read the Location
         header directly, avoiding a full page download.
         """
-        final_url = fetch_head(url, headers=BILIBILI_HEADERS)
-        _log.debug("Bilibili: short link %s -> %s", url[:60], final_url[:60])
+        context = dict(network_context or {})
+        proxy_url = str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+        try:
+            timeout = max(1, min(300, int(float(context.get("timeout_sec", 12)))))
+        except (TypeError, ValueError):
+            timeout = 12
+        final_url = fetch_head(
+            url,
+            headers=dict(headers or BILIBILI_HEADERS),
+            timeout=timeout,
+            proxy_url=proxy_url,
+        )
+        _log.debug("Bilibili: short link %s -> %s", redact_url(url)[:60], redact_url(final_url)[:60])
         # fetch_head returns the original URL on failure; treat that as failure
         # for a short link because it should always redirect to live.bilibili.com.
         if final_url == url:
             return ""
         return final_url
 
-    def _fetch_json(self, url: str, params: dict[str, str] | None = None) -> dict[str, Any]:
-        headers = _build_headers_with_cookies()
-        _log.debug("Bilibili: fetch_json %s", url[:100])
-        return fetch_json(url, headers=headers, params=params)
+    def _fetch_json(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
+        headers = dict(headers or _build_headers_with_cookies())
+        _log.debug("Bilibili: fetch_json %s", redact_url(url)[:100])
+        context = dict(network_context or {})
+        proxy_url = str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+        try:
+            timeout = max(1, min(300, int(float(context.get("timeout_sec", 12)))))
+        except (TypeError, ValueError):
+            timeout = 12
+        try:
+            return fetch_json(
+                url,
+                headers=headers,
+                params=params,
+                timeout=timeout,
+                proxy_url=proxy_url,
+            )
+        except Exception as exc:
+            safe = redact_text(exc) or type(exc).__name__
+            _log.warning("Bilibili: fetch_json failed %s: %s", redact_url(url)[:100], safe)
+            return {"code": -1, "message": safe}
 
-    def _extract_play_urls(self, payload: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    def _describe_error(self, exc: BaseException) -> str:
+        safe = redact_text(exc) or type(exc).__name__
+        lowered = safe.lower()
+        if isinstance(exc, TimeoutError) or "timeout" in lowered or "超时" in safe:
+            return "连接直播服务器超时"
+        return f"B 站接口请求失败：{safe}"
+
+    def _describe_api_error(self, prefix: str, payload: Mapping[str, Any] | None) -> str:
+        api_msg = str((payload or {}).get("message") or "").strip()
+        text = f"{prefix}{api_msg}" if api_msg else prefix
+        lowered = text.lower()
+        if "timeout" in lowered or "超时" in text:
+            return "连接直播服务器超时"
+        return text
+
+    def _extract_play_urls(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[str, dict[str, str], list[dict[str, Any]]]:
         playurl_info = payload.get("playurl_info")
         if not isinstance(playurl_info, dict):
-            return "", {}
+            return "", {}, []
         playurl = playurl_info.get("playurl")
         if not isinstance(playurl, dict):
-            return "", {}
+            return "", {}, []
 
         quality_urls: dict[str, str] = {}
+        candidate_urls: list[dict[str, Any]] = []
         for stream in playurl.get("stream") or []:
             if not isinstance(stream, dict):
                 continue
@@ -257,9 +383,18 @@ class BilibiliAdapter(BasePlatformAdapter):
                     built_urls = self._build_quality_urls(codec)
                     for quality, quality_url in built_urls.items():
                         quality_urls.setdefault(quality, quality_url)
+                    candidate_urls.extend(self._build_candidate_urls(codec))
 
         stream_url = next(iter(quality_urls.values()), "")
-        return stream_url, quality_urls
+        # Keep one URL per (quality, CDN) while preserving API order.  The
+        # legacy quality mapping remains first-host-only for compatibility;
+        # V2 consumes this complete list to probe alternate CDNs.
+        unique: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in candidate_urls:
+            key = (str(item.get("quality", "")), str(item.get("url", "")))
+            if key[0] and key[1]:
+                unique.setdefault(key, item)
+        return stream_url, quality_urls, list(unique.values())
 
     def _build_quality_urls(self, codec: dict[str, Any]) -> dict[str, str]:
         base_url = str(codec.get("base_url") or "")
@@ -288,6 +423,36 @@ class BilibiliAdapter(BasePlatformAdapter):
                 break
 
         return quality_urls
+
+    def _build_candidate_urls(self, codec: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build every quality/CDN URL without collapsing alternate hosts."""
+        base_url = str(codec.get("base_url") or "")
+        url_info_list = codec.get("url_info") or []
+        if not base_url or not isinstance(url_info_list, list):
+            return []
+        accept_qn = codec.get("accept_qn") or []
+        qualities = [str(qn) for qn in accept_qn if str(qn)] or ["origin"]
+        candidates: list[dict[str, Any]] = []
+        for url_info in url_info_list:
+            if not isinstance(url_info, dict):
+                continue
+            host = str(url_info.get("host") or "")
+            extra = str(url_info.get("extra") or "")
+            if not host.startswith(("http://", "https://")):
+                continue
+            parsed_host = urlparse(host).hostname or ""
+            cdn_id = parsed_host.split(".", 1)[0] if parsed_host else ""
+            for quality in qualities:
+                raw_url = f"{host}{base_url}{extra}"
+                url = raw_url if quality == "origin" else self._replace_qn(raw_url, quality)
+                candidates.append({
+                    "url": url,
+                    "quality": quality,
+                    "cdn_id": cdn_id,
+                    "source_kind": "official",
+                    "confidence": 0.9,
+                })
+        return candidates
 
     def _replace_qn(self, stream_url: str, quality: str) -> str:
         parsed = urlparse(stream_url)

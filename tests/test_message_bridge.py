@@ -64,6 +64,57 @@ class TestBroadcastHub:
         assert result["data"]["room_id"] == "room1"
         assert result["data"]["success"] is True
 
+    def test_connect_and_recording_events_redact_signed_urls(self):
+        hub, _ = self._make_hub()
+        hub._on_connect_finished(
+            "room1",
+            False,
+            "ffmpeg failed at https://cdn.example/live.flv?token=bridge-secret",
+        )
+        result = hub.get_broadcast(block=False)
+        assert "bridge-secret" not in str(result)
+        hub._on_recording_stopped(
+            "room1",
+            "upstream",
+            "https://cdn.example/live.flv?signature=stop-secret",
+        )
+        result = hub.get_broadcast(block=False)
+        assert "stop-secret" not in str(result)
+
+    def test_runtime_event_mapping_has_final_public_redaction_boundary(self):
+        hub, _ = self._make_hub()
+        hub._on_runtime_event({
+            "event_type": "UPSTREAM_FAILED",
+            "room_id": "room1",
+            "context": {
+                "url": "https://cdn.example/live.flv?token=runtime-secret",
+                "Cookie": "session=runtime-cookie",
+            },
+        })
+        result = hub.get_broadcast(block=False)
+        assert result["type"] == "runtime_event"
+        assert "runtime-secret" not in str(result)
+        assert "runtime-cookie" not in str(result)
+
+    def test_runtime_event_is_logged_without_secrets(self, caplog):
+        hub, _ = self._make_hub()
+        with caplog.at_level("INFO", logger="broadcast_hub"):
+            hub._on_runtime_event({
+                "event_type": "UPSTREAM_FAILED",
+                "room_id": "room1",
+                "component": "ingest",
+                "state_from": "RUNNING",
+                "state_to": "FAILED",
+                "failure_kind": "CONNECTION_RESET",
+                "context": {
+                    "url": "https://cdn.example/live.flv?token=runtime-secret",
+                },
+            })
+        joined = "\n".join(record.getMessage() for record in caplog.records)
+        assert "runtime_event room=room1" in joined
+        assert "UPSTREAM_FAILED" in joined
+        assert "runtime-secret" not in joined
+
     def test_bus_emit_connect_finished_queues_broadcast(self):
         hub, orch = self._make_hub()
         orch.bus.emit("room_connect_finished", "room1", True, "")

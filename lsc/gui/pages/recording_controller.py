@@ -23,7 +23,8 @@ except ImportError:
     def get_logger(name: str):
         return logging.getLogger(name)
 
-from lsc.platforms.registry import parse_stream, select_quality
+from lsc.config import is_platform_pipeline_component_enabled, load_config
+from lsc.platforms.registry import detect_platform, parse_stream, select_quality
 from lsc.recorder.capture import validate_recording
 from lsc.utils.process_launcher import hidden_run_kwargs
 
@@ -236,6 +237,7 @@ class RecordingController:
         self.recording_start_mono: float = 0.0
 
         self.video_path: str = ""
+        self.record_manifest_path: str = ""
         self.stream_url: str = ""
         self.page_url: str = ""
         self.last_stream_info = None
@@ -417,12 +419,35 @@ class RecordingController:
 
     def parse_stream_url(self, url: str, *, force_refresh: bool = False) -> dict:
         """Parse a supported room URL into the legacy dict consumed by the GUI."""
-        # Only pass force_refresh when explicitly requested so monkey-patched
-        # test fakes that only accept a single ``url`` argument keep working.
-        if force_refresh:
-            info = parse_stream(url, force_refresh=True)
+        platform = detect_platform(url)
+        cfg = load_config()
+        use_v2 = all(
+            is_platform_pipeline_component_enabled(component, platform, cfg)
+            for component in (
+                "unified_resolver_v2",
+                "media_probe_v2",
+                "stream_lease_v2",
+            )
+        )
+        if use_v2:
+            from lsc.platforms.models import ResolveRequest, resolve_result_to_stream_info
+            from lsc.platforms.resolver import resolve_stream_v2
+
+            result = resolve_stream_v2(
+                ResolveRequest(
+                    source_url=url,
+                    force_refresh=force_refresh,
+                    request_id="recording-controller",
+                )
+            )
+            info = resolve_result_to_stream_info(result)
         else:
-            info = parse_stream(url)
+            # Only pass force_refresh when explicitly requested so monkey-patched
+            # test fakes that only accept a single ``url`` argument keep working.
+            if force_refresh:
+                info = parse_stream(url, force_refresh=True)
+            else:
+                info = parse_stream(url)
         legacy = info.to_legacy_dict()
         self.last_stream_info = info
         self.input_args = list(legacy.get("_inputArgs", []))
@@ -807,7 +832,9 @@ class RecordingController:
         # Use public API - no private-member access
         exit_code = self._capture.check_and_handle_crash()
         if exit_code is not None:
-            return f"FFmpeg 异常退出 (code {exit_code})"
+            # 携带 stderr 尾部，保留 403/鉴权/I/O error 特征，
+            # 否则下游 is_recoverable_error 看不到可恢复信号（code 0 被误判不可恢复）
+            return self._capture.crash_message(exit_code)
         msg = self._capture.check_health()
         return msg
 
@@ -834,10 +861,27 @@ class RecordingController:
         if not self._exporter:
             self._last_export_error = self.exporter_init_error or "导出器未初始化"
             return ""
-        if not self.video_path:
+        if not self.video_path and not self.record_manifest_path:
             self._last_export_error = "没有录制文件，请先开始录制"
             return ""
-        if not os.path.isfile(self.video_path):
+        export_input = self.video_path
+        if not os.path.isfile(export_input) and self.record_manifest_path:
+            try:
+                from lsc.config import load_config
+                from lsc.recorder.assets import RecordingAsset
+
+                asset = RecordingAsset.recover(self.record_manifest_path)
+                cfg = load_config()
+                with asset.materialized_input(
+                    ffmpeg_path=cfg.ffmpeg_path,
+                    ffprobe_path=cfg.ffprobe_path,
+                    cleanup=False,
+                ) as materialized:
+                    export_input = materialized
+            except (FileNotFoundError, RuntimeError) as exc:
+                self._last_export_error = f"分段录制无法合并为导出输入: {exc}"
+                return ""
+        if not os.path.isfile(export_input):
             self._last_export_error = f"录制文件不存在: {self.video_path}"
             return ""
 
@@ -851,7 +895,7 @@ class RecordingController:
             except Exception:
                 _log.exception("on_done callback raised in start_export")
         self._export_thread = ExportWorker(
-            self._exporter, self.video_path,
+            self._exporter, export_input,
             start_sec, end_sec, output_dir, name,
             profile=profile,
             on_done=_on_finished,

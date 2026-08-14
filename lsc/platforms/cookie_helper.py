@@ -1,10 +1,12 @@
-"""B站/抖音直播流 Cookie 认证支持。"""
+"""B站/抖音/虎牙直播流 Cookie 认证支持。"""
 import json
 import logging
 import os
 import shutil
 import sqlite3
 import tempfile
+
+from .redaction import redact_text
 
 _log = logging.getLogger(__name__)
 
@@ -63,7 +65,7 @@ def _decrypt_chrome_value(encrypted_value: bytes) -> str:
                 text = decrypted[1].decode("utf-8")
                 return text if _is_http_header_safe(text) else ""
         except Exception as exc:
-            _log.debug("DPAPI 解密失败（可忽略，请改用导出的 Cookie 文件）: %s", exc)
+            _log.debug("DPAPI 解密失败（可忽略，请改用导出的 Cookie 文件）: %s", redact_text(exc))
         return ""
     # 无加密前缀：仅接受干净的 UTF-8/latin-1 明文，绝不 errors='replace'
     try:
@@ -117,13 +119,13 @@ def _query_cookie_db(db_path: str, domain: str) -> dict[str, str]:
         finally:
             conn.close()
     except Exception as exc:
-        _log.debug("Failed to query cookie DB %s: %s", db_path, exc)
+        _log.debug("Failed to query cookie DB %s: %s", db_path, redact_text(exc))
     finally:
         if tmp_path:
             try:
                 os.unlink(tmp_path)
             except Exception as exc:
-                _log.debug("操作异常（已忽略）: %s", exc)
+                _log.debug("操作异常（已忽略）: %s", redact_text(exc))
     return cookies
 
 
@@ -246,7 +248,7 @@ def get_bilibili_cookies() -> dict[str, str]:
                 if cleaned:
                     return cleaned
         except Exception as exc:
-            _log.warning("LSC_BILIBILI_COOKIES 环境变量 JSON 解析失败: %s", exc)
+            _log.warning("LSC_BILIBILI_COOKIES 环境变量 JSON 解析失败: %s", redact_text(exc))
 
     # 2. 配置文件
     config_dir = os.path.expanduser("~/.lsc/cookies")
@@ -301,7 +303,7 @@ def get_douyin_cookies() -> dict[str, str]:
                 if cleaned:
                     return cleaned
         except Exception as exc:
-            _log.warning("LSC_DOUYIN_COOKIES 环境变量 JSON 解析失败: %s", exc)
+            _log.warning("LSC_DOUYIN_COOKIES 环境变量 JSON 解析失败: %s", redact_text(exc))
 
     # 2. 配置文件
     config_dir = os.path.expanduser("~/.lsc/cookies")
@@ -330,6 +332,41 @@ def get_douyin_cookies() -> dict[str, str]:
         )
 
     return cookies
+
+
+def get_huya_cookies() -> dict[str, str]:
+    """获取虎牙 cookies。
+
+    虎牙公开房间可匿名解析；登录 Cookie 用于页面鉴权，可能拿到更稳的线路。
+    优先级:
+    1. 环境变量 LSC_HUYA_COOKIES (JSON格式)
+    2. 配置文件 ~/.lsc/cookies/huya.json
+    3. 浏览器cookies (Chrome/Edge，域名 huya.com)
+    """
+    env_cookies = os.environ.get("LSC_HUYA_COOKIES")
+    if env_cookies:
+        try:
+            data = json.loads(env_cookies)
+            if isinstance(data, dict):
+                cleaned = _sanitize_cookie_map(
+                    {str(k): str(v) for k, v in data.items() if v is not None}
+                )
+                if cleaned:
+                    return cleaned
+        except Exception as exc:
+            _log.warning("LSC_HUYA_COOKIES 环境变量 JSON 解析失败: %s", redact_text(exc))
+
+    config_dir = os.path.expanduser("~/.lsc/cookies")
+    cookie_file = os.path.join(config_dir, "huya.json")
+    if os.path.exists(cookie_file):
+        cookies = load_cookies_from_file(cookie_file)
+        if cookies:
+            return cookies
+
+    cookies = get_chrome_cookies_for_domain("huya.com")
+    if not cookies:
+        cookies = get_edge_cookies_for_domain("huya.com")
+    return _sanitize_cookie_map(cookies)
 
 
 def parse_cookie_input(raw: str) -> dict[str, str]:
@@ -438,6 +475,35 @@ def save_bilibili_cookies_from_text(raw: str) -> dict[str, object]:
         )
     save_cookies(cookies, platform="bilibili")
     return get_bilibili_cookie_status()
+
+
+def get_huya_cookie_status() -> dict[str, object]:
+    """返回虎牙 Cookie 状态，供设置页展示。"""
+    cookies = get_huya_cookies()
+    config_dir = os.path.expanduser("~/.lsc/cookies")
+    cookie_file = os.path.join(config_dir, "huya.json")
+    return {
+        "configured": bool(cookies),
+        "count": len(cookies),
+        "keys": sorted(cookies.keys())[:20],
+        "source_file": cookie_file if os.path.exists(cookie_file) else "",
+        "has_env": bool(os.environ.get("LSC_HUYA_COOKIES")),
+    }
+
+
+def save_huya_cookies_from_text(raw: str) -> dict[str, object]:
+    """解析并保存虎牙 Cookie，返回状态。"""
+    cookies = parse_cookie_input(raw)
+    if not cookies:
+        raise ValueError("未解析到有效 Cookie，请确认格式（JSON 或 name=value; ...）")
+    important = ("udb_uid", "udb_guid", "udb_oar", "yyuid", "guid")
+    if not any(k in cookies for k in important):
+        _log.warning(
+            "虎牙 Cookie 已保存，但未发现常见登录字段 %s，页面鉴权可能仍受限",
+            "/".join(important),
+        )
+    save_cookies(cookies, platform="huya")
+    return get_huya_cookie_status()
 
 
 def cookies_to_header(cookies: dict[str, str]) -> str:

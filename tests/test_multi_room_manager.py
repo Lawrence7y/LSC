@@ -228,7 +228,10 @@ def test_manager_start_recording_refreshes_stream_url_before_ffmpeg_start(monkey
     assert calls  # at least one parse when no reusable cache
     assert calls[0] == ("https://live.bilibili.com/35", False)
     assert room.controller.stream_url == "https://example.com/fresh-250.flv"
-    assert room.controller.input_args == ["-headers", "Referer: https://live.bilibili.com/\r\n"]
+    assert room.controller.input_args == [
+        "-headers",
+        "Referer: https://live.bilibili.com/\r\n",
+    ]
     assert room.controller.calls[-1][1] == "https://example.com/fresh-250.flv"
     assert room.controller.calls[-1][5]["input_args"] == [
         "-headers",

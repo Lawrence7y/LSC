@@ -10,11 +10,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from lsc.config import LscConfig
 from lsc.core.models import RecordingStatus, RoomInfo, StreamQuality
 from lsc.core.services.recording_service import (
     RecordingConfig,
     RecordingService,
 )
+from lsc.platforms.models import ResolveResult, StreamCandidate
 
 
 @pytest.fixture
@@ -121,6 +123,38 @@ class TestRecordingServiceParseRoom:
             service.parse_room(sample_room.room_url, force_refresh=True)
 
             mock_parse.assert_called_once_with(sample_room.room_url, force_refresh=True)
+
+    def test_parse_room_uses_v2_compatibility_bridge_when_allowlisted(self, sample_room):
+        config = LscConfig(
+            platform_pipeline_v2_enabled=True,
+            platform_pipeline_v2_allowlist=["douyin"],
+        )
+        service = RecordingService(config=config)
+        result = ResolveResult(
+            platform="douyin",
+            room_url=sample_room.room_url,
+            room_title=sample_room.title,
+            anchor_name=sample_room.streamer,
+            live_status="LIVE",
+            candidates=(
+                StreamCandidate(
+                    candidate_id="douyin|origin",
+                    url=sample_room.stream_url,
+                    quality_label="origin",
+                    request_headers=dict(sample_room.headers),
+                ),
+            ),
+        )
+        with (
+            patch("lsc.platforms.resolver.resolve_stream_v2", return_value=result) as resolve,
+            patch("lsc.core.services.recording_service.parse_stream") as legacy,
+        ):
+            room = service.parse_room(sample_room.room_url)
+
+        resolve.assert_called_once()
+        legacy.assert_not_called()
+        assert room.stream_url == sample_room.stream_url
+        assert room.headers == sample_room.headers
 
 
 class TestRecordingServicePreflight:

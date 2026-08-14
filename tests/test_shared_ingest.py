@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,7 @@ from lsc.core.services.shared_ingest import (
     SharedPreviewHandle,
     SharedRoomIngest,
 )
+from lsc.recorder.manifest import ManifestStore
 
 TS_PACKET_SIZE = 188
 
@@ -126,6 +128,16 @@ def _wait_until(predicate, timeout_sec: float = 0.5) -> bool:
     return predicate()
 
 
+def _start_recording_writer(ingest: SharedRoomIngest, recording) -> None:
+    ingest._recording_generation = getattr(ingest, "_recording_generation", 0) + 1
+    generation = ingest._recording_generation
+    ingest._recording_input_thread = ingest._start_thread(
+        ingest._write_recording_input_loop,
+        (recording, generation),
+        f"test-recording-input-{ingest.room_id}",
+    )
+
+
 def _disable_preview_start(ingest: SharedRoomIngest, monkeypatch) -> None:
     monkeypatch.setattr(
         ingest,
@@ -156,6 +168,17 @@ def test_registry_returns_same_ingest_and_updates_only_when_idle():
     assert first.url == "http://example/new.flv"
 
 
+def test_registry_does_not_mutate_url_while_preview_is_attached():
+    registry = SharedIngestRegistry()
+    ingest = registry.get_or_create("room-preview", url="http://example/old.flv")
+    ingest._preview_subscribers.append(PreviewSubscriber(1024))
+
+    same = registry.get_or_create("room-preview", url="http://example/new.flv")
+
+    assert same is ingest
+    assert same.url == "http://example/old.flv"
+
+
 def test_registry_stop_room_removes_and_stops_ingest():
     registry = SharedIngestRegistry()
     ingest = registry.get_or_create("room-a", url="http://example/live.flv", headers={})
@@ -179,6 +202,9 @@ def test_three_commands_keep_network_input_only_in_upstream(tmp_path):
     assert upstream[upstream.index("-i") + 1] == url
     assert "-reconnect" in upstream
     assert "-headers" in upstream
+    assert upstream[upstream.index("-protocol_whitelist") + 1] == (
+        "file,http,https,tcp,tls,crypto"
+    )
     assert "-f" in upstream and "mpegts" in upstream
     assert "-mpegts_flags" in upstream and "+resend_headers" in upstream
     assert upstream[-1] == "pipe:1"
@@ -194,6 +220,18 @@ def test_three_commands_keep_network_input_only_in_upstream(tmp_path):
     assert preview[-1] == "pipe:1"
 
 
+def test_upstream_omits_http_reconnect_for_signed_huya_url():
+    url = "https://al.flv.huya.com/src/live.flv?wsSecret=abc&wsTime=6a75d2c7"
+    command = SharedRoomIngest("room-a", url).build_upstream_command()
+    assert "-reconnect" not in command
+    assert "-reconnect_streamed" not in command
+    assert url not in command
+    assert "wsSecret" not in " ".join(command)
+    input_index = command.index("-i")
+    assert command[input_index - 2:input_index] == ["-f", "flv"]
+    assert command[input_index + 1] == "pipe:0"
+
+
 def test_upstream_omits_network_options_for_file_input(tmp_path):
     source = tmp_path / "source.ts"
     command = SharedRoomIngest("room-a", str(source)).build_upstream_command()
@@ -206,6 +244,53 @@ def test_upstream_omits_network_options_for_file_input(tmp_path):
         "-reconnect_delay_max",
     ):
         assert option not in command
+
+
+def test_upstream_reuses_probe_proxy_context():
+    command = SharedRoomIngest(
+        "room-a",
+        "https://example/live.flv",
+        network_context={"proxy_url": "http://proxy.example:8080"},
+    ).build_upstream_command()
+    assert "-http_proxy" in command
+    assert command[command.index("-http_proxy") + 1] == "http://proxy.example:8080"
+
+
+def test_upstream_reuses_probe_timeout_context():
+    command = SharedRoomIngest(
+        "room-a",
+        "https://example/live.flv",
+        network_context={
+            "connect_timeout_sec": 2.5,
+            "read_timeout_sec": 4.0,
+        },
+    ).build_upstream_command()
+    assert command[command.index("-timeout") + 1] == "2500000"
+    assert command[command.index("-rw_timeout") + 1] == "4000000"
+
+
+def test_shared_ingest_segmented_sink_writes_manifest(tmp_path, monkeypatch):
+    ingest = SharedRoomIngest("room-segmented", "https://example/live.flv")
+    process = _FakeProcess(pid=2001)
+    monkeypatch.setattr(ingest, "_launch_process", lambda _command: process)
+    monkeypatch.setattr(ingest, "_wait_for_startup_data", lambda _path: True)
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", lambda: "")
+
+    result = ingest.start_recording(
+        str(tmp_path / "recording.mp4"),
+        segmented=True,
+        platform_id="direct",
+        segment_seconds=30,
+    )
+    assert result.ok
+    assert ingest.recording_manifest_path
+    segment = Path(ingest._recording_segments_dir) / "000001.partial.mkv"
+    segment.write_bytes(b"media")
+    ingest.stop_recording_sink(reason="test")
+
+    manifest = ManifestStore(ingest.recording_manifest_path).load()
+    assert manifest.recording_state == "COMPLETE"
+    assert [item.state for item in manifest.segments] == ["COMPLETE"]
 
 
 @pytest.mark.parametrize(
@@ -318,11 +403,15 @@ def test_upstream_reader_dispatches_only_complete_ts_packets_and_keeps_order():
     ingest._process = process
     ingest._recording_process = recording
     ingest.recording_active = True
+    _start_recording_writer(ingest, recording)
 
     ingest._read_upstream_stdout_loop(process)
+    expected = (first + second)[:TS_PACKET_SIZE]
+    assert _wait_until(lambda: bytes(recording.stdin.data) == expected)
 
-    assert bytes(recording.stdin.data) == (first + second)[:TS_PACKET_SIZE]
+    assert bytes(recording.stdin.data) == expected
     assert len(recording.stdin.data) % TS_PACKET_SIZE == 0
+    ingest._stop_recording_process()
 
 
 @pytest.mark.parametrize(
@@ -351,14 +440,18 @@ def test_preview_overflow_drops_whole_batches_while_recording_receives_all(
     ingest._preview_process = preview
     ingest.recording_active = True
     ingest._preview_subscribers.append(PreviewSubscriber(1024))
+    _start_recording_writer(ingest, recording)
 
     ingest._read_upstream_stdout_loop(upstream)
+    expected_recording = b"".join(batches)
+    assert _wait_until(lambda: bytes(recording.stdin.data) == expected_recording)
 
-    assert bytes(recording.stdin.data) == b"".join(batches)
+    assert bytes(recording.stdin.data) == expected_recording
     assert b"".join(ingest._preview_ts_queue) == expected_preview
     assert all(len(batch) % TS_PACKET_SIZE == 0 for batch in ingest._preview_ts_queue)
     assert ingest.preview_dropped_bytes == TS_PACKET_SIZE
     assert ingest.preview_dropped_batches == 1
+    ingest._stop_recording_process()
 
 
 def test_preview_then_recording_reuses_same_upstream(monkeypatch):
@@ -367,7 +460,9 @@ def test_preview_then_recording_reuses_same_upstream(monkeypatch):
     factory = _ProcessFactory(url)
     _configure_lifecycle(ingest, factory, monkeypatch)
 
-    assert ingest.start_preview_only().ok is True
+    preview = ingest.start_preview_only()
+    assert preview.accepted is True
+    assert preview.ok is False
     subscriber = ingest.attach_preview_subscriber()
     upstream = ingest._process
     result = ingest.start_recording("out.mp4")
@@ -470,7 +565,9 @@ def test_preview_only_wrapper_does_not_create_child_without_subscriber(monkeypat
 
     result = ingest.start_preview_only()
 
-    assert result.ok is True
+    assert result.accepted is True
+    assert result.ok is False
+    assert result.media_ready is False
     assert result.use_legacy_fallback is False
     assert launched == []
     assert ingest.process_id is None
@@ -494,7 +591,7 @@ def test_recording_and_preview_wrapper_only_delegates_recording(monkeypatch):
     assert ingest.preview_process_id is None
 
 
-def test_upstream_failure_stops_all_children_and_subscribers():
+def test_upstream_failure_keeps_sinks_for_supervised_recovery():
     upstream = _FakeProcess(returncode=7, pid=1001)
     recording = _FakeProcess(pid=1002)
     preview = _FakeProcess(pid=1003)
@@ -504,15 +601,157 @@ def test_upstream_failure_stops_all_children_and_subscribers():
     ingest._preview_process = preview
     ingest.recording_active = True
     ingest._preview_subscribers.append(PreviewSubscriber(1024))
+    ingest._upstream_generation = 1
 
-    ingest._read_upstream_stdout_loop(upstream)
+    ingest._read_upstream_stdout_loop(upstream, 1)
 
-    assert ingest.is_stopped is True
+    assert ingest.is_stopped is False
     assert "code=7" in ingest.upstream_error
-    assert ingest.recording_active is False
-    assert ingest.preview_subscribers == 0
-    assert recording.terminated is True
-    assert preview.terminated is True
+    assert ingest.recording_active is True
+    assert ingest.preview_subscribers == 1
+    assert recording.terminated is False
+    assert preview.terminated is False
+    assert ingest.process_id is None
+    assert ingest.upstream_is_live() is False
+    assert ingest.recording_sink_is_live() is True
+
+
+def test_signed_http_empty_read_after_media_reports_remote_eof(monkeypatch):
+    ingest = SharedRoomIngest("room-a", "https://hs.flv.huya.com/src/live.flv?wsSecret=abc")
+    proc = _FakeProcess(pid=1001)
+    ingest._process = proc
+    ingest._upstream_generation = 3
+
+    class _Response:
+        status = 200
+        headers = {"Content-Length": None}
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, _size: int = -1) -> bytes:
+            self.reads += 1
+            if self.reads == 1:
+                return b"flv-payload"
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "lsc.core.services.shared_ingest.open_http_stream",
+        lambda *_args, **_kwargs: _Response(),
+    )
+    ingest._feed_signed_http_loop(proc, 3, url=ingest.url, headers={}, network_context={})
+    assert "remote EOF after media" in ingest.upstream_error
+    assert ingest._upstream_has_produced_data is True
+
+
+def test_preview_handle_keeps_sink_during_lease_rotation():
+    ingest = SharedRoomIngest("room-a", "https://hs.flv.huya.com/src/live.flv?wsSecret=abc")
+    ingest.upstream_error = "signed http remote EOF after media"
+    ingest._upstream_has_produced_data = True
+    handle = SharedPreviewHandle(
+        ingest,
+        on_init_segment=lambda _data: None,
+        on_media_segment=lambda _data: None,
+        auto_start=False,
+    )
+    assert ingest.is_lease_rotating() is True
+    assert handle._should_stop_for_upstream_error() is False
+    handle.stop()
+
+
+def test_stash_pending_lease_skips_refresh_on_rotate():
+    ingest = SharedRoomIngest("room-a", "https://old.example/live.flv?wsSecret=old")
+    ingest.stash_pending_lease(
+        url="https://new.example/live.flv?wsSecret=new",
+        headers={"Referer": "https://www.huya.com/"},
+        network_context={"http_session_ttl_sec": 0.2},
+        lease_id="lease-new",
+        generation=4,
+    )
+    pending = ingest.take_pending_lease()
+    assert pending is not None
+    assert pending["url"].endswith("wsSecret=new")
+    assert ingest.take_pending_lease() is None
+
+
+def test_replace_upstream_invalidates_old_generation_without_detaching_sinks(monkeypatch):
+    old_upstream = _FakeProcess(pid=1001)
+    new_upstream = _FakeProcess(pid=2001)
+    recording = _FakeProcess(pid=1002)
+    preview = _FakeProcess(pid=1003)
+    ingest = SharedRoomIngest("room-a", "https://old.example/live.flv")
+    ingest._process = old_upstream
+    ingest._recording_process = recording
+    ingest._preview_process = preview
+    ingest.recording_active = True
+    ingest._preview_subscribers.append(PreviewSubscriber(1024))
+    ingest._upstream_generation = 4
+    monkeypatch.setattr(ingest, "_launch_process", lambda _command: new_upstream)
+
+    error = ingest.replace_upstream(
+        "https://new.example/live.flv",
+        headers={"Referer": "https://new.example/"},
+    )
+
+    assert error == ""
+    assert old_upstream.terminated is True
+    assert ingest.process_id == new_upstream.pid
+    assert ingest.upstream_generation > 4
+    assert ingest.recording_active is True
+    assert ingest.preview_subscribers == 1
+    assert recording.terminated is False
+    assert preview.terminated is False
+
+
+def test_replace_upstream_preflight_adopts_only_after_first_ts_packet(monkeypatch):
+    old_upstream = _FakeProcess(pid=1101)
+    new_upstream = _FakeProcess(
+        pid=2101,
+        stdout_chunks=[b"\x47" + b"x" * (TS_PACKET_SIZE - 1)],
+    )
+    recording = _FakeProcess(pid=1102)
+    ingest = SharedRoomIngest("room-a", "https://old.example/live.flv")
+    ingest._process = old_upstream
+    ingest._recording_process = recording
+    ingest.recording_active = True
+    ingest._upstream_generation = 2
+    monkeypatch.setattr(ingest, "_launch_process", lambda _command: new_upstream)
+
+    error = ingest.replace_upstream(
+        "https://new.example/live.flv",
+        preflight=True,
+    )
+
+    assert error == ""
+    assert ingest.process_id == new_upstream.pid
+    assert old_upstream.terminated is True
+    assert ingest.upstream_generation == 3
+    assert ingest.recording_active is True
+
+
+def test_replace_upstream_preflight_rejects_candidate_without_media(monkeypatch):
+    old_upstream = _FakeProcess(pid=1201)
+    new_upstream = _FakeProcess(pid=2201)
+    ingest = SharedRoomIngest("room-a", "https://old.example/live.flv")
+    ingest._process = old_upstream
+    ingest._recording_process = _FakeProcess(pid=1202)
+    ingest.recording_active = True
+    ingest._upstream_generation = 5
+    monkeypatch.setattr(ingest, "_launch_process", lambda _command: new_upstream)
+
+    error = ingest.replace_upstream(
+        "https://new.example/live.flv",
+        preflight=True,
+    )
+
+    assert "preflight" in error
+    assert ingest.process_id == old_upstream.pid
+    assert old_upstream.terminated is False
+    assert new_upstream.terminated is True
+    assert ingest.upstream_generation == 5
 
 
 def test_recording_failure_isolated_from_preview_and_upstream():
@@ -668,3 +907,169 @@ def test_preview_stream_registry_attaches_shared_handle(monkeypatch):
     assert ingest.preview_subscribers == 1
     registry.stop_room("room-a")
     assert ingest.preview_subscribers == 0
+
+
+def test_shared_ingest_tracks_media_progress_counters(tmp_path):
+    ingest = SharedRoomIngest("room-a", "http://example/live.flv")
+    ingest.publish_preview_segment(b"init", kind="init")
+    ingest.publish_preview_segment(b"media", kind="media")
+    assert ingest.preview_segment_count == 2
+    assert ingest.preview_media_bytes == len(b"init") + len(b"media")
+
+    recording = tmp_path / "recording.mkv"
+    recording.write_bytes(b"media-bytes")
+    ingest._recording_path = str(recording)
+    assert ingest.recording_size_bytes == len(b"media-bytes")
+
+    segments_dir = tmp_path / "recording_session" / "segments"
+    segments_dir.mkdir(parents=True)
+    (segments_dir / "000001.partial.mkv").write_bytes(b"segment-bytes")
+    ingest._recording_segmented = True
+    ingest._recording_segments_dir = str(segments_dir)
+    assert ingest.recording_size_bytes == len(b"media-bytes") + len(b"segment-bytes")
+
+
+def test_startup_probe_keeps_waiting_after_upstream_eof(tmp_path, monkeypatch):
+    import lsc.core.services.shared_ingest as shared_ingest_mod
+
+    ingest = SharedRoomIngest("room-a", "http://example/live.flv")
+    recording = _FakeProcess(pid=1002)
+    ingest._recording_process = recording
+    ingest.recording_active = True
+    ingest.upstream_error = (
+        "shared ingest upstream ffmpeg exited: code=0 | stderr: error=End of file."
+    )
+    ingest._upstream_has_produced_data = True
+    ingest._process = _FakeProcess(pid=1001)
+    path = tmp_path / "out.mp4"
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", lambda: "")
+    monkeypatch.setattr(shared_ingest_mod, "STARTUP_PROBE_INTERVAL_SEC", 0.01)
+    monkeypatch.setattr(shared_ingest_mod, "_RECORDING_START_STABLE_SEC", 0.0)
+    monkeypatch.setattr(shared_ingest_mod, "STARTUP_PROBE_TIMEOUT_SEC", 1.0)
+
+    def fake_sleep(_seconds):
+        if not path.exists():
+            path.write_bytes(b"media")
+
+    monkeypatch.setattr(shared_ingest_mod.time, "sleep", fake_sleep)
+    assert ingest._wait_for_startup_data(str(path)) is True
+
+
+def test_startup_probe_restarts_dead_upstream_while_recording_alive(tmp_path, monkeypatch):
+    import lsc.core.services.shared_ingest as shared_ingest_mod
+
+    ingest = SharedRoomIngest("room-a", "http://example/live.flv")
+    recording = _FakeProcess(pid=1002)
+    ingest._recording_process = recording
+    ingest.recording_active = True
+    ingest._process = None
+    ingest.upstream_error = "shared ingest upstream ffmpeg exited: code=0"
+    ingest._upstream_has_produced_data = True
+    path = tmp_path / "out.mp4"
+    restarted = {"n": 0}
+
+    def restart():
+        restarted["n"] += 1
+        ingest._process = _FakeProcess(pid=2001)
+        ingest.upstream_error = ""
+        path.write_bytes(b"media")
+        return ""
+
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", restart)
+    monkeypatch.setattr(shared_ingest_mod, "STARTUP_PROBE_INTERVAL_SEC", 0.01)
+    monkeypatch.setattr(shared_ingest_mod, "_RECORDING_START_STABLE_SEC", 0.0)
+    monkeypatch.setattr(shared_ingest_mod, "STARTUP_PROBE_TIMEOUT_SEC", 1.0)
+    assert ingest._wait_for_startup_data(str(path)) is True
+    assert restarted["n"] >= 1
+
+
+def test_recording_start_reports_upstream_eof_not_h264_pps(monkeypatch):
+    ingest = SharedRoomIngest("room-a", "http://example/live.flv")
+    factory = _ProcessFactory(ingest.url)
+    monkeypatch.setattr(ingest, "_launch_process", factory)
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", lambda: "")
+    monkeypatch.setattr(ingest, "_wait_for_startup_data", lambda _path: False)
+    ingest._upstream_has_produced_data = True
+    ingest.upstream_error = (
+        "shared ingest upstream ffmpeg exited: code=0 | stderr: error=End of file."
+    )
+    ingest._stderr_buffer.append(
+        "[https @ 1] Will reconnect at 1573622 in 0 second(s), error=End of file."
+    )
+    ingest._recording_stderr_buffer.append(
+        "[h264 @ 00000270e245b740] non-existing PPS 0 referenced"
+    )
+    ingest._recording_stderr_buffer.append("[h264 @ 00000270e245b740] no frame!")
+
+    result = ingest.start_recording("out.mp4")
+
+    assert result.ok is False
+    assert "PPS" not in result.error
+    assert "no frame" not in result.error.lower()
+    assert "连接异常" in result.error or "End of file" in result.error
+
+
+def test_recording_command_discards_corrupt_startup_packets():
+    command = SharedRoomIngest("room-a", "http://example/live.flv").build_recording_command(
+        "out.mp4"
+    )
+    flags = command[command.index("-fflags") + 1]
+    assert "genpts" in flags
+    assert "discardcorrupt" in flags
+
+
+def test_recording_command_writes_fragmented_mp4_without_faststart():
+    command = SharedRoomIngest("room-a", "http://example/live.flv").build_recording_command(
+        "out.mp4"
+    )
+    movflags = command[command.index("-movflags") + 1]
+    assert "faststart" not in movflags
+    assert "frag_keyframe" in movflags
+    assert "empty_moov" in movflags
+    assert "default_base_moof" in movflags
+
+
+def test_recording_command_probes_mpegts_pipe_before_input():
+    command = SharedRoomIngest("room-a", "http://example/live.flv").build_recording_command(
+        "out.mp4"
+    )
+    input_index = command.index("-i")
+    assert command[input_index + 1] == "pipe:0"
+    assert "-probesize" in command[:input_index]
+    assert "-analyzeduration" in command[:input_index]
+
+
+def test_recording_start_reports_file_not_written_instead_of_english_probe(monkeypatch):
+    ingest = SharedRoomIngest("room-a", "http://example/live.flv")
+    factory = _ProcessFactory(ingest.url)
+    monkeypatch.setattr(ingest, "_launch_process", factory)
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", lambda: "")
+    monkeypatch.setattr(ingest, "_wait_for_startup_data", lambda _path: False)
+    ingest._upstream_has_produced_data = True
+
+    result = ingest.start_recording("out.mp4")
+
+    assert result.ok is False
+    assert "startup probe failed" not in result.error.lower()
+    assert "录制文件未开始写入" in result.error
+
+
+def test_recording_start_prefers_stdin_write_timeout_error(monkeypatch):
+    ingest = SharedRoomIngest("room-a", "http://example/live.flv")
+    factory = _ProcessFactory(ingest.url)
+    monkeypatch.setattr(ingest, "_launch_process", factory)
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", lambda: "")
+
+    def fail_wait(_path):
+        ingest.recording_error = "recording ffmpeg input failed: stdin write timed out after 10.0s"
+        ingest._recording_process = None
+        ingest.recording_active = False
+        return False
+
+    monkeypatch.setattr(ingest, "_wait_for_startup_data", fail_wait)
+    ingest._upstream_has_produced_data = True
+
+    result = ingest.start_recording("out.mp4")
+
+    assert result.ok is False
+    assert "stdin write timed out" in result.error

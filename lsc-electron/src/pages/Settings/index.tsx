@@ -72,6 +72,13 @@ export default function Settings() {
     keys?: string[]
   } | null>(null)
   const [savingBilibiliCookie, setSavingBilibiliCookie] = useState(false)
+  const [huyaCookieText, setHuyaCookieText] = useState('')
+  const [huyaCookieStatus, setHuyaCookieStatus] = useState<{
+    configured?: boolean
+    count?: number
+    keys?: string[]
+  } | null>(null)
+  const [savingHuyaCookie, setSavingHuyaCookie] = useState(false)
   const [detectedJianyingDir, setDetectedJianyingDir] = useState('')
 
   useEffect(() => {
@@ -91,6 +98,7 @@ export default function Settings() {
       send('check_dependencies', {})
       send('get_douyin_cookie_status', {})
       send('get_bilibili_cookie_status', {})
+      send('get_huya_cookie_status', {})
       send('get_jianying_draft_dir', {})
     }
   }, [isConnected, send])
@@ -170,6 +178,43 @@ export default function Settings() {
         })
         setBilibiliCookieText('')
         message.success(`B站 Cookie 已保存（${data.count || 0} 项），请重新连接直播间`)
+      }),
+      on('get_huya_cookie_status_response', (data: {
+        success?: boolean
+        configured?: boolean
+        count?: number
+        keys?: string[]
+        error?: string
+      }) => {
+        if (data?.success === false && data.error) {
+          message.error(`读取虎牙 Cookie 状态失败：${data.error}`)
+          return
+        }
+        setHuyaCookieStatus({
+          configured: !!data?.configured,
+          count: data?.count || 0,
+          keys: data?.keys || [],
+        })
+      }),
+      on('save_huya_cookies_response', (data: {
+        success?: boolean
+        configured?: boolean
+        count?: number
+        keys?: string[]
+        error?: string
+      }) => {
+        setSavingHuyaCookie(false)
+        if (!data?.success) {
+          message.error(data?.error || '保存虎牙 Cookie 失败')
+          return
+        }
+        setHuyaCookieStatus({
+          configured: !!data.configured,
+          count: data.count || 0,
+          keys: data.keys || [],
+        })
+        setHuyaCookieText('')
+        message.success(`虎牙 Cookie 已保存（${data.count || 0} 项），请重新连接直播间`)
       }),
       on('get_jianying_draft_dir_response', (data: {
         success?: boolean
@@ -330,6 +375,15 @@ export default function Settings() {
     }
     setSavingBilibiliCookie(true)
     send('save_bilibili_cookies', { cookies: bilibiliCookieText })
+  }
+
+  const handleSaveHuyaCookies = () => {
+    if (!huyaCookieText.trim()) {
+      message.warning('请先粘贴 Cookie 内容')
+      return
+    }
+    setSavingHuyaCookie(true)
+    send('save_huya_cookies', { cookies: huyaCookieText })
   }
 
   const scrollToSection = (id: string) => {
@@ -757,6 +811,7 @@ export default function Settings() {
               borderRadius: 'var(--radius)',
               overflow: 'hidden',
               padding: 16,
+              marginBottom: 16,
             }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-50)', marginBottom: 8 }}>B站 Cookie</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: bilibiliCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
@@ -793,6 +848,50 @@ export default function Settings() {
                 disabled={!isConnected}
               >
                 保存 B站 Cookie
+              </Button>
+            </div>
+
+            <div style={{
+              background: 'var(--background-800)',
+              borderRadius: 'var(--radius)',
+              overflow: 'hidden',
+              padding: 16,
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-50)', marginBottom: 8 }}>虎牙 Cookie</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: huyaCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
+                {huyaCookieStatus?.configured
+                  ? <>
+                      <span>已配置 {huyaCookieStatus.count || 0} 项</span>
+                      {(huyaCookieStatus.keys || []).length > 0 && (
+                        <Tooltip title={(huyaCookieStatus.keys || []).join(', ')}>
+                          <span style={{
+                            fontSize: 11,
+                            color: 'var(--text-tertiary)',
+                            textDecoration: 'underline dotted',
+                            cursor: 'help',
+                          }}>
+                            查看键名
+                          </span>
+                        </Tooltip>
+                      )}
+                    </>
+                  : '尚未配置有效 Cookie'}
+              </div>
+              <Input.TextArea
+                value={huyaCookieText}
+                onChange={(e) => setHuyaCookieText(e.target.value)}
+                placeholder='支持 JSON 对象/数组，或 udb_uid=...; udb_guid=... 格式'
+                autoSize={{ minRows: 4, maxRows: 10 }}
+                style={{ marginBottom: 10 }}
+              />
+              <Button
+                type="primary"
+                size="small"
+                loading={savingHuyaCookie}
+                onClick={handleSaveHuyaCookies}
+                disabled={!isConnected}
+              >
+                保存虎牙 Cookie
               </Button>
             </div>
           </SettingsSection>

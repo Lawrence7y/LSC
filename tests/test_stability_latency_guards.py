@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOM_HANDLER = (ROOT / "python-backend" / "handlers" / "room_handler.py").read_text(encoding="utf-8")
+EXPORT_HANDLER = (ROOT / "python-backend" / "handlers" / "export_handlers.py").read_text(encoding="utf-8")
 TIMELINE_HANDLERS = (ROOT / "python-backend" / "handlers" / "timeline_handlers.py").read_text(encoding="utf-8")
 MANAGER = (ROOT / "lsc" / "gui" / "multi_room" / "manager.py").read_text(encoding="utf-8")
 RECORDING_SERVICE = (ROOT / "lsc" / "core" / "services" / "recording_service.py").read_text(encoding="utf-8")
@@ -16,22 +17,23 @@ WORKBENCH = (ROOT / "lsc-electron" / "src" / "pages" / "Workbench" / "index.tsx"
 
 
 def test_export_start_failure_broadcasts_clip_failed():
-    assert "clip_failed" in ROOM_HANDLER
+    source = ROOM_HANDLER + "\n" + EXPORT_HANDLER
+    assert "clip_failed" in source
     # 启动失败分支在 result['error'] 时也要 broadcast
-    assert "导出启动失败" in ROOM_HANDLER or "导出任务失败" in ROOM_HANDLER
-    idx_err = ROOM_HANDLER.find("导出任务失败: room=%s, job=%s, error=%s")
+    assert "导出启动失败" in source or "导出任务失败" in source
+    idx_err = source.find("导出任务失败: room=%s, job=%s, error=%s")
     assert idx_err > 0
-    window = ROOM_HANDLER[idx_err : idx_err + 400]
+    window = source[idx_err : idx_err + 400]
     assert "clip_failed" in window
 
 
 def test_export_jobs_registered_inside_run_export():
-    assert "export_jobs[job_id] = clip_id" in ROOM_HANDLER
+    assert "export_jobs[job_id] = clip_id" in EXPORT_HANDLER
 
 
 def test_export_queue_put_nowait_on_full():
-    assert "put_nowait" in ROOM_HANDLER
-    assert "导出队列已满" in ROOM_HANDLER
+    assert "put_nowait" in EXPORT_HANDLER
+    assert "导出队列已满" in EXPORT_HANDLER
 
 
 def test_align_split_brain_rejects_missing_timeline():

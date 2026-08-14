@@ -75,7 +75,9 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 | 模式 | 配置 | 行为 |
 | :--- | :--- | :--- |
 | 独立双进程（默认） | `shared_ingest_enabled=false` | 预览与录制各一条 CDN 连接、各一个 FFmpeg，互不牵连 |
-| 共享进样 | `shared_ingest_enabled=true` | 单 FFmpeg 双输出：录制 `-c copy` + 预览转码；更省连接与功耗，但故障会互相影响 |
+| 共享进样 | `shared_ingest_enabled=true` | 一个远端上游 FFmpeg + 独立录制/预览 sink；共享连接但故障隔离 |
+
+共享进样的当前实现是一个远端上游 FFmpeg 加独立录制/预览 sink；录制 sink 与预览 sink 可分别停止和恢复。旧版“单 FFmpeg 双输出”仅是历史描述，运行时契约以 `SharedRoomIngest`/`IngestSupervisor` 为准。
 
 ### 2.4 时间线三坐标系契约
 
@@ -174,6 +176,8 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 - Protocol + Registry，适配器无状态，可多线程安全并发解析
 - 解析成功缓存 30s、失败 10s，防止平台 API 熔断
+
+平台适配统一经过 `Resolver → Probe → Lease → IngestSupervisor`。V2 默认关闭，需通过 `platform_pipeline_v2_enabled` 与平台 allowlist 灰度启用；除抖音外的各平台当前支持级别以运行时 `pipeline_health.support_level` 为准，未经真实授权流和长时稳定性验收不得标记为 `STABLE`。
 
 ### 3.8 交互与运维
 

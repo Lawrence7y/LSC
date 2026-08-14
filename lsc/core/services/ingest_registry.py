@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 from lsc.config import load_config
+from lsc.core.services.ingest_supervisor import IngestSupervisor
 from lsc.core.services.shared_ingest import SharedPreviewHandle, SharedRoomIngest
 
 
@@ -80,16 +82,23 @@ class SharedIngestRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._ingests: dict[str, SharedRoomIngest] = {}
+        self._supervisors: dict[str, IngestSupervisor] = {}
 
     def get(self, room_id: str) -> SharedRoomIngest | None:
         with self._lock:
             return self._ingests.get(room_id)
+
+    def get_supervisor_if_exists(self, room_id: str) -> IngestSupervisor | None:
+        """Read-only lookup used by snapshots; never creates resources."""
+        with self._lock:
+            return self._supervisors.get(room_id)
 
     def get_or_create(
         self,
         room_id: str,
         url: str,
         headers: dict[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
     ) -> SharedRoomIngest:
         with self._lock:
             ingest = self._ingests.get(room_id)
@@ -98,34 +107,98 @@ class SharedIngestRegistry:
                     cfg = load_config()
                     queue_bytes = cfg.shared_ingest_preview_queue_bytes
                     drop_policy = cfg.shared_ingest_preview_drop_policy
+                    recording_queue_bytes = cfg.shared_ingest_recording_queue_bytes
                 except Exception:
                     queue_bytes = 2 * 1024 * 1024
                     drop_policy = "drop_oldest"
+                    recording_queue_bytes = 2 * 1024 * 1024
                 ingest = SharedRoomIngest(
                     room_id=room_id,
                     url=url,
                     headers=headers,
+                    network_context=network_context,
                     preview_queue_bytes=queue_bytes,
                     preview_drop_policy=drop_policy,
+                    recording_queue_bytes=recording_queue_bytes,
                 )
                 self._ingests[room_id] = ingest
-            elif not ingest.recording_active:
+            elif not ingest.recording_active and ingest.preview_subscribers <= 0:
+                # When preview is still attached, keep the old upstream until
+                # the supervisor explicitly performs a lease-generation
+                # switch.  Updating the URL here would make the registry
+                # forget which process is actually feeding the preview pipe.
                 ingest.url = url
                 ingest.headers = dict(headers or {})
+                ingest.network_context = dict(network_context or {})
             return ingest
 
-    def stop_room(self, room_id: str, reason: str = "") -> None:
+    def get_supervisor(
+        self,
+        room_id: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        network_context: Mapping[str, object] | None = None,
+        event_callback: Callable[[Any], None] | None = None,
+    ) -> IngestSupervisor:
+        with self._lock:
+            ingest = self.get_or_create(
+                room_id,
+                url,
+                headers,
+                network_context=network_context,
+            )
+            supervisor = self._supervisors.get(room_id)
+            if supervisor is None or supervisor.ingest is not ingest:
+                supervisor = IngestSupervisor(
+                    room_id,
+                    ingest,
+                    event_callback=event_callback,
+                )
+                self._supervisors[room_id] = supervisor
+            elif event_callback is not None:
+                supervisor.add_event_callback(event_callback)
+            return supervisor
+
+    def stop_room(
+        self,
+        room_id: str,
+        reason: str = "",
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> None:
         with self._lock:
             ingest = self._ingests.pop(room_id, None)
+            self._supervisors.pop(room_id, None)
         if ingest is not None:
-            ingest.stop(reason=reason)
+            try:
+                ingest.stop(
+                    reason=reason,
+                    deadline_monotonic=deadline_monotonic,
+                )
+            except TypeError as exc:
+                if "deadline_monotonic" not in str(exc):
+                    raise
+                ingest.stop(reason=reason)
 
-    def stop_all(self, reason: str = "") -> int:
+    def stop_all(
+        self,
+        reason: str = "",
+        *,
+        timeout_sec: float = 10.0,
+    ) -> int:
         with self._lock:
             ingests = list(self._ingests.values())
             self._ingests.clear()
+            self._supervisors.clear()
+        deadline = time.monotonic() + max(0.1, float(timeout_sec))
         for ingest in ingests:
-            ingest.stop(reason=reason)
+            try:
+                ingest.stop(reason=reason, deadline_monotonic=deadline)
+            except TypeError as exc:
+                if "deadline_monotonic" not in str(exc):
+                    raise
+                ingest.stop(reason=reason)
         return len(ingests)
 
     def snapshot_counts(self) -> dict[str, int]:

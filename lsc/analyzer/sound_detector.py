@@ -194,6 +194,22 @@ def _merge_events(
     return merged
 
 
+def _merge_events_last(
+    events: list[dict[str, Any]], merge_window: float = 5.0
+) -> list[dict[str, Any]]:
+    """Merge nearby spikes while retaining the last event in each window."""
+    if not events:
+        return []
+    ordered = sorted(events, key=lambda event: event["timestamp"])
+    merged: list[dict[str, Any]] = [ordered[0]]
+    for event in ordered[1:]:
+        if event["timestamp"] - merged[-1]["timestamp"] <= merge_window:
+            merged[-1] = event
+        else:
+            merged.append(event)
+    return merged
+
+
 def detect_round_end_events(
     video_path: str,
     ffmpeg_path: str = "ffmpeg",

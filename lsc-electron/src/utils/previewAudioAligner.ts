@@ -14,6 +14,14 @@ class PCMRecorder extends AudioWorkletProcessor {
     this.buffer = new Float32Array(options.processorOptions.targetSamples);
     this.offset = 0;
     this.done = false;
+    this.port.onmessage = (e) => {
+      if (this.done) return;
+      if (e.data && e.data.type === 'flush') {
+        const partial = this.buffer.slice(0, this.offset);
+        this.port.postMessage({ type: 'partial', samples: partial, offset: this.offset }, [partial.buffer]);
+        this.done = true;
+      }
+    };
   }
   process(inputs) {
     if (this.done) return false;
@@ -47,6 +55,8 @@ class PreviewAudioAligner {
   private workletLoaded = false
   private workletPromise: Promise<boolean> | null = null
   private lastCaptureDiagnostics: Record<string, PreviewAudioCaptureDiagnostics> = {}
+  private _lastFinalizeRms: number | null = null
+  private _lastFinalizePeak: number | null = null
 
   getLastCaptureDiagnostics(roomId: string): PreviewAudioCaptureDiagnostics | undefined {
     return this.lastCaptureDiagnostics[roomId]
@@ -156,6 +166,19 @@ class PreviewAudioAligner {
       }
 
       const timeout = setTimeout(() => {
+        // 采满超时：已采部分 ≥2s 时降级使用（短窗口互相关精度略降但可用）
+        if (offset >= 2 * sampleRate) {
+          const partial = new Float32Array(offset)
+          partial.set(collected.subarray(0, offset))
+          const downsampled = this.finalizeSamples(partial, sampleRate)
+          if (downsampled) {
+            console.warn(
+              `[PreviewAudioAligner] ScriptProcessor partial capture used for room ${roomId}: ${offset} samples (~${(offset / sampleRate).toFixed(1)}s)`,
+            )
+            finish(downsampled, 'ok', { rms: this._lastFinalizeRms, sample_count: downsampled.length })
+            return
+          }
+        }
         finish(null, 'capture_timeout')
       }, (duration + 4) * 1000)
 
@@ -169,31 +192,16 @@ class PreviewAudioAligner {
         }
         if (offset < collected.length) return
 
-        let sumSq = 0
-        let peak = 0
-        for (let i = 0; i < collected.length; i++) {
-          const v = collected[i]
-          const a = v < 0 ? -v : v
-          if (a > peak) peak = a
-          sumSq += v * v
-        }
-        const rms = Math.sqrt(sumSq / collected.length)
-        if (peak < 1e-5 || rms < 1e-5) {
+        const downsampled = this.finalizeSamples(collected, sampleRate)
+        if (!downsampled) {
           console.warn(`[PreviewAudioAligner] ScriptProcessor silent for room ${roomId}`)
-          finish(null, 'silent_audio', { rms, sample_count: collected.length })
+          finish(null, 'silent_audio', { rms: this._lastFinalizeRms, sample_count: collected.length })
           return
         }
-        let normalized = collected
-        if (peak > 0 && peak < 0.2) {
-          const scale = 0.5 / peak
-          normalized = new Float32Array(collected.length)
-          for (let i = 0; i < collected.length; i++) normalized[i] = collected[i] * scale
-        }
-        const downsampled = this.downsample(normalized, sampleRate, 16000)
         console.log(
           `[PreviewAudioAligner] ScriptProcessor capture OK: room=${roomId}, samples=${downsampled.length}`,
         )
-        finish(downsampled, 'ok', { rms, sample_count: downsampled.length })
+        finish(downsampled, 'ok', { rms: this._lastFinalizeRms, sample_count: downsampled.length })
       }
 
       try {
@@ -264,6 +272,18 @@ class PreviewAudioAligner {
       }
     }
 
+    /** 等待 video 有 ≥3s 前瞻缓冲再开捕，避免直播沿 stall 采到静音/超时。 */
+    const waitForPlayableBuffer = async () => {
+      const deadline = Date.now() + 3000
+      while (Date.now() < deadline) {
+        if (video.buffered.length > 0) {
+          const end = video.buffered.end(video.buffered.length - 1)
+          if (end - video.currentTime >= 3) return
+        }
+        await new Promise<void>((r) => setTimeout(r, 150))
+      }
+    }
+
     // 捕获路径上可能已建立连接的节点，异常退出时统一断开，避免泄漏
     let connectedSource: AudioNode | null = null
     let workletNode: AudioWorkletNode | null = null
@@ -279,6 +299,7 @@ class PreviewAudioAligner {
       const ctx = await this.getContext()
       const ok = await this.loadWorklet(ctx)
       await ensureElementAudible()
+      await waitForPlayableBuffer()
 
       // 优先使用 VideoPreview 创建的共享 MediaElementSourceNode
       // 扬声器仍由 GainNode 控音；对齐只从 source 并联抽 PCM，不改扬声器增益
@@ -380,20 +401,28 @@ class PreviewAudioAligner {
 
         const timeout = setTimeout(() => {
           if (settled) return
-          settled = true
-          cleanup()
-          console.warn(`[PreviewAudioAligner] Capture timeout for room ${roomId} (${duration + 4}s)`)
-          this.setCaptureDiagnostics(roomId, { reason: 'capture_timeout', ready_state: video.readyState })
-          resolve(null)
+          // 采满超时：请求 worklet flush 已采部分；≥2s 仍可用于互相关
+          try { node.port.postMessage({ type: 'flush' }) } catch { /* ignore */ }
+          partialTimeout = setTimeout(() => {
+            if (settled) return
+            settled = true
+            cleanup()
+            console.warn(`[PreviewAudioAligner] Capture timeout for room ${roomId} (${duration + 4}s)`)
+            this.setCaptureDiagnostics(roomId, { reason: 'capture_timeout', ready_state: video.readyState })
+            resolve(null)
+          }, 400)
         }, (duration + 4) * 1000)
+
+        let partialTimeout: ReturnType<typeof setTimeout> | null = null
 
         node.port.onmessage = (e: MessageEvent) => {
           if (settled) return
           settled = true
           clearTimeout(timeout)
+          if (partialTimeout) clearTimeout(partialTimeout)
           cleanup()
 
-          const samples = e.data.samples as Float32Array
+          const samples = e.data?.samples as Float32Array | undefined
           if (!samples || samples.length === 0) {
             console.warn(`[PreviewAudioAligner] Empty samples for room ${roomId}`)
             this.setCaptureDiagnostics(roomId, { reason: 'buffer_empty', ready_state: video.readyState })
@@ -401,46 +430,41 @@ class PreviewAudioAligner {
             return
           }
 
-          // 静音检测：只丢弃「近乎全零」的数字静音。
-          // 弱信号（如 rms≈3e-4）仍可能含可对齐的游戏音效；后端会做 std 归一化。
-          let sumSq = 0
-          let peak = 0
-          for (let i = 0; i < samples.length; i++) {
-            const v = samples[i]
-            const a = v < 0 ? -v : v
-            if (a > peak) peak = a
-            sumSq += v * v
+          const partial = e.data?.type === 'partial'
+          const minSamples = 2 * sampleRate
+          if (partial && samples.length < minSamples) {
+            console.warn(
+              `[PreviewAudioAligner] Partial capture too short for room ${roomId}: ${samples.length} samples`,
+            )
+            this.setCaptureDiagnostics(roomId, { reason: 'capture_timeout', ready_state: video.readyState, sample_count: samples.length })
+            resolve(null)
+            return
           }
-          const rms = Math.sqrt(sumSq / samples.length)
-          if (peak < 1e-5 || rms < 1e-5) {
-            console.warn(`[PreviewAudioAligner] Room ${roomId} audio is silent (RMS=${rms.toFixed(8)}, peak=${peak.toFixed(8)}), discarding`)
+
+          const downsampled = this.finalizeSamples(samples, sampleRate)
+          if (!downsampled) {
+            console.warn(
+              `[PreviewAudioAligner] Room ${roomId} audio is silent (RMS=${this._lastFinalizeRms?.toFixed(8)}, peak=${this._lastFinalizePeak?.toFixed(8)}), discarding`,
+            )
             this.setCaptureDiagnostics(roomId, {
               reason: 'silent_audio',
               ready_state: video.readyState,
-              rms,
+              rms: this._lastFinalizeRms,
               sample_count: samples.length,
             })
             resolve(null)
             return
           }
-
-          // 峰值归一化：弱电平预览流也能稳定互相关（避免 quiet 房间被前端误杀）
-          let normalized = samples
-          if (peak > 0 && peak < 0.2) {
-            const scale = 0.5 / peak
-            normalized = new Float32Array(samples.length)
-            for (let i = 0; i < samples.length; i++) normalized[i] = samples[i] * scale
-          }
-
-          const downsampled = this.downsample(normalized, sampleRate, 16000)
           this.setCaptureDiagnostics(roomId, {
             reason: 'ok',
             ready_state: video.readyState,
             has_audio_track: true,
-            rms,
+            rms: this._lastFinalizeRms,
             sample_count: downsampled.length,
           })
-          console.log(`[PreviewAudioAligner] Capture OK: room=${roomId}, samples=${samples.length} → ${downsampled.length} (16kHz), RMS=${rms.toFixed(6)}, peak=${peak.toFixed(6)}`)
+          console.log(
+            `[PreviewAudioAligner] Capture OK${partial ? ' (partial)' : ''}: room=${roomId}, samples=${samples.length} → ${downsampled.length} (16kHz), RMS=${this._lastFinalizeRms?.toFixed(6)}, peak=${this._lastFinalizePeak?.toFixed(6)}`,
+          )
           resolve(downsampled)
         }
       })
@@ -452,6 +476,36 @@ class PreviewAudioAligner {
       this.setCaptureDiagnostics(roomId, { reason: 'capture_exception', ready_state: video.readyState })
       return null
     }
+  }
+
+  /** 静音检测 + 峰值归一化 + 降采样。返回 16kHz 样本，近乎全零时返回 null。 */
+  private finalizeSamples(samples: Float32Array, sampleRate: number): Float32Array | null {
+    // 静音检测：只丢弃「近乎全零」的数字静音。
+    // 弱信号（如 rms≈3e-4）仍可能含可对齐的游戏音效；后端会做 std 归一化。
+    let sumSq = 0
+    let peak = 0
+    for (let i = 0; i < samples.length; i++) {
+      const v = samples[i]
+      const a = v < 0 ? -v : v
+      if (a > peak) peak = a
+      sumSq += v * v
+    }
+    const rms = Math.sqrt(sumSq / samples.length)
+    this._lastFinalizeRms = rms
+    this._lastFinalizePeak = peak
+    if (peak < 1e-5 || rms < 1e-5) {
+      return null
+    }
+
+    // 峰值归一化：弱电平预览流也能稳定互相关（避免 quiet 房间被前端误杀）
+    let normalized = samples
+    if (peak > 0 && peak < 0.2) {
+      const scale = 0.5 / peak
+      normalized = new Float32Array(samples.length)
+      for (let i = 0; i < samples.length; i++) normalized[i] = samples[i] * scale
+    }
+
+    return this.downsample(normalized, sampleRate, 16000)
   }
 
   private downsample(buffer: Float32Array, fromRate: number, toRate: number): Float32Array {

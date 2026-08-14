@@ -35,6 +35,94 @@ export function computeDvrLeftEdge(liveEdgeSec: number): number {
   return Math.max(0, liveEdgeSec - DVR_LOOKBACK_SEC)
 }
 
+export type ExpandedPreviewWindowInput = {
+  liveDvr: boolean
+  previewPos: number
+  bufferedStart?: number
+  bufferedEnd?: number
+  previewDuration?: number
+  fileDuration?: number
+  markIn?: number | null
+  markOut?: number | null
+  /** Live 必须忽略；回看也只用 file/preview 秒，不用录制墙钟。 */
+  recordedHint?: number
+  /** Live 默认 true：播放头钉在右沿。DVR 回看传 false。 */
+  followLive?: boolean
+}
+
+export type ExpandedPreviewWindow = {
+  start: number
+  end: number
+  purple: number
+  liveEdge: number
+  hasLiveDvr: boolean
+  playheadPct: number
+  fillLeftPct: number
+  fillWidthPct: number
+}
+
+function finiteNonNeg(n: number | null | undefined): number {
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/**
+ * 放大预览条窗口：Live 左端 = 紫线 = liveEdge − 120s。
+ * liveEdge 优先 buffered.end，无效时用 previewPos；禁止录制墙钟。
+ */
+export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput): ExpandedPreviewWindow {
+  const pos = typeof input.previewPos === 'number' && Number.isFinite(input.previewPos)
+    ? Math.max(0, input.previewPos)
+    : 0
+
+  if (!input.liveDvr) {
+    const end = Math.max(
+      pos,
+      finiteNonNeg(input.previewDuration),
+      finiteNonNeg(input.fileDuration),
+      finiteNonNeg(input.markIn),
+      finiteNonNeg(input.markOut),
+      1,
+    )
+    const playheadPct = Math.max(0, Math.min(100, (pos / end) * 100))
+    return {
+      start: 0,
+      end,
+      purple: 0,
+      liveEdge: end,
+      hasLiveDvr: false,
+      playheadPct,
+      fillLeftPct: 0,
+      fillWidthPct: playheadPct,
+    }
+  }
+
+  const bufStart = input.bufferedStart
+  const bufEnd = input.bufferedEnd
+  const hasBuffer =
+    typeof bufStart === 'number' && Number.isFinite(bufStart)
+    && typeof bufEnd === 'number' && Number.isFinite(bufEnd)
+    && bufEnd - bufStart > 1
+  const liveEdge = hasBuffer ? Math.max(0, bufEnd as number) : pos
+  const purple = computeDvrLeftEdge(liveEdge)
+  const start = purple
+  const end = Math.max(liveEdge, start)
+  const span = Math.max(end - start, 1e-6)
+  const followLive = input.followLive !== false
+  const playheadPct = followLive
+    ? 100
+    : Math.max(0, Math.min(100, ((pos - start) / span) * 100))
+  return {
+    start,
+    end,
+    purple,
+    liveEdge,
+    hasLiveDvr: true,
+    playheadPct,
+    fillLeftPct: 0,
+    fillWidthPct: playheadPct,
+  }
+}
+
 /**
  * 1x + followLive + !scrub + !refine → windowStart=0，整段压进视口。
  * zoom>1 → visibleSpan=contentEnd/zoom；Live 时窗贴右缘；scrub 时用 pan/frozen。

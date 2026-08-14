@@ -27,6 +27,9 @@ from scripts.valorant_vision.round_gt import (
 
 DEFAULT_ROOT = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"
 PORT = 8765
+_AUTH_TOKEN = ""
+_MAX_BODY_BYTES = 2 * 1024 * 1024
+_SERVER_HOLDER: list[ThreadingHTTPServer] = []
 
 ROOT = DEFAULT_ROOT
 QUEUE = ROOT / "queue.json"
@@ -608,13 +611,54 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _authorized(self) -> bool:
+        """Require the opt-in local token without changing no-token usage."""
+        if not _AUTH_TOKEN:
+            return True
+        query_token = parse_qs(urlparse(self.path).query).get("auth", [""])[0]
+        return self.headers.get("X-Auth-Token", "") == _AUTH_TOKEN or query_token == _AUTH_TOKEN
+
+    def _require_auth(self) -> bool:
+        if self._authorized():
+            return True
+        self._json(401, {"error": "authentication required"})
+        return False
+
+    def _origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        expected = {
+            f"http://127.0.0.1:{self.server.server_port}",
+            f"http://localhost:{self.server.server_port}",
+        }
+        return origin in expected
+
+    def _html(self, template: str) -> bytes:
+        # The browser UI is the trusted local client; install the token on its
+        # same-origin fetches so enabling auth does not break existing flows.
+        token = json.dumps(_AUTH_TOKEN, ensure_ascii=False)
+        bootstrap = (
+            "<script>"
+            f"const LSC_AUTH_TOKEN={token};"
+            "const _lscFetch=window.fetch.bind(window);"
+            "window.fetch=(input,init={})=>{"
+            "const headers=new Headers(init.headers||{});"
+            "if(LSC_AUTH_TOKEN) headers.set('X-Auth-Token',LSC_AUTH_TOKEN);"
+            "return _lscFetch(input,{...init,headers});};"
+            "</script>"
+        )
+        return template.replace("<head>", f"<head>{bootstrap}", 1).encode("utf-8")
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._require_auth():
+            return
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
-            self._bytes(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+            self._bytes(200, self._html(HTML), "text/html; charset=utf-8")
             return
         if path == "/rounds":
-            self._bytes(200, ROUNDS_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            self._bytes(200, self._html(ROUNDS_HTML), "text/html; charset=utf-8")
             return
         if path == "/api/queue":
             self._bytes(200, QUEUE.read_bytes(), "application/json; charset=utf-8")
@@ -650,10 +694,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/frame/"):
             rel = unquote(path[len("/frame/") :])
             # normpath 防 .. 穿越，但不 resolve 以免穿透 junction/symlink
-            import os.path as _osp
-            root_str = str(ROOT)
-            fp = Path(_osp.normpath(_osp.join(root_str, rel)))
-            if not str(fp).startswith(root_str) or not fp.is_file():
+            try:
+                fp = resolve_frame_path(ROOT, rel)
+            except ValueError:
+                self._json(404, {"error": "missing"})
+                return
+            if not fp.is_file():
                 self._json(404, {"error": "missing"})
                 return
             ctype = mimetypes.guess_type(fp.name)[0] or "image/jpeg"
@@ -662,8 +708,20 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._require_auth():
+            return
+        if not self._origin_allowed():
+            self._json(403, {"error": "cross-origin request rejected"})
+            return
         path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json(400, {"error": "invalid content length"})
+            return
+        if length < 0 or length > _MAX_BODY_BYTES:
+            self._json(413, {"error": "request body too large"})
+            return
         body = self.rfile.read(length) if length else b"{}"
         if path == "/api/labels":
             LABELS.write_bytes(body)
@@ -712,15 +770,21 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: ~/LSC/datasets/valorant_phase/annotate)",
     )
     parser.add_argument("--port", type=int, default=PORT, help=f"HTTP port (default: {PORT})")
+    parser.add_argument("--token", default=None, help="Optional token required by the local UI")
+    parser.add_argument("--max-threads", type=int, default=8, help="Compatibility option for the local server")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
+    global _AUTH_TOKEN
     args = build_parser().parse_args(argv)
+    if args.token is not None:
+        _AUTH_TOKEN = str(args.token)
     paths = configure_paths(args.root)
     if not paths.queue.exists():
         raise SystemExit(f"missing {paths.queue}; run build_round_boundary_queue.py first")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    _SERVER_HOLDER.append(server)
     print(f"Label UI: http://127.0.0.1:{args.port}/")
     print(f"Frames root: {paths.root}")
     server.serve_forever()

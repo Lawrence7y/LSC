@@ -22,6 +22,7 @@ class RoomDraftSource:
     record_output_path: str
     recording_to_common_delta: float
     is_main: bool = False
+    record_manifest_path: str = ""
 
 
 @dataclass(slots=True)
@@ -249,9 +250,9 @@ def build_session_draft(
 
     usable: list[RoomDraftSource] = []
     for room in rooms:
-        if (options.include_recordings or options.include_clips) and (
-            not room.record_output_path or not os.path.isfile(room.record_output_path)
-        ):
+        has_legacy_file = bool(room.record_output_path and os.path.isfile(room.record_output_path))
+        has_manifest = bool(room.record_manifest_path and os.path.isfile(room.record_manifest_path))
+        if (options.include_recordings or options.include_clips) and not (has_legacy_file or has_manifest):
             warnings.append(f"房间 {room.name} 无录制文件，已跳过")
             continue
         usable.append(room)
@@ -308,12 +309,29 @@ def build_session_draft(
     def _material_for(room: RoomDraftSource) -> Any:
         if room.room_id in materials:
             return materials[room.room_id]
+        material_path = room.record_output_path
+        if room.record_manifest_path:
+            try:
+                from lsc.config import load_config
+                from lsc.recorder.assets import RecordingAsset
+
+                cfg = load_config()
+                material_path = RecordingAsset.recover(
+                    room.record_manifest_path
+                ).materialize_persistent(
+                    ffmpeg_path=cfg.ffmpeg_path,
+                    ffprobe_path=cfg.ffprobe_path,
+                )
+            except (FileNotFoundError, OSError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"房间 {room.name} 的分段录制无法作为剪映素材: {exc}"
+                ) from exc
         if options.vertical:
-            raw = draft.VideoMaterial(room.record_output_path)
+            raw = draft.VideoMaterial(material_path)
             crop = center_crop_9_16(width=raw.width, height=raw.height)
-            mat = draft.VideoMaterial(room.record_output_path, crop_settings=crop)
+            mat = draft.VideoMaterial(material_path, crop_settings=crop)
         else:
-            mat = draft.VideoMaterial(room.record_output_path)
+            mat = draft.VideoMaterial(material_path)
         materials[room.room_id] = mat
         return mat
 

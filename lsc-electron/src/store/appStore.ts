@@ -107,6 +107,26 @@ function roomsShallowEqual(a: RoomSession[], b: RoomSession[]): boolean {
     const right = b[i] as unknown as Record<string, unknown>
     const keys = new Set([...Object.keys(left), ...Object.keys(right)])
     for (const key of keys) {
+      if (key === 'pipeline_health') {
+        const l = left[key] as Record<string, unknown> | undefined
+        const r = right[key] as Record<string, unknown> | undefined
+        const healthKeys = [
+          'schema_version', 'platform_id', 'pipeline_mode', 'platform', 'support_level',
+          'connection_policy', 'credential_status', 'credential_kinds', 'resolver',
+          'ingest', 'recording', 'preview', 'error', 'failure_kind', 'lease_id', 'candidate_id',
+          'quality_id', 'protocol', 'cdn_id', 'lease_expires_at', 'lease_refresh_at',
+          'generation', 'upstream_generation', 'recovery_attempt', 'max_recovery_attempts', 'resources',
+        ]
+        if (healthKeys.some((healthKey) => {
+          const leftValue = l?.[healthKey]
+          const rightValue = r?.[healthKey]
+          if (healthKey === 'credential_kinds' || healthKey === 'resources') {
+            return JSON.stringify(leftValue) !== JSON.stringify(rightValue)
+          }
+          return leftValue !== rightValue
+        })) return false
+        continue
+      }
       if (left[key] !== right[key]) return false
     }
   }

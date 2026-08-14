@@ -8,8 +8,18 @@ import logging
 import os
 import re
 import socket
+import sys
+from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, getproxies
+
+try:
+    from lsc.platforms.redaction import redact_text, redact_url
+except ModuleNotFoundError:  # direct ``python scripts/douyin_record.py`` usage
+    _repo_root = str(Path(__file__).resolve().parents[1])
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from lsc.platforms.redaction import redact_text, redact_url
 
 log = logging.getLogger("lsc.douyin")
 logging.basicConfig(
@@ -72,7 +82,18 @@ _SSRF_SAFE_OPENER = build_opener(
 )
 
 
-def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | None, str | None]:
+def urlopen(request, *, timeout: float):
+    """Compatibility seam for tests/callers while retaining the safe opener."""
+    return _SSRF_SAFE_OPENER.open(request, timeout=timeout)
+
+
+def fetch_page(
+    url: str,
+    cookies: dict[str, str] | None = None,
+    *,
+    proxy_url: str = "",
+    timeout_sec: float | None = None,
+) -> tuple[str | None, str | None]:
     """Fetch the Douyin live page HTML with unified timeout and retry.
 
     Returns
@@ -87,6 +108,26 @@ def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | N
         return None, "仅支持 http/https 链接"
     if _is_private_ip(parsed.hostname):
         return None, "不允许访问内网/保留地址"
+
+    request_timeout = _HTTP_TIMEOUT
+    if timeout_sec is not None:
+        try:
+            request_timeout = max(1.0, min(300.0, float(timeout_sec)))
+        except (TypeError, ValueError):
+            request_timeout = _HTTP_TIMEOUT
+
+    scoped_proxy = str(proxy_url or "").strip()
+    opener = _SSRF_SAFE_OPENER
+    if scoped_proxy:
+        proxy = urlparse(scoped_proxy)
+        if proxy.scheme not in ("http", "https") or not proxy.hostname:
+            return None, "仅支持 http/https 代理"
+        # Keep redirects SSRF-safe while scoping this request to the resolved
+        # platform proxy. Do not log or expose proxy credentials.
+        opener = build_opener(
+            _SSRFRedirectHandler(),
+            ProxyHandler({"http": scoped_proxy, "https": scoped_proxy}),
+        )
 
     headers = {
         "User-Agent": (
@@ -119,7 +160,12 @@ def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | N
     for attempt in range(_HTTP_RETRIES + 1):
         try:
             request = Request(url, headers=headers)
-            with _SSRF_SAFE_OPENER.open(request, timeout=_HTTP_TIMEOUT) as response:
+            if scoped_proxy:
+                response_context = opener.open(request, timeout=request_timeout)
+            else:
+                # Preserve the legacy urlopen seam for existing callers/tests.
+                response_context = urlopen(request, timeout=request_timeout)
+            with response_context as response:
                 return response.read().decode("utf-8", errors="replace"), None
         except HTTPError as exc:
             last_exc = exc
@@ -136,7 +182,7 @@ def fetch_page(url: str, cookies: dict[str, str] | None = None) -> tuple[str | N
             reason = f"连接异常: {exc}"
             if attempt < _HTTP_RETRIES:
                 time.sleep(1.0 * (attempt + 1))
-    log.warning("fetch_page failed url=%s err=%s", url, last_exc)
+    log.warning("fetch_page failed url=%s err=%s", redact_url(url), redact_text(last_exc))
     return None, reason
 
 

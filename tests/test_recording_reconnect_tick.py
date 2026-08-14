@@ -134,3 +134,97 @@ def test_recording_reconnect_stops_when_stream_is_offline(monkeypatch, tmp_path)
     assert room.is_reconnecting is False
     assert room.reconnect_next_attempt_at == 0.0
     assert "下播" in room.last_error
+
+
+def test_huya_ffmpeg_crash_code0_forces_reconnect(monkeypatch, tmp_path) -> None:
+    """虎牙 FFmpeg code=0 异常退出即使无 403 特征也强制换线重连（回归 #3b）。"""
+    from lsc.gui.multi_room.manager import MultiRoomManager
+    from lsc.platforms.base import StreamInfo
+
+    monkeypatch.setattr(
+        "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        def stop_recording(self):
+            self.stop_calls += 1
+            return True, 1.0, str(tmp_path / "old.mp4")
+
+        def start_recording_with_crf(self, stream_url, output_dir, encoder, crf, **kwargs):
+            self.start_calls += 1
+            return True, str(tmp_path / "new.mp4"), encoder, ""
+
+    manager = MultiRoomManager(controller_factory=FakeController)
+    room = manager.add_room("https://www.huya.com/example")
+    room.is_connected = True
+    room.is_recording = True
+    room.stream_info = StreamInfo(
+        platform="huya",
+        room_url="https://www.huya.com/example",
+        stream_url="https://tx.flv.huya.com/live.flv",
+        is_live=True,
+    )
+
+    # code=0 异常退出文案无 403 特征 → is_recoverable_error 判 False，
+    # 但虎牙 "异常退出" 应放行走重连，而非置不可恢复停止
+    manager._attempt_recording_reconnect(room, "FFmpeg 异常退出 (code 0)")
+
+    assert room.controller.stop_calls == 0
+    assert room.is_recording is True
+    assert room.is_reconnecting is True
+
+
+def test_recording_start_auth_failure_does_not_quarantine_huya_cdn(monkeypatch, tmp_path) -> None:
+    """虎牙录制启动鉴权失败走签名族失效，不得当成 CDN 换线。"""
+    from lsc.gui.multi_room.manager import MultiRoomManager
+    from lsc.platforms.base import StreamInfo
+
+    monkeypatch.setattr(
+        "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+
+    marked: list[str] = []
+    monkeypatch.setattr(
+        "lsc.platforms.huya.mark_cdn_bad",
+        lambda cdn: marked.append(cdn),
+    )
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.stream_url = "https://tx.flv.huya.com/live.flv"
+            self.input_args: list[str] = []
+
+        def start_recording_with_crf(self, stream_url, output_dir, encoder, crf, **kwargs):
+            return False, "", encoder, "直播流鉴权失败或链接已过期 (code 3436169992)"
+
+    manager = MultiRoomManager(controller_factory=FakeController)
+    room = manager.add_room("https://www.huya.com/example")
+    room.is_connected = True
+    room.stream_info = StreamInfo(
+        platform="huya",
+        room_url="https://www.huya.com/example",
+        stream_url="https://tx.flv.huya.com/live.flv",
+        is_live=True,
+    )
+    monkeypatch.setattr(manager, "_refresh_room_stream_for_recording", lambda room: True)
+    monkeypatch.setattr(manager._orch, "_refresh_room_stream_for_recording", lambda room: True)
+
+    ok = manager.start_recording(room.room_id, str(tmp_path), "Copy", 23)
+
+    assert ok is False
+    assert marked == []
+    assert "鉴权" in room.last_error

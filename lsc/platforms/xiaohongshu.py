@@ -6,6 +6,7 @@ import logging
 _log = logging.getLogger(__name__)
 
 import re
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -16,8 +17,10 @@ from .base import (
     ERROR_RESTRICTED,
     BasePlatformAdapter,
     StreamInfo,
+    fetch_head,
     fetch_url,
 )
+from .redaction import redact_url
 
 XHS_HEADERS = {
     "Referer": "https://www.xiaohongshu.com/",
@@ -25,9 +28,13 @@ XHS_HEADERS = {
 }
 # Live room URL patterns:
 #   https://www.xiaohongshu.com/live/{id}
+#   https://www.xiaohongshu.com/livestream/{id}
 #   https://www.xiaohongshu.com/user/profile/{uid}?live_id={id}
 _LIVE_PATH_RE = re.compile(r"^/live/([a-zA-Z0-9_-]+)/?$")
+_LIVESTREAM_PATH_RE = re.compile(r"^/livestream/([a-zA-Z0-9_-]+)/?$")
 _USER_PATH_RE = re.compile(r"^/user/profile/([a-zA-Z0-9_-]+)/?$")
+_SHORT_LINK_HOSTS = {"xhslink.com"}
+_LIVE_HOSTS = {"www.xiaohongshu.com"}
 
 
 class XiaohongshuAdapter(BasePlatformAdapter):
@@ -35,34 +42,96 @@ class XiaohongshuAdapter(BasePlatformAdapter):
     display_name = "小红书"
 
     def can_handle(self, url: str) -> bool:
-        _log.debug("Xiaohongshu: checking %s", url[:60])
+        _log.debug("Xiaohongshu: checking %s", redact_url(url)[:60])
         parsed = urlparse((url or "").strip())
         host = parsed.netloc.lower()
-        if host not in {"www.xiaohongshu.com", "xhslink.com"}:
+        if host in _SHORT_LINK_HOSTS:
+            return bool(parsed.path.strip("/"))
+        if host not in _LIVE_HOSTS:
             return False
-        return bool(_LIVE_PATH_RE.match(parsed.path)) or bool(_USER_PATH_RE.match(parsed.path))
+        return (
+            bool(_LIVE_PATH_RE.match(parsed.path))
+            or bool(_LIVESTREAM_PATH_RE.match(parsed.path))
+            or bool(_USER_PATH_RE.match(parsed.path))
+        )
 
     def parse(self, url: str) -> StreamInfo:
-        _log.info("Xiaohongshu: parsing %s", url[:80])
+        return self._parse(url)
+
+    def parse_with_context(self, url: str, context: object) -> StreamInfo:
+        """Resolve both profile and live pages through the scoped context."""
+        headers = dict(XHS_HEADERS)
+        headers.update(dict(getattr(context, "headers", {}) or {}))
+        return self._parse(
+            url,
+            request_headers=headers,
+            network_context=getattr(context, "network_context", {}) or {},
+        )
+
+    def _parse(
+        self,
+        url: str,
+        *,
+        request_headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
+        _log.info("Xiaohongshu: parsing %s", redact_url(url)[:80])
         clean_url = (url or "").strip()
         parsed = urlparse(clean_url)
+        headers = dict(request_headers or XHS_HEADERS)
+        context = dict(network_context or {})
+
+        if parsed.netloc.lower() in _SHORT_LINK_HOSTS:
+            expanded = self._expand_short_link(
+                clean_url,
+                request_headers=headers,
+                network_context=context,
+            )
+            if not expanded:
+                return self._failed(clean_url, "小红书短链解析失败", ERROR_PARSE_FAILED)
+            clean_url = expanded
+            parsed = urlparse(clean_url)
 
         # Direct live room URL
-        live_match = _LIVE_PATH_RE.match(parsed.path)
+        live_match = _LIVE_PATH_RE.match(parsed.path) or _LIVESTREAM_PATH_RE.match(parsed.path)
         if live_match:
-            return self._parse_live_room(clean_url, live_match.group(1))
+            return self._parse_live_room(
+                clean_url,
+                live_match.group(1),
+                request_headers=headers if request_headers is not None else None,
+                network_context=context if request_headers is not None or context else None,
+            )
 
         # User profile URL — need to find their live room
         user_match = _USER_PATH_RE.match(parsed.path)
         if user_match:
-            return self._parse_user_profile(clean_url, user_match.group(1))
+            return self._parse_user_profile(
+                clean_url,
+                user_match.group(1),
+                request_headers=headers if request_headers is not None else None,
+                network_context=context if request_headers is not None or context else None,
+            )
 
         return self._failed(clean_url, "无法识别小红书链接", ERROR_PARSE_FAILED)
 
-    def _parse_live_room(self, url: str, live_id: str) -> StreamInfo:
+    def _parse_live_room(
+        self,
+        url: str,
+        live_id: str,
+        *,
+        request_headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
         """Parse a direct live room URL."""
         try:
-            html = fetch_url(url, headers=XHS_HEADERS)
+            if request_headers is None and network_context is None:
+                html = fetch_url(url, headers=XHS_HEADERS)
+            else:
+                html = self._fetch_page(
+                    url,
+                    headers=request_headers,
+                    network_context=network_context,
+                )
         except Exception as exc:
             return self._failed(url, f"小红书页面加载失败: {exc}", ERROR_PARSE_FAILED)
 
@@ -84,13 +153,32 @@ class XiaohongshuAdapter(BasePlatformAdapter):
             is_live=True,
             quality_urls={"source": stream_url},
             selected_quality="source",
-            headers=dict(XHS_HEADERS),
+            headers=dict(request_headers or XHS_HEADERS),
+            raw={
+                "source_kind": "fallback",
+                "confidence": 0.45,
+                "state_source": "live_page",
+            },
         )
 
-    def _parse_user_profile(self, url: str, user_id: str) -> StreamInfo:
+    def _parse_user_profile(
+        self,
+        url: str,
+        user_id: str,
+        *,
+        request_headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> StreamInfo:
         """Parse a user profile URL — try to find active live room."""
         try:
-            html = fetch_url(url, headers=XHS_HEADERS)
+            if request_headers is None and network_context is None:
+                html = fetch_url(url, headers=XHS_HEADERS)
+            else:
+                html = self._fetch_page(
+                    url,
+                    headers=request_headers,
+                    network_context=network_context,
+                )
         except Exception as exc:
             return self._failed(url, f"小红书用户页面加载失败: {exc}", ERROR_PARSE_FAILED)
 
@@ -98,7 +186,12 @@ class XiaohongshuAdapter(BasePlatformAdapter):
         live_id_match = re.search(r'"liveId"\s*:\s*"([a-zA-Z0-9_-]+)"', html)
         if live_id_match:
             live_id = live_id_match.group(1)
-            return self._parse_live_room(f"https://www.xiaohongshu.com/live/{live_id}", live_id)
+            return self._parse_live_room(
+                f"https://www.xiaohongshu.com/live/{live_id}",
+                live_id,
+                request_headers=request_headers,
+                network_context=network_context,
+            )
 
         # Check for live status indicators
         if '"isLive":true' in html or '"LIVING"' in html:
@@ -112,10 +205,79 @@ class XiaohongshuAdapter(BasePlatformAdapter):
                     is_live=True,
                     quality_urls={"source": stream_url},
                     selected_quality="source",
-                    headers=dict(XHS_HEADERS),
+                    headers=dict(request_headers or XHS_HEADERS),
+                    raw={
+                        "source_kind": "fallback",
+                        "confidence": 0.4,
+                        "state_source": "profile_page",
+                    },
                 )
 
         return self._failed(url, "该用户未在直播", ERROR_OFFLINE)
+
+    def _fetch_page(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> str:
+        context = dict(network_context or {})
+        proxy_url = str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+        try:
+            timeout = max(1, min(300, int(float(context.get("timeout_sec", 12)))))
+        except (TypeError, ValueError):
+            timeout = 12
+        return fetch_url(
+            url,
+            headers=dict(headers or XHS_HEADERS),
+            timeout=timeout,
+            proxy_url=proxy_url,
+        )
+
+    def _expand_short_link(
+        self,
+        url: str,
+        *,
+        request_headers: Mapping[str, str] | None = None,
+        network_context: Mapping[str, object] | None = None,
+    ) -> str:
+        """Follow xhslink.com redirects to a www.xiaohongshu.com live URL."""
+        context = dict(network_context or {})
+        proxy_url = str(
+            context.get("proxy_url")
+            or context.get("http_proxy")
+            or context.get("https_proxy")
+            or ""
+        ).strip()
+        try:
+            timeout = max(1, min(300, int(float(context.get("timeout_sec", 12)))))
+        except (TypeError, ValueError):
+            timeout = 12
+        final_url = fetch_head(
+            url,
+            headers=dict(request_headers or XHS_HEADERS),
+            timeout=timeout,
+            proxy_url=proxy_url,
+        )
+        if not final_url or final_url == url:
+            return ""
+        parsed = urlparse(final_url)
+        host = parsed.netloc.lower()
+        if host not in _LIVE_HOSTS:
+            return ""
+        if not (
+            _LIVE_PATH_RE.match(parsed.path)
+            or _LIVESTREAM_PATH_RE.match(parsed.path)
+            or _USER_PATH_RE.match(parsed.path)
+        ):
+            return ""
+        return final_url
 
     def _extract_stream_url(self, html: str) -> str:
         """Extract stream URL from Xiaohongshu page."""

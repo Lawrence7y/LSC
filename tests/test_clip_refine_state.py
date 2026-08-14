@@ -167,6 +167,104 @@ def test_save_bilibili_cookies_rejects_oversized_input():
     assert "过大" in result.get("error", "") or "large" in result.get("error", "").lower()
 
 
+def test_cookie_save_refreshes_invalidated_provider(monkeypatch):
+    """Saving replacement cookies must clear the provider revoke marker."""
+    from lsc.platforms import cookie_helper, credentials
+    from lsc.platforms.credentials import CredentialStatus
+
+    refreshed: list[str] = []
+
+    class Provider:
+        def refresh(self, platform):
+            refreshed.append(platform)
+            return SimpleNamespace(status=CredentialStatus.AVAILABLE)
+
+    monkeypatch.setattr(
+        cookie_helper,
+        "save_douyin_cookies_from_text",
+        lambda _raw: {"count": 1},
+    )
+    monkeypatch.setattr(credentials, "get_default_credential_provider", lambda: Provider())
+    server, _ = _register_refine_handlers()
+
+    result = asyncio.run(
+        server.handlers["save_douyin_cookies"]({"cookies": "session=redacted"})
+    )
+
+    assert result["success"] is True
+    assert result["credential_status"] == "AVAILABLE"
+    assert refreshed == ["douyin"]
+
+
+def test_bilibili_cookie_save_refreshes_invalidated_provider(monkeypatch):
+    from lsc.platforms import cookie_helper, credentials
+    from lsc.platforms.credentials import CredentialStatus
+
+    refreshed: list[str] = []
+
+    class Provider:
+        def refresh(self, platform):
+            refreshed.append(platform)
+            return SimpleNamespace(status=CredentialStatus.AVAILABLE)
+
+    monkeypatch.setattr(
+        cookie_helper,
+        "save_bilibili_cookies_from_text",
+        lambda _raw: {"count": 1},
+    )
+    monkeypatch.setattr(credentials, "get_default_credential_provider", lambda: Provider())
+    server, _ = _register_refine_handlers()
+
+    result = asyncio.run(
+        server.handlers["save_bilibili_cookies"]({"cookies": "SESSDATA=redacted"})
+    )
+
+    assert result["success"] is True
+    assert result["credential_status"] == "AVAILABLE"
+    assert refreshed == ["bilibili"]
+
+
+def test_save_huya_cookies_rejects_oversized_input():
+    server, _ = _register_refine_handlers()
+    oversized = "x" * (2 * 1024 * 1024)
+
+    async def scenario():
+        return await server.handlers["save_huya_cookies"]({"cookies": oversized})
+
+    result = asyncio.run(scenario())
+    assert result is not None
+    assert result.get("success") is False
+    assert "过大" in result.get("error", "") or "large" in result.get("error", "").lower()
+
+
+def test_huya_cookie_save_refreshes_invalidated_provider(monkeypatch):
+    from lsc.platforms import cookie_helper, credentials
+    from lsc.platforms.credentials import CredentialStatus
+
+    refreshed: list[str] = []
+
+    class Provider:
+        def refresh(self, platform):
+            refreshed.append(platform)
+            return SimpleNamespace(status=CredentialStatus.AVAILABLE)
+
+    monkeypatch.setattr(
+        cookie_helper,
+        "save_huya_cookies_from_text",
+        lambda _raw: {"count": 1},
+    )
+    monkeypatch.setattr(credentials, "get_default_credential_provider", lambda: Provider())
+    server, _ = _register_refine_handlers()
+
+    result = asyncio.run(
+        server.handlers["save_huya_cookies"]({"cookies": "udb_uid=redacted"})
+    )
+
+    assert result["success"] is True
+    assert result["credential_status"] == "AVAILABLE"
+    assert refreshed == ["huya"]
+
+
 def test_align_preview_audio_rejects_too_many_rooms():
     """align_preview_audio must reject > 64 rooms (#4)."""
     server, _ = _register_refine_handlers()

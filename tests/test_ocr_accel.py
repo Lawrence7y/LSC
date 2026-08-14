@@ -115,17 +115,17 @@ def test_create_ocr_uses_resolved_backend(monkeypatch) -> None:
         def __init__(self, **kwargs):
             calls.append(kwargs)
 
-    monkeypatch.setattr(oa, "run_probe_if_needed", lambda mode: "dml")
-    monkeypatch.setattr(
-        "rapidocr_onnxruntime.RapidOCR",
-        FakeOCR,
-        raising=False,
-    )
     import sys
     import types
+
     mod = types.ModuleType("rapidocr_onnxruntime")
     mod.RapidOCR = FakeOCR
+    # Install the fake module before resolving the dotted monkeypatch target.
+    # Packaged OCR runtimes may import PIL/PySide during module discovery and
+    # can block the test process on machines without the matching runtime.
     monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", mod)
+    monkeypatch.setattr(oa, "run_probe_if_needed", lambda mode: "dml")
+    monkeypatch.setattr("rapidocr_onnxruntime.RapidOCR", FakeOCR)
     inst = oa.create_ocr("auto")
     assert isinstance(inst, FakeOCR)
     assert calls and calls[0].get("det_use_dml") is True

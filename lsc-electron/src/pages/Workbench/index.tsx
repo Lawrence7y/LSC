@@ -178,6 +178,34 @@ function canExportForShortcut(c: ClipSegment): boolean {
     c.confirm_status === 'vision_confirmed'
 }
 
+type ContinuousListedClip = ClipSegment & { export_deferred?: boolean }
+
+/** Reconcile a reconnect snapshot without duplicating the same room/round. */
+export function reconcileContinuousListedClips(
+  current: ContinuousListedClip[],
+  incoming: ContinuousListedClip[],
+): ContinuousListedClip[] {
+  const result = [...current]
+  for (const clip of incoming) {
+    const key = clip.round_key || clip.clip_id
+    const index = result.findIndex(
+      item => item.room_id === clip.room_id
+        && key != null
+        && (item.round_key || item.clip_id) === key,
+    )
+    const merged: ContinuousListedClip = {
+      ...(index >= 0 ? result[index] : {}),
+      ...clip,
+    }
+    if (clip.export_deferred && !merged.export_status) {
+      merged.export_status = 'pending'
+    }
+    if (index >= 0) result[index] = merged
+    else result.push(merged)
+  }
+  return result
+}
+
 function isApproximateClip(c: ClipSegment): boolean {
   if (c.clip_snapshot_id || c.mark_precision === 'exact') return false
   if (c.is_ai_highlight && c.mark_precision !== 'approximate') return false
@@ -217,7 +245,10 @@ function formatPreviewDegradationLabel(width: number, height: number, fps?: numb
   return label
 }
 
-function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
+function formatCaptureFailureSummary(
+  failures: CaptureFailure[],
+  roomNames?: Map<string, string>,
+): string {
   if (failures.length === 0) return '原因未知'
   const labels: Record<string, string> = {
     no_video: '无预览播放器',
@@ -239,7 +270,8 @@ function formatCaptureFailureSummary(failures: CaptureFailure[]): string {
       const suffix = sampleCount !== undefined
         ? ` samples=${sampleCount}${typeof rms === 'number' ? ` rms=${rms.toFixed(5)}` : ''}`
         : ''
-      return `${failure.roomId}:${label}${suffix}`
+      const display = roomNames?.get(failure.roomId) ?? failure.roomId.slice(0, 8)
+      return `${display}(${label}${suffix})`
     })
     .join('；')
 }
@@ -1892,7 +1924,11 @@ export default function Workbench() {
         alignmentBackgroundRef.current = false
         setAligning(false)
         message.destroy('align')
-        const failureSummary = formatCaptureFailureSummary(captureFailures)
+        const roomNameMap = new Map<string, string>()
+        rooms.forEach(r => {
+          roomNameMap.set(r.room_id, r.streamer || r.title || r.room_id.slice(0, 8))
+        })
+        const failureSummary = formatCaptureFailureSummary(captureFailures, roomNameMap)
         console.warn('[Workbench] 音频捕获不足诊断', {
           selectedRooms: [...roomIds],
           capturedRooms: results.map(r => r.room_id),
@@ -1900,7 +1936,7 @@ export default function Workbench() {
           failureSummary,
         })
         if (!backgroundRefresh) {
-          message.warning(`未精确对齐：有效音频不足（${failureSummary}）`)
+          message.warning(`未精确对齐：有效音频不足——${failureSummary}`, 8)
         }
         return false
       }
@@ -4094,9 +4130,12 @@ export default function Workbench() {
                         expandedRoomId={expandedRoomId}
                         onCollapse={handleCollapse}
                         previewPos={expandedRoomId === room.room_id ? (previewPositions[room.room_id] ?? 0) : 0}
-                        previewDuration={expandedRoomId === room.room_id
-                          ? Math.max(recordedDurationHint, timelineView?.duration ?? 0)
-                          : 0}
+                        previewDuration={
+                          expandedRoomId === room.room_id && isNoDvrPreviewMode(room.preview_mode)
+                            ? Math.max(recordedDurationHint, timelineView?.duration ?? 0)
+                            : 0
+                        }
+                        followLive={expandedRoomId === room.room_id ? timelineFollowLive : true}
                         onPlayPause={handleControlPlayPause}
                         onSeekBack={handleControlSeekBack}
                         onSeekFwd={handleControlSeekFwd}
