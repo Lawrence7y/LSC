@@ -2,9 +2,11 @@
 
 基于 **Electron + React + TypeScript + Python** 的多直播间录制切片系统。面向电竞 / 直播多视角场景，提供多路同步录制、低延迟预览、墙钟精确切片、音频对齐批量导出，以及无畏契约等场景的持续高光分析。
 
-当前版本：**v3.0.0**
+当前版本：**v3.0.21**
 
 仓库：[https://github.com/Lawrence7y/LSC](https://github.com/Lawrence7y/LSC)
+
+> 安装包在安装过程中联网下载运行依赖（国内镜像），安装完成即可使用，无需首次启动再下载。
 
 ---
 
@@ -43,10 +45,10 @@ LSC 是一款 **直播录制 + 快速切片工具**，不是 NLE 剪辑软件。
                                       │ WebSocket (localhost:9876，端口可回退)
 +----------------------------------------------------------------------------------+
 | 2. 桥接服务层 (Python Backend)                                                   |
-|    Qt 主线程事件循环 + 工作线程 WebSocket                                        |
-|    职责：线程安全消息桥接、房间/录制/导出/分析生命周期管理                         |
+|    编排线程（RoomOrchestrator）+ WebSocket 工作线程                              |
+|    职责：orchestrator.call 同步调用 + BroadcastHub 线程安全广播、房间/录制/导出/分析生命周期管理 |
 +----------------------------------------------------------------------------------+
-                                      │ Qt 槽调用
+                                      │ 线程安全队列 / 广播
 +----------------------------------------------------------------------------------+
 | 3. 核心业务层 (lsc Python 包)                                                    |
 |    平台解析、FFmpeg 录制/导出、MSE 转码、音频对齐、回合/OCR 分析管线               |
@@ -130,10 +132,10 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 ### 3.5 多房间音频对齐
 
-- 前端从各房预览 `<video>` 捕获 3.0s PCM（Web Audio / AudioWorklet）
-- 后端 FFT 互相关计算 `content_offset`，置信度 < 0.1 降级为 0
+- 前端从各房预览 `<video>` 捕获约 **8 秒** PCM（Web Audio / AudioWorklet，16kHz）
+- 后端 FFT 互相关计算 `content_offset`，置信度 < 0.3 不写入对齐组（防止误对齐）
 - 以「进度最慢 / 延迟最大」房间为基准
-- 低置信房间不写入对齐组，避免误对齐
+- 对齐成功建立公共时间轴（`timeline_ready`），导出时按墙钟映射 + offset 对齐多视角
 
 ### 3.6 持续分析（v3 重点）
 
@@ -182,9 +184,10 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 ### 3.8 交互与运维
 
 - 全局快捷键：播放/暂停、标记、录制、静音、全屏、批量开停录、导出等
+- **新手引导**：首次进入工作台弹出四步引导（添加房间 → 预览录制 → 标记切片 → 导出）
 - 设置页：编码器、码率、画质、共享进样、导出并发、OCR 加速等
 - 依赖检测：FFmpeg / ffprobe / NVENC / Python
-- 手动「检查更新」（GitHub Releases API，5 分钟缓存）
+- 手动「检查更新」（GitHub Releases API，5 分钟缓存，展示发布说明）
 - 日志滚动：`%APPDATA%\lsc-electron\logs\`（单文件约 2MB × 5）
 
 ### 3.9 安全与鲁棒性
@@ -228,7 +231,7 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 - WebSocket 主端口 `9876`，占用时回退 `19877`–`19880`
 - `rooms_updated` 等高频消息合并 / 日志降级
-- Qt 主线程执行业务；WS 线程通过 `bridge.call` / `queue_broadcast` 跨线程
+- 编排线程（RoomOrchestrator）执行核心逻辑；WS 线程通过 `orchestrator.call` 同步调用 + `BroadcastHub` 广播（上限 1000，满时按类型驱逐/扩容）
 
 ### 5.2 领域模型（节选）
 
@@ -244,13 +247,14 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 │   ├── analyzer/                # 持续分析：回合检测、OCR、相位调度、onset
 │   ├── core/models.py           # DTO
 │   ├── core/services/           # 录制 / 导出 / MSE / 共享进样
+│   ├── core/orchestrator.py     # 编排线程（同步调用 + tick 调度）
 │   ├── platforms/               # 平台适配器
 │   ├── recorder/ · exporter/    # FFmpeg 控制
 │   ├── editor/audio_aligner.py  # 音频互相关对齐
 │   └── gui/multi_room/manager.py
 ├── python-backend/              # WebSocket 桥接服务
-│   ├── main.py · server.py · message_bridge.py
-│   └── handlers/                # 房间 / 时间线 / 分析 / 导出
+│   ├── main.py · server.py · broadcast_hub.py
+│   └── handlers/                # 房间 / 时间线 / 分析 / 导出 / 对齐
 ├── lsc-electron/                # Electron 前端
 │   ├── electron/                # 主进程 / preload
 │   └── src/                     # 工作台 / 预览 / 时间线 / 设置
@@ -276,6 +280,8 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 ### 安装包（推荐）
 
 从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `LSC 直播切片系统 Setup x.y.z.exe` 安装即可。
+
+安装过程中会**自动下载运行依赖**（Python 库 + FFmpeg，走国内镜像），并自动检测 / 升级 VC++ 运行库；完成后首次启动即可直接使用。若机器不支持 DirectML（如虚拟机），分析会自动降级为 CPU，不影响安装与录制。
 
 ### 前置条件
 
@@ -346,7 +352,16 @@ cd lsc-electron
 
 ---
 
-## 9. v3.0.0 摘要
+## 9. 版本摘要
+
+### v3.0.21（2026-08-14）
+
+- **稳定性（长期挂机）**：录制重连后台化（不再全局冻结 20-60s）、编排线程防死亡、导出防挂死（终态必达 + 6h 兜底）、OCR 抽帧子窗化（内存尖峰 330MB → 40MB）、MSE watchdog 恢复上限、心跳定时器泄漏修复、广播 1s 超时剔除、backend-stdout 日志轮转、FFmpeg `-headers` 超长防御
+- **功能**：新手引导、设置页检查更新显示发布说明
+- **安装体验**：安装期依赖走国内镜像（清华 pypi + GitHub 加速代理）、VC++ 运行库自动检测/升级、DirectML 不可用自动降级 CPU
+- 修复：刷新按钮长按粒子卡死/误触短按、对齐拦截诊断日志等
+
+### v3.0.0
 
 - **持续分析**：Valorant OCR 权威边界、相位调度、副房映射、待确认再导出
 - **页面优化**：工作台 UI 统一、Modal / 设置抽屉溢出修复、分析进度与导出摘要
