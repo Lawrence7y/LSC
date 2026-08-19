@@ -156,3 +156,12 @@ _log_part*.txt
 # Local git worktrees
 .worktrees/
 
+# Promo / archive artifacts (large binaries, local observation)
+promo-material/
+promo-video/
+宣推物料/
+_archive_20260819/
+.dsh-media/
+.qoder/
+datasets/_seg*.mp4
+
