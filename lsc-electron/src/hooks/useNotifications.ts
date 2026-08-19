@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { wsClient } from '@/services/websocket'
+import { t } from '@/i18n'
 
 interface NotificationPayload {
   title: string
@@ -9,26 +10,26 @@ interface NotificationPayload {
 
 const TRIGGERS: Record<string, (data: any) => NotificationPayload | null> = {
   clip_completed: (d) => ({
-    title: '切片导出完成',
-    body: `${d.room_name || '房间'} 切片已就绪`,
+    title: t('切片导出完成'),
+    body: `${d.room_name || t('房间')} ${t('切片已就绪')}`,
   }),
   clip_failed: (d) => ({
-    title: '切片导出失败',
-    body: d.error || '未知错误',
+    title: t('切片导出失败'),
+    body: d.error || t('未知错误'),
   }),
   recording_started: (d) => d.success
-    ? { title: '录制已开始', body: d.room_name || '直播间', silent: true }
-    : { title: '录制启动失败', body: d.error || '未知错误' },
+    ? { title: t('录制已开始'), body: d.room_name || t('直播间'), silent: true }
+    : { title: t('录制启动失败'), body: d.error || t('未知错误') },
   room_connect_finished: (d) => d.success
     ? null
-    : { title: '房间连接失败', body: d.error || '连接失败' },
+    : { title: t('房间连接失败'), body: d.error || t('连接失败') },
   reconnect_failed: () => ({
-    title: '后端连接断开',
-    body: 'WebSocket 重连失败，请检查后端状态',
+    title: t('后端连接断开'),
+    body: t('WebSocket 重连失败，请检查后端状态'),
   }),
   recording_stopped: (d) => ({
-    title: d.reason === 'disk_full' ? '磁盘空间不足' : '录制已停止',
-    body: d.message || (d.room_name || '房间') + '录制已停止',
+    title: d.reason === 'disk_full' ? t('磁盘空间不足') : t('录制已停止'),
+    body: d.message || (d.room_name || t('房间')) + t('录制已停止'),
   }),
 }
 
@@ -60,7 +61,7 @@ export function useNotifications() {
       unsubBackendError = window.electronAPI.onBackendError((error) => {
         if (error) {
           window.electronAPI?.showNotification?.({
-            title: '后端启动失败',
+            title: t('后端启动失败'),
             body: error,
           })
         }

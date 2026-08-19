@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """在赛事/解说域 val 帧上对比 valorant_phase 模型（v1 vs v2）。
 
 评估集：数据集 val/ 目录下 broadcast_xuenai_*（2026-08-04 新标注赛事流）。

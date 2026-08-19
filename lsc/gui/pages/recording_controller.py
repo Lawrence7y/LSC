@@ -15,7 +15,12 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from PySide6.QtCore import QThread, QTimer, Signal  # noqa: F401  # kept for backward compat
+try:
+    from PySide6.QtCore import QThread, QTimer, Signal  # noqa: F401  # kept for backward compat
+except ImportError:
+    # 无 PySide6 环境（Store/内置依赖安装包）：使用标准库兼容层，
+    # 线程/回调语义等价，Electron 后端无需 Qt。
+    from lsc.gui.qt_compat import QThread, QTimer, Signal  # noqa: F401
 
 try:
     from lsc import get_logger

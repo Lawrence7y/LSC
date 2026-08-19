@@ -49,7 +49,28 @@ _REQUIREMENTS_AI_PATH = _REQUIREMENTS_DIR / "requirements-ai.txt"
 # 运行时资源必须写入用户数据目录；安装目录在 Program Files 时不可写。
 _APPDATA_DIR = Path(os.environ.get("APPDATA", _PROJECT_ROOT)) / "lsc-electron"
 _RUNTIME_DIR = Path(os.environ.get("LSC_RUNTIME_DIR", _APPDATA_DIR / "runtime"))
-_SITE_PACKAGES = Path(os.environ.get("LSC_PYTHON_PACKAGES", _RUNTIME_DIR / "python-packages"))
+
+# 打包内置的 Python 依赖目录（MSIX / 内置依赖版安装包）：
+# electron-builder extraResources 将 .bundle/python-packages 放到 resources/python-packages，
+# 本脚本位于 resources/python-backend/，因此 _HERE.parent 即 resources。
+_BUNDLED_PACKAGES_DIR = _HERE.parent / "python-packages"
+
+
+def _resolve_site_packages() -> Path:
+    """优先使用打包内置的 Python 依赖目录（Store 版无需联网安装）。
+
+    内置目录包含核心包时直接使用（只读也可运行）；否则回退到
+    LSC_PYTHON_PACKAGES 指定的用户数据目录（联网下载安装版）。
+    """
+    try:
+        if _BUNDLED_PACKAGES_DIR.is_dir() and (_BUNDLED_PACKAGES_DIR / "numpy").is_dir():
+            return _BUNDLED_PACKAGES_DIR
+    except OSError:
+        pass
+    return Path(os.environ.get("LSC_PYTHON_PACKAGES", _RUNTIME_DIR / "python-packages"))
+
+
+_SITE_PACKAGES = _resolve_site_packages()
 _FFMPEG_DIR = _RUNTIME_DIR / "ffmpeg"
 _FFMPEG_EXE = _FFMPEG_DIR / "ffmpeg.exe"
 _FFPROBE_EXE = _FFMPEG_DIR / "ffprobe.exe"
@@ -143,8 +164,9 @@ def _emit_error(phase: str, message: str) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 # 核心依赖（必须安装）
+# 注：PySide6 已移除——recording_controller/common_workers 通过
+# lsc.gui.qt_compat 标准库兼容层运行（见 requirements.txt 注释）。
 _CORE_DEPS = [
-    ("PySide6", "PySide6"),
     ("numpy", "numpy"),
     ("websockets", "websockets"),
     ("psutil", "psutil"),
@@ -483,7 +505,30 @@ def _install_windows_directml(phase_name: str) -> bool:
 
 
 def install_python_deps(include_ai: bool = True) -> bool:
-    """安装 Python 依赖。"""
+    """安装 Python 依赖。
+
+    Store / 内置依赖版：打包内置目录已就绪时直接使用，不发起任何联网安装
+    （符合 Microsoft Store 政策 10.2.5：产品不得在运行时下载安装其他软件）。
+    """
+    # 打包内置核心依赖：直接使用，跳过联网安装
+    if _is_package_importable("numpy") and _SITE_PACKAGES == _BUNDLED_PACKAGES_DIR:
+        _emit_done("python_core", True, "使用打包内置依赖，无需联网安装")
+
+        # AI 依赖：内置版打包时已装好（含 DirectML），直接确认
+        if include_ai and _REQUIREMENTS_AI_PATH.exists():
+            ai_modules_ready = all(
+                _is_package_importable(name)
+                for name, _ in _AI_DEPS
+            )
+            if ai_modules_ready:
+                _emit_done("python_ai", True, "打包内置 AI 依赖已就绪")
+                if not _has_windows_onnx_accel():
+                    _log.warning("打包内置 onnxruntime 未启用 DirectML/CUDA，分析将运行在 CPU")
+                return True
+            _log.warning("打包内置目录缺少 AI 依赖，回退到联网安装路径")
+        else:
+            return True
+
     # 核心依赖
     if check_core_deps_ok():
         _emit_done("python_core", True, "核心依赖已存在，跳过重复安装")

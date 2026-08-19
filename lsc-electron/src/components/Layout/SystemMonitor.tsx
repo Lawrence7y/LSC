@@ -1,4 +1,5 @@
 import { useAppStore } from '@/store/appStore'
+import { useI18n } from '@/i18n'
 
 function ResourceBar({ label, percent, color }: { label: string; percent: number; color: string }) {
   const isOverload = percent > 85
@@ -36,6 +37,7 @@ function ResourceBar({ label, percent, color }: { label: string; percent: number
 
 export default function SystemMonitor() {
   const systemStats = useAppStore((state) => state.systemStats)
+  const { t } = useI18n()
 
   if (!systemStats) return null
 
@@ -51,8 +53,8 @@ export default function SystemMonitor() {
       width: '100%',
     }}>
       <ResourceBar label="CPU" percent={systemStats.cpu_percent} color="var(--brand-500)" />
-      <ResourceBar label="内存" percent={systemStats.memory_percent} color="var(--state-warning-dark)" />
-      <ResourceBar label="磁盘" percent={systemStats.disk_percent} color="var(--state-success-dark)" />
+      <ResourceBar label={t('内存')} percent={systemStats.memory_percent} color="var(--state-warning-dark)" />
+      <ResourceBar label={t('磁盘')} percent={systemStats.disk_percent} color="var(--state-success-dark)" />
     </div>
   )
 }

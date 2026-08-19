@@ -37,6 +37,10 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
      "未找到直播流。主播可能已下播或流地址已过期。"),
     (re.compile(r"Server returned 5\d\d|Internal Server Error", re.I),
      "直播平台服务器异常，请稍后重试。"),
+    # FFmpeg HTTP 层：CDN 返回超长响应头（>4096B/行）→ EINVAL。
+    # 常见于流地址签名过期/CDN 线路异常/网络中间设备注入长头。
+    (re.compile(r"overlong headers?|Overlong header", re.I),
+     "直播服务器返回异常响应（响应头过长）。流地址可能已过期或线路异常，系统将尝试自动刷新。"),
 
     # FFmpeg
     (re.compile(r"Invalid data found when processing input", re.I),
@@ -86,6 +90,7 @@ _RECOVERABLE_PATTERNS: list[re.Pattern] = [
     re.compile(r"Stream ends prematurely", re.I),
     re.compile(r"Error number -138", re.I),
     re.compile(r"Invalid data found", re.I),
+    re.compile(r"overlong headers?", re.I),
     re.compile(r"未增长|stalled|not growing", re.I),
     re.compile(r"流.*过期|链接已过期|鉴权失败", re.I),
     re.compile(r"403|Forbidden", re.I),
@@ -195,6 +200,9 @@ _REPAIR_SUGGESTIONS: list[tuple[re.Pattern, str]] = [
     # 录制文件
     (re.compile(r"moov|moof|MP4.*(不完整|损坏|invalid)", re.I),
      "录制文件不完整，可尝试使用「修复录制文件」功能"),
+    # CDN 异常响应头
+    (re.compile(r"overlong headers?", re.I),
+     "请重新连接房间刷新流地址，或稍后重试"),
     # 编码器
     (re.compile(r"Encoder.*not found|cannot find encoder", re.I),
      "缺少视频编码器，请检查编码器设置"),

@@ -23,6 +23,7 @@ import { computeExpandedPreviewWindow } from '@/utils/timelineWindow'
 import { isNoDvrPreviewMode } from '@/utils/timelineCoords'
 import { readPlayhead, retainClockLoop, subscribeClock } from '@/utils/playheadStore'
 import { useAppStore } from '@/store/appStore'
+import { useI18n, t } from '@/i18n'
 
 function openCredentialSettings(e: React.MouseEvent) {
   e.stopPropagation()
@@ -60,8 +61,8 @@ function credentialSettingsAvailable(room: RoomSession): boolean {
 }
 
 function credentialErrorTitle(room: RoomSession): string {
-  const label = room.platform_name || room.platform || '平台'
-  return `需要${label}凭据`
+  const label = room.platform_name || room.platform || t('平台')
+  return t('需要{label}凭据', { label })
 }
 
 function readMseBuffered(video: HTMLVideoElement | undefined | null): { start: number; end: number } {
@@ -254,6 +255,7 @@ export const RoomCard = memo(function RoomCard({
   isCommonMode = false,
 }: RoomCardProps) {
   const tick = recordingTick
+  const { t } = useI18n()
   const [disconnecting, setDisconnecting] = useState(false)
   const [localMuted, setLocalMuted] = useState(room.preview_muted)
   const [localVolume, setLocalVolume] = useState(1.0)
@@ -336,7 +338,7 @@ export const RoomCard = memo(function RoomCard({
       const el = recordedLabelRef.current
       if (!el) return
       const sec = Math.max(0, (Date.now() - startedAt) / 1000)
-      el.textContent = `已录 ${formatTime(sec)}`
+      el.textContent = t('已录 {time}', { time: formatTime(sec) })
     })
     return () => {
       unsub()
@@ -444,10 +446,10 @@ export const RoomCard = memo(function RoomCard({
       getPopupContainer={() => document.body}
       style={{ width: 88, fontSize: 11 }}
       options={[
-        { value: '原画', label: '原画' },
-        { value: '高清', label: '高清 720p' },
-        { value: '标清', label: '标清 480p' },
-        { value: '流畅', label: '流畅 360p' },
+        { value: '原画', label: t('原画') },
+        { value: '高清', label: t('高清 720p') },
+        { value: '标清', label: t('标清 480p') },
+        { value: '流畅', label: t('流畅 360p') },
       ]}
     />
   )
@@ -459,7 +461,7 @@ export const RoomCard = memo(function RoomCard({
       onMouseLeave={() => setVolumeOpen(false)}
       onClick={(e) => e.stopPropagation()}
     >
-      <Tooltip title={localMuted ? '取消静音' : '静音'}>
+      <Tooltip title={localMuted ? t('取消静音') : t('静音')}>
         <Button
           type="text"
           size="small"
@@ -531,7 +533,7 @@ export const RoomCard = memo(function RoomCard({
     </div>
   )
   const stopPreviewBtn = (
-    <Tooltip title="取消预览">
+    <Tooltip title={t('取消预览')}>
       <Button
         type="text"
         size="small"
@@ -591,7 +593,7 @@ export const RoomCard = memo(function RoomCard({
                 onToggleMultiSelect(room.room_id, e as unknown as React.MouseEvent)
               }
             }}
-            title={multiSelected || selected ? '取消选择' : '选择此房间'}
+            title={multiSelected || selected ? t('取消选择') : t('选择此房间')}
             style={{
               flexShrink: 0,
               width: 22,
@@ -622,7 +624,7 @@ export const RoomCard = memo(function RoomCard({
             {multiSelected || selected ? '✓' : ''}
           </div>
         )}
-        <Tooltip title={room.streamer_name || '未知主播'}>
+        <Tooltip title={room.streamer_name || t('未知主播')}>
           <span
             style={{
               flex: 1,
@@ -634,7 +636,7 @@ export const RoomCard = memo(function RoomCard({
               whiteSpace: 'nowrap',
             }}
           >
-            {room.streamer_name || '未知主播'}
+            {room.streamer_name || t('未知主播')}
           </span>
         </Tooltip>
         {multiSelected && (
@@ -662,7 +664,7 @@ export const RoomCard = memo(function RoomCard({
                 background: 'var(--accent-primary)',
               }}
             />
-            已选中
+            {t('已选中')}
           </span>
         )}
         {isRecordingReview && (
@@ -695,7 +697,7 @@ export const RoomCard = memo(function RoomCard({
                 color: '#af52de',
               }}
             >
-              回看
+              {t('回看')}
             </span>
           </div>
         )}
@@ -763,7 +765,7 @@ export const RoomCard = memo(function RoomCard({
                 marginBottom: 4,
               }}
             >
-              {isCredentialError(room) ? credentialErrorTitle(room) : '连接失败'}
+              {isCredentialError(room) ? credentialErrorTitle(room) : t('连接失败')}
             </div>
             <Tooltip title={room.last_error}>
               <div
@@ -778,19 +780,19 @@ export const RoomCard = memo(function RoomCard({
                   marginBottom: isCredentialError(room) && credentialSettingsAvailable(room) ? 8 : 0,
                 }}
               >
-                {room.last_error}
+                {t(room.last_error)}
               </div>
             </Tooltip>
             {isCredentialError(room) && credentialSettingsAvailable(room) && (
               <Button size="small" type="primary" onClick={openCredentialSettings}>
-                去设置凭据
+                {t('去设置凭据')}
               </Button>
             )}
           </div>
         ) : !room.is_connected ? (
           <div style={{ textAlign: 'center' }}>
             <VideoCameraOutlined style={{ fontSize: 36, color: 'rgba(255,255,255,0.3)' }} />
-            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', marginTop: 6 }}>未连接</div>
+            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.45)', marginTop: 6 }}>{t('未连接')}</div>
           </div>
         ) : room.preview_enabled ? (
           <>
@@ -825,7 +827,7 @@ export const RoomCard = memo(function RoomCard({
                   <div
                     role="slider"
                     tabIndex={0}
-                    aria-label="预览时间线"
+                    aria-label={t('预览时间线')}
                     aria-valuemin={Math.round(replayBoundary)}
                     aria-valuemax={Math.round(expTimelineEnd)}
                     aria-valuenow={Math.round(previewPos)}
@@ -873,7 +875,7 @@ export const RoomCard = memo(function RoomCard({
                         <span
                           className="room-card__expanded-replay-boundary"
                           style={{ left: `${replayBoundaryPct}%` }}
-                          title={`DVR 左边界 ${formatTime(replayBoundary)}：约实时−2分钟，左侧不可回放，右侧可回放`}
+                          title={t('DVR 左边界 {time}：约实时−2分钟，左侧不可回放，右侧可回放', { time: formatTime(replayBoundary) })}
                         />
                       </>
                     )}
@@ -884,7 +886,7 @@ export const RoomCard = memo(function RoomCard({
                         <span
                           className="room-card__expanded-main-pos"
                           style={{ left: `${mwPct}%` }}
-                          title={`主时间线位置 ${formatTime(mainWindowStart)}`}
+                          title={t('主时间线位置 {time}', { time: formatTime(mainWindowStart) })}
                         />
                       )
                     })()}
@@ -927,23 +929,23 @@ export const RoomCard = memo(function RoomCard({
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 8px 6px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                    <Tooltip title={isPreviewPlaying ? '暂停' : '播放'}>
+                    <Tooltip title={isPreviewPlaying ? t('暂停') : t('播放')}>
                       <Button type="text" size="small" icon={isPreviewPlaying ? <PauseCircleOutlined /> : <PlayCircleOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onPlayPause?.() }} />
                     </Tooltip>
-                    <Tooltip title="后退 10 秒（与总体时间线一致）">
+                    <Tooltip title={t('后退 10 秒（与总体时间线一致）')}>
                       <Button type="text" size="small" icon={<StepBackwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekBack?.() }}>10s</Button>
                     </Tooltip>
-                    <Tooltip title="前进 10 秒（与总体时间线一致）">
+                    <Tooltip title={t('前进 10 秒（与总体时间线一致）')}>
                       <Button type="text" size="small" icon={<StepForwardOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onSeekFwd?.() }}>10s</Button>
                     </Tooltip>
                     {qualitySelect}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                     {muteBtn}
-                    <Tooltip title="缩小（窗口播放）">
+                    <Tooltip title={t('缩小（窗口播放）')}>
                       <Button type="text" size="small" icon={<ShrinkOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onCollapse?.(room.room_id) }} />
                     </Tooltip>
-                    <Tooltip title={isBrowserFullscreen ? '退出全屏' : '全屏放大'}>
+                    <Tooltip title={isBrowserFullscreen ? t('退出全屏') : t('全屏放大')}>
                       <Button
                         type="text"
                         size="small"
@@ -974,7 +976,7 @@ export const RoomCard = memo(function RoomCard({
                 {qualitySelect}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                   {muteBtn}
-                  <Tooltip title="放大">
+                  <Tooltip title={t('放大')}>
                     <Button
                       type="text"
                       size="small"
@@ -1002,7 +1004,7 @@ export const RoomCard = memo(function RoomCard({
                   onTogglePreview(room.room_id, true)
                 }}
               >
-                启用预览
+                {t('启用预览')}
               </Button>
             </div>
           </div>
@@ -1028,7 +1030,7 @@ export const RoomCard = memo(function RoomCard({
 
       {/* Meta 行：已录墙钟时长（与时间线预览轴不同，可能差几秒） */}
       {room.is_recording && (
-        <Tooltip title="「已录」为录制墙钟时长；时间线显示的是预览播放位置，二者可能相差数秒">
+        <Tooltip title={t('「已录」为录制墙钟时长；时间线显示的是预览播放位置，二者可能相差数秒')}>
           <div
             style={{
               display: 'flex',
@@ -1045,13 +1047,13 @@ export const RoomCard = memo(function RoomCard({
             }}
           >
             <span style={{ color: 'var(--state-success)', fontWeight: 500, flexShrink: 0 }}>
-              录制中
+              {t('录制中')}
             </span>
             {room.record_started_at && (
               <>
                 <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>·</span>
                 <span ref={recordedLabelRef} style={{ fontFamily: 'monospace', flexShrink: 0 }}>
-                  已录 {formatTime(recordingElapsedSeconds)}
+                  {t('已录 {time}', { time: formatTime(recordingElapsedSeconds) })}
                 </span>
               </>
             )}
@@ -1071,7 +1073,7 @@ export const RoomCard = memo(function RoomCard({
 
       {/* 标题行：仅 stream_title */}
       <div style={{ marginBottom: 10 }}>
-        <Tooltip title={room.stream_title || '暂无标题'}>
+        <Tooltip title={room.stream_title || t('暂无标题')}>
           <div
             style={{
               fontSize: 12,
@@ -1081,7 +1083,7 @@ export const RoomCard = memo(function RoomCard({
               whiteSpace: 'nowrap',
             }}
           >
-            {room.stream_title || '暂无标题'}
+            {room.stream_title || t('暂无标题')}
           </div>
         </Tooltip>
       </div>
@@ -1102,7 +1104,7 @@ export const RoomCard = memo(function RoomCard({
             loading={room.is_connecting}
             style={{ flex: 1 }}
           >
-            连接
+            {t('连接')}
           </Button>
         ) : room.is_recording ? (
           <Button
@@ -1112,10 +1114,10 @@ export const RoomCard = memo(function RoomCard({
             onClick={(e) => {
               e.stopPropagation()
               Modal.confirm({
-                title: '确认停止录制',
-                content: `将停止录制「${room.streamer_name || '未知主播'}」`,
-                okText: '确认停止',
-                cancelText: '取消',
+                title: t('确认停止录制'),
+                content: t('将停止录制「{streamer}」', { streamer: room.streamer_name || t('未知主播') }),
+                okText: t('确认停止'),
+                cancelText: t('取消'),
                 okButtonProps: { danger: true },
                 onOk: () => onStopRecord(room.room_id),
               })
@@ -1127,7 +1129,7 @@ export const RoomCard = memo(function RoomCard({
               color: 'var(--state-error)',
             }}
           >
-            停止录制
+            {t('停止录制')}
           </Button>
         ) : (
           <Button
@@ -1143,10 +1145,10 @@ export const RoomCard = memo(function RoomCard({
             style={{ flex: 1 }}
           >
             {room.is_recording_queued
-              ? `排队中${room.recording_queue_position ? ` #${room.recording_queue_position}` : ''}`
+              ? `${t('排队中')}${room.recording_queue_position ? ` #${room.recording_queue_position}` : ''}`
               : room.is_recording_starting
-                ? '启动中'
-                : '开始录制'}
+                ? t('启动中')
+                : t('开始录制')}
           </Button>
         )}
       
@@ -1171,12 +1173,12 @@ export const RoomCard = memo(function RoomCard({
             }}
             style={{ flex: 1 }}
           >
-            断开
+            {t('断开')}
           </Button>
         )}
       
         {/* 删除按钮（角落） */}
-        <Tooltip title="删除房间">
+        <Tooltip title={t('删除房间')}>
           <Button
             type="text"
             size="small"
@@ -1185,10 +1187,10 @@ export const RoomCard = memo(function RoomCard({
             onClick={(e) => {
               e.stopPropagation()
               Modal.confirm({
-                title: '确认删除',
-                content: `确定要删除房间“${room.streamer_name || '未知主播'}”吗？此操作不可撤销。`,
-                okText: '确认删除',
-                cancelText: '取消',
+                title: t('确认删除'),
+                content: t('确定要删除房间“{streamer}”吗？此操作不可撤销。', { streamer: room.streamer_name || t('未知主播') }),
+                okText: t('确认删除'),
+                cancelText: t('取消'),
                 okButtonProps: { danger: true },
                 onOk: () => onRemove(room.room_id),
               })

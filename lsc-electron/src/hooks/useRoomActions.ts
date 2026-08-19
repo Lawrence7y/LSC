@@ -6,6 +6,7 @@ import {
   RecordingSpecSelector,
   recordingSpecFromSettings,
 } from '@/components/RecordingSpecSelector'
+import { t } from '@/i18n'
 
 // send 返回 boolean：false 表示断连且消息被丢弃（useWebSocket.send 已统一弹提示）
 type SendFn = (type: string, data?: any) => boolean
@@ -60,11 +61,11 @@ export function useRoomActions(opts: {
     const spec = recordingSpecFromSettings(useAppStore.getState().settings)
     let selectedSpec = spec
     modal.confirm({
-      title: '选择录制规格',
+      title: t('选择录制规格'),
       icon: null,
       width: 620,
-      okText: '开始录制',
-      cancelText: '取消',
+      okText: t('开始录制'),
+      cancelText: t('取消'),
       content: createElement(RecordingSpecSelector, {
         initial: spec,
         onChange: (next) => { selectedSpec = next },
@@ -83,7 +84,7 @@ export function useRoomActions(opts: {
     )
     send('stop_recording', { room_id: roomId })
     if (analyzingThisRoom) {
-      message.info('录制已停止。请稍候，持续分析正在收尾并将回合入列待确认，请勿立刻停止分析', 6)
+      message.info(t('录制已停止。请稍候，持续分析正在收尾并将回合入列待确认，请勿立刻停止分析'), 6)
     }
   }, [send])
 
@@ -92,11 +93,11 @@ export function useRoomActions(opts: {
       const activePreviews = useAppStore.getState().rooms
         .filter(r => r.preview_enabled && r.room_id !== roomId).length
       if (activePreviews >= 4) {
-        message.warning('最多 4 路同时预览，请先关闭一路')
+        message.warning(t('最多 4 路同时预览，请先关闭一路'))
         return
       }
       if (activePreviews >= 3) {
-        message.info('多路预览已自动降画质以保证流畅', 3)
+        message.info(t('多路预览已自动降画质以保证流畅'), 3)
       }
     }
     send('enable_preview', { room_id: roomId, enabled, mode: 'mse' })
@@ -148,7 +149,7 @@ export function useRoomActions(opts: {
         if (continuousStatus.room_id === roomId) {
           send('stop_continuous_analysis', { main_room_id: roomId })
         } else if (targets.includes(roomId)) {
-          message.warning('该房间已退出持续分析映射，后续回合可能仅入列主房')
+          message.warning(t('该房间已退出持续分析映射，后续回合可能仅入列主房'))
         }
       }
       send('disconnect_room', { room_id: roomId })
@@ -156,11 +157,11 @@ export function useRoomActions(opts: {
     const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
     if (room?.is_recording) {
       modal.confirm({
-        title: '确认断开',
-        content: `断开将停止录制「${room.streamer_name || '未知主播'}」`,
-        okText: '确认',
+        title: t('确认断开'),
+        content: t('断开将停止录制「{name}」', { name: room.streamer_name || t('未知主播') }),
+        okText: t('确认'),
         okButtonProps: { danger: true },
-        cancelText: '取消',
+        cancelText: t('取消'),
         onOk: doDisconnect,
       })
       return

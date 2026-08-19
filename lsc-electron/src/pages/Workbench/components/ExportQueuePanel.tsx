@@ -3,6 +3,7 @@ import { Button, Tooltip } from 'antd'
 import { CloseOutlined, LoadingOutlined } from '@ant-design/icons'
 import type { ClipSegment } from '@/types'
 import type { ExportProgressInfo } from './ClipList'
+import { useI18n } from '@/i18n'
 
 interface ExportQueuePanelProps {
   clips: ClipSegment[]
@@ -25,6 +26,7 @@ function clampPct(v: number): number {
  * 单条进度仍在切片列表内展示；本面板聚焦「整批走到哪了」。
  */
 export function ExportQueuePanel({ clips, exportProgress, onCancelExport }: ExportQueuePanelProps) {
+  const { t } = useI18n()
   const { active, completed, failed } = useMemo(() => {
     const active: { clip: ClipSegment; percent: number }[] = []
     let completed = 0
@@ -64,12 +66,13 @@ export function ExportQueuePanel({ clips, exportProgress, onCancelExport }: Expo
       <div className="export-queue-panel__head">
         <span className="export-queue-panel__title">
           <LoadingOutlined style={{ marginRight: 6 }} />
-          导出队列
+          {t('导出队列')}
           <span className="export-queue-panel__count">
-            {active.length} 进行中 · {completed} 完成{failed > 0 ? ` · ${failed} 失败` : ''}
+            {t('{active} 进行中 · {completed} 完成', { active: active.length, completed })}
+            {failed > 0 ? t(' · {failed} 失败', { failed }) : ''}
           </span>
         </span>
-        <Tooltip title="取消全部进行中的导出">
+        <Tooltip title={t('取消全部进行中的导出')}>
           <Button
             type="text"
             size="small"
@@ -77,7 +80,7 @@ export function ExportQueuePanel({ clips, exportProgress, onCancelExport }: Expo
             icon={<CloseOutlined />}
             onClick={handleCancelAll}
           >
-            全部取消
+            {t('全部取消')}
           </Button>
         </Tooltip>
       </div>
@@ -97,7 +100,7 @@ export function ExportQueuePanel({ clips, exportProgress, onCancelExport }: Expo
               <span className="export-queue-panel__item-fill" style={{ width: `${percent}%` }} />
             </span>
             <span className="export-queue-panel__item-pct">
-              {percent > 0 ? `${percent.toFixed(0)}%` : '排队'}
+              {percent > 0 ? `${percent.toFixed(0)}%` : t('排队')}
             </span>
           </div>
         ))}

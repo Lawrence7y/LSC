@@ -1,6 +1,6 @@
 {
   "name": "lsc-electron",
-  "version": "3.0.22",
+  "version": "1.0.1",
   "description": "LSC 直播切片系统 - Electron 版本",
   "author": "Lawrence7y",
   "repository": {
@@ -16,7 +16,9 @@
     "electron:build": "tsc --noEmit && vite build && electron-builder",
     "release": "vite build && electron-builder --publish always",
     "prep-bundle": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1",
+    "prep-bundle:store": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1 -WithDeps",
     "build:full": "powershell -ExecutionPolicy Bypass -File scripts/prep-bundle.ps1 && tsc --noEmit && vite build && electron-builder",
+    "build:msix": "powershell -ExecutionPolicy Bypass -File scripts/build-msix.ps1",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
@@ -93,6 +95,7 @@
           "!__pycache__/**",
           "!**/__pycache__/**",
           "!*.pyc",
+          "!python-packages/**",
           "!Scripts/**",
           "!pip/**",
           "!setuptools/**",
@@ -105,6 +108,22 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": ".bundle/python/python-packages",
+        "to": "python-packages",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!*.pyc"
+        ]
+      },
+      {
+        "from": ".bundle/ffmpeg",
+        "to": "ffmpeg",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "publish": {
@@ -114,12 +133,30 @@
       "releaseType": "release"
     },
     "win": {
-      "target": "nsis"
+      "target": [
+        "nsis",
+        {
+          "target": "appx",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "include": "build/installer.nsh"
+    },
+    "appx": {
+      "artifactName": "LiveStreamClipper-${version}.${ext}",
+      "publisher": "CN=B2250643-15B9-4016-82B3-C97EAFA5DABD",
+      "publisherDisplayName": "Lawrence7YY",
+      "displayName": "Live Stream Clipper",
+      "identityName": "Lawrence7YY.LiveStreamClipper",
+      "applicationId": "LiveStreamClipper",
+      "backgroundColor": "#000000",
+      "showNameOnTiles": true
     }
   }
 }

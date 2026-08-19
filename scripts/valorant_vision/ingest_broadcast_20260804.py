@@ -22,7 +22,6 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-
 from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
 
 ANN = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"

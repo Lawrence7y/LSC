@@ -217,7 +217,7 @@ def test_timeline_invalidation_keeps_room_local_marks() -> None:
 
 
 def _analysis_modal_body(source: str) -> str:
-    return source.split("title={analysisIsContinuous ? '持续分析设置' : '多房间同步分析'}", 1)[1].split(
+    return source.split("title={analysisIsContinuous ? t('持续分析设置') : t('多房间同步分析')}", 1)[1].split(
         "</Modal>", 1
     )[0]
 

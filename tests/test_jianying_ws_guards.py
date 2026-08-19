@@ -95,7 +95,6 @@ def test_handler_derives_room_deltas_from_clips_without_ctx():
 
 def test_handler_ctx_less_fallback_builds_sources(monkeypatch):
     """无对齐上下文时多房草稿不再直接拒绝：按切片反推 delta 构建房间源。"""
-    from types import SimpleNamespace
 
     from handlers import jianying_handlers as h
 
@@ -167,7 +166,6 @@ def test_handler_ctx_less_fallback_builds_sources(monkeypatch):
 
 def test_handler_ctx_less_fallback_still_rejects_without_coords(monkeypatch):
     """无 ctx 且切片也没有坐标时，仍按原契约返回 no_aligned_context。"""
-    from types import SimpleNamespace
 
     from handlers import jianying_handlers as h
 

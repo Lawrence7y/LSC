@@ -308,6 +308,7 @@ export interface UpdateStatusPayload {
 export interface ElectronAPI {
   getAppVersion: () => Promise<string>
   getPlatform: () => string
+  isStoreBuild?: () => boolean
   getBackendWsUrl: () => Promise<string | null>
   getBackendWsToken?: () => Promise<string | null>
   onBackendReady?: (callback: (payload: { url: string }) => void) => () => void

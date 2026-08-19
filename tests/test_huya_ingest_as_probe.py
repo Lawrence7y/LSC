@@ -207,8 +207,8 @@ def test_huya_http_session_prefetch_window_covers_150s():
     second_prefetch = first_eof + (ttl - lead)
     assert first_eof == 1120.0
     assert second_prefetch == 1225.0
-    assert 1000.0 + 150.0 > first_eof
-    assert 1000.0 + 150.0 < second_prefetch
+    assert first_eof < 1000.0 + 150.0
+    assert second_prefetch > 1000.0 + 150.0
 
 
 def test_shared_mse_skips_reconnect_loop_on_lease_rotation():

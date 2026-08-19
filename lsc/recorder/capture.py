@@ -27,6 +27,7 @@ _FRIENDLY_STDERR_RULES = (
     ("permission denied", "文件写入权限不足"),
     ("Invalid data found", "直播流数据异常"),
     ("Server returned 5", "服务器返回错误"),
+    ("overlong headers", "直播服务器返回异常响应（响应头过长），流地址可能已过期"),
     ("HTTP error", "HTTP 请求失败"),
     ("Cookie", "Cookie 无效或已过期"),
 )

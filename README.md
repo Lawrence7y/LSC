@@ -62,9 +62,10 @@
 
 ### 方式一：安装包（推荐）
 
-1. 从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `LSC 直播切片系统 Setup x.y.z.exe`
-2. 运行安装 —— 安装过程中自动下载运行依赖（国内镜像加速），自动检测 / 升级 VC++ 运行库
-3. 首次启动即可使用；若机器不支持 DirectML（如虚拟机），AI 分析自动降级 CPU，不影响录制
+- **Microsoft Store 版（自包含）**：从 Microsoft Store 安装 `Live Stream Clipper`。所有 Python 依赖与 FFmpeg 已内置在 MSIX 包中，首次启动无需联网下载或安装任何组件。
+- **GitHub Releases 安装包**：从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `LSC 直播切片系统 Setup x.y.z.exe`。该安装包会在安装过程中下载运行依赖（国内镜像加速）并自动检测 / 升级 VC++ 运行库。
+
+无论哪种方式，首次启动均可直接使用；若机器不支持 DirectML（如虚拟机），AI 分析自动降级 CPU，不影响录制。
 
 ### 方式二：开发模式
 
@@ -273,6 +274,19 @@ cd lsc-electron && npx tsc --noEmit   # TypeScript 类型检查
 
 ## 📦 构建打包
 
+### Microsoft Store（MSIX，自包含，推荐上架用）
+
+```powershell
+cd lsc-electron
+.\scripts\build-msix.ps1
+```
+
+流程：`prep-bundle.ps1 -WithDeps`（首次构建会下载约 1.5GB 依赖并打进包内）→ 代码签名 → `tsc --noEmit` → `vite build` → `electron-builder --win appx`。
+
+产物位于 `lsc-electron/release/`：`LiveStreamClipper-<version>.appx`。该包为自包含 Store 包，运行时不下载/安装任何软件，满足 Microsoft Store 政策 10.2.5。
+
+### GitHub 安装包（NSIS）
+
 ```powershell
 cd lsc-electron
 .\build-installer.ps1
@@ -280,7 +294,7 @@ cd lsc-electron
 
 流程：嵌入式 Python + FFmpeg → `npm install` → `tsc --noEmit` → `vite build` → `electron-builder`（NSIS）。
 
-产物位于 `lsc-electron/release/`：`LSC 直播切片系统 Setup x.y.z.exe`（约 118MB，运行依赖首次启动时国内镜像下载）。
+产物位于 `lsc-electron/release/`：`LSC 直播切片系统 Setup x.y.z.exe`（运行依赖首次启动时国内镜像下载）。
 
 ---
 
@@ -313,7 +327,7 @@ cd lsc-electron
 ## ❓ 常见问题
 
 **Q：安装后首次启动需要联网吗？**
-需要联网下载运行依赖（走国内镜像加速）；录制 / 分析本身仅需能访问直播间。
+Microsoft Store 版不需要——所有运行组件已内置在 MSIX 包中。GitHub NSIS 安装包需要联网下载运行依赖（走国内镜像加速）；录制 / 分析本身仅需能访问直播间。
 
 **Q：虚拟机 / 无 GPU 机器能用 AI 分析吗？**
 可以。DirectML 不可用时自动降级 CPU，仅分析速度变慢，录制功能不受影响。
@@ -325,7 +339,7 @@ cd lsc-electron
 确认已执行「一键对齐」（多房场景）；单房场景墙钟映射自动补偿预览延迟，若仍偏移可检查录制是否发生过重连（重连会生成新的录制段）。
 
 **Q：数据存哪里？会上传吗？**
-所有数据本地存储，无遥测、无上报。网络仅用于：下载依赖、拉取直播流、手动检查更新。
+所有数据本地存储，无遥测、无上报。Store 版网络仅用于：拉取直播流、手动检查更新；GitHub NSIS 版额外用于首次安装时下载运行依赖。
 
 ---
 

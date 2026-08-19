@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type MutableRefObject } from 'react'
 import { message } from 'antd'
+import { t } from '@/i18n'
 
 type OnFn = (type: string, handler: (data: any) => void) => () => void
 type SendFn = (type: string, data?: any) => boolean
@@ -31,30 +32,30 @@ export type RoomUrlValidationResult = {
 /** 校验用户输入的直播间链接（支持多行多链接），返回规范化 URL 列表或错误。 */
 export function parseRoomUrlsForValidation(raw: string): { urls: string[]; error?: string } {
   const urls = raw.split(/\r?\n/).map(item => item.trim()).filter(Boolean)
-  if (urls.length === 0) return { urls: [], error: '请输入直播间链接' }
+  if (urls.length === 0) return { urls: [], error: t('请输入直播间链接') }
   if (urls.length > MAX_ROOM_URLS_PER_ADD) {
-    return { urls: [], error: `一次最多添加 ${MAX_ROOM_URLS_PER_ADD} 个直播间` }
+    return { urls: [], error: t('一次最多添加 {count} 个直播间', { count: MAX_ROOM_URLS_PER_ADD }) }
   }
 
   const seen = new Set<string>()
   for (const url of urls) {
-    if (url.length > 2048) return { urls: [], error: '直播间链接过长' }
-    if (/\s/.test(url)) return { urls: [], error: '每行只能填写一个完整链接，链接中不能包含空格' }
+    if (url.length > 2048) return { urls: [], error: t('直播间链接过长') }
+    if (/\s/.test(url)) return { urls: [], error: t('每行只能填写一个完整链接，链接中不能包含空格') }
     let parsed: URL
     try {
       parsed = new URL(url)
     } catch {
-      return { urls: [], error: `链接格式无效：${url}` }
+      return { urls: [], error: t('链接格式无效：{url}', { url }) }
     }
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return { urls: [], error: '仅支持 http:// 或 https:// 直播间链接' }
+      return { urls: [], error: t('仅支持 http:// 或 https:// 直播间链接') }
     }
     if (!parsed.hostname || parsed.username || parsed.password) {
-      return { urls: [], error: `链接缺少有效域名或包含不安全的登录信息：${url}` }
+      return { urls: [], error: t('链接缺少有效域名或包含不安全的登录信息：{url}', { url }) }
     }
     const duplicateKey = `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}${parsed.search}`.toLowerCase()
     if (seen.has(duplicateKey)) {
-      return { urls: [], error: `输入中存在重复链接：${url}` }
+      return { urls: [], error: t('输入中存在重复链接：{url}', { url }) }
     }
     seen.add(duplicateKey)
   }
@@ -106,9 +107,9 @@ export function useAddRoom(opts: {
       if (!data?.valid || invalidResults.length > 0 || results.length === 0) {
         const detail = invalidResults
           .slice(0, 2)
-          .map(result => `${result.url || '输入内容'}：${result.error || '无法识别'}`)
+          .map(result => `${result.url || t('输入内容')}：${result.error || t('无法识别')}`)
           .join('；')
-        const error = detail || data?.error || '直播间链接未通过验证'
+        const error = detail || data?.error || t('直播间链接未通过验证')
         setLoading(false)
         setRoomUrlValidation({ status: 'error', message: error })
         message.error(error)
@@ -117,7 +118,7 @@ export function useAddRoom(opts: {
 
       const normalizedUrls = results.map(result => result.normalized_url || result.url || '').filter(Boolean)
       if (normalizedUrls.length !== results.length) {
-        const error = '验证结果缺少有效链接，请重新输入后再试'
+        const error = t('验证结果缺少有效链接，请重新输入后再试')
         setLoading(false)
         setRoomUrlValidation({ status: 'error', message: error })
         message.error(error)
@@ -126,8 +127,8 @@ export function useAddRoom(opts: {
 
       const firstResult = results[0]
       const validatedMessage = results.length === 1
-        ? (firstResult.warning || `${firstResult.message || '链接验证通过'}${firstResult.streamer ? `：${firstResult.streamer}` : ''}`)
-        : `${results.length} 个直播间链接均已验证通过，正在添加`
+        ? (firstResult.warning || `${firstResult.message || t('链接验证通过')}${firstResult.streamer ? `：${firstResult.streamer}` : ''}`)
+        : t('{count} 个直播间链接均已验证通过，正在添加', { count: results.length })
       setRoomUrlValidation({ status: 'success', message: validatedMessage })
 
       pendingAddCountRef.current = normalizedUrls.length
@@ -143,7 +144,7 @@ export function useAddRoom(opts: {
       })
       if (pendingAddCountRef.current === 0) {
         setLoading(false)
-        setRoomUrlValidation({ status: 'error', message: '后端未连接，已取消添加' })
+        setRoomUrlValidation({ status: 'error', message: t('后端未连接，已取消添加') })
       }
     }))
 
@@ -154,7 +155,7 @@ export function useAddRoom(opts: {
         if (pendingRoomSavesRef.current > 0) {
           pendingRoomSavesRef.current -= 1
         }
-        message.error(data.error || '添加房间失败')
+        message.error(data.error || t('添加房间失败'))
       }
 
       if (pendingAddCountRef.current > 0) {
@@ -165,11 +166,11 @@ export function useAddRoom(opts: {
             setUrl(pendingAddUrlRef.current)
             setRoomUrlValidation({
               status: 'error',
-              message: '链接验证已通过，但部分房间添加失败，请根据提示重试',
+              message: t('链接验证已通过，但部分房间添加失败，请根据提示重试'),
             })
           } else {
             setUrl('')
-            setRoomUrlValidation({ status: 'success', message: '链接有效，直播间已添加' })
+            setRoomUrlValidation({ status: 'success', message: t('链接有效，直播间已添加') })
           }
           pendingAddUrlRef.current = ''
         }
@@ -210,8 +211,8 @@ export function useAddRoom(opts: {
     setRoomUrlValidation({
       status: 'checking',
       message: parsed.urls.length > 1
-        ? `正在验证 ${parsed.urls.length} 个直播间链接…`
-        : '正在连接平台验证直播间链接…',
+        ? t('正在验证 {count} 个直播间链接…', { count: parsed.urls.length })
+        : t('正在连接平台验证直播间链接…'),
     })
     const sent = send('validate_room_urls', {
       urls: parsed.urls,
@@ -220,7 +221,7 @@ export function useAddRoom(opts: {
     if (!sent) {
       pendingValidationRequestRef.current = ''
       setLoading(false)
-      setRoomUrlValidation({ status: 'error', message: '后端未连接，无法验证直播间链接' })
+      setRoomUrlValidation({ status: 'error', message: t('后端未连接，无法验证直播间链接') })
     }
   }
 

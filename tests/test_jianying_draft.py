@@ -264,7 +264,6 @@ def test_build_cleans_partial_folder_on_save_failure(monkeypatch, tmp_path: Path
     rooms = [RoomDraftSource("r1", "nobody", str(a), 0.0, is_main=True)]
     opt = JianyingDraftOptions(draft_name="LSC_cleanup", include_clips=False, text_labels=False)
 
-    import lsc.exporter.jianying_draft as mod
     import pyJianYingDraft.script_file as sf
 
     def boom_save(self):

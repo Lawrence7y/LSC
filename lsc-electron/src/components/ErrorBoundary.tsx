@@ -1,4 +1,5 @@
 import { Component, ReactNode } from 'react'
+import { t } from '@/i18n'
 
 interface Props {
   children: ReactNode
@@ -43,10 +44,10 @@ export default class ErrorBoundary extends Component<Props, State> {
         }}>
           <div style={{ fontSize: 48 }}>:(</div>
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>
-            应用遇到问题
+            {t('应用遇到问题')}
           </h2>
           <p style={{ fontSize: 13, color: 'var(--text-400, #8e8e93)', margin: 0, maxWidth: 400, textAlign: 'center' }}>
-            页面发生了意外错误。请刷新页面重试，如果问题持续出现请重启应用。
+            {t('页面发生了意外错误。请刷新页面重试，如果问题持续出现请重启应用。')}
           </p>
           <pre style={{
             fontSize: 11,
@@ -75,7 +76,7 @@ export default class ErrorBoundary extends Component<Props, State> {
               marginTop: 8,
             }}
           >
-            刷新页面
+            {t('刷新页面')}
           </button>
         </div>
       )

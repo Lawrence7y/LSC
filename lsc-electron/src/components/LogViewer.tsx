@@ -1,12 +1,14 @@
 import { useState, useCallback } from 'react'
 import { Button, message } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
+import { useI18n } from '@/i18n'
 
 const MAX_DISPLAY_LINES = 500
 
 type LogFile = 'debug.log' | 'backend.log' | 'backend-stdout.log'
 
 export default function LogViewer() {
+  const { t } = useI18n()
   const [content, setContent] = useState('')
   const [logFile, setLogFile] = useState<LogFile>('debug.log')
   const [loading, setLoading] = useState(false)
@@ -18,18 +20,18 @@ export default function LogViewer() {
     try {
       const result = await window.electronAPI?.readLogFile?.({ file, lines: MAX_DISPLAY_LINES })
       if (result?.success) {
-        setContent(result.content || '(空)')
+        setContent(result.content || t('(空)'))
         setLogPath(result.path || '')
         setSize(result.size || 0)
       } else {
-        message.error(result?.error || '读取日志失败')
+        message.error(result?.error || t('读取日志失败'))
       }
     } catch (err) {
-      message.error(`读取日志失败: ${err}`)
+      message.error(t('读取日志失败: {err}', { err: String(err) }))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [t])
 
   return (
     <div>
@@ -44,9 +46,9 @@ export default function LogViewer() {
           className="settings-select"
           style={{ flex: '1 1 180px', minWidth: 0, maxWidth: '100%' }}
         >
-          <option value="debug.log">debug.log (主进程)</option>
+          <option value="debug.log">debug.log ({t('主进程')})</option>
           <option value="backend.log">backend.log (Python)</option>
-          <option value="backend-stdout.log">backend-stdout.log (后端输出)</option>
+          <option value="backend-stdout.log">backend-stdout.log ({t('后端输出')})</option>
         </select>
         <Button
           size="small"
@@ -55,7 +57,7 @@ export default function LogViewer() {
           onClick={() => fetchLog(logFile)}
           style={{ flexShrink: 0 }}
         >
-          刷新
+          {t('刷新')}
         </Button>
         {size > 0 && (
           <span style={{ fontSize: 11, color: 'var(--text-tertiary)', flexShrink: 0 }}>
@@ -77,11 +79,11 @@ export default function LogViewer() {
         wordBreak: 'break-all',
         margin: 0,
       }}>
-        {content || '点击"刷新"查看日志'}
+        {content || t('点击"刷新"查看日志')}
       </pre>
       {logPath && (
         <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
-          路径: {logPath}
+          {t('路径: {path}', { path: logPath })}
         </div>
       )}
     </div>

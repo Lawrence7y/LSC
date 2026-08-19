@@ -9,7 +9,11 @@ from __future__ import annotations
 import os
 from argparse import Namespace
 
-from PySide6.QtCore import QThread, Signal  # noqa: F401  # kept for backward compat
+try:
+    from PySide6.QtCore import QThread, Signal  # noqa: F401  # kept for backward compat
+except ImportError:
+    # 无 PySide6 环境（Store/内置依赖安装包）：使用标准库兼容层。
+    from lsc.gui.qt_compat import QThread, Signal  # noqa: F401
 
 from lsc.exporter.clip import ClipExporter
 

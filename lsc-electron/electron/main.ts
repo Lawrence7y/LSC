@@ -158,14 +158,25 @@ function updateStartupDependencyState(state: StartupDependencyState): void {
   }
 }
 
+/** 是否运行在 Microsoft Store / MSIX 容器中。
+ *  Store 版必须零联网安装：所有 Python 依赖与 FFmpeg 都在 MSIX 包内，
+ *  否则违反 10.2.5（Store 应用不得是其他应用的安装器）。
+ */
+function isStoreBuild(): boolean {
+  return app.isPackaged && process.windowsStore === true
+}
+
 interface AppSettings {
   autoLaunch: boolean
   minimizeToTray: boolean
+  /** 渲染层 UI 语言偏好（'zh-CN' | 'en-US' | ''=未上报，默认中文） */
+  locale: string
 }
 
 let settingsCache: AppSettings = {
   autoLaunch: false,
   minimizeToTray: false,
+  locale: '',
 }
 
 // ===== 设置持久化 =====
@@ -184,12 +195,13 @@ function loadSettings(): AppSettings {
       return {
         autoLaunch: !!parsed.autoLaunch,
         minimizeToTray: !!parsed.minimizeToTray,
+        locale: typeof parsed.locale === 'string' ? parsed.locale : '',
       }
     }
   } catch (err) {
     appLog('ERROR', 'Settings', `读取设置失败: ${err}`)
   }
-  return { autoLaunch: false, minimizeToTray: false }
+  return { autoLaunch: false, minimizeToTray: false, locale: '' }
 }
 
 function saveSettings(settings: AppSettings): void {
@@ -206,6 +218,11 @@ function pushSettingsToRenderer(): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('app:settings-changed', settingsCache)
   }
+}
+
+/** 渲染层是否上报了英文 UI（未上报时默认中文）。 */
+function isEnglishUI(): boolean {
+  return settingsCache.locale === 'en-US'
 }
 
 // ===== Python 后端管理 =====
@@ -388,6 +405,12 @@ function getFfmpegBundleDir(): string {
 
 /** 依赖安装目录。必须位于用户数据目录，不能写入受保护的安装目录。 */
 function getRuntimePackagesDir(): string {
+  // 打包内置的 Python 依赖（Store / 内置依赖版安装包）：直接使用包内目录，
+  // 无需复制到 userData，也不做任何联网安装（政策 10.2.5）。
+  if (app.isPackaged) {
+    const bundled = path.join(process.resourcesPath, 'python-packages')
+    if (fs.existsSync(path.join(bundled, 'numpy'))) return bundled
+  }
   return path.join(app.getPath('userData'), 'runtime', 'python-packages')
 }
 
@@ -397,9 +420,8 @@ function getRequirementsDir(): string {
   return path.join(__dirname, '../../..')
 }
 
-const DEPENDENCY_MARKER_VERSION = 3
+const DEPENDENCY_MARKER_VERSION = 6
 const REQUIRED_RUNTIME_MODULES = [
-  'PySide6',
   'numpy',
   'websockets',
   'psutil',
@@ -987,11 +1009,11 @@ function createTray(): void {
 
   try {
     tray = new Tray(image)
-    tray.setToolTip('LSC 直播切片系统')
+    tray.setToolTip(isEnglishUI() ? 'Live Stream Clipper' : 'LSC 直播切片系统')
 
     const menu = Menu.buildFromTemplate([
       {
-        label: '显示',
+        label: isEnglishUI() ? 'Show' : '显示',
         click: () => {
           if (mainWindow) {
             mainWindow.show()
@@ -1000,7 +1022,7 @@ function createTray(): void {
         },
       },
       {
-        label: '退出',
+        label: isEnglishUI() ? 'Quit' : '退出',
         click: () => {
           if (tray) {
             tray.destroy()
@@ -1257,6 +1279,15 @@ function registerWindowIpc(): void {
   ipcMain.handle('check-for-update', async () => {
     appLog('INFO', 'Update', '用户触发检查更新')
 
+    // Store 版由 Microsoft Store 统一管理更新，不查询 GitHub 安装器。
+    if (isStoreBuild()) {
+      const statusPayload = { type: 'not-available', version: app.getVersion(), storeManaged: true }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update-status', statusPayload)
+      }
+      return { success: true, storeManaged: true }
+    }
+
     // 通知前端：正在检查
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('update-status', { type: 'checking' })
@@ -1314,6 +1345,9 @@ function registerWindowIpc(): void {
 
   // 打开 GitHub Release 页面（浏览器下载）
   ipcMain.handle('download-update', async () => {
+    if (isStoreBuild()) {
+      return { success: false, error: 'Microsoft Store 版本通过 Store 自动更新，无需手动下载。' }
+    }
     appLog('INFO', 'Update', '用户点击下载更新，跳转到 GitHub Release 页面')
     // 使用缓存的 releaseUrl，否则直接跳转仓库 releases 页
     const releaseUrl =
@@ -1335,6 +1369,10 @@ function registerWindowIpc(): void {
 
   // 安装更新（保留接口兼容性，提示用户手动安装）
   ipcMain.handle('install-update', () => {
+    if (isStoreBuild()) {
+      appLog('INFO', 'Update', 'Store 版本更新由 Microsoft Store 管理')
+      return { success: false, error: 'Microsoft Store 版本通过 Store 自动更新。' }
+    }
     appLog('INFO', 'Update', 'install-update called（手动下载模式，跳转 GitHub）')
     shell.openExternal('https://github.com/Lawrence7y/LSC/releases/latest').catch(() => {})
   })
@@ -1375,9 +1413,9 @@ function registerWindowIpc(): void {
 
   // 托盘动态状态：通过 tooltip 文字区分状态（图标暂不切换，缺少多状态图标资源）
   const _trayTooltips: Record<string, string> = {
-    idle: 'LSC 直播切片系统',
-    recording: 'LSC 直播切片系统 — 录制中',
-    error: 'LSC 直播切片系统 — 有错误',
+    idle: isEnglishUI() ? 'Live Stream Clipper' : 'LSC 直播切片系统',
+    recording: isEnglishUI() ? 'Live Stream Clipper — Recording' : 'LSC 直播切片系统 — 录制中',
+    error: isEnglishUI() ? 'Live Stream Clipper — Error' : 'LSC 直播切片系统 — 有错误',
   }
   ipcMain.handle('set-tray-state', (_event, state: 'idle' | 'recording' | 'error') => {
     if (!tray) return
@@ -1385,6 +1423,34 @@ function registerWindowIpc(): void {
       tray.setToolTip(_trayTooltips[state] || _trayTooltips.idle)
     } catch {
       // ignore
+    }
+  })
+
+  // 重启 Python 后端：杀旧进程后重新拉起。
+  // 前端「重新连接」在 WS 重连耗尽（reconnect_failed，后端进程大概率已死亡）
+  // 时调用本接口，使按钮具备真正的后端恢复能力，无需重启整个应用。
+  ipcMain.handle('restart-backend', async () => {
+    appLog('INFO', 'IPC', '用户触发后端重启')
+    try {
+      await killBackendAndWait(8000)
+    } catch (err) {
+      appLog('WARN', 'Backend', `重启前终止后端异常: ${err}`)
+    }
+    spawnBackend()
+    return { success: true }
+  })
+
+  // 渲染层上报 UI 语言偏好：持久化并刷新托盘文案
+  ipcMain.on('app:set-locale', (_event, locale: string) => {
+    if (locale !== 'zh-CN' && locale !== 'en-US') return
+    settingsCache.locale = locale
+    saveSettings(settingsCache)
+    if (tray) {
+      try {
+        tray.setToolTip(isEnglishUI() ? 'Live Stream Clipper' : 'LSC 直播切片系统')
+      } catch {
+        // ignore
+      }
     }
   })
 
@@ -1608,6 +1674,10 @@ let isQuitting = false
 
     // 前端触发依赖安装
     ipcMain.handle('install-dependencies', async (_event, options?: { includeAi?: boolean }) => {
+      // Store 版禁止运行时安装/下载依赖（政策 10.2.5）。
+      if (isStoreBuild()) {
+        return { success: false, error: 'Microsoft Store 版本已内置全部运行组件，无需安装依赖。' }
+      }
       const includeAi = options?.includeAi !== false
       appLog('INFO', 'IPC', `前端触发依赖安装 (includeAi=${includeAi})`)
       if (depInstallProcess) {
@@ -1642,6 +1712,25 @@ let isQuitting = false
    * 如果依赖已就绪则直接启动后端。
    */
   async function ensureDependenciesThenStartBackend(): Promise<void> {
+    // Microsoft Store / MSIX 版本：所有运行依赖必须已在包内。
+    // 这里不调用 checkDependencies / installDependencies，也不会显示
+    // “下载依赖”安装界面，完全符合 10.2.5 的要求。
+    if (isStoreBuild()) {
+      if (hasValidDependencyMarker() || hasRequiredRuntimeFiles()) {
+        appLog('INFO', 'App', 'Store 内置依赖已就绪，直接启动后端')
+        writeDependencyMarker()
+        updateStartupDependencyState({ phase: 'ready' })
+        spawnBackend()
+      } else {
+        const msg = 'This Store build is missing bundled runtime components. Please reinstall the app from Microsoft Store.'
+        pythonDetectError = msg
+        appLog('ERROR', 'App', msg)
+        updateStartupDependencyState({ phase: 'error', error: msg })
+        // 不尝试联网安装，也不启动后端。
+      }
+      return
+    }
+
     // 开发版和安装版共用同一运行时目录与检测流程。首次发现只有 CPU 版
     // onnxruntime 时会自动迁移到 DirectML；验证完成后仍走毫秒级快速路径。
     if (hasValidDependencyMarker()) {
@@ -1670,7 +1759,7 @@ let isQuitting = false
       return
     }
 
-    // 有缺失依赖，通知前端显示安装界面
+    // 有缺失依赖，通知前端显示安装界面（仅非 Store 的 NSIS/开发模式）
     appLog('WARN', 'App', `依赖缺失: core=${depResult.core_ok}, ai=${depResult.ai_ok}, ffmpeg=${depResult.ffmpeg_ok}`)
     updateStartupDependencyState({ phase: 'installing', result: depResult })
     if (mainWindow && !mainWindow.isDestroyed()) {

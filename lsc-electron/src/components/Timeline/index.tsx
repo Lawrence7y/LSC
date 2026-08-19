@@ -1,6 +1,7 @@
 import { useRef, useState, useCallback, useMemo, useEffect } from 'react'
 import type { TimelineHighlightBand } from '@/types'
 import { subscribeDisplayPlayhead } from '@/utils/playheadStore'
+import { useI18n } from '@/i18n'
 import './Timeline.css'
 
 export interface TimelineClip {
@@ -196,6 +197,7 @@ export function Timeline({
   analysisProgress,
   scanRange = null,
 }: TimelineProps) {
+  const { t } = useI18n()
   const scrollRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
   const playheadRef = useRef<HTMLDivElement>(null)
@@ -645,7 +647,7 @@ export function Timeline({
               <div
                 className="lsc-timeline__analysis-progress"
                 style={{ width: `${clamp(analysisProgress * 100, 0, 100)}%` }}
-                title={`已分析 ${Math.round(analysisProgress * 100)}%`}
+                title={t('已分析 {pct}%', { pct: Math.round(analysisProgress * 100) })}
               />
             )}
 
@@ -657,7 +659,7 @@ export function Timeline({
                 <div
                   className="lsc-timeline__scan-range"
                   style={{ left: `${srLeft}%`, width: `${srWidth}%` }}
-                  title={`扫描范围 ${formatTickTime(scanRange[0])}–${formatTickTime(scanRange[1])}`}
+                  title={t('扫描范围 {start}–{end}', { start: formatTickTime(scanRange[0]), end: formatTickTime(scanRange[1]) })}
                 />
               )
             })()}
@@ -668,16 +670,16 @@ export function Timeline({
               const dur = h.end - h.start
               const isAudioPending = h.confirm_status === 'audio_pending'
               const isPending = h.confirm_status === 'pending' || h.confirm_status === 'refining'
-              const statusLabel = h.confirm_status === 'audio_pending' ? '音频待复核'
-                : h.confirm_status === 'pending' ? '待确认'
-                : h.confirm_status === 'refining' ? '调整中'
-                : h.confirm_status === 'user_confirmed' ? '已确认'
-                : h.confirm_status === 'ocr_confirmed' ? 'AI可导'
-                : h.confirm_status === 'vision_confirmed' ? '视觉确认'
+              const statusLabel = h.confirm_status === 'audio_pending' ? t('音频待复核')
+                : h.confirm_status === 'pending' ? t('待确认')
+                : h.confirm_status === 'refining' ? t('调整中')
+                : h.confirm_status === 'user_confirmed' ? t('已确认')
+                : h.confirm_status === 'ocr_confirmed' ? t('AI可导')
+                : h.confirm_status === 'vision_confirmed' ? t('视觉确认')
                 : ''
-              const precisionLabel = h.boundary_precision === 'audio_approximate' ? '音频粗定位' : ''
+              const precisionLabel = h.boundary_precision === 'audio_approximate' ? t('音频粗定位') : ''
               const title = [
-                h.reason || h.label || 'AI 高光',
+                h.reason || h.label || t('AI 高光'),
                 h.score != null ? `score ${h.score.toFixed(2)}` : '',
                 `${formatTickTime(h.start)}–${formatTickTime(h.end)}（${formatTickTime(dur)}）`,
                 statusLabel,
@@ -746,7 +748,7 @@ export function Timeline({
                   snapFlash?.type === 'record' ? ' lsc-timeline__record-end--snap' : ''
                 }`}
                 style={{ left: `${dvrStartPct}%` }}
-                title={`DVR 左边界 ${formatTime(dvrStart!)}：约实时−2分钟，左侧回跟播，右侧可回看`}
+                title={t('DVR 左边界 {time}：约实时−2分钟，左侧回跟播，右侧可回看', { time: formatTime(dvrStart!) })}
               />
             )}
 
@@ -763,7 +765,7 @@ export function Timeline({
                   onDeleteMarker?.('in')
                 }}
               >
-                <span className="lsc-timeline__marker-label">入 {markIn !== null ? formatTime(markIn + ws) : ''}</span>
+                <span className="lsc-timeline__marker-label">{t('入')} {markIn !== null ? formatTime(markIn + ws) : ''}</span>
               </div>
             )}
 
@@ -780,7 +782,7 @@ export function Timeline({
                   onDeleteMarker?.('out')
                 }}
               >
-                <span className="lsc-timeline__marker-label">出 {markOut !== null ? formatTime(markOut + ws) : ''}</span>
+                <span className="lsc-timeline__marker-label">{t('出')} {markOut !== null ? formatTime(markOut + ws) : ''}</span>
               </div>
             )}
 

@@ -1,5 +1,6 @@
 import { Tooltip } from 'antd'
 import { CheckCircleFilled, CloseCircleFilled } from '@ant-design/icons'
+import { useI18n } from '@/i18n'
 
 export function DepStatus({
   ok,
@@ -10,8 +11,9 @@ export function DepStatus({
   version?: string
   path?: string
 }) {
+  const { t } = useI18n()
   if (ok === undefined) {
-    return <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>检测中...</span>
+    return <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{t('检测中...')}</span>
   }
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, maxWidth: 'min(320px, 100%)' }}>

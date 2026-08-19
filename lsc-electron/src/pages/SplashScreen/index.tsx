@@ -10,6 +10,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Progress, Button, Typography, Space, ConfigProvider, theme } from 'antd'
 import { CheckCircleFilled, DownloadOutlined, ReloadOutlined, WarningOutlined } from '@ant-design/icons'
+import { useI18n } from '@/i18n'
 import './SplashScreen.css'
 
 const { Title, Text } = Typography
@@ -22,12 +23,6 @@ interface InstallPhase {
   percent: number
   detail?: string
 }
-
-const PHASE_DEFS: Array<{ key: string; label: string }> = [
-  { key: 'python_core', label: 'Python 核心依赖' },
-  { key: 'python_ai', label: 'AI 分析依赖' },
-  { key: 'ffmpeg', label: 'FFmpeg 多媒体框架' },
-]
 
 /** 依赖状态 */
 export interface DepCheckResult {
@@ -55,6 +50,15 @@ export default function SplashScreen({
   initialStatus = 'checking',
   initialError = '',
 }: SplashScreenProps) {
+  const { t } = useI18n()
+
+  // 依赖阶段定义（key 为协议值，label 需随语言切换，须在组件内用 t 构建）
+  const PHASE_DEFS: Array<{ key: string; label: string }> = [
+    { key: 'python_core', label: t('Python 核心依赖') },
+    { key: 'python_ai', label: t('AI 分析依赖') },
+    { key: 'ffmpeg', label: t('FFmpeg 多媒体框架') },
+  ]
+
   const [phases, setPhases] = useState<InstallPhase[]>(
     PHASE_DEFS.map((p) => ({ ...p, status: 'pending', percent: 0 }))
   )
@@ -147,7 +151,7 @@ export default function SplashScreen({
           setStatus('error')
           // 内层阶段的错误更具体；不要被随后发出的 all 阶段通用错误覆盖。
           setErrorMsg((previous) =>
-            evt.phase === 'all' && previous ? previous : (evt.message ?? '安装失败')
+            evt.phase === 'all' && previous ? previous : t(evt.message ?? '安装失败')
           )
           break
       }
@@ -228,11 +232,11 @@ export default function SplashScreen({
       const result = await api.installDependencies({ includeAi: true })
       if (result?.success === false) {
         setStatus('error')
-        setErrorMsg(result.error || '依赖安装失败')
+        setErrorMsg(t(result.error || '依赖安装失败'))
       }
     } catch {
       setStatus('error')
-      setErrorMsg('启动安装失败')
+      setErrorMsg(t('启动安装失败'))
     }
   }, [])
 
@@ -249,7 +253,7 @@ export default function SplashScreen({
           <div className="splash-logo">
             <div className="logo-icon">LSC</div>
             <Title level={2} className="splash-title">
-              直播切片系统
+              {t('直播切片系统')}
             </Title>
             <Text className="splash-subtitle">Live Stream Clipper</Text>
           </div>
@@ -257,7 +261,7 @@ export default function SplashScreen({
           {/* 进度区域 */}
           <div className="splash-progress-area">
             {status === 'checking' && (
-              <Text className="splash-status-text">正在检测运行环境...</Text>
+              <Text className="splash-status-text">{t('正在检测运行环境...')}</Text>
             )}
 
             {status === 'installing' && (
@@ -270,7 +274,7 @@ export default function SplashScreen({
                     format={(p) => <span className="progress-text">{p}%</span>}
                   />
                   <Text className="splash-status-text">
-                    首次使用需要下载依赖，请耐心等待（约 1.5 GB）
+                    {t('首次使用需要下载依赖，请耐心等待（约 1.5 GB）')}
                   </Text>
                 </div>
 
@@ -286,14 +290,14 @@ export default function SplashScreen({
                       <div className="phase-info">
                         <Text className="phase-label">{phase.label}</Text>
                         {phase.detail && (
-                          <Text className="phase-detail">{phase.detail}</Text>
+                          <Text className="phase-detail">{t(phase.detail)}</Text>
                         )}
                       </div>
                       <div className="phase-percent">
                         {phase.status === 'running' && <Text>{Math.round(phase.percent)}%</Text>}
-                        {phase.status === 'done' && <Text style={{ color: '#34c759' }}>完成</Text>}
-                        {phase.status === 'pending' && <Text type="secondary">等待中</Text>}
-                        {phase.status === 'error' && <Text type="danger">失败</Text>}
+                        {phase.status === 'done' && <Text style={{ color: '#34c759' }}>{t('完成')}</Text>}
+                        {phase.status === 'pending' && <Text type="secondary">{t('等待中')}</Text>}
+                        {phase.status === 'error' && <Text type="danger">{t('失败')}</Text>}
                       </div>
                     </div>
                   ))}
@@ -304,17 +308,17 @@ export default function SplashScreen({
             {status === 'error' && (
               <div className="error-area">
                 <WarningOutlined style={{ fontSize: 32, color: '#ff3b30', marginBottom: 12 }} />
-                <div className="error-message" role="alert">{errorMsg}</div>
+                <div className="error-message" role="alert">{t(errorMsg)}</div>
                 <Space style={{ marginTop: 16 }}>
                   <Button
                     type="primary"
                     icon={<ReloadOutlined />}
                     onClick={handleRetry}
                   >
-                    重试
+                    {t('重试')}
                   </Button>
                   <Button onClick={onReady}>
-                    跳过（部分功能不可用）
+                    {t('跳过（部分功能不可用）')}
                   </Button>
                 </Space>
               </div>
@@ -323,7 +327,7 @@ export default function SplashScreen({
             {status === 'done' && (
               <div className="done-area">
                 <CheckCircleFilled style={{ fontSize: 32, color: '#34c759' }} />
-                <Text className="splash-status-text">环境就绪，正在启动...</Text>
+                <Text className="splash-status-text">{t('环境就绪，正在启动...')}</Text>
               </div>
             )}
           </div>
@@ -331,7 +335,7 @@ export default function SplashScreen({
           {/* 底部提示 */}
           <div className="splash-footer">
             <Text type="secondary" style={{ fontSize: 12 }}>
-              依赖将安装至当前用户数据目录，不会污染系统环境
+              {t('依赖将安装至当前用户数据目录，不会污染系统环境')}
             </Text>
           </div>
         </div>

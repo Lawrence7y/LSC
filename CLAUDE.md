@@ -87,7 +87,7 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
 
 ### 2.2 WebSocket 协议规范
 
-WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
+WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式传入 `LSCWebSocketServer(port=9876)`；注意 `server.py` 中类默认值为 `19876`，两处常量不一致，改动端口时需同步）。
 *   **端口自动回退**：若主端口被占用，会自动依次尝试备用端口 `19877`, `19878`, `19879`, `19880`。
 *   **高频消息优化**：
     *   在 Qt 主线程快速触发房间状态变更时，`rooms_updated` 消息会被连续合并（若队列里有连续的多条 `rooms_updated`，只广播最新的一条），以极大缓解前端 JSON 序列化与 React 重渲染的负载。
@@ -128,7 +128,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 
 | 配置键 | 默认值 | 可选范围 / 说明 |
 | :--- | :--- | :--- |
-| `output_dir` | `~/LSC/recordings` | 录制产物主目录。支持 Windows 绝对路径或带 `~` 的家目录。 |
+| `output_dir` | `~/LSC/output` | 录制产物主目录。支持 Windows 绝对路径或带 `~` 的家目录。⚠️ **默认值存在两处不一致**：settings/handler 层默认 `~/LSC/output`（`room_handler.py` 等），而 `lsc/config.py` 的 `LscConfig` 默认 `~/LSC/recordings`（config.py:244），待统一。 |
 | `encoder` | `h264_nvenc` | `libx264` (CPU H264), `libx265` (CPU H265), `h264_nvenc` (Nvidia), `h264_qsv` (Intel), `h264_amf` (AMD), `copy` (直接拷贝) |
 | `crf` | `23` | `0` 到 `51`，越低画质越高。 |
 | `param_mode` | `"CRF 质量"` | `"CRF 质量"` 或 `"自定义码率"` |
@@ -181,11 +181,14 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 5.  `KuaishouAdapter`、`DouyuAdapter`、`XiaohongshuAdapter`、`WeiboAdapter`
 6.  `GenericPageAdapter` (未知链接兜底，尝试匹配通用 HTML `<video>` 流标签)
 
-**统一错误代码清单**：
+**统一错误代码清单**（legacy `parse_stream` 路径）：
 *   `unsupported_url`：无法识别的直播间链接或地址。
 *   `offline`：未开播。
 *   `restricted`：被平台限制访问（如地理围栏、禁播）。
 *   `parse_failed`：解析逻辑异常。
+
+> [!NOTE]
+> **V2 解析管线（feature-gated）**：`lsc/platforms/` 另有一套候选/探测/租约模型（`resolver.py` + `models.py` + `probe.py` + `lease_manager.py`），使用完整 typed `FailureKind` 失败分类（`failure.py`）。由 `config.py: platform_pipeline_v2_enabled` 控制（**默认 `False`**，生产实际走 legacy `parse_stream`），启用 V2 时对外错误码仍归一化为上述四类。
 
 ---
 
@@ -246,7 +249,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`。
 ```
 
 *   **采样规范**：后端互相关算法窗提取各房间音频的 PCM 信号，采样率为 `16000Hz`（Mono，单声道，float32 编码），长度恒定为 **3.0秒** (`AUDIO_DURATION`)。
-*   **⭐ 音频来源（关键澄清）**：实际运行时的音频数据来自**预览流**，而非录制文件。前端通过 Web Audio API（AudioWorklet）从 `<video>` 元素捕获约 **8 秒** 的预览音频（对齐采集窗口），base64 编码后通过 `align_preview_audio` WebSocket 消息发送给后端。后端 `room_handler.py:handle_align_preview_audio` 解码后直接调用 `compute_offset` 计算互相关。
+*   **⭐ 音频来源（关键澄清）**：实际运行时的音频数据来自**预览流**，而非录制文件。前端通过 Web Audio API（AudioWorklet）从 `<video>` 元素捕获约 **8 秒** 的预览音频（对齐采集窗口），base64 编码后通过 `align_preview_audio` WebSocket 消息发送给后端。后端解码后直接调用 `compute_offset` 计算互相关（当前实现在 `handlers/alignment_handlers.py`，由 `register_room_handlers` 统一装配；`room_handler.py` 内旧版 `handle_align_preview_audio` 会被后注册的 `register_alignment_handlers` 覆盖，永不触发）。
     *   `audio_aligner.py` 中虽存在 `align_rooms` 函数（支持从录制文件用 FFmpeg 提取音频），但**该函数从未被业务代码调用**（死代码）。
     *   即：对齐算法的输入永远是**预览流的实时音频**，这与"预览流和录制流完全独立"的核心约束一致。
 *   **对齐基准选择**：通过 FFT 互相关计算，以**拉流进度最慢（内容最新、延迟最大）**的房间作为基准房间。
@@ -752,7 +755,7 @@ Electron 应用使用 `electron-builder` 进行打包：
 ### 11.2 子进程运行安全设计
 
 *   **进程环境变量白名单**：启动 Python 后端子进程时，严禁污染或直接透传全部父进程环境变量。只透传精简的安全环境变量：
-    `PATH`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP`、`HOME`、`SYSTEMROOT`、`PATHEXT`、`PYTHONUNBUFFERED=1` 及 `PYTHONPATH`（另加 `LSC_*` 必要项）。
+    `PATH`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP`、`HOME`、`SYSTEMROOT`、`PATHEXT`、`PYTHONUNBUFFERED=1`（另加 `LSC_*` 必要项）。⚠️ `PYTHONPATH` **不在**白名单内（`process_launcher.py` 已移除——防止通过环境变量注入恶意 Python 模块路径）。
 *   **非阻塞管道防死锁**：在 MSE 转码或录制捕获子进程读取数据时，必须对 stdout/stderr 描述符调用 `_set_stream_nonblocking()`（POSIX 下使用 `fcntl` 接口设置 `O_NONBLOCK`）。**Windows 下读侧保持阻塞 no-op**（实测非阻塞 fd 上 `BufferedReader.readline` 无数据时返回 `b''`，会把逐行迭代误判为 EOF 提前退出读线程，导致管道积压）；写侧（共享进样 stdin）由 `shared_ingest` 单独 `os.set_blocking(fd, False)` + `_write_all` 捕获 `BlockingIOError` 重试至 deadline，保证超时保护真正生效。
 *   **Windows 权限防御**：后端可写目录已统一指向 userData（`LSC_DATA_DIR`），`detached` 恒为 `false` 使后端跟随 Electron 生命周期（防孤儿分析进程），不再依赖 detached 绕过 WinError 5。
 
@@ -761,8 +764,8 @@ Electron 应用使用 `electron-builder` 进行打包：
 *   **未处理异常捕获**：后端入口 `main.py` 安装了 `sys.excepthook`（含 `threading.excepthook`），任何后台线程或主线程发生的未捕获异常，都会完整格式化 traceback 写入日志，防止服务瞬时悄无声息崩溃退出。
 *   **Qt 消息重定向**：~~`qInstallMessageHandler`~~ —— 系统已全面迁离 PySide6（python-backend 无 Qt 导入），该条不再适用。
 *   **日志轮转机制**：日志文件大小限制为 **2MB**，最大备份数为 **5个**，采用 `RotatingFileHandler` 滚动覆盖（另带 gzip 压缩），确保不会因长期挂机导致磁盘爆满。
-*   **优雅停机保护**：
-    *   主进程销毁时，Windows 环境下 Electron 先写优雅停机信号文件（`userData/stop.signal`），后端 `main.py` 主循环轮询到后自行执行 `stop()`（flush rooms.json 未落盘写入 + 正常停 FFmpeg），Electron 轮询等待 ≤4s，超时再用 `taskkill /T /F` 强杀子进程树兜底，防止 FFmpeg 僵尸进程残留挂载占用端口。
+*   **优雅停机保护**（2026-08 子系统审查核实：`stop.signal` 信号文件机制已不存在，以下为当前实际实现）：
+    *   **父进程存活 watchdog**：Electron 以 `LSC_PARENT_PID` 环境变量注入后端；`main.py` 主循环轮询父进程存活，父进程退出即触发 `stop()`（flush rooms.json 未落盘写入 + 正常停 FFmpeg）。Electron 侧 `killBackendAndWait` 轮询等待（≤4s）后再用进程树强杀兜底，防止 FFmpeg 僵尸进程残留挂载占用端口。
     *   POSIX 环境下先发 `SIGTERM`，如果 3 秒内未退出再调度 `SIGKILL`，采用非阻塞的轮询检测，防止同步忙等待阻塞 Electron UI 主线程。
     *   导出取消/录制停止等强杀 FFmpeg 的统一入口为 `lsc/utils/process_launcher.py: kill_process_tree()`（Windows `taskkill /T /F`；POSIX `SIGTERM → 3s → SIGKILL`），禁止直接 `proc.kill()`。
 
@@ -822,6 +825,24 @@ Electron 应用使用 `electron-builder` 进行打包：
 *   **关键错误事件**（`clip_failed`、`recording_started` 失败、`room_connect_finished` 失败、`reconnect_failed`、导出提交失败的 `export_clip*_response`）始终通知，即使窗口聚焦。
 *   MSE segment watchdog：前端检测到预览流超过 10s 无数据时自动触发 WebSocket 重连。
 *   持续分析 `continuous_highlights.mapping_fallback === true` 时须 toast 提示副房映射失败。
+
+### 11.5 已知死代码 / 冗余实现清单（2026-08 全子系统审查）
+
+> [!WARNING]
+> 以下条目经代码交叉验证确认：**仅测试引用或已被覆盖注册，永不进入生产运行路径**。清理前须先删除/迁移其测试用例；新代码禁止复用或依赖这些符号。
+
+| 符号 / 位置 | 状态 | 说明 |
+| :--- | :--- | :--- |
+| `audio_aligner.py: align_rooms` | 死代码 | 从录制文件提音频的路径，业务全走预览流 `align_audio_map`（见 §5.3）。 |
+| `core/services/mse_sender.py: MseSender` | 仅测试引用 | 生产 MSE 走二进制帧（`python-backend/mse_ws_frames.py` + `broadcast_bytes`）。 |
+| `core/services/export_service.py: ExportService` | 仅测试引用 | 真实导出统一走 `export_handlers` 的 asyncio 全局队列。 |
+| `utils/cancellable_ffmpeg.py: CancellableFFmpeg` | 仅测试引用 | 产品导出仍用裸 `subprocess.Popen` + 自绘 watchdog。 |
+| `utils/error_stats.py: ErrorStats` | 无业务调用 | 错误统计预留模块，仅测试引用。 |
+| `room_handler.py` L8382/L8568 的 `start_continuous_analysis` / `stop_continuous_analysis` | 覆盖死代码 | `register_analysis_handlers` 后注册，`server.on` 覆盖语义下永不触发（代码注释已自认）。 |
+| `analyzer/generic_plugin.py: scan_window` | 恒返回空 | 只更新扫描游标，持续分析主路径不再使用；`scene_analysis` / `sound_detector` 为遗留分支（约 900 行）。 |
+| `export_handlers._deferred_export_jobs` | 死代码 | 无任何 append 调用方（代码注释已标注）。 |
+
+**另注（文档≠代码，均已在上文相关章节标注）**：`stop.signal` 优雅停机机制不存在（实为 `LSC_PARENT_PID` watchdog，§11.3）；`PYTHONPATH` 已移出环境白名单（§11.2）；`output_dir` 默认值两处不一致（§3.2）；WS 端口 `9876`（main.py）与类默认 `19876`（server.py）不一致（§2.2）。
 
 ---
 

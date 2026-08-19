@@ -7,6 +7,7 @@ import type { RoomPipelineHealth, RoomSession, RuntimeEventPayload } from '@/typ
 export const wsClient = _wsClient
 import { useAppStore } from '@/store/appStore'
 import { removePlayhead } from '@/utils/playheadStore'
+import { t } from '@/i18n'
 
 // 模块级标记：整个应用生命周期只发起一次 connect()。
 // useWebSocket() 会在 App、MainLayout、Workbench 等多处调用；连接可以共享，
@@ -135,7 +136,7 @@ const _MSE_WATCHDOG_MAX_FAILS = 3
 let _mseWatchdogTimer: ReturnType<typeof setInterval> | null = null
 
 /** 断连时写操作被丢弃的用户可见提示（useWebSocket.send 统一弹出） */
-export const DISCONNECTED_SEND_WARNING = '未连接后端，操作未发送'
+export const DISCONNECTED_SEND_WARNING = t('未连接后端，操作未发送')
 
 /** system_stats 节流：避免高频推送触发全树重渲染 */
 const SYSTEM_STATS_MIN_INTERVAL_MS = 1000
@@ -250,13 +251,8 @@ export function getMseInitCache(roomId: string): ArrayBuffer | null {
 }
 
 function _decodeBase64Segment(b64Data: string): ArrayBuffer {
-  const binary = atob(b64Data)
-  const len = binary.length
-  const bytes = new Uint8Array(len)
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary.charCodeAt(i)
-  }
-  return bytes.buffer
+  // ponytail: fast path, loop is hot for every MSE segment; Worker if still bottleneck
+  return Uint8Array.from(atob(b64Data), (c) => c.charCodeAt(0)).buffer
 }
 
 function _coerceMsePayload(data: ArrayBuffer | string): ArrayBuffer {
@@ -642,7 +638,7 @@ function _attachSharedWebSocketHandlers(): () => void {
       counts[roomId] = count
       if (count > 10) {
         console.warn(`MSE init retry exhausted for ${roomId}`)
-        useAppStore.getState().updateRoom(roomId, { mse_error: 'MSE 流初始化超时，请重试预览' })
+        useAppStore.getState().updateRoom(roomId, { mse_error: t('MSE 流初始化超时，请重试预览') })
         delete counts[roomId]
         return
       }
@@ -695,17 +691,17 @@ function _attachSharedWebSocketHandlers(): () => void {
         // 恢复尝试耗尽：停止自动恢复，置 error 态提示用户手动处理。
         // phase 变更为 error 后本 watchdog 会跳过该房间（非 streaming），不再触发。
         console.warn(`[WS] Preview stall recovery exhausted for room ${r.room_id} (${fails}/${_MSE_WATCHDOG_MAX_FAILS}), disabling auto-recovery`)
-        message.warning({ content: '预览持续中断，请手动重新开启预览', key: `mse-stall-${r.room_id}`, duration: 5 })
+        message.warning({ content: t('预览持续中断，请手动重新开启预览'), key: `mse-stall-${r.room_id}`, duration: 5 })
         useAppStore.getState().updateRoom(r.room_id, {
           preview_phase: 'error' as const,
-          mse_error: '预览持续中断，请手动重新开启预览',
+          mse_error: t('预览持续中断，请手动重新开启预览'),
         })
         // 清理 watchdog 记录，用户手动重开后重新计数
         _lastMseSegmentTimePerRoom.delete(r.room_id)
         delete _mseWatchdogLastRecovery[r.room_id]
         delete _mseWatchdogFailCount[r.room_id]
       } else if (fails >= 2) {
-        message.warning({ content: '预览恢复中', key: `mse-stall-${r.room_id}`, duration: 3 })
+        message.warning({ content: t('预览恢复中'), key: `mse-stall-${r.room_id}`, duration: 3 })
         wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
       } else if (_mseInitCache[r.room_id]) {
         wsClient.send('request_mse_init', { room_id: r.room_id })
@@ -808,5 +804,24 @@ export function useWebSocket() {
     wsClient.reconnect()
   }, [])
 
-  return { isConnected: connectionStatus === 'connected', connectionStatus, send, on, reconnect }
+  // 重启 Python 后端进程后重连 WebSocket。
+  // 用于 WS 重连耗尽（reconnect_failed，后端进程大概率已死亡）时，
+  // 通过主进程 IPC 杀掉旧后端并重新拉起，使「重新连接」真正可恢复。
+  const restartBackend = useCallback(async () => {
+    try {
+      await (window as any).electronAPI?.restartBackend?.()
+    } catch (err) {
+      console.error('[WS] restart backend failed:', err)
+    }
+    wsClient.reconnect()
+  }, [])
+
+  return {
+    isConnected: connectionStatus === 'connected',
+    connectionStatus,
+    send,
+    on,
+    reconnect,
+    restartBackend,
+  }
 }

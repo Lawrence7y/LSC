@@ -294,9 +294,12 @@ def sanitize_undefined_to_null(text: str) -> str:
 
 def headers_to_ffmpeg_input_args(headers: dict[str, str] | None) -> list[str]:
     """Convert request headers to FFmpeg input arguments."""
-    # FFmpeg libavformat/http.c 对 -headers 参数有 32768 字节硬限制，
-    # 超限直接报 "overlong headers" + EINVAL（code -22）。留余量取 30KB。
-    _FFMPEG_HEADERS_MAX_BYTES = 30_000
+    # FFmpeg libavformat/http.c 对 -headers 参数有硬限制：旧版（≤7.x）为
+    # 32768 字节，新版（8.x master，如 BtbN 2026-08 内置构建）收紧到 4096
+    # 字节，超限直接报 "overlong headers" + EINVAL（code -22）。
+    # 实测内置 FFmpeg：4000B 通过、8192B 触发。取 2048 保守上限，
+    # 兼容所有版本；UA/Referer 等小头（~200B）正常保留。
+    _FFMPEG_HEADERS_MAX_BYTES = 2048
 
     def _sanitize_header_part(value: object) -> str:
         return str(value).replace("\r", "").replace("\n", "").strip()

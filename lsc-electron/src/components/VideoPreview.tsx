@@ -5,6 +5,7 @@ import { clearMseRoomCache, drainPendingMseSegments, getMseInitCache, wsClient }
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
 import { isMuteSyncSuppressed, withMuteSyncSuppressed } from '@/utils/muteSyncGuard'
+import { useI18n } from '@/i18n'
 
 interface VideoPreviewProps {
   /** Room ID for the video stream */
@@ -35,6 +36,7 @@ export function VideoPreview({
   style,
   muted = true,
 }: VideoPreviewProps) {
+  const { t } = useI18n()
   const videoRef = useRef<HTMLVideoElement>(null)
   const playerRef = useRef<MsePlayer | null>(null)
   const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null)
@@ -189,7 +191,7 @@ export function VideoPreview({
           if (loadTimeoutRef.current) clearTimeout(loadTimeoutRef.current)
           loadTimeoutRef.current = setTimeout(() => {
             if (!hasReceivedDataRef.current && playerRef.current) {
-              setError('预览加载超时，请检查直播流是否正常')
+              setError(t('预览加载超时，请检查直播流是否正常'))
             }
           }, 30000)
           return
@@ -205,12 +207,12 @@ export function VideoPreview({
           }
           loadTimeoutRef.current = setTimeout(() => {
             if (!hasReceivedDataRef.current && playerRef.current) {
-              setError('预览加载超时，请检查直播流是否正常')
+              setError(t('预览加载超时，请检查直播流是否正常'))
             }
           }, 30000)
           return
         }
-        setError('预览加载超时，请检查直播流是否正常')
+        setError(t('预览加载超时，请检查直播流是否正常'))
       }
     }, 30000)
 
@@ -473,12 +475,12 @@ export function VideoPreview({
 
   // 阶段进度文案：首次刷新流地址可能需要等待上游解析完成
   const phaseText =
-    previewPhase === 'refreshing_url' ? '正在刷新流地址…' :
-    previewPhase === 'probing' ? '正在探测/转码…' :
-    '正在拉流/转码…'
+    previewPhase === 'refreshing_url' ? t('正在刷新流地址…') :
+    previewPhase === 'probing' ? t('正在探测/转码…') :
+    t('正在拉流/转码…')
   const phaseHint =
     previewPhase === 'refreshing_url'
-      ? '首次刷新可能需要 10–30 秒'
+      ? t('首次刷新可能需要 10–30 秒')
       : null
 
   return (
@@ -558,7 +560,7 @@ export function VideoPreview({
           }}
         >
           <PauseCircleOutlined style={{ fontSize: 13, color: 'var(--text-200, #c7c7cc)' }} />
-          <span style={{ fontSize: 11, color: 'var(--text-200, #c7c7cc)' }}>已暂停</span>
+          <span style={{ fontSize: 11, color: 'var(--text-200, #c7c7cc)' }}>{t('已暂停')}</span>
         </div>
       )}
 
@@ -579,7 +581,7 @@ export function VideoPreview({
         >
           <span style={{ fontSize: 20 }}>⚠️</span>
           <span style={{ fontSize: 12, color: 'var(--state-error)', textAlign: 'center' }}>
-            {error || '预览不可用'}
+            {t(error || '') || t('预览不可用')}
           </span>
           <button
             onClick={handleRetry}
@@ -595,7 +597,7 @@ export function VideoPreview({
               cursor: retrying ? 'not-allowed' : 'pointer',
             }}
           >
-            {retrying ? '重试中...' : '重试'}
+            {retrying ? t('重试中...') : t('重试')}
           </button>
         </div>
       )}
@@ -617,7 +619,7 @@ export function VideoPreview({
         >
           <LoadingOutlined style={{ fontSize: 24, color: 'var(--brand-500)' }} />
           <span style={{ fontSize: 12, color: 'var(--text-300)', textAlign: 'center' }}>
-            正在恢复预览 ({mseReconnecting.attempt}/{mseReconnecting.maxAttempts})...
+            {t('正在恢复预览 ({attempt}/{max})...', { attempt: mseReconnecting.attempt, max: mseReconnecting.maxAttempts })}
           </span>
         </div>
       )}
@@ -637,7 +639,7 @@ export function VideoPreview({
         >
           <PlayCircleOutlined style={{ fontSize: 32, color: 'var(--text-500)' }} />
           <span style={{ fontSize: 12, color: 'var(--text-500)' }}>
-            点击启用预览
+            {t('点击启用预览')}
           </span>
         </div>
       )}

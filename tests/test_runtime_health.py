@@ -1,5 +1,5 @@
-from types import SimpleNamespace
 import logging
+from types import SimpleNamespace
 
 from lsc.core.services.runtime_health import (
     build_room_health,

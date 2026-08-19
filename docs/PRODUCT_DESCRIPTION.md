@@ -69,8 +69,13 @@ LSC（Live Stream Clipper）是一款面向**电竞直播与多视角内容创�
 
 ## 五、安装与使用
 
-### Windows 安装包（推荐）
-1. 从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `Setup 3.0.21.exe`
+### Microsoft Store（推荐，自包含）
+1. 从 Microsoft Store 安装 `Live Stream Clipper`
+2. MSIX 包已内置 Python 依赖与 FFmpeg，首次启动无需联网下载或安装任何组件
+3. 安装完成后直接使用（若机器不支持 DirectML，分析自动降级 CPU，不影响录制）
+
+### GitHub Releases 安装包
+1. 从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `Setup x.y.z.exe`
 2. 运行安装：安装过程自动下载运行依赖（国内镜像加速），并自动检测/升级 VC++ 运行库
 3. 安装完成后直接使用（若机器不支持 DirectML，分析自动降级 CPU，不影响录制）
 

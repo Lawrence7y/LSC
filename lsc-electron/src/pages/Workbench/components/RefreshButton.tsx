@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, memo } from 'react'
 import { Button, Tooltip } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
+import { useI18n } from '@/i18n'
 
 /* ── Types ── */
 
@@ -214,8 +215,10 @@ export const RefreshButton = memo(function RefreshButton({
   onShortClick,
   onLongPress,
   disabled = false,
-  tooltip = '点按刷新预览；长按 0.8s 刷新全部（将停止录制，需确认）',
+  tooltip,
 }: RefreshButtonProps) {
+  const { t } = useI18n()
+  const resolvedTooltip = tooltip ?? t('点按刷新预览；长按 0.8s 刷新全部（将停止录制，需确认）')
   // ── Render state ──
   // 长按进度 = 按钮从底部向上整体填充主题青绿（按键全绿），
   // 液面处生成上浮光点；完成时白光一闪 + 主题色碎片向外爆发。
@@ -435,7 +438,7 @@ export const RefreshButton = memo(function RefreshButton({
   const isShattering = shatterParticles.length > 0
 
   return (
-    <Tooltip title={disabled ? '' : tooltip}>
+    <Tooltip title={disabled ? '' : resolvedTooltip}>
       <Button
         ref={buttonRef}
         size="middle"
@@ -504,7 +507,7 @@ export const RefreshButton = memo(function RefreshButton({
             transition: 'color 0.15s ease',
           }}
         >
-          刷新
+          {t('刷新')}
         </span>
       </Button>
     </Tooltip>

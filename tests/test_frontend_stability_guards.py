@@ -476,8 +476,8 @@ def test_workbench_continuous_analysis_uses_explicit_game_modes() -> None:
     assert "const isValorantRoundCutting = analysisGameType === 'valorant_round'" in source
     assert "mode: isValorantRoundCutting ? 'valorant_round' : 'scene'" in source
     assert "game: isValorantRoundCutting ? 'valorant' : 'generic'" in source
-    assert '<Radio.Button value="valorant_round">无畏契约</Radio.Button>' in source
-    assert '<Radio.Button value="generic">通用直播</Radio.Button>' in source
+    assert '<Radio.Button value="valorant_round">{t('"'无畏契约'"')}</Radio.Button>' in source
+    assert '<Radio.Button value="generic">{t('"'通用直播'"')}</Radio.Button>' in source
     assert "setAnalysisGameType('valorant')" not in source
     # 无畏契约持续分析：无预览 45s / 有预览 60s，禁止再写死 20s
     continuous_start = source.split("send('start_continuous_analysis'", 1)[1].split("})", 1)[0]

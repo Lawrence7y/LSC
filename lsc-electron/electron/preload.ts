@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 系统相关
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   getPlatform: () => process.platform,
+  isStoreBuild: () => process.windowsStore === true,
   getBackendWsUrl: () => ipcRenderer.invoke('get-backend-ws-url'),
   getBackendWsToken: () => ipcRenderer.invoke('get-backend-ws-token'),
   onBackendReady: (callback: (payload: { url: string }) => void) => {
@@ -103,6 +104,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('cleanup-all-rooms', handler)
   },
 
+  // 重启 Python 后端（「重新连接」在后端进程死亡时使用）
+  restartBackend: () => ipcRenderer.invoke('restart-backend'),
+
   // 依赖安装管理
   getStartupDependencyState: () => ipcRenderer.invoke('get-startup-dependency-state'),
   onStartupDependencyState: (callback: (state: any) => void) => {
@@ -110,6 +114,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('startup-dependency-state', wrapper)
     return () => ipcRenderer.removeListener('startup-dependency-state', wrapper)
   },
+
+  // 语言偏好：渲染层上报给主进程（托盘文案等跟随语言）
+  setLocale: (locale: string) => ipcRenderer.send('app:set-locale', locale),
   checkDependencies: () => ipcRenderer.invoke('check-dependencies'),
   installDependencies: (options?: { includeAi?: boolean }) =>
     ipcRenderer.invoke('install-dependencies', options),

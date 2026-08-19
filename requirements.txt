@@ -3,8 +3,9 @@
 # Install with:  pip install -r requirements.txt
 # For development/testing:  pip install -r requirements.txt pytest
 
-# Qt event loop for python-backend (Signal/Slot, QTimer)
-PySide6>=6.5,<7
+# 注：PySide6 已移除。历史遗留组件 lsc/gui/pages/recording_controller.py 与
+# lsc/gui/common_workers.py 顶部通过 try/except 切换 lsc.gui.qt_compat
+# 标准库兼容层（QThread/QTimer/Signal），无 Qt 环境（Store/内置包）亦可运行。
 
 # Python WebSocket backend (Electron version)
 websockets>=12.0

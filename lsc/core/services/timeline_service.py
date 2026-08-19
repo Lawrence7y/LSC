@@ -68,7 +68,7 @@ def build_room_snapshots_from_align(
 
     # 先收集锚点数据：所有可信房间的预览 PTS 与媒体起点
     anchored_rooms: dict[str, tuple[float, float]] = {}  # room_id -> (pct, media_start)
-    for room_id, offset in offsets.items():
+    for room_id, _offset in offsets.items():
         score = float(scores.get(room_id, 0.0) or 0.0)
         if score < confidence_threshold:
             continue

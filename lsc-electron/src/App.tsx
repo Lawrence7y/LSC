@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { ConfigProvider, theme, App as AntdApp } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
+import enUS from 'antd/locale/en_US'
 import MainLayout from './components/Layout/MainLayout'
 import ErrorBoundary from './components/ErrorBoundary'
 import Workbench from './pages/Workbench'
@@ -9,6 +10,7 @@ import SplashScreen from './pages/SplashScreen'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useNotifications } from '@/hooks/useNotifications'
 import { useAppStore } from '@/store/appStore'
+import { useI18n } from '@/i18n'
 
 interface StartupDependencyState {
   phase: 'checking' | 'installing' | 'ready' | 'error'
@@ -28,6 +30,7 @@ function AppContent() {
 
   const [dependencyState, setDependencyState] = useState<StartupDependencyState | null>(null)
   const [dependencyOverlayDismissed, setDependencyOverlayDismissed] = useState(false)
+  const [isStoreBuild] = useState(() => window.electronAPI?.isStoreBuild?.() ?? false)
 
   useEffect(() => {
     const api = (window as any).electronAPI
@@ -54,7 +57,8 @@ function AppContent() {
     setDependencyOverlayDismissed(true)
   }, [])
 
-  const showDependencyOverlay = !dependencyOverlayDismissed &&
+  // Microsoft Store 版本已内置全部依赖，不显示“下载依赖/安装依赖”启动页。
+  const showDependencyOverlay = !isStoreBuild && !dependencyOverlayDismissed &&
     (dependencyState?.phase === 'installing' || dependencyState?.phase === 'error')
 
   return (
@@ -85,10 +89,21 @@ function AppContent() {
 function App() {
   const appTheme = useAppStore((state) => state.appSettings?.theme ?? 'dark')
   const isDark = appTheme === 'dark'
+  const { locale } = useI18n()
+
+  // 窗口标题跟随语言
+  useEffect(() => {
+    document.title = locale === 'zh-CN' ? 'LSC - 直播切片系统' : 'LSC - Live Stream Clipper'
+  }, [locale])
+
+  // 语言偏好上报主进程（托盘 tooltip/菜单跟随语言），并持久化到主进程设置
+  useEffect(() => {
+    ;(window as any).electronAPI?.setLocale?.(locale)
+  }, [locale])
 
   return (
     <ConfigProvider
-      locale={zhCN}
+      locale={locale === 'zh-CN' ? zhCN : enUS}
       theme={{
         algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
         token: {

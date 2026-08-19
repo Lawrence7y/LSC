@@ -10,6 +10,7 @@ import {
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
+import { useI18n } from '@/i18n'
 import type { ConnectionStatus } from '@/store/appStore'
 import SystemMonitor from './SystemMonitor'
 import Settings from '@/pages/Settings'
@@ -23,30 +24,11 @@ const connectionDotColors: Record<ConnectionStatus, string> = {
   reconnect_failed: 'var(--state-error)',
 }
 
-const connectionLabels: Record<ConnectionStatus, string> = {
-  connected: '已连接',
-  connecting: '连接中',
-  disconnected: '未连接',
-  reconnect_failed: '连接失败',
-}
-
-const menuItems = [
-  {
-    key: '/workbench',
-    icon: <DesktopOutlined />,
-    label: '多房间管理',
-  },
-  {
-    key: '/settings',
-    icon: <SettingOutlined />,
-    label: '设置',
-  },
-]
-
 export default function MainLayout() {
   const navigate = useNavigate()
   const location = useLocation()
-  const { send, reconnect } = useWebSocket()
+  const { t } = useI18n()
+  const { send, reconnect, restartBackend } = useWebSocket()
   const connectionStatus = useAppStore((state) => state.connectionStatus)
   const appSettings = useAppStore((state) => state.appSettings)
   const setAppSettings = useAppStore((state) => state.setAppSettings)
@@ -54,6 +36,26 @@ export default function MainLayout() {
   const setSettingsDrawerOpen = useAppStore((state) => state.setSettingsDrawerOpen)
   const [connectionVisible, setConnectionVisible] = useState(false)
   const themeTransitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const connectionLabels: Record<ConnectionStatus, string> = {
+    connected: t('已连接'),
+    connecting: t('连接中'),
+    disconnected: t('未连接'),
+    reconnect_failed: t('连接失败'),
+  }
+
+  const menuItems = [
+    {
+      key: '/workbench',
+      icon: <DesktopOutlined />,
+      label: t('多房间管理'),
+    },
+    {
+      key: '/settings',
+      icon: <SettingOutlined />,
+      label: t('设置'),
+    },
+  ]
 
   // 卸载时清理主题过渡定时器
   useEffect(() => () => {
@@ -230,15 +232,17 @@ export default function MainLayout() {
             </span>
           </div>
           <SystemMonitor />
-          {/* 重连按钮：仅在断开/失败时显示 */}
+          {/* 重连按钮：仅在断开/失败时显示。
+              断开（后端可能还活着）→ 纯 WS 重连；
+              重连耗尽（后端大概率已死亡）→ 重启后端进程后再重连。 */}
           {(connectionStatus === 'disconnected' || connectionStatus === 'reconnect_failed') && (
             <Button
               size="small"
               icon={<ReloadOutlined />}
-              onClick={reconnect}
+              onClick={connectionStatus === 'reconnect_failed' ? restartBackend : reconnect}
               style={{ fontSize: 12 }}
             >
-              重新连接
+              {t('重新连接')}
             </Button>
           )}
           {/* 主题切换按钮 — 底部居中 */}
@@ -249,7 +253,7 @@ export default function MainLayout() {
             onClick={handleToggleTheme}
             style={{ color: 'var(--text-50)', fontSize: 12, marginTop: 4 }}
           >
-            {appSettings.theme === 'dark' ? '浅色' : '深色'}
+            {appSettings.theme === 'dark' ? t('浅色') : t('深色')}
           </Button>
         </div>
       </Sider>
@@ -267,7 +271,7 @@ export default function MainLayout() {
             gap: 8,
             fontSize: 13,
           }}>
-            <span>⚠️ 无法连接到后端服务，请确保 Python 后端已启动</span>
+            <span>{t('⚠️ 无法连接到后端服务，请确保 Python 后端已启动')}</span>
             <button 
               onClick={() => setConnectionVisible(false)}
               style={{
@@ -279,7 +283,7 @@ export default function MainLayout() {
                 opacity: 0.8,
               }}
             >
-              隐藏
+              {t('隐藏')}
             </button>
           </div>
         )}
@@ -296,7 +300,7 @@ export default function MainLayout() {
 
       {/* 设置抽屉 — 侧边弹出，不离开工作台，保持 Workbench 状态 */}
       <Drawer
-        title="设置"
+        title={t('设置')}
         placement="right"
         width={520}
         open={settingsDrawerOpen}

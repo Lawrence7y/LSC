@@ -6,6 +6,7 @@ import {
   ScissorOutlined,
   ExportOutlined,
 } from '@ant-design/icons'
+import { useI18n } from '@/i18n'
 
 /** localStorage 键：标记是否已完成/跳过引导 */
 const ONBOARDING_KEY = 'lsc.onboarding.done'
@@ -17,33 +18,6 @@ interface OnboardingStep {
   hint: string
 }
 
-const STEPS: OnboardingStep[] = [
-  {
-    icon: <LinkOutlined />,
-    title: '添加直播间',
-    desc: '把直播间链接粘贴到顶部输入框，支持抖音、B站、虎牙等多平台，一次最多添加 12 路。',
-    hint: '多路同步监播，是直播切片的第一步。',
-  },
-  {
-    icon: <VideoCameraOutlined />,
-    title: '开启预览与录制',
-    desc: '在房间卡片上开启预览实时观看，点击录制按钮保存原始流。录制是后续切片的前提。',
-    hint: '快捷键 R 可一键开始/停止录制。',
-  },
-  {
-    icon: <ScissorOutlined />,
-    title: '标记切片',
-    desc: '在时间线上用 I / O 设置入点与出点，点击「添加切片」加入列表。也可开启 AI 持续分析自动检出高光回合。',
-    hint: '空格键播放/暂停，方向键微调播放头。',
-  },
-  {
-    icon: <ExportOutlined />,
-    title: '确认并导出',
-    desc: '在切片列表确认边界后导出为竖屏/横屏视频，或一键生成剪映草稿继续精剪。',
-    hint: '导出完成后可直接打开文件或所在目录。',
-  },
-]
-
 /**
  * 首次使用引导。
  *
@@ -51,8 +25,36 @@ const STEPS: OnboardingStep[] = [
  * 采用居中分步卡片而非元素锚点 Tour，避免复杂布局下锚点失效，更稳健。
  */
 export function Onboarding() {
+  const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const [step, setStep] = useState(0)
+
+  const STEPS: OnboardingStep[] = [
+    {
+      icon: <LinkOutlined />,
+      title: t('添加直播间'),
+      desc: t('把直播间链接粘贴到顶部输入框，支持抖音、B站、虎牙等多平台，一次最多添加 12 路。'),
+      hint: t('多路同步监播，是直播切片的第一步。'),
+    },
+    {
+      icon: <VideoCameraOutlined />,
+      title: t('开启预览与录制'),
+      desc: t('在房间卡片上开启预览实时观看，点击录制按钮保存原始流。录制是后续切片的前提。'),
+      hint: t('快捷键 R 可一键开始/停止录制。'),
+    },
+    {
+      icon: <ScissorOutlined />,
+      title: t('标记切片'),
+      desc: t('在时间线上用 I / O 设置入点与出点，点击「添加切片」加入列表。也可开启 AI 持续分析自动检出高光回合。'),
+      hint: t('空格键播放/暂停，方向键微调播放头。'),
+    },
+    {
+      icon: <ExportOutlined />,
+      title: t('确认并导出'),
+      desc: t('在切片列表确认边界后导出为竖屏/横屏视频，或一键生成剪映草稿继续精剪。'),
+      hint: t('导出完成后可直接打开文件或所在目录。'),
+    },
+  ]
 
   useEffect(() => {
     try {
@@ -132,11 +134,11 @@ export function Onboarding() {
 
         <div style={{ display: 'flex', gap: 10, width: '100%' }}>
           <Button onClick={finish} style={{ flex: 1 }}>
-            跳过
+            {t('跳过')}
           </Button>
           {step > 0 && (
             <Button onClick={() => setStep(s => s - 1)} style={{ flex: 1 }}>
-              上一步
+              {t('上一步')}
             </Button>
           )}
           <Button
@@ -144,7 +146,7 @@ export function Onboarding() {
             onClick={() => (isLast ? finish() : setStep(s => s + 1))}
             style={{ flex: 1.5 }}
           >
-            {isLast ? '开始使用' : '下一步'}
+            {isLast ? t('开始使用') : t('下一步')}
           </Button>
         </div>
       </div>

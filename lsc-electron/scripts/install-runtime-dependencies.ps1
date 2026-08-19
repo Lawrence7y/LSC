@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$UvExe,
     [Parameter(Mandatory = $true)]
@@ -10,6 +10,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ── 内置依赖检测 ──────────────────────────────────────────────────────
+# 若安装包内置了完整 Python 依赖（Store/内置构建，resources/python-packages），
+# 则无需联网安装：直接返回成功（应用运行时使用包内目录，见 dependency_manager.py）。
+$bundledPackagesDir = Join-Path $PSScriptRoot 'python-packages'
+if (Test-Path (Join-Path $bundledPackagesDir 'numpy')) {
+    "=== $(Get-Date -Format o) Bundled dependencies detected, skipping network install ===" |
+        Out-File -FilePath (Join-Path $env:TEMP 'lsc-deps-skip.log') -Encoding utf8 -Append -ErrorAction SilentlyContinue
+    Write-Host 'Bundled dependencies detected (resources/python-packages), skipping network install.'
+    exit 0
+}
 
 # ── 国内镜像配置 ──────────────────────────────────────────────────────
 # pypi 走清华镜像（国内直连 pypi 官方极慢/易超时）

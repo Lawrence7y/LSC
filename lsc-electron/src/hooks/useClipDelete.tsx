@@ -3,6 +3,7 @@ import { message } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import { getClipStableId } from '@/pages/Workbench/components/ClipList'
 import { useUndoStack } from '@/hooks/useUndoStack'
+import { t } from '@/i18n'
 
 type SendFn = (type: string, data?: any) => boolean
 
@@ -63,7 +64,7 @@ export function useClipDelete(opts: {
 
     // 撤销兜底：捕获被删切片与原位置，5s 内可恢复
     const toastKey = `clip-delete-${clipId}-${Date.now()}`
-    const undoId = clipUndo.push(`删除切片「${clip.label}」`, () => {
+    const undoId = clipUndo.push(t('删除切片「{label}」', { label: clip.label }), () => {
       const current = useAppStore.getState().clips
       const insertAt = Math.min(idx, current.length)
       const restored = [...current.slice(0, insertAt), clip, ...current.slice(insertAt)]
@@ -75,15 +76,15 @@ export function useClipDelete(opts: {
       duration: 5,
       content: (
         <span>
-          已删除切片「{clip.label}」
+          {t('已删除切片「{label}」', { label: clip.label })}
           <a
             style={{ marginLeft: 8 }}
             onClick={() => {
-              if (clipUndo.undo(undoId)) message.success('已恢复切片')
+              if (clipUndo.undo(undoId)) message.success(t('已恢复切片'))
               message.destroy(toastKey)
             }}
           >
-            撤销
+            {t('撤销')}
           </a>
         </span>
       ),

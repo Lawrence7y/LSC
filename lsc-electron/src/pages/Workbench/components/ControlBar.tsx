@@ -19,6 +19,7 @@ import { computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode,
 import { computeTimelineWindow } from '@/utils/timelineWindow'
 import { Timeline } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
+import { useI18n } from '@/i18n'
 import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
 import {
   readDisplayPlayhead,
@@ -189,6 +190,7 @@ export const ControlBar = memo(function ControlBar({
   scanRange = null,
 }: ControlBarProps) {
   void _alignStatus
+  const { t } = useI18n()
   const isRecordingReview = isRecordingReviewMode(room?.preview_mode)
   const goLiveDisabled = isNoDvrPreviewMode(room?.preview_mode)
   // 录制中时每秒刷新一次时间显示，非录制时不触发
@@ -338,11 +340,11 @@ export const ControlBar = memo(function ControlBar({
   // 轴标签文案
   const axisLabel = useMemo(() => {
     switch (axis) {
-      case 'common': return '公共轴'
-      case 'recording_review': return '录制回看轴'
-      default: return '预览轴'
+      case 'common': return t('公共轴')
+      case 'recording_review': return t('录制回看轴')
+      default: return t('预览轴')
     }
-  }, [axis])
+  }, [axis, t])
 
   const displayMarkIn = (() => {
     if (localDragMark?.type === 'in') {
@@ -420,7 +422,7 @@ export const ControlBar = memo(function ControlBar({
             fontWeight: 500,
           }}>
             <span style={{ display: 'inline-block', width: 5, height: 5, borderRadius: '50%', background: 'var(--brand-400, #4DC4BF)' }} />
-            {multiSelectCount} 房间 · 全局控制
+            {t('{count} 房间 · 全局控制', { count: multiSelectCount })}
           </div>
         </div>
       )}
@@ -472,7 +474,7 @@ export const ControlBar = memo(function ControlBar({
       }}>
         {/* 左侧：播放控制 + 选区操作 */}
         <Space size={2} wrap>
-          <Tooltip title="后退 10 秒">
+          <Tooltip title={t('后退 10 秒')}>
             <Button 
               type="text" size="small"
               icon={<StepBackwardOutlined />}
@@ -481,7 +483,7 @@ export const ControlBar = memo(function ControlBar({
             />
           </Tooltip>
           
-          <Tooltip title={isPlaying ? "暂停" : "播放"}>
+          <Tooltip title={isPlaying ? t('暂停') : t('播放')}>
             <Button 
               type="text" size="small"
               icon={isPlaying ? <PauseCircleOutlined /> : <PlayCircleOutlined />}
@@ -491,7 +493,7 @@ export const ControlBar = memo(function ControlBar({
             />
           </Tooltip>
           
-          <Tooltip title="前进 10 秒">
+          <Tooltip title={t('前进 10 秒')}>
             <Button 
               type="text" size="small"
               icon={<StepForwardOutlined />}
@@ -501,7 +503,7 @@ export const ControlBar = memo(function ControlBar({
           </Tooltip>
 
           {onPlaybackRateChange && (
-            <Tooltip title="播放速率 (Shift+,/. 或 <> )">
+            <Tooltip title={t('播放速率 (Shift+,/. 或 <> )')}>
               <Select
                 size="small"
                 value={playbackRate}
@@ -514,7 +516,7 @@ export const ControlBar = memo(function ControlBar({
             </Tooltip>
           )}
 
-          <Tooltip title="设置入点 (I)">
+          <Tooltip title={t('设置入点 (I)')}>
             <Button 
               type="text" size="small"
               icon={<AimOutlined />}
@@ -522,11 +524,11 @@ export const ControlBar = memo(function ControlBar({
               disabled={isDisabled}
               style={{ color: room?.mark_in !== null ? 'var(--state-success)' : undefined }}
             >
-              入点
+              {t('入点')}
             </Button>
           </Tooltip>
           
-          <Tooltip title="设置出点 (O)">
+          <Tooltip title={t('设置出点 (O)')}>
             <Button 
               type="text" size="small"
               icon={<AimOutlined />}
@@ -534,7 +536,7 @@ export const ControlBar = memo(function ControlBar({
               disabled={isDisabled}
               style={{ color: room?.mark_out !== null ? 'var(--state-error)' : undefined }}
             >
-              出点
+              {t('出点')}
             </Button>
           </Tooltip>
         </Space>
@@ -552,7 +554,7 @@ export const ControlBar = memo(function ControlBar({
             {axisLabel}
           </span>
           {/* 当前播放位置（单一时间读数） */}
-          <Tooltip title="当前播放位置（预览流）">
+          <Tooltip title={t('当前播放位置（预览流）')}>
             <span
               ref={timeLabelRef}
               style={{
@@ -569,7 +571,7 @@ export const ControlBar = memo(function ControlBar({
         {/* 右侧：视图控制 + 添加切片 */}
         <Space size={2} wrap>
           {onGoLive && (
-            <Tooltip title={goLiveDisabled ? '回看模式不可用' : '跳转到直播最新位置'}>
+            <Tooltip title={goLiveDisabled ? t('回看模式不可用') : t('跳转到直播最新位置')}>
               <Button
                 type="text"
                 size="small"
@@ -577,22 +579,22 @@ export const ControlBar = memo(function ControlBar({
                 onClick={onGoLive}
                 disabled={isDisabled || goLiveDisabled}
               >
-                直播
+                {t('直播')}
               </Button>
             </Tooltip>
           )}
-          <Tooltip title={!hasRecordingFile ? '请先开始录制后再添加切片' : '添加到切片列表'}>
+          <Tooltip title={!hasRecordingFile ? t('请先开始录制后再添加切片') : t('添加到切片列表')}>
             <Button 
               type="text" size="small"
               icon={<ScissorOutlined />}
               onClick={onAddClip}
               disabled={!room || !canAddClip}
             >
-              添加切片
+              {t('添加切片')}
             </Button>
           </Tooltip>
           {onToggleLoop && (
-            <Tooltip title={loopPreview ? '停止试听选区' : '试听选区（循环播放入/出点）'}>
+            <Tooltip title={loopPreview ? t('停止试听选区') : t('试听选区（循环播放入/出点）')}>
               <Button
                 type={loopPreview ? 'primary' : 'text'}
                 size="small"
@@ -604,7 +606,7 @@ export const ControlBar = memo(function ControlBar({
           )}
           {onZoomChange && (
             <>
-              <Tooltip title="缩小时间线 (Ctrl+滚轮)">
+              <Tooltip title={t('缩小时间线 (Ctrl+滚轮)')}>
                 <Button
                   type="text"
                   size="small"
@@ -616,7 +618,7 @@ export const ControlBar = memo(function ControlBar({
               <span style={{ fontSize: 11, color: 'var(--text-tertiary)', minWidth: 32, textAlign: 'center', userSelect: 'none' }}>
                 {zoomLevel.toFixed(1)}x
               </span>
-              <Tooltip title="放大时间线 (Ctrl+滚轮)">
+              <Tooltip title={t('放大时间线 (Ctrl+滚轮)')}>
                 <Button
                   type="text"
                   size="small"
@@ -624,7 +626,7 @@ export const ControlBar = memo(function ControlBar({
                   onClick={() => onZoomChange(Math.min(20, zoomLevel * 1.5))}
                 />
               </Tooltip>
-              <Tooltip title="重置缩放">
+              <Tooltip title={t('重置缩放')}>
                 <Button
                   type="text"
                   size="small"
