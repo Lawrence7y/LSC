@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSC 直播切片多人 — 项目检查报告与优化建议</title>
+<style>
+  :root {
+    --bg: #0f141a; --panel: #171d26; --panel2: #1c2430; --border: #2a3442;
+    --text: #e6ecf3; --muted: #94a3b8; --accent: #31b3ae; --accent2: #5ec4c0;
+    --red: #f26d6d; --orange: #f0a35e; --yellow: #e8c96a; --green: #5ecf8e; --blue: #6ea8f5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; line-height: 1.65; padding: 32px 20px 80px; }
+  .wrap { max-width: 1060px; margin: 0 auto; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 28px; }
+  h1 { font-size: 26px; letter-spacing: .5px; }
+  .sub { color: var(--muted); margin-top: 6px; font-size: 14px; }
+  h2 { font-size: 19px; margin: 40px 0 14px; padding-left: 10px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 15.5px; margin: 22px 0 8px; color: var(--accent2); }
+  p { margin: 8px 0; }
+  code { background: #232c3a; padding: 1px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 13px; color: #9fd8d6; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 18px; font-size: 13.5px; }
+  th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--panel2); color: var(--accent2); font-weight: 600; white-space: nowrap; }
+  tr:nth-child(even) td { background: #141a22; }
+  .metrics { display: flex; flex-wrap: wrap; gap: 14px; margin: 16px 0; }
+  .metric { flex: 1 1 170px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .metric .v { font-size: 24px; font-weight: 700; color: var(--accent); }
+  .metric .k { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  .badge { display: inline-block; padding: 1px 9px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .b-red { background: rgba(242,109,109,.14); color: var(--red); border: 1px solid rgba(242,109,109,.4); }
+  .b-orange { background: rgba(240,163,94,.13); color: var(--orange); border: 1px solid rgba(240,163,94,.4); }
+  .b-yellow { background: rgba(232,201,106,.13); color: var(--yellow); border: 1px solid rgba(232,201,106,.4); }
+  .b-green { background: rgba(94,207,142,.13); color: var(--green); border: 1px solid rgba(94,207,142,.4); }
+  .b-blue { background: rgba(110,168,245,.13); color: var(--blue); border: 1px solid rgba(110,168,245,.4); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin: 14px 0; }
+  .card-title { font-weight: 700; color: var(--accent2); margin-bottom: 6px; font-size: 14.5px; }
+  .note { font-size: 13px; color: var(--muted); }
+  .quote { border-left: 3px solid var(--border); padding: 4px 12px; color: var(--muted); margin: 10px 0; font-size: 13.5px; }
+  ul, ol { padding-left: 22px; margin: 8px 0; }
+  li { margin: 5px 0; }
+  .pill-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+  .prio { font-weight: 700; }
+  .p0 { color: var(--red); } .p1 { color: var(--orange); } .p2 { color: var(--yellow); } .p3 { color: var(--green); }
+  footer { margin-top: 48px; color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--border); padding-top: 14px; }
+  @media print { body { background: #fff; color: #111; } .card, th { background: #f5f5f5; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>LSC 直播切片多人 — 项目检查报告与优化建议</h1>
+  <div class="sub">检查日期：2026-08-19 · 目标目录：D:\Project\直播切片多人 · 基线：v3.0.22（main 分支，最近提交 2026-08-14）</div>
+  <div class="pill-row">
+    <span class="badge b-green">测试 99.87% 通过</span>
+    <span class="badge b-orange">CI 红线当前会失败</span>
+    <span class="badge b-yellow">723 MB 调试文件滞留仓库根目录</span>
+    <span class="badge b-blue">前端 i18n 系统未提交</span>
+  </div>
+</header>
+
+<h2>一、项目总览</h2>
+<p>LSC（Live Stream Clipper）是一个 <b>多直播间录制 + 切片一体化桌面工具</b>：最多 12 路并发录制、4 路 MSE 低延迟预览，支持抖音/B站/虎牙/斗鱼/快手/小红书/微博/直链 8 类源，墙钟精确切片、音频互相关多视角对齐、Valorant OCR 回合 AI 高光分析，可一键导出剪映草稿。定位清晰（CLAUDE.md 明确"不做非线编/特效/推流"），架构分层干净：Electron+React 前端 → Python WebSocket 桥接层 → lsc 核心业务包。</p>
+
+<div class="metrics">
+  <div class="metric"><div class="v">4.3 MB</div><div class="k">源码总量（Py 3.3 + TS 1.0）</div></div>
+  <div class="metric"><div class="v">1507</div><div class="k">Python 测试用例（2 失败）</div></div>
+  <div class="metric"><div class="v">77</div><div class="k">前端 vitest（全通过）</div></div>
+  <div class="metric"><div class="v">8</div><div class="k">平台适配器</div></div>
+  <div class="metric"><div class="v">2.1 GB</div><div class="k">.git 目录体积</div></div>
+</div>
+
+<h3>代码规模分布（Top 异常文件）</h3>
+<table>
+  <tr><th>文件</th><th>行数/体积</th><th>问题性质</th></tr>
+  <tr><td><code>python-backend/handlers/room_handler.py</code></td><td>8948 行 / 423 KB</td><td>单体巨型 handler：108 个函数，最长函数 <code>_spawn_worker</code> 980 行且嵌套闭包，WebSocket 协议入口全部堆在一个文件</td></tr>
+  <tr><td><code>lsc/core/orchestrator.py</code></td><td>4105 行 / 187 KB</td><td>核心编排器 6 个类，mypy 报错最集中（87 个错误中的大头）</td></tr>
+  <tr><td><code>lsc-electron/src/pages/Workbench/index.tsx</code></td><td>4653 行 / 195 KB</td><td>39 个 useState、26 个 useEffect、53 个 useCallback 挤在一个组件里</td></tr>
+  <tr><td><code>lsc/core/services/shared_ingest.py</code></td><td>88.6 KB</td><td>共享进样核心，逻辑密集但已有测试覆盖</td></tr>
+</table>
+
+<h2>二、检查发现（按严重度）</h2>
+
+<h3>🔴 P0 — CI 红线当前处于失败状态</h3>
+<div class="card">
+  <div class="card-title">CI 的 ruff job 会挂：lint 错误存在于 CI 实际检查的路径中</div>
+  <p>本地实测 <code>ruff check lsc python-backend tests</code> 报 <b>10 个错误</b>。其中 CI 配置（<code>.github/workflows/ci.yml</code>）只检查 <code>lsc/ python-backend/</code>，这两个目录内有 2 个错误，<b>任何一个都会让 CI lint job 直接红</b>：</p>
+  <ul>
+    <li><code>lsc\core\services\timeline_service.py:71</code> — B007 循环变量 <code>offset</code> 未使用（唯一不能 <code>--fix</code> 自动修的，需要人工判断是 bug 还是改名）</li>
+    <li><code>lsc\gui\qt_compat.py:24</code> — UP035 <code>Callable</code> 应从 <code>collections.abc</code> 导入。注意该文件还是 <b>未跟踪文件</b>，CI 检出后它不存在 → 更微妙：本地过、CI 上不过的组合风险</li>
+  </ul>
+  <p class="note">其余 8 个错误都在 tests/ 目录（未使用 import、import 排序、Yoda 条件），9/10 可 <code>ruff --fix</code> 一键修复。</p>
+</div>
+
+<h3>🔴 P0 — 2 个 Python 测试失败（源码变更后断言未同步）</h3>
+<div class="card">
+  <p>全量 pytest 实测：<b>1507 个用例，1505 通过，2 失败（99.87%）</b>。两个失败均为「产品代码已正确演进、测试断言没跟上」，不是产品 bug：</p>
+  <table>
+    <tr><th>失败用例</th><th>原因</th><th>修复方式</th></tr>
+    <tr><td><code>test_workbench_continuous_analysis_uses_explicit_game_modes</code></td><td>源码把 <code>&lt;Radio.Button&gt;无畏契约&lt;/Radio.Button&gt;</code> 改成了 <code>{t('无畏契约')}</code>（i18n 化），断言还在匹配旧字面量</td><td>断言改为匹配 <code>value="valorant_round"</code> + <code>t('无畏契约')</code></td></tr>
+    <tr><td><code>test_sync_analysis_modal_has_no_export_preset_select</code></td><td>同上：弹窗 title 由 <code>'持续分析设置'</code> 变为 <code>t('持续分析设置')</code>，测试用旧字符串定位 Modal 失败</td><td>定位锚点同步更新</td></tr>
+  </table>
+  <p class="note">这是全量跑出来的（CI matrix 上同样会红）。修两个断言约 5 分钟工作量，但当前就是"仓库不在绿色状态"。</p>
+</div>
+
+<h3>🟠 P1 — 未提交改动规模大，且含关键未跟踪源码</h3>
+<div class="card">
+  <p>当前工作区 <b>76 个文件已修改未提交</b>（几乎全是前端 + electron 主进程），另有 <b>36 个未跟踪的源码文件</b>，其中关键的有：</p>
+  <ul>
+    <li><code>lsc-electron/src/i18n/</code> 整个目录（core.ts + 8 个 en.part.*.ts，共 66 KB）— 中英双语系统<b>完全没进 git</b>，一旦误删即丢失全部翻译工作</li>
+    <li><code>lsc/gui/qt_compat.py</code> — requirements.txt 明确引用的标准库兼容层，未跟踪（CI 上会 ImportError 风险）</li>
+    <li><code>lsc-electron/scripts/build-msix.ps1</code> 等 3 个发布脚本 — Microsoft Store 发布链路未入库</li>
+    <li><code>feedback-collector/</code> 11 个 PowerShell 脚本 — 用户反馈收集工具链未入库</li>
+  </ul>
+  <p>最近一次提交是 08-14，五天的改动摊在工作区里，没有中间 commit，丢工作区=丢全部。</p>
+</div>
+
+<h3>🟠 P1 — 仓库卫生：723 MB 调试文件 + 2.1 GB git 历史</h3>
+<div class="card">
+  <ul>
+    <li>根目录 <b>325 个 <code>_</code> 开头调试文件共 723 MB</b>（截图 PNG、抽取帧、log dump、3r.mp4 测试视频 217 MB 等），全部被 .gitignore 规则忽略但物理滞留，<b>不清理的话任何全量备份/复制仓库都带着它们</b></li>
+    <li><code>.git</code> 目录已膨胀到 <b>2.1 GB</b>（说明历史里提交过二进制大文件），clone 体验很差，建议 git-filter-repo 瘦身 + 大文件走 LFS/网盘</li>
+    <li><code>nul</code> 文件（Windows 保留名）、<code>test.txt</code>、<code>_shell_ok.txt</code> 等垃圾文件在根目录</li>
+    <li><code>work/</code> 目录有 7 个分析脚本 + 2 份 session 报告未跟踪，属于一次性调试产物，应归档或删除</li>
+  </ul>
+</div>
+
+<h3>🟡 P2 — 类型安全与静态检查缺口</h3>
+<div class="card">
+  <p><code>mypy lsc</code> 实测：<b>22 个文件 87 个错误</b>（配置是 <code>disallow_untyped_defs</code>，说明团队有意收紧但尚未收完），最集中的是 <code>orchestrator.py</code>（None 联合类型未收窄、Any 返回值等）。目前 mypy 在 CI 里会失败吗？—— 会，CI 里 <code>mypy</code> 用默认配置跑，同样报这些错误。</p>
+  <p class="note">注：我本地跑的是 mypy 2.1.0（项目锁定时代更早的版本可能结果不同），但 CI 装 latest，结论一致：lint job 当前必红。</p>
+</div>
+
+<h3>🟡 P2 — 两个"上帝对象"急需拆分</h3>
+<div class="card">
+  <p><code>room_handler.py</code> 已到 8948 行且还在增长（本次未提交 diff 又改了它）。108 个函数塞在一个模块里，其中 <code>_spawn_worker</code> 是 980 行的嵌套闭包（内含整个持续分析主循环状态机），单函数超过很多中小项目的单文件规模。建议按域拆：<code>room_crud / recording / preview / export / analysis / cliplist</code>，每个域一个 handler 文件 + 一个 router。</p>
+  <p>前端 <code>Workbench/index.tsx</code> 4653 行同理：39 个 state + 26 个 effect 纠缠，虽然已有 memo 比较器惯例兜底，但新功能每加一次都在这个文件里再插一段，出错面持续扩大。i18n 迁移后顺带把 Modal 抽成独立组件会明显改善。</p>
+</div>
+
+<h3>🟡 P2 — i18n 迁移进行中，但硬编码中文仍大量存在</h3>
+<div class="card">
+  <p>统计显示 <code>Workbench/index.tsx</code> 还有 <b>1157 段中文字符串</b> 未被 <code>t()</code> 包裹，<code>electron/main.ts</code> 有 <b>579 段</b>（菜单、对话框、系统通知）。已完成的 en.part.*.ts 只是翻译资源，键的抽取工作远未完成。现状是"半双语"：界面部分走 t()、部分硬编码，切英文会中英混杂。</p>
+</div>
+
+<h3>🟢 已修复/已落地的历史问题（值得肯定）</h3>
+<div class="card">
+  <p>7 月的三份优化报告（架构性能、前端、稳定性）里的 P0 项多数已落地，我逐条核对了代码：</p>
+  <table>
+    <tr><th>历史 P0 项</th><th>现状</th></tr>
+    <tr><td>200ms 全量重渲染轮询</td><td><span class="badge b-green">已修</span> previewPositions 降频 500ms + 仅变化时 setState；<code>playheadStore.ts</code> rAF 直写 DOM 已落地</td></tr>
+    <tr><td>WebSocket 每条消息深拷贝</td><td><span class="badge b-green">已修</span> <code>websocket.ts</code> 深拷贝日志已加 isDev 保护</td></tr>
+    <tr><td>MSE base64 带宽/解码开销</td><td><span class="badge b-green">大部分已修</span> 后端已推二进制帧（<code>mse_ws_frames.py</code> MAGIC 协议）；但前端 <code>_decodeBase64Segment</code> 的逐字节 <code>charCodeAt</code> 兜底循环还在（字符串帧路径）</td></tr>
+    <tr><td>多线程竞态、task 泄漏、FFmpeg 孤儿进程</td><td><span class="badge b-green">已修</span> 锁保护、TaskRegistry 思路、watchdog 上限等见 CHANGELOG v3.0.21</td></tr>
+  </table>
+</div>
+
+<h2>三、检查数据一览</h2>
+<table>
+  <tr><th>检查项</th><th>结果</th><th>评价</th></tr>
+  <tr><td>pytest 全量（Python 3.12 + offscreen）</td><td>1505/1507 通过，35.9s（deselect 后 81s）</td><td><span class="badge b-yellow">2 断言过期</span></td></tr>
+  <tr><td>vitest（前端）</td><td>8 文件 77 用例全通过，10.3s</td><td><span class="badge b-green">绿</span></td></tr>
+  <tr><td>tsc --noEmit</td><td>0 错误</td><td><span class="badge b-green">绿</span></td></tr>
+  <tr><td>ruff check lsc + python-backend（CI 范围）</td><td>2 错误</td><td><span class="badge b-red">CI 必红</span></td></tr>
+  <tr><td>ruff check 含 tests/</td><td>10 错误（9 可自动修）</td><td><span class="badge b-orange">待清理</span></td></tr>
+  <tr><td>mypy lsc</td><td>22 文件 87 错误</td><td><span class="badge b-red">CI 必红</span></td></tr>
+  <tr><td>Git 工作区</td><td>76 修改 + 36 未跟踪源码 + 325 调试文件(723MB)</td><td><span class="badge b-orange">有丢失风险</span></td></tr>
+  <tr><td>CI 配置</td><td>lint / typecheck / test(2 OS × 3 Python) / release + core-guard 路径守卫</td><td><span class="badge b-green">框架完善</span></td></tr>
+</table>
+
+<h2>四、优化点建议（按优先级排序）</h2>
+
+<h3>P0 — 立即做（恢复绿色 CI，半小时级）</h3>
+<table>
+  <tr><th>#</th><th>事项</th><th>说明</th></tr>
+  <tr><td>1</td><td>修复 2 个过期测试断言</td><td>把断言中的中文字面量改为 <code>t('...')</code> 形式，或改为匹配 value 属性（更稳，不随文案变）</td></tr>
+  <tr><td>2</td><td>清 ruff 10 错误</td><td><code>ruff check lsc python-backend tests --fix</code> 自动修 9 个；B007 人工看一眼 <code>timeline_service.py:71</code> 的循环是否该用 <code>_offset</code> 或 <code>enumerate</code></td></tr>
+  <tr><td>3</td><td>把 <code>qt_compat.py</code> + <code>i18n/</code> + MSIX 脚本 commit 进去</td><td>它们是运行时依赖/发布依赖，未跟踪状态最危险。先提交这 36 个未跟踪文件，再提交 76 个已修改文件（建议拆 2-3 个 commit：i18n 迁移、修复、脚本）</td></tr>
+  <tr><td>4</td><td>mypy 分两步处理</td><td>先修 <code>orchestrator.py</code> 的高频错误；若想立即绿 CI，可把 mypy job 改成 <code>--exit-zero</code> 信息性运行（要团队认可），同时开 issue 跟踪清零。不建议长期 exit-zero</td></tr>
+</table>
+
+<h3>P1 — 仓库卫生（一天内可完成）</h3>
+<table>
+  <tr><th>#</th><th>事项</th><th>说明</th></tr>
+  <tr><td>5</td><td>清理根目录 723 MB 调试文件</td><td>325 个 <code>_*</code> 文件按类归档：截图/抽取帧/日志删除，3r.mp4 测试素材移到 datasets/ 或网盘。<b>建议用 trash 而非直接删除</b>，先移到一个 <code>_archive_20260819/</code> 目录观察一周再清</td></tr>
+  <tr><td>6</td><td>work/、feedback-collector/ 归档</td><td>一次性分析脚本进 <code>scripts/archive/</code> 或删除；反馈收集脚本如果还在用就入库</td></tr>
+  <tr><td>7</td><td>.git 瘦身</td><td>2.1 GB 历史需要 git-filter-repo 去掉大 blob，配合强制推送前在团队内通告。可顺带把 datasets/ 大文件移到仓库外</td></tr>
+  <tr><td>8</td><td>提交纪律</td><td>当前 5 天改动一个 commit 都没有。建议至少按"完成一个功能点/修一类问题"粒度提交，避免再次出现大块未提交状态</td></tr>
+</table>
+
+<h3>P2 — 架构与技术债（本迭代后启动）</h3>
+<table>
+  <tr><th>#</th><th>事项</th><th>说明</th></tr>
+  <tr><td>9</td><td>拆分 room_handler.py</td><td>按域拆 6 个 handler 模块 + router，980 行的 <code>_spawn_worker</code> 拆成「Worker 生命周期 + 扫描循环 + OCR 预算」三块。已有 108 个函数名作为拆分边界，风险可控，测试套件（32 个 test_room_handler_* 文件）作为回归网</td></tr>
+  <tr><td>10</td><td>拆分 Workbench/index.tsx</td><td>先把分析 Modal、房间添加 Modal、导出队列抽屉抽成独立组件；播放头相关逻辑已在 playheadStore，继续把导出进度监听、快捷键注册抽成 hook 模块</td></tr>
+  <tr><td>11</td><td>完成 i18n 键抽取</td><td>清完 1157+579 段硬编码中文；补 zh-CN 基础键让英文包基于键系统工作（现在 en.*.part 已存在，缺的是源码里 t() 全覆盖）</td></tr>
+  <tr><td>12</td><td>前端 base64 解码换高效路径</td><td>字符串帧兜底路径用 <code>Uint8Array.from(atob(b), c =&gt; c.charCodeAt(0))</code> 或移入 Web Worker；二进制帧已是主流，收益小但零风险</td></tr>
+  <tr><td>13</td><td>pre-commit 钩子接上</td><td>项目已有 <code>.pre-commit-config.yaml</code>，确认 ruff + 白名单是否实际启用；启用后 lint 错误不会再到 CI 才暴露</td></tr>
+</table>
+
+<h2>五、新功能建议</h2>
+<p>以下建议均基于现有架构的自然延伸，不违背 CLAUDE.md 的定位边界（不做非线编/特效/推流）。按「价值 × 成本」排序：</p>
+
+<table>
+  <tr><th>#</th><th>功能</th><th>价值</th><th>成本</th><th>落点</th></tr>
+  <tr><td>F1</td><td><b>AI 切片标题/标签自动生成</b></td><td>导出时按 OCR 文本 + 音频能量自动起名（"第X回合 4杀 ACE"），替代人工命名，直接提升发布效率</td><td>中</td><td>analysis_handlers + clipNaming.ts 已有一半基础（format_ai_round_clip_label）</td></tr>
+  <tr><td>F2</td><td><b>切片批量发布助手（半自动）</b></td><td>生成剪映草稿的同时产出「标题+标签+简介+封面图（抽帧）」套餐，用户一键复制去抖音/B站发布。不做自动发布（违反平台风控），只做内容打包</td><td>中</td><td>export_service 已有抽帧能力（frame_capture），补一个模板化文案生成即可</td></tr>
+  <tr><td>F3</td><td><b>AI 高光分析扩展到通用游戏/语音直播</b></td><td>现有 pipeline 是 Valorant 专用 OCR；generic_plugin.py 已有雏形。做「弹幕密度峰值检测」类通用信号（弹幕是各平台通用的高光代理指标），把持续分析价值带到非 Valorant 场景</td><td>高（需求最广）</td><td>analyzer/generic_plugin.py + 弹幕需要平台 API 接入（B站已有，抖音难）</td></tr>
+  <tr><td>F4</td><td><b>录制磁盘空间水位线告警 + 自动清档</b></td><td>12 路 1080p 录制磁盘消耗很快，录制前预估剩余可录时长，低于阈值告警/按策略清最旧档</td><td>低</td><td>resource_monitor.py 已监控 CPU/内存/磁盘，补可录时长估算即可</td></tr>
+  <tr><td>F5</td><td><b>切片打点回放（书签系统）</b></td><td>录制中按快捷键给"可能精彩"打点，AI 分析后对照打点快速复核，人机协同提效</td><td>低-中</td><td>timeline_service + DVR 标记已有类似结构</td></tr>
+  <tr><td>F6</td><td><b>多房间对比同步回放</b></td><td>导出前以公共时间轴同时回放 2-4 路（现有多视角对齐已算出 offset，只差同步播放 UI）</td><td>中</td><td>前端 previewAudioAligner 已有 offset 数据</td></tr>
+  <tr><td>F7</td><td><b>直播预告/订阅提醒</b></td><td>对已添加房间的开播状态做轮询提醒（"XX 已开播，是否一键连接录制"），解决"错过开播"痛点</td><td>中</td><td>平台解析层可加开播状态查询</td></tr>
+  <tr><td>F8</td><td><b>导出预设模板（分辨率/平台/命名规则）</b></td><td>现 exportPresets.ts 是代码级预设，做成 UI 可编辑模板（抖音竖版、B站横版、双版本同出），减少重复设置</td><td>低</td><td>Settings + exportPresets 联动</td></tr>
+  <tr><td>F9</td><td><b>录制健康报告（每房间）</b></td><td>导出时附一份「断流次数/重连时长/编码错误」摘要，帮用户识别网络或平台问题</td><td>低</td><td>runtime_health.py 已在采集，缺报告化</td></tr>
+</table>
+
+<h3>建议路线</h3>
+<div class="card">
+  <p><b>本迭代（1-2 天）</b>：P0 修复 → CI 绿 → 清理仓库 → 提交纪律恢复。<br>
+  <b>下迭代</b>：F4 磁盘水位线（成本最低、痛点直接）+ F8 导出预设模板 + F9 健康报告（三者都复用现有采集数据）。<br>
+  <b>再之后</b>：F1 AI 命名（配合现有 AI 分析链路）+ F3 通用高光信号，同时启动 room_handler 拆分。</p>
+</div>
+
+<footer>
+  LSC 项目检查报告 · 生成于 2026-08-19 · 数据来源：本地实际执行 pytest / vitest / tsc / ruff / mypy / git 状态检查。测试环境：Python 3.12.4、Node 20、Windows。报告中"未运行"项无；全部数字为实测值。
+</footer>
+
+</div>
+</body>
+</html>
