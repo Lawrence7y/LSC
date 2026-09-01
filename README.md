@@ -4,6 +4,7 @@
 
 ![version](https://img.shields.io/badge/version-v3.0.22-31B3AE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
+[![Microsoft Store](https://get.microsoft.com/images/en-us/dark.svg)](https://apps.microsoft.com/detail/9NQWM5KPRWF1)
 ![license](https://img.shields.io/badge/license-GPL%20v2-blue)
 ![frontend](https://img.shields.io/badge/frontend-Electron%20%2B%20React%20%2B%20TypeScript-61DAFB)
 ![backend](https://img.shields.io/badge/backend-Python%20%2B%20FFmpeg-3776AB)
@@ -62,7 +63,7 @@
 
 ### 方式一：安装包（推荐）
 
-- **Microsoft Store 版（自包含）**：从 Microsoft Store 安装 `Live Stream Clipper`。所有 Python 依赖与 FFmpeg 已内置在 MSIX 包中，首次启动无需联网下载或安装任何组件。
+- **Microsoft Store 版（自包含）**：[![Microsoft Store](https://get.microsoft.com/images/en-us/dark.svg)](https://apps.microsoft.com/detail/9NQWM5KPRWF1) 从 Microsoft Store 安装 `Live Stream Clipper`。所有 Python 依赖与 FFmpeg 已内置在 MSIX 包中，首次启动无需联网下载或安装任何组件。
 - **GitHub Releases 安装包**：从 [Releases](https://github.com/Lawrence7y/LSC/releases) 下载 `LSC 直播切片系统 Setup x.y.z.exe`。该安装包会在安装过程中下载运行依赖（国内镜像加速）并自动检测 / 升级 VC++ 运行库。
 
 无论哪种方式，首次启动均可直接使用；若机器不支持 DirectML（如虚拟机），AI 分析自动降级 CPU，不影响录制。
