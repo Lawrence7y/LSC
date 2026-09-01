@@ -194,7 +194,8 @@ class TimelineContext:
 class ClipSnapshot:
     """不可变的切片快照 — 后端冻结的录制文件坐标。
 
-    start/end 是录制文件中的物理位置，一经创建不可修改。
+    common_start/common_end 是公共轴范围；recording_start_sec/
+    recording_end_sec 是创建瞬间换算出的录制文件物理位置，一经创建不可修改。
     通过 recording_id 绑定到特定录制文件版本。
     """
     clip_id: str
@@ -204,6 +205,8 @@ class ClipSnapshot:
     common_start: float
     common_end: float
     room_id: str
+    recording_start_sec: float | None = None
+    recording_end_sec: float | None = None
     source: str = ""
     source_highlight_id: str = ""
     output_path: str = ""

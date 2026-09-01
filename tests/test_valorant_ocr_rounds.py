@@ -750,7 +750,7 @@ def test_open_round_closes_across_windows(monkeypatch, tmp_path):
     rounds2 = mod.detect_valorant_rounds_ocr(str(video), time_range=(100.0, 150.0),
                                               runtime_state=state, finalize=False)
     assert len(rounds2) == 1
-    assert rounds2[0]["start"] == 7.0   # 入点跨窗口持久化（锚点两帧确认 @7）
+    assert rounds2[0]["start"] == 6.0   # 入点跨窗口持久化（首帧回溯至交战首帧 @6）
     assert rounds2[0]["end"] == 131.0   # 窗口 B 的真准备信号（两帧确认）
     assert rounds2[0]["confirm_status"] == "vision_confirmed"
     assert rounds2[0]["end_by"] == "next_prep"
@@ -880,7 +880,7 @@ def test_settle_residual_countdown_not_exported_as_round(monkeypatch, tmp_path):
         refine_boundaries=False,
     )
     assert len(rounds) == 1
-    assert rounds[0]["start"] == 1.0  # 锚点两帧确认
+    assert rounds[0]["start"] == 0.0  # 首帧回溯至交战首帧
     assert rounds[0]["end"] >= 70.0
     assert rounds[0]["end_by"] == "next_prep"
     # 不得在残余钟段（≤45 误当 prep）提前闭合成短切片
@@ -1011,3 +1011,89 @@ def test_refine_valorant_round_boundaries_updates_and_marks(monkeypatch):
     assert out[0]["start"] == 98.5
     assert out[0]["end"] == 158.2
     assert out[0]["boundary_refined"] is True
+
+
+def test_post_settle_recovers_prep_without_gap_after_settle_period(monkeypatch, tmp_path):
+    """结算 6s 之后，即使没有读到 None/<=1.0 的空档，连续两帧读到准备倒计时也应正常解除 hold 并闭合回合。"""
+    import numpy as np
+
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"dummy")
+
+    # combat 0-10 -> settle 11 -> settle 内倒计时 5s (12-16) -> 无 gap 直接进入 30s 买枪准备 (17+)
+    readings = []
+    for ts in range(0, 30):
+        if ts <= 10:
+            readings.append((90.0 - ts, None, None))
+        elif ts == 11:
+            readings.append((None, None, None))
+        elif ts <= 16:
+            readings.append((5.0 - (ts - 12), None, None))  # 结算倒计时
+        else:
+            readings.append((30.0 - (ts - 17), None, None))  # 买枪倒计时（无 gap 直切）
+
+    it = iter(readings)
+    ci = [0]
+
+    def fake_top(img):
+        return next(it, (None, None, None))
+
+    def fake_center(img):
+        ci[0] += 1
+        # ts=11 出现结算横幅，之后无准备横幅
+        return (False, True) if ci[0] == 12 else (False, False)
+
+    monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: [
+        (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 30)
+    ])
+    monkeypatch.setattr(mod, "_read_top_anchors", fake_top)
+    monkeypatch.setattr(mod, "_read_center_banner", fake_center)
+
+    rounds = mod.detect_valorant_rounds_ocr(
+        str(video),
+        time_range=(0.0, 30.0),
+        runtime_state={},
+        finalize=False,
+        refine_boundaries=False,
+    )
+    assert len(rounds) == 1
+    assert rounds[0]["confirm_status"] == "vision_confirmed"
+    assert rounds[0]["end_by"] == "next_prep"
+    # 出点应在买枪阶段两帧确认处（ts=18 确认两帧）
+    assert rounds[0]["end"] <= 20.0
+
+
+def test_refine_boundary_ts_combat_skips_center_banner_and_early_stops(monkeypatch):
+    """combat 密扫必须跳过 center banner OCR，并在连续 2 帧命中时提前退出。"""
+    import numpy as np
+
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    # 构造 30 帧 (5fps 下 6 秒)
+    frames = [(100.0 + i * 0.2, np.zeros((360, 640, 3), dtype=np.uint8)) for i in range(30)]
+    monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: frames)
+
+    center_called = [0]
+    top_called = [0]
+
+    def fake_center(img):
+        center_called[0] += 1
+        return False, False
+
+    def fake_top(img):
+        top_called[0] += 1
+        # 前 2 帧无读数，第 3、4 帧出现交战钟 (95.0)，后续依然有帧
+        if top_called[0] <= 2:
+            return None, None, None
+        return 95.0, None, None
+
+    monkeypatch.setattr(mod, "_read_center_banner", fake_center)
+    monkeypatch.setattr(mod, "_read_top_anchors", fake_top)
+
+    ts = mod._refine_boundary_ts("v.mp4", "ffmpeg", 103.0, "combat")
+    assert ts == 100.4  # 第 3 帧的时间戳 100.0 + 2*0.2 = 100.4
+    assert center_called[0] == 0  # combat 密扫完全跳过 center banner OCR
+    assert top_called[0] == 4  # 提前退出：仅运行了 4 帧 OCR，而非全部 30 帧
+

@@ -59,6 +59,41 @@ def test_mse_streamer_file_mode_skips_network_flags() -> None:
     assert r"C:\recordings\room.mp4" in captured_cmd
 
 
+
+def test_mse_streamer_file_mode_start_offset_adds_copyts_and_ss() -> None:
+    captured_cmd: list[str] = []
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            self.stdout = None
+            self.stderr = None
+
+        def poll(self):
+            return 0
+
+    from unittest.mock import patch
+
+    import lsc.core.services.mse_streamer as mse_mod
+
+    streamer = mse_mod.MseStreamer(
+        url=r"C:\recordings\room.mp4",
+        is_file=True,
+        start_offset_sec=125.0,
+        on_init_segment=lambda _b: None,
+        on_media_segment=lambda _b: None,
+    )
+    with patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch.object(
+        mse_mod, "set_stream_nonblocking"
+    ), patch("lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen):
+        streamer.start(startup_probe_timeout=0.2)
+
+    assert "-copyts" in captured_cmd
+    assert "-ss" in captured_cmd
+    assert "125.000" in captured_cmd
+    assert "-re" in captured_cmd
+
+
 def test_segment_reader_emits_media_when_moof_starts_current_buffer() -> None:
     init_segment = _mp4_box(b"ftyp", b"isom") + _mp4_box(b"moov", b"init")
     media_segment = _mp4_box(b"moof", b"traf") + _mp4_box(b"mdat", b"frame")

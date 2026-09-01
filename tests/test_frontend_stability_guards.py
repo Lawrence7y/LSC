@@ -1404,6 +1404,14 @@ def test_websocket_deep_copy_logging_is_dev_only() -> None:
         assert "truncateLogData" in body, f"{label} DEV 日志应走 truncateLogData"
         # 生产路径禁止在 handler 内直接深拷贝
         assert "JSON.parse(JSON.stringify" not in body, f"{label} 不得在热路径内联深拷贝"
+        assert "isHighFrequencyWsType" in body, f"{label} 须跳过心跳/房间状态等高频类型"
+
+
+def test_mse_preview_debug_is_off_by_default() -> None:
+    """开发模式也不默认打开每分片 MsePlayer 日志，避免主进程磁盘被打满。"""
+    source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    ctor = source.split("new MsePlayer({", 1)[1].split("onStateChange", 1)[0]
+    assert "debug: false" in ctor or "debug:false" in ctor.replace(" ", "")
 
 
 def test_workbench_preview_position_poll_is_500ms() -> None:

@@ -195,6 +195,12 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
   color: var(--text-secondary);
 }
 
+.clip-row-v2__time .clip-row-v2__axis {
+  color: var(--brand-400, #4dc4bf);
+  font-size: 10px;
+  margin-right: 5px;
+}
+
 .clip-row-v2__acts {
   display: none;
   align-items: center;

@@ -11,8 +11,30 @@ const DISCONNECTED_QUEUEABLE_TYPES = new Set([
   'check_dependencies',
 ])
 
+const HIGH_FREQ_WS_TYPES = new Set([
+  'heartbeat',
+  'rooms_updated',
+  'room_updated',
+  'system_stats',
+  'mse_segment',
+  'mse_init',
+  'preview_frame',
+  'preview_phase',
+  'continuous_analysis_status',
+  'export_progress',
+  'analysis_progress',
+  'get_rooms',
+  'get_system_stats',
+  'get_continuous_analysis_status',
+  'request_mse_init',
+])
+
 export function shouldQueueWhenDisconnected(type: string): boolean {
   return DISCONNECTED_QUEUEABLE_TYPES.has(type)
+}
+
+export function isHighFrequencyWsType(type: string): boolean {
+  return HIGH_FREQ_WS_TYPES.has(type)
 }
 
 const isDev = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV)
@@ -234,9 +256,7 @@ export class WebSocketClient {
                 this.lastHeartbeat = Date.now()
               }
               if (isDev) {
-                if (message.type === 'mse_segment' || message.type === 'mse_init' || message.type === 'preview_frame') {
-                  console.log(`[WebSocket] Received message type=${message.type} (length: ${text.length})`)
-                } else {
+                if (!isHighFrequencyWsType(message.type)) {
                   console.log(`[WebSocket] Received message type=${message.type}, data=`, truncateLogData(message.data))
                 }
               }
@@ -373,9 +393,9 @@ export class WebSocketClient {
    */
   send(type: string, data: unknown): boolean {
     if (isDev) {
-      if (type === 'align_preview_audio') {
+      if (!isHighFrequencyWsType(type) && type === 'align_preview_audio') {
         console.log(`[WebSocket] Sending message type=${type} (PCM base64 audio payload)`)
-      } else {
+      } else if (!isHighFrequencyWsType(type)) {
         console.log(`[WebSocket] Sending message type=${type}, data=`, truncateLogData(data))
       }
     }

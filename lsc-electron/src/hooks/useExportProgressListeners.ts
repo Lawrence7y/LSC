@@ -7,6 +7,18 @@ import { t } from '@/i18n'
 type OnFn = (type: string, handler: (data: any) => void) => () => void
 type SendFn = (type: string, data?: any) => boolean
 
+function readExportRange(data: {
+  export_start?: unknown
+  export_end?: unknown
+  start?: unknown
+  end?: unknown
+}): { start: number; end: number } | null {
+  const start = Number(data?.export_start ?? data?.start)
+  const end = Number(data?.export_end ?? data?.end)
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null
+  return { start, end }
+}
+
 /**
  * 导出进度 / 完成 / 失败 WebSocket 监听（从 Workbench 拆出，降低巨型组件体积）。
  */
@@ -80,9 +92,20 @@ export function useExportProgressListeners(opts: {
     unsubs.push(on('clip_completed', (data: any) => {
       if (data?.job_id) {
         const store = useAppStore.getState()
+        const actualRange = readExportRange(data)
         const updatedClips = store.clips.map(c =>
           c.job_id === data.job_id
-            ? { ...c, exported: true, outputPath: data.output_path, export_status: 'completed' as const, export_error: undefined }
+            ? {
+              ...c,
+              ...(actualRange ? {
+                recording_start_sec: actualRange.start,
+                recording_end_sec: actualRange.end,
+              } : {}),
+              exported: true,
+              outputPath: data.output_path,
+              export_status: 'completed' as const,
+              export_error: undefined,
+            }
             : c
         )
         store.setClips(updatedClips)
@@ -126,9 +149,29 @@ export function useExportProgressListeners(opts: {
         store.setClips(updatedClips)
       }
     }))
-    const handleExportSubmitResponse = (data: { success?: boolean; error?: string; job_id?: string }) => {
+    const handleExportSubmitResponse = (data: {
+      success?: boolean
+      error?: string
+      job_id?: string
+      export_start?: number
+      export_end?: number
+      start?: number
+      end?: number
+    }) => {
       const failed = data?.success === false || (Boolean(data?.error) && data?.success !== true)
       if (!failed) {
+        const actualRange = readExportRange(data)
+        if (data?.job_id && actualRange) {
+          const store = useAppStore.getState()
+          store.setClips(store.clips.map(c => c.job_id === data.job_id
+            ? {
+              ...c,
+              recording_start_sec: actualRange.start,
+              recording_end_sec: actualRange.end,
+            }
+            : c
+          ))
+        }
         if (data?.job_id) pendingExportJobIdsRef.current.delete(data.job_id)
         return
       }
@@ -177,6 +220,8 @@ export function useExportProgressListeners(opts: {
         percent?: number
         elapsed?: number
         total?: number
+        export_start?: number
+        export_end?: number
         output_path?: string
         error?: string
       }>
@@ -208,9 +253,14 @@ export function useExportProgressListeners(opts: {
         nextClips = nextClips.map(clip => {
           if (clip.job_id !== job.job_id) return clip
           clipsChanged = true
+          const actualRange = readExportRange(job)
           if (job.status === 'completed') {
             return {
               ...clip,
+              ...(actualRange ? {
+                recording_start_sec: actualRange.start,
+                recording_end_sec: actualRange.end,
+              } : {}),
               exported: true,
               outputPath: job.output_path,
               export_status: 'completed' as const,

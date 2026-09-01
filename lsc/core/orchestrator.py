@@ -31,10 +31,20 @@ from lsc.core.services.ingest_registry import get_shared_ingest_registry
 from lsc.core.services.recording_service import RecordingService
 from lsc.core.services.timeline_service import get_timeline_service
 from lsc.core.session import RoomSession
-from lsc.platforms.base import StreamInfo
+from lsc.platforms.base import (
+    ERROR_OFFLINE,
+    ERROR_PARSE_FAILED,
+    ERROR_RESTRICTED,
+    ERROR_UNSUPPORTED_URL,
+    StreamInfo,
+)
 from lsc.platforms.failure import FailureKind, classify_failure, normalize_failure_kind
 from lsc.platforms.redaction import redact_text
 from lsc.platforms.registry import detect_platform, parse_stream, select_quality
+from lsc.platforms.stream_expiry import (
+    is_stream_url_expiring,
+    should_proactively_refresh_stream,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -146,39 +156,37 @@ def _offline_stream_error_message(raw: str = "") -> str:
     return "直播间已下播或未开播，录制已停止"
 
 
-def _is_stream_url_expiring(url: str, threshold_sec: int = _STREAM_URL_REFRESH_THRESHOLD_SEC) -> bool:
-    """检查流 URL 是否即将过期。
-
-    平台 CDN URL 包含过期时间戳参数：
-    - 抖音: expire=<hex_timestamp> 或 wsTime=<hex_timestamp>
-    - B站: expires=<decimal_timestamp>
-    - 虎牙: wsTime=<hex_timestamp>
-    """
-    if not url:
+def _is_offline_stream_info(info: StreamInfo | None, message: str = "") -> bool:
+    """解析失败 / 风控 / 不支持 不得当成主播下播（否则会永久停录）。"""
+    if info is None:
+        return _is_stream_offline_error(message)
+    code = str(getattr(info, "error_code", "") or "")
+    if code == ERROR_OFFLINE:
+        return True
+    if code in {ERROR_PARSE_FAILED, ERROR_RESTRICTED, ERROR_UNSUPPORTED_URL}:
         return False
-    try:
-        from urllib.parse import parse_qs
-        from urllib.parse import urlparse as _urlparse
-        params = parse_qs(_urlparse(url).query)
-        now = time.time()
-        # 启发式：遍历所有 query 参数值，识别"像时间戳"的整数（十进制或 hex，
-        # 值接近当前时间 ±48h），覆盖任意平台的任意过期参数名，避免平台新增
-        # URL 参数（斗鱼 time、快手/小红书签名等）时效检测静默失效。
-        # B站 expires 是十进制；虎牙/抖音 wsTime/expire、斗鱼 time 是 hex。
-        for vals in params.values():
-            for raw in vals:
-                if not raw:
-                    continue
-                for _base in (16, 10):
-                    try:
-                        _ts = int(raw, _base)
-                    except (ValueError, OverflowError):
-                        continue
-                    if _ts > 0 and abs(_ts - now) < 48 * 3600 and now > _ts - threshold_sec:
-                        return True
-    except Exception as exc:
-        _log.debug("操作异常（已忽略）: %s", exc)
-    return False
+    text = message or str(getattr(info, "error", "") or "")
+    if _is_stream_offline_error(text):
+        return True
+    return not bool(info.is_live) and not bool(info.stream_url)
+
+
+def _is_stream_url_expiring(url: str, threshold_sec: int = _STREAM_URL_REFRESH_THRESHOLD_SEC) -> bool:
+    """检查流 URL 是否即将过期（具名 expire/expires/wsTime，且仍在未来窗口内）。"""
+    return is_stream_url_expiring(url, threshold_sec=threshold_sec)
+
+
+def _should_proactively_refresh_stream(
+    url: str,
+    parsed_at: float = 0.0,
+    threshold_sec: int = _STREAM_URL_REFRESH_THRESHOLD_SEC,
+) -> bool:
+    """心跳是否应为主动过期刷新而重启录制。刚解析出的短 TTL 地址不得立刻再拆。"""
+    return should_proactively_refresh_stream(
+        url,
+        parsed_at,
+        threshold_sec=threshold_sec,
+    )
 
 
 def _get_room_stream_url(room: RoomSession) -> str:
@@ -883,17 +891,21 @@ class RoomOrchestrator:
                 }
             is_recording = bool(room.is_recording)
             last_error = str(room.last_error or "")
-            # 共享录制使用独立 FFmpeg sink。它退出后必须立刻反映到状态，不能只
-            # 依赖 RoomSession 的旧布尔值，否则界面会继续显示“录制中”。
-            try:
-                shared_ingest = get_shared_ingest_registry().get(room_id)
-            except Exception:
-                shared_ingest = None
-            if shared_ingest is not None and not bool(getattr(shared_ingest, "recording_active", False)):
-                is_recording = False
-                shared_error = str(getattr(shared_ingest, "recording_error", "") or "")
-                if shared_error:
-                    last_error = shared_error
+            # 主动刷新/恢复期间进样会短暂停止，但仍视为录制中，避免持续分析被拒。
+            if room.is_reconnecting:
+                is_recording = True
+            else:
+                # 共享录制使用独立 FFmpeg sink。它退出后必须立刻反映到状态，不能只
+                # 依赖 RoomSession 的旧布尔值，否则界面会继续显示“录制中”。
+                try:
+                    shared_ingest = get_shared_ingest_registry().get(room_id)
+                except Exception:
+                    shared_ingest = None
+                if shared_ingest is not None and not bool(getattr(shared_ingest, "recording_active", False)):
+                    is_recording = False
+                    shared_error = str(getattr(shared_ingest, "recording_error", "") or "")
+                    if shared_error:
+                        last_error = shared_error
             return {
                 "exists": True,
                 "is_recording": is_recording,
@@ -1980,7 +1992,7 @@ class RoomOrchestrator:
 
         if not info.is_live or not info.stream_url:
             message = info.error or ""
-            if not info.is_live or _is_stream_offline_error(message):
+            if _is_offline_stream_info(info, message):
                 room.set_error(_offline_stream_error_message(message))
             else:
                 room.set_error(message or "刷新直播流失败")
@@ -3678,7 +3690,8 @@ class RoomOrchestrator:
                         controller.stop_recording()
                     except Exception as exc:
                         _log.warning("Proactive reconnect stop failed room=%s: %s", room.room_id, exc)
-            room.is_recording = False
+            # 保持 is_recording=True：停止进样到新进程起来之间持续分析仍视为在录。
+            # 启动失败由 start_recording / 常规重连回落再清标志。
             ok = self.start_recording(
                 room.room_id,
                 room.reconnect_output_dir,
@@ -3946,7 +3959,9 @@ class RoomOrchestrator:
                         stream_url = ""
                         if room.stream_info and room.stream_info.stream_url:
                             stream_url = room.stream_info.stream_url
-                        if stream_url and _is_stream_url_expiring(stream_url):
+                        if stream_url and _should_proactively_refresh_stream(
+                            stream_url, room.stream_parsed_at
+                        ):
                             _log.info("Room %s stream URL expiring soon (shared ingest), proactive reconnect", room.room_id)
                             room.is_reconnecting = True
                             room._cancel_reconnect.clear()
@@ -3998,7 +4013,10 @@ class RoomOrchestrator:
                         if os.path.exists(room.record_output_path):
                             file_size = os.path.getsize(room.record_output_path)
                             if file_size > 10240:
-                                media_start = _time.monotonic() - 2.5
+                                # 不要用固定的 2.5s 猜测覆盖已捕获到的首帧时刻。
+                                # recording_start_mono 在 capture.start 的首帧探测返回后设置，
+                                # 比“now - 2.5”更接近真实媒体起点；不同网络/编码耗时可能偏差数秒。
+                                media_start = room.recording_start_mono or (_time.monotonic() - 2.5)
                                 room.recording_start_mono = media_start
                                 room.recording_media_start_mono = media_start
                                 room._first_frame_corrected = True
@@ -4082,7 +4100,9 @@ class RoomOrchestrator:
                     stream_url = ""
                     if room.stream_info and room.stream_info.stream_url:
                         stream_url = room.stream_info.stream_url
-                    if stream_url and _is_stream_url_expiring(stream_url):
+                    if stream_url and _should_proactively_refresh_stream(
+                        stream_url, room.stream_parsed_at
+                    ):
                         _log.info("Room %s stream URL expiring soon, proactive reconnect", room.room_id)
                         room.is_reconnecting = True
                         room._cancel_reconnect.clear()

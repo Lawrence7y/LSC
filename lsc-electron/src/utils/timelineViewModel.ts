@@ -145,11 +145,14 @@ export function computeTimelineViewModel(input: TimelineViewInput): TimelineView
   const refineClip = refiningClipId
     ? clips.find(c => c.round_key === refiningClipId || c.clip_id === refiningClipId)
     : null
-  let refineStart = commonMarkIn
-  let refineEnd = commonMarkOut
-  if ((refineStart == null || refineEnd == null) && refineClip) {
-    refineStart = refineClip.common_start ?? refineClip.start
-    refineEnd = refineClip.common_end ?? refineClip.end
+  // 普通手动选区只是待添加的切片，不是精修窗口。此前直接用 commonMark
+  // 生成 refining，导致用户按 I/O 后 1x 时间线被自动缩到选区附近，左端
+  // 不再是 0。只有真正进入某个切片精修时，才允许窗口聚焦到该切片。
+  let refineStart: number | null = null
+  let refineEnd: number | null = null
+  if (refineClip) {
+    refineStart = commonMarkIn ?? refineClip.common_start ?? refineClip.start
+    refineEnd = commonMarkOut ?? refineClip.common_end ?? refineClip.end
   }
   if (refineEnd != null && refineEnd > axisProgress) axisProgress = refineEnd
   if (refineStart != null && refineStart > axisProgress) axisProgress = refineStart

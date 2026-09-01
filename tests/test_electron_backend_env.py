@@ -38,3 +38,23 @@ def test_csp_allows_blob_audio_worklet() -> None:
     assert "worker-src 'self' blob:" in source
     assert "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:" in source
     assert "script-src 'self' file: blob:" in source
+
+
+def test_electron_hides_default_application_menu() -> None:
+    """Windows 默认 File/Edit/Window 菜单对切片工具无用，必须去掉以免占标题栏。"""
+    source = (ROOT / "lsc-electron/electron/main.ts").read_text(encoding="utf-8")
+    assert "Menu.setApplicationMenu(null)" in source
+    window_opts = source.split("mainWindow = new BrowserWindow({", 1)[1].split("});", 1)[0]
+    assert "autoHideMenuBar: true" in window_opts
+
+
+def test_electron_drops_high_frequency_renderer_console_forwarding() -> None:
+    """MSE/心跳等 console 不得再经 console-message 写入 debug.log。"""
+    source = (ROOT / "lsc-electron/electron/main.ts").read_text(encoding="utf-8")
+    handler = source.split("webContents.on('console-message'", 1)[1].split(
+        "webContents.on('did-fail-load'", 1
+    )[0]
+    assert "shouldSkipRendererConsole" in handler
+    skip_fn = source.split("function shouldSkipRendererConsole", 1)[1].split("\nfunction ", 1)[0]
+    for needle in ("[MsePlayer]", "heartbeat", "rooms_updated", "mse_segment"):
+        assert needle in skip_fn

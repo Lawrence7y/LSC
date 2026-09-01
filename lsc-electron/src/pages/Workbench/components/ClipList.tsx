@@ -75,6 +75,16 @@ function needsAttention(clip: ClipSegment): boolean {
   return needsConfirm(clip) || needsOcrReview(clip)
 }
 
+function getActualRecordingRange(clip: ClipSegment): { start: number; end: number } | null {
+  const start = clip.recording_start_sec
+  const end = clip.recording_end_sec
+  if (typeof start !== 'number' || !Number.isFinite(start)
+    || typeof end !== 'number' || !Number.isFinite(end) || end <= start) {
+    return null
+  }
+  return { start, end }
+}
+
 function canExportClip(clip: ClipSegment): boolean {
   const confirmed = !clip.confirm_status ||
     clip.confirm_status === 'user_confirmed' ||
@@ -176,6 +186,11 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         !clip.clip_snapshot_id &&
         (clip.mark_in_wallclock == null || clip.mark_out_wallclock == null))
     const isAI = clip.confirm_status === 'ocr_confirmed' || clip.confirm_status === 'vision_confirmed'
+    const actualRange = getActualRecordingRange(clip)
+    const shownStart = actualRange?.start ?? clip.start
+    const shownEnd = actualRange?.end ?? clip.end
+    const shownDuration = Math.max(0, shownEnd - shownStart)
+    const timeAxisLabel = actualRange ? '录制轴（实际导出）' : '预览轴（导出范围待确认）'
     const hoverTitle = formatClipHoverTitle(clip.label || t('切片'), {
       roomName: clip.room_name,
       start: clip.start,
@@ -184,6 +199,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
     })
       + (isApprox ? ` · ${t('近似定位')}` : '')
       + (clip.boundary_evidence?.length ? `\n${clip.boundary_evidence.join(' · ')}` : '')
+      + `\n${timeAxisLabel}：${formatTime(shownStart)}→${formatTime(shownEnd)}`
       + (clip.export_status === 'failed' && clip.export_error ? `\n${clip.export_error}` : '')
 
     return (
@@ -248,7 +264,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                 </span>
             ) : (
               <span className="clip-row-v2__time">
-                {formatTime(clip.start)}<i className="sep-dot">→</i>{formatTime(clip.end)}<i className="sep-dot">·</i><span className="dur">{formatDuration(clip.end - clip.start)}</span>
+                <span className="clip-row-v2__axis">{actualRange ? '录制' : '预览'}</span>{formatTime(shownStart)}<i className="sep-dot">→</i>{formatTime(shownEnd)}<i className="sep-dot">·</i><span className="dur">{formatDuration(shownDuration)}</span>
               </span>
             )}
             {clip.boundary_evidence?.length ? (

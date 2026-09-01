@@ -960,8 +960,12 @@ async def _start_recording_file_mse(
     *,
     offline_message: str = "",
     stop_recording_if_active: bool = True,
+    start_offset_sec: float = 0.0,
 ) -> tuple[bool, str]:
-    """下播确认后切换为录制文件 MSE 回看。返回 (success, error_message)。"""
+    """切换为录制文件 MSE 回看。返回 (success, error_message)。
+
+    start_offset_sec > 0 时从录制文件指定秒数开始回看（按需 seek）。
+    """
     if room_id in _offline_file_review_in_progress:
         return False, "offline file review already in progress"
     _offline_file_review_in_progress.add(room_id)
@@ -1105,6 +1109,7 @@ async def _start_recording_file_mse(
                     fps=fps,
                     video_bitrate=video_bitrate,  # type: ignore[arg-type]
                     crf_value=crf_value,  # type: ignore[arg-type]
+                    start_offset_sec=start_offset_sec,
                     on_init_segment=lambda seg, _room_id=room_id: _push_mse_segment(  # type: ignore[misc]
                         srv, loop, 'mse_init', _room_id, seg
                     ),
@@ -1922,6 +1927,21 @@ def _merge_round_windows(
                 replaced_confirmed = True
                 break
             if new_hybrid or not old_hybrid:
+                # 保护已有完整 OCR 入点：后一截断窗口（如从 219s 开始扫描）的晚入点（217s）
+                # 绝不能覆盖已有 OCR 回合更早且更完整的合法入点（200s）。
+                if old_hybrid and old_start < new_start - 3.0 and old_end - old_start >= 10.0:
+                    new_item["start"] = old_start
+                    if old.get("start_by"):
+                        new_item["start_by"] = old["start_by"]
+                # 保护已有出点：如果旧出点已是真准备阶段确认，新出点是降级 open_tail，保留旧出点
+                if (
+                    old.get("end_by") == "next_prep"
+                    and new_item.get("end_by") in ("open_tail", "next_combat")
+                    and old_end > new_item.get("start", 0.0) + 10.0
+                ):
+                    new_item["end"] = old_end
+                    new_item["end_by"] = old["end_by"]
+                    new_item["confirm_status"] = old.get("confirm_status", new_item.get("confirm_status"))
                 key = str(old.get("round_key") or "")
                 if key:
                     superseded_old_keys.add(key)
@@ -1951,7 +1971,7 @@ def _merge_round_windows(
     )
     for item in merged:
         item.setdefault("round_key", _valorant_round_key(item))
-    # 轻微重叠：邻接对齐，禁止直接丢后段（丢回合）
+    # 相邻微重叠修整：优先截断前段出点至后段入点，绝不推后后段入点（防止吃掉后段交战）
     cleaned: list[dict[str, Any]] = []
     for item in merged:
         start, end = _span(item)
@@ -1960,15 +1980,12 @@ def _merge_round_windows(
         if cleaned:
             prev_start, prev_end = _span(cleaned[-1])
             if start < prev_end:
-                # 后段整体被前段覆盖 → 保留前段（通常是更早确认的 OCR）
                 if end <= prev_end + overlap_tol:
                     continue
-                # 轻微重叠：把后段起点推到前段终点
-                start = prev_end
-                if end - start < 5.0:
-                    continue
-                item = dict(item)
-                item["start"] = round(start, 3)
+                # 前段出点越过了后段入点：截断前段出点至后段入点
+                cleaned[-1]["end"] = round(start, 3)
+                if float(cleaned[-1]["end"]) - float(cleaned[-1]["start"]) < 5.0:
+                    cleaned.pop()
         cleaned.append(dict(item))
     return cleaned
 
@@ -4356,6 +4373,29 @@ def register_room_handlers(server, bridge):
 
         success = await asyncio.get_running_loop().run_in_executor(_bridge_executor, lambda: bridge.manager.call(_seek))
         return {'success': bool(success)}
+
+    @server.on('start_recording_review')
+    async def handle_start_recording_review(data):
+        """手动切换到录制文件回看，并从指定秒数开始播放。
+
+        时间线拖到直播 MSE 缓冲之外时，前端调用此接口把该房间预览切到
+        本地录制文件（recording_review），从而能回放更早的片段。
+        """
+        room_id = data.get('room_id')
+        time_pos = _safe_float(data.get('time', 0))
+        if not room_id:
+            return {'error': 'room_id is required'}
+        _log.info("录制文件回看: room_id=%s, start=%.2fs", room_id, time_pos)
+        success, err = await _start_recording_file_mse(
+            server,
+            manager,
+            bridge,
+            room_id,
+            asyncio.get_running_loop(),
+            stop_recording_if_active=False,
+            start_offset_sec=max(0.0, time_pos),
+        )
+        return {'success': success, 'error': err or ''}
 
     @server.on('set_mark_in')
     async def handle_set_mark_in(data):
@@ -7058,7 +7098,7 @@ def register_room_handlers(server, bridge):
                             and not _finalizing
                             and not task_state.get('cancelled')
                             and not task_state.get('scan_abort')
-                            and _lag_now <= 25.0
+                            and _lag_now <= 45.0
                         ):
                             _refine_vp = video_path
                             _refine_rounds = [dict(r) for r in (result or [])]
@@ -7148,7 +7188,7 @@ def register_room_handlers(server, bridge):
                                 _boundary_refine_bg(),
                                 name=f"boundary-refine-{room_id[:8]}",
                             )
-                        elif _need_refine and _lag_now > 25.0:
+                        elif _need_refine and _lag_now > 45.0:
                             _log.info(
                                 "持续分析跳过密扫（优先追赶）: room_id=%s, lag=%.0fs",
                                 room_id,
@@ -8042,8 +8082,21 @@ def register_room_handlers(server, bridge):
                             )
                         # 停录收尾：从游标继续处理尾部（保留重叠），禁止默认全文件重扫
                         if _finalize_started or _finalize_pending:
+                            # 锚定收尾扫描起点：优先从最后一个已确认闭合回合的 end 处向后扫描，
+                            # 若有未闭合回合（open_tail/pending），则从该回合的 start 处扫描，
+                            # 避免无脑减去 120s 倒退到已确认回合的中间部分，产生时间倒流和截断。
+                            _fin_start = max(0.0, float(last_analyzed) - _OCR_FINALIZE_OVERLAP_SEC)
+                            if all_highlights:
+                                _last_h = all_highlights[-1]
+                                _last_end = float(_last_h.get("end", 0.0) or 0.0)
+                                _last_start = float(_last_h.get("start", 0.0) or 0.0)
+                                if _last_h.get("end_by") == "next_prep":
+                                    _fin_start = max(_fin_start, max(0.0, _last_end - 5.0))
+                                elif _last_start > 0:
+                                    _fin_start = max(0.0, _last_start - 5.0)
+
                             scan_range = (
-                                max(0.0, float(last_analyzed) - _OCR_FINALIZE_OVERLAP_SEC),
+                                _fin_start,
                                 float(current_dur),
                             )
                             use_ocr_this_tick = True
@@ -8052,15 +8105,18 @@ def register_room_handlers(server, bridge):
                                 _scan_timeout,
                                 _finalize_scan_timeout(current_dur, attempt=_finalize_failures + 1),
                             )
-                            # 重置 FSM 游标，允许重叠区域的帧被重新处理；
-                            # 否则 last_processed_ts 会过滤掉回看窗口内的所有帧，
-                            # 导致收尾扫描实际只处理极少新帧，几乎不产出切片。
+                            # 重置 FSM 游标与状态：允许重叠区域帧被重新处理；
+                            # 清除旧 FSM 防止时间戳倒流产生负时间差。
                             _rs = state.get('ocr_runtime_state')
                             if _rs is not None:
-                                _rs['last_processed_ts'] = max(
-                                    0.0,
-                                    float(last_analyzed) - _OCR_FINALIZE_OVERLAP_SEC,
-                                )
+                                _rs['last_processed_ts'] = _fin_start
+                                _rs.pop('combat_anchor', None)
+                                _rs.pop('combat_cand_ts', None)
+                                _rs.pop('last_timer', None)
+                                _rs.pop('last_timer_ts', None)
+                                _rs.pop('last_raw_timer', None)
+                                _rs.pop('last_raw_ts', None)
+                                _rs.pop('ocr_fsm', None)
                         else:
                             use_ocr_this_tick, scan_range = _apply_scan_budget_degrade(
                                 state,

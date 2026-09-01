@@ -135,9 +135,11 @@ class MseStreamer:
         video_bitrate: str = "",
         crf_value: int = 0,
         is_file: bool = False,
+        start_offset_sec: float = 0.0,
     ):
         self._url = url
         self._is_file = is_file or (os.path.isfile(url) if url else False)
+        self._start_offset_sec = max(0.0, float(start_offset_sec or 0.0))
         self._on_init = on_init_segment
         self._on_segment = on_media_segment
         self._on_error = on_error
@@ -299,6 +301,10 @@ class MseStreamer:
         ]
         if self._is_file:
             cmd += ["-re"]
+            if self._start_offset_sec > 0:
+                # 录制文件回看按需 seek：保留原始 PTS（-copyts），
+                # 否则播放器 currentTime 会从 0 开始，时间线/回看定位错位。
+                cmd += ["-copyts", "-ss", f"{self._start_offset_sec:.3f}"]
         cmd += [
             "-fflags", "+genpts",
             "-thread_queue_size", "1024",

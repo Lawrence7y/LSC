@@ -166,6 +166,23 @@ function isStoreBuild(): boolean {
   return app.isPackaged && process.windowsStore === true
 }
 
+/**
+ * 是否为自包含构建：包内已内置全部 Python 依赖与 FFmpeg。
+ * Store 版必然自包含；自包含的 NSIS 版同样不应在运行时联网安装依赖
+ * （否则会被判定为“其他应用的安装器”，政策 10.2.5）。
+ * 注意：是否自包含只用于“依赖安装”相关逻辑，不影响更新来源判断（更新仍按 isStoreBuild）。
+ */
+function hasBundledRuntime(): boolean {
+  if (!app.isPackaged) return false
+  try {
+    const pkgDir = path.join(process.resourcesPath, 'python-packages')
+    const ffmpegExe = path.join(process.resourcesPath, 'ffmpeg', 'ffmpeg.exe')
+    return fs.existsSync(path.join(pkgDir, 'numpy')) && fs.existsSync(ffmpegExe)
+  } catch {
+    return false
+  }
+}
+
 interface AppSettings {
   autoLaunch: boolean
   minimizeToTray: boolean
@@ -1049,6 +1066,27 @@ function createTray(): void {
 
 // ===== 窗口 =====
 
+function shouldSkipRendererConsole(message: string): boolean {
+  if (!message) return true
+  if (message.includes('[MsePlayer]')) return true
+  if (message.includes('[Workbench] 直播按钮诊断')) return true
+  const noisy = [
+    'heartbeat',
+    'rooms_updated',
+    'room_updated',
+    'system_stats',
+    'mse_segment',
+    'mse_init',
+    'preview_phase',
+    'continuous_analysis_status',
+    'export_progress',
+  ]
+  if (message.includes('[WebSocket]')) {
+    return noisy.some((type) => message.includes(type))
+  }
+  return false
+}
+
 function _readJianyingDraftDirFromSettings(): string | null {
   try {
     const backendDir = getBackendDir()
@@ -1513,6 +1551,7 @@ function createWindow() {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     backgroundColor: '#0f1018',
     show: false,
+    autoHideMenuBar: true,
   });
 
   // S-1: Content-Security-Policy — 限制脚本/样式/连接来源，防止 XSS 加载外部资源
@@ -1558,6 +1597,7 @@ function createWindow() {
   // 始终注册渲染进程日志转发和生命周期日志
   mainWindow.webContents.on('console-message', (_event, level, message) => {
     if (message.includes('Electron Security Warning')) return
+    if (shouldSkipRendererConsole(message)) return
     const levelMap: Record<number, 'INFO' | 'WARN' | 'ERROR'> = {
       0: 'INFO',
       1: 'INFO',
@@ -1672,6 +1712,12 @@ let isQuitting = false
       return { success: true, data: result }
     })
 
+    // Store / 自包含包：禁止运行时安装/下载依赖（政策 10.2.5）。
+    // 不再注册 install/cancel 相关 IPC，避免被判定为“其他应用的安装器”。
+    if (app.isPackaged && hasBundledRuntime()) {
+      return
+    }
+
     // 前端触发依赖安装
     ipcMain.handle('install-dependencies', async (_event, options?: { includeAi?: boolean }) => {
       // Store 版禁止运行时安装/下载依赖（政策 10.2.5）。
@@ -1712,17 +1758,17 @@ let isQuitting = false
    * 如果依赖已就绪则直接启动后端。
    */
   async function ensureDependenciesThenStartBackend(): Promise<void> {
-    // Microsoft Store / MSIX 版本：所有运行依赖必须已在包内。
+    // Microsoft Store / 自包含（MSIX 或内置依赖版）构建：所有运行依赖必须在包内。
     // 这里不调用 checkDependencies / installDependencies，也不会显示
     // “下载依赖”安装界面，完全符合 10.2.5 的要求。
-    if (isStoreBuild()) {
+    if (app.isPackaged && hasBundledRuntime()) {
       if (hasValidDependencyMarker() || hasRequiredRuntimeFiles()) {
-        appLog('INFO', 'App', 'Store 内置依赖已就绪，直接启动后端')
+        appLog('INFO', 'App', '内置依赖已就绪，直接启动后端')
         writeDependencyMarker()
         updateStartupDependencyState({ phase: 'ready' })
         spawnBackend()
       } else {
-        const msg = 'This Store build is missing bundled runtime components. Please reinstall the app from Microsoft Store.'
+        const msg = 'This build is missing bundled runtime components. Please reinstall the app from Microsoft Store.'
         pythonDetectError = msg
         appLog('ERROR', 'App', msg)
         updateStartupDependencyState({ phase: 'error', error: msg })
@@ -1800,6 +1846,9 @@ let isQuitting = false
     if (process.platform === 'win32') {
       app.setAppUserModelId('com.lsc.app')
     }
+
+    // 切片工作台不需要 Electron 默认 File/Edit/Window 菜单
+    Menu.setApplicationMenu(null)
 
     // 注册应用设置 IPC（只注册一次）
     registerAppSettingsIpc()

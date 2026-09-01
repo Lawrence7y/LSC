@@ -1246,3 +1246,36 @@ def test_continuous_valorant_listing_is_list_only() -> None:
     assert "list_only=False" not in listing_block
     # 入列不得触发即时导出（queue_export 由用户手动确认后执行）
     assert "defer_export=False" not in listing_block
+
+
+def test_merge_round_windows_protects_existing_ocr_start_from_truncated_window() -> None:
+    """实测复现防退化测试：已有完整 OCR 回合入点 200.4s，后续截断窗口产出晚入点 217.2s 时，
+    合并算法必须保护 200.4s，禁止被截断窗口篡改吃掉前半段。"""
+    existing = [
+        {
+            "start": 200.4,
+            "end": 301.5,
+            "round_key": "round-000019",
+            "boundary_source": "valorant_ocr_v1",
+            "confirm_status": "vision_confirmed",
+            "end_by": "next_prep",
+            "start_by": "ocr_combat",
+        }
+    ]
+    # 模拟新窗口从 219s 开始扫描产出的截断半截回合
+    truncated_window = [
+        {
+            "start": 217.2,
+            "end": 301.4,
+            "round_key": "round-000019",
+            "boundary_source": "valorant_ocr_v1",
+            "confirm_status": "vision_confirmed",
+            "end_by": "next_prep",
+            "start_by": "ocr_combat",
+        }
+    ]
+    merged = room_handler._merge_round_windows(existing, truncated_window)
+    assert len(merged) == 1
+    assert merged[0]["start"] == 200.4  # 必须保护早先已确认的完整起点，不能被篡改为 217.2
+    assert merged[0]["round_key"] == "round-000019"
+

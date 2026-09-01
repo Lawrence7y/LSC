@@ -91,6 +91,7 @@ def test_ffmpeg_demux_io_error_is_connection_reset():
 
 def test_dns_failure():
     assert classify_failure("getaddrinfo: Name or service not known") == FailureKind.DNS_FAILURE
+    assert classify_failure("getaddrinfo failed") == FailureKind.DNS_FAILURE
 
 
 def test_unsupported_codec():

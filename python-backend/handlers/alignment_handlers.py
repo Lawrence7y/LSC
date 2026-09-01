@@ -28,6 +28,21 @@ _MAX_ALIGN_SAMPLE_RATE = 48_000
 _MAX_ALIGN_DURATION_SEC = 15
 
 
+def _epoch_ms_to_mono(epoch_ms: float) -> float:
+    """将前端 Date.now() 捕获结束时刻（ms）转换为后端 time.monotonic()。
+
+    前端各房 captureAudio 的实际结束时刻不同；若都用后端收到请求的
+    align_received_mono 作锚点，先结束的房间会被人为推迟数秒，导致
+    预览轴与录制/导出轴错位（现场可到 6-7 秒）。这里通过同一台机器的
+    time.time() 与 time.monotonic() 换算，恢复每路各自的捕获结束单调时刻。
+    """
+    if not epoch_ms or epoch_ms <= 0:
+        return 0.0
+    now_epoch = time.time()
+    now_mono = time.monotonic()
+    return now_mono - (now_epoch - float(epoch_ms) / 1000.0)
+
+
 def register_alignment_handlers(
     server,
     *,
@@ -102,6 +117,7 @@ def register_alignment_handlers(
             audio_map: dict[str, np.ndarray] = {}
             align_sample_rate: int | None = None
             preview_cur_time: dict[str, float] = {}
+            preview_capture_mono: dict[str, float] = {}
             for rd in rooms_data:
                 room_id = rd.get('room_id', '')
                 sample_rate = int(rd.get('sample_rate', 16000))
@@ -125,8 +141,17 @@ def register_alignment_handlers(
                     _pct = float(diagnostics.get('current_time'))
                 except (TypeError, ValueError):
                     _pct = 0.0
+                _capture_end_ms = 0.0
+                try:
+                    _capture_end_ms = float(diagnostics.get('capture_end_epoch_ms'))
+                except (TypeError, ValueError):
+                    pass
                 if room_id and _pct > 0.0:
                     preview_cur_time[room_id] = _pct
+                if room_id and _capture_end_ms > 0.0:
+                    _capture_mono = _epoch_ms_to_mono(_capture_end_ms)
+                    if _capture_mono > 0.0:
+                        preview_capture_mono[room_id] = _capture_mono
                 if not room_id or not pcm_b64:
                     _align_log.warning("预览音频对齐跳过: room_id=%s, 缺少数据", room_id)
                     continue
@@ -300,6 +325,7 @@ def register_alignment_handlers(
                         'recording_id': getattr(room, 'recording_id', '') or '',
                         'media_start_mono': float(media_start or 0.0),
                         'preview_current_time': preview_cur_time.get(rid, 0.0),
+                        'preview_capture_mono': preview_capture_mono.get(rid, 0.0),
                     }
 
                 snapshots = build_room_snapshots_from_align(

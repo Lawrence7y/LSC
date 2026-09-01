@@ -58,7 +58,8 @@ def _is_private_ip(hostname: str) -> bool:
             if any(ip in network for network in networks):
                 return True
     except Exception:
-        return True
+        # DNS 失败不是内网；让后续 HTTP 以真实网络错误失败，避免伪装成 SSRF。
+        return False
     return False
 
 

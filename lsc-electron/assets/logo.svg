@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <pattern id="clapStripes" width="30" height="30" patternUnits="userSpaceOnUse" patternTransform="rotate(-9)">
+      <rect width="30" height="30" fill="#00D4FF"/>
+      <rect width="15" height="30" fill="#16233F"/>
+    </pattern>
+  </defs>
+  <g>
+    <path d="M46 98 L208 90 L216 66 L54 74 Z" fill="url(#clapStripes)"/>
+    <path d="M46 98 L208 90 L216 66 L54 74 Z" fill="none" stroke="#00D4FF" stroke-width="7" stroke-linejoin="round"/>
+  </g>
+  <rect x="40" y="96" width="176" height="112" rx="18" fill="none" stroke="#00D4FF" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M112 124 L112 184 L156 154 Z" fill="#00D4FF" stroke="#00D4FF" stroke-width="6" stroke-linejoin="round"/>
+  <g transform="translate(60,72)" stroke="#00D4FF" stroke-width="5" fill="none" stroke-linejoin="round">
+    <circle cx="0" cy="0" r="12"/>
+    <g>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5"/>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5" transform="rotate(45)"/>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5" transform="rotate(90)"/>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5" transform="rotate(135)"/>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5" transform="rotate(180)"/>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5" transform="rotate(225)"/>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5" transform="rotate(270)"/>
+      <rect x="-3" y="-20" width="6" height="7" rx="1.5" transform="rotate(315)"/>
+    </g>
+    <circle cx="0" cy="0" r="4.5" fill="#00D4FF" stroke="none"/>
+  </g>
+</svg>

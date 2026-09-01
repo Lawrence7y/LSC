@@ -1973,7 +1973,9 @@ class SharedRoomIngest:
                     output_seen_at = now
                 elif now - output_seen_at >= _RECORDING_START_STABLE_SEC:
                     if self.recording_media_start_mono <= 0:
-                        self.recording_media_start_mono = now
+                        # 用首次观察到输出数据的时刻作为媒体起点，而不是稳定 1s 后的 now；
+                        # 后者会让所有房间的录制起点统一偏晚约 1s，导致时间线/导出轴错位。
+                        self.recording_media_start_mono = float(output_seen_at or now)
                     return True
             # Upstream EOF is recoverable while the recording sink is still
             # alive: keep the pipe open and replace the remote source so the

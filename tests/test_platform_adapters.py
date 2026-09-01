@@ -267,6 +267,10 @@ def test_douyin_adapter_wraps_existing_parser(monkeypatch):
     assert info.stream_url == "https://pull.example.com/live.m3u8"
     assert info.headers["Referer"] == "https://live.douyin.com/"
     assert info.headers["User-Agent"].startswith("Mozilla/5.0")
+    # Page fetch still uses login Cookie; signed CDN pull must not, or FFmpeg
+    # N-126342+ overflows its 8KB HTTP request buffer (overlong headers / EINVAL).
+    assert "Cookie" not in info.headers
+    assert "Origin" not in info.headers
 
 
 def test_douyin_context_parser_uses_scoped_cookie(monkeypatch):
@@ -310,8 +314,55 @@ def test_douyin_context_parser_uses_scoped_cookie(monkeypatch):
 
     assert info.is_live is True
     assert seen == [{"ttwid": "scoped", "msToken": "token"}]
-    assert info.headers["Cookie"] == "ttwid=scoped; msToken=token"
+    assert "Cookie" not in info.headers
+    assert "Origin" not in info.headers
     assert info.headers["Referer"] == "https://live.douyin.com/"
+
+
+def test_douyin_cdn_headers_omit_cookie_from_ffmpeg_input_args(monkeypatch):
+    """Regression: Douyin login Cookie must not be forwarded to FFmpeg -headers.
+
+    BtbN FFmpeg N-126342 (2026-08) packs the whole HTTP request into an 8KB
+    buffer. A typical 60+ cookie Douyin export overflows it with
+    ``overlong headers`` / EINVAL (Windows code 4294967274).
+    """
+    from lsc.platforms.douyin import DouyinAdapter
+
+    bulky = {f"c{i}": "v" * 40 for i in range(70)}
+    bulky["bd_ticket_guard_client_data"] = "B" * 3000
+
+    class FakeDouyinModule:
+        @staticmethod
+        def fetch_page(url, cookies=None):
+            assert "bd_ticket_guard_client_data" in (cookies or {})
+            return "<html>fake</html>", None
+
+        @staticmethod
+        def extract_ssr_data(html):
+            return {
+                "isLive": True,
+                "title": "抖音直播",
+                "streamerName": "主播",
+                "streamUrl": "http://pull-flv-f13.douyinliving.com/thirdgame/stream-1.flv",
+                "qualityUrls": {
+                    "origin": "http://pull-flv-f13.douyinliving.com/thirdgame/stream-1.flv",
+                },
+            }
+
+    adapter = DouyinAdapter()
+    monkeypatch.setattr(adapter, "_load_script_module", lambda: FakeDouyinModule)
+    monkeypatch.setattr(adapter, "_get_douyin_cookies", lambda: bulky)
+
+    info = adapter.parse("https://live.douyin.com/6096197105")
+    legacy = info.to_legacy_dict()
+    header_blob = ""
+    if "-headers" in legacy["_inputArgs"]:
+        header_blob = legacy["_inputArgs"][legacy["_inputArgs"].index("-headers") + 1]
+
+    assert info.is_live is True
+    assert "Cookie" not in info.headers
+    assert "cookie:" not in header_blob.lower()
+    assert "bd_ticket_guard" not in header_blob.lower()
 
 
 def test_douyin_context_parser_scopes_proxy_and_timeout(monkeypatch):

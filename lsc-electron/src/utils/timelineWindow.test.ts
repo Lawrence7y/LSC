@@ -54,10 +54,10 @@ describe('computeTimelineWindow', () => {
     expect(r.visibleSpan).toBe(1200)
   })
 
-  it('refine window overrides zoom/live', () => {
+  it('refine window overrides zoom>1', () => {
     const r = computeTimelineWindow({
       contentEnd: 2400,
-      zoomLevel: 1,
+      zoomLevel: 2,
       followLive: true,
       scrubbing: false,
       frozenWindowStart: null,
@@ -67,6 +67,22 @@ describe('computeTimelineWindow', () => {
     })
     expect(r.windowStart).toBeGreaterThan(0)
     expect(r.windowStart).toBeLessThan(100)
+  })
+
+  it('1x always starts at 0 even when scrubbing/not followLive/refining', () => {
+    const r = computeTimelineWindow({
+      contentEnd: 2400,
+      zoomLevel: 1,
+      followLive: false,
+      scrubbing: true,
+      frozenWindowStart: 500,
+      playhead: 800,
+      prevWindowStart: 500,
+      refining: { start: 100, end: 130 },
+    })
+    expect(r.windowStart).toBe(0)
+    expect(r.duration).toBe(2400)
+    expect(r.visibleSpan).toBe(2400)
   })
 })
 

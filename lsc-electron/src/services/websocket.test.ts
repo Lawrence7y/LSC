@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { shouldQueueWhenDisconnected, WebSocketClient } from './websocket'
+import { shouldQueueWhenDisconnected, WebSocketClient, isHighFrequencyWsType } from './websocket'
 
 class MockWebSocket {
   static readonly CONNECTING = 0
@@ -53,6 +53,13 @@ describe('websocket service', () => {
 
     it('should return true for idempotent read operations', () => {
       expect(shouldQueueWhenDisconnected('get_rooms')).toBe(true)
+    })
+
+    it('classifies heartbeat and room ticks as high-frequency', () => {
+      expect(isHighFrequencyWsType('heartbeat')).toBe(true)
+      expect(isHighFrequencyWsType('rooms_updated')).toBe(true)
+      expect(isHighFrequencyWsType('mse_segment')).toBe(true)
+      expect(isHighFrequencyWsType('start_recording')).toBe(false)
     })
   })
 

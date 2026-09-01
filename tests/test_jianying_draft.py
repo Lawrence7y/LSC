@@ -132,6 +132,34 @@ def test_resolve_common_range_single_room_identity_fallback():
     assert resolve_common_range({}, None) is None
 
 
+def test_resolve_common_range_prefers_actual_recording_range_without_ctx():
+    """手动切片的预览轴时间不能覆盖已确认的录制轴实际范围。"""
+    clip = {
+        "start": 100.0,
+        "end": 130.0,
+        "recording_start_sec": 94.0,
+        "recording_end_sec": 124.0,
+        "room_id": "r1",
+        "mark_precision": "exact",
+    }
+    assert resolve_common_range(clip, None) == (94.0, 124.0, "exact")
+
+
+def test_resolve_common_range_legacy_wallclock_without_ctx():
+    """旧手动切片没有录制轴字段时，仍用冻结墙钟恢复剪映范围。"""
+    clip = {
+        "start": 100.0,
+        "end": 130.0,
+        "mark_in_wallclock": 1100.0,
+        "mark_out_wallclock": 1130.0,
+        "recording_media_start_mono": 1000.0,
+        "content_offset": 0.0,
+        "room_id": "r1",
+        "mark_precision": "exact",
+    }
+    assert resolve_common_range(clip, None) == (100.0, 130.0, "exact")
+
+
 import json
 import shutil
 import subprocess

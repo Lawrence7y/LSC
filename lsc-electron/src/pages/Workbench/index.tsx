@@ -220,6 +220,31 @@ function isApproximateClip(c: ClipSegment): boolean {
   )
 }
 
+function resolveManualRecordingRange(room: {
+  mark_in_wallclock?: number | null
+  mark_out_wallclock?: number | null
+  recording_media_start_mono?: number | null
+  recording_start_mono?: number | null
+  content_offset?: number
+}): { start: number; end: number } | null {
+  const markIn = room.mark_in_wallclock
+  const markOut = room.mark_out_wallclock
+  const recordingStart = room.recording_media_start_mono ?? room.recording_start_mono
+  if (
+    typeof markIn !== 'number' || !Number.isFinite(markIn)
+    || typeof markOut !== 'number' || !Number.isFinite(markOut)
+    || typeof recordingStart !== 'number' || !Number.isFinite(recordingStart)
+  ) {
+    return null
+  }
+  const offset = typeof room.content_offset === 'number' && Number.isFinite(room.content_offset)
+    ? room.content_offset
+    : 0
+  const start = Math.max(0, markIn - recordingStart - offset)
+  const end = Math.max(0, markOut - recordingStart - offset)
+  return end > start ? { start, end } : null
+}
+
 function clipSnapshotJobId(clipId: string): string {
   return `clip-${clipId.slice(0, 8)}`
 }
@@ -234,19 +259,6 @@ function confirmStopRecording(modal: { confirm: (config: any) => any }, title: s
     cancelText: tModule('取消'),
     onOk,
   })
-}
-
-function formatPreviewDegradationLabel(width: number, height: number, fps?: number): string {
-  let label: string
-  if (height === 360 || height === 480 || height === 720) {
-    label = `${height}p`
-  } else if (width > 0 && height > 0) {
-    label = `${width}×${height}`
-  } else {
-    label = tModule('较低画质')
-  }
-  if (fps && fps > 0) label += `@${fps}fps`
-  return label
 }
 
 function formatCaptureFailureSummary(
@@ -301,8 +313,6 @@ export default function Workbench() {
   }, [connectionStatus])
   const clips = useAppStore((state) => state.clips)
   const continuousAnalysisStatus = useAppStore((state) => state.continuousAnalysisStatus)
-  const previewDegradationBanner = useAppStore((state) => state.previewDegradationBanner)
-  const dismissPreviewDegradationBanner = useAppStore((state) => state.dismissPreviewDegradationBanner)
   const setSelectedRoomId = useAppStore((state) => state.setSelectedRoomId)
   const addClip = useAppStore((state) => state.addClip)
   const setClips = useAppStore((state) => state.setClips)
@@ -1257,8 +1267,32 @@ export default function Workbench() {
       if (t >= bufStart && t <= bufEnd) {
         try { video.currentTime = t } catch { /* seek 可能被浏览器拒绝 */ }
       } else if (!quiet) {
-        // 非拖动回放（点击切片/标记/跳转）缓冲外：clamp 到最近可回放位置，
-        // 保证回放有响应；否则旧实现静默忽略 → "时间线回放不能用"。
+        // 非拖动回放（点击切片/标记/跳转）缓冲外：如果存在录制文件，切换到
+        // 录制文件回看（recording_review）并按目标秒数起播，而不是只回退到
+        // MSE 直播缓冲边缘（通常只有数秒到数十秒）。
+        const st = useAppStore.getState()
+        const roomState = st.rooms.find(r => r.room_id === roomId)
+        const mode = roomState?.preview_mode
+        const canReview = Boolean(roomState?.record_output_path) && mode !== 'recording_review' && mode !== 'degraded'
+        if (canReview) {
+          let recTime = t
+          const ctx = st.timelineContext
+          const status = getAlignStatus(ctx, st.timelineInvalidated)
+          if (status === 'ready' && ctx?.room_snapshots[roomId]) {
+            try {
+              const common = previewToCommon(ctx, roomId, t)
+              recTime = commonToRecording(ctx, roomId, common)
+            } catch { /* 保持 t */ }
+          } else {
+            recTime = Math.max(0, t - (roomState?.content_offset ?? 0))
+          }
+          console.info(
+            `[Workbench] seek ${t.toFixed(1)}s 超出直播缓冲 [${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}]，切换到录制文件回看 @${recTime.toFixed(1)}s`,
+          )
+          send('start_recording_review', { room_id: roomId, time: recTime })
+          return
+        }
+        // 没有可回看文件时：clamp 到最近可回放位置，保证回放有响应。
         const fallback = Math.max(bufStart, bufEnd - 0.5)
         try { video.currentTime = fallback } catch { /* ignore */ }
         console.info(
@@ -1316,12 +1350,23 @@ export default function Workbench() {
     const hasNoDvrTargets = targetsIncludeNoDvrMode(ids, roomList)
     const skippedNoDvr: string[] = []
     const dvrIds: string[] = []
+    const restoreLiveIds: string[] = []
     ids.forEach(rid => {
-      const mode = roomList.find(r => r.room_id === rid)?.preview_mode
-      if (isNoDvrPreviewMode(mode)) skippedNoDvr.push(rid)
-      else dvrIds.push(rid)
+      const room = roomList.find(r => r.room_id === rid)
+      const mode = room?.preview_mode
+      if (isNoDvrPreviewMode(mode)) {
+        // 手动从录制文件回看切回直播：如果录制仍在进行，说明这不是离线回看，
+        // 应该重新 enable_preview 恢复 live_mse，而不是简单跳过。
+        if (mode === 'recording_review' && room?.is_recording) {
+          restoreLiveIds.push(rid)
+        } else {
+          skippedNoDvr.push(rid)
+        }
+      } else {
+        dvrIds.push(rid)
+      }
     })
-    if (dvrIds.length === 0) return
+    if (dvrIds.length === 0 && restoreLiveIds.length === 0) return
     if (hasNoDvrTargets && skippedNoDvr.length > 0) {
       message.info(t('部分房间为回看模式，未跳转直播沿'), 3)
     }
@@ -1330,6 +1375,10 @@ export default function Workbench() {
     setTimelineFollowLive(true)
     timelineScrubbingRef.current = false
     setTimelineScrubbing(false)
+    // 手动回看且仍在录制：切回直播预览（live_mse）。
+    restoreLiveIds.forEach(rid => {
+      send('enable_preview', { room_id: rid, enabled: true, mode: 'mse' })
+    })
     const registry = window.__msePlayers
     dvrIds.forEach(rid => {
       const entry = registry?.[rid]
@@ -1352,7 +1401,7 @@ export default function Workbench() {
         video.play().catch(() => {})
       }
     })
-  }, [resolveSeekTargets])
+  }, [resolveSeekTargets, send])
 
   const handleTimelineSeek = useCallback((time: number) => {
     const targets = resolveSeekTargets()
@@ -1468,6 +1517,7 @@ export default function Workbench() {
       // 添加切片
       const roomManualCount = currentClips.filter(c => c.room_id === roomId && c.source === 'manual').length
       const newIndex = roomManualCount + 1
+      const actualRange = resolveManualRecordingRange(room)
       const newClip: ClipSegment = {
         start: room.mark_in,
         end: room.mark_out,
@@ -1478,6 +1528,8 @@ export default function Workbench() {
         mark_out_wallclock: room.mark_out_wallclock ?? null,
         recording_start_mono: room.recording_start_mono ?? null,
         recording_media_start_mono: room.recording_media_start_mono ?? null,
+        recording_start_sec: actualRange?.start ?? null,
+        recording_end_sec: actualRange?.end ?? null,
         content_offset: room.content_offset ?? 0,
         mark_precision:
           room.mark_in_wallclock != null &&
@@ -1700,7 +1752,19 @@ export default function Workbench() {
           common_end: commonMarkOut,
           target_room_ids: targetIds,
           source: 'manual',
-        }) as { success?: boolean; clips?: Array<{ clip_id: string; room_id: string; common_start: number; common_end: number }>; error?: string; failed_room?: string }
+        }) as {
+          success?: boolean
+          clips?: Array<{
+            clip_id: string
+            room_id: string
+            common_start: number
+            common_end: number
+            recording_start_sec?: number | null
+            recording_end_sec?: number | null
+          }>
+          error?: string
+          failed_room?: string
+        }
         if (!res?.success || !res.clips?.length) {
           message.error(res?.error === 'RANGE_UNAVAILABLE'
             ? t('时间范围不可用: {room}', { room: res.failed_room ?? '' })
@@ -1716,6 +1780,8 @@ export default function Workbench() {
             end: c.common_end,
             common_start: c.common_start,
             common_end: c.common_end,
+            recording_start_sec: c.recording_start_sec ?? null,
+            recording_end_sec: c.recording_end_sec ?? null,
             label: formatManualClipLabel(room?.streamer_name ?? c.room_id, roomManualCount + i + 1),
             room_id: c.room_id,
             clip_id: c.clip_id,
@@ -1992,12 +2058,17 @@ export default function Workbench() {
           return null
         }
         const buffered = video.buffered
+        // 记录“读取 currentTime 的同一时刻”作为该路音频捕获结束的墙钟时间。
+        // 后端用它换成本机 monotonic，避免把不同时刻结束的捕获统一锚到请求接收时刻。
+        const currentTime = video.currentTime
+        const captureEndEpochMs = Date.now()
         return {
           room_id: rid,
           sample_rate: 16000,
           pcm_base64: aligner.base64Encode(pcm),
           diagnostics: {
-            current_time: video.currentTime,
+            current_time: currentTime,
+            capture_end_epoch_ms: captureEndEpochMs,
             buffer_start: buffered.length ? buffered.start(0) : null,
             buffer_end: buffered.length ? buffered.end(buffered.length - 1) : null,
             ingest_mode: entry?.ingestMode || 'unknown',
@@ -2015,6 +2086,7 @@ export default function Workbench() {
         pcm_base64: string
         diagnostics: {
           current_time: number
+          capture_end_epoch_ms: number
           buffer_start: number | null
           buffer_end: number | null
           ingest_mode: string
@@ -2532,6 +2604,9 @@ export default function Workbench() {
       ...clip,
       start,
       end,
+      ...(clip.is_ai_highlight
+        ? { recording_start_sec: start, recording_end_sec: end }
+        : {}),
       confirm_status: 'user_confirmed',
     }
     // 乐观更新必须限定同 room_id：同 round_key 的其它房间由后端映射后再广播
@@ -2541,7 +2616,17 @@ export default function Workbench() {
         (clipKey && (c.round_key === clipKey || c.clip_id === clipKey)) ||
         (c.clip_id && c.clip_id === clip.clip_id) ||
         (c.start === clip.start && c.end === clip.end)
-      return same ? { ...c, start, end, confirm_status: 'user_confirmed' as const } : c
+      return same
+        ? {
+          ...c,
+          start,
+          end,
+          ...(clip.is_ai_highlight
+            ? { recording_start_sec: start, recording_end_sec: end }
+            : {}),
+          confirm_status: 'user_confirmed' as const,
+        }
+        : c
     }))
     return confirmed
   }
@@ -2582,6 +2667,11 @@ export default function Workbench() {
           common_end: c.common_end,
           mark_in_wallclock: c.mark_in_wallclock,
           mark_out_wallclock: c.mark_out_wallclock,
+          recording_start_mono: c.recording_start_mono,
+          recording_media_start_mono: c.recording_media_start_mono,
+          content_offset: c.content_offset,
+          recording_start_sec: c.recording_start_sec,
+          recording_end_sec: c.recording_end_sec,
           mark_precision: c.mark_precision,
           confirm_status: c.confirm_status,
         })),
@@ -2763,16 +2853,37 @@ export default function Workbench() {
             content_offset: clip.content_offset,
             use_room_marks: false,
             },
-          ) as { success?: boolean; job_id?: string; error?: string }
+          ) as {
+            success?: boolean
+            job_id?: string
+            error?: string
+            export_start?: number
+            export_end?: number
+          }
           if (!response?.success) {
             throw new Error(response?.error || t('后端未接受导出任务'))
           }
           const acceptedJobId = response.job_id || snapshotJobId
+          const actualStart = typeof response.export_start === 'number' && Number.isFinite(response.export_start)
+            ? response.export_start
+            : null
+          const actualEnd = typeof response.export_end === 'number' && Number.isFinite(response.export_end)
+            ? response.export_end
+            : null
           queued += 1
           pendingExportJobIdsRef.current.add(acceptedJobId)
           store.setClips(useAppStore.getState().clips.map(c =>
             c.clip_id === clip.clip_id || (c.start === clip.start && c.end === clip.end && c.room_id === clip.room_id)
-              ? { ...c, job_id: acceptedJobId, exported: false, export_status: 'queued' as const, export_error: undefined }
+              ? {
+                ...c,
+                ...(actualStart != null && actualEnd != null && actualEnd > actualStart
+                  ? { recording_start_sec: actualStart, recording_end_sec: actualEnd }
+                  : {}),
+                job_id: acceptedJobId,
+                exported: false,
+                export_status: 'queued' as const,
+                export_error: undefined,
+              }
               : c
           ))
         } catch (error) {
@@ -3350,6 +3461,8 @@ export default function Workbench() {
                 ...c,
                 start: data.start,
                 end: data.end,
+                recording_start_sec: data.start,
+                recording_end_sec: data.end,
                 common_start: commonStart ?? c.common_start,
                 common_end: commonEnd ?? c.common_end,
                 confirm_status: data.confirm_status ?? c.confirm_status,
@@ -3374,6 +3487,8 @@ export default function Workbench() {
         st.addClip({
           start: data.start,
           end: data.end,
+          recording_start_sec: data.start,
+          recording_end_sec: data.end,
           common_start: commonStart,
           common_end: commonEnd,
           label: data.label || t('高光'),
@@ -3399,6 +3514,8 @@ export default function Workbench() {
       st.addClip({
         start: data.start,
         end: data.end,
+        recording_start_sec: data.start,
+        recording_end_sec: data.end,
         common_start: commonStart,
         common_end: commonEnd,
         label: data.label || t('高光'),
@@ -4021,23 +4138,6 @@ export default function Workbench() {
           showIcon
         />
       )}
-      {previewDegradationBanner && (
-        <Alert
-          type="info"
-          banner
-          showIcon
-          closable
-          onClose={dismissPreviewDegradationBanner}
-          message={t('多路预览已降为 {label} 以保流畅', {
-            label: formatPreviewDegradationLabel(
-              previewDegradationBanner.width,
-              previewDegradationBanner.height,
-              previewDegradationBanner.fps,
-            ),
-          })}
-          description={previewDegradationBanner.reason}
-        />
-      )}
       {/* 顶部操作栏 */}
       <div className="workbench-toolbar">
         <div className="workbench-toolbar__row">
@@ -4488,6 +4588,12 @@ export default function Workbench() {
             <div><strong>{t('入点：')}</strong>{formatTime(previewClip.start)}</div>
             <div><strong>{t('出点：')}</strong>{formatTime(previewClip.end)}</div>
             <div><strong>{t('时长：')}</strong>{formatTime(previewClip.end - previewClip.start)}</div>
+            <div>
+              <strong>实际导出（录制轴）：</strong>
+              {previewClip.recording_start_sec != null && previewClip.recording_end_sec != null
+                ? `${formatTime(previewClip.recording_start_sec)} → ${formatTime(previewClip.recording_end_sec)}`
+                : '提交后由后端计算'}
+            </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
               <strong>{t('导出预设')}</strong>
               <Select

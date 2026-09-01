@@ -236,3 +236,140 @@ def test_recording_start_auth_failure_does_not_quarantine_huya_cdn(monkeypatch, 
     assert ok is False
     assert marked == []
     assert "鉴权" in room.last_error
+
+
+def test_proactive_reconnect_keeps_recording_flag_while_restarting(monkeypatch, tmp_path) -> None:
+    """主动刷新不得先清 is_recording，否则持续分析会在空窗里报「尚未开始录制」。"""
+    from lsc.gui.multi_room.manager import MultiRoomManager
+
+    monkeypatch.setattr(
+        "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr("lsc.core.orchestrator.RoomOrchestrator.save_rooms", lambda self: 0)
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.stream_url = "https://example.com/live.m3u8"
+            self.input_args: list[str] = []
+            self.stop_calls = 0
+
+        def stop_recording(self):
+            self.stop_calls += 1
+            return True, 1.0, str(tmp_path / "old.mp4")
+
+    seen: dict[str, bool] = {}
+
+    manager = MultiRoomManager(controller_factory=FakeController)
+    room = manager.add_room("https://example.com/live.m3u8")
+    room.is_connected = True
+    room.is_recording = True
+    room.is_reconnecting = True
+    room.reconnect_output_dir = str(tmp_path)
+    room.reconnect_encoder = "Copy"
+    room.reconnect_crf = 23
+
+    def fake_start(room_id, *args, **kwargs):
+        seen["is_recording"] = bool(manager.get_room(room_id).is_recording)
+        manager.get_room(room_id).is_recording = True
+        return True
+
+    monkeypatch.setattr(manager._orch, "start_recording", fake_start)
+    manager._orch._do_proactive_reconnect(room)
+
+    assert room.controller.stop_calls == 1
+    assert seen.get("is_recording") is True
+    assert room.is_recording is True
+    assert room.is_reconnecting is False
+
+
+def test_get_recording_status_stays_true_during_reconnect(monkeypatch) -> None:
+    from lsc.core.orchestrator import RoomOrchestrator
+
+    orch = RoomOrchestrator(controller_factory=lambda: object(), preview_factory=lambda: object())
+    room = orch.add_room("https://example.com/live.m3u8")
+    room.is_recording = True
+    room.is_reconnecting = True
+
+    class DeadIngest:
+        recording_active = False
+        recording_error = "proactive reconnect"
+
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.get_shared_ingest_registry",
+        lambda: type("Reg", (), {"get": staticmethod(lambda _rid: DeadIngest())})(),
+    )
+
+    status = orch.get_recording_status(room.room_id)
+    assert status["exists"] is True
+    assert status["is_recording"] is True
+
+
+def test_parse_failed_reconnect_is_not_treated_as_offline(monkeypatch, tmp_path) -> None:
+    from lsc.gui.multi_room import manager as manager_module
+    from lsc.gui.multi_room.manager import MultiRoomManager
+    from lsc.platforms.base import ERROR_PARSE_FAILED, StreamInfo
+
+    monkeypatch.setattr(
+        "lsc.gui.multi_room.manager.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.load_config",
+        lambda: LscConfig(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe", shared_ingest_enabled=False),
+    )
+    monkeypatch.setattr("lsc.core.orchestrator.RoomOrchestrator.save_rooms", lambda self: 0)
+
+    class FakeController:
+        def __init__(self) -> None:
+            self.stream_url = "https://example.com/live.m3u8"
+            self.input_args: list[str] = []
+            self.stop_calls = 0
+            self.start_calls = 0
+
+        def stop_recording(self):
+            self.stop_calls += 1
+            return True, 1.0, str(tmp_path / "old.mp4")
+
+        def start_recording_with_crf(self, stream_url, output_dir, encoder, crf, **kwargs):
+            self.start_calls += 1
+            return True, str(tmp_path / "new.mp4"), encoder, ""
+
+    failed = StreamInfo(
+        platform="douyin",
+        room_url="https://live.douyin.com/4577510133",
+        stream_url="",
+        is_live=False,
+        error="无法获取抖音直播间页面：不允许访问内网/保留地址。请检查网络连接或稍后重试。",
+        error_code=ERROR_PARSE_FAILED,
+    )
+    monkeypatch.setattr(
+        "lsc.gui.multi_room.manager.parse_stream",
+        lambda url, force_refresh=False: failed,
+    )
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.parse_stream",
+        lambda url, force_refresh=False: failed,
+    )
+
+    manager = MultiRoomManager(controller_factory=FakeController)
+    room = manager.add_room("https://live.douyin.com/4577510133")
+    room.is_connected = True
+    room.is_recording = True
+    room.is_reconnecting = True
+    room.last_error = "流 URL 即将过期，主动刷新"
+    room.reconnect_next_attempt_at = manager_module._time.monotonic() - 1.0
+    room.reconnect_output_dir = str(tmp_path)
+    room.reconnect_encoder = "Copy"
+    room.reconnect_crf = 23
+
+    manager._attempt_recording_reconnect(room, room.last_error)
+
+    assert room.controller.stop_calls == 1
+    assert room.controller.start_calls == 0
+    assert "下播" not in (room.last_error or "")
+    assert room.is_reconnecting is True

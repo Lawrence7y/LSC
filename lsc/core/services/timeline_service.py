@@ -66,8 +66,9 @@ def build_room_snapshots_from_align(
     """
     ref_offset = float(offsets.get(reference_room_id, 0.0) or 0.0)
 
-    # 先收集锚点数据：所有可信房间的预览 PTS 与媒体起点
-    anchored_rooms: dict[str, tuple[float, float]] = {}  # room_id -> (pct, media_start)
+    # 先收集锚点数据：所有可信房间的预览 PTS、捕获结束单调时刻与媒体起点
+    # 旧前端/旧数据不传 preview_capture_mono 时，回退到 align_mono（整体接收时刻）。
+    anchored_rooms: dict[str, tuple[float, float, float]] = {}  # room_id -> (pct, capture_mono, media_start)
     for room_id, _offset in offsets.items():
         score = float(scores.get(room_id, 0.0) or 0.0)
         if score < confidence_threshold:
@@ -76,11 +77,14 @@ def build_room_snapshots_from_align(
         pct = meta.get("preview_current_time")
         if align_mono is None or not isinstance(pct, (int, float)) or float(pct) <= 0:
             continue
+        capture_mono = float(meta.get("preview_capture_mono") or align_mono)
+        if capture_mono <= 0:
+            capture_mono = float(align_mono)
         media_start = float(meta.get("media_start_mono", 0.0) or 0.0)
-        anchored_rooms[room_id] = (float(pct), media_start)
+        anchored_rooms[room_id] = (float(pct), capture_mono, media_start)
     origin_mono = 0.0
     if anchored_rooms:
-        valid_starts = [ms for _, ms in anchored_rooms.values() if ms > 0.0]
+        valid_starts = [ms for _, _, ms in anchored_rooms.values() if ms > 0.0]
         if valid_starts:
             origin_mono = min(valid_starts)
 
@@ -96,8 +100,8 @@ def build_room_snapshots_from_align(
         rec_delta = media_start + rel_delta
         anchored = room_id in anchored_rooms
         if anchored:
-            pct, _ms = anchored_rooms[room_id]
-            preview_delta = (float(align_mono) - origin_mono - pct) + rel_delta
+            pct, capture_mono, _ms = anchored_rooms[room_id]
+            preview_delta = (capture_mono - origin_mono - pct) + rel_delta
             rec_delta = media_start + rel_delta - origin_mono
         snapshots[room_id] = RoomTimeSnapshot(
             room_id=room_id,
@@ -261,6 +265,11 @@ class TimelineService:
 
             clip_id = uuid4().hex
             group_id = clip_group_id or f"group_{timeline_id[:8]}_{_time.monotonic():.0f}"
+            # 同时冻结录制轴坐标。TimelineContext 可能在预览重建/重新对齐后失效，
+            # 但 ClipSnapshot 仍允许导出；只保留 common_start/end 会导致失效后
+            # 被当前房间标记或新 offset 重新解释成另一段内容。
+            recording_start_sec = ctx.common_to_recording(room_id, common_start)
+            recording_end_sec = ctx.common_to_recording(room_id, common_end)
             clip = ClipSnapshot(
                 clip_id=clip_id,
                 clip_group_id=group_id,
@@ -269,6 +278,8 @@ class TimelineService:
                 common_start=common_start,
                 common_end=common_end,
                 room_id=room_id,
+                recording_start_sec=recording_start_sec,
+                recording_end_sec=recording_end_sec,
                 source=source,
                 source_highlight_id=source_highlight_id,
             )

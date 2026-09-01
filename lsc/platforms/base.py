@@ -56,8 +56,9 @@ def _is_private_ip(hostname: str) -> bool:
                 if ip in network:
                     return True
     except Exception:
-        # 解析失败时保守处理，拒绝访问
-        return True
+        # DNS 失败不是内网。fail-closed 会把瞬时解析失败伪装成 SSRF，
+        # 调用方再把「不允许访问内网」误判成主播下播并永久停录。
+        return False
     return False
 
 

@@ -132,20 +132,18 @@ export function computeTimelineWindow(input: TimelineWindowInput): TimelineWindo
   const zoom = Math.max(1, input.zoomLevel || 1)
   const refining = input.refining
 
+  // 1x（未放大）始终从 00:00 开始，整段压进视口，不做局部滑动窗。
+  // 精修/拖拽/跟播都不改变 1x 的左端点，保证“最左边恒定零点”。
+  if (zoom <= 1) {
+    return { windowStart: 0, duration: contentEnd, visibleSpan: contentEnd }
+  }
+
   if (refining && refining.end > refining.start) {
     const mid = (refining.start + refining.end) / 2
     const half = Math.min(TIMELINE_MAX_WINDOW, Math.max(30, (refining.end - refining.start) * 4)) / 2
     const ws = Math.max(0, mid - half)
     const dur = Math.max(contentEnd, ws + half * 2, 1)
     return { windowStart: ws, duration: dur, visibleSpan: dur - ws }
-  }
-
-  if (zoom <= 1 && input.followLive && !input.scrubbing) {
-    return { windowStart: 0, duration: contentEnd, visibleSpan: contentEnd }
-  }
-
-  if (zoom <= 1 && contentEnd <= TIMELINE_MAX_WINDOW) {
-    return { windowStart: 0, duration: contentEnd, visibleSpan: contentEnd }
   }
 
   const visibleSpan =

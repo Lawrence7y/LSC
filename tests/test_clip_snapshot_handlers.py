@@ -1,8 +1,10 @@
 """create_clip_snapshot handler 和 export_clip clip_id 模式测试 — TDD。"""
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,26 @@ if _python_backend not in sys.path:
 
 from lsc.core.models import RoomTimeSnapshot
 from lsc.core.services.timeline_service import TimelineService
+
+
+class _FakeServer:
+    def __init__(self):
+        self.handlers = {}
+
+    def on(self, name):
+        def decorator(fn):
+            self.handlers[name] = fn
+            return fn
+
+        return decorator
+
+
+class _FakeBridge:
+    def __init__(self):
+        self.broadcasts = []
+
+    def queue_broadcast(self, payload):
+        self.broadcasts.append(payload)
 
 
 @pytest.fixture
@@ -139,3 +161,54 @@ class TestExportClipById:
         """不存在的 clip_id 应返回 None。"""
         stored = timeline_service.get_clip_snapshot("nonexistent-clip")
         assert stored is None
+
+    def test_export_by_id_does_not_map_recording_range_twice(self, timeline_service, tmp_path, monkeypatch):
+        """ClipSnapshot 已是公共轴快照，入队时必须声明录制坐标已完成换算。"""
+        recording = tmp_path / "recording.mp4"
+        recording.write_bytes(b"media")
+        snapshots = {
+            "room-1": RoomTimeSnapshot(
+                room_id="room-1",
+                recording_id="rec-1",
+                recording_to_common_delta=100.0,
+                align_confidence=0.95,
+                media_start_mono=100.0,
+            ),
+        }
+        ctx = timeline_service.create_timeline("room-1", snapshots)
+        clip = timeline_service.create_clip_snapshot(ctx.timeline_id, "room-1", 120.0, 135.0)
+
+        room = SimpleNamespace(
+            room_id="room-1",
+            recording_id="rec-1",
+            record_manifest_path="",
+            record_output_path=str(recording),
+            content_offset=1.5,
+        )
+        manager = SimpleNamespace(get_room=lambda room_id: room if room_id == "room-1" else None)
+        server = _FakeServer()
+        bridge = _FakeBridge()
+        queued = {}
+
+        async def fake_queue_export(*args, **kwargs):
+            queued["args"] = args
+            queued["kwargs"] = kwargs
+            return {"success": True, "job_id": "job-1"}
+
+        from handlers import timeline_handlers
+
+        monkeypatch.setattr(timeline_handlers, "get_timeline_service", lambda: timeline_service)
+        timeline_handlers.register_timeline_handlers(
+            server,
+            bridge=bridge,
+            manager=manager,
+            queue_export=fake_queue_export,
+        )
+
+        # 模拟预览重建/重新对齐导致 TimelineContext 失效；snapshot 自身仍应可精确导出。
+        timeline_service.invalidate_timeline(ctx.timeline_id, "preview_epoch_change")
+        result = asyncio.run(server.handlers["export_clip_by_id"]({"clip_id": clip.clip_id}))
+
+        assert result["success"] is True
+        assert queued["args"][1:3] == (20.0, 35.0)
+        assert queued["kwargs"]["pre_mapped"] is True

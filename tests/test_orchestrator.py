@@ -77,6 +77,9 @@ def test_is_stream_offline_error():
     from lsc.core.orchestrator import _is_stream_offline_error
     assert _is_stream_offline_error("直播间已结束")
     assert not _is_stream_offline_error("connection reset")
+    assert not _is_stream_offline_error(
+        "无法获取抖音直播间页面：不允许访问内网/保留地址。请检查网络连接或稍后重试。"
+    )
 
 
 def test_add_get_remove_room(orch):

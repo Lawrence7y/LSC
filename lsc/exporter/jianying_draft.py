@@ -116,6 +116,31 @@ def resolve_common_range(clip: dict[str, Any], ctx: Any) -> tuple[float, float, 
     ce = clip.get("common_end")
     if cs is not None and ce is not None:
         return float(cs), float(ce), "exact"
+    # 手动切片的 start/end 是预览轴；若前端已携带后端确认/计算出的录制轴
+    # 范围，优先使用它，避免在无 TimelineContext 的单房场景把预览时间误当
+    # 成录制时间（预览启动延迟可能达到数秒）。
+    recording_start = clip.get("recording_start_sec")
+    recording_end = clip.get("recording_end_sec")
+    if recording_start is not None and recording_end is not None:
+        try:
+            rs = float(recording_start)
+            re = float(recording_end)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if re > rs:
+                if ctx is not None:
+                    room_id = clip.get("room_id")
+                    snapshots = getattr(ctx, "room_snapshots", None) or {}
+                    snap = snapshots.get(room_id) if room_id else None
+                    if snap is not None:
+                        return (
+                            rs + float(snap.recording_to_common_delta),
+                            re + float(snap.recording_to_common_delta),
+                            "exact",
+                        )
+                # 无公共轴时，单房录制轴就是剪映草稿的公共轴。
+                return rs, re, "exact"
     # H8 回退：切片 recording 本地时间 + 该房 timeline 快照 delta 换算公共轴。
     # AI 切片在 clip_queued 时若公共轴未就绪会缺 common 坐标，此处补救。
     if ctx is not None:
@@ -144,6 +169,25 @@ def resolve_common_range(clip: dict[str, Any], ctx: Any) -> tuple[float, float, 
     if mark_in is not None and mark_out is not None and media_starts:
         origin = min(media_starts)
         return float(mark_in) - origin, float(mark_out) - origin, "exact"
+    # 兼容较早版本前端产生的手动切片：虽没有 recording_start_sec，仍可用
+    # 入列时冻结的墙钟与录制媒体起点恢复录制轴。不能直接退回 preview start/end。
+    if ctx is None:
+        try:
+            mark_in_value = float(mark_in)
+            mark_out_value = float(mark_out)
+            recording_start_mono = float(
+                clip.get("recording_media_start_mono")
+                if clip.get("recording_media_start_mono") is not None
+                else clip.get("recording_start_mono")
+            )
+            content_offset = float(clip.get("content_offset") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        else:
+            rs = max(0.0, mark_in_value - recording_start_mono - content_offset)
+            re = max(0.0, mark_out_value - recording_start_mono - content_offset)
+            if re > rs:
+                return rs, re, "exact"
     if ctx is None:
         # 单房降级兜底：无 timeline ctx 时该房 delta=0，recording 时间即公共坐标。
         # 多房未对齐已被 handler 前置拦截（allow_single_fallback=False）；

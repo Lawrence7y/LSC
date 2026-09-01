@@ -75,6 +75,43 @@ class TestBuildRoomSnapshotsFromAlign:
         assert snapshots["r1"].preview_to_common_delta == pytest.approx(0.8)
 
 
+
+    def test_per_room_capture_mono_anchors_preview_independently(self):
+        """各房音频捕获结束时刻不同时，preview→common 必须使用各自的 capture_mono。
+
+        现场多路采集时，先结束的房间会等待最慢房间；若统一用后端收到请求的
+        align_mono 锚定，先结束房间的预览轴会被整体推迟数秒，导致时间线/导出错位。
+        """
+        snapshots = build_room_snapshots_from_align(
+            reference_room_id="ref",
+            offsets={"ref": 0.0, "b": 0.2691},
+            scores={"ref": 0.9, "b": 0.9},
+            room_meta={
+                "ref": {
+                    "media_start_mono": 100.0,
+                    "recording_id": "a",
+                    "preview_epoch_id": "e0",
+                    "preview_current_time": 40.0,
+                    "preview_capture_mono": 150.0,
+                },
+                "b": {
+                    "media_start_mono": 102.0,
+                    "recording_id": "b",
+                    "preview_epoch_id": "e1",
+                    "preview_current_time": 40.0,
+                    "preview_capture_mono": 155.0,
+                },
+            },
+            align_mono=160.0,  # 旧逻辑会统一用 160；本测试应使用每路 150/155
+        )
+        # origin = min(100, 102) = 100
+        assert snapshots["ref"].preview_to_common_delta == pytest.approx(150 - 100 - 40.0)
+        assert snapshots["b"].preview_to_common_delta == pytest.approx(155 - 100 - 40.0 + 0.2691)
+        # 录制轴不受捕获时刻影响
+        assert snapshots["ref"].recording_to_common_delta == pytest.approx(0.0)
+        assert snapshots["b"].recording_to_common_delta == pytest.approx(2.0 + 0.2691)
+
+
 class TestCreateTimelineFromAlignSnapshots:
     def test_create_timeline_sets_preview_ready_and_clip_ready(self):
         service = TimelineService()

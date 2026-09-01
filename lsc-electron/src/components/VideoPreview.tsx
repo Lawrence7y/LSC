@@ -218,7 +218,7 @@ export function VideoPreview({
 
     const player = new MsePlayer({
       videoElement: videoRef.current,
-      debug: (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV ?? false,
+      debug: false,
       onStateChange: (newState) => {
         setState(newState)
         if (newState === 'playing') {

@@ -118,6 +118,8 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
                 'recording_id': snap.recording_id,
                 'common_start': snap.common_start,
                 'common_end': snap.common_end,
+                'recording_start_sec': snap.recording_start_sec,
+                'recording_end_sec': snap.recording_end_sec,
                 'source': snap.source,
             })
 
@@ -151,20 +153,22 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
         # 入队时冻结 content_offset 快照，避免导出排队期间重对齐改变历史切片
         snap_content_offset = float(content_offset or 0.0)
         ctx = timeline_svc.get_timeline(snap.timeline_id)
-        if ctx is not None and snap.room_id in ctx.room_snapshots:
+        if snap.recording_start_sec is not None and snap.recording_end_sec is not None:
+            # ClipSnapshot 创建时已冻结录制轴坐标；即使 TimelineContext 已失效，
+            # 也必须沿用这份坐标，不能用房间当前 mark/offset 重新解释旧切片。
+            export_start = max(0.0, float(snap.recording_start_sec))
+            export_end = max(0.0, float(snap.recording_end_sec))
+        elif ctx is not None and snap.room_id in ctx.room_snapshots:
             rec_delta = ctx.room_snapshots[snap.room_id].recording_to_common_delta
             export_start = max(0.0, snap.common_start - rec_delta)
             export_end = max(0.0, snap.common_end - rec_delta)
         else:
-            rec_start = getattr(room, 'recording_media_start_mono', None) or getattr(room, 'recording_start_mono', None)
-            mark_in_wc = getattr(room, 'mark_in_wallclock', None)
-            mark_out_wc = getattr(room, 'mark_out_wallclock', None)
-            if mark_in_wc is not None and mark_out_wc is not None and rec_start is not None:
-                export_start = max(0.0, mark_in_wc - rec_start - snap_content_offset)
-                export_end = max(0.0, mark_out_wc - rec_start - snap_content_offset)
-            else:
-                export_start = max(0.0, snap.common_start - snap_content_offset)
-                export_end = max(0.0, snap.common_end - snap_content_offset)
+            # 兼容旧手工构造的 snapshot：上下文失效后没有可信的录制轴映射，
+            # 宁可拒绝精确导出，也不能拿当前房间标记拼出错误切片。
+            return {
+                'success': False,
+                'error': '时间轴上下文已失效，无法精确映射旧切片，请重新创建切片',
+            }
 
         jid = f"clip-{clip_id[:8]}"
 
@@ -175,12 +179,23 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
             source=snap.source or data.get('source', 'manual'),
             job_id=jid,
             content_offset=snap_content_offset,
+            # export_start/end 已在上面按 ClipSnapshot 的公共轴快照换算成
+            # 录制文件坐标；统一队列不得再次套用 preview latency/offset。
+            pre_mapped=True,
         )
 
         if result.get('error'):
             return {'success': False, 'error': result['error']}
 
-        return {'success': True, 'clip_id': clip_id, 'job_id': result['job_id'], 'queued': True}
+        return {
+            'success': True,
+            'clip_id': clip_id,
+            'job_id': result['job_id'],
+            'queued': True,
+            'export_start': result.get('export_start', export_start),
+            'export_end': result.get('export_end', export_end),
+            'precision': result.get('precision', 'exact'),
+        }
 
     # ── get_timeline handler ──
     @server.on('get_timeline')

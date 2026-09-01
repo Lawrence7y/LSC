@@ -429,11 +429,10 @@ class DouyinAdapter(BasePlatformAdapter):
             is_live=True,
             quality_urls=quality_urls,
             selected_quality=str(data.get("selectedQuality", "") or next(iter(quality_urls), "")),
-            # Preserve the scoped credential context for the downstream
-            # probe/ingest request.  The page fetch above may use a
-            # compatibility cookie source, but the resulting candidate must
-            # carry the exact controlled headers used for that parse.
-            headers=self._headers_with_cookies(request_cookies),
+            # Page fetch used login Cookie; CDN pull only needs Referer/UA.
+            headers=self._cdn_request_headers(
+                self._headers_with_cookies(request_cookies)
+            ),
             raw={
                 "source_kind": "official",
                 "confidence": 0.9,
@@ -463,6 +462,21 @@ class DouyinAdapter(BasePlatformAdapter):
                 f"{key}={value}" for key, value in cookies.items()
             )
         return headers
+
+    @staticmethod
+    def _cdn_request_headers(headers: Mapping[str, str] | None = None) -> dict[str, str]:
+        """Drop Cookie/Origin from Douyin CDN pull headers.
+
+        Page fetches still need login Cookie to pass the anti-bot interstitial.
+        The signed FLV/HLS URL does not; forwarding dozens of browser cookies
+        to FFmpeg overflows libavformat's 8KB HTTP request buffer and exits
+        with ``overlong headers`` / EINVAL (Windows code 4294967274).
+        """
+        return {
+            key: value
+            for key, value in dict(headers or DOUYIN_HEADERS).items()
+            if key.lower() not in {"cookie", "origin"}
+        }
 
     @staticmethod
     def _context_timeout(context: Mapping[str, object], *, default: int) -> int:

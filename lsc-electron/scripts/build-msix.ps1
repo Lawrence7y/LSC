@@ -1,4 +1,4 @@
-﻿# LSC Live Stream Clipper - Build the Microsoft Store (MSIX/AppX) package
+# LSC Live Stream Clipper - Build the Microsoft Store (MSIX/AppX) package
 #
 # Native electron-builder AppX — NOT MSIX Packaging Tool conversion.
 # Wrapping the NSIS "Setup.exe" with MSIX Packaging Tool is policy 10.2.5
@@ -33,16 +33,27 @@ Write-Host "  identityName: $IdentityName"
 Write-Host "  publisher:    $Publisher"
 Write-Host "  NEVER wrap NSIS Setup.exe with MSIX Packaging Tool." -ForegroundColor Yellow
 
+# ----- 0. Regenerate high-quality tile logos (Store policy 10.1.1.11 "On Device Tiles") -----
+# Rejected 1.0.1/1.0.2: incomplete tiles, ICO upscale, no HiDPI.
+# 1.0.3 still used GDI+ (jagged 44px, no scale-400 / targetsize).
+# This must run BEFORE electron-builder so build/appx/*.png are the crisp ones.
+Write-Host "[1/7] Generate high-quality Store tile logos (policy 10.1.1.11)..." -ForegroundColor Cyan
+& (Join-Path $ScriptDir "gen-appx-icons.ps1")
+if (-not $?) {
+    Write-Error "gen-appx-icons failed; MSIX tiles would be low-res"
+    exit 1
+}
+
 # ----- 1. Bundle all dependencies -----
 if (-not $SkipPrep) {
-    Write-Host "[1/6] prep-bundle.ps1 -WithDeps (downloads ~1.5GB on first run)..." -ForegroundColor Cyan
+    Write-Host "[2/7] prep-bundle.ps1 -WithDeps (downloads ~1.5GB on first run)..." -ForegroundColor Cyan
     & (Join-Path $ScriptDir "prep-bundle.ps1") -WithDeps
     if (-not $?) {
         Write-Error "prep-bundle failed"
         exit 1
     }
 } else {
-    Write-Host "[1/6] Skip prep-bundle (-SkipPrep)" -ForegroundColor Cyan
+    Write-Host "[2/7] Skip prep-bundle (-SkipPrep)" -ForegroundColor Cyan
 }
 
 $packagesDir = Join-Path $AppDir ".bundle\python\python-packages"
@@ -57,7 +68,7 @@ if (-not (Test-Path $ffmpegExe)) {
 }
 
 # ----- 2. Code-signing certificate (Subject must match Publisher) -----
-Write-Host "[2/6] Ensure code-signing certificate matches Publisher..." -ForegroundColor Cyan
+Write-Host "[3/7] Ensure code-signing certificate matches Publisher..." -ForegroundColor Cyan
 $CertFull = Join-Path $AppDir $Certificate
 $needNewCert = $true
 if (Test-Path $CertFull) {
@@ -83,7 +94,7 @@ if ($needNewCert) {
 }
 
 # ----- 3. TypeScript check + renderer build -----
-Write-Host "[3/6] tsc --noEmit + vite build..." -ForegroundColor Cyan
+Write-Host "[4/7] tsc --noEmit + vite build..." -ForegroundColor Cyan
 Push-Location $AppDir
 try {
     npx tsc --noEmit
@@ -95,7 +106,7 @@ try {
 }
 
 # ----- 4. electron-builder AppX (native container, not a converted installer) -----
-Write-Host "[4/6] electron-builder --win appx (native Store package)..." -ForegroundColor Cyan
+Write-Host "[5/7] electron-builder --win appx (native Store package)..." -ForegroundColor Cyan
 Push-Location $AppDir
 try {
     $pkgPath = Join-Path $AppDir "package.json"
@@ -126,6 +137,18 @@ try {
     $filtered = @($build.extraResources | Where-Object {
         $_.to -ne "uv" -and $_.to -ne "install-runtime-dependencies.ps1"
     })
+    # python-backend 里的 dependency_manager.py 是运行时依赖安装器（政策 10.2.5），
+    # 自包含 Store 包不应携带它；同时剔除 __pycache__ / *.pyc。
+    foreach ($res in $filtered) {
+        if ($res.to -eq "python-backend") {
+            $res | Add-Member -NotePropertyName filter -NotePropertyValue @(
+                "**/*",
+                "!dependency_manager.py",
+                "!**/__pycache__/**",
+                "!**/*.pyc"
+            ) -Force
+        }
+    }
     $build.extraResources = $filtered
 
     $configOverride = Join-Path $AppDir "build\msix.config.json"
@@ -142,7 +165,7 @@ try {
 }
 
 # ----- 5. Reject converted-installer packages (the 10.2.5 failure mode) -----
-Write-Host "[5/6] Verify AppxManifest is a native app, not a Setup wrapper..." -ForegroundColor Cyan
+Write-Host "[6/7] Verify AppxManifest is a native app, not a Setup wrapper..." -ForegroundColor Cyan
 $pkgFile = Get-ChildItem -Path (Join-Path $AppDir "release") -Include "*.appx","*.msix" -File -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notmatch 'blockmap' } |
     Sort-Object LastWriteTime -Descending |
@@ -167,6 +190,11 @@ try {
     $reader = New-Object System.IO.StreamReader($manifestEntry.Open())
     try { $manifest = $reader.ReadToEnd() } finally { $reader.Close() }
     $exeEntries = @($zip.Entries | Where-Object { $_.FullName -match '\.exe$' } | ForEach-Object { $_.FullName })
+    $installerEntries = @($zip.Entries | Where-Object {
+        $_.FullName -match '(?i)dependency_manager\.(py|pyc)$' -or
+        $_.FullName -match '(?i)(^|/)uv\.exe$' -or
+        $_.FullName -match '(?i)install-runtime-dependencies\.ps1$'
+    } | ForEach-Object { $_.FullName })
 } finally {
     $zip.Dispose()
 }
@@ -192,6 +220,12 @@ if ($setupExes) {
     $failures += ("Package still contains installer EXE: " + ($setupExes -join ", "))
 }
 
+# dependency_manager.py / uv / install-runtime-dependencies.ps1 are runtime
+# dependency installers that violate policy 10.2.5.
+if ($installerEntries) {
+    $failures += ("Package still contains runtime dependency installer: " + ($installerEntries -join ", "))
+}
+
 if ($failures.Count -gt 0) {
     Write-Host $manifest
     Write-Error ("Store package failed 10.2.5 sanity check:`n  - " + ($failures -join "`n  - "))
@@ -201,7 +235,7 @@ if ($failures.Count -gt 0) {
 Write-Host "  AppxManifest OK (native Electron app, Store identity)." -ForegroundColor Green
 
 # ----- 6. Result -----
-Write-Host "[6/6] Build complete" -ForegroundColor Cyan
+Write-Host "[7/7] Build complete" -ForegroundColor Cyan
 $sizeMB = [math]::Round($pkgFile.Length / 1MB, 1)
 Write-Host ""
 Write-Host "Package: $($pkgFile.FullName) ($sizeMB MB)" -ForegroundColor Green

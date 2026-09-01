@@ -75,6 +75,17 @@ describe('ClipList 渲染', () => {
     render(<ClipList {...defaultProps} clips={[makeClip({ confirm_status: 'audio_pending' })]} />)
     expect(screen.getByText('OCR 复核中')).toBeTruthy()
   })
+
+  it('优先显示后端确认的实际录制轴范围', () => {
+    render(
+      <ClipList
+        {...defaultProps}
+        clips={[makeClip({ start: 100, end: 130, recording_start_sec: 94, recording_end_sec: 124 })]}
+      />,
+    )
+    const time = document.querySelector('.clip-row-v2__time')
+    expect(time?.textContent).toContain('录制00:01:34→00:02:04')
+  })
 })
 
 // ─── 交互：删除 ──────────────────────────────────────────────────────

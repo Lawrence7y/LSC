@@ -180,6 +180,9 @@ export interface ClipSegment {
   mark_out_wallclock?: number | null
   recording_start_mono?: number | null
   recording_media_start_mono?: number | null
+  /** 后端最终用于 FFmpeg 的录制文件时间轴范围（秒）。 */
+  recording_start_sec?: number | null
+  recording_end_sec?: number | null
   /** exact = 入队时有完整墙钟或 ClipSnapshot；approximate = 仅有 start/end（如拖拽标记） */
   mark_precision?: 'exact' | 'approximate'
   /** 入队时快照的 content_offset，导出时优先于房间当前值 */

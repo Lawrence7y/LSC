@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterable, Mapping
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from .base import ERROR_PARSE_FAILED, ERROR_UNSUPPORTED_URL, PlatformAdapter, StreamInfo
 from .bilibili import BilibiliAdapter
@@ -22,6 +22,7 @@ from .generic import GenericPageAdapter
 from .huya import HuyaAdapter
 from .kuaishou import KuaishouAdapter
 from .redaction import redact_text, redact_url
+from .stream_expiry import is_stream_url_expiring
 from .weibo import WeiboAdapter
 from .xiaohongshu import XiaohongshuAdapter
 
@@ -106,38 +107,11 @@ class _ParseCache:
 
     @staticmethod
     def _is_stream_url_expired(info: StreamInfo) -> bool:
-        """检查 StreamInfo 中的 stream_url 是否已过期。
+        """缓存命中时：仅当具名过期参数仍在未来且剩余 ≤60s 才视为失效。
 
-        平台 CDN URL 通常包含过期时间戳参数：
-        - 抖音: expire=<hex_timestamp> 或 wsTime=<hex_timestamp>
-        - B站: expires=<decimal_timestamp>
-        - 虎牙: wsTime=<hex_timestamp>
-        当 URL 已过期或即将过期（60 秒内）时返回 True，促使调用方重新解析。
+        已过期或 expire≈签发时刻不得驱逐缓存，否则抖音每次 parse 都会穿透。
         """
-        url = info.stream_url
-        if not url:
-            return False
-        try:
-            params = parse_qs(urlparse(url).query)
-            now = time.time()
-            for key in ('expire', 'expires', 'wsTime'):
-                vals = params.get(key, [])
-                if not vals:
-                    continue
-                raw = vals[0]
-                try:
-                    # #38: pure-digit strings (Bilibili expires) are decimal, not hex
-                    ts = int(raw, 10) if raw.isdigit() else (
-                        int(raw, 16) if all(c in '0123456789abcdefABCDEF' for c in raw) and len(raw) >= 6
-                        else int(raw)
-                    )
-                except (ValueError, OverflowError):
-                    continue
-                if now > ts - 60:
-                    return True
-        except Exception as exc:
-            _log.debug("操作异常（已忽略）: %s", redact_text(exc))
-        return False
+        return is_stream_url_expiring(info.stream_url)
 
     def _cleanup(self) -> None:
         """清理过期条目。单次加锁内完成检查和删除，防止竞态误删新条目。"""

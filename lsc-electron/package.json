@@ -1,6 +1,6 @@
 {
   "name": "lsc-electron",
-  "version": "1.0.1",
+  "version": "1.0.11",
   "description": "LSC 直播切片系统 - Electron 版本",
   "author": "Lawrence7y",
   "repository": {
@@ -34,6 +34,7 @@
     "zustand": "^4.4.7"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^14.3.1",
     "@testing-library/user-event": "^14.6.1",
@@ -45,6 +46,7 @@
     "electron": "^30.5.1",
     "electron-builder": "^24.9.1",
     "happy-dom": "^13.10.1",
+    "sharp": "^0.33.5",
     "sharp-ico": "^0.1.5",
     "typescript": "^5.3.3",
     "vite": "^5.0.8",

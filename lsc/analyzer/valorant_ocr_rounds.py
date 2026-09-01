@@ -48,20 +48,17 @@ _PREP_RUN_FRAMES = 4                # 无结算信号时 prep 连续帧数要求
 _SUB_WINDOW_SEC = 60.0
 _MIDSTREAM_STREAK = 3        # 中段切入：连续 N 帧交战钟且递减才开局
 _MIDSTREAM_DECREASE_SEC = 1.0
-# 边界局部密扫：粗扫（1fps）定位候选后，±3s @10fps 精确定位转换首帧
+# 边界局部密扫：粗扫（1fps）定位候选后，±3s @5fps 精确定位转换首帧
 _REFINE_WINDOW_SEC = 3.0
-_REFINE_FPS = 10.0
-_REFINE_RUN_FRAMES = 3       # 密扫连续帧确认阈值
+_REFINE_FPS = 5.0
+_REFINE_RUN_FRAMES = 2       # 密扫连续帧确认阈值（5fps 下 2 帧即 0.4s）
 _REFINE_MAX_FRAMES_PER_BOUNDARY = 80  # 密扫单边界最大帧数：超限等距抽样兜底
 # 结算后 ≥此时长的非游戏段标注为回放（仅 broadcast 赛事流）
 _REPLAY_MIN_SEC = 5.0
-# SETTLE 内判定"新回合交战钟"的最小原始读数（残余外推钟通常 <90 且非 raw）
 _NEW_ROUND_CLOCK_MIN = 85.0
-# SETTLE 内距结算超过此时长后，任意交战钟均可认定新回合（买枪+开局已过）
 _NEW_ROUND_AFTER_RESULT_SEC = 45.0
 _CENTER_BANNER_SCALE = 3     # 中央横幅放大倍数（小图 OCR 对中文不稳）
 _TOP_BAND_RATIO = 0.12       # 顶部条占帧高比例
-# 中央横幅竖带覆盖顶部买枪横幅（y≈0.09-0.28）与屏幕中央结算横幅（y≈0.38-0.62）
 _CENTER_CROP_RATIO = (0.34, 0.09, 0.32, 0.56)
 
 _PREP_BANNER_KEYWORDS = (
@@ -271,10 +268,18 @@ class OcrRoundFSM:
         other.__dict__.update(self.__dict__)
         return other
 
-    def feed(self, label: str, ts: float, timer: float | None, timer_raw: bool = False) -> list[dict[str, Any]]:
+    def feed(
+        self,
+        label: str,
+        ts: float,
+        timer: float | None,
+        timer_raw: bool = False,
+        cand_ts: float | None = None,
+    ) -> list[dict[str, Any]]:
         """推进一帧，返回本帧新闭合的回合（正常 0/1）。
 
         timer_raw：本帧计时器是否来自原始 OCR 读数（外推值不得触发新回合判定）。
+        cand_ts：交战钟连续确认的首帧真实 PTS（入点回溯，消除两帧确认带来的延迟）。
         """
         closed: list[dict[str, Any]] = []
 
@@ -287,7 +292,7 @@ class OcrRoundFSM:
                     if self._mid_streak == 0:
                         self._mid_streak = 1
                         self._mid_first_timer = float(timer)
-                        self._mid_start_ts = ts
+                        self._mid_start_ts = cand_ts if cand_ts is not None else ts
                     else:
                         self._mid_streak += 1
                     countdown_ok = (
@@ -305,7 +310,7 @@ class OcrRoundFSM:
 
         if self._state == _State.PREP:
             if label == "combat":
-                self._open_combat(ts)
+                self._open_combat(cand_ts if cand_ts is not None else ts)
             return closed
 
         if self._state == _State.COMBAT:
@@ -374,7 +379,7 @@ class OcrRoundFSM:
                 if (_fresh_clock or _late_raw_combat) and (
                     _since_result is None or _since_result >= _PREP_AFTER_RESULT_SEC
                 ):
-                    close = self._close(end=ts, end_by="next_combat")
+                    close = self._close(end=cand_ts if cand_ts is not None else ts, end_by="next_combat")
                     if close is not None:
                         closed.append(close)
                         _log.info(
@@ -386,7 +391,7 @@ class OcrRoundFSM:
                             "SETTLE 错过准备直接见新交战钟: 旧回合过短未产出，开新回合（ts=%.1f）",
                             ts,
                         )
-                    self._open_combat(ts)
+                    self._open_combat(cand_ts if cand_ts is not None else ts)
                 return closed
 
         return closed
@@ -460,11 +465,12 @@ def _refine_boundary_ts(
     min_start_ts: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> float | None:
-    """边界局部密扫：粗扫候选 ±3s @10fps，找连续 ≥3 帧目标标签游程的首帧真实 PTS。
+    """边界局部密扫：粗扫候选 ±3s @5fps，找连续 ≥2 帧目标标签游程的首帧真实 PTS。
 
     target="combat"：交战钟（>45s）首现帧；target="prep"：准备信号（≤45s 或横幅）首现帧。
     min_start_ts：游程首帧不得早于该时刻（prep 密扫排除结算画面低倒计时）。
     密扫失败返回 None（保留粗扫值，宁用粗值不丢回合）。
+    优化：combat 密扫跳过中央横幅 OCR，prep 密扫优先读顶部计时器并支持提前退出。
     """
     t0 = max(0.0, float(center_ts) - _REFINE_WINDOW_SEC)
     t1 = float(center_ts) + _REFINE_WINDOW_SEC
@@ -483,7 +489,7 @@ def _refine_boundary_ts(
         return None
 
     if len(frames) > _REFINE_MAX_FRAMES_PER_BOUNDARY:
-        # 帧数超上限：等距抽样保住时间覆盖，避免极端场景每边界 60+ 帧 × 2 OCR 拖垮分析
+        # 帧数超上限：等距抽样保住时间覆盖
         _step = len(frames) / float(_REFINE_MAX_FRAMES_PER_BOUNDARY)
         frames = [frames[int(i * _step)] for i in range(_REFINE_MAX_FRAMES_PER_BOUNDARY)]
 
@@ -492,20 +498,31 @@ def _refine_boundary_ts(
     for ts, img in frames:
         if cancel_check and cancel_check():
             return None
-        try:
-            timer, _, _ = _read_top_anchors(img)
-            prep_banner, _ = _read_center_banner(img)
-        except Exception as exc:  # noqa: BLE001
-            _log.debug("边界密扫 OCR 失败: %s", exc)
-            run = 0
-            run_start = None
-            continue
         if target == "combat":
+            try:
+                timer, _, _ = _read_top_anchors(img)
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("边界密扫 top OCR 失败: %s", exc)
+                run = 0
+                run_start = None
+                continue
             hit = timer is not None and _is_combat_timer(timer)
         else:
-            hit = (prep_banner or (timer is not None and _is_prep_timer(timer))) and (
-                min_start_ts is None or ts >= float(min_start_ts)
-            )
+            # target == "prep"
+            timer = None
+            try:
+                timer, _, _ = _read_top_anchors(img)
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("边界密扫 top OCR 失败: %s", exc)
+            if timer is not None and _is_prep_timer(timer):
+                hit = min_start_ts is None or ts >= float(min_start_ts)
+            else:
+                try:
+                    prep_banner, _ = _read_center_banner(img)
+                except Exception as exc:  # noqa: BLE001
+                    _log.debug("边界密扫 center OCR 失败: %s", exc)
+                    prep_banner = False
+                hit = prep_banner and (min_start_ts is None or ts >= float(min_start_ts))
         if hit:
             if run == 0:
                 run_start = ts
@@ -669,12 +686,13 @@ def detect_valorant_rounds_ocr(
     timer_streak = int(state.get("timer_streak", 0) or 0)
     timer_streak_val: float | None = state.get("timer_streak_val")
     combat_raw_streak = int(state.get("combat_raw_streak", 0) or 0)
+    combat_cand_ts: float | None = state.get("combat_cand_ts")
     # 结算后抑制：残余交战钟不得重建锚点/标成 combat/prep，直到
     # 出现空档（钟走完）后再见准备/交战，或中央准备横幅 / 满钟新回合。
     post_settle_hold = bool(state.get("post_settle_hold", False))
     post_settle_gap = bool(state.get("post_settle_gap", False))
 
-    labels: list[tuple[float, str, float | None, bool]] = []
+    labels: list[tuple[float, str, float | None, bool, float | None]] = []
     closed_rounds: list[dict[str, Any]] = []
 
     # 子窗口分块扫描：整窗抽帧会把追赶窗（最长 480s @1fps ≈ 330MB）帧全部驻留
@@ -726,6 +744,8 @@ def detect_valorant_rounds_ocr(
             )
             if raw_timer is not None and not frozen:
                 if _is_combat_timer(raw_timer):
+                    if combat_raw_streak == 0:
+                        combat_cand_ts = ts
                     # anchor 建立/刷新需连续 2 帧原始交战钟读数（单帧误读不得开局）
                     combat_raw_streak += 1
                     if combat_raw_streak >= 2:
@@ -738,6 +758,7 @@ def detect_valorant_rounds_ocr(
                             anchor = (float(raw_timer), ts)
                 else:
                     combat_raw_streak = 0
+                    combat_cand_ts = None
                     if (
                         anchor is not None
                         and extrapolated is not None
@@ -759,6 +780,7 @@ def detect_valorant_rounds_ocr(
             else:
                 if raw_timer is None:
                     combat_raw_streak = 0
+                    combat_cand_ts = None
                 if extrapolated is not None:
                     timer = extrapolated  # 外推 1:1 走秒
                 else:
@@ -817,6 +839,7 @@ def detect_valorant_rounds_ocr(
             if end_banner or score_confirmed:
                 anchor = None
                 combat_raw_streak = 0
+                combat_cand_ts = None
                 post_settle_hold = True
                 post_settle_gap = False
                 label = "settle"
@@ -847,6 +870,17 @@ def detect_valorant_rounds_ocr(
                     post_settle_hold = False
                     post_settle_gap = False
                     label = "prep"
+                elif (
+                    timer_phase == "prep"
+                    and fsm._result_ts is not None
+                    and ts - fsm._result_ts >= _PREP_AFTER_RESULT_SEC
+                ):
+                    # 关键优化：距结算已超过 6 秒（结算画面倒计时 5s 已结束），
+                    # 连续两帧出现有效买枪准备计时器（<=45s），直接解除 post_settle_hold！
+                    # 不再强求必须出现 raw_timer is None 的 gap，防止买枪阶段被整段吞掉！
+                    post_settle_hold = False
+                    post_settle_gap = False
+                    label = "prep"
                 elif post_settle_gap and timer_raw and raw_timer is not None and _is_combat_timer(
                     raw_timer
                 ):
@@ -863,7 +897,7 @@ def detect_valorant_rounds_ocr(
                 label = timer_phase
             else:
                 label = "neutral"
-            labels.append((ts, label, timer, timer_raw))
+            labels.append((ts, label, timer, timer_raw, combat_cand_ts))
 
             _log.debug(
                 "ocr_label ts=%.1f label=%s timer=%s raw=%s anchor=%s hold=%s gap=%s",
@@ -883,9 +917,9 @@ def detect_valorant_rounds_ocr(
         return []
 
     # 循环先验平滑（帧级，仅删孤立 combat 噪点，不补缝——非游戏阶段透明）
-    smoothed = _apply_phase_cycle_prior([label for _, label, _, _ in labels])
-    for (ts, _, timer, timer_raw), label in zip(labels, smoothed, strict=True):
-        closed = fsm.feed(label, ts, timer, timer_raw=timer_raw)
+    smoothed = _apply_phase_cycle_prior([label for _, label, _, _, _ in labels])
+    for (ts, _, timer, timer_raw, cand_ts), label in zip(labels, smoothed, strict=True):
+        closed = fsm.feed(label, ts, timer, timer_raw=timer_raw, cand_ts=cand_ts)
         if closed:
             closed_rounds.extend(closed)
 
@@ -930,6 +964,7 @@ def detect_valorant_rounds_ocr(
     state["last_raw_ts"] = last_raw_ts
     state["combat_anchor"] = anchor
     state["combat_raw_streak"] = combat_raw_streak
+    state["combat_cand_ts"] = combat_cand_ts
     state["post_settle_hold"] = post_settle_hold
     state["post_settle_gap"] = post_settle_gap
     state["score_pending"] = score_pending

@@ -291,7 +291,16 @@ async def _process_export_job_impl(job):
     output_dir = job['output_dir']
     profile = job['profile']
     job_id = job['job_id']
-    _set_export_job_state(job_id, 'exporting', room_id=room_id, label=label, percent=0.0)
+    _set_export_job_state(
+        job_id,
+        'exporting',
+        room_id=room_id,
+        label=label,
+        percent=0.0,
+        export_start=export_start,
+        export_end=export_end,
+        precision=job.get('precision', 'exact'),
+    )
 
     await server.broadcast('clip_export_started', {'room_id': room_id, 'job_id': job_id})
 
@@ -307,9 +316,14 @@ async def _process_export_job_impl(job):
                 job_id, 'completed', room_id=room_id, label=label,
                 percent=100.0, output_path=output_path,
                 thumbnail_path=thumbnail_path or '', size_mb=float(size_mb or 0.0), error='',
+                export_start=export_start,
+                export_end=export_end,
+                precision=job.get('precision', 'exact'),
             )
             asyncio.run_coroutine_threadsafe(server.broadcast('clip_completed', {
                 'room_id': room_id, 'start': export_start, 'end': export_end,
+                'export_start': export_start, 'export_end': export_end,
+                'precision': job.get('precision', 'exact'),
                 'label': label, 'room_name': job.get('room_name', ''),
                 'thumbnail_path': thumbnail_path or '', 'output_path': output_path,
                 'job_id': job_id,
@@ -626,7 +640,7 @@ def register_export_handlers(
         job = {
             'room_id': room_id, 'start': export_start, 'end': export_end,
             'label': label, 'output_dir': output_dir, 'profile': profile,
-            'job_id': job_id, 'room_name': room_name,
+            'job_id': job_id, 'room_name': room_name, 'precision': precision,
         }
         try:
             _export_queue.put_nowait(job)  # type: ignore[union-attr]
@@ -634,10 +648,26 @@ def register_export_handlers(
             _log.warning("导出队列已满: room=%s, job=%s, qsize=%d",
                          room_id, job_id, _export_queue.qsize())  # type: ignore[union-attr]
             return {'success': False, 'error': '导出队列已满，请稍后重试'}
-        _set_export_job_state(job_id, 'queued', room_id=room_id, label=label, percent=0.0)
+        _set_export_job_state(
+            job_id,
+            'queued',
+            room_id=room_id,
+            label=label,
+            percent=0.0,
+            export_start=export_start,
+            export_end=export_end,
+            precision=precision,
+        )
         _log.debug("导出已入队: room=%s, job=%s, %.1f-%.1f, precision=%s, queue_size=%d",
                    room_id, job_id, export_start, export_end, precision, _export_queue.qsize())  # type: ignore[union-attr]
-        return {'success': True, 'queued': True, 'job_id': job_id, 'precision': precision}
+        return {
+            'success': True,
+            'queued': True,
+            'job_id': job_id,
+            'precision': precision,
+            'export_start': export_start,
+            'export_end': export_end,
+        }
 
     # 暴露 queue_export 供外部模块使用
     _queue_export_fn = queue_export
@@ -728,6 +758,8 @@ def register_export_handlers(
             'operation_id': operation_id,
             'queued': True,
             'precision': result.get('precision'),
+            'export_start': result.get('export_start'),
+            'export_end': result.get('export_end'),
         }
 
     @server.on('cancel_export')
