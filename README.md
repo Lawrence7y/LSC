@@ -2,7 +2,7 @@
 
 > 多直播间**录制 + 切片**一体化工具 —— 同时录制多视角直播，跨房间同步预览，一键标记、对齐、批量导出精彩片段。
 
-![version](https://img.shields.io/badge/version-v3.0.22-31B3AE)
+![version](https://img.shields.io/badge/version-v3.0.23-31B3AE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 [![Microsoft Store](https://get.microsoft.com/images/en-us/dark.svg)](https://apps.microsoft.com/detail/9NQWM5KPRWF1)
 ![license](https://img.shields.io/badge/license-GPL%20v2-blue)
@@ -300,6 +300,14 @@ cd lsc-electron
 ---
 
 ## 📜 版本历史
+
+### v3.0.23（2026-09-01）
+
+- **稳定性修复**：对齐锚点按每路音频捕获结束时刻修正，修复时间线 / 导出 / 剪映 6–7 秒错位
+- **录制回看**：时间线拖出直播 MSE 缓冲后自动切换到本地录制文件回放，支持按需 seek
+- **时间线**：1x 视图最左端恒定 00:00，不再因拖拽/精修右移
+- **持续分析**：OCR 边界精修、回合合并保护、收尾扫描锚定优化
+- **Microsoft Store**：添加商店徽章与自包含 AppX 构建说明
 
 ### v3.0.22（2026-08-14）
 
