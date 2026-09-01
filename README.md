@@ -2,7 +2,7 @@
 
 > 多直播间**录制 + 切片**一体化工具 —— 同时录制多视角直播，跨房间同步预览，一键标记、对齐、批量导出精彩片段。
 
-![version](https://img.shields.io/badge/version-v3.0.23-31B3AE)
+![version](https://img.shields.io/badge/version-1.0.11-31B3AE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 [![Microsoft Store](https://get.microsoft.com/images/en-us/dark.svg)](https://apps.microsoft.com/detail/9NQWM5KPRWF1)
 ![license](https://img.shields.io/badge/license-GPL%20v2-blue)
@@ -233,7 +233,7 @@ cd lsc-electron && npx tsc --noEmit   # TypeScript 类型检查
 | ② 标记路径 | 用户按 `i`/`o` 时刻 | `mark_in/out_wallclock`（单调时钟） |
 | ③ 录制流 | CDN → FFmpeg → 磁盘文件 | `recording_start_mono` |
 
-三条路径通过 `time.monotonic()` 统一锚定，导出时做差即可将预览标记精确映射到录制文件物理位置。v3.0.22 起支持 **预览 PTS 锚点**：公共轴零点取最早录制起点，播放头与切片不再错位，时间线最大值为真实会话时长。
+三条路径通过 `time.monotonic()` 统一锚定，导出时做差即可将预览标记精确映射到录制文件物理位置。自旧版 v3.0.22（已归档）起支持 **预览 PTS 锚点**：公共轴零点取最早录制起点，播放头与切片不再错位，时间线最大值为真实会话时长。
 
 ### 目录结构
 
@@ -301,7 +301,7 @@ cd lsc-electron
 
 ## 📜 版本历史
 
-### v3.0.23（2026-09-01）
+### v1.0.11（2026-09-01）
 
 - **稳定性修复**：对齐锚点按每路音频捕获结束时刻修正，修复时间线 / 导出 / 剪映 6–7 秒错位
 - **录制回看**：时间线拖出直播 MSE 缓冲后自动切换到本地录制文件回放，支持按需 seek
@@ -309,7 +309,7 @@ cd lsc-electron
 - **持续分析**：OCR 边界精修、回合合并保护、收尾扫描锚定优化
 - **Microsoft Store**：添加商店徽章与自包含 AppX 构建说明
 
-### v3.0.22（2026-08-14）
+### 旧版 v3.0.22（已降级存档，不再作为当前版本号）
 
 - **时间线锚点系统**：公共轴零点取最早录制起点，MSE 预览 PTS 与录制媒体起点统一锚定，修复播放头与切片错位、时间线默认最大值异常
 - **剪映草稿增强**：草稿生成与校验逻辑重构，支持更多切片场景
@@ -317,13 +317,13 @@ cd lsc-electron
 - **对齐链路**：`preview_current_time` 元数据随对齐请求上报，旧数据自动退化兼容
 - 新增 `docs/CERTIFICATION_DESCRIPTION.md` 认证说明
 
-### v3.0.21（2026-08-14）
+### 旧版 v3.0.21（已降级存档，不再作为当前版本号）
 
 - **稳定性（长期挂机）**：录制重连后台化、编排线程防死亡、导出防挂死（终态必达 + 6h 兜底）、OCR 抽帧子窗化（内存尖峰 330MB → 40MB）、MSE watchdog 恢复上限、心跳定时器泄漏修复、广播超时剔除、日志轮转、FFmpeg `-headers` 超长防御
 - **功能**：新手引导、设置页检查更新显示发布说明
 - **安装体验**：安装期依赖国内镜像、VC++ 运行库自动检测 / 升级、DirectML 不可用自动降级 CPU
 
-### v3.0.0（2026-07-28）
+### 旧版 v3.0.0（已降级存档，不再作为当前版本号）
 
 - **持续分析**：Valorant OCR 权威边界、相位调度、副房映射、待确认再导出
 - **页面优化**：工作台 UI 统一、Modal / 设置抽屉溢出修复、分析进度与导出摘要
