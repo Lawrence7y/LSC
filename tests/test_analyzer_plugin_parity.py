@@ -106,8 +106,9 @@ def test_adaptive_catchup_floor_is_45s():
     assert vp.MIN_CATCHUP_SEC == 45.0
     # 吞吐很好时仍不低于下限
     assert vp._adaptive_catchup_cap([3.0, 3.0, 3.0], kick_interval=5.0) == 45.0
-    # 无历史沿用 MAX
-    assert vp._adaptive_catchup_cap(None, kick_interval=5.0) == vp.MAX_CATCHUP_SEC
+    # 无历史用短窗，避免中途开分析一次吞掉数分钟已录内容
+    assert vp._adaptive_catchup_cap(None, kick_interval=5.0) == vp.MIN_CATCHUP_SEC
+    assert vp._adaptive_catchup_cap([], kick_interval=5.0) == vp.MIN_CATCHUP_SEC
     # 低吞吐时公式仍被下限托住（避免窗缩到无法覆盖 lookback 外新内容）
     assert vp._adaptive_catchup_cap([0.2], kick_interval=5.0) == 45.0
 

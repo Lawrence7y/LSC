@@ -7610,7 +7610,21 @@ def register_room_handlers(server, bridge):
                 )
                 if can_consume and _boundary_refine_pass:
                     scan_result['boundary_refine_pass'] = False
-                if can_consume and worker_error:
+                # 录制文件切换守卫：在途扫描完成时若录制文件已切换（如 URL 过期
+                # 主动重连），结果属于旧文件时间轴——游标写回会覆盖切换时的 0 重置
+                # （2026-09-01 实测：旧文件游标 84s 写回 → 收尾扫描反向区间 84-67
+                # 空扫）。丢弃陈旧结果，游标保持切换后的重置值。
+                _scanned_video = str(scan_result.get('video_path') or '')
+                _stale_scan_result = bool(
+                    _scanned_video and video_path and _scanned_video != video_path
+                )
+                if _stale_scan_result:
+                    _log.warning(
+                        "持续分析丢弃旧文件扫描结果（文件已切换）: room_id=%s, scanned=%s, current=%s",
+                        room_id, os.path.basename(_scanned_video), os.path.basename(video_path),
+                    )
+                    last_consumed_at = worker_completed_at
+                elif can_consume and worker_error:
                     last_consumed_at = worker_completed_at
                     scan_result['error'] = None
                     terminal_model_error = _is_model_contract_error(worker_error)
@@ -8086,6 +8100,14 @@ def register_room_handlers(server, bridge):
                             # 若有未闭合回合（open_tail/pending），则从该回合的 start 处扫描，
                             # 避免无脑减去 120s 倒退到已确认回合的中间部分，产生时间倒流和截断。
                             _fin_start = max(0.0, float(last_analyzed) - _OCR_FINALIZE_OVERLAP_SEC)
+                            if float(last_analyzed) > float(current_dur):
+                                # 游标超过新文件时长（切换守卫漏网时的兜底）：
+                                # 新文件视为未分析，从 0 全量收尾，禁止反向区间空扫
+                                _log.warning(
+                                    "持续分析收尾游标越界，改为全量收尾: room_id=%s, last_analyzed=%.1fs > dur=%.1fs",
+                                    room_id, float(last_analyzed), float(current_dur),
+                                )
+                                _fin_start = 0.0
                             if all_highlights:
                                 _last_h = all_highlights[-1]
                                 _last_end = float(_last_h.get("end", 0.0) or 0.0)

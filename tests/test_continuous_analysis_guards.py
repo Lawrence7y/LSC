@@ -327,8 +327,59 @@ def test_valorant_incremental_lookback_is_bounded() -> None:
     assert room_handler._VALORANT_MAX_CATCHUP_SEC > 0.0
 
 
+def test_first_scan_mid_recording_caps_window_instead_of_swallowing_file() -> None:
+    """中途开启持续分析时，首窗不得一次吞掉已录全部时长。
+
+    现场：停虎牙后给已录 ~248s 的抖音开分析，full 扫 0–248。
+    analyzed_duration 整窗结束前一直是 0，滞后随录制上涨，UI 像卡死。
+    无吞吐历史时应按 MIN_CATCHUP 切窗，让游标能每窗前进。
+    """
+    from lsc.analyzer.valorant_plugin import MIN_CATCHUP_SEC
+
+    scan_range, use_ocr, _, full_rescan = room_handler._continuous_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=0.0,
+        current_dur=248.0,
+        pressure={"level": "normal"},
+    )
+    assert use_ocr is True
+    assert scan_range[0] == 0.0
+    assert scan_range[1] == MIN_CATCHUP_SEC
+    assert scan_range[1] < 248.0
+    assert full_rescan is False
+
+
+def test_first_scan_of_short_recording_covers_all() -> None:
+    """已录短于 MIN_CATCHUP 时，首窗仍覆盖全部，可标 full。"""
+    scan_range, _, _, full_rescan = room_handler._continuous_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=0.0,
+        current_dur=30.0,
+        pressure={"level": "normal"},
+    )
+    assert scan_range == (0.0, 30.0)
+    assert full_rescan is True
+
+
+def test_known_throughput_can_still_take_large_catchup() -> None:
+    """有吞吐历史时仍允许放大追赶窗（上限 MAX 480s）。"""
+    from lsc.analyzer.valorant_plugin import MAX_CATCHUP_SEC, compute_valorant_scan_budget
+
+    scan_range, _, _, full = compute_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=100.0,
+        current_dur=3600.0,
+        pressure={"level": "normal"},
+        throughput_history=[10.0],
+        kick_interval=60.0,
+    )
+    assert scan_range[0] == 70.0
+    assert scan_range[1] == 100.0 + MAX_CATCHUP_SEC
+    assert full is False
+
+
 def test_continuous_valorant_budget_uses_first_full_scan_then_catchup_window() -> None:
-    """首次全量；之后从 last_analyzed 回看 30s 并向前追赶，禁止跳到尾部滑动窗。"""
+    """首窗受短追赶上限制；之后从 last_analyzed 回看 30s 并向前追赶，禁止跳到尾部滑动窗。"""
     first_range, first_ocr, _, first_full = room_handler._continuous_valorant_scan_budget(
         mode="valorant_round",
         last_analyzed=0.0,
@@ -348,14 +399,14 @@ def test_continuous_valorant_budget_uses_first_full_scan_then_catchup_window() -
         pressure={"level": "critical", "analysis_window_sec": 75, "degrade_analysis": True, "pause_analysis": True},
     )
 
-    assert (first_range, first_ocr, first_full) == ((0.0, 120.0), True, True)
-    # 回看 30s → 570，向前追赶到 720；不得变成 current-lookback=690 而跳过中段
-    assert (normal_range, normal_ocr, normal_full) == ((570.0, 720.0), True, False)
+    assert (first_range, first_ocr, first_full) == ((0.0, 45.0), True, False)
+    # 回看 30s → 570，无历史时向前追赶 MIN 45s → 645；不得变成 current-lookback=690 而跳过中段
+    assert (normal_range, normal_ocr, normal_full) == ((570.0, 645.0), True, False)
     # 纯 OCR 路径：pressure 不关 OCR
     assert critical_ocr is True
     assert critical_full is False
     assert critical_range[0] <= 600.0
-    assert critical_range[1] == 720.0
+    assert critical_range[1] == 645.0
 
 
 def test_continuous_valorant_budget_does_not_skip_middle_when_falling_behind() -> None:
@@ -370,9 +421,12 @@ def test_continuous_valorant_budget_does_not_skip_middle_when_falling_behind() -
         current_dur=277.0,
         pressure={"level": "normal", "analysis_window_sec": 240},
     )
+    from lsc.analyzer.valorant_plugin import MIN_CATCHUP_SEC
+
     assert scan_range[0] <= 25.0
-    assert scan_range[1] >= 277.0 - 1.0
-    # 旧逻辑 current-60=217 会跳过 25→217；新逻辑必须从 last_analyzed 回看覆盖中段
+    assert scan_range[1] > 25.0
+    # 无吞吐历史时按短窗追赶，不得跳到尾部，也不得一次吞到 277
+    assert scan_range[1] <= 25.0 + MIN_CATCHUP_SEC + 1.0
     assert scan_range[0] < 217.0
     assert scan_range[0] <= max(0.0, 25.0 - 30.0) + 1.0
 
@@ -394,7 +448,7 @@ def test_continuous_valorant_budget_does_not_expand_with_recording_length() -> N
     lookback = room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC
     max_catchup = room_handler._VALORANT_MAX_CATCHUP_SEC
     assert short_range[0] == max(0.0, 600.0 - lookback)
-    assert short_range[1] == 720.0
+    assert short_range[1] == 645.0
     assert long_range[0] == max(0.0, 600.0 - lookback)
     assert long_range[1] - long_range[0] <= max_catchup + lookback + 1.0
     assert long_range[1] < 3600.0
@@ -457,7 +511,7 @@ def test_valorant_round_scan_uses_catchup_window_after_first_scan() -> None:
         "valorant_round", 600.0, 720.0, {"level": "normal", "analysis_window_sec": 180}
     )
 
-    assert (scan_range, use_ocr, full_rescan) == ((570.0, 720.0), True, False)
+    assert (scan_range, use_ocr, full_rescan) == ((570.0, 645.0), True, False)
 
 
 def test_valorant_round_scan_only_first_pass_is_full() -> None:
@@ -468,11 +522,11 @@ def test_valorant_round_scan_only_first_pass_is_full() -> None:
         "valorant_round", 600.0, 720.0, {"level": "normal"}
     )
 
-    assert (first_range, first_full) == ((0.0, 120.0), True)
-    # 固定 lookback=30 → max(0, 600-30)=570，向前追赶到 720
+    assert (first_range, first_full) == ((0.0, 45.0), False)
+    # 固定 lookback=30 → max(0, 600-30)=570，无历史时向前追赶 MIN 45s → 645
     assert later_range[0] == max(0.0, 600.0 - room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC)
     assert later_range[0] <= 600.0
-    assert later_range[1] == 720.0
+    assert later_range[1] == 645.0
     assert later_full is False
     assert first_ocr is True
     assert later_ocr is True

@@ -21,16 +21,18 @@ def _adaptive_catchup_cap(
     throughput_history: list[float] | None,
     kick_interval: float,
 ) -> float:
-    """自适应追赶上限：夹在 [MIN_CATCHUP_SEC, MAX_CATCHUP_SEC]，无历史时沿用默认 480s。
+    """自适应追赶上限：夹在 [MIN_CATCHUP_SEC, MAX_CATCHUP_SEC]。
 
-    throughput_history：近 N 次扫描吞吐（媒体秒/墙钟秒）。
-    目标：追赶窗按 avg_throughput × kick_interval × 1.5 收缩，使单窗在间隔内可完成。
+    无吞吐历史时用 MIN（短窗），避免中途开分析一次吞掉数分钟已录内容。
+    有历史后按 avg_throughput × kick_interval × 1.5 放大，但仍不超过 MAX。
     """
     if not throughput_history:
-        return MAX_CATCHUP_SEC
+        # 无历史时用短窗，而不是 MAX。中途开分析时 last_analyzed=0，
+        # 若一次吞掉已录全部时长，analyzed_duration 会卡在 0 直到整窗 OCR 结束。
+        return MIN_CATCHUP_SEC
     history = [float(v) for v in throughput_history if float(v) > 0.0]
     if not history:
-        return MAX_CATCHUP_SEC
+        return MIN_CATCHUP_SEC
     avg = sum(history) / len(history)
     return min(
         MAX_CATCHUP_SEC,
@@ -57,22 +59,25 @@ def compute_valorant_scan_budget(
 ) -> tuple[tuple[float, float], bool, int, bool]:
     """增量扫描预算：从已分析点回看 lookback 再向前追赶，绝不跳窗漏扫。
 
-    throughput_history：近 N 次扫描吞吐（媒体秒/墙钟秒），用于自适应收缩追赶窗，
-    打破「滞后 → 窗更大 → 更慢 → 滞后更大」的反馈环。
-    kick_interval：两次扫描 kick 的名义间隔（秒）；追赶窗按
-    avg_throughput × kick_interval × 1.5 收缩，目标单窗在 ~1.5×kick_interval 内完成。
+    首窗（last_analyzed<=0）同样受 catchup_cap 约束，禁止一次扫完整场已录内容。
+    throughput_history：近 N 次扫描吞吐（媒体秒/墙钟秒），用于自适应窗口。
+    kick_interval：两次扫描 kick 的名义间隔（秒）。
     """
     del pressure
-    full_rescan = last_analyzed <= 0.0
-    if full_rescan:
+    last = float(last_analyzed)
+    dur = float(current_dur)
+    catchup_cap = _adaptive_catchup_cap(throughput_history, kick_interval)
+    if last <= 0.0:
         scan_start = 0.0
-        scan_end = float(current_dur)
+        scan_end = min(dur, catchup_cap)
+        # 只有首窗已经覆盖当前全部已录内容时才叫 full；中途开分析要切窗追赶。
+        full_rescan = scan_end >= dur - 0.5
     else:
-        scan_start = max(0.0, float(last_analyzed) - INCREMENTAL_LOOKBACK_SEC)
-        catchup_cap = _adaptive_catchup_cap(throughput_history, kick_interval)
-        scan_end = min(float(current_dur), float(last_analyzed) + catchup_cap)
+        scan_start = max(0.0, last - INCREMENTAL_LOOKBACK_SEC)
+        scan_end = min(dur, last + catchup_cap)
         if scan_end < scan_start:
-            scan_end = float(current_dur)
+            scan_end = dur
+        full_rescan = False
     scan_range = (round(scan_start, 3), round(float(scan_end), 3))
     scan_duration = max(1.0, scan_range[1] - scan_range[0])
     timeout = window_scan_timeout(scan_duration, use_ocr=True)
