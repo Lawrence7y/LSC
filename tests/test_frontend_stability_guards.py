@@ -426,8 +426,8 @@ def test_preview_audio_aligner_records_capture_failure_reasons() -> None:
 
 
 def test_backend_alignment_handler_reads_preview_diagnostics() -> None:
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    handler_body = source.split("@server.on('align_preview_audio')", 1)[1].split("@server.on('export_clip')", 1)[0]
+    source = (ROOT / "python-backend/handlers/alignment_handlers.py").read_text(encoding="utf-8")
+    handler_body = source.split("@server.on('align_preview_audio')", 1)[1]
 
     assert "diagnostics" in handler_body
     assert "ready_state" in handler_body
@@ -435,12 +435,13 @@ def test_backend_alignment_handler_reads_preview_diagnostics() -> None:
     assert "rms" in handler_body
     assert "sample_count" in handler_body
     assert "capture_reason" in handler_body
-    assert "pcm_base64" not in handler_body.split("diagnostics", 1)[1].split("_align_log.info", 1)[0]
+    diag_log = handler_body.split('预览音频诊断', 1)[1].split(")", 1)[0]
+    assert "pcm_base64" not in diag_log
 
 
 def test_low_confidence_align_does_not_write_group_for_failed_rooms() -> None:
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    handler_body = source.split("@server.on('align_preview_audio')", 1)[1].split("@server.on('export_clip')", 1)[0]
+    source = (ROOT / "python-backend/handlers/alignment_handlers.py").read_text(encoding="utf-8")
+    handler_body = source.split("@server.on('align_preview_audio')", 1)[1]
 
     assert "align_group_id" in handler_body
     # 仅可信 offset（≥0.3）写入 group；可信不足 2 路时不写 group
@@ -744,14 +745,15 @@ def test_workbench_optimistically_updates_connect_record_and_mute() -> None:
 
 def test_room_handler_mute_awaits_before_broadcast_and_exposes_recording_starting() -> None:
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    rec_src = (ROOT / "python-backend/handlers/recording_handlers.py").read_text(encoding="utf-8")
     mute_body = source.split("async def handle_set_preview_muted(data):", 1)[1].split("@server.on(", 1)[0]
     assert "bridge.manager.call(manager.set_preview_muted" in mute_body
     assert "bridge.manager.submit(manager.set_preview_muted" not in mute_body
     assert "_broadcast_rooms(force=True)" in mute_body
     assert "'is_recording_starting': room_id in _recording_starting" in source
-    start_body = source.split("async def handle_start_recording(data):", 1)[1].split("@server.on('stop_recording')", 1)[0]
-    assert "_recording_starting.add(room_id)" in start_body
-    assert "_broadcast_rooms(force=True)" in start_body
+    start_body = rec_src.split("async def handle_start_recording(data):", 1)[1].split("@server.on('stop_recording')", 1)[0]
+    assert "recording_starting.add(room_id)" in start_body
+    assert "broadcast_rooms(force=True)" in start_body
 
 
 def test_workbench_does_not_auto_disconnect_on_missing_is_live() -> None:
@@ -908,12 +910,12 @@ def test_connect_does_not_restore_persisted_rooms() -> None:
 
 def test_recording_queue_broadcast_before_semaphore() -> None:
     """多路开录进入 semaphore 前应广播 recording_queue 含 position/waiting。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    source = (ROOT / "python-backend/handlers/recording_handlers.py").read_text(encoding="utf-8")
     start_body = source.split("async def handle_start_recording(data):", 1)[1].split("@server.on('stop_recording')", 1)[0]
     assert "recording_queue" in start_body
     assert "position" in start_body
     assert "waiting" in start_body
-    assert "_recording_semaphore" in start_body
+    assert "recording_semaphore" in start_body
 
 
 def test_room_card_distinguishes_recording_queue_states() -> None:

@@ -669,14 +669,14 @@ def test_derive_round_signals_uses_energy_fields_not_score() -> None:
 
 def test_start_continuous_analysis_validates_off_event_loop() -> None:
     """start_continuous_analysis 的 wait_for_file 校验不得在 event loop 线程里 time.sleep。"""
-    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    src = (ROOT / "python-backend/handlers/analysis_handlers.py").read_text(encoding="utf-8")
     handler = src.split("async def handle_start_continuous_analysis", 1)[1].split(
         "@server.on(", 1
     )[0]
-    assert "_validate_synced_analysis_targets" in handler
+    assert "validate_synced_analysis_targets" in handler
     assert "run_in_executor" in handler
     # 校验调用须落在 executor 提交路径内，禁止裸同步调用阻塞 asyncio
-    validate_idx = handler.find("_validate_synced_analysis_targets")
+    validate_idx = handler.find("validate_synced_analysis_targets")
     window = handler[max(0, validate_idx - 400) : validate_idx]
     assert "run_in_executor" in window
 
@@ -929,7 +929,7 @@ def test_list_only_min_duration_allows_short_hybrid_rounds() -> None:
 
 def test_stop_handler_sets_stopping_not_stopped() -> None:
     """stop 响应须返回 stopping，并在 handler 内广播 stopping 阶段。"""
-    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    src = (ROOT / "python-backend/handlers/analysis_handlers.py").read_text(encoding="utf-8")
     stop_fn = src.split("async def handle_stop_continuous_analysis", 1)[1].split(
         "@server.on('get_continuous_analysis_status')", 1
     )[0]
@@ -954,7 +954,7 @@ def test_worker_stop_has_hard_timeout_constant() -> None:
 
 
 def test_start_rejects_while_stopping() -> None:
-    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    src = (ROOT / "python-backend/handlers/analysis_handlers.py").read_text(encoding="utf-8")
     start_fn = src.split("async def handle_start_continuous_analysis", 1)[1].split(
         "@server.on('stop_continuous_analysis')", 1
     )[0]

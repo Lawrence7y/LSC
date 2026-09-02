@@ -860,13 +860,12 @@ def test_recording_history_capped_on_load():
 
 
 def test_recording_history_capped_on_append():
-    """Append site must trim when exceeding _MAX_RECORDING_HISTORY (#18)."""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    """Append site must trim when exceeding max_recording_history (#18)."""
+    source = (ROOT / "python-backend/handlers/recording_handlers.py").read_text(encoding="utf-8")
     snippet = source.split("recording_history.append", 1)[1].split("\n", 15)
     joined = "\n".join(snippet)
-    assert "_MAX_RECORDING_HISTORY" in joined
+    assert "max_recording_history" in joined
     assert "del recording_history[" in joined
-
 
 # ── #17 regression: recording_history lock ─────────────────────────
 
