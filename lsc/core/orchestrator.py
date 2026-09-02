@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 import queue
-import re
 import shutil
 import threading
 import time
@@ -27,6 +26,11 @@ from lsc.config import (
     load_config,
 )
 from lsc.core.events import EventBus
+from lsc.core.recording_layout import (
+    finalize_room_recording,
+    recording_in_progress_path,
+    room_recording_dir,
+)
 from lsc.core.services.ingest_registry import get_shared_ingest_registry
 from lsc.core.services.recording_service import RecordingService
 from lsc.core.services.timeline_service import get_timeline_service
@@ -271,20 +275,14 @@ def _heal_connected_flag(room: RoomSession) -> bool:
 
 
 def _make_room_output_dir(base_dir: str, room: RoomSession) -> str:
-    """生成可读的多房间录制子目录名，避免纯 uuid 难以辨认。
-
-    格式: {platform}_{streamer}_{room_id_short}
-    非法文件名字符会被替换为下划线，并以 room_id 后 6 位保证唯一性。
-    """
-    platform = re.sub(r"[^\w\-]", "_", (room.platform or "unknown")).strip("_")[:20]
-    streamer = re.sub(r"[^\w\-]", "_", (room.streamer_name or "room")).strip("_")[:30]
-    short_id = room.room_id[-6:]
-    name = f"{platform}_{streamer}_{short_id}"
-    # 防止连续下划线或首尾下划线
-    name = re.sub(r"_+", "_", name).strip("_")
-    if not name:
-        name = f"room_{short_id}"
-    return os.path.join(base_dir, name)
+    """主播名子目录；已存在则复用，不再追加 _1/_2。"""
+    return room_recording_dir(
+        base_dir,
+        streamer_name=room.streamer_name or "",
+        stream_title=room.stream_title or "",
+        room_id=room.room_id,
+        bundle_dir=getattr(room, "output_bundle_dir", "") or "",
+    )
 
 
 class SizeUpdateJob:
@@ -2367,6 +2365,7 @@ class RoomOrchestrator:
                     )
                 room.align_group_id = ""
                 room.content_offset = 0.0
+                room.output_bundle_dir = ""
 
         controller = room.controller
         if controller is None:
@@ -2431,21 +2430,14 @@ class RoomOrchestrator:
         input_args = controller.input_args
         _log.info("[录制诊断] stream refreshed, stream_url=%s", bool(stream_url))
 
-        # Per-room output directory:
-        #   - Uses a readable name (platform_streamer_shortid) instead of a raw UUID.
-        #   - Appends a numeric suffix if the directory already exists, which can
-        #     happen when two rooms point at the same streamer/short_id combo.
-        #   - Falls back to ~/.lsc/output on OSError (e.g. sandboxed environments).
+        # Per-room output directory: {output}/{streamer}/，已存在则复用。
+        # 新开录（非重连）清掉上一场对齐组合目录，避免新录像写进旧的 A+B 文件夹。
         if room.is_reconnecting and room.reconnect_output_dir and os.path.isdir(room.reconnect_output_dir):
             room_output_dir = room.reconnect_output_dir
         else:
+            if not room.is_reconnecting:
+                room.output_bundle_dir = ""
             room_output_dir = _make_room_output_dir(output_dir, room)
-            # 若可读目录名已存在（同名主播+同 short_id 概率极低），追加序号避免覆盖
-            original_room_output_dir = room_output_dir
-            suffix = 1
-            while os.path.exists(room_output_dir):
-                room_output_dir = f"{original_room_output_dir}_{suffix}"
-                suffix += 1
         try:
             os.makedirs(room_output_dir, exist_ok=True)
         except OSError:
@@ -2472,7 +2464,7 @@ class RoomOrchestrator:
             media_start_mono = shared_media_start
             room.is_recording = True
             room.record_output_path = output_path
-            room.record_started_at = keep_started_at or datetime.now()
+            room.record_started_at = keep_started_at or room.record_started_at or datetime.now()
             # 共享进样模式也需要同步 controller.video_path，否则导出时找不到文件
             if controller is not None:
                 controller.video_path = output_path
@@ -2545,7 +2537,7 @@ class RoomOrchestrator:
         _log.info("[录制诊断] start_recording_with_crf returned ok=%s, error_msg=%s", ok, error_msg)
         room.is_recording = ok
         room.record_output_path = output_path
-        room.record_started_at = (keep_started_at or datetime.now()) if ok else None
+        room.record_started_at = (keep_started_at or room.record_started_at or datetime.now()) if ok else None
         if ok:
             room.recording_start_mono = getattr(controller, 'recording_start_mono', 0.0) or _time.monotonic()
             room.recording_media_start_mono = None
@@ -2655,9 +2647,10 @@ class RoomOrchestrator:
         if not getattr(cfg, "shared_ingest_enabled", False) and not use_v2_ingest:
             return "", 0.0, ""
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_suffix = uuid4().hex[:6]
-        output_path = os.path.join(room_output_dir, f"recording_{timestamp}_{unique_suffix}.mp4")
+        started_at = room.record_started_at if room.is_reconnecting and room.record_started_at else datetime.now()
+        if room.record_started_at is None:
+            room.record_started_at = started_at
+        output_path = recording_in_progress_path(room_output_dir, started_at)
         headers = {}
         if room.stream_info is not None:
             headers = dict(getattr(room.stream_info, "headers", {}) or {})
@@ -2792,6 +2785,31 @@ class RoomOrchestrator:
         _log.warning("shared ingest recording failed room=%s: %s", room.room_id, result_error)
         return "", 0.0, str(result_error)
 
+    def _finalize_and_commit_recording(self, room: RoomSession, output_path: str) -> str:
+        """停录后把「录制中」改名为时间至时间，若已对齐则搬进组合目录。"""
+        if not output_path:
+            return ""
+        last_error: OSError | None = None
+        for _attempt in range(8):
+            try:
+                new_path = finalize_room_recording(room, output_path)
+                room.record_output_path = new_path
+                controller = room.controller
+                if controller is not None and getattr(controller, "video_path", None):
+                    controller.video_path = new_path
+                return new_path
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.4)
+        _log.warning(
+            "finalize recording layout failed room=%s path=%s: %s",
+            room.room_id,
+            output_path,
+            last_error,
+        )
+        room.record_output_path = output_path
+        return output_path
+
     def stop_recording(self, room_id: str) -> bool:
         """Stop FFmpeg recording for a room and reset reconnect state.
 
@@ -2823,6 +2841,8 @@ class RoomOrchestrator:
                 shared_ingest.stop_recording_sink(reason="manager stop recording")
             if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
                 registry.stop_room(room_id, reason="manager stop recording")
+            if output_path:
+                output_path = self._finalize_and_commit_recording(room, output_path)
             room.is_recording = False
             room.is_reconnecting = False
             room.record_started_at = None
@@ -2835,6 +2855,8 @@ class RoomOrchestrator:
         if controller is None:
             return False
         ok, _size_mb, output_path = controller.stop_recording()
+        if output_path:
+            output_path = self._finalize_and_commit_recording(room, output_path)
         room.is_recording = False
         room.is_reconnecting = False
         room.record_started_at = None
@@ -2880,6 +2902,8 @@ class RoomOrchestrator:
                 shared_ingest.stop_recording_sink(reason="manager async stop recording")
             if shared_ingest.is_stopped or shared_ingest.preview_subscribers <= 0:
                 registry.stop_room(room_id, reason="manager async stop recording")
+            if output_path:
+                output_path = self._finalize_and_commit_recording(room, output_path)
             room.is_recording = False
             room.is_reconnecting = False
             room.record_started_at = None
@@ -2892,6 +2916,8 @@ class RoomOrchestrator:
         if controller is None:
             return False
         output_path = room.record_output_path or ""
+        started_at = room.record_started_at
+        bundle_dir = getattr(room, "output_bundle_dir", "") or ""
         controller.stop_recording_async()
         room.is_recording = False
         room.is_reconnecting = False
@@ -2901,6 +2927,27 @@ class RoomOrchestrator:
         self._dirty_recording = True
         if output_path:
             room.record_output_path = output_path
+            def _delayed_finalize() -> None:
+                time.sleep(1.5)
+
+                def _apply() -> bool:
+                    room2 = self.get_room(room_id)
+                    if room2 is None:
+                        return False
+                    if room2.record_started_at is None:
+                        room2.record_started_at = started_at
+                    if bundle_dir and not getattr(room2, "output_bundle_dir", ""):
+                        room2.output_bundle_dir = bundle_dir
+                    self._finalize_and_commit_recording(room2, output_path)
+                    room2.record_started_at = None
+                    return True
+
+                try:
+                    self.call(_apply)
+                except Exception as exc:
+                    _log.warning("delayed recording finalize failed room=%s: %s", room_id, exc)
+
+            self._submit_worker(_delayed_finalize)
             probe_fn = getattr(controller, "probe_video_duration", None)
             if callable(probe_fn):
                 def _on_probed(duration: float) -> None:

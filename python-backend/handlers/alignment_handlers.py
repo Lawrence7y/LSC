@@ -9,12 +9,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 
 import numpy as np
 from handlers.timeline_handlers import timeline_to_dict
+from handlers.room_utils import expand_user_path
+from persistence import SETTINGS_FILE
 
+from lsc.core.recording_layout import bind_rooms_to_bundle
 from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
     get_timeline_service,
@@ -26,6 +31,22 @@ _ALIGN_COMPUTE_TIMEOUT_SEC = 20.0
 _MIN_ALIGN_SAMPLE_RATE = 8_000
 _MAX_ALIGN_SAMPLE_RATE = 48_000
 _MAX_ALIGN_DURATION_SEC = 15
+
+
+def _settings_output_dir() -> str:
+    default = os.path.join(os.path.expanduser("~"), "LSC", "output")
+    try:
+        payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        raw = payload.get("output_dir", "") if isinstance(payload, dict) else ""
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        raw = ""
+    return expand_user_path(raw or default)
+
+
+def _clear_room_alignment(room) -> None:
+    room.align_group_id = ""
+    room.content_offset = 0.0
+    room.output_bundle_dir = ""
 
 
 def _epoch_ms_to_mono(epoch_ms: float) -> float:
@@ -312,6 +333,7 @@ def register_alignment_handlers(
                     if score < _ALIGN_TRUST_THRESHOLD:
                         room.content_offset = 0.0
                         room.align_group_id = ''
+                        room.output_bundle_dir = ''
                         continue
                     room.content_offset = float(offset)
                     room.align_group_id = group_id
@@ -327,6 +349,14 @@ def register_alignment_handlers(
                         'preview_current_time': preview_cur_time.get(rid, 0.0),
                         'preview_capture_mono': preview_capture_mono.get(rid, 0.0),
                     }
+
+                bundled = [
+                    manager.get_room(rid)
+                    for rid in trusted
+                    if manager.get_room(rid) is not None
+                ]
+                if len(bundled) >= 2:
+                    bind_rooms_to_bundle(bundled, _settings_output_dir())
 
                 snapshots = build_room_snapshots_from_align(
                     reference_room_id,
@@ -370,8 +400,7 @@ def register_alignment_handlers(
                             room = manager.get_room(rid)
                             if room is None:
                                 continue
-                            room.align_group_id = ''
-                            room.content_offset = 0.0
+                            _clear_room_alignment(room)
                         return True
 
                     try:

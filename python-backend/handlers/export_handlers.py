@@ -19,6 +19,7 @@ import time
 from typing import Any
 
 from lsc.config import ExportProfile
+from lsc.core.recording_layout import resolve_clip_output_dir
 from lsc.core.services.mse_streamer import _check_nvenc
 from lsc.core.services.resource_monitor import get_resource_pressure
 from lsc.utils.error_messages import humanize_error
@@ -633,6 +634,7 @@ def register_export_handlers(
         output_dir = expand_user_path(
             settings.get('output_dir', os.path.join(os.path.expanduser('~'), 'LSC', 'output'))
         )
+        output_dir = resolve_clip_output_dir(room, output_dir)
 
         if not job_id:
             job_id = f"q-{int(time.time() * 1000)}-{room_id[:6]}"

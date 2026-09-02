@@ -109,6 +109,8 @@ class RoomSession:
     # 多房间同步导出时校验：target_room_ids 的 align_group_id 必须一致且非空
     # 房间重连/录制重启时与 content_offset 一起重置
     align_group_id: str = ""
+    # 一键对齐成功后的组合输出根目录（{主播A}+{主播B}）。空串=未归组。
+    output_bundle_dir: str = ""
     # #7: set by disconnect_room, checked by _on_connect_finished
     disconnect_requested: bool = False
     # 重连取消事件：用户断开/删除房间时 set()，通知进行中的重连退出

@@ -596,9 +596,9 @@ class RecordingController:
             return False, "", encoder, "直播流地址为空"
 
         os.makedirs(output_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_suffix = uuid4().hex[:6]
-        output_path = os.path.join(output_dir, f"recording_{timestamp}_{unique_suffix}.mp4")
+        from lsc.core.recording_layout import recording_in_progress_path
+
+        output_path = recording_in_progress_path(output_dir, datetime.now())
 
         if input_args is None:
             input_args = []
