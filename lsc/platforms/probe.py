@@ -160,6 +160,10 @@ class ProbeService:
                     command,
                     capture_output=True,
                     text=True,
+                    # 媒体文件路径/FFmpeg 报错可能含任意 UTF-8 字节，禁止
+                    # 落入 GBK locale 解码（_readerthread UnicodeDecodeError）。
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=timeout,
                     check=False,
                 )

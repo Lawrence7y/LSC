@@ -3707,12 +3707,14 @@ class RoomOrchestrator:
                 self._dirty_recording = True
 
     def _do_proactive_reconnect(self, room: RoomSession) -> None:
-        """URL 过期前在 Qt 主线程重启录制（由 global tick 调用）。
+        """URL 过期前重启录制（由 global tick 在编排线程调用）。
 
-        失败时回退到常规重连流程（_attempt_recording_reconnect），
-        避免录制静默死亡。
+        重启落地段（URL 刷新 + FFmpeg 首帧探测，可达 10-30s）必须投递到
+        worker 池执行：编排线程内联跑 start_recording 会冻结全部
+        orchestrator.call（含预览恢复、广播快照），2026-09-01 22:56 全房
+        预览断流事故即此因。失败时回退到常规重连流程
+        （_attempt_recording_reconnect），避免录制静默死亡。
         """
-        reconnect_error = "流 URL 即将过期，主动刷新"
         try:
             registry = get_shared_ingest_registry()
             shared_ingest = registry.get(room.room_id)
@@ -3737,38 +3739,47 @@ class RoomOrchestrator:
                         controller.stop_recording()
                     except Exception as exc:
                         _log.warning("Proactive reconnect stop failed room=%s: %s", room.room_id, exc)
+        except Exception as exc:
+            # stop 阶段失败：立即回退常规重连，不复位 is_recording（同下方约定）
+            room.is_reconnecting = False
+            self._dirty_recording = True
+            _log.warning("Room %s proactive reconnect failed: %s, falling back to regular reconnect",
+                         room.room_id, exc)
+            self._start_recording_reconnect_thread(room, str(exc))
+            return
+
+        def _restart_on_worker() -> None:
+            try:
+                ok = self.start_recording(
+                    room.room_id,
+                    room.reconnect_output_dir,
+                    room.reconnect_encoder,
+                    room.reconnect_crf,
+                    param_mode=room.reconnect_param_mode,
+                    bitrate=room.reconnect_bitrate,
+                    bitrate_unit=room.reconnect_bitrate_unit,
+                    resolution=room.reconnect_resolution or None,
+                    framerate=room.reconnect_framerate or None,
+                    audio_bitrate=room.reconnect_audio_bitrate or None,
+                    _run_in_background=True,
+                )
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+            else:
+                error = room.last_error or "主动刷新录制失败"
             # 保持 is_recording=True：停止进样到新进程起来之间持续分析仍视为在录。
             # 启动失败由 start_recording / 常规重连回落再清标志。
-            ok = self.start_recording(
-                room.room_id,
-                room.reconnect_output_dir,
-                room.reconnect_encoder,
-                room.reconnect_crf,
-                param_mode=room.reconnect_param_mode,
-                bitrate=room.reconnect_bitrate,
-                bitrate_unit=room.reconnect_bitrate_unit,
-                resolution=room.reconnect_resolution or None,
-                framerate=room.reconnect_framerate or None,
-                audio_bitrate=room.reconnect_audio_bitrate or None,
-            )
+            room.is_reconnecting = False
+            self._dirty_recording = True
             if ok:
                 _log.info("Room %s proactive reconnect succeeded", room.room_id)
                 return
-            # 启动失败：记录错误并回退到常规重连流程
-            reconnect_error = room.last_error or "主动刷新录制失败"
             _log.warning("Room %s proactive reconnect failed: %s, falling back to regular reconnect",
-                         room.room_id, reconnect_error)
-        except Exception as exc:
-            reconnect_error = str(exc)
-            _log.warning("Room %s proactive reconnect failed: %s, falling back to regular reconnect",
-                         room.room_id, exc)
-        finally:
-            room.is_reconnecting = False
-            self._dirty_recording = True
+                         room.room_id, error)
+            self._start_recording_reconnect_thread(room, error)
 
-        # 回退到常规重连流程：通过 _attempt_recording_reconnect 进行指数退避重试
-        # 这样可以在 URL 刷新后仍失败时（如下播、网络抖动）继续尝试恢复
-        self._start_recording_reconnect_thread(room, reconnect_error)
+        self._worker_pool.submit(_restart_on_worker)
 
     def _start_recording_reconnect_thread(self, room: RoomSession, error_msg: str) -> bool:
         """调度录制重连（由 global tick 调用）。

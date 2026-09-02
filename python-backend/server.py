@@ -72,6 +72,13 @@ def _json_dumps(obj) -> str:
 
 
 class LSCWebSocketServer:
+    # 单次 send 超时只记为「变慢起点」，持续慢超 _SLOW_KICK_AFTER_SEC 才剔除。
+    # 渲染进程单次卡顿（React 大快照重渲染 / GC）会让 send 短暂超时——
+    # 2026-09-01 22:56 一次踢出导致唯一客户端断连、全部房间预览同时停滞，
+    # 因此禁止单次超时直接踢人；真正死连接由硬异常或 ping_timeout 兜底。
+    _SEND_TIMEOUT_SEC = 2.0
+    _SLOW_KICK_AFTER_SEC = 15.0
+
     def __init__(self, host: str = 'localhost', port: int = 19876, fallback_ports: list[int] | None = None):
         self.host = host
         self.port = port
@@ -81,6 +88,8 @@ class LSCWebSocketServer:
         self.connect_handlers: list[Callable] = []
         self._server = None
         self._bound_port: int | None = None
+        # client -> 首次发送超时的 monotonic 时刻；发送成功即清除
+        self._slow_since: dict[Any, float] = {}
 
     @property
     def bound_port(self) -> int | None:
@@ -272,7 +281,53 @@ class LSCWebSocketServer:
                     for t in pending:
                         t.cancel()
             self.clients.discard(websocket)
+            self._slow_since.pop(websocket, None)
             _log.info(f"Client disconnected. Total: {len(self.clients)}")
+
+    def _on_send_success(self, client) -> None:
+        """发送成功即清除变慢标记，避免历史卡顿累积误踢。"""
+        self._slow_since.pop(client, None)
+
+    def _on_send_timeout(self, client, label: str) -> None:
+        """超时只标记变慢起点；持续慢才剔除（见类常量注释）。"""
+        now = time.monotonic()
+        first = self._slow_since.setdefault(client, now)
+        if now - first < self._SLOW_KICK_AFTER_SEC:
+            _log.debug("Slow WebSocket client send (%s): stalled %.1fs, keeping connection",
+                       label, now - first)
+            return
+        self._slow_since.pop(client, None)
+        self.clients.discard(client)
+        _log.warning(
+            "Removed slow WebSocket client (%s): send stalled %.1fs > %ds",
+            label, now - first, self._SLOW_KICK_AFTER_SEC,
+        )
+
+    def _on_send_error(self, client, label: str) -> None:
+        """硬异常（连接已关闭/协议损坏）立即剔除。"""
+        self._slow_since.pop(client, None)
+        self.clients.discard(client)
+        _log.debug("Removed dead WebSocket client (%s)", label)
+
+    async def _send_all(self, message: str | bytes, label: str) -> None:
+        """向所有客户端发送一帧，并按超时/异常分类处理慢客户端。"""
+        if not self.clients:
+            return
+
+        async def _send_one(client):
+            try:
+                await asyncio.wait_for(client.send(message), timeout=self._SEND_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                self._on_send_timeout(client, label)
+            except Exception:
+                self._on_send_error(client, label)
+            else:
+                self._on_send_success(client)
+
+        await asyncio.gather(
+            *[_send_one(client) for client in list(self.clients)],
+            return_exceptions=True,
+        )
 
     async def broadcast(self, message_type: str, data: Any):
         """广播消息给所有客户端。
@@ -289,25 +344,7 @@ class LSCWebSocketServer:
             'data': safe_data
         })
 
-        # 发送并检测慢客户端，超时客户端移出广播集合
-        slow_clients: list = []
-        async def _send_with_timeout(client):
-            try:
-                await asyncio.wait_for(client.send(message), timeout=1.0)
-            except asyncio.TimeoutError:
-                slow_clients.append(client)
-            except Exception:
-                slow_clients.append(client)
-
-        await asyncio.gather(
-            *[_send_with_timeout(client) for client in self.clients],
-            return_exceptions=True,
-        )
-
-        # 移除慢客户端，避免单个客户端拖慢整个广播
-        for client in slow_clients:
-            self.clients.discard(client)
-            _log.warning("Removed slow WebSocket client (send timeout)")
+        await self._send_all(message, 'broadcast')
 
         # 高频消息不记录 INFO，确保 INFO 中 MSE 记录为 0
         _HIGH_FREQ_BROADCASTS = frozenset({
@@ -320,25 +357,7 @@ class LSCWebSocketServer:
 
     async def broadcast_bytes(self, payload: bytes) -> None:
         """广播原始二进制帧（用于 MSE fMP4，避免 base64）。"""
-        if not self.clients or not payload:
-            return
-        slow_clients: list = []
-        async def _send_with_timeout(client):
-            try:
-                await asyncio.wait_for(client.send(payload), timeout=1.0)
-            except asyncio.TimeoutError:
-                slow_clients.append(client)
-            except Exception:
-                slow_clients.append(client)
-
-        await asyncio.gather(
-            *[_send_with_timeout(client) for client in self.clients],
-            return_exceptions=True,
-        )
-
-        for client in slow_clients:
-            self.clients.discard(client)
-            _log.warning("Removed slow WebSocket client (send timeout, bytes)")
+        await self._send_all(payload, 'bytes')
 
     async def broadcast_mse(self, kind: str, room_id: str, payload: bytes) -> None:
         """广播 MSE init/segment 为二进制帧。"""

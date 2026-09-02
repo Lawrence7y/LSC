@@ -134,6 +134,13 @@ def hidden_run_kwargs(**extra: object) -> dict[str, object]:
         startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
         startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
         out.setdefault("startupinfo", startupinfo)
+    # Windows 中文系统 locale 编码是 GBK：text 模式下 FFmpeg/ffprobe 输出
+    # （版本构建信息、中文录制路径）按 UTF-8 解码，否则 _readerthread 抛
+    # UnicodeDecodeError 且 communicate() 拿不到输出（2026-09-01 依赖检查
+    # 路径 4 次崩溃的根因）。
+    if out.get("text") or out.get("universal_newlines"):
+        out.setdefault("encoding", "utf-8")
+        out.setdefault("errors", "replace")
     return out
 
 

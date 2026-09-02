@@ -768,6 +768,9 @@ Electron 应用使用 `electron-builder` 进行打包：
     *   **父进程存活 watchdog**：Electron 以 `LSC_PARENT_PID` 环境变量注入后端；`main.py` 主循环轮询父进程存活，父进程退出即触发 `stop()`（flush rooms.json 未落盘写入 + 正常停 FFmpeg）。Electron 侧 `killBackendAndWait` 轮询等待（≤4s）后再用进程树强杀兜底，防止 FFmpeg 僵尸进程残留挂载占用端口。
     *   POSIX 环境下先发 `SIGTERM`，如果 3 秒内未退出再调度 `SIGKILL`，采用非阻塞的轮询检测，防止同步忙等待阻塞 Electron UI 主线程。
     *   导出取消/录制停止等强杀 FFmpeg 的统一入口为 `lsc/utils/process_launcher.py: kill_process_tree()`（Windows `taskkill /T /F`；POSIX `SIGTERM → 3s → SIGKILL`），禁止直接 `proc.kill()`。
+*   **WS 慢客户端剔除契约**（2026-09-01 22:56 全房断流事故后收紧）：`server.py` 广播单次 send 超时（2s）**只记录变慢起点，禁止踢人**；持续慢超过 **15s** 才剔除，发送成功即清除标记，硬异常（连接已关）立即剔除。渲染进程单次卡顿（React 大快照重渲染/GC）曾致唯一客户端被 1s 超时踢出 → 全部房间预览同时停滞且恢复失败。
+*   **主动重连落地段禁止占用编排线程**：`_do_proactive_reconnect`（URL 过期主动刷新）的重启段（URL 刷新 + FFmpeg 首帧探测，可达 10-30s）必须投递 `self._worker_pool` 并以 `_run_in_background=True` 执行，与常规重连线程路径一致；编排线程内联执行会冻结全部 `orchestrator.call`（含预览恢复）直至 10s 超时。
+*   **subprocess 文本模式强制 UTF-8**：`hidden_run_kwargs` 对 text 模式自动注入 `encoding="utf-8", errors="replace"`；绕过该 helper 的 `subprocess.run(text=True)` 调用必须显式传 encoding，否则中文 Windows GBK locale 下 `_readerthread` 抛 `UnicodeDecodeError` 且 `communicate()` 拿不到输出。
 
 ### 11.4 错误处理与异常捕获规范
 

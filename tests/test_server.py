@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -258,6 +259,110 @@ class TestBroadcastQueue:
             assert "secret" not in str(sent)
         finally:
             loop.close()
+
+
+class TestSlowClientEviction:
+    """慢客户端剔除契约：单次超时不踢，持续慢才踢，死连接立即踢。
+
+    背景（2026-09-01 22:56 事故）：渲染进程一次卡顿触发 send 超时即被踢，
+    唯一客户端断连导致全部房间预览同时停滞且自动恢复失败。
+    """
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_single_timeout_keeps_client(self, monkeypatch):
+        monkeypatch.setattr(LSCWebSocketServer, "_SEND_TIMEOUT_SEC", 0.01)
+        srv = LSCWebSocketServer()
+
+        async def slow_send(_msg):
+            await asyncio.sleep(0.05)
+
+        client = MagicMock()
+        client.send = slow_send
+        srv.clients.add(client)
+
+        self._run(srv.broadcast("test", {"k": 1}))
+        assert client in srv.clients, "单次超时不得踢出客户端"
+        assert client in srv._slow_since, "超时应记录变慢起点"
+
+    def test_persistent_slow_client_kicked(self, monkeypatch):
+        monkeypatch.setattr(LSCWebSocketServer, "_SEND_TIMEOUT_SEC", 0.01)
+        monkeypatch.setattr(LSCWebSocketServer, "_SLOW_KICK_AFTER_SEC", 0.1)
+        srv = LSCWebSocketServer()
+
+        async def slow_send(_msg):
+            await asyncio.sleep(0.08)
+
+        client = MagicMock()
+        client.send = slow_send
+        srv.clients.add(client)
+
+        self._run(srv.broadcast("test", {"n": 1}))
+        assert client in srv.clients
+        # 模拟持续变慢：两次超时的时间差必须超过踢出窗口才判「持续慢」
+        time.sleep(0.12)
+        self._run(srv.broadcast("test", {"n": 2}))
+        assert client not in srv.clients, "持续慢超过窗口必须剔除"
+        assert client not in srv._slow_since
+
+    def test_success_resets_slow_mark(self, monkeypatch):
+        monkeypatch.setattr(LSCWebSocketServer, "_SEND_TIMEOUT_SEC", 0.01)
+        monkeypatch.setattr(LSCWebSocketServer, "_SLOW_KICK_AFTER_SEC", 0.1)
+        srv = LSCWebSocketServer()
+
+        gate = {"slow": True}
+
+        async def maybe_slow_send(_msg):
+            if gate["slow"]:
+                await asyncio.sleep(0.05)
+
+        client = MagicMock()
+        client.send = maybe_slow_send
+        srv.clients.add(client)
+
+        self._run(srv.broadcast("test", {"n": 1}))
+        assert client in srv._slow_since
+        gate["slow"] = False
+        self._run(srv.broadcast("test", {"n": 2}))
+        assert client not in srv._slow_since, "发送成功必须清除变慢标记"
+        self._run(srv.broadcast("test", {"n": 3}))
+        gate["slow"] = True
+        self._run(srv.broadcast("test", {"n": 4}))
+        assert client in srv.clients, "重置后再次短暂超时不应累计旧记录踢人"
+
+    def test_dead_client_kicked_immediately(self):
+        from websockets.exceptions import ConnectionClosed
+
+        srv = LSCWebSocketServer()
+
+        async def dead_send(_msg):
+            raise ConnectionClosed(None, None)
+
+        client = MagicMock()
+        client.send = dead_send
+        srv.clients.add(client)
+
+        self._run(srv.broadcast("test", {"k": 1}))
+        assert client not in srv.clients, "连接已死的客户端必须立即剔除"
+
+    def test_broadcast_bytes_uses_same_policy(self, monkeypatch):
+        monkeypatch.setattr(LSCWebSocketServer, "_SEND_TIMEOUT_SEC", 0.01)
+        srv = LSCWebSocketServer()
+
+        async def slow_send(_msg):
+            await asyncio.sleep(0.05)
+
+        client = MagicMock()
+        client.send = slow_send
+        srv.clients.add(client)
+
+        self._run(srv.broadcast_bytes(b"\x00\x01"))
+        assert client in srv.clients, "MSE 二进制帧路径同样禁止单次超时踢人"
 
 
 class _MockWebSocket:

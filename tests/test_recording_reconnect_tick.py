@@ -280,6 +280,9 @@ def test_proactive_reconnect_keeps_recording_flag_while_restarting(monkeypatch, 
 
     monkeypatch.setattr(manager._orch, "start_recording", fake_start)
     manager._orch._do_proactive_reconnect(room)
+    # 落地段（URL 刷新 + FFmpeg 首帧探测）已移入 worker 池以避免冻结编排线程；
+    # 测试中等待池排空后再断言，保证与同步语义等价。
+    manager._orch._worker_pool.shutdown(wait=True)
 
     assert room.controller.stop_calls == 1
     assert seen.get("is_recording") is True

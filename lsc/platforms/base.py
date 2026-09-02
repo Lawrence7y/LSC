@@ -298,9 +298,10 @@ def headers_to_ffmpeg_input_args(headers: dict[str, str] | None) -> list[str]:
     # FFmpeg libavformat/http.c 对 -headers 参数有硬限制：旧版（≤7.x）为
     # 32768 字节，新版（8.x master，如 BtbN 2026-08 内置构建）收紧到 4096
     # 字节，超限直接报 "overlong headers" + EINVAL（code -22）。
-    # 实测内置 FFmpeg：4000B 通过、8192B 触发。取 2048 保守上限，
-    # 兼容所有版本；UA/Referer 等小头（~200B）正常保留。
-    _FFMPEG_HEADERS_MAX_BYTES = 2048
+    # 实测内置 FFmpeg：4000B 通过、8192B 触发。取 3800 上限：低于 4096 留
+    # 余量，同时保住抖音/B站等平台的完整 Cookie（2067B 实测被 2048 误杀）；
+    # UA 走独立的 -user_agent，不占此预算。
+    _FFMPEG_HEADERS_MAX_BYTES = 3800
 
     def _sanitize_header_part(value: object) -> str:
         return str(value).replace("\r", "").replace("\n", "").strip()
@@ -340,8 +341,9 @@ def headers_to_ffmpeg_input_args(headers: dict[str, str] | None) -> list[str]:
             del trimmed[longest]
         if dropped:
             _log.warning(
-                "FFmpeg -headers 超长（%d 字节 > 32KB 限制），已丢弃: %s",
+                "FFmpeg -headers 超长（%d 字节 > %dB 限制），已丢弃: %s",
                 blob_bytes,
+                _FFMPEG_HEADERS_MAX_BYTES,
                 ", ".join(dropped),
             )
 
