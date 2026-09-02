@@ -44,13 +44,13 @@ LSC（Live Stream Clipper）是一个**多直播间录制与切片工具**，核
 │   ├── exporter/clip.py          # FFmpeg 切片导出
 │   ├── platforms/                # 平台适配器 (9 个)
 │   ├── recorder/capture.py       # FFmpeg 录制控制
-│   ├── gui/multi_room/manager.py # 多房间编排核心
+│   ├── core/orchestrator.py # RoomOrchestrator 编排核心（gui/... 为遗留）
 │   ├── utils/                    # 错误友好化、进程启动器
 │   └── config.py                 # LscConfig + ExportProfile
 ├── python-backend/               # 桥接服务层
 │   ├── main.py                   # 后端入口 (双线程)
 │   ├── server.py                 # WebSocket 服务器
-│   ├── message_bridge.py         # Qt 信号槽桥接
+│   ├── broadcast_hub.py         # 线程安全 FIFO 广播队列
 │   ├── persistence.py            # rooms.json 持久化
 │   ├── handlers/room_handler.py  # WebSocket 指令处理
 │   └── settings.json             # 运行时设置
@@ -92,7 +92,7 @@ LSC（Live Stream Clipper）是一个**多直播间录制与切片工具**，核
 │    React + TS + Zustand                                     │
 │    职责：UI 交互、MSE 预览播放器、快捷键、导出队列管理         │
 └──────────────────────────┬──────────────────────────────────┘
-                           │ WebSocket (localhost:19876~19880)
+                           │ WebSocket (localhost:9876，回退 19877~19880)
 ┌──────────────────────────┴──────────────────────────────────┐
 │ 2. 桥接与服务层 (python-backend/)                           │
 │    RoomOrchestrator 编排线程 + 工作线程 (WebSocket)           │
@@ -172,7 +172,7 @@ LSC（Live Stream Clipper）是一个**多直播间录制与切片工具**，核
 
 **位置**：`python-backend/server.py:193-213`
 
-主端口 `19876` 被占用时自动尝试 `19877 → 19878 → 19879 → 19880`。`_bound_port` 记录实际端口，后端启动时打印 `WebSocket server ready at ws://localhost:PORT`，Electron 主进程通过 stdout 正则匹配捕获实际端口。
+主端口 `9876`（`main.py` 显式传入；`server.py` 类默认仍为 19876），占用时自动尝试 `19877 → 19878 → 19879 → 19880`。`_bound_port` 记录实际端口，后端启动时打印 `WebSocket server ready at ws://localhost:PORT`，Electron 主进程通过 stdout 正则匹配捕获实际端口。
 
 ---
 

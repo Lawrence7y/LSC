@@ -29,7 +29,7 @@
 - call() 的『超时=结果未知』语义在注释与 handler 层（4312 附近注释）被显式贯彻，禁止盲目重试重复副作用
 
 **问题/风险**：
-- ports 不一致（待核实）：server.py 全局 `server=LSCWebSocketServer()` 默认 port=19876，主入口 main.py 另建 port=9876 的实例，代码存在两套 WS 引导路径（server.main() vs LSCWebSocketBackend），易留双端口/双广播源隐患
+- ports 不一致（已确认）：server.py 全局 `server=LSCWebSocketServer()` 默认 port=19876，主入口 main.py 另建 port=9876 的实例，代码存在两套 WS 引导路径（server.main() vs LSCWebSocketBackend），易留双端口/双广播源隐患；建议收敛到单一常量
 - call() 超时默认 10s，但 handler 大量用 run_in_executor(_bridge_executor, …) 包裹调用，桥接线程池(×8)与编排队列(1024)两层限流；高并发时 call 直接抛 too busy 而被 handler 捕获返回 error，无重试语义，需调用方自我处理
 - EventBus emit 强制编排线程，但 BroadcastHub 的 queue_broadcast 可在任意线程调用并假定线程安全——依赖 Python queue 与 notify 的 loop.call_soon_threadsafe，若 loop 关闭仅 debug 级日志，广播可能静默丢失
 - rooms_updated 节流 _RoomsThrottle 状态与 drain coalesce 两处独立实现，且 force 路径依赖取消 _flush task，代码在 _pending/_last_send_time 有手工重置，维护成本偏高（潜在竞态窗口）
@@ -231,12 +231,12 @@
 - analyzer 层纯 OCR 检测器与 room_handler 回合合并/入列出点契约(boundary_source/round_key/confirm_status)严格对应，边界稳定 key(round-{start/10})吸收 OCR 漂移
 
 **问题/风险**：
-- 代码重复+注册覆盖风险：room_handler.py L8382/8568 仍自带 @server.on('start_continuous_analysis'/'stop_continuous_analysis') 实现，但 register_analysis_handlers(L8887) 在函数体后段执行，server.on 用 handlers[type]=fn 覆盖注册，room_handler 两份实为死代码且双份易漂移（已读 server.py:93 确认覆盖语义）
+- 代码重复+注册覆盖风险：room_handler.py 曾自带 @server.on('start_continuous_analysis'/'stop_continuous_analysis') 等 16 条死路由，被 register_analysis_handlers 等子模块后注册覆盖；2026-09 已删除死体（原 L8382/8568，实际 L8485/8671 等），守卫测试同步迁移到子模块
 - detect_valorant_rounds_ocr 非严格纯函数：函数尾部读写调用方传入的 state/runtime_state dict（含读 last_processed_ts、回写 ocr_fsm/combat_anchor/score_pending 等 20+ 键），与注释『会话状态放 state dict，禁止写实例字段』的无状态契约有张力，共享状态全靠调用约定（valorant_ocr_rounds.py:639-940）
 - scene 回退链路（scene_analysis.run_scene_analysis + 音频 RMS/OCR 补充）与 sound_detector 属遗留分支，持续分析主路径不再使用但仍保留近 900 行；generic_plugin.scan_window 恒返回 []，plan 只更新游标，是明显技术债
 - worker 超时结构复杂：run_in_executor 外层再包 asyncio.wait_for(shield(fut)) 两层嵌套，超时后仍须等线程经 cancel_check 释放 semaphore，TimeoutError 语义易误读、急停路径易延滞（room_handler.py:6993-7021）
 
-**总结**：持续分析子系统以纯 OCR+相位状态机精确切分 Valorant 回合，产消双向循环与多房映射防御设计扎实、实时与精度平衡良好；主要技术债是 room_handler 与 analysis_handlers 的 handler 重复注册死代码及 scene/sound 遗留分支。
+**总结**：持续分析子系统以纯 OCR+相位状态机精确切分 Valorant 回合，产消双向循环与多房映射防御设计扎实、实时与精度平衡良好；handler 重复注册死代码已于 2026-09 清理，主要剩余技术债是 scene/sound 遗留分支及 room_handler 活路径中仍待抽取的 MSE 预览大块。
 
 ## 导出与剪映（FFmpeg 切片导出 + JianYing 草稿生成）
 

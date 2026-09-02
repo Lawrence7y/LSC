@@ -87,7 +87,7 @@
 
 - 前端 Media Source Extensions 消费 fMP4（`ftyp+moov` init + `moof+mdat` media）。
 - **独立双进程**（默认 `shared_ingest_enabled=False`）：录制 FFmpeg 与预览 FFmpeg 完全独立拉流。
-- **共享进样**（`shared_ingest_enabled=True`）：单 FFmpeg 双输出（`-c copy` 录制 + libx264 预览 pipe）。
+- **共享进样**（`shared_ingest_enabled=True`）：共享远端上游 FFmpeg，录制/预览各自独立 sink（非单 FFmpeg 双输出）。
 - 预览上限 **4**；`enable_preview {mode:"mse"}` 启停。
 - 阶段广播 `preview_phase`：`idle|refreshing_url|probing|streaming|error`。
 - MSE 自动重连最多 **3** 次，退避 2→4→8s（上限 30s）。
@@ -386,10 +386,10 @@ B. 技术栈与目录
    - src/hooks/useKeyboardShortcuts.ts / useWebSocket.ts / useNotifications.ts
    - src/styles/tokens.css + global.css
 
-2) 桥接层 python-backend/（工作线程 asyncio WS + Qt 主线程）
-   - main.py：入口，Qt 事件循环 + 启动 WS（host 127.0.0.1, port 9876）
+2) 桥接层 python-backend/（asyncio WS 工作线程 + RoomOrchestrator 编排线程）
+   - main.py：入口，RoomOrchestrator 编排线程 + 启动 WS（host 127.0.0.1, port 9876）
    - server.py：LSCWebSocketServer；handler 注册；broadcast；binary MSE；rooms_updated 合并
-   - message_bridge.py：QtManagerBridge（call 同步原语 + queue_broadcast）
+   - broadcast_hub.py：BroadcastHub（线程安全 FIFO 广播队列）
    - persistence.py：rooms.json / analysis.json 旁路
    - handlers/room_handler.py：房间/录制/预览/对齐/导出队列/分析
    - handlers/timeline_handlers.py：create_clip_snapshot / export_clip_by_id / get_timeline
@@ -500,7 +500,7 @@ H. 录制 / 预览实现要点
 ════════════════════════════════════
 RecordingService + StreamCapture：按 encoder 拼 FFmpeg；copy 则 -c:v copy -c:a copy；NVENC 用 -rc vbr -cq {crf}。
 独立模式：预览 MseStreamer 独立拉流，movflags frag_keyframe+empty_moov+default_base_moof；解析 ftyp/moov/moof/mdat。
-共享进样 SharedRoomIngest：单进程双输出；preview CRF/preset 来自 LscConfig；planned_stop 区分计划关闭。
+共享进样 SharedRoomIngest：共享远端上游 FFmpeg，录制/预览独立 sink；preview CRF/preset 来自 LscConfig；planned_stop 区分计划关闭。
 enable_preview 流程：refresh_stream_url（线程池）→ start → 广播 init → segments。
 预览画质预设：
   原画: 0x0, nvenc 8000k, x264 crf20/6000k
