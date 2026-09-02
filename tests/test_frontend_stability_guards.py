@@ -1697,7 +1697,9 @@ def test_timeline_1x_zero_and_dvr_lookback_contract() -> None:
     assert "export function computeTimelineWindow" in window
     assert "export function computeDvrLeftEdge" in window
     assert "export function computeExpandedPreviewWindow" in window
-    assert "zoom <= 1 && input.followLive && !input.scrubbing" in window
+    assert "if (zoom <= 1)" in window
+    assert "windowStart: 0" in window
+    assert "input.followLive && !input.scrubbing" in window
     room = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
     assert "boundaryLeadSeconds" not in room
     assert "computeExpandedPreviewWindow" in room
