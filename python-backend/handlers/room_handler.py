@@ -731,12 +731,21 @@ def _bind_shared_ingest_lease(mgr, room_id: str, ingest) -> None:
 
 
 def _shared_preview_reconnect_ready(result: object, ingest: object | None) -> bool:
-    """Reconnect is ready only when the handler succeeded and upstream is live."""
+    """Reconnect is ready only when upstream is live AND the preview sink is
+    actually producing media.
+
+    「进程拉起 + 上游存活」曾被视为就绪，导致预览 sink 零产出（TS 丢包洞/
+    时间戳断裂）时陷入「重启→停滞→再重启」死循环（2026-09-01 斗鱼/抖音/
+    B站三房实测）；就绪必须以 init+media 实际产出为准。
+    """
     if not isinstance(result, dict) or not result.get("success") or ingest is None:
         return False
     checker = getattr(ingest, "upstream_is_live", None)
-    if callable(checker):
-        return bool(checker())
+    if callable(checker) and not bool(checker()):
+        return False
+    media_ready = getattr(ingest, "preview_media_ready", None)
+    if media_ready is not None:
+        return bool(media_ready)
     return getattr(ingest, "process_id", None) is not None
 
 
@@ -3249,6 +3258,22 @@ def register_room_handlers(server, bridge):
 
             if not isinstance(result, dict):
                 result = {'success': False, 'error': '预览重连失败'}
+            # 预览 sink 从 spawn 到产出 init 需要等上游首个关键帧；给最长 8s
+            # 产出窗口，避免把慢启动误判为失败；零产出（转码故障/丢包洞）则
+            # 不再被误判成功，3 次尝试后必然耗尽并给出明确错误，杜绝死循环。
+            if isinstance(result, dict) and result.get('success'):
+                media_deadline = time.monotonic() + 8.0
+                while time.monotonic() < media_deadline:
+                    ingest_probe = None
+                    try:
+                        ingest_probe = _shared_ingests.get(room_id)
+                    except Exception:
+                        ingest_probe = None
+                    if ingest_probe is not None and getattr(
+                        ingest_probe, 'preview_media_ready', False
+                    ):
+                        break
+                    await asyncio.sleep(0.5)
             ingest = None
             try:
                 ingest = _shared_ingests.get(room_id)

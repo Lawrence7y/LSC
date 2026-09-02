@@ -180,3 +180,69 @@ def test_try_start_probe_timeout_without_error_assumes_success() -> None:
             streamer.stop()
 
     assert ok is True
+
+
+def test_file_review_encode_attempts_never_use_nvenc() -> None:
+    """录制文件回看不得与直播预览/录制抢 NVENC（CreateInputBuffer invalid param）。"""
+    from lsc.core.services.mse_streamer import resolve_mse_encode_attempts
+
+    attempts = resolve_mse_encode_attempts(
+        is_file=True,
+        nvenc_available=True,
+        gpu_scale_ok=True,
+    )
+    assert attempts == [("", False)]
+    assert all(not use_nvenc for _hw, use_nvenc in attempts)
+
+
+def test_live_encode_attempts_keep_nvenc_then_drop_hwaccel() -> None:
+    from lsc.core.services.mse_streamer import resolve_mse_encode_attempts
+
+    assert resolve_mse_encode_attempts(
+        is_file=False,
+        nvenc_available=True,
+        gpu_scale_ok=False,
+    ) == [("d3d11va", True), ("", True)]
+    assert resolve_mse_encode_attempts(
+        is_file=False,
+        nvenc_available=False,
+        gpu_scale_ok=False,
+    ) == [("", False)]
+
+
+def test_file_review_start_uses_libx264_even_when_nvenc_available() -> None:
+    captured_cmd: list[str] = []
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            self.stdout = None
+            self.stderr = None
+
+        def poll(self):
+            return 0
+
+    from unittest.mock import patch
+
+    import lsc.core.services.mse_streamer as mse_mod
+
+    streamer = mse_mod.MseStreamer(
+        url=r"C:\recordings\room.mp4",
+        is_file=True,
+        start_offset_sec=61.4,
+        width=640,
+        height=360,
+        fps=20,
+        on_init_segment=lambda _b: None,
+        on_media_segment=lambda _b: None,
+    )
+    with patch.object(mse_mod, "_check_nvenc", return_value=True), patch.object(
+        mse_mod, "scale_cuda_available", return_value=True
+    ), patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch.object(
+        mse_mod, "set_stream_nonblocking"
+    ), patch("lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen):
+        streamer.start(startup_probe_timeout=0.2)
+
+    assert "h264_nvenc" not in captured_cmd
+    assert "libx264" in captured_cmd
+    assert "-hwaccel" not in captured_cmd

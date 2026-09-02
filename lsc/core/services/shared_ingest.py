@@ -358,6 +358,8 @@ class SharedRoomIngest:
         self.upstream_bytes = 0
         self.preview_segment_count = 0
         self.preview_media_bytes = 0
+        # 预览 sink stdin 实际写入字节数：区分「上游没喂进来」与「喂了但解不出」
+        self.preview_input_bytes = 0
 
         self._lock = threading.RLock()
         self._preview_condition = threading.Condition(self._lock)
@@ -889,14 +891,13 @@ class SharedRoomIngest:
         effective_preset = cfg.shared_ingest_preview_preset or "veryfast"
         # 注意：mpegts pipe 输入上不要加 -hwaccel cuda / scale_cuda。
         # 直播管道硬解极易失败，表现为预览进程秒退、mse_init 永远不就绪。
+        # 与录制 sink 共用 _mpegts_pipe_input_args：+discardcorrupt 丢掉虎牙等
+        # TS 坏包，避免 H.264 参考链断裂后 stdout 停滞、队列溢出。
         command = [
             self._ffmpeg_path(),
             "-y",
             "-loglevel", "warning",
-            "-fflags", "+genpts",
-            "-thread_queue_size", "1024",
-            "-f", "mpegts",
-            "-i", "pipe:0",
+            *self._mpegts_pipe_input_args(),
             "-map", "0:v",
             "-map", "0:a?",
         ]
@@ -922,6 +923,10 @@ class SharedRoomIngest:
                 "-c:v", "libx264",
                 "-preset", effective_preset,
                 "-crf", str(effective_crf),
+                # 多房间预览各自默认拉满线程会互相饿死 → 编码跟不上消费 →
+                # 预览队列溢出丢 TS 包洞 → h264 参考链断裂永远解不出首帧
+                # （2026-09-01 三房预览零产出实测）。预览不需要吞吐，封顶线程数。
+                "-threads", "2",
                 "-b:v", bitrate,
                 "-maxrate", _scaled_kbitrate(bitrate, 4, 3),
                 "-bufsize", _scaled_kbitrate(bitrate, 2),
@@ -1176,6 +1181,7 @@ class SharedRoomIngest:
             self._preview_has_media_segment = False
             self._preview_ts_queue.clear()
             self._preview_queued_bytes = 0
+            self.preview_input_bytes = 0
             self.is_stopped = False
             self.stop_reason = ""
         self._start_stderr_reader(proc, self._preview_stderr_buffer, "preview")
@@ -1789,9 +1795,15 @@ class SharedRoomIngest:
                 self._preview_queued_bytes -= len(batch)
             try:
                 self._write_all(proc, batch)
+                self.preview_input_bytes += len(batch)
             except Exception as exc:
                 self._handle_preview_process_exit(proc, f"preview ffmpeg input failed: {exc}")
                 return
+
+    @property
+    def preview_media_ready(self) -> bool:
+        """预览 sink 是否已实际产出 init+media；重连就绪判定必须以此为准。"""
+        return bool(self._preview_has_init and self._preview_has_media_segment)
 
     def _read_preview_stdout_loop(self, proc: _FfmpegProcess) -> None:
         stdout = getattr(proc, "stdout", None)
@@ -1809,10 +1821,25 @@ class SharedRoomIngest:
                 if self._poll(proc) is not None:
                     return
                 if time.monotonic() - last_data_time[0] > _PREVIEW_STDOUT_STALL_SEC:
+                    with self._preview_condition:
+                        dropped_bytes = self.preview_dropped_bytes
+                        dropped_batches = self.preview_dropped_batches
+                        queued_batches = len(self._preview_ts_queue)
+                    # 停滞诊断必须一次带全：stderr 尾部定位解码故障（TS 丢包洞/
+                    # 时间戳断裂），dropped/queued 判定是否队列溢出抠流，
+                    # media_bytes 区分「从未产出」与「中途停滞」。
                     _log.error(
-                        "shared preview stdout stalled (%ds) room=%s",
+                        "shared preview stdout stalled (%ds) room=%s "
+                        "media_bytes=%d segments=%d dropped=%dB/%d queued=%d upstream_bytes=%d stderr=%s",
                         _PREVIEW_STDOUT_STALL_SEC,
                         self.room_id,
+                        self.preview_media_bytes,
+                        self.preview_segment_count,
+                        dropped_bytes,
+                        dropped_batches,
+                        queued_batches,
+                        self.upstream_bytes,
+                        self._stderr_tail(self._preview_stderr_buffer) or "<empty>",
                     )
                     # kill 失败时尝试 terminate + 关闭 stdin 作为备用方案
                     try:

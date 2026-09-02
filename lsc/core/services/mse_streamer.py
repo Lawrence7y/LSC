@@ -58,6 +58,25 @@ _nvenc_available: bool | None = None
 _nvenc_lock = threading.Lock()
 
 
+def resolve_mse_encode_attempts(
+    *,
+    is_file: bool,
+    nvenc_available: bool,
+    gpu_scale_ok: bool,
+) -> list[tuple[str, bool]]:
+    """返回 (hwaccel_mode, use_nvenc) 的有序尝试列表。
+
+    文件回看常与正在进行的直播录制/预览并行。录制侧已占用 NVENC 时，
+    回看再抢同一编码器会得到 ``CreateInputBuffer failed: invalid param``；
+    旧逻辑只去掉 ``-hwaccel d3d11va``、编码仍走 ``h264_nvenc``，第二次同样失败。
+    因此文件路径直接软解软编。
+    """
+    if is_file or not nvenc_available:
+        return [("", False)]
+    first = "cuda_full" if gpu_scale_ok else "d3d11va"
+    return [(first, True), ("", True)]
+
+
 def _check_nvenc() -> bool:
     """Quick test: can FFmpeg use h264_nvenc on this system?"""
     global _nvenc_available
@@ -202,47 +221,42 @@ class MseStreamer:
             _log.warning("MseStreamer already running")
             return False
 
-        use_nvenc = _check_nvenc()
+        nvenc_available = _check_nvenc()
         # 硬件解码策略：
         # 1) NVENC + scale_cuda + 仅需 scale（无 fps）→ 全 GPU 管线（cuda 硬解 + scale_cuda）
         # 2) NVENC + 需要 fps 滤镜 → d3d11va 硬解 + CPU 滤镜（fps 无 GPU 版本）
-        # 3) 无 NVENC → 不加硬解（纯 CPU 软编软解）
+        # 3) 无 NVENC / 文件回看 → 不加硬解（纯 CPU 软编软解）
         has_scale = self._width > 0 and self._height > 0
         has_fps = self._fps > 0
         gpu_scale_ok = (
-            use_nvenc
+            nvenc_available
             and has_scale
             and not has_fps
             and scale_cuda_available(self._ffmpeg_path)
         )
-        # 决定 hwaccel 模式: "cuda_full" | "d3d11va" | ""
-        if gpu_scale_ok:
-            hwaccel_mode = "cuda_full"
-        elif use_nvenc:
-            hwaccel_mode = "d3d11va"
-        else:
-            hwaccel_mode = ""
-
-        # 第一次尝试（带硬解），失败则回退软解
-        ok = self._try_start(
-            hwaccel_mode=hwaccel_mode,
-            use_nvenc=use_nvenc,
-            startup_probe_timeout=startup_probe_timeout,
+        attempts = resolve_mse_encode_attempts(
+            is_file=self._is_file,
+            nvenc_available=nvenc_available,
+            gpu_scale_ok=gpu_scale_ok,
         )
-        if ok or hwaccel_mode == "":
-            return ok
-
-        # 硬解启动失败（CDN/HLS 不兼容），回退软解重试
-        _log.warning(
-            "MSE hwaccel(%s) startup failed, retrying without hwaccel",
-            hwaccel_mode,
-        )
-        self._cleanup_after_failed_start()
-        return self._try_start(
-            hwaccel_mode="",
-            use_nvenc=use_nvenc,
-            startup_probe_timeout=min(2.0, startup_probe_timeout),
-        )
+        ok = False
+        for index, (hwaccel_mode, use_nvenc) in enumerate(attempts):
+            probe_timeout = startup_probe_timeout
+            if index > 0:
+                _log.warning(
+                    "MSE hwaccel(%s) startup failed, retrying without hwaccel",
+                    attempts[index - 1][0],
+                )
+                self._cleanup_after_failed_start()
+                probe_timeout = min(2.0, startup_probe_timeout)
+            ok = self._try_start(
+                hwaccel_mode=hwaccel_mode,
+                use_nvenc=use_nvenc,
+                startup_probe_timeout=probe_timeout,
+            )
+            if ok:
+                return True
+        return ok
 
     def _cleanup_after_failed_start(self) -> None:
         """清理首次启动失败后的残留状态，为重试做准备。"""

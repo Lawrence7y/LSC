@@ -362,6 +362,16 @@ def test_recording_copy_profile_with_filter_falls_back_to_libx264_without_nvenc(
     assert command[command.index("-c:v") + 1] == "libx264"
 
 
+def test_preview_command_discards_corrupt_mpegts_packets():
+    """虎牙等 TS 流 Packet corrupt 时预览 sink 必须丢弃坏包，否则解码卡住 stdout stall。"""
+    command = SharedRoomIngest("room-a", "http://example/live.flv").build_preview_command(
+        use_nvenc=False,
+    )
+    flags = command[command.index("-fflags") + 1]
+    assert "genpts" in flags
+    assert "discardcorrupt" in flags
+
+
 def test_preview_command_matches_mse_streamer_software_parameters():
     command = SharedRoomIngest("room-a", "http://example/live.flv").build_preview_command(
         width=960,
