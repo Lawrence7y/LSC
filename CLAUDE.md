@@ -23,11 +23,11 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
                                          │ 
 +----------------------------------------------------------------------------------------+
 | 2. 桥接与服务层 (Python Backend)                                                       |
-|    - Qt 事件循环 (主线程) + WebSocket 服务器 (工作线程)                                   |
-|    - 职责：维护多线程安全的消息桥接器，承上启下，实现前后台通信及生命周期管理                 |
+|    - asyncio WebSocket 服务器 (工作线程) + BroadcastHub (线程安全 FIFO 广播队列)                                   |
+|    - 职责：通过 RoomOrchestrator.call() 排队到编排线程，维护前后台通信及生命周期管理                 |
 +----------------------------------------------------------------------------------------+
                                          │
-                                     Qt 槽调用
+                                     Orchestrator.call() / BroadcastHub
                                          │
 +----------------------------------------------------------------------------------------+
 | 3. 核心业务层 (lsc 核心 Python 包)                                                     |
@@ -38,10 +38,10 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
 
 ### 1.2 关键目录结构与职责说明
 
-*   `python-backend/`：桥接服务，协调工作线程与 Qt 主线程。
+*   `python-backend/`：桥接服务，协调 asyncio WebSocket 工作线程与 RoomOrchestrator 编排线程。
     *   `main.py`：后端入口，管理进程初始化及双线程启动。
     *   `server.py`：基于 asyncio 的 WebSocket 服务器，处理来自前端的 JSON 指令。
-    *   `message_bridge.py`：利用 Qt 信号槽实现线程安全的跨线程调用及广播分发。
+    *   `broadcast_hub.py`：线程安全 FIFO 广播队列，替代旧 Qt 信号槽桥接。
     *   `persistence.py`：本地房间配置的持久化存储。
     *   `handlers/room_handler.py`：房间/录制/对齐/导出队列/持续分析等主 handler。
     *   `handlers/timeline_handlers.py`：`create_clip_snapshot` / `export_clip_by_id` 等时间线精确切片。
@@ -53,7 +53,7 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
     *   `recorder/`：FFmpeg 录制控制与文件有效性验证。
     *   `exporter/`：FFmpeg 切片剪辑与直拷/转码导出。
     *   `editor/audio_aligner.py`：基于音频信号互相关的对齐补偿模块。
-    *   `gui/multi_room/manager.py`：多房间管理的核心编排层（运行在 Qt 主线程）。
+    *   `core/orchestrator.py`：`RoomOrchestrator` 纯 Python 编排核心（运行在独立编排线程；`gui/multi_room/manager.py` 为迁移前遗留）。
 *   `lsc-electron/`：前端桌面包。
     *   `electron/main.ts`：Electron 主进程，控制窗口、系统托盘、自动启动、Python 进程检测与生命周期保护。
     *   `src/store/appStore.ts`：基于 Zustand 的全局前端状态管理。
@@ -140,7 +140,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 | `audio_codec` | `"AAC 128k"` | 音频参数配置。 |
 | `audio_bitrate`| `"128k"` | 导出音频码率：`"96k"`、`"128k"`、`"256k"` 等。 |
 | `preview_quality`| `"高清"` | MSE 预览的转码分辨率参考预设。 |
-| `shared_ingest_enabled` | `False` | 是否启用共享进样模式（单 FFmpeg 进程同时输出录制和预览）。`True` 开启，`False` 使用独立双进程。 |
+| `shared_ingest_enabled` | `False` | 是否启用共享进样模式（共享远端上游 FFmpeg，录制/预览各自独立 sink）。`True` 开启共享上游，`False` 使用独立双进程。 |
 | `shared_ingest_preview_crf` | `23` | 共享进样模式下预览流的 CRF 值（0-51），越低画质越高。默认 23。 |
 | `shared_ingest_preview_preset`| `"veryfast"` | 共享进样模式下预览流的编码预设。可选 `ultrafast`/`superfast`/`veryfast`/`faster`/`fast`/`medium` 等。 |
 | `export_max_concurrent` | `2` | 全局导出 FFmpeg 并发上限，合法值仅 `1` 或 `2`。由 `room_handler._export_semaphore` 限流。 |
@@ -671,7 +671,7 @@ cd lsc-electron && npm install
 
 ### 10.2 开发启动方式
 
-1.  **纯 Python 后端开发调试**（无 GUI，仅启动 WebSocket 服务与 Qt 事件循环）：
+1.  **纯 Python 后端开发调试**（无 GUI，仅启动 WebSocket 服务与 RoomOrchestrator 编排线程）：
     ```bash
     cd python-backend && python main.py
     ```
@@ -841,7 +841,7 @@ Electron 应用使用 `electron-builder` 进行打包：
 | `core/services/export_service.py: ExportService` | 仅测试引用 | 真实导出统一走 `export_handlers` 的 asyncio 全局队列。 |
 | `utils/cancellable_ffmpeg.py: CancellableFFmpeg` | 仅测试引用 | 产品导出仍用裸 `subprocess.Popen` + 自绘 watchdog。 |
 | `utils/error_stats.py: ErrorStats` | 无业务调用 | 错误统计预留模块，仅测试引用。 |
-| `room_handler.py` L8382/L8568 的 `start_continuous_analysis` / `stop_continuous_analysis` | 覆盖死代码 | `register_analysis_handlers` 后注册，`server.on` 覆盖语义下永不触发（代码注释已自认）。 |
+| `room_handler.py` L8485/L8671 的 `start_continuous_analysis` / `stop_continuous_analysis` | 覆盖死代码 | `register_analysis_handlers` 后注册，`server.on` 覆盖语义下永不触发（同批还有 `start_recording` / `align_preview_audio` / `confirm_highlight_clip` 等，见 2026-09-01 深调研）。 |
 | `analyzer/generic_plugin.py: scan_window` | 恒返回空 | 只更新扫描游标，持续分析主路径不再使用；`scene_analysis` / `sound_detector` 为遗留分支（约 900 行）。 |
 | `export_handlers._deferred_export_jobs` | 死代码 | 无任何 append 调用方（代码注释已标注）。 |
 
