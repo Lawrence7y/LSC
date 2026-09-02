@@ -165,3 +165,16 @@ _archive_20260819/
 .qoder/
 datasets/_seg*.mp4
 
+
+# AI review/tool history (local, not source)
+.mimosa/
+lsc-electron/.mimosa/
+
+# Promotional material (large media / local artifacts)
+宣传物料/
+
+# Local log analyzer helper (not part of product source)
+scripts/analyze_platform_test.py
+
+# Backup files (tracked .bak files remain; new backups ignored)
+*.bak
