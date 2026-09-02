@@ -417,6 +417,7 @@ export default function Workbench() {
   const exportProgressStatusPendingRef = useRef<Set<string>>(new Set())
   const aligningRoomIdsRef = useRef<Set<string>>(new Set())
   const alignmentInFlightRef = useRef(false)
+  const recordingReviewInFlightRef = useRef<Set<string>>(new Set())
   const alignmentBackgroundRef = useRef(false)
   const alignmentWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const alignButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -1273,7 +1274,12 @@ export default function Workbench() {
         const st = useAppStore.getState()
         const roomState = st.rooms.find(r => r.room_id === roomId)
         const mode = roomState?.preview_mode
-        const canReview = Boolean(roomState?.record_output_path) && mode !== 'recording_review' && mode !== 'degraded'
+        if (recordingReviewInFlightRef.current.has(roomId) && mode !== 'recording_review') {
+          console.info(`[Workbench] recording review already starting for ${roomId}, skip duplicate`)
+          return
+        }
+        // recording_review 缓冲外也要重启文件 FFmpeg（换 -ss），不能永远 clamp 到几秒缓冲。
+        const canReview = Boolean(roomState?.record_output_path) && mode !== 'degraded'
         if (canReview) {
           let recTime = t
           const ctx = st.timelineContext
@@ -1289,6 +1295,10 @@ export default function Workbench() {
           console.info(
             `[Workbench] seek ${t.toFixed(1)}s 超出直播缓冲 [${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}]，切换到录制文件回看 @${recTime.toFixed(1)}s`,
           )
+          recordingReviewInFlightRef.current.add(roomId)
+          window.setTimeout(() => {
+            recordingReviewInFlightRef.current.delete(roomId)
+          }, 8000)
           send('start_recording_review', { room_id: roomId, time: recTime })
           return
         }

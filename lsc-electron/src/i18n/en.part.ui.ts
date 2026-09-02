@@ -170,6 +170,7 @@ export const enPartUi: Record<string, string> = {
   '去确认': 'Confirm',
   '后台已确认分析 {analyzed} / 已录 {recorded}': 'Confirmed: {analyzed} analyzed / {recorded} recorded',
   '本轮扫描已用 {sec}': 'this scan {sec}',
+  '本窗 {from}–{to}': 'window {from}–{to}',
   '正在进行最终回合确认（首次约 1–2 分钟）': 'Final round confirmation in progress (first run ~1–2 min)',
   '请先结束录制，并等待收尾完成': 'Stop recording first and wait for finalization',
   '停录后会做一次收尾扫描，把尾部回合补入列表（待确认）。收尾完成后回合仍需你确认/导出。': 'Stopping recording runs a final scan that appends trailing rounds (pending confirmation). Rounds still need your confirmation/export after finalization.',

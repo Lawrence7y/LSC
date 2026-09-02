@@ -522,7 +522,7 @@ export const ControlBar = memo(function ControlBar({
               icon={<AimOutlined />}
               onClick={onMarkIn}
               disabled={isDisabled}
-              style={{ color: room?.mark_in !== null ? 'var(--state-success)' : undefined }}
+              style={{ color: room?.mark_in != null ? 'var(--state-success)' : undefined }}
             >
               {t('入点')}
             </Button>
@@ -534,7 +534,7 @@ export const ControlBar = memo(function ControlBar({
               icon={<AimOutlined />}
               onClick={onMarkOut}
               disabled={isDisabled}
-              style={{ color: room?.mark_out !== null ? 'var(--state-error)' : undefined }}
+              style={{ color: room?.mark_out != null ? 'var(--state-error)' : undefined }}
             >
               {t('出点')}
             </Button>

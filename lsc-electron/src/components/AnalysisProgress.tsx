@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Alert, Card, Typography } from 'antd'
 import { ContinuousAnalysisStatus } from '@/types'
-import { calculateConfirmedAnalysisPercent } from '@/utils/analysisProgress'
+import { calculateConfirmedAnalysisPercent, inFlightScanWindow } from '@/utils/analysisProgress'
 import { useI18n, type I18nT } from '@/i18n'
 
 export interface ExportSummary {
@@ -127,6 +127,10 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
       out: formatDuration(current.last_detected_out_sec!),
     })
     : ''
+  const window = inFlightScanWindow(current)
+  const windowPart = window
+    ? t('本窗 {from}–{to}', { from: formatDuration(window.from), to: formatDuration(window.to) })
+    : ''
   const reasonPart = current.scan_reason === 'audio_increment'
     ? t('音频推进')
     : current.scan_reason === 'finalize'
@@ -141,7 +145,7 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
     : ''
   return {
     verb: current.scan_running ? t('扫描中') : t('运行中'),
-    detail: [detectedPart, reasonPart, phasePart, audioPendingPart].filter(Boolean).join(' · '),
+    detail: [windowPart, detectedPart, reasonPart, phasePart, audioPendingPart].filter(Boolean).join(' · '),
     tone: 'active',
     nextAction: summary.pendingConfirm > 0 ? 'confirm' : undefined,
   }
@@ -233,6 +237,7 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
   const analyzed = current.analyzed_duration ?? 0
   const recorded = current.recorded_duration ?? 0
   const lagSec = current.analysis_lag_sec ?? Math.max(0, recorded - analyzed)
+  const scanWindow = inFlightScanWindow(current)
   const hasFixedScanRange = !current.running
     || current.phase === 'finalizing'
     || current.phase === 'completed'
@@ -339,6 +344,7 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
             <span style={{ fontSize: 11, color: 'var(--text-400)', whiteSpace: 'nowrap' }}>
               {!hasFixedScanRange && `${t('实时跟进')} `}
               {formatDuration(analyzed)}/{formatDuration(recorded)}
+              {scanWindow ? ` · ${t('本窗 {from}–{to}', { from: formatDuration(scanWindow.from), to: formatDuration(scanWindow.to) })}` : ''}
               {lagSec > 5 && current.running ? ` · ${t('滞后{lag}', { lag: formatDuration(lagSec) })}` : ''}
             </span>
           </div>
@@ -384,6 +390,7 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
             <Typography.Text type="secondary">
               {!hasFixedScanRange ? `${t('实时跟进')} · ` : ''}
               {t('后台已确认分析 {analyzed} / 已录 {recorded}', { analyzed: formatDuration(analyzed), recorded: formatDuration(recorded) })}
+              {scanWindow ? ` · ${t('本窗 {from}–{to}', { from: formatDuration(scanWindow.from), to: formatDuration(scanWindow.to) })}` : ''}
               {current.scan_running ? ` · ${t('本轮扫描已用 {sec}', { sec: formatDuration(current.scan_elapsed_sec ?? 0) })}` : ''}
               {lagSec > 1 && current.running ? ` · ${t('滞后 {lag}', { lag: formatDuration(lagSec) })}` : ''}
             </Typography.Text>

@@ -1345,6 +1345,20 @@ def test_recording_review_timeline_guards() -> None:
     assert "isNoDvrPreviewMode" in coords
 
 
+def test_recording_review_seek_restarts_and_debounces_inflight() -> None:
+    """缓冲外点击：已在回看时重启 FFmpeg；启动中禁止连发第二次 start_recording_review。"""
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    handler = workbench.split("const mseSeek = useCallback", 1)[1].split(
+        "const mseTogglePlayPause = useCallback", 1
+    )[0]
+    assert "recordingReviewInFlightRef" in workbench
+    assert "recordingReviewInFlightRef" in handler
+    assert "mode !== 'degraded'" in handler
+    # 回看模式缓冲外必须允许再次 start_recording_review（换 -ss），不能永远 clamp 到 8s。
+    assert "mode !== 'recording_review' && mode !== 'degraded'" not in handler
+    assert "start_recording_review" in handler
+
+
 def test_timeline_content_span_uses_recording_when_preview_off() -> None:
     """无预览时长录制：时间线右沿须跟录制/切片，不得卡在冻结的预览轴（现场 ~21min vs 1h+）。"""
     coords = (ROOT / "lsc-electron/src/utils/timelineCoords.ts").read_text(encoding="utf-8")
