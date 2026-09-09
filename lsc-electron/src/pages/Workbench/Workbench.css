@@ -1,11 +1,11 @@
-/* 房间区域右侧滚动条 */
+/* 现代化紧凑工作台操作带 */
 .workbench-toolbar {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 14px 24px;
-  background: var(--bg-secondary);
-  border-bottom: 1px solid var(--border-default);
+  gap: 8px;
+  padding: 8px 20px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-hairline);
 }
 
 .workbench-toolbar__row {
@@ -22,21 +22,47 @@
 
 .workbench-toolbar__actions .ant-btn,
 .workbench-toolbar__identity .ant-btn,
+.workbench-toolbar__btn,
 .workbench-toolbar__refresh {
-  height: 32px;
-  min-width: 88px;
-  padding-inline: 12px;
-  border-radius: var(--radius-xs, 6px);
+  height: 28px !important;
+  padding-inline: 9px !important;
+  border-radius: var(--radius-xs) !important;
+  font-size: 12px !important;
 }
 
 .workbench-toolbar__identity .ant-select-selector {
-  min-height: 32px !important;
+  min-height: 28px !important;
+  height: 28px !important;
   align-items: center;
+  border-radius: var(--radius-xs) !important;
+}
+
+.workbench-toolbar__add-room {
+  display: flex;
+  align-items: center;
+}
+
+.workbench-toolbar__add-room .ant-space-compact {
+  display: flex !important;
+  width: 100% !important;
+}
+
+.workbench-toolbar__add-room .ant-input,
+.workbench-toolbar__add-room .ant-btn {
+  height: 28px !important;
+  border-radius: var(--radius-xs) !important;
+  font-size: 12px !important;
+}
+
+.workbench-toolbar__add-room .ant-input {
+  background: var(--bg-tertiary) !important;
+  border-color: var(--border-default) !important;
+  color: var(--text-primary) !important;
 }
 
 .workbench-toolbar__actions .ant-btn .anticon,
 .workbench-toolbar__identity .ant-btn .anticon {
-  font-size: 14px;
+  font-size: 13px;
 }
 
 @media (max-width: 1100px) {
@@ -48,7 +74,7 @@
 
 .workbench-room-scroll {
   scrollbar-width: thin;
-  scrollbar-color: var(--text-400, #8e8e93) transparent;
+  scrollbar-color: var(--text-tertiary) transparent;
 }
 
 .workbench-room-scroll::-webkit-scrollbar {
@@ -127,7 +153,75 @@
   overflow-wrap: anywhere;
 }
 
+/* ===== 房间卡片微动效与深度阴影 ===== */
+.room-card {
+  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.22s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s ease !important;
+}
+
+.room-card:not(.room-card--expanded):hover {
+  transform: translateY(-2px);
+}
+
+/* 放大展开态卡片 */
+.room-card--expanded {
+  transform: none !important;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--brand-500, #31b3ae) !important;
+  z-index: 10;
+}
+
+/* 录制中卡片：边框红光微呼吸与顶部极光能量条 */
+.room-card--recording {
+  border-color: rgba(255, 69, 58, 0.42) !important;
+  box-shadow: 0 0 0 1px rgba(255, 69, 58, 0.3), 0 4px 18px rgba(255, 69, 58, 0.16) !important;
+  position: relative;
+}
+
+.room-card--recording::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2.5px;
+  background: linear-gradient(90deg, transparent 0%, #ff453a 30%, #ff9f0a 50%, #ff453a 70%, transparent 100%);
+  background-size: 200% 100%;
+  animation: auroraFlow 2.6s linear infinite;
+  z-index: 6;
+  pointer-events: none;
+}
+
+@keyframes auroraFlow {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+/* 放大预览底部时间线滑入 */
+.room-card__expanded-controls {
+  animation: roomCardControlsSlideUp 0.26s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes roomCardControlsSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* 放大预览时间线：加大命中区域，显示首尾时间并支持点击/键盘定位。 */
+.room-card__expanded-replay-info {
+  padding: 3px 14px 0;
+  color: rgba(255, 255, 255, 0.68);
+  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .room-card__expanded-timeline {
   display: grid;
   grid-template-columns: minmax(54px, auto) 1fr minmax(54px, auto);
@@ -182,7 +276,7 @@
   height: 12px;
   border: 2px solid #fff;
   border-radius: 50%;
-  background: var(--brand-500, #31b3ae);
+  background: var(--brand-500);
   box-shadow: 0 2px 7px rgba(0, 0, 0, 0.45);
   transform: translate(-50%, -50%);
   opacity: 0;
@@ -202,14 +296,14 @@
 }
 
 .room-card__expanded-round--confirmed {
-  background: color-mix(in srgb, var(--brand-500, #31B3AE) 60%, transparent);
+  background: color-mix(in srgb, var(--brand-500) 60%, transparent);
 }
 
 .room-card__expanded-round--pending {
   background: repeating-linear-gradient(
     -45deg,
-    color-mix(in srgb, var(--brand-500, #31B3AE) 40%, transparent),
-    color-mix(in srgb, var(--brand-500, #31B3AE) 40%, transparent) 3px,
+    color-mix(in srgb, var(--brand-500) 40%, transparent),
+    color-mix(in srgb, var(--brand-500) 40%, transparent) 3px,
     transparent 3px,
     transparent 6px
   );
@@ -294,3 +388,146 @@
   box-shadow: 0 0 7px rgba(191, 90, 242, 0.9);
   transform: translateX(-50%);
 }
+
+/* ===== 控制栏元信息行（对齐健康度 / 多选提示 / AI 色带暂停说明） ===== */
+.control-bar__meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 18px;
+}
+
+.control-bar__hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 8px;
+  border-radius: var(--radius-xs);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.control-bar__hint--warn {
+  background: rgba(255, 149, 0, 0.12);
+  border: 1px solid rgba(255, 149, 0, 0.3);
+  color: var(--state-warning-on-surface);
+}
+
+.control-bar__hint--muted {
+  background: var(--surface-2);
+  border: 1px solid var(--border-hairline);
+  color: var(--text-secondary);
+}
+
+/* 参考系徽章：颜色即健康度，避免“看一眼不知道现在看的是哪一路时间” */
+.control-bar__align-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.control-bar__align-badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.control-bar__align-badge--ready { color: var(--brand-400); }
+.control-bar__align-badge--warn { color: var(--state-warning-on-surface); }
+.control-bar__align-badge--idle { color: var(--text-tertiary); font-weight: 600; }
+.control-bar__align-badge--recording { color: var(--state-error, #ff3b30); }
+.control-bar__align-badge--recording::before {
+  animation: pulse-recording-badge 2s infinite ease-in-out;
+}
+
+@keyframes pulse-recording-badge {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.85); }
+}
+
+/* ===== 精修模式提示条：除了说明，还必须给反悔与确认的入口 ===== */
+.workbench-refine-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 24px;
+  background: rgba(255, 149, 0, 0.08);
+  border-bottom: 1px solid rgba(255, 149, 0, 0.25);
+  font-size: 12px;
+  color: var(--state-warning-on-surface);
+}
+
+.workbench-refine-bar__acts {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ===== 添加直播间输入条（置于持续分析状态栏右侧） ===== */
+.add-room-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0;
+  width: 100%;
+}
+
+.add-room-bar__field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.add-room-bar__input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-hairline) !important;
+  background: var(--surface-2) !important;
+  box-shadow: none !important;
+}
+
+.add-room-bar__input:focus,
+.add-room-bar__input:focus-within {
+  border-color: var(--brand-500) !important;
+  background: var(--surface-1) !important;
+}
+
+.add-room-bar__submit {
+  flex-shrink: 0;
+  height: 28px !important;
+  font-size: 12px;
+  font-weight: 600;
+  padding-inline: 12px !important;
+  border-radius: var(--radius-xs);
+  background: var(--brand-500);
+  border-color: var(--brand-500);
+}
+
+.add-room-bar__msg {
+  font-size: 11px;
+  line-height: 1.3;
+  padding-left: 2px;
+}
+
+.add-room-bar__msg--pending { color: var(--text-tertiary); }
+.add-room-bar__msg--ok { color: var(--state-success-on-surface); }
+.add-room-bar__msg--err { color: var(--state-error-on-surface); }
+
+

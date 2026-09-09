@@ -7,7 +7,8 @@
 | 字段 | 类型 | 必填 | 说明 |
 | :--- | :--- | :---: | :--- |
 | `video_id` | string | ✓ | 录像唯一 ID（同一会话内稳定，用于分组与去重） |
-| `video_path` | string | ✓ | 本地绝对或相对路径，指向源 MP4/MKV 等 |
+| `video_path` | string \| null | ✓* | 本地绝对或相对路径，指向源 MP4/MKV 等；从已物化 JPEG 重建数据集且源视频不可用时为 `null` |
+| `frame_path` | string | ✓* | 物化帧文件路径；当 `video_path` 为 `null` 时必填 |
 | `timestamp_sec` | number | ✓ | 帧在录像时间轴上的秒位置（浮点，≥ 0） |
 | `label` | string | ✓ | 五分类标签，见下表 |
 | `split` | string | ✓ | `train` \| `val` \| `test` |
@@ -47,6 +48,25 @@
 
 也可用 `--output-dir` 指定；若放在仓库内，请使用已 gitignore 的路径（如 `datasets/valorant_phase/`）。
 
+来源分离重建器会将物化帧分别写入：
+
+```
+datasets/valorant_phase_broadcast/<split>/<label>/
+datasets/valorant_phase_pov/<split>/<label>/
+```
+
+分别训练时，将对应来源目录作为 `train_export.py --data-dir`，不要把两个来源
+重新合并到同一个训练目录。
+
 ## 示例
 
-见同目录 `example_manifest.jsonl`。
+见同目录 `example_manifest.jsonl`。从现有 JPEG 数据集重建来源分离数据时，额外使用
+`frame_path` 记录输出帧，避免把 JPEG 错写成源视频的 `video_path`。
+
+## 生产等价评估记录
+
+发布评估必须显式记录 `evaluation_mode`：`plain_frame` 仅用于基线，
+`broadcast_runtime` 才复用生产的全帧/顶部 HUD 融合、类别阈值、unknown 判定和邻帧稳定器。
+promotion report 还必须记录 `model_sha256`、`data_summary.class_support`、
+`data_summary.source_sessions_by_type` 及 `gate_failures`。`gates_passed=false` 的报告
+不得覆盖 `lsc/analyzer/models/` 的默认模型。

@@ -7,7 +7,7 @@
 :root {
   /* ===== PRIMITIVE PALETTE ===== */
 
-  /* brand (teal) */
+  /* brand (original teal/cyan) */
   --brand-50: #e6f7f7;
   --brand-100: #ccefef;
   --brand-200: #99dfdf;
@@ -27,21 +27,21 @@
   --background-400: #d1d1d6;
   --background-500: #aeaeb2;
   --background-600: #8e8e93;
-  --background-700: #3a3a3c;
-  --background-800: #1c1c1e;
-  --background-900: #000000;
+  --background-700: #22272e;
+  --background-800: #1b1f25;
+  --background-900: #15181c;
 
   /* text */
-  --text-50: #f5f5f7;
-  --text-100: #e3e3e8;
-  --text-200: #c7c7cc;
-  --text-300: #aeaeb2;
-  --text-400: #8e8e93;
-  --text-500: #6e6e73;
-  --text-600: #48484a;
-  --text-700: #3c3c43;
-  --text-800: #1d1d1f;
-  --text-900: #000000;
+  --text-50: #e6edf3;
+  --text-100: #c9d1d9;
+  --text-200: #8b949e;
+  --text-300: #6e7681;
+  --text-400: #545d68;
+  --text-500: #484f58;
+  --text-600: #30363d;
+  --text-700: #21262d;
+  --text-800: #161b22;
+  --text-900: #0d1117;
 
   /* icon */
   --icon-50: #f5f5f7;
@@ -73,6 +73,13 @@
   --state-warning-surface: #fff4e6;
   --state-warning-foreground: #ffffff;
 
+  /* 状态语义角色：用于「带色调的 surface 上的正文」。
+   * *-dark 后缀实为暗色主题优化变体（更亮），直接铺到浅色底上会失去对比度，
+   * 因此组件不应再裸用 --state-*-dark 作文案色，改用语义角色。 */
+  --state-warning-on-surface: var(--state-warning-dark);
+  --state-success-on-surface: var(--state-success-dark);
+  --state-error-on-surface: var(--state-error-dark);
+
   /* ===== SEMANTIC ROLES (Dark Theme) ===== */
   --background: var(--background-900);
   --foreground: var(--text-50);
@@ -80,6 +87,12 @@
   --card-foreground: var(--text-50);
   --popover: var(--background-700);
   --popover-foreground: var(--text-50);
+
+  /* Surface Elevation Hierarchy (Dark) */
+  --surface-0: #0a0c10;
+  --surface-1: #12151b;
+  --surface-2: #191d25;
+  --surface-3: #222733;
 
   --primary: var(--brand-400);
   --primary-foreground: var(--background-900);
@@ -100,56 +113,61 @@
   --icon: var(--icon-50);
   --icon-muted: var(--icon-500);
 
-  /* Typography */
-  --font-sans: 'SF Pro Display', 'PingFang SC', system-ui, -apple-system, sans-serif;
-  --font-mono: 'SF Mono', 'JetBrains Mono', 'Menlo', monospace;
+  /* Typography —— 字体栈以 macOS 优先，但本产品只跑 Windows：
+   * 不加 Windows 中文字体时，CJK 会回退到默认 sans-serif，与 antd 组件的字体栈不一致，
+   * 导致同字号下自写元素与 antd 控件的字形/字重看起来不一样。 */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Menlo', 'Cascadia Mono', Consolas, monospace;
 
-  /* Radius — 统一档：控件 6 / 默认 8 / 卡片小 10 / 分区 14 / 大面板 18 */
-  --radius-xs: 6px;
-  --radius: 14px;
-  --radius-sm: 10px;
-  --radius-md: 8px;
-  --radius-lg: 18px;
+  /* Radius — 精巧现代化微圆角体系 */
+  --radius-xs: 5px;
+  --radius: 10px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.36), 0 1px 3px -1px rgba(0, 0, 0, 0.36);
-  --shadow: 0 2px 4px -1px rgba(0, 0, 0, 0.40), 0 1px 2px -1px rgba(0, 0, 0, 0.36);
-  --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.44), 0 2px 4px -2px rgba(0, 0, 0, 0.36);
-  --shadow-lg: 0 8px 24px -8px rgba(0, 0, 0, 0.50), 0 4px 8px -4px rgba(0, 0, 0, 0.40);
-
-  /* Border */
+  /* Hairline & Borders */
+  --border-hairline: rgba(255, 255, 255, 0.07);
+  --border-subtle: rgba(255, 255, 255, 0.12);
   --border-default: rgba(255, 255, 255, 0.08);
 
+  /* Brand Glow */
+  --brand-glow: 0 0 12px rgba(49, 179, 174, 0.35);
+  --brand-glow-lg: 0 0 20px rgba(49, 179, 174, 0.5);
+
+  /* Shadows — 精致柔和层级 */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.35);
+  --shadow: 0 2px 6px -1px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 4px 12px -2px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 12px 28px -6px rgba(0, 0, 0, 0.65);
+
   /* Surface/background aliases used by components */
-  --bg-primary: var(--background-900);
-  --bg-secondary: var(--background-800);
-  --bg-tertiary: var(--background-700);
+  --bg-primary: var(--surface-0);
+  --bg-secondary: var(--surface-1);
+  --bg-tertiary: var(--surface-2);
 
   /* Text aliases */
   --text-primary: var(--text-50);
   --text-secondary: var(--text-200);
   --text-tertiary: var(--text-400);
 
-  /* Accent */
-  --accent-primary: var(--brand-500);
-  --accent-primary-dim: var(--brand-400);
-
-  /* DVR 紫标 */
-  --dvr-marker: #c084fc;
-  --dvr-marker-glow: rgba(192, 132, 252, 0.35);
-  --dvr-marker-shadow: rgba(162, 89, 255, 0.55);
+  /* DVR 缓冲左边界标记（纯单色指示，非渐变） */
+  --dvr-marker: #a855f7;
+  --dvr-marker-glow: rgba(168, 85, 247, 0.3);
+  --dvr-marker-shadow: rgba(168, 85, 247, 0.45);
 
   /* 时间线高亮（AI 高光） */
-  --highlight-bg: rgba(255, 159, 10, 0.16);
-  --highlight-border: rgba(245, 158, 11, 0.9);
-  --highlight-bg-hover: rgba(255, 159, 10, 0.28);
+  --highlight-bg: rgba(255, 159, 10, 0.14);
+  --highlight-border: rgba(245, 158, 11, 0.75);
+  --highlight-bg-hover: rgba(255, 159, 10, 0.24);
 
   /* 时间线选区（入/出点区间） */
-  --selection-bg: rgba(77, 196, 191, 0.12);
-  --selection-border: rgba(77, 196, 191, 0.85);
+  --selection-bg: rgba(49, 179, 174, 0.12);
+  --selection-border: rgba(49, 179, 174, 0.75);
 
   /* 悬浮操作按钮背景（视频上始终为深色遮罩，不随主题切换） */
-  --overlay-btn-bg: rgba(0, 0, 0, 0.5);
+  --overlay-btn-bg: rgba(15, 18, 24, 0.72);
+  --overlay-btn-hover-bg: rgba(25, 30, 40, 0.88);
   --overlay-text: #f5f5f7;
 }
 
@@ -182,15 +200,38 @@
   --shadow: 0 1px 3px rgba(0,0,0,0.08);
   --shadow-md: 0 2px 6px rgba(0,0,0,0.08);
   --shadow-lg: 0 6px 16px rgba(0,0,0,0.10);
-  --border-default: rgba(0,0,0,0.08);
-  --bg-primary: #f5f6f8;
-  --bg-secondary: #ffffff;
-  --bg-tertiary: #f0f1f4;
+  /* Surface Elevation Hierarchy (Light) */
+  --surface-0: #f4f5f8;
+  --surface-1: #ffffff;
+  --surface-2: #eef0f4;
+  --surface-3: #e2e5eb;
+
+  --border-hairline: rgba(0, 0, 0, 0.06);
+  --border-subtle: rgba(0, 0, 0, 0.1);
+  --border-default: rgba(0, 0, 0, 0.08);
+
+  --bg-primary: var(--surface-0);
+  --bg-secondary: var(--surface-1);
+  --bg-tertiary: var(--surface-2);
   --text-primary: #1a1d23;
   --text-secondary: #4a5160;
   --text-tertiary: #6b7280;
-  --accent-primary: var(--brand-500);
-  --accent-primary-dim: var(--brand-400);
+
+  /* 浅色主题下取深色调变体，保证在 tinted surface 上仍达 WCAG AA 对比度 */
+  --state-warning-on-surface: #b45309;
+  --state-success-on-surface: #15803d;
+  --state-error-on-surface: #b91c1c;
+
+  /* 时间线上的 AI 高光色带与选区：暗色下用低透明度发光色，铺到白底上几乎看不见，
+   * 浅色主题必须改为带饱和的半透底 + 更深的边线 */
+  --highlight-bg: rgba(217, 119, 6, 0.18);
+  --highlight-border: rgba(180, 83, 9, 0.85);
+  --highlight-bg-hover: rgba(217, 119, 6, 0.3);
+  --selection-bg: rgba(39, 158, 153, 0.16);
+  --selection-border: rgba(20, 86, 82, 0.8);
+  --dvr-marker: #7e22ce;
+  --dvr-marker-glow: rgba(126, 34, 206, 0.25);
+  --dvr-marker-shadow: rgba(126, 34, 206, 0.4);
 
   /* ── 已知技术债（M21）：此处直接覆盖基础调色板变量 ──
    * 为使 light 主题下直接引用 --background-800/--text-50 等调色板 token 的组件

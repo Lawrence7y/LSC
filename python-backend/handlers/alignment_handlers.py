@@ -15,8 +15,8 @@ import os
 import time
 
 import numpy as np
-from handlers.timeline_handlers import timeline_to_dict
 from handlers.room_utils import expand_user_path
+from handlers.timeline_handlers import timeline_to_dict
 from persistence import SETTINGS_FILE
 
 from lsc.core.recording_layout import bind_rooms_to_bundle

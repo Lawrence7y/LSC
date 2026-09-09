@@ -1,5 +1,5 @@
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
-import { message } from 'antd'
+import { App } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import type { ExportProgressInfo } from '@/pages/Workbench/components/ClipList'
 import { t } from '@/i18n'
@@ -40,6 +40,8 @@ export function useExportProgressListeners(opts: {
     exportProgressStatusPendingRef,
     pendingExportJobIdsRef,
   } = opts
+  // context 版 message：跟随 ConfigProvider 主题（antd v5 静态方法不走主题）
+  const { message } = App.useApp()
   useEffect(() => {
     const unsubs: (() => void)[] = []
     const flushExportProgress = () => {
@@ -309,5 +311,6 @@ export function useExportProgressListeners(opts: {
     exportProgressFlushTimerRef,
     exportProgressStatusPendingRef,
     pendingExportJobIdsRef,
+    message,
   ])
 }

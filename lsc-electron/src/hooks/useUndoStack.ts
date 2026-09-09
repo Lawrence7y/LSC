@@ -50,6 +50,20 @@ export function useUndoStack(maxSize = 20) {
     return true
   }, [])
 
+  /**
+   * 撤销最近一条命令（Ctrl+Z 这类键盘入口，调用方不关心 id）。
+   * 栈空时返回 false，由调用方决定要不要给提示。
+   */
+  const undoLast = useCallback((): boolean => {
+    const cmd = stackRef.current.pop()
+    if (!cmd) return false
+    cmd.undo()
+    return true
+  }, [])
+
+  /** 是否还有可撤销命令（ref 存栈，因此用函数而非布尔值暴露，不触发重渲染） */
+  const canUndo = useCallback((): boolean => stackRef.current.length > 0, [])
+
   /** 丢弃指定命令（如操作已被后续动作固化，不再允许撤销） */
   const dismiss = useCallback((id: string): void => {
     stackRef.current = stackRef.current.filter((c) => c.id !== id)
@@ -60,5 +74,5 @@ export function useUndoStack(maxSize = 20) {
     stackRef.current = []
   }, [])
 
-  return { push, undo, dismiss, clear }
+  return { push, undo, undoLast, canUndo, dismiss, clear }
 }

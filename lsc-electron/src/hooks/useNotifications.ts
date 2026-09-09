@@ -27,6 +27,10 @@ const TRIGGERS: Record<string, (data: any) => NotificationPayload | null> = {
     title: t('后端连接断开'),
     body: t('WebSocket 重连失败，请检查后端状态'),
   }),
+  backend_crashed: () => ({
+    title: t('后端无响应'),
+    body: t('后端心跳超时，请在顶栏点击「重新连接」重启后端'),
+  }),
   recording_stopped: (d) => ({
     title: d.reason === 'disk_full' ? t('磁盘空间不足') : t('录制已停止'),
     body: d.message || (d.room_name || t('房间')) + t('录制已停止'),
@@ -34,7 +38,7 @@ const TRIGGERS: Record<string, (data: any) => NotificationPayload | null> = {
 }
 
 // 关键错误事件：即使窗口聚焦也必须通知，避免用户错过重要失败信息
-const CRITICAL_EVENTS = new Set(['clip_failed', 'reconnect_failed', 'recording_stopped'])
+const CRITICAL_EVENTS = new Set(['clip_failed', 'reconnect_failed', 'recording_stopped', 'backend_crashed'])
 
 export function useNotifications() {
   const unsubsRef = useRef<(() => void)[]>([])

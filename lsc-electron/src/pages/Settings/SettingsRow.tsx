@@ -1,9 +1,20 @@
 import type { ReactNode } from 'react'
 
-export function SettingsRow({ label, children }: { label: string; children: ReactNode }) {
+export function SettingsRow({
+  label,
+  description,
+  children,
+}: {
+  label: string
+  description?: ReactNode
+  children: ReactNode
+}) {
   return (
     <div className="settings-row">
-      <span className="settings-row__label">{label}</span>
+      <div className="settings-row__info">
+        <span className="settings-row__label">{label}</span>
+        {description && <span className="settings-row__desc">{description}</span>}
+      </div>
       <div className="settings-row__control">{children}</div>
     </div>
   )

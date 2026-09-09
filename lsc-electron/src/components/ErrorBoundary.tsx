@@ -46,7 +46,7 @@ export default class ErrorBoundary extends Component<Props, State> {
           <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>
             {t('应用遇到问题')}
           </h2>
-          <p style={{ fontSize: 13, color: 'var(--text-400, #8e8e93)', margin: 0, maxWidth: 400, textAlign: 'center' }}>
+          <p style={{ fontSize: 13, color: 'var(--text-tertiary)', margin: 0, maxWidth: 400, textAlign: 'center' }}>
             {t('页面发生了意外错误。请刷新页面重试，如果问题持续出现请重启应用。')}
           </p>
           <pre style={{
@@ -65,7 +65,7 @@ export default class ErrorBoundary extends Component<Props, State> {
           <button
             onClick={this.handleReload}
             style={{
-              background: 'var(--brand-500, #31B3AE)',
+              background: 'var(--brand-500)',
               color: 'var(--text-50, #f5f5f7)',
               border: 'none',
               borderRadius: 10,

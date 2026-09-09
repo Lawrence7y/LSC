@@ -103,6 +103,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('cleanup-all-rooms', handler)
     return () => ipcRenderer.removeListener('cleanup-all-rooms', handler)
   },
+  notifyCleanupAllRoomsComplete: (result: {
+    success: boolean
+    finalization_state?: 'idle' | 'checkpoint_saved' | 'finalizing' | 'completed' | 'error'
+    finalization_job_id?: string | null
+    stopped_recording_room_ids?: string[]
+    errors?: string[]
+  }) => ipcRenderer.send('cleanup-all-rooms-complete', result),
 
   // 重启 Python 后端（「重新连接」在后端进程死亡时使用）
   restartBackend: () => ipcRenderer.invoke('restart-backend'),

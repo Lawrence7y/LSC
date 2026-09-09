@@ -3,8 +3,8 @@ import { t as tModule, useI18n } from '@/i18n'
 
 // 模块级操作计数器，确保 operation_id 唯一性
 let _operationCounter = 0
-import { Row, Col, Card, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch, App } from 'antd'
-import { PlusOutlined, VideoCameraOutlined, SoundOutlined, MutedOutlined, SyncOutlined } from '@ant-design/icons'
+import { Row, Col, Input, Button, Space, message, Empty, Modal, Tooltip, Select, Alert, Radio, Switch, App } from 'antd'
+import { PlusOutlined, VideoCameraOutlined, SoundOutlined, AudioMutedOutlined, SyncOutlined } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useExportProgressListeners } from '@/hooks/useExportProgressListeners'
 import { usePlayheadSampling } from '@/hooks/usePlayheadSampling'
@@ -45,6 +45,20 @@ const LIVE_EDGE_TOLERANCE_SEC = 1.0
 /** 越过紫标左沿此容差内视为回到 Live（秒） */
 const DVR_LEFT_TOLERANCE_SEC = 0.25
 const MAX_ROOM_URLS_PER_ADD = 12
+const BROADCAST_PROFILE_HINTS = [
+  '官方赛事', '官方解说', '赛事直播', '赛事转播', '赛事解说',
+  '比赛直播', '比赛解说', '赛事实况', '二路', '联赛', '锦标赛',
+  '太平洋', '进化者', 'vct', 'valorant champions', 'valorant masters',
+  'tournament', 'official match',
+]
+
+function likelyBroadcastProfileMismatch(room: { streamer_name?: string; stream_title?: string; room_url?: string }): boolean {
+  const text = [room.streamer_name, room.stream_title, room.room_url]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  return Boolean(text) && !BROADCAST_PROFILE_HINTS.some((hint) => text.includes(hint))
+}
 
 type RoomUrlValidationState = {
   status: 'idle' | 'checking' | 'success' | 'error'
@@ -313,6 +327,7 @@ export default function Workbench() {
   }, [connectionStatus])
   const clips = useAppStore((state) => state.clips)
   const continuousAnalysisStatus = useAppStore((state) => state.continuousAnalysisStatus)
+  const timelineReplaySeconds = useAppStore((state) => state.settings.timeline_replay_seconds)
   const setSelectedRoomId = useAppStore((state) => state.setSelectedRoomId)
   const addClip = useAppStore((state) => state.addClip)
   const setClips = useAppStore((state) => state.setClips)
@@ -381,6 +396,7 @@ export default function Workbench() {
   const [continuousTargetRoomIds, setContinuousTargetRoomIds] = useState<string[]>([])
   const [analysisGameType, setAnalysisGameType] = useState<AnalysisMode>('valorant_round')
   const isValorantRoundCutting = analysisGameType === 'valorant_round'
+  const [valorantSourceProfile, setValorantSourceProfile] = useState<'auto' | 'pov' | 'broadcast'>('auto')
   const continuousActiveRoomRef = useRef<string | null>(null)
   const openedWithMultiRef = useRef(false)
   // 同步导出模式标记（response 监听器据此预创建 clips 关联 job_id）
@@ -703,7 +719,8 @@ export default function Workbench() {
     }
     const buf = getRoomBufferedRange(rid)
     if (!buf) return null
-    const dvrPreview = computeDvrLeftEdge(buf.end)
+    // 真实 MSE 缓冲起播安全线：不能落后于播放器真实连续缓存起始 buf.start。
+    const dvrPreview = Math.max(buf.start, computeDvrLeftEdge(buf.end, timelineReplaySeconds))
     if (commonMode && timelineContext?.room_snapshots[rid]) {
       try {
         return previewToCommon(timelineContext, rid, dvrPreview)
@@ -713,7 +730,7 @@ export default function Workbench() {
       }
     }
     return dvrPreview
-  }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, commonMode, timelineContext, previewPositions, timelineTick])
+  }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, commonMode, timelineContext, previewPositions, timelineTick, timelineReplaySeconds])
 
   // recording_review / degraded：强制退出 followLive
   useEffect(() => {
@@ -1262,12 +1279,17 @@ export default function Workbench() {
 
     const registry = window.__msePlayers
     const video = registry?.[roomId]?.player?.videoElement as HTMLVideoElement | undefined
+    const player = registry?.[roomId]?.player
     if (video && video.buffered.length > 0) {
       const bufStart = video.buffered.start(0)
       const bufEnd = video.buffered.end(video.buffered.length - 1)
       if (t >= bufStart && t <= bufEnd) {
-        try { video.currentTime = t } catch { /* seek 可能被浏览器拒绝 */ }
+        try {
+          player?.markSeeked?.()
+          video.currentTime = t
+        } catch { /* seek 可能被浏览器拒绝 */ }
       } else if (!quiet) {
+        player?.markSeeked?.()
         // 非拖动回放（点击切片/标记/跳转）缓冲外：如果存在录制文件，切换到
         // 录制文件回看（recording_review）并按目标秒数起播，而不是只回退到
         // MSE 直播缓冲边缘（通常只有数秒到数十秒）。
@@ -1302,11 +1324,15 @@ export default function Workbench() {
           send('start_recording_review', { room_id: roomId, time: recTime })
           return
         }
-        // 没有可回看文件时：clamp 到最近可回放位置，保证回放有响应。
-        const fallback = Math.max(bufStart, bufEnd - 0.5)
-        try { video.currentTime = fallback } catch { /* ignore */ }
+        // 没有可回看文件时：clamp 到当前连续有效缓冲起点，保证平滑回放且不暂停。
+        const fallback = Math.max(bufStart + 0.3, Math.min(bufEnd - 0.5, t))
+        try {
+          video.currentTime = fallback
+          player?.markSeeked?.()
+          player?.resumePlayback?.(true)
+        } catch { /* ignore */ }
         console.info(
-          `[Workbench] seek ${t.toFixed(1)}s 超出缓冲 [${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}]，回退到 ${fallback.toFixed(1)}s`,
+          `[Workbench] seek ${t.toFixed(1)}s 超出缓冲 [${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}]，平滑回退到 ${fallback.toFixed(1)}s`,
         )
       }
       // quiet（scrub 拖动中）缓冲外：只动时间线 UI，不把 video 拽回 live edge
@@ -2684,6 +2710,14 @@ export default function Workbench() {
           recording_end_sec: c.recording_end_sec,
           mark_precision: c.mark_precision,
           confirm_status: c.confirm_status,
+          // 赛事审计元数据随切片端到端透传（后端草稿门禁仍以权威快照为准）
+          source_profile: c.source_profile,
+          broadcast_audit: c.broadcast_audit,
+          broadcast_audit_reason: c.broadcast_audit_reason,
+          broadcast_excluded_reason: c.broadcast_excluded_reason,
+          broadcast_review_required: c.broadcast_review_required,
+          duration_anomaly: c.duration_anomaly,
+          end_by: c.end_by,
         })),
         options: {
           include_recordings: true,
@@ -2787,7 +2821,9 @@ export default function Workbench() {
       mainRoomId: s.mainRoomId,
       clips: sessionClips,
       includeClips: true,
-      includePending: true,
+      // 自动草稿失败关闭：严禁无条件包含 pending / 未通过赛事审计的切片。
+      // 需要包含待确认切片时，用户应通过手工生成（includePending=true）并确认。
+      includePending: false,
       allowSingleFallback: false,
     })
     if (res?.success) {
@@ -3168,6 +3204,35 @@ export default function Workbench() {
     message.info(t('请点击上方「一键对齐」完成多房间同步'))
   }, [])
 
+  const handleResumeFinalization = useCallback((roomId: string) => {
+    const current = useAppStore.getState().continuousAnalysisStatus
+    const queued = send('resume_continuous_finalization', {
+      main_room_id: roomId,
+      finalization_job_id: current?.finalization_job_id,
+      target_room_ids: current?.target_room_ids?.length
+        ? current.target_room_ids
+        : [roomId],
+      mode: current?.mode || 'valorant_round',
+      game: 'valorant',
+      valorant_profile: current?.valorant_profile || 'broadcast',
+    })
+    if (!queued) return
+    setContinuousAnalyzing(true)
+    setContinuousRoomId(roomId)
+    continuousActiveRoomRef.current = roomId
+    setContinuousAnalysisStatus({
+      ...(current || { running: false }),
+      running: true,
+      room_id: roomId,
+      phase: 'finalizing',
+      status: 'finalizing',
+      finalization_state: 'finalizing',
+      analysis_stage: t('正在恢复收尾扫描…'),
+      updated_at: Math.floor(Date.now() / 1000),
+    })
+    message.info(t('正在恢复收尾扫描…'))
+  }, [send, setContinuousAnalysisStatus, t])
+
   // 分析导出确认（持续分析 / 同步分析导出 合并）
   const handleConfirmAnalysisExport = () => {
     if (!continuousMainRoom) {
@@ -3212,27 +3277,47 @@ export default function Workbench() {
         return
       }
       const mainRoomPreviewEnabled = rooms.find(r => r.room_id === continuousMainRoom)?.preview_enabled ?? false
-      if (!mainRoomPreviewEnabled) {
-        // 后端 valorant 强制 interval=5；此处仅提示未开预览时观感更依赖状态面板
-        message.info(t('主房未开启预览：请以状态面板中的有效间隔为准'), 4)
+      const startContinuousAnalysis = () => {
+        if (!mainRoomPreviewEnabled) {
+          // 后端 valorant 强制 interval=5；此处仅提示未开预览时观感更依赖状态面板
+          message.info(t('主房未开启预览：请以状态面板中的有效间隔为准'), 4)
+        }
+        setContinuousSubmitting(true)
+        const queued = send('start_continuous_analysis', {
+          main_room_id: continuousMainRoom,
+          target_room_ids: targetRoomIds,
+          mode: isValorantRoundCutting ? 'valorant_round' : 'scene',
+          interval: isValorantRoundCutting ? (mainRoomPreviewEnabled ? 60 : 45) : 60,
+          preview_enabled: mainRoomPreviewEnabled,
+          threshold: 0.3,
+          game: isValorantRoundCutting ? 'valorant' : 'generic',
+          valorant_profile: isValorantRoundCutting ? valorantSourceProfile : undefined,
+        })
+        if (!queued) {
+          setContinuousSubmitting(false)
+          return
+        }
+        armDraftSession(continuousMainRoom, targetRoomIds)
+        setContinuousModalOpen(false)
+        message.info(t('持续分析启动请求已发送'))
       }
-      setContinuousSubmitting(true)
-      const queued = send('start_continuous_analysis', {
-        main_room_id: continuousMainRoom,
-        target_room_ids: targetRoomIds,
-        mode: isValorantRoundCutting ? 'valorant_round' : 'scene',
-        interval: isValorantRoundCutting ? (mainRoomPreviewEnabled ? 60 : 45) : 60,
-        preview_enabled: mainRoomPreviewEnabled,
-        threshold: 0.3,
-        game: isValorantRoundCutting ? 'valorant' : 'generic',
-      })
-      if (!queued) {
-        setContinuousSubmitting(false)
-        return
+      const mainRoom = rooms.find(r => r.room_id === continuousMainRoom)
+      if (
+        isValorantRoundCutting
+        && valorantSourceProfile === 'broadcast'
+        && mainRoom
+        && likelyBroadcastProfileMismatch(mainRoom)
+      ) {
+        modal.confirm({
+          title: t('视角策略与直播信息不匹配'),
+          content: t('当前直播间没有明显赛事特征。broadcast 会启用赛事审计，可能带来更大滞后。确定继续？'),
+          okText: t('继续使用 broadcast'),
+          cancelText: t('返回修改'),
+          onOk: startContinuousAnalysis,
+        })
+      } else {
+        startContinuousAnalysis()
       }
-      armDraftSession(continuousMainRoom, targetRoomIds)
-      setContinuousModalOpen(false)
-      message.info(t('持续分析启动请求已发送'))
     } else {
       const jobPrefix = `hlexport-${Date.now()}`
       isSyncExportModeRef.current = true
@@ -3249,6 +3334,7 @@ export default function Workbench() {
         weights: { audio: 0.45, visual: 0.35, scene: 0.20 },
         job_prefix: jobPrefix,
         game: isValorantRoundCutting ? 'valorant' : 'generic',
+        valorant_profile: isValorantRoundCutting ? valorantSourceProfile : undefined,
       })
       if (!queued) {
         setContinuousSubmitting(false)
@@ -3328,6 +3414,27 @@ export default function Workbench() {
         message.error(data?.error || t('持续分析启动失败'))
       }
     }))
+    unsubs.push(on('resume_continuous_finalization_response', (data: any) => {
+      if (data?.success) {
+        message.info(t('正在恢复收尾扫描…'))
+        return
+      }
+      const previous = useAppStore.getState().continuousAnalysisStatus
+      setContinuousAnalyzing(false)
+      setContinuousRoomId(null)
+      continuousActiveRoomRef.current = null
+      setContinuousAnalysisStatus({
+        ...(previous || { running: false }),
+        running: false,
+        phase: 'checkpoint_saved',
+        status: 'checkpoint_saved',
+        finalization_state: 'checkpoint_saved',
+        finalization_recoverable: true,
+        error: data?.error || t('恢复收尾失败'),
+        updated_at: Math.floor(Date.now() / 1000),
+      })
+      message.error(data?.error || t('恢复收尾失败'))
+    }))
     unsubs.push(on('stop_continuous_analysis_response', (data: any) => {
       if (data?.success) {
         // 不立即宣告已停止：保持忙碌直到 idle 广播（任务槽释放）
@@ -3361,6 +3468,10 @@ export default function Workbench() {
           status: 'error',
           error: data.error,
           analysis_stage: t('视觉模型不可用'),
+          finalization_state: data.finalization_state ?? 'error',
+          coverage_complete: false,
+          audit_delivery_gap: data.audit_delivery_gap ?? 0,
+          pending_queue_depth: data.pending_queue_depth ?? 0,
           updated_at: Math.floor(Date.now() / 1000),
         })
       } else {
@@ -3374,6 +3485,12 @@ export default function Workbench() {
           pending_rounds: previous?.pending_rounds ?? 0,
           phase: 'completed',
           analysis_stage: t('已完成'),
+          coverage_ranges: data?.coverage_ranges ?? previous?.coverage_ranges,
+          coverage_complete: data?.coverage_complete ?? true,
+          finalization_state: data?.finalization_state ?? 'completed',
+          finalization_job_id: data?.finalization_job_id ?? previous?.finalization_job_id,
+          audit_delivery_gap: data?.audit_delivery_gap ?? 0,
+          pending_queue_depth: data?.pending_queue_depth ?? 0,
           updated_at: Math.floor(Date.now() / 1000),
         })
       }
@@ -3431,7 +3548,7 @@ export default function Workbench() {
       }
     }))
     return () => unsubs.forEach(u => u())
-  }, [on, runAnalysisDraftIfNeeded, clearDraftSession])
+  }, [on, runAnalysisDraftIfNeeded, clearDraftSession, t, setContinuousAnalysisStatus])
 
   // ── 后端自动导出入队通知：切片添加到列表 ──
   useEffect(() => {
@@ -3478,6 +3595,17 @@ export default function Workbench() {
                 confirm_status: data.confirm_status ?? c.confirm_status,
                 boundary_evidence: data.boundary_evidence ?? c.boundary_evidence,
                 boundary_source: data.boundary_source ?? c.boundary_source,
+                boundary_quality: data.boundary_quality ?? c.boundary_quality,
+                boundary_quality_reason_code: data.boundary_quality_reason_code ?? c.boundary_quality_reason_code,
+                boundary_review_required: data.boundary_review_required ?? c.boundary_review_required,
+                source_profile: data.source_profile ?? c.source_profile,
+                broadcast_audit: data.broadcast_audit ?? c.broadcast_audit,
+                broadcast_audit_reason: data.broadcast_audit_reason ?? c.broadcast_audit_reason,
+                broadcast_excluded_reason: data.broadcast_excluded_reason ?? c.broadcast_excluded_reason,
+                broadcast_review_required: data.broadcast_review_required ?? c.broadcast_review_required,
+                duration_anomaly: data.duration_anomaly ?? c.duration_anomaly,
+                end_by: data.end_by ?? c.end_by,
+                start_by: data.start_by ?? c.start_by,
                 label: data.label || c.label,
                 clip_id: data.clip_id || c.clip_id,
                 job_id: data.job_id || c.job_id,
@@ -3517,6 +3645,17 @@ export default function Workbench() {
           confirm_status: data.confirm_status ?? (data.export_deferred ? 'pending' : undefined),
           boundary_evidence: data.boundary_evidence,
           boundary_source: data.boundary_source,
+          boundary_quality: data.boundary_quality,
+          boundary_quality_reason_code: data.boundary_quality_reason_code,
+          boundary_review_required: data.boundary_review_required,
+          source_profile: data.source_profile,
+          broadcast_audit: data.broadcast_audit,
+          broadcast_audit_reason: data.broadcast_audit_reason,
+          broadcast_excluded_reason: data.broadcast_excluded_reason,
+          broadcast_review_required: data.broadcast_review_required,
+          duration_anomaly: data.duration_anomaly,
+          end_by: data.end_by,
+          start_by: data.start_by,
           round_key: data.round_key,
         })
         return
@@ -3544,6 +3683,17 @@ export default function Workbench() {
         confirm_status: data.confirm_status ?? (data.export_deferred ? 'pending' : undefined),
         boundary_evidence: data.boundary_evidence,
         boundary_source: data.boundary_source,
+        boundary_quality: data.boundary_quality,
+        boundary_quality_reason_code: data.boundary_quality_reason_code,
+        boundary_review_required: data.boundary_review_required,
+        source_profile: data.source_profile,
+        broadcast_audit: data.broadcast_audit,
+        broadcast_audit_reason: data.broadcast_audit_reason,
+        broadcast_excluded_reason: data.broadcast_excluded_reason,
+        broadcast_review_required: data.broadcast_review_required,
+        duration_anomaly: data.duration_anomaly,
+        end_by: data.end_by,
+        start_by: data.start_by,
         round_key: data.round_key,
       })
       scheduleBatchedToast(
@@ -3665,6 +3815,17 @@ export default function Workbench() {
     if (!s.sawRunning) return
     if (status.running) return
     if (phase !== 'idle' && phase !== 'completed') return
+
+    // 收尾完成门禁（fail closed）：自动草稿必须等收尾真正完成——
+    // finalization_state == completed && coverage_complete == true
+    // && audit_delivery_gap == 0 && 后台审计队列为空（pending_queue_depth == 0）。
+    // 任一不满足则继续等待，绝不提前生成包含未审计/未覆盖内容的草稿。
+    const finalizedOk =
+      status.finalization_state === 'completed'
+      && status.coverage_complete === true
+      && (status.audit_delivery_gap ?? 0) === 0
+      && (status.pending_queue_depth ?? 0) === 0
+    if (!finalizedOk) return
 
     // autoFired 仅由 runAnalysisDraftIfNeeded 置位；此处预置会导致函数内立即 return
     void runAnalysisDraftIfNeeded('auto')
@@ -4112,6 +4273,23 @@ export default function Workbench() {
 
   // ── P0 UI 优化：切片面板定位 / 批量确认 / 空态启动持续分析 ──
   const clipPanelRef = useRef<HTMLDivElement>(null)
+  const actionsBarRef = useRef<HTMLDivElement>(null)
+  const [actionsBarWidth, setActionsBarWidth] = useState<number | undefined>(undefined)
+
+  useEffect(() => {
+    const el = actionsBarRef.current
+    if (!el) return
+    const updateWidth = () => {
+      const w = Math.round(el.getBoundingClientRect().width)
+      if (w > 0) setActionsBarWidth(w)
+    }
+    updateWidth()
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => updateWidth())
+      ro.observe(el)
+      return () => ro.disconnect()
+    }
+  }, [])
   const scrollToClipPanel = useCallback(() => {
     clipPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   }, [])
@@ -4292,7 +4470,8 @@ export default function Workbench() {
               </Button>
             )}
           </Space>
-          <Space className="workbench-toolbar__actions" wrap size={8}>
+          <div ref={actionsBarRef} className="workbench-toolbar__actions-wrapper" style={{ display: 'inline-flex' }}>
+            <Space className="workbench-toolbar__actions" wrap size={8}>
             <Button
               size="middle"
               onClick={() => {
@@ -4324,7 +4503,7 @@ export default function Workbench() {
             <Button
               size="middle"
               type={allMuted ? 'primary' : 'default'}
-              icon={allMuted ? <MutedOutlined /> : <SoundOutlined />}
+              icon={allMuted ? <AudioMutedOutlined /> : <SoundOutlined />}
               onClick={() => {
                 const newMuted = !allMuted
                 setAllMuted(newMuted)
@@ -4359,19 +4538,79 @@ export default function Workbench() {
               </span>
             </Tooltip>
           </Space>
+          </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-          <AnalysisProgress status={continuousAnalysisStatus} compact exportSummary={exportSummary} onGoToClips={scrollToClipPanel} />
-          {draftSessionStatus === 'failed' && (
-            <Button
-              size="small"
-              loading={jianyingLoading}
-              disabled={jianyingLoading}
-              onClick={() => void runAnalysisDraftIfNeeded('retry')}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, minWidth: 0, marginTop: 4 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0, flexShrink: 0 }}>
+            <AnalysisProgress
+              status={continuousAnalysisStatus}
+              compact
+              exportSummary={exportSummary}
+              onGoToClips={scrollToClipPanel}
+              onResumeFinalization={handleResumeFinalization}
+            />
+            {draftSessionStatus === 'failed' && (
+              <Button
+                size="small"
+                loading={jianyingLoading}
+                disabled={jianyingLoading}
+                onClick={() => void runAnalysisDraftIfNeeded('retry')}
+                style={{ height: 28, fontSize: 12, borderRadius: 'var(--radius-xs)' }}
+              >
+                {t('重试生成草稿')}
+              </Button>
+            )}
+          </div>
+
+          {/* 添加直播间输入框和按键（移动到持续分析状态栏后方，与上方全选到批量停止按键等宽等高） */}
+          <div
+            className="workbench-toolbar__add-room"
+            style={{
+              width: actionsBarWidth ? `${actionsBarWidth}px` : undefined,
+              minWidth: 260,
+              maxWidth: 620,
+              marginLeft: 'auto',
+              flexShrink: 0,
+            }}
+          >
+            <Tooltip
+              open={roomUrlValidation.status !== 'idle'}
+              title={roomUrlValidation.message}
+              color={
+                roomUrlValidation.status === 'error'
+                  ? 'var(--state-error)'
+                  : roomUrlValidation.status === 'success'
+                    ? 'var(--state-success)'
+                    : undefined
+              }
+              placement="bottomRight"
             >
-              {t('重试生成草稿')}
-            </Button>
-          )}
+              <Space.Compact style={{ width: '100%' }}>
+                <Input
+                  placeholder={t('粘贴直播间链接...')}
+                  value={url}
+                  onChange={e => {
+                    setUrl(e.target.value)
+                    if (roomUrlValidation.status !== 'idle') {
+                      setRoomUrlValidation({ status: 'idle', message: '' })
+                    }
+                  }}
+                  onPressEnter={handleAddRoom}
+                  disabled={loading}
+                />
+                <Button 
+                  type="primary" 
+                  icon={<PlusOutlined />}
+                  onClick={handleAddRoom}
+                  loading={loading}
+                  disabled={!url.trim()}
+                  style={{ fontWeight: 600 }}
+                >
+                  {t('添加')}
+                </Button>
+              </Space.Compact>
+            </Tooltip>
+          </div>
         </div>
       </div>
 
@@ -4397,7 +4636,7 @@ export default function Workbench() {
           >
             {rooms.length === 0 ? (
               <Empty
-                description={t('暂无房间，请添加直播间地址')}
+                description={t('暂无房间 · 在上方粘贴直播间链接开始')}
                 style={{ marginTop: 100 }}
               />
             ) : (
@@ -4497,61 +4736,14 @@ export default function Workbench() {
         <div
           ref={clipPanelRef}
           style={{
-          width: 320,
-          borderLeft: '1px solid var(--border-default)',
-          display: 'flex',
-          flexDirection: 'column',
-          overflow: 'hidden',
-          minHeight: 0,
-        }}>
-          {/* 添加直播间 */}
-          <Card 
-            size="small" 
-            title={t('添加直播间')}
-            style={{ 
-              margin: 16, 
-              marginBottom: 8,
-              background: 'var(--bg-secondary)',
-            }}
-          >
-            <Space.Compact style={{ width: '100%' }}>
-              <Input
-                placeholder={t('粘贴直播间链接...')}
-                value={url}
-                onChange={e => {
-                  setUrl(e.target.value)
-                  if (roomUrlValidation.status !== 'idle') {
-                    setRoomUrlValidation({ status: 'idle', message: '' })
-                  }
-                }}
-                onPressEnter={handleAddRoom}
-                disabled={loading}
-              />
-              <Button 
-                type="primary" 
-                icon={<PlusOutlined />}
-                onClick={handleAddRoom}
-                loading={loading}
-              >
-                {t('添加')}
-              </Button>
-            </Space.Compact>
-            {roomUrlValidation.status !== 'idle' && (
-              <Alert
-                className="room-url-validation"
-                type={
-                  roomUrlValidation.status === 'success'
-                    ? 'success'
-                    : roomUrlValidation.status === 'error'
-                      ? 'error'
-                      : 'info'
-                }
-                showIcon
-                message={roomUrlValidation.message}
-              />
-            )}
-          </Card>
-
+            width: 320,
+            borderLeft: '1px solid var(--border-default)',
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            minHeight: 0,
+          }}
+        >
           {/* 切片列表 */}
           <ClipList
             clips={clips}
@@ -4724,12 +4916,28 @@ export default function Workbench() {
               <Radio.Button value="valorant_round">{t('无畏契约')}</Radio.Button>
               <Radio.Button value="generic">{t('通用直播')}</Radio.Button>
             </Radio.Group>
-            {isValorantRoundCutting && (
-              <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
-                {t('自动适配游戏视角与赛事解说画面，回合入列后需确认再导出')}
-              </div>
-            )}
           </div>
+
+          {isValorantRoundCutting && (
+            <div>
+              <div style={{ fontWeight: 600, marginBottom: 8 }}>{t('视角策略')}</div>
+              <Radio.Group
+                value={valorantSourceProfile}
+                onChange={(e) => setValorantSourceProfile(e.target.value)}
+                optionType="button"
+                buttonStyle="solid"
+              >
+                <Radio.Button value="auto">{t('自动识别')}</Radio.Button>
+                <Radio.Button value="pov">{t('主播 / 第一视角')}</Radio.Button>
+                <Radio.Button value="broadcast">{t('官方赛事 / 二路解说')}</Radio.Button>
+              </Radio.Group>
+              <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+                {valorantSourceProfile === 'pov' && t('纯第一视角画面，纯 OCR 极速检测，适合主播天梯排位')}
+                {valorantSourceProfile === 'broadcast' && t('带视觉模型深度审计，严格截断慢动作回放与暂停，适合官方比赛与二路转播')}
+                {valorantSourceProfile === 'auto' && t('根据直播间标题和主播信息自动适配策略（可手动强制指定）')}
+              </div>
+            </div>
+          )}
 
           <div style={{
             display: 'flex', alignItems: 'center', gap: 24, flexWrap: 'wrap',

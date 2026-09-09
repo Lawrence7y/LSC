@@ -87,15 +87,16 @@ describe('computeTimelineWindow', () => {
 })
 
 describe('computeDvrLeftEdge', () => {
-  it('returns max(0, liveEdge - 120)', () => {
-    expect(DVR_LOOKBACK_SEC).toBe(120)
-    expect(computeDvrLeftEdge(500)).toBe(380)
+  it('returns max(0, liveEdge - configured replay duration)', () => {
+    expect(DVR_LOOKBACK_SEC).toBe(300)
+    expect(computeDvrLeftEdge(500)).toBe(200)
+    expect(computeDvrLeftEdge(500, 120)).toBe(380)
     expect(computeDvrLeftEdge(60)).toBe(0)
   })
 })
 
 describe('computeExpandedPreviewWindow', () => {
-  it('live without buffer: left = purple = previewPos − 120, ignores recordedHint', () => {
+  it('live without buffer: left = purple = previewPos − configured duration, ignores recordedHint', () => {
     const r = computeExpandedPreviewWindow({
       liveDvr: true,
       previewPos: 500,
@@ -103,9 +104,9 @@ describe('computeExpandedPreviewWindow', () => {
       previewDuration: 3600,
       fileDuration: 3600,
     })
-    expect(r.start).toBe(380)
+    expect(r.start).toBe(200)
     expect(r.end).toBe(500)
-    expect(r.purple).toBe(380)
+    expect(r.purple).toBe(200)
     expect(r.liveEdge).toBe(500)
     expect(r.hasLiveDvr).toBe(true)
     expect(r.playheadPct).toBe(100)
@@ -121,7 +122,7 @@ describe('computeExpandedPreviewWindow', () => {
       bufferedStart: 490,
       bufferedEnd: 620,
     })
-    expect(r.start).toBe(500)
+    expect(r.start).toBe(490)
     expect(r.end).toBe(620)
     expect(r.playheadPct).toBe(100)
     expect(r.fillWidthPct).toBe(100)
@@ -146,11 +147,13 @@ describe('computeExpandedPreviewWindow', () => {
       bufferedEnd: 620,
       recordedHint: 3600,
     })
-    expect(r.start).toBe(500)
+    expect(r.start).toBe(490)
     expect(r.end).toBe(620)
-    expect(r.purple).toBe(500)
+    expect(r.purple).toBe(490)
     expect(r.liveEdge).toBe(620)
-    expect(r.playheadPct).toBeCloseTo((610 - 500) / 120 * 100, 5)
+    expect(r.playheadPct).toBeCloseTo((610 - 490) / 130 * 100, 5)
+    expect(r.configuredReplaySeconds).toBe(300)
+    expect(r.availableReplaySeconds).toBe(130)
   })
 
   it('live under 120s starts at 0 even if recording is long', () => {
@@ -178,6 +181,21 @@ describe('computeExpandedPreviewWindow', () => {
     expect(r.liveEdge).toBe(12)
   })
 
+  it('disabled replay exposes only the live edge', () => {
+    const r = computeExpandedPreviewWindow({
+      liveDvr: true,
+      replaySeconds: 0,
+      previewPos: 610,
+      bufferedStart: 490,
+      bufferedEnd: 620,
+    })
+    expect(r.start).toBe(620)
+    expect(r.end).toBe(620)
+    expect(r.purple).toBe(620)
+    expect(r.hasLiveDvr).toBe(false)
+    expect(r.playheadPct).toBe(100)
+  })
+
   it('recording_review uses file duration from 0, no 120s DVR window', () => {
     const r = computeExpandedPreviewWindow({
       liveDvr: false,
@@ -193,5 +211,7 @@ describe('computeExpandedPreviewWindow', () => {
     expect(r.purple).toBe(0)
     expect(r.hasLiveDvr).toBe(false)
     expect(r.playheadPct).toBeCloseTo(30 / 180 * 100, 5)
+    expect(r.configuredReplaySeconds).toBe(0)
+    expect(r.availableReplaySeconds).toBe(180)
   })
 })

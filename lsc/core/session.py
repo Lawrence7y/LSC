@@ -44,6 +44,8 @@ class RoomSession:
     preview_error: str = ""
     # live_mse | recording_review | degraded
     preview_mode: str = "live_mse"
+    # 文件回看 MSE 的时间基座：video.currentTime 从 0 开始时对应录制轴的秒数。
+    preview_review_start_sec: float = 0.0
     include_in_cut: bool = True
     is_connecting: bool = False
     is_connected: bool = False
@@ -127,6 +129,19 @@ class RoomSession:
     _shared_ingest_stall_checks: int = 0
     # 预览 epoch ID：每次预览启动/重建时生成新 UUID，用于检测预览流版本变化
     preview_epoch_id: str = ""
+    # 录制文件回看（C-01/C-05：独立生命周期，不破坏直播 preview_epoch_id）
+    active_preview_channel: str = "live"
+    review_session_id: str = ""
+    review_start_sec: float = 0.0
+    review_window_end_sec: float = 0.0
+    # 直播 MSE 预览轴相对录制文件轴的运行时映射。
+    # 约定：preview_local = recording_local + recording_to_preview_delta。
+    # 预览晚于录制 15 秒时，该值为 -15；仅在当前预览/录制 epoch 内有效，不持久化。
+    recording_to_preview_delta: float | None = None
+    preview_clock_epoch_id: str = ""
+    preview_clock_anchor_mono: float | None = None
+    preview_clock_anchor_time: float | None = None
+    preview_clock_updated_mono: float = 0.0
     # 录制 ID：每次录制启动/重连时生成新 UUID，用于绑定 ClipSnapshot 到特定录制文件
     recording_id: str = ""
     # 缓存的流地址：连接/刷新时保存，避免录制/预览启动时重复刷新
@@ -160,6 +175,14 @@ class RoomSession:
         self.is_connected = False
         self.is_connecting = False
         self.last_error = message
+
+    def clear_preview_clock(self) -> None:
+        """清除当前预览 epoch 的录制轴→预览轴映射。"""
+        self.recording_to_preview_delta = None
+        self.preview_clock_epoch_id = ""
+        self.preview_clock_anchor_mono = None
+        self.preview_clock_anchor_time = None
+        self.preview_clock_updated_mono = 0.0
 
     def status_text(self) -> str:
         """生成当前房间状态的简短文本描述，供 UI 状态栏展示。"""

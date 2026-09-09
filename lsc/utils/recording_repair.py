@@ -10,6 +10,7 @@ import os
 import subprocess
 
 from lsc.recorder.capture import validate_recording
+from lsc.utils.process_launcher import prepare_launch, run_hidden
 
 _log = logging.getLogger(__name__)
 
@@ -48,13 +49,21 @@ def repair_recording(input_path: str, output_path: str | None = None) -> str | N
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        # 走统一启动 helper：prepare_launch 提供打包版 FFmpeg 的 PATH/环境，
+        # run_hidden 注入 CREATE_NO_WINDOW（否则每次修复在用户机器上闪 CMD 窗口）。
+        # subprocess.run 超时后会自行 kill 子进程再抛 TimeoutExpired。
+        env, _cflags, cwd = prepare_launch(ffmpeg_path)
+        result = run_hidden(
+            cmd, capture_output=True, timeout=600,
+            env=env, cwd=cwd,
+        )
         if result.returncode == 0 and os.path.isfile(output_path):
             _log.info("修复成功: %s -> %s", input_path, output_path)
             return output_path
         else:
+            stderr_text = result.stderr if isinstance(result.stderr, str) else (result.stderr or b"").decode("utf-8", errors="replace")
             _log.warning("修复失败: returncode=%d, stderr=%s",
-                         result.returncode, result.stderr.decode("utf-8", errors="replace")[:500])
+                         result.returncode, stderr_text[:500])
             # 清理失败的输出文件
             if os.path.isfile(output_path):
                 os.unlink(output_path)

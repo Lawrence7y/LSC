@@ -1,5 +1,6 @@
 import { useEffect, useCallback } from 'react'
-import { message } from 'antd'
+import { App, message as staticMessageApi } from 'antd'
+import type { MessageInstance } from 'antd/es/message/interface'
 import { wsClient as _wsClient } from '@/services/websocket'
 import type { RoomPipelineHealth, RoomSession, RuntimeEventPayload } from '@/types'
 
@@ -7,7 +8,18 @@ import type { RoomPipelineHealth, RoomSession, RuntimeEventPayload } from '@/typ
 export const wsClient = _wsClient
 import { useAppStore } from '@/store/appStore'
 import { removePlayhead } from '@/utils/playheadStore'
+import { performShutdownCleanup } from '@/utils/shutdownCleanup'
 import { t } from '@/i18n'
+
+/**
+ * antd v5 的静态 `message.*` 不消费 ConfigProvider（主题 / locale），暗色界面
+ * 会弹出浅色气泡。模块级回调（watchdog / send）无法调 hook，统一走这里：
+ * useWebSocket 挂载时注入 context 实例；未注入前降级到静态实例，不丢提示。
+ */
+let _messageApi: MessageInstance | null = null
+function msgApi(): MessageInstance {
+  return _messageApi ?? staticMessageApi
+}
 
 // 模块级标记：整个应用生命周期只发起一次 connect()。
 // useWebSocket() 会在 App、MainLayout、Workbench 等多处调用；连接可以共享，
@@ -15,6 +27,7 @@ import { t } from '@/i18n'
 let _initialConnectStarted = false
 let _sharedHandlersRefCount = 0
 let _sharedHandlersCleanup: (() => void) | null = null
+let _shutdownCleanupPromise: Promise<void> | null = null
 
 // 广播序列号追踪：检测丢消息并触发强制同步
 let _lastBroadcastSeq: number | null = null
@@ -160,6 +173,11 @@ export function clearMseRoomCache(roomId: string): void {
   _lastMseSegmentTimePerRoom.delete(roomId)
   delete _mseWatchdogLastRecovery[roomId]
   delete _mseWatchdogFailCount[roomId]
+  // 清除该房间旧一代的 init 重试计数；否则新文件 epoch 可能继承
+  // 旧直播的 10 次上限，明明收到新流仍被判定为 retry exhausted。
+  if (window.__mseInitRetryCount) {
+    delete window.__mseInitRetryCount[roomId]
+  }
   // 同步清理播放头快照，避免 rAF flush 携带死房间数据
   removePlayhead(roomId)
 }
@@ -250,6 +268,26 @@ export function getMseInitCache(roomId: string): ArrayBuffer | null {
   return _mseInitCache[roomId] ?? null
 }
 
+const _mseReviewInitCache: Record<string, { buffer: ArrayBuffer; sessionId?: string }> = {}
+const _mseReviewSegmentCache: Record<string, { buffer: ArrayBuffer; sessionId?: string }[]> = {}
+
+/** 获取某房间缓存的 review init 段 */
+export function getMseReviewInitCache(roomId: string, sessionId?: string): ArrayBuffer | null {
+  const item = _mseReviewInitCache[roomId]
+  if (!item) return null
+  if (sessionId && item.sessionId && item.sessionId !== sessionId) return null
+  return item.buffer
+}
+
+/** 取出并清空某房间已排队的 review media 段 */
+export function drainPendingMseReviewSegments(roomId: string, sessionId?: string): ArrayBuffer[] {
+  const arr = _mseReviewSegmentCache[roomId]
+  if (!arr || arr.length === 0) return []
+  delete _mseReviewSegmentCache[roomId]
+  const valid = arr.filter((item) => !sessionId || !item.sessionId || item.sessionId === sessionId)
+  return valid.map((item) => item.buffer)
+}
+
 function _decodeBase64Segment(b64Data: string): ArrayBuffer {
   // ponytail: fast path, loop is hot for every MSE segment; Worker if still bottleneck
   return Uint8Array.from(atob(b64Data), (c) => c.charCodeAt(0)).buffer
@@ -262,32 +300,65 @@ function _coerceMsePayload(data: ArrayBuffer | string): ArrayBuffer {
   return data
 }
 
-function _feedMseSegment(roomId: string, data: ArrayBuffer | string, type: 'init' | 'segment'): void {
+function _feedMseSegment(
+  roomId: string,
+  data: ArrayBuffer | string,
+  type: 'init' | 'segment',
+  channel: 'live' | 'review' = 'live',
+  streamId?: string,
+): void {
   try {
     const buffer = _coerceMsePayload(data)
-    // 缓存 init 段，供后续 VideoPreview 挂载时直接取用
-    if (type === 'init') {
-      _cacheMseInit(roomId, buffer)
+    if (channel === 'live') {
+      if (type === 'init') {
+        _cacheMseInit(roomId, buffer)
+      }
+    } else {
+      if (type === 'init') {
+        _mseReviewInitCache[roomId] = { buffer, sessionId: streamId }
+      }
     }
 
     const registry = window.__msePlayers as Record<string, any> | undefined
-    const player = registry?.[roomId]
-    if (!player) {
-      // player 未注册时缓存 media 段，避免初始几秒丢帧。
-      // init 段已通过 _cacheMseInit 缓存，此处只处理 media 段。
+    const entry = registry?.[roomId]
+    // 支持 entry 为单一 player（旧结构兼容）或 { live, review, player }
+    let targetPlayer: any = undefined
+    if (entry) {
+      if (channel === 'review') {
+        targetPlayer = entry.review
+      } else {
+        targetPlayer = entry.live ?? entry.player
+      }
+    }
+
+    if (!targetPlayer) {
+      // player 未注册时缓存 media 段，避免初始几秒丢帧
       if (type === 'segment') {
-        _cacheMseSegment(roomId, buffer)
+        if (channel === 'live') {
+          _cacheMseSegment(roomId, buffer)
+        } else {
+          if (!_mseReviewSegmentCache[roomId]) _mseReviewSegmentCache[roomId] = []
+          _mseReviewSegmentCache[roomId].push({ buffer, sessionId: streamId })
+          if (_mseReviewSegmentCache[roomId].length > 30) {
+            _mseReviewSegmentCache[roomId].shift()
+          }
+        }
       }
       return
     }
 
+    // 若带有 streamId，且目标播放器绑定了特定 session，失配时丢弃过期帧
+    if (streamId && targetPlayer.sessionId && targetPlayer.sessionId !== streamId) {
+      return
+    }
+
     if (type === 'init') {
-      player.feedInit(buffer)
+      targetPlayer.feedInit(buffer)
     } else {
-      player.feedMedia(buffer)
+      targetPlayer.feedMedia(buffer)
     }
   } catch (e) {
-    console.warn(`MSE ${type} decode failed for ${roomId}:`, e)
+    console.warn(`MSE ${type} (${channel}) decode failed for ${roomId}:`, e)
   }
 }
 
@@ -404,6 +475,15 @@ function _attachSharedWebSocketHandlers(): () => void {
     }
   })
 
+  const unsubPreviewClock = wsClient.on('set_preview_clock_response', (data: any) => {
+    const delta = Number(data?.recording_to_preview_delta)
+    if (!data?.success || !data?.room_id || !Number.isFinite(delta)) return
+    useAppStore.getState().updateRoom(data.room_id, {
+      recording_to_preview_delta: delta,
+      preview_clock_epoch_id: String(data.preview_clock_epoch_id || ''),
+    })
+  })
+
   const unsubRuntimeEvent = wsClient.on('runtime_event', (data: RuntimeEventPayload) => {
     if (data && data.room_id) {
       _applyRuntimeEvent(data)
@@ -453,6 +533,17 @@ function _attachSharedWebSocketHandlers(): () => void {
   const unsubReconnectFailed = wsClient.on('reconnect_failed', () => {
     console.error('WebSocket reconnect failed: max attempts reached, backend may be unavailable')
     useAppStore.getState().setConnectionStatus('reconnect_failed')
+  })
+
+  // 后端心跳超时（TCP 存活但后端 hang）：置全局标志让 UI 显示「重启后端」；
+  // 此前该事件零监听，后端假死时 UI 永远显示已连接。后端恢复消息由
+  // backend_revived 复位（MainLayout 展示与 reconnect_failed 同款按钮）。
+  const unsubBackendCrashed = wsClient.on('backend_crashed', () => {
+    console.error('[WebSocket] backend heartbeat timeout, marking unresponsive')
+    useAppStore.getState().setBackendUnresponsive(true)
+  })
+  const unsubBackendRevived = wsClient.on('backend_revived', () => {
+    useAppStore.getState().setBackendUnresponsive(false)
   })
 
   const handleSystemStats = (data: any) => {
@@ -510,17 +601,29 @@ function _attachSharedWebSocketHandlers(): () => void {
     }
   })
 
-  const unsubMseInit = wsClient.on('mse_init', (data: { room_id: string; data: ArrayBuffer | string }) => {
+  const unsubMseInit = wsClient.on('mse_init', (data: {
+    room_id: string
+    data: ArrayBuffer | string
+    channel?: 'live' | 'review'
+    stream_id?: string
+  }) => {
     if (data?.room_id && data?.data) {
-      _feedMseSegment(data.room_id, data.data, 'init')
+      _feedMseSegment(data.room_id, data.data, 'init', data.channel || 'live', data.stream_id)
     }
   })
 
-  const unsubMseSegment = wsClient.on('mse_segment', (data: { room_id: string; data: ArrayBuffer | string }) => {
+  const unsubMseSegment = wsClient.on('mse_segment', (data: {
+    room_id: string
+    data: ArrayBuffer | string
+    channel?: 'live' | 'review'
+    stream_id?: string
+  }) => {
     if (data?.room_id && data?.data) {
-      _lastMseSegmentTimePerRoom.set(data.room_id, Date.now())
-      _mseWatchdogFailCount[data.room_id] = 0
-      _feedMseSegment(data.room_id, data.data, 'segment')
+      if ((data.channel || 'live') === 'live') {
+        _lastMseSegmentTimePerRoom.set(data.room_id, Date.now())
+        _mseWatchdogFailCount[data.room_id] = 0
+      }
+      _feedMseSegment(data.room_id, data.data, 'segment', data.channel || 'live', data.stream_id)
     }
   })
 
@@ -691,7 +794,7 @@ function _attachSharedWebSocketHandlers(): () => void {
         // 恢复尝试耗尽：停止自动恢复，置 error 态提示用户手动处理。
         // phase 变更为 error 后本 watchdog 会跳过该房间（非 streaming），不再触发。
         console.warn(`[WS] Preview stall recovery exhausted for room ${r.room_id} (${fails}/${_MSE_WATCHDOG_MAX_FAILS}), disabling auto-recovery`)
-        message.warning({ content: t('预览持续中断，请手动重新开启预览'), key: `mse-stall-${r.room_id}`, duration: 5 })
+        msgApi().warning({ content: t('预览持续中断，请手动重新开启预览'), key: `mse-stall-${r.room_id}`, duration: 5 })
         useAppStore.getState().updateRoom(r.room_id, {
           preview_phase: 'error' as const,
           mse_error: t('预览持续中断，请手动重新开启预览'),
@@ -701,7 +804,7 @@ function _attachSharedWebSocketHandlers(): () => void {
         delete _mseWatchdogLastRecovery[r.room_id]
         delete _mseWatchdogFailCount[r.room_id]
       } else if (fails >= 2) {
-        message.warning({ content: t('预览恢复中'), key: `mse-stall-${r.room_id}`, duration: 3 })
+        msgApi().warning({ content: t('预览恢复中'), key: `mse-stall-${r.room_id}`, duration: 3 })
         wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
       } else if (_mseInitCache[r.room_id]) {
         wsClient.send('request_mse_init', { room_id: r.room_id })
@@ -718,6 +821,7 @@ function _attachSharedWebSocketHandlers(): () => void {
     unsubRoomsUpdated()
     unsubRoomsLoaded()
     unsubRoomUpdated()
+    unsubPreviewClock()
     unsubRuntimeEvent()
     unsubClipCompleted()
     unsubClipFailed()
@@ -726,6 +830,8 @@ function _attachSharedWebSocketHandlers(): () => void {
     unsubSettingsResponse()
     unsubReconnecting()
     unsubReconnectFailed()
+    unsubBackendCrashed()
+    unsubBackendRevived()
     unsubSystemStats()
     unsubDepStatus()
     unsubRecordingQueue()
@@ -752,6 +858,12 @@ function _attachSharedWebSocketHandlers(): () => void {
 
 export function useWebSocket() {
   const connectionStatus = useAppStore((state) => state.connectionStatus)
+  // context 版 message：跟随 ConfigProvider 主题与 locale。本模块的 watchdog 与
+  // 共享事件处理器跑在 hook 外，拿不到 hook 上下文，因此在这里注入实例。
+  const { message } = App.useApp()
+  useEffect(() => {
+    _messageApi = message
+  }, [message])
 
   useEffect(() => {
     _sharedHandlersRefCount += 1
@@ -761,21 +873,26 @@ export function useWebSocket() {
 
     // 监听 Electron 主进程的清理全部房间事件（应用退出时触发）
     const cleanupOnExit = window.electronAPI?.onCleanupAllRooms?.(() => {
+      if (_shutdownCleanupPromise) {
+        return
+      }
       console.log('[useWebSocket] 收到清理全部房间通知，正在停止所有录制/预览/分析...')
       const state = useAppStore.getState()
-      // 停止所有录制
-      state.rooms.forEach(r => {
-        if (r.is_recording) {
-          wsClient.send('stop_recording', { room_id: r.room_id })
-        }
-        if (r.preview_enabled) {
-          wsClient.send('enable_preview', { room_id: r.room_id, enabled: false, mode: 'mse' })
-        }
-      })
-      // 停止持续分析
-      if (state.continuousAnalysisStatus?.running && state.continuousAnalysisStatus.room_id) {
-        wsClient.send('stop_continuous_analysis', { main_room_id: state.continuousAnalysisStatus.room_id })
-      }
+      _shutdownCleanupPromise = performShutdownCleanup(
+        wsClient,
+        state.rooms,
+        state.continuousAnalysisStatus,
+      )
+        .then((result) => {
+          window.electronAPI?.notifyCleanupAllRoomsComplete?.(result)
+        })
+          .catch((error) => {
+            window.electronAPI?.notifyCleanupAllRoomsComplete?.({
+              success: false,
+              finalization_state: 'checkpoint_saved',
+              errors: [String(error)],
+            })
+        })
     })
 
     return () => {
@@ -791,7 +908,7 @@ export function useWebSocket() {
   const send = useCallback((type: string, data: any): boolean => {
     const ok = wsClient.send(type, data)
     if (!ok) {
-      message.warning(DISCONNECTED_SEND_WARNING)
+      msgApi().warning(DISCONNECTED_SEND_WARNING) // message.warning(DISCONNECTED_SEND_WARNING)
     }
     return ok
   }, [])

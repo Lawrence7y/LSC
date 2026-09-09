@@ -209,15 +209,15 @@
 
 **实际阅读范围**：lsc/analyzer/valorant_ocr_rounds.py；lsc/analyzer/ocr_detector.py；lsc/analyzer/ocr_accel.py；lsc/analyzer/pipeline.py；lsc/analyzer/scene_analysis.py；lsc/analyzer/sound_detector.py；lsc/analyzer/registry.py；lsc/analyzer/base.py；lsc/analyzer/generic_plugin.py；lsc/analyzer/valorant_plugin.py；python-backend/handlers/analysis_handlers.py；python-backend/handlers/room_handler.py（关键函数：_continuous_analysis_loop/_continuous_valorant_worker/_export_and_broadcast/_auto_export_highlights/_analyze_scene_or_rounds 及常量区）；lsc/core/services/runtime_health.py
 
-**职责**：对主房录制文件做边录边分析的「持续分析」：按增量预算抽帧，纯 OCR（顶部计分板+回合计时器、中央横幅）通过相位状态机 FSM 检测 Valorant 回合的入/出点，跨窗口持久化 FSM/锚点状态；产出回合入 6fps 切片列表并映射到多副房；同时承担录制后全量文件分析与 scene 通用分析回退；运行时输出 OCR 加速后端（auto/dml/cuda/cpu）选择与 FFmpeg 硬解抽帧。核心生产者 worker 在后台循环执行 detect_valorant_rounds_ocr。
+**职责**：对主房录制文件做边录边分析的「持续分析」：按增量预算抽帧，以纯 OCR 通过相位状态机 FSM 粗定位 Valorant 回合；普通主播/第一视角保持该路径，官方赛事/二路再经过五分类视觉模型和暂停计时器冻结审计，过滤 Replay、非游戏和暂停后才入列；跨窗口持久化 FSM/锚点状态，产出回合切片列表并映射到多副房；同时承担录制后全量文件分析与 scene 通用分析回退。核心生产者 worker 在后台循环执行 Valorant 插件。
 
-**架构**：插件范式分层：base.py 定义 AnalyzerPlugin 无状态协议与 ScanWindow/capabilities；registry.py 按 game 注册 Generic/Valorant 插件并提供默认导出值；valorant_plugin.py 经 compute_valorant_scan_budget 计算增量窗口（回看30s+自适应追赶45-480s），统一调用 valorant_ocr_rounds.detect_valorant_rounds_ocr 纯 OCR 检测器。检测器内部：extract_frames_cancellable 子窗口(≤60s)分块抽帧@1fps→OCR 双区域读信号→相位判定（锚点/冻结/结算抑制）→相位循环先验平滑→OcrRoundFSM.feed 状态机闭合回合→边界±3s@10fps 密扫精修。ocr_detector/ocr_accel 是相对独立分支（击杀检测、加速探针），持续分析主路径仅用其 _get_ocr/create_ocr/ffmpeg_hwaccel_args。后端：WebSocket handler(analysis_handlers)只做启停/状态/精修，真正的循环在 room_handler._continuous_analysis_loop（产消模式）+ _continuous_valorant_worker（后台 worker 持 _analysis_semaphore）+ _export_and_broadcast/_auto_export_highlights。runtime_health 与 OCR 检测无直接耦合，仅提供平台摄入健康投影。对外接口：WebSocket 消息 + clip_queued/highlight_stream/continuous_highlights/continuous_analysis_status 广播。
+**架构**：插件范式分层：base.py 定义 AnalyzerPlugin 无状态协议与 ScanWindow/capabilities；registry.py 按 game 注册 Generic/Valorant 插件；valorant_profile.py 解析 `auto/pov/broadcast` 来源策略；valorant_plugin.py 经 compute_valorant_scan_budget 计算增量窗口，并统一调用 OCR 粗定位，broadcast 候选再调用 valorant_broadcast.py 的 ONNX 阶段审计。检测器内部仍为 extract_frames_cancellable 子窗口(≤60s)分块抽帧@1fps→OCR 双区域读信号→相位判定→OcrRoundFSM.feed→边界密扫；赛事审计按 1fps 检查 Replay/结果/非游戏，暂停计时器低频取样并在非 combat 疑点即时补取，从 OCR 粗 end 向后审计最多 90s。直播后视不足的候选以 `pending_lookahead` 跨窗口保存，录制完成后再定稿；普通 POV 不进入该审计模块。后端循环、广播和多房映射职责不变。对外接口：WebSocket 消息 + clip_queued/highlight_stream/continuous_highlights/continuous_analysis_status 广播。
 
 **关键机制**：
 - 相位状态机 OcrRoundFSM.feed(WAIT/PREP/COMBAT/SETTLE)：入点=combat，出点契约=真·下回合准备→vision_confirmed，next_combat/open_tail→pending（valorant_ocr_rounds.py:OcrRoundFSM._close）
 - 相近相似/循环两条 OCR 先验：计时器外推(last_timer)与冻结读数忽略、结算后 post_settle_hold/gap 抑制残余钟，防回放残留误开回合（valorant_ocr_rounds.py 主扫描循环）
 - 跨窗口状态持久化于 state['ocr_runtime_state']（ocr_fsm/last_timer/combat_anchor/score_pending 等），文件切换时清空防静默漏检（room_handler._continuous_analysis_loop + valorant_ocr_rounds 尾部回写）
-- 产消循环：主循环期建 scan_requested，worker 持 _analysis_semaphore 执行，scan_result_container 传结果、scan_done_event 唤醒；worker 崩溃重建≤3次、超时指数退避、压力让路/降级追赶（room_handler:7206/6890/_WORKER_MAX_RESTARTS）
+- 产消循环：主循环期建 scan_requested，worker 持 _analysis_semaphore 执行，scan_result_container 传结果、scan_done_event 唤醒；worker 崩溃重建≤3次、超时指数退避、压力让路/降级追赶；broadcast 审计模型在任务 runtime_state 中复用，`broadcast_pending_rounds` 在后视不足时跨扫描重审，runtime_state 中的回合审计缓存只补扫新增尾部并缓存已定稿边界
 - 增量回合合并 _merge_round_windows 按 round_key/时间重叠去重，新窗覆盖旧边界，OCR 回合优先不被纯音频覆盖（room_handler.py:1880）
 - 自适应 OCR 加速 run_probe_if_needed：微基准(ms)探针选 dml/cuda/cpu 并缓存 7 天，FFmpeg 抽帧 hwaccel d3d11va/cuda 失败回退软解（ocr_accel.py:86,276,346）
 

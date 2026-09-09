@@ -32,5 +32,17 @@
   "seed": 20260722,
   "train_count": 7342,
   "val_count": 669,
-  "dataset_digest": "a3f1f789432a1013b7cfa4b0e04cd11e37abbef7a1ca4d6d1112b58b45b5d51a"
+  "dataset_digest": "a3f1f789432a1013b7cfa4b0e04cd11e37abbef7a1ca4d6d1112b58b45b5d51a",
+  "promotion_state": "baseline",
+  "evaluation_mode": "plain_frame",
+  "evaluation_data_summary": {
+    "note": "broadcast_runtime independent promotion evaluation is required before activation",
+    "source_sessions_by_type": {}
+  },
+  "gate_results": {
+    "gates_passed": false,
+    "reason": "baseline is retained until a production-equivalent promotion report passes"
+  },
+  "promotion_report_path": "scripts/valorant_vision/promotion_report_baseline_20260908.json",
+  "rollback_model_sha": null
 }

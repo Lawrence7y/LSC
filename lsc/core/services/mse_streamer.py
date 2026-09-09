@@ -27,7 +27,7 @@ from lsc.core.services.fmp4_segments import Fmp4SegmentParser
 from lsc.platforms.base import headers_to_ffmpeg_input_args
 from lsc.platforms.redaction import redact_command, redact_text
 from lsc.utils.gpu_ffmpeg import scale_cuda_available
-from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
+from lsc.utils.process_launcher import kill_process_tree, prepare_launch, set_stream_nonblocking
 
 _log = get_logger(__name__)
 
@@ -162,8 +162,10 @@ class MseStreamer:
         self._on_init = on_init_segment
         self._on_segment = on_media_segment
         self._on_error = on_error
-        self._width = width
-        self._height = height
+        # YUV420/硬件编码器要求视频尺寸为偶数；后端计算路径已偶数化，
+        # 这里再做一次边界防御，避免直接构造 MseStreamer 时传入 853x480。
+        self._width = max(0, int(width or 0)) & ~1
+        self._height = max(0, int(height or 0)) & ~1
         self._fps = fps
         self._headers = headers
         self._video_bitrate = video_bitrate
@@ -187,6 +189,11 @@ class MseStreamer:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def is_file(self) -> bool:
+        """Whether this stream is backed by a local recording file."""
+        return self._is_file
 
     def replay_init(self) -> bool:
         """重发缓存的 init 段。返回 True 表示有缓存可发，False 表示尚无 init 段。
@@ -292,15 +299,25 @@ class MseStreamer:
             # 再交给 h264_nvenc 编码。若直接以 cuda 帧交给 auto_scale/-pix_fmt yuv420p，
             # FFmpeg 无法在滤镜间转换会立即退出（历史多次 cuda_full 启动失败根因）。
             if self._width > 0 and self._height > 0:
+                # force_divisible_by=2：force_original_aspect_ratio=decrease 会按源
+                # 宽高比反算输出尺寸，源 AR 与目标框不一致时会产出奇数（如 854:480
+                # 框内放 16:9 源 → 853x480），libx264+yuv420p 要求偶数否则秒退。
                 vf_parts.append(
                     f"scale_cuda={self._width}:{self._height}"
                     f":force_original_aspect_ratio=decrease"
+                    f":force_divisible_by=2"
                 )
             vf_parts.append("hwdownload,format=nv12")
         else:
             # CPU 滤镜路径（d3d11va 自动下载帧到系统内存）
             if self._width > 0 and self._height > 0:
-                vf_parts.append(f"scale={self._width}:{self._height}:force_original_aspect_ratio=decrease")
+                # 同上：必须 force_divisible_by=2，否则录制回看/直播预览在源 AR
+                # 非 854:480 时产出 853x480 触发 "width not divisible by 2" 崩溃。
+                vf_parts.append(
+                    f"scale={self._width}:{self._height}"
+                    f":force_original_aspect_ratio=decrease"
+                    f":force_divisible_by=2"
+                )
             if self._fps > 0:
                 vf_parts.append(f"fps={self._fps}")
 
@@ -316,9 +333,9 @@ class MseStreamer:
         if self._is_file:
             cmd += ["-re"]
             if self._start_offset_sec > 0:
-                # 录制文件回看按需 seek：保留原始 PTS（-copyts），
-                # 否则播放器 currentTime 会从 0 开始，时间线/回看定位错位。
-                cmd += ["-copyts", "-ss", f"{self._start_offset_sec:.3f}"]
+                # 文件回看刻意把 MSE 片段归一到本次 -ss 后的 0 秒；
+                # 录制轴基座由 preview_review_start_sec 另行传给前端。
+                cmd += ["-copyts", "-start_at_zero", "-ss", f"{self._start_offset_sec:.3f}"]
         cmd += [
             "-fflags", "+genpts",
             "-thread_queue_size", "1024",
@@ -513,7 +530,7 @@ class MseStreamer:
         if proc is not None:
             try:
                 if proc.poll() is None:
-                    proc.kill()
+                    kill_process_tree(proc)
                     proc.wait(timeout=2)
             except Exception as exc:
                 _log.warning("MSE process cleanup failed: %s", exc)
@@ -540,7 +557,7 @@ class MseStreamer:
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    kill_process_tree(proc)
                     proc.wait(timeout=2)
             except Exception as exc:
                 _log.warning("Error stopping FFmpeg: %s", exc)
@@ -603,7 +620,7 @@ class MseStreamer:
                         self._on_error("流编码无响应：读取超时")
                     # 强杀 FFmpeg → stdout 管道关闭 → 阻塞 read() 返回空 → 主线程退出
                     try:
-                        proc.kill()
+                        kill_process_tree(proc)
                     except Exception as exc:
                         _log.warning("MSE watchdog kill failed: %s", exc)
                     # D-4: 显式关闭 stdout 管道，确保即使 kill 信号未及时生效，

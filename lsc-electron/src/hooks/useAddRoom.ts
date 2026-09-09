@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type MutableRefObject } from 'react'
-import { message } from 'antd'
+import { App } from 'antd'
 import { t } from '@/i18n'
+import { useAppStore } from '@/store/appStore'
 
 type OnFn = (type: string, handler: (data: any) => void) => () => void
 type SendFn = (type: string, data?: any) => boolean
@@ -38,9 +39,19 @@ export function parseRoomUrlsForValidation(raw: string): { urls: string[]; error
   }
 
   const seen = new Set<string>()
-  for (const url of urls) {
-    if (url.length > 2048) return { urls: [], error: t('直播间链接过长') }
-    if (/\s/.test(url)) return { urls: [], error: t('每行只能填写一个完整链接，链接中不能包含空格') }
+  const normalizedUrls: string[] = []
+  for (const line of urls) {
+    if (line.length > 2048) return { urls: [], error: t('直播间链接过长') }
+    let url = line
+    if (/\s/.test(url)) {
+      // 智能提取：用户从 App 复制的文案中往往嵌入了完整 http/https 链接
+      const match = url.match(/https?:\/\/[^\s"'<>]+/i)
+      if (match) {
+        url = match[0]
+      } else {
+        return { urls: [], error: t('每行只能填写一个完整链接，链接中不能包含空格') }
+      }
+    }
     let parsed: URL
     try {
       parsed = new URL(url)
@@ -58,8 +69,9 @@ export function parseRoomUrlsForValidation(raw: string): { urls: string[]; error
       return { urls: [], error: t('输入中存在重复链接：{url}', { url }) }
     }
     seen.add(duplicateKey)
+    normalizedUrls.push(url)
   }
-  return { urls }
+  return { urls: normalizedUrls }
 }
 
 /**
@@ -76,6 +88,8 @@ export function useAddRoom(opts: {
   pendingRoomSavesRef: MutableRefObject<number>
 }) {
   const { on, send, pendingRoomSavesRef } = opts
+  // context 版 message：跟随 ConfigProvider 主题，暗色界面不再弹浅色气泡
+  const { message } = App.useApp()
 
   const [url, setUrl] = useState('')
   const [loading, setLoading] = useState(false)
@@ -199,6 +213,21 @@ export function useAddRoom(opts: {
     if (parsed.error) {
       setRoomUrlValidation({ status: 'error', message: parsed.error })
       message.warning(parsed.error)
+      return
+    }
+
+    const currentRooms = useAppStore.getState().rooms
+    const existingNorm = new Set(
+      currentRooms.map(r => (r.room_url || '').trim().replace(/\/+$/, '').toLowerCase())
+    )
+    const duplicateExisting = parsed.urls.find(u => {
+      const norm = u.trim().replace(/\/+$/, '').toLowerCase()
+      return existingNorm.has(norm)
+    })
+    if (duplicateExisting) {
+      const err = t('该直播间已在列表中，无需重复添加')
+      setRoomUrlValidation({ status: 'error', message: err })
+      message.warning(err)
       return
     }
 

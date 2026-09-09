@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, memo, useRef } from 'react'
-import { Card, Button, Tooltip, Modal, Select } from 'antd'
+import { Card, Button, Tooltip, App, Select } from 'antd'
 import {
   PlayCircleOutlined,
   PauseCircleOutlined,
@@ -11,7 +11,7 @@ import {
   VideoCameraOutlined,
   StopOutlined,
   SoundOutlined,
-  MutedOutlined,
+  AudioMutedOutlined,
   FullscreenOutlined,
   FullscreenExitOutlined,
   ShrinkOutlined,
@@ -20,38 +20,17 @@ import { RoomSession } from '@/types'
 import { VideoPreview } from '@/components/VideoPreview'
 import { formatTime } from '@/utils/time'
 import { computeExpandedPreviewWindow } from '@/utils/timelineWindow'
+import { normalizeReplayBufferSeconds } from '@/utils/replaySettings'
 import { isNoDvrPreviewMode } from '@/utils/timelineCoords'
 import { readPlayhead, retainClockLoop, subscribeClock } from '@/utils/playheadStore'
 import { useAppStore } from '@/store/appStore'
+import { confirmDangerous } from '@/utils/confirmDangerous'
 import { useI18n, t } from '@/i18n'
+import { isCredentialError } from '@/utils/roomError'
 
 function openCredentialSettings(e: React.MouseEvent) {
   e.stopPropagation()
   useAppStore.getState().setSettingsDrawerOpen(true)
-}
-
-/** 根据统一 pipeline health 提示任何平台的凭据失效。 */
-function isCredentialError(room: RoomSession): boolean {
-  const health = room.pipeline_health
-  const failureKind = String(health?.failure_kind || '').toUpperCase()
-  if (failureKind === 'AUTH_REQUIRED' || failureKind === 'AUTH_EXPIRED') return true
-  const credentialStatus = String(health?.credential_status || '').toUpperCase()
-  if (
-    ['NOT_CONFIGURED', 'INVALID', 'EXPIRED', 'INTERACTION_REQUIRED'].includes(credentialStatus) &&
-    (health?.credential_kinds || []).length > 0
-  ) return true
-  const text = `${room.last_error || ''} ${room.mse_error || ''}`.toLowerCase()
-  if (!text.trim()) return false
-  return (
-    text.includes('cookie') ||
-    text.includes('验证中间页') ||
-    text.includes('验证码') ||
-    text.includes('login required') ||
-    text.includes('auth_required') ||
-    text.includes('auth expired') ||
-    text.includes('需要登录') ||
-    text.includes('登录态已过期')
-  )
 }
 
 function credentialSettingsAvailable(room: RoomSession): boolean {
@@ -85,6 +64,7 @@ function expandedWindowFromVideo(opts: {
   markOut?: number | null
   video?: HTMLVideoElement | null
   followLive?: boolean
+  replaySeconds?: number
 }) {
   const buffered = readMseBuffered(opts.video)
   const duration = opts.video?.duration
@@ -98,6 +78,7 @@ function expandedWindowFromVideo(opts: {
     markIn: opts.markIn,
     markOut: opts.markOut,
     followLive: opts.followLive,
+    replaySeconds: opts.replaySeconds,
   })
 }
 
@@ -221,6 +202,12 @@ function areRoomPropsEqual(prev: RoomCardProps, next: RoomCardProps): boolean {
     && a.pipeline_health?.recovery_attempt === b.pipeline_health?.recovery_attempt
     && a.pipeline_health?.max_recovery_attempts === b.pipeline_health?.max_recovery_attempts
     && JSON.stringify(a.pipeline_health?.resources) === JSON.stringify(b.pipeline_health?.resources)
+    && a.preview_epoch_id === b.preview_epoch_id
+    && a.recording_id === b.recording_id
+    && a.recording_media_start_mono === b.recording_media_start_mono
+    && a.recording_start_mono === b.recording_start_mono
+    && a.recording_to_preview_delta === b.recording_to_preview_delta
+    && a.preview_review_start_sec === b.preview_review_start_sec
   )
 }
 
@@ -256,6 +243,8 @@ export const RoomCard = memo(function RoomCard({
 }: RoomCardProps) {
   const tick = recordingTick
   const { t } = useI18n()
+  // context 版 modal：静态 Modal.confirm 在 antd v5 下不跟随 ConfigProvider 主题
+  const { modal } = App.useApp()
   const [disconnecting, setDisconnecting] = useState(false)
   const [localMuted, setLocalMuted] = useState(room.preview_muted)
   const [localVolume, setLocalVolume] = useState(1.0)
@@ -349,15 +338,22 @@ export const RoomCard = memo(function RoomCard({
   /** 放大态播放控制所需派生量 */
   const isPreviewPlaying = room.preview_enabled && !room.preview_paused
   const videoElement = window.__msePlayers?.[room.room_id]?.player?.videoElement
-  const supportsLiveDvr = !isNoDvrPreviewMode(room.preview_mode)
+  const configuredReplaySeconds = useAppStore((state) => state.settings.timeline_replay_seconds)
+  const replayBufferSeconds = normalizeReplayBufferSeconds(configuredReplaySeconds)
+  const isLivePreview = !isNoDvrPreviewMode(room.preview_mode)
+  const reviewStartSec = isRecordingReview
+    ? Math.max(0, Number(room.preview_review_start_sec) || 0)
+    : 0
+  const supportsLiveDvr = isLivePreview && replayBufferSeconds > 0
   const expandedWindow = expandedWindowFromVideo({
-    liveDvr: supportsLiveDvr,
-    previewPos,
+    liveDvr: isLivePreview,
+    previewPos: previewPos + reviewStartSec,
     previewDuration,
     markIn: room.mark_in,
     markOut: room.mark_out,
     video: videoElement,
     followLive: supportsLiveDvr && followLive,
+    replaySeconds: replayBufferSeconds,
   })
   const expTimelineStart = expandedWindow.start
   const expTimelineEnd = expandedWindow.end
@@ -368,6 +364,9 @@ export const RoomCard = memo(function RoomCard({
   const progressFillLeftPct = expandedWindow.fillLeftPct
   const progressFillWidthPct = expandedWindow.fillWidthPct
   const hasLiveDvrRange = expandedWindow.hasLiveDvr
+  // 放大预览条一次拖动内冻结左右时间，避免直播 buffered.end 持续增长
+  // 造成同一个鼠标位置映射到不同的实际秒数。
+  const expandedDragWindowRef = useRef<ReturnType<typeof expandedWindowFromVideo> | null>(null)
 
   useEffect(() => {
     if (!isExpanded) return
@@ -378,13 +377,14 @@ export const RoomCard = memo(function RoomCard({
         ? Math.max(0, video.currentTime)
         : readPlayhead(room.room_id)
       const win = expandedWindowFromVideo({
-        liveDvr: supportsLiveDvr,
-        previewPos: pos,
+        liveDvr: isLivePreview,
+        previewPos: pos + reviewStartSec,
         previewDuration,
         markIn: room.mark_in,
         markOut: room.mark_out,
         video,
         followLive: supportsLiveDvr && followLive,
+        replaySeconds: replayBufferSeconds,
       })
       if (expStartLabelRef.current) expStartLabelRef.current.textContent = formatTime(win.start)
       if (expEndLabelRef.current) expEndLabelRef.current.textContent = formatTime(win.end)
@@ -398,22 +398,27 @@ export const RoomCard = memo(function RoomCard({
       unsub()
       release()
     }
-  }, [isExpanded, room.room_id, supportsLiveDvr, previewDuration, room.mark_in, room.mark_out, followLive])
+  }, [isExpanded, room.room_id, isLivePreview, isRecordingReview, reviewStartSec, supportsLiveDvr, replayBufferSeconds, previewDuration, room.mark_in, room.mark_out, followLive])
 
-  const seekExpandedTimeline = (clientX: number, track: HTMLElement) => {
+  const seekExpandedTimeline = (
+    clientX: number,
+    track: HTMLElement,
+    frozenWindow?: ReturnType<typeof expandedWindowFromVideo> | null,
+  ) => {
     if (!onSeekTo) return
     const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
     const pos = video && Number.isFinite(video.currentTime)
       ? Math.max(0, video.currentTime)
       : previewPos
-    const win = expandedWindowFromVideo({
-      liveDvr: supportsLiveDvr,
-      previewPos: pos,
+    const win = frozenWindow ?? expandedWindowFromVideo({
+      liveDvr: isLivePreview,
+      previewPos: pos + reviewStartSec,
       previewDuration,
       markIn: room.mark_in,
       markOut: room.mark_out,
       video,
       followLive: supportsLiveDvr && followLive,
+      replaySeconds: replayBufferSeconds,
     })
     const span = Math.max(1e-6, win.end - win.start)
     const rect = track.getBoundingClientRect()
@@ -465,7 +470,7 @@ export const RoomCard = memo(function RoomCard({
         <Button
           type="text"
           size="small"
-          icon={localMuted ? <MutedOutlined /> : <SoundOutlined />}
+          icon={localMuted ? <AudioMutedOutlined /> : <SoundOutlined />}
           style={overlayBtnStyle}
           onClick={(e) => {
             e.stopPropagation()
@@ -519,7 +524,7 @@ export const RoomCard = memo(function RoomCard({
             style={{
               width: 4,
               height: 84,
-              accentColor: 'var(--accent-primary, #4dc4bf)',
+              accentColor: 'var(--brand-500)',
               cursor: 'pointer',
               writingMode: 'vertical-lr',
               direction: 'rtl',
@@ -551,28 +556,31 @@ export const RoomCard = memo(function RoomCard({
     <Card
       hoverable
       onClick={(e) => onSelect(room.room_id, e)}
+      className={`room-card${isExpanded ? ' room-card--expanded' : ''}${room.is_recording ? ' room-card--recording' : ''}`}
       style={{
-        background: selected ? 'var(--bg-tertiary)' : 'var(--bg-secondary)',
+        background: selected ? 'var(--surface-2)' : 'var(--surface-1)',
+        borderRadius: 'var(--radius-sm, 8px)',
         border: multiSelected
-          ? '1px solid var(--accent-primary)'
+          ? '1px solid var(--brand-400)'
           : selected
-            ? '1px solid var(--accent-primary)'
-            : '1px solid transparent',
+            ? '1px solid var(--brand-500)'
+            : '1px solid var(--border-hairline)',
         boxShadow: multiSelected
-          ? '0 0 0 2px rgba(77, 196, 191, 0.15), 0 0 12px rgba(77, 196, 191, 0.12)'
+          ? '0 0 0 1px var(--brand-400), 0 2px 10px rgba(49, 179, 174, 0.18)'
           : selected
-          ? '0 0 0 3px rgba(77, 196, 191, 0.12), 0 0 16px rgba(77, 196, 191, 0.22)'
-          : 'none',
+          ? '0 0 0 1px var(--brand-500), 0 2px 14px rgba(49, 179, 174, 0.22)'
+          : 'var(--shadow-sm)',
         cursor: 'pointer',
+        overflow: 'hidden',
       }}
-      styles={{ body: { padding: 12 } }}
+      styles={{ body: { padding: '10px 12px 12px' } }}
     >
-      {/* Header：checkbox | 主播名 | LIVE */}
+      {/* Header：checkbox | 平台 | 主播名 | LIVE/录制 */}
       <div
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 8,
+          gap: 7,
           marginBottom: 8,
           minWidth: 0,
         }}
@@ -596,25 +604,25 @@ export const RoomCard = memo(function RoomCard({
             title={multiSelected || selected ? t('取消选择') : t('选择此房间')}
             style={{
               flexShrink: 0,
-              width: 22,
-              height: 22,
-              borderRadius: 6,
-              border: `2px solid ${
+              width: 18,
+              height: 18,
+              borderRadius: 4,
+              border: `1.5px solid ${
                 multiSelected || selected
-                  ? 'var(--accent-primary)'
-                  : 'var(--text-primary, #1a1d23)'
+                  ? 'var(--brand-500)'
+                  : 'var(--border-subtle)'
               }`,
               background:
                 multiSelected || selected
-                  ? 'var(--accent-primary)'
-                  : 'var(--bg-primary, #fff)',
+                  ? 'var(--brand-500)'
+                  : 'transparent',
               cursor: 'pointer',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              transition: 'all .15s ease',
-              color: multiSelected || selected ? 'var(--overlay-text, #f5f5f7)' : 'var(--text-primary, #1a1d23)',
-              fontSize: 13,
+              transition: 'all .12s ease',
+              color: '#ffffff',
+              fontSize: 11,
               fontWeight: 700,
               lineHeight: 1,
               userSelect: 'none',
@@ -623,6 +631,22 @@ export const RoomCard = memo(function RoomCard({
           >
             {multiSelected || selected ? '✓' : ''}
           </div>
+        )}
+        {(room.platform_name || room.platform) && (
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 700,
+              padding: '1px 6px',
+              borderRadius: 4,
+              background: 'rgba(49, 179, 174, 0.12)',
+              color: 'var(--brand-500)',
+              border: '1px solid rgba(49, 179, 174, 0.25)',
+              flexShrink: 0,
+            }}
+          >
+            {room.platform_name || room.platform}
+          </span>
         )}
         <Tooltip title={room.streamer_name || t('未知主播')}>
           <span
@@ -650,7 +674,7 @@ export const RoomCard = memo(function RoomCard({
               fontSize: 9,
               fontWeight: 600,
               background: 'rgba(77, 196, 191, 0.12)',
-              color: 'var(--accent-primary)',
+              color: 'var(--brand-500)',
               border: '1px solid rgba(77, 196, 191, 0.25)',
               flexShrink: 0,
             }}
@@ -661,7 +685,7 @@ export const RoomCard = memo(function RoomCard({
                 width: 5,
                 height: 5,
                 borderRadius: '50%',
-                background: 'var(--accent-primary)',
+                background: 'var(--brand-500)',
               }}
             />
             {t('已选中')}
@@ -742,9 +766,11 @@ export const RoomCard = memo(function RoomCard({
       <div
         style={{
           width: '100%',
-          height: isExpanded ? 'auto' : 180,
-          aspectRatio: isExpanded ? '16 / 9' : undefined,
-          minHeight: isExpanded ? 420 : undefined,
+          // 预览容器统一保持 16:9；高度交给 aspect-ratio 根据卡片宽度计算。
+          // 不再同时指定固定 height，否则 aspect-ratio 不会真正约束布局。
+          height: 'auto',
+          aspectRatio: '16 / 9',
+          minHeight: 0,
           background: '#0a0a0a',
           borderRadius: 8,
           marginBottom: 8,
@@ -772,19 +798,19 @@ export const RoomCard = memo(function RoomCard({
                 style={{
                   color: 'var(--text-tertiary)',
                   fontSize: 11,
-                  lineHeight: 1.4,
+                  lineHeight: 1.3,
                   maxWidth: '100%',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
-                  marginBottom: isCredentialError(room) && credentialSettingsAvailable(room) ? 8 : 0,
+                  marginBottom: isCredentialError(room) && credentialSettingsAvailable(room) ? 4 : 0,
                 }}
               >
                 {t(room.last_error)}
               </div>
             </Tooltip>
             {isCredentialError(room) && credentialSettingsAvailable(room) && (
-              <Button size="small" type="primary" onClick={openCredentialSettings}>
+              <Button size="small" type="primary" onClick={openCredentialSettings} style={{ height: 22, fontSize: 10, padding: '0 6px', marginTop: 2 }}>
                 {t('去设置凭据')}
               </Button>
             )}
@@ -797,7 +823,10 @@ export const RoomCard = memo(function RoomCard({
         ) : room.preview_enabled ? (
           <>
             {/* VideoPreview 实例始终保持挂载，区域放大时铺满卡片，不销毁/重建 MsePlayer */}
-            <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+            <div
+              // 预览容器通过 aspect-ratio 定高，播放器用绝对填充避免百分比高度链失效。
+              style={{ position: 'absolute', inset: 0 }}
+            >
               <VideoPreview
                 key={`preview-${room.room_id}`}
                 roomId={room.room_id}
@@ -821,7 +850,21 @@ export const RoomCard = memo(function RoomCard({
             </div>
             {/* 底部控制区：普通态单行；放大态 = 动态进度条 + 播放控制行（原有按键全部保留、不被遮挡） */}
             {isExpanded ? (
-              <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, display: 'flex', flexDirection: 'column', background: 'linear-gradient(transparent, rgba(0,0,0,0.78))', zIndex: 9 }}>
+              <div
+                className="room-card__expanded-controls"
+                style={{ position: 'absolute', bottom: 0, left: 0, right: 0, display: 'flex', flexDirection: 'column', background: 'linear-gradient(transparent, rgba(0,0,0,0.78))', zIndex: 9 }}
+              >
+                {hasLiveDvrRange && (
+                  <div
+                    className="room-card__expanded-replay-info"
+                    title={t('左侧时间是绝对时间点；设置回看是时长，当前可用时长受实际 MSE 缓冲限制')}
+                  >
+                    {t('回看设置 {configured} · 当前可用 {available}', {
+                      configured: formatTime(expandedWindow.configuredReplaySeconds),
+                      available: formatTime(expandedWindow.availableReplaySeconds),
+                    })}
+                  </div>
+                )}
                 <div className="room-card__expanded-timeline">
                   <span ref={expStartLabelRef} className="room-card__expanded-time">{formatTime(expTimelineStart)}</span>
                   <div
@@ -830,26 +873,42 @@ export const RoomCard = memo(function RoomCard({
                     aria-label={t('预览时间线')}
                     aria-valuemin={Math.round(replayBoundary)}
                     aria-valuemax={Math.round(expTimelineEnd)}
-                    aria-valuenow={Math.round(previewPos)}
+                    aria-valuenow={Math.round(previewPos + reviewStartSec)}
                     className="room-card__expanded-track"
                     onPointerDown={(e) => {
                       e.stopPropagation()
                       e.currentTarget.setPointerCapture(e.pointerId)
-                      seekExpandedTimeline(e.clientX, e.currentTarget)
+                      const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
+                      const pos = video && Number.isFinite(video.currentTime)
+                        ? Math.max(0, video.currentTime)
+                        : previewPos
+                      expandedDragWindowRef.current = expandedWindowFromVideo({
+                        liveDvr: isLivePreview,
+                        previewPos: pos + reviewStartSec,
+                        previewDuration,
+                        markIn: room.mark_in,
+                        markOut: room.mark_out,
+                        video,
+                        followLive: supportsLiveDvr && followLive,
+                        replaySeconds: replayBufferSeconds,
+                      })
+                      seekExpandedTimeline(e.clientX, e.currentTarget, expandedDragWindowRef.current)
                     }}
                     onPointerMove={(e) => {
                       if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
                       e.stopPropagation()
-                      seekExpandedTimeline(e.clientX, e.currentTarget)
+                      seekExpandedTimeline(e.clientX, e.currentTarget, expandedDragWindowRef.current)
                     }}
                     onPointerUp={(e) => {
                       e.stopPropagation()
-                      seekExpandedTimeline(e.clientX, e.currentTarget)
+                      seekExpandedTimeline(e.clientX, e.currentTarget, expandedDragWindowRef.current)
+                      expandedDragWindowRef.current = null
                       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
                         e.currentTarget.releasePointerCapture(e.pointerId)
                       }
                     }}
                     onPointerCancel={(e) => {
+                      expandedDragWindowRef.current = null
                       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
                         e.currentTarget.releasePointerCapture(e.pointerId)
                       }
@@ -875,7 +934,7 @@ export const RoomCard = memo(function RoomCard({
                         <span
                           className="room-card__expanded-replay-boundary"
                           style={{ left: `${replayBoundaryPct}%` }}
-                          title={t('DVR 左边界 {time}：约实时−2分钟，左侧不可回放，右侧可回放', { time: formatTime(replayBoundary) })}
+                          title={t('DVR 回看窗口左边界 {time}：早于直播缓冲的区域将切换录制文件，边界按安全边距起播，右侧可直接回看', { time: formatTime(replayBoundary) })}
                         />
                       </>
                     )}
@@ -995,7 +1054,7 @@ export const RoomCard = memo(function RoomCard({
           </>
         ) : (
           <div style={{ textAlign: 'center' }}>
-            <PlayCircleOutlined style={{ fontSize: 36, color: 'var(--accent-primary)' }} />
+            <PlayCircleOutlined style={{ fontSize: 36, color: 'var(--brand-500)' }} />
             <div style={{ marginTop: 6 }}>
               <Button
                 size="small"
@@ -1021,7 +1080,7 @@ export const RoomCard = memo(function RoomCard({
               right: 0,
               height: 2,
               width: '100%',
-              background: 'var(--accent-primary)',
+              background: 'var(--brand-500)',
               zIndex: 4,
             }}
           />
@@ -1088,9 +1147,9 @@ export const RoomCard = memo(function RoomCard({
         </Tooltip>
       </div>
       
-      {/* 操作按钮：重新设计的布局 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        {/* 主操作按钮（占据主要宽度） */}
+      {/* 操作按钮组：精密扁平现代质感 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 }}>
+        {/* 主操作按钮（连接 / 开始录制 / 停止录制） */}
         {!room.is_connected ? (
           <Button
             type="primary"
@@ -1102,7 +1161,15 @@ export const RoomCard = memo(function RoomCard({
             }}
             disabled={room.is_connecting}
             loading={room.is_connecting}
-            style={{ flex: 1 }}
+            style={{
+              flex: 1,
+              height: 28,
+              fontSize: 12,
+              fontWeight: 600,
+              borderRadius: 'var(--radius-xs)',
+              background: 'var(--brand-500)',
+              borderColor: 'var(--brand-500)',
+            }}
           >
             {t('连接')}
           </Button>
@@ -1113,19 +1180,18 @@ export const RoomCard = memo(function RoomCard({
             danger
             onClick={(e) => {
               e.stopPropagation()
-              Modal.confirm({
-                title: t('确认停止录制'),
-                content: t('将停止录制「{streamer}」', { streamer: room.streamer_name || t('未知主播') }),
-                okText: t('确认停止'),
-                cancelText: t('取消'),
-                okButtonProps: { danger: true },
-                onOk: () => onStopRecord(room.room_id),
-              })
+              // 二次确认由父级 requestStopRecord 统一承担（含持续分析收尾提示），
+              // 以前提这里自己弹一份简化确认，导致同一动作按入口文案不一致
+              onStopRecord(room.room_id)
             }}
             style={{
               flex: 1,
-              background: 'rgba(255,59,48,0.12)',
-              borderColor: 'rgba(255,59,48,0.3)',
+              height: 28,
+              fontSize: 12,
+              fontWeight: 600,
+              borderRadius: 'var(--radius-xs)',
+              background: 'rgba(255,69,58,0.12)',
+              borderColor: 'rgba(255,69,58,0.3)',
               color: 'var(--state-error)',
             }}
           >
@@ -1142,7 +1208,15 @@ export const RoomCard = memo(function RoomCard({
               e.stopPropagation()
               onStartRecord(room.room_id)
             }}
-            style={{ flex: 1 }}
+            style={{
+              flex: 1,
+              height: 28,
+              fontSize: 12,
+              fontWeight: 600,
+              borderRadius: 'var(--radius-xs)',
+              background: 'var(--brand-500)',
+              borderColor: 'var(--brand-500)',
+            }}
           >
             {room.is_recording_queued
               ? `${t('排队中')}${room.recording_queue_position ? ` #${room.recording_queue_position}` : ''}`
@@ -1171,13 +1245,21 @@ export const RoomCard = memo(function RoomCard({
                 }, 1500)
               }
             }}
-            style={{ flex: 1 }}
+            style={{
+              flex: 1,
+              height: 28,
+              fontSize: 12,
+              borderRadius: 'var(--radius-xs)',
+              background: 'var(--surface-2)',
+              borderColor: 'var(--border-hairline)',
+              color: 'var(--text-secondary)',
+            }}
           >
             {t('断开')}
           </Button>
         )}
       
-        {/* 删除按钮（角落） */}
+        {/* 删除按钮 */}
         <Tooltip title={t('删除房间')}>
           <Button
             type="text"
@@ -1186,16 +1268,20 @@ export const RoomCard = memo(function RoomCard({
             danger
             onClick={(e) => {
               e.stopPropagation()
-              Modal.confirm({
-                title: t('确认删除'),
-                content: t('确定要删除房间“{streamer}”吗？此操作不可撤销。', { streamer: room.streamer_name || t('未知主播') }),
-                okText: t('确认删除'),
-                cancelText: t('取消'),
-                okButtonProps: { danger: true },
-                onOk: () => onRemove(room.room_id),
-              })
+              confirmDangerous(
+                modal,
+                t('确认删除'),
+                t('确定要删除房间“{streamer}”吗？此操作不可撤销。', { streamer: room.streamer_name || t('未知主播') }),
+                () => onRemove(room.room_id),
+                t('确认删除'),
+              )
             }}
-            style={{ width: 36, height: 32, flexShrink: 0 }}
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: 'var(--radius-xs)',
+              flexShrink: 0,
+            }}
           />
         </Tooltip>
       </div>

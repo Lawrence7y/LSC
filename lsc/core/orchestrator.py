@@ -796,26 +796,17 @@ class RoomOrchestrator:
     def _create_controller(self) -> object:
         if self._controller_factory is not None:
             return self._controller_factory()
-        try:
-            from lsc.gui.pages.recording_controller import RecordingController
-            controller = RecordingController()
-            # 初始化录制和导出组件，否则录制功能无法使用
-            controller.init_capture()
-            controller.init_exporter()
-            return controller
-        except ImportError:
-            # RecordingController 已移除（PySide6 GUI 层），Electron 后端不需要 controller
-            return None
+        from lsc.core.controller import HeadlessRecordingController
+        controller = HeadlessRecordingController()
+        controller.init_capture()
+        controller.init_exporter()
+        return controller
 
     def _create_preview(self) -> object:
         if self._preview_factory is not None:
             return self._preview_factory()
-        try:
-            from lsc.gui.components.mpv_widget import MpvWidget
-            return MpvWidget()
-        except ImportError:
-            # MpvWidget 已移除（PySide6 GUI 层），Electron 后端不需要 preview widget
-            return None
+        # Electron 后端通过 WebRTC/MSE 预览，默认不创建废弃的 MPV 视图；如需使用由调用方注入工厂
+        return None
 
     # ── Room CRUD ────────────────────────────────────────────
 
@@ -1050,6 +1041,20 @@ class RoomOrchestrator:
             entry["align_group_id"] = room.align_group_id
         if room.content_offset:
             entry["content_offset"] = room.content_offset
+        # 记忆平台与主播名/标题，确保重启后卡片仍能认出主播与平台
+        if room.platform:
+            entry["platform"] = room.platform
+        if room.platform_name:
+            entry["platform_name"] = room.platform_name
+        if room.streamer_name:
+            entry["streamer_name"] = room.streamer_name
+        if room.stream_title:
+            entry["stream_title"] = room.stream_title
+        # A stopped recording's epoch is needed to validate a finalization
+        # sidecar after an application restart.  It is not an active process
+        # handle; persisting it does not resurrect recording state.
+        if room.recording_id:
+            entry["recording_id"] = room.recording_id
         return entry
 
     def save_rooms(self) -> int:
@@ -1061,26 +1066,26 @@ class RoomOrchestrator:
 
         Returns number of rooms queued for save.
         """
-        if self._thread is not None and threading.current_thread() is not self._thread:
-            return self.call(lambda: type(self).save_rooms(self))
-        data = {
-            "version": 2,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "rooms": [self._serialize_room(room) for room in self._rooms.values()],
-        }
-        count = len(self._rooms)
-        self._pending_save_payload = data
-        self._pending_save_count = count
-        timer = getattr(self, "_save_rooms_timer", None)
-        if timer is not None:
-            try:
-                timer.cancel()
-            except Exception as exc:
-                _log.debug("cancel save_rooms timer failed: %s", exc)
-        timer = threading.Timer(1.0, self._flush_save_rooms)
-        timer.daemon = True
-        self._save_rooms_timer = timer
-        timer.start()
+        with self._lock:
+            rooms_copy = [self._serialize_room(room) for room in self._rooms.values()]
+            count = len(rooms_copy)
+            data = {
+                "version": 2,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "rooms": rooms_copy,
+            }
+            self._pending_save_payload = data
+            self._pending_save_count = count
+            timer = getattr(self, "_save_rooms_timer", None)
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception as exc:
+                    _log.debug("cancel save_rooms timer failed: %s", exc)
+            timer = threading.Timer(1.0, self._flush_save_rooms)
+            timer.daemon = True
+            self._save_rooms_timer = timer
+            timer.start()
         return count
 
     def flush_save_rooms(self) -> int:
@@ -1200,6 +1205,17 @@ class RoomOrchestrator:
                 room.include_in_cut = bool(item["include_in_cut"])
             if "preview_muted" in item:
                 room.preview_muted = bool(item["preview_muted"])
+            # 恢复平台与主播名/标题记忆
+            if "platform" in item and item["platform"]:
+                room.platform = str(item["platform"])
+            if "platform_name" in item and item["platform_name"]:
+                room.platform_name = str(item["platform_name"])
+            if "streamer_name" in item and item["streamer_name"]:
+                room.streamer_name = str(item["streamer_name"])
+            if "stream_title" in item and item["stream_title"]:
+                room.stream_title = str(item["stream_title"])
+            if "recording_id" in item and item["recording_id"]:
+                room.recording_id = str(item["recording_id"])
 
         self._batch_loading = False
         self.save_rooms()
@@ -1365,6 +1381,8 @@ class RoomOrchestrator:
             controller.stream_url = info.stream_url
             controller.input_args = legacy_info.get("_inputArgs", [])
             controller.selected_quality = legacy_info.get("selectedQuality", info.selected_quality)
+        # 成功解析出主播名和平台后，自动保存记忆
+        self.save_rooms()
         return True
 
     def _cancel_connect_worker(self, room_id: str) -> None:
@@ -2356,6 +2374,11 @@ class RoomOrchestrator:
                 new_recording_id,
                 media_start_mono=media_start_mono,
             )
+            # 录制文件时间轴换代后，旧直播预览映射不再可信；下一次预览
+            # 稳定采样时重新建立 recording_local → preview_local 关系。
+            clear_preview_clock = getattr(room, "clear_preview_clock", None)
+            if callable(clear_preview_clock):
+                clear_preview_clock()
             if previous_recording_id:
                 if room.align_group_id or room.content_offset:
                     _log.warning(
@@ -2402,10 +2425,11 @@ class RoomOrchestrator:
         )
         if preflight:
             # Fallback chain for unwritable / full output directories:
-            #   1. If the configured dir fails, try ~/.lsc/output (user home, usually writable).
+            #   1. If the configured dir fails, try ~/LSC/output (user home, usually writable;
+            #      与 settings/handler 层默认 output_dir 同一目录，避免分裂出 ~/.lsc 孤儿目录).
             #   2. If that also fails, surface the error and abort so FFmpeg
             #      doesn't start and immediately die mid-write.
-            fallback_base = os.path.join(os.path.expanduser('~'), '.lsc', 'output')
+            fallback_base = os.path.join(os.path.expanduser('~'), 'LSC', 'output')
             if os.path.abspath(fallback_base) != os.path.abspath(output_dir):
                 _log.warning("预检失败 %s，回退到 %s", output_dir, fallback_base)
                 fallback_preflight = RecordingService.preflight_check(
@@ -2441,8 +2465,8 @@ class RoomOrchestrator:
         try:
             os.makedirs(room_output_dir, exist_ok=True)
         except OSError:
-            # 默认目录不可写（如沙箱环境），回退到 ~/.lsc/output
-            fallback_base = os.path.join(os.path.expanduser('~'), '.lsc', 'output')
+            # 默认目录不可写（如沙箱环境），回退到 ~/LSC/output
+            fallback_base = os.path.join(os.path.expanduser('~'), 'LSC', 'output')
             fallback_dir = os.path.join(fallback_base, os.path.basename(room_output_dir))
             _log.warning("录制目录不可写 %s，回退到 %s", room_output_dir, fallback_dir)
             room_output_dir = fallback_dir
@@ -2625,6 +2649,28 @@ class RoomOrchestrator:
             fps=fps,
         )
 
+    def _stop_failed_recording_keep_preview(self, room_id: str, reason: str) -> None:
+        """录制启动失败后的清理：只停录制 sink，预览健康时不得连坐整房。
+
+        共享进样契约（CLAUDE.md §7.3.3）：录制 sink 故障不得停止预览。
+        旧实现三条失败路径都直接 registry.stop_room() → 清空预览订阅者并
+        terminate 上游，预览-only 房间点「开始录制」失败即黑屏。这里对齐
+        stop_recording 的既有守卫：仅当 ingest 已整体停止或没有预览订阅者
+        时才允许 stop_room。
+        """
+        registry = get_shared_ingest_registry()
+        ingest = registry.get(room_id)
+        supervisor = registry.get_supervisor_if_exists(room_id)
+        try:
+            if supervisor is not None:
+                supervisor.stop_recording(reason=reason)
+            elif ingest is not None:
+                ingest.stop_recording_sink(reason=reason)
+        except Exception as exc:
+            _log.warning("stop failed recording sink error room=%s: %s", room_id, exc)
+        if ingest is None or ingest.is_stopped or ingest.preview_subscribers <= 0:
+            registry.stop_room(room_id, reason=reason)
+
     def _start_shared_recording_if_enabled(
         self,
         room: RoomSession,
@@ -2760,7 +2806,7 @@ class RoomOrchestrator:
                 result_ok = result.ok
                 result_error = result.error
         except Exception as exc:
-            registry.stop_room(room.room_id, reason="shared recording start exception")
+            self._stop_failed_recording_keep_preview(room.room_id, "shared recording start exception")
             _log.warning("shared ingest recording failed room=%s: %s", room.room_id, exc)
             return "", 0.0, str(exc)
         if result_ok:
@@ -2777,11 +2823,11 @@ class RoomOrchestrator:
             # 避免在 mock/测试环境中因无真实进程而误判。
             if not bool(getattr(ingest, "recording_active", False)):
                 error = str(getattr(ingest, "recording_error", "") or "shared recording process is not running")
-                registry.stop_room(room.room_id, reason="shared recording process unavailable")
+                self._stop_failed_recording_keep_preview(room.room_id, "shared recording process unavailable")
                 _log.warning("shared ingest recording unusable room=%s: %s", room.room_id, error)
                 return "", 0.0, error
             return output_path, getattr(ingest, "recording_media_start_mono", 0.0), ""
-        registry.stop_room(room.room_id, reason="shared recording start failed")
+        self._stop_failed_recording_keep_preview(room.room_id, "shared recording start failed")
         _log.warning("shared ingest recording failed room=%s: %s", room.room_id, result_error)
         return "", 0.0, str(result_error)
 
@@ -2790,7 +2836,7 @@ class RoomOrchestrator:
         if not output_path:
             return ""
         last_error: OSError | None = None
-        for _attempt in range(8):
+        for _attempt in range(3):
             try:
                 new_path = finalize_room_recording(room, output_path)
                 room.record_output_path = new_path
@@ -2800,9 +2846,9 @@ class RoomOrchestrator:
                 return new_path
             except OSError as exc:
                 last_error = exc
-                time.sleep(0.4)
+                time.sleep(0.15)
         _log.warning(
-            "finalize recording layout failed room=%s path=%s: %s",
+            "finalize recording layout failed (file may be busy) room=%s path=%s: %s",
             room.room_id,
             output_path,
             last_error,
@@ -3250,9 +3296,30 @@ class RoomOrchestrator:
         controller = room.controller
         if controller is None:
             return ""
-        export_id = controller.start_export(start_sec, end_sec, output_dir, title, on_done,
-                                            profile=profile, on_progress=on_progress)
-        if not export_id and not controller._last_export_error:
+        start_export = getattr(controller, "start_export", None)
+        if not callable(start_export):
+            # Controller 是跨版本/打包边界；接口缺失必须变成明确的启动失败，
+            # 不能让 handler 只得到 AttributeError 的泛化异常。
+            error = "导出接口缺失：HeadlessRecordingController.start_export"
+            controller._last_export_error = error
+            _log.error("Export controller contract missing: room=%s method=start_export", room_id)
+            return ""
+        try:
+            export_id = start_export(
+                start_sec,
+                end_sec,
+                output_dir,
+                title,
+                on_done,
+                profile=profile,
+                on_progress=on_progress,
+            )
+        except AttributeError as exc:
+            error = f"导出接口调用失败：{exc}"
+            controller._last_export_error = error
+            _log.exception("Export controller contract failed: room=%s", room_id)
+            return ""
+        if not export_id and not getattr(controller, "_last_export_error", ""):
             # 启动失败时在 controller 上标记错误原因
             controller._last_export_error = "导出启动失败（控制器异常）"
         return export_id
@@ -3706,6 +3773,43 @@ class RoomOrchestrator:
                 room._reconnect_in_progress = False
                 self._dirty_recording = True
 
+    def _is_recording_active_and_healthy(self, room: RoomSession) -> bool:
+        """检查当前录制是否正在持续健康写入数据。
+
+        若录制链路正在正常下发数据、文件持续增长且无错误，说明底层 TCP / HTTP
+        传输仍然健康。CDN 常在 URL 附带的 expire / wsTime 到期后继续供流；
+        正在正常写入的录制绝不可因 URL query 倒计时而主动掐死并切段文件。
+        真正断流由看门狗（文件停滞/进程退出）负责秒级兜底。
+        """
+        if not room.is_recording:
+            return False
+        # 共享进样检查
+        try:
+            registry = get_shared_ingest_registry()
+            shared = registry.get(room.room_id)
+            if shared is not None and (
+                getattr(shared, "recording_active", False)
+                and not getattr(shared, "recording_error", "")
+                and not getattr(shared, "upstream_error", "")
+                and not getattr(shared, "is_stopped", False)
+                and getattr(shared, "upstream_bytes", 0) > 0
+            ):
+                return True
+        except Exception:
+            pass
+        # 传统 controller 检查
+        controller = room.controller
+        if controller is not None:
+            is_rec = getattr(controller, "is_recording", None)
+            if (
+                callable(is_rec)
+                and is_rec()
+                and getattr(room, "record_size_mb", 0) > 0
+                and not getattr(room, "last_error", "")
+            ):
+                return True
+        return False
+
     def _do_proactive_reconnect(self, room: RoomSession) -> None:
         """URL 过期前重启录制（由 global tick 在编排线程调用）。
 
@@ -3844,7 +3948,14 @@ class RoomOrchestrator:
             if action == "restart_preview_sink":
                 restart = getattr(supervisor, "restart_preview_sink", None)
                 if callable(restart):
-                    return bool(restart())
+                    # Preview encoder重启也必须经过统一 recovery lock、退避和
+                    # 有限预算，避免 stdout stall 时每个 global tick 都重启一次。
+                    return bool(
+                        supervisor.run_recovery(
+                            lambda _recovery_id: bool(restart()),
+                            reason_code="PREVIEW_ENCODER_FAILURE",
+                        )
+                    )
             if action == "rotate_lease":
                 def rotate(_recovery_id: str) -> bool:
                     return self._recover_shared_upstream_in_place(room)
@@ -3947,6 +4058,30 @@ class RoomOrchestrator:
                                 err or "共享进样上游已停止",
                             )
                             continue
+                    preview_error = getattr(ingest, "preview_error", "")
+                    if preview_error and room.preview_enabled and not room.is_reconnecting:
+                        from lsc.platforms.recovery_policy import (
+                            recovery_action as _preview_recovery_action,
+                        )
+
+                        preview_action = _preview_recovery_action(
+                            getattr(room, "stream_info", None),
+                            preview_error,
+                            saw_first_ts=bool(
+                                getattr(ingest, "_upstream_has_produced_data", False)
+                            ),
+                        )
+                        if preview_action == "restart_preview_sink":
+                            _log.warning(
+                                "Room %s shared preview sink failed; scheduling isolated restart: %s",
+                                room.room_id,
+                                preview_error[:160],
+                            )
+                            if self._start_supervised_recovery(room, preview_error):
+                                # restart_preview_sink only replaces the preview
+                                # encoder; recording/upstream state is untouched.
+                                room.preview_error = ""
+
                     ingest_error = getattr(ingest, "recording_error", "") or getattr(ingest, "upstream_error", "")
                     rotate_lease = False
                     if ingest_error:
@@ -4013,7 +4148,13 @@ class RoomOrchestrator:
                             room.last_error or "录制恢复到期",
                         )
                     # 主动流 URL 过期检测（与 controller 路径对齐）
-                    if is_low_tick and room.is_recording and not room.is_reconnecting:
+                    # 正在健康录制中时禁止主动切断；真正的断流由看门狗毫秒级接管
+                    if (
+                        is_low_tick
+                        and room.is_recording
+                        and not room.is_reconnecting
+                        and not self._is_recording_active_and_healthy(room)
+                    ):
                         stream_url = ""
                         if room.stream_info and room.stream_info.stream_url:
                             stream_url = room.stream_info.stream_url
@@ -4154,7 +4295,12 @@ class RoomOrchestrator:
                     _log.warning("Disk space check failed for room %s: %s", room.room_id, exc)
 
                 # 主动流 URL 过期检测：在 URL 过期前重启录制以获取新 URL
-                if room.is_recording and not room.is_reconnecting:
+                # 正在健康录制中时禁止主动切断；真正的断流由看门狗毫秒级接管
+                if (
+                    room.is_recording
+                    and not room.is_reconnecting
+                    and not self._is_recording_active_and_healthy(room)
+                ):
                     stream_url = ""
                     if room.stream_info and room.stream_info.stream_url:
                         stream_url = room.stream_info.stream_url

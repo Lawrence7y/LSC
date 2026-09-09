@@ -90,7 +90,10 @@ class FrameCaptureWorker:
         return args
 
     def _spawn_process(self) -> subprocess.Popen:
-        from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
+        from lsc.utils.process_launcher import (
+            prepare_launch,
+            set_stream_nonblocking,
+        )
 
         args = self._build_args()
         ffmpeg_bin = args[0]
@@ -225,6 +228,8 @@ class FrameCaptureWorker:
 
     def stop(self) -> None:
         """终止子进程并清理资源。幂等。"""
+        from lsc.utils.process_launcher import kill_process_tree
+
         self._stop_event.set()
         process = self._process
         if process is not None:
@@ -233,7 +238,7 @@ class FrameCaptureWorker:
                 try:
                     process.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    kill_process_tree(process)
                     try:
                         process.wait(timeout=1.0)
                     except subprocess.TimeoutExpired:

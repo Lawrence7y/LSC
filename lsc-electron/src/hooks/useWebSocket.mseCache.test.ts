@@ -3,8 +3,10 @@ import {
   _cacheMseInit,
   _cacheMseSegment,
   clearMseRoomCache,
+  drainPendingMseReviewSegments,
   drainPendingMseSegments,
   getMseInitCache,
+  getMseReviewInitCache,
 } from './useWebSocket'
 
 function bufferOf(mb: number): ArrayBuffer {
@@ -54,5 +56,11 @@ describe('MSE cache bounds', () => {
       if (getMseInitCache(`room-${i}`)) kept++
     }
     expect(kept).toBeLessThanOrEqual(20)
+  })
+
+  it('drains review channel init and segments with session isolation', () => {
+    const roomId = 'room-review-test'
+    expect(getMseReviewInitCache(roomId)).toBeNull()
+    expect(drainPendingMseReviewSegments(roomId)).toEqual([])
   })
 })

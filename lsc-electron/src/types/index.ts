@@ -114,6 +114,11 @@ export interface RoomSession {
   mark_out_wallclock?: number | null
   recording_start_mono?: number | null
   recording_media_start_mono?: number | null
+  /** 直播 MSE 预览轴相对录制轴的运行时映射：preview = recording + delta。 */
+  recording_to_preview_delta?: number | null
+  /** 采样对应的预览 epoch；预览重建或录制换代后必须重新采样。 */
+  preview_clock_epoch_id?: string
+  recording_id?: string
   preview_latency?: number
   /** 音频互相关偏移量（秒），表示该房间内容相对于最慢参考房间的时间差。
    *
@@ -134,6 +139,16 @@ export interface RoomSession {
   preview_phase?: 'idle' | 'refreshing_url' | 'probing' | 'streaming' | 'error'
   /** 预览来源：live_mse=直播 MSE，recording_review=录制文件回看，degraded=降级；缺省视为 live_mse */
   preview_mode?: PreviewMode
+  /** 当前激活的预览通道：live=直播，review=录制文件回看 */
+  active_preview_channel?: 'live' | 'review'
+  /** 录制文件回看会话 ID（与直播 preview_epoch_id 严格隔离） */
+  review_session_id?: string
+  /** 录制回看窗口起点（秒） */
+  review_start_sec?: number
+  /** 录制回看预载窗口终点（秒） */
+  review_window_end_sec?: number
+  /** 文件回看流的 MSE 0 秒对应录制轴的秒数。 */
+  preview_review_start_sec?: number
   /** 预览源世代 ID；切换 live/recording_review 或重建 MSE 时递增，供前端强制重建播放器 */
   preview_epoch_id?: string
   // 直播是否在线（false 表示断联）
@@ -173,6 +188,22 @@ export interface ClipSegment {
   boundary_evidence?: string[]
   /** 边界来源（如 valorant_hybrid_v1） */
   boundary_source?: string
+  /** Valorant 输入来源策略；broadcast 切片已经通过回放/暂停审计 */
+  source_profile?: 'pov' | 'broadcast' | string
+  broadcast_audit?: 'passed' | string
+  broadcast_audit_reason?: string
+  broadcast_excluded_reason?: string
+  /** 赛事审计要求人工复核（证据不完整/未通过时 True，自动草稿须拦截） */
+  broadcast_review_required?: boolean
+  /** 时长异常标记：拦截自动导出/自动草稿 */
+  duration_anomaly?: boolean
+  /** OCR 出点类型（next_prep / broadcast_exclusion / next_combat / open_tail …） */
+  end_by?: string
+  /** OCR 入点类型（ocr_combat / refined_combat …） */
+  start_by?: string
+  boundary_quality?: 'precise' | 'coarse' | 'pending' | 'invalid' | string
+  boundary_quality_reason_code?: string
+  boundary_review_required?: boolean
   /** 稳定回合键（与持续分析 _valorant_round_key 一致），用于多房同步 */
   round_key?: string
   /** 入队时快照的墙钟入点（time.monotonic），导出时优先于房间当前 mark */
@@ -222,6 +253,8 @@ export interface RecordSettings {
   audio_codec: string
   audio_bitrate: string
   preview_quality: string
+  /** 时间线直播回放缓存：0=关闭，单位秒 */
+  timeline_replay_seconds: number
   preset?: string
   /** 共享进样：单 FFmpeg 同时输出录制与预览 */
   shared_ingest_enabled?: boolean
@@ -253,6 +286,9 @@ export interface WSPayloadMap {
   disconnected: undefined
   reconnecting: undefined
   reconnect_failed: undefined
+  // 心跳健康（客户端内部事件，非服务端消息）
+  backend_crashed: undefined
+  backend_revived: undefined
   // 广播
   rooms_updated: { rooms: RoomSession[] }
   rooms_loaded: { rooms: RoomSession[] }
@@ -284,9 +320,37 @@ export interface WSPayloadMap {
   get_settings_response: Record<string, unknown>
   enable_preview_response: { success?: boolean; note?: string }
   request_mse_init_response: { success?: boolean; note?: string; room_id?: string }
+  set_preview_clock_response: {
+    success?: boolean
+    room_id?: string
+    accepted?: boolean
+    recording_to_preview_delta?: number
+    preview_clock_epoch_id?: string
+    recording_id?: string
+    sample_epoch_ms?: number
+    reason?: string
+  }
   check_dependencies_response: { python: unknown; ffmpeg: unknown; ffprobe: unknown }
   clip_export_started: { job_id: string; room_name?: string }
-  continuous_analysis_complete: { room_id: string; total_rounds: number; confirmed_rounds: number; exported_rounds: number; failed_rounds: number }
+  continuous_analysis_complete: {
+    room_id: string
+    total_highlights?: number
+    highlights?: unknown[]
+    listed_clip_count?: number
+    listed_clips?: ClipSegment[]
+    confirmed_rounds?: number
+    pending_rounds?: number
+    coverage_ranges?: Array<[number, number]>
+    coverage_uncovered_ranges?: Array<[number, number]>
+    coverage_complete?: boolean
+    finalization_job_id?: string | null
+    finalization_state?: 'idle' | 'checkpoint_saved' | 'finalizing' | 'completed' | 'error' | string
+    audit_delivery_gap?: number
+    pending_queue_depth?: number
+    error?: string
+    /** 收尾超时/扫描失败放弃但 pending 候选已落盘，可恢复；终端模型错误不设此标记 */
+    finalization_recoverable?: boolean
+  }
 }
 
 export type WSMessageType = keyof WSPayloadMap
@@ -340,6 +404,13 @@ export interface ElectronAPI {
 
   // 退出清理：主进程通知渲染进程清理所有房间
   onCleanupAllRooms?: (callback: () => void) => () => void
+  notifyCleanupAllRoomsComplete?: (result: {
+    success: boolean
+    finalization_state?: 'idle' | 'checkpoint_saved' | 'finalizing' | 'completed' | 'error'
+    finalization_job_id?: string | null
+    stopped_recording_room_ids?: string[]
+    errors?: string[]
+  }) => void
 }
 
 // 依赖检测状态
@@ -373,6 +444,9 @@ export interface AppSettings {
   autoLaunch: boolean
   minimizeToTray: boolean
   default_export_preset: string
+  workbenchViewMode?: 'compact' | 'standard'
+  autoAlignOnLive?: boolean
+  defaultMuteAll?: boolean
 }
 
 export interface RoomTimeSnapshot {
@@ -443,7 +517,7 @@ export interface TimelineProgressSummary {
   /** 录制领先预览的秒数，max(0, recordedDuration - previewPosition) */
   previewDelay: number
   /** 当前控制栏所处轴 */
-  axis: 'preview' | 'common' | 'recording_review'
+  axis: 'preview' | 'common' | 'recording_review' | 'recording'
 }
 
 export interface ContinuousAnalysisStatus {
@@ -457,7 +531,7 @@ export interface ContinuousAnalysisStatus {
   pending_rounds?: number
   analysis_stage?: string
   total_highlights?: number
-  phase?: 'idle' | 'running' | 'stopping' | 'finalizing' | 'completed' | 'error' | 'stalled'
+  phase?: 'idle' | 'running' | 'stopping' | 'finalizing' | 'checkpoint_saved' | 'completed' | 'error' | 'stalled'
   status?: string
   updated_at?: number
   scan_mode?: 'full' | 'incremental'
@@ -476,8 +550,8 @@ export interface ContinuousAnalysisStatus {
   effective_interval?: number
   progress?: number
   error?: string
-  // 无畏契约相位调度字段（valorant_profile 为遗留字段，pov/broadcast/valorant 均表示统一档）
-  valorant_profile?: 'pov' | 'broadcast' | 'valorant' | string
+  // 无畏契约来源策略：pov 保持普通直播路径，broadcast 启用赛事安全审计。
+  valorant_profile?: 'auto' | 'pov' | 'broadcast' | 'valorant' | string
   round_phase?: 'unknown' | 'buy' | 'pre_combat' | 'combat' | 'post_combat' | 'intermission'
   round_phase_detail?: string
   pending_round?: boolean
@@ -495,6 +569,52 @@ export interface ContinuousAnalysisStatus {
   scan_running?: boolean
   /** 分析滞后于录制的秒数（recorded - analyzed），后端 payload 提供 */
   analysis_lag_sec?: number
+  analysis_backlog_sec?: number
+  realtime_fast_mode?: boolean
+  scan_cycle_sec?: number
+  last_scan_wall_sec?: number
+  scan_throughput_history?: number[]
+  /** 实际抽帧采样频率，不是模型推理 FPS */
+  sample_fps?: number
+  /** 视觉模型实际处理吞吐与延迟 */
+  model_infer_fps?: number
+  model_infer_ms_p50?: number
+  model_infer_ms_p90?: number
+  pending_review_count?: number
+  analysis_quality_status?: 'normal' | 'degraded' | 'review' | 'error' | string
+  gross_scanned_sec?: number
+  newly_covered_sec?: number
+  gross_scan_throughput?: number
+  net_coverage_throughput?: number
+  net_coverage_throughput_history?: number[]
+  lag_delta_sec?: number
+  lag_slope?: number
+  audit_queue_depth?: number
+  audit_accepted_count?: number
+  audit_rejected_count?: number
+  audit_manual_review_count?: number
+  audit_terminal_total?: number
+  audit_delivered_total?: number
+  audit_delivery_gap?: number
+  pending_queue_depth?: number
+  refine_result_queue_depth?: number
+  finalization_pending_jobs?: number
+  last_audit_rejection?: {
+    start: number
+    end: number
+    reason: string
+  } | null
+  listed_clip_count?: number
+  listed_clips?: ClipSegment[]
+  coverage_ranges?: Array<[number, number]>
+  coverage_uncovered_ranges?: Array<[number, number]>
+  coverage_complete?: boolean
+  finalization_job_id?: string | null
+  finalization_state?: 'idle' | 'checkpoint_saved' | 'finalizing' | 'completed' | 'error' | string
+  finalization_full_rescan?: boolean
+  finalization_full_rescan_started?: boolean
+  /** 收尾失败但可恢复（pending 候选已落盘）；前端据此渲染“恢复收尾”按钮 */
+  finalization_recoverable?: boolean
   model_version?: string | null
   provider?: string | null
   provider_warning?: string | null
@@ -531,14 +651,23 @@ export interface MsePlayerRegistryEntry {
     pause: () => void
     goLive: () => void
     getBufferedRange: () => { start: number; end: number } | null
+    getBufferedRanges?: () => Array<{ start: number; end: number }>
+    setReplayBufferSeconds?: (seconds: number) => void
     state: string
     videoElement?: HTMLVideoElement
     resumePlayback?: (silent?: boolean) => void
+    markSeeked?: () => void
+    seek?: (time: number) => void
+    sessionId?: string
   } | null
+  live?: any
+  review?: any
+  channel?: string
   audioSource: MediaElementAudioSourceNode | null
   gainNode: GainNode | null
   /** 可选：诊断用，标识进样模式 */
   ingestMode?: string
+  [key: string]: any
 }
 
 declare global {

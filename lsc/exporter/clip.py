@@ -22,7 +22,7 @@ ClipExporter 是直播切片系统（LSC）的导出核心，负责将识别出�
   （非零起点无法保证关键帧对齐）时，自动降级到硬件编码（优先 NVENC）/
   ``libx264`` 以保证切口精度。
 - 实时进度回调：通过 ``-progress pipe:1`` 读取 FFmpeg 进度，支持进程追踪
-  与取消（``on_process``），并内置 300 秒看门狗防止卡死。
+  与取消（``on_process``），并内置按分辨率/编码器计算的看门狗超时防止卡死。
 - 路径安全防护：文件名消毒（移除 Windows 非法字符）+ ``os.path.realpath``
   双重校验，防止路径遍历攻击。
 """
@@ -49,7 +49,7 @@ from lsc.utils.gpu_ffmpeg import (
     input_hwaccel_args,
     prefer_gpu_filters,
 )
-from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
+from lsc.utils.process_launcher import kill_process_tree, prepare_launch, set_stream_nonblocking
 
 _log = get_logger(__name__)
 
@@ -251,7 +251,7 @@ class ClipExporter:
                 returncode = proc.wait(timeout=watchdog_timeout)
             except subprocess.TimeoutExpired:
                 try:
-                    proc.kill()
+                    kill_process_tree(proc)
                     proc.wait(timeout=5)
                 except Exception as exc:
                     _log.warning(
@@ -539,7 +539,7 @@ class ClipExporter:
 
         def _assemble_cmd(hw: list[str], vf: list[str], prof: ExportProfile) -> list[str]:
             out = [self.ffmpeg, "-y", "-loglevel", "warning", *hw]
-            out += ["-ss", f"{start_sec:.3f}", "-i", video_path, "-t", f"{duration:.3f}"]
+            out += ["-accurate_seek", "-ss", f"{start_sec:.3f}", "-i", video_path, "-t", f"{duration:.3f}"]
             out += prof.ffmpeg_video_args()
             # 音频尽量 copy，避免 AAC 软编占 CPU（失败时外层可再试）
             if prof.is_copy:
@@ -592,7 +592,8 @@ class ClipExporter:
             if has_callback:
                 # 使用 Popen 模式：实时读取 stdout 中的进度行，
                 # 同时后台线程收集 stderr 尾部用于错误诊断，
-                # 并启动 watchdog 线程在 300 秒无响应时强制终止进程。
+                # 并启动 watchdog 线程在 compute_export_watchdog_timeout 计算的
+                # 超时（按分辨率/编码器 300~1500 秒）无响应时强制终止进程。
                 # 调用方可通过 on_process 获取 Popen 对象以追踪或取消任务。
                 proc = subprocess.Popen(cmd, **popen_kwargs)  # type: ignore[call-overload]
                 set_stream_nonblocking(proc.stderr)
@@ -628,7 +629,7 @@ class ClipExporter:
                     except subprocess.TimeoutExpired:
                         _timed_out_flag[0] = True
                         try:
-                            proc.kill()
+                            kill_process_tree(proc)
                             proc.wait(timeout=5)
                         except Exception as exc:
                             # Kill 失败，记录进程信息便于手动清理
@@ -672,7 +673,7 @@ class ClipExporter:
                     # stdout 已关闭，等待进程退出（不会阻塞太久）
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    kill_process_tree(proc)
                     _timed_out_flag[0] = True
 
                 stderr_thread.join(timeout=2)
@@ -681,7 +682,7 @@ class ClipExporter:
                 if _timed_out_flag[0]:
                     _cleanup_tmp(tmp_output_path)
                     return ExportResult(False, output_path, clip_index, safe_title,
-                                        error="导出超时（FFmpeg 运行超过 300 秒）")
+                                        error=f"导出超时（FFmpeg 运行超过 {watchdog_timeout} 秒无响应）")
                 if proc.returncode != 0:
                     error_tail = "\n".join(stderr_tail)
                     _cleanup_tmp(tmp_output_path)

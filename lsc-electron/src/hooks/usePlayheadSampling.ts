@@ -1,6 +1,12 @@
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 import { useAppStore } from '@/store/appStore'
-import { getAlignStatus, pickReferenceRoomId, previewToCommon } from '@/utils/timelineCoords'
+import {
+  getAlignStatus,
+  isRecordingReviewMode,
+  pickReferenceRoomId,
+  previewToCommon,
+  previewToRecordingLocal,
+} from '@/utils/timelineCoords'
 import { writeDisplayPlayhead, writePlayhead } from '@/utils/playheadStore'
 
 // 轴换算降级告警节流（200ms 采样循环内，避免刷屏）
@@ -109,9 +115,10 @@ export function usePlayheadSampling(opts: {
         || null
       if (refId) {
         const t = next[refId] ?? lastPreviewPositionsRef.current[refId] ?? 0
+        let displayTime = t
         if (status === 'ready' && ctx?.room_snapshots[refId]) {
           try {
-            writeDisplayPlayhead(previewToCommon(ctx, refId, t))
+            displayTime = previewToCommon(ctx, refId, t)
           } catch (err) {
             // preview→common 轴换算失败（对齐快照瞬时不可用）：降级为 preview 轴，
             // 两轴数值含义不同会导致播放头瞬时跳变，节流记录日志便于排查
@@ -119,11 +126,27 @@ export function usePlayheadSampling(opts: {
               _lastAxisFallbackWarnAt = now
               console.warn('[usePlayheadSampling] previewToCommon failed, fallback to preview axis:', err)
             }
-            writeDisplayPlayhead(t)
           }
         } else {
-          writeDisplayPlayhead(t)
+          // 单房录制时间线显示 recording_local，而 MSE currentTime 是
+          // preview_local。这里必须和 ControlBar 的 localPlayhead 使用同一转换，
+          // 否则每帧都会把正确的 recording 轴播放头覆盖回左侧 delta 秒。
+          const room = store.rooms.find((item) => item.room_id === refId)
+          const isReview = isRecordingReviewMode(room?.preview_mode)
+          if (isReview) {
+            // 文件回看 MSE 以本次 -ss 后的 0 为起点，恢复到录制显示轴。
+            displayTime = t + Math.max(0, Number(room?.preview_review_start_sec) || 0)
+          } else {
+            const usesRecordingAxis = Boolean(
+              room
+              && (room.is_recording || room.record_output_path),
+            )
+            if (usesRecordingAxis) {
+              displayTime = previewToRecordingLocal(room, t) ?? t
+            }
+          }
         }
+        writeDisplayPlayhead(displayTime)
       }
     }
 

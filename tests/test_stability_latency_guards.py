@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ROOM_HANDLER = (ROOT / "python-backend" / "handlers" / "room_handler.py").read_text(encoding="utf-8")
+ALIGN_HANDLER = (ROOT / "python-backend" / "handlers" / "alignment_handlers.py").read_text(encoding="utf-8")
 EXPORT_HANDLER = (ROOT / "python-backend" / "handlers" / "export_handlers.py").read_text(encoding="utf-8")
 TIMELINE_HANDLERS = (ROOT / "python-backend" / "handlers" / "timeline_handlers.py").read_text(encoding="utf-8")
 MANAGER = (ROOT / "lsc" / "gui" / "multi_room" / "manager.py").read_text(encoding="utf-8")
@@ -37,15 +38,17 @@ def test_export_queue_put_nowait_on_full():
 
 
 def test_align_split_brain_rejects_missing_timeline():
-    assert "公共时间轴创建失败" in ROOM_HANDLER
+    source = ROOM_HANDLER + "\n" + ALIGN_HANDLER
+    assert "公共时间轴创建失败" in source
     assert "公共时间轴未就绪" in WORKBENCH or "公共时间轴创建失败" in WORKBENCH
 
 
 def test_align_audio_map_runs_in_executor():
-    assert "run_in_executor" in ROOM_HANDLER
-    assert "align_audio_map" in ROOM_HANDLER
+    source = ROOM_HANDLER + "\n" + ALIGN_HANDLER
+    assert "run_in_executor" in source
+    assert "align_audio_map" in source
     # 互相关应在 executor 内调用，而非 handler 协程直接阻塞
-    assert "lambda: align_audio_map(" in ROOM_HANDLER
+    assert "lambda: align_audio_map(" in source
 
 
 def test_continuous_skip_kick_allows_retry_after_error():

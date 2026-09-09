@@ -1,5 +1,5 @@
 import { useCallback } from 'react'
-import { message } from 'antd'
+import { App } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import { getClipStableId } from '@/pages/Workbench/components/ClipList'
 import { useUndoStack } from '@/hooks/useUndoStack'
@@ -23,6 +23,8 @@ export function useClipDelete(opts: {
   setClipSelectedIds: (updater: (prev: Set<string>) => Set<string>) => void
 }) {
   const { send, refiningClipId, setRefiningClipId, setClipSelectedIds } = opts
+  // context 版 message：支持 JSX content，且跟随 ConfigProvider 主题
+  const { message } = App.useApp()
   const clipUndo = useUndoStack(20)
 
   const handleDeleteClip = useCallback((clipId: string) => {
@@ -89,7 +91,7 @@ export function useClipDelete(opts: {
         </span>
       ),
     })
-  }, [send, refiningClipId, setRefiningClipId, setClipSelectedIds, clipUndo])
+  }, [send, refiningClipId, setRefiningClipId, setClipSelectedIds, clipUndo, message])
 
   return { handleDeleteClip }
 }

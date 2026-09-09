@@ -39,9 +39,12 @@ export function writeDisplayPlayhead(absoluteTime: number): void {
   writePlayhead(DISPLAY_KEY, absoluteTime)
 }
 
-/** Live 贴边：写入 contentEnd 采样，供 rAF 插值连续走秒 */
+/** Live 贴边：写入 contentEnd 采样，供 rAF 插值连续走秒。<=0 时重置基准，禁止后台空转计时 */
 export function writeLiveEdgeBase(contentEndSec: number): void {
-  if (!Number.isFinite(contentEndSec) || contentEndSec < 0) return
+  if (!Number.isFinite(contentEndSec) || contentEndSec <= 0) {
+    liveEdgeBase = { sec: 0, monoMs: 0 }
+    return
+  }
   liveEdgeBase = { sec: contentEndSec, monoMs: performance.now() }
 }
 

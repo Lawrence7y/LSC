@@ -1,5 +1,4 @@
 import { Tooltip } from 'antd'
-import { CheckCircleFilled, CloseCircleFilled } from '@ant-design/icons'
 import { useI18n } from '@/i18n'
 
 export function DepStatus({
@@ -16,19 +15,27 @@ export function DepStatus({
     return <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{t('检测中...')}</span>
   }
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, maxWidth: 'min(320px, 100%)' }}>
-      {ok ? (
-        <CheckCircleFilled style={{ color: 'var(--state-success)', fontSize: 14, flexShrink: 0 }} />
-      ) : (
-        <CloseCircleFilled style={{ color: 'var(--state-error)', fontSize: 14, flexShrink: 0 }} />
-      )}
-      <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, width: '100%', maxWidth: 400 }}>
+      <span
+        style={{
+          display: 'inline-block',
+          width: 7,
+          height: 7,
+          borderRadius: '50%',
+          backgroundColor: ok ? '#45ab6c' : '#c96868',
+          boxShadow: ok ? '0 0 6px rgba(69, 171, 108, 0.4)' : '0 0 6px rgba(201, 104, 104, 0.3)',
+          flexShrink: 0,
+        }}
+      />
+      <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1, overflow: 'hidden' }}>
         {version && (
           <Tooltip title={version}>
             <span
               style={{
                 fontSize: 12,
-                color: ok ? 'var(--text-secondary)' : 'var(--state-error)',
+                color: ok ? 'var(--text-primary)' : 'var(--state-error)',
+                fontFamily: 'var(--font-mono)',
+                fontWeight: 500,
                 lineHeight: 1.4,
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',

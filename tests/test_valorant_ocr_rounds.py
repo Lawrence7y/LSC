@@ -9,12 +9,25 @@ from lsc.analyzer.valorant_ocr_rounds import (
 )
 
 
-def _feed_labels(fsm: OcrRoundFSM, seq: list) -> list[dict]:
+def _feed_labels(
+    fsm: OcrRoundFSM,
+    seq: list,
+    *,
+    broadcast_mode: bool = False,
+) -> list[dict]:
     out: list[dict] = []
     for item in seq:
         label, ts, timer = item[0], item[1], item[2]
         timer_raw = bool(item[3]) if len(item) > 3 else False
-        out.extend(fsm.feed(label, ts, timer, timer_raw=timer_raw))
+        out.extend(
+            fsm.feed(
+                label,
+                ts,
+                timer,
+                timer_raw=timer_raw,
+                broadcast_mode=broadcast_mode,
+            )
+        )
     return out
 
 
@@ -83,6 +96,72 @@ def test_broadcast_cycle_with_replay():
     rounds = _feed_labels(fsm, seq)
     assert len(rounds) == 1
     assert (rounds[0]["start"], rounds[0]["end"]) == (1.0, 19.0)
+
+
+def test_broadcast_fresh_clock_does_not_split_replay_without_prep():
+    """官方回放中的高计时器不能绕过准备阶段开启临时新回合。"""
+    fsm = OcrRoundFSM()
+    seq = [
+        ("prep", 0.0, 30.0),
+        ("combat", 1.0, 90.0, True),
+        ("combat", 2.0, 89.0, True),
+        ("combat", 3.0, 88.0, True),
+        ("combat", 4.0, 87.0, True),
+        ("combat", 5.0, 86.0, True),
+        ("combat", 6.0, 85.0, True),
+        ("combat", 7.0, 84.0, True),
+        ("combat", 8.0, 83.0, True),
+        ("combat", 9.0, 82.0, True),
+        ("combat", 10.0, 81.0, True),
+        ("combat", 11.0, 80.0, True),
+        ("combat", 12.0, 79.0, True),
+        ("settle", 13.0, None),
+        ("neutral", 14.0, None),
+        ("neutral", 15.0, None),
+        ("neutral", 16.0, None),
+        ("neutral", 17.0, None),
+        ("neutral", 18.0, None),
+        ("combat", 19.0, 95.0, True),  # Replay HUD 的伪新计时器
+        ("combat", 20.0, 94.0, True),
+        ("combat", 21.0, 93.0, True),
+        ("neutral", 22.0, None),
+        ("neutral", 23.0, None),
+        ("neutral", 24.0, None),
+        ("prep", 25.0, 30.0),
+        ("prep", 26.0, 29.0),
+    ]
+
+    rounds = _feed_labels(fsm, seq, broadcast_mode=True)
+
+    assert len(rounds) == 1
+    assert rounds[0]["start"] == 1.0
+    assert rounds[0]["end"] == 25.0
+    assert rounds[0]["end_by"] == "next_prep"
+
+
+def test_broadcast_late_fresh_clock_closes_missing_prep_as_pending():
+    """真实下一回合缺少 prep 时，不能把多个回合吞成一个巨候选。"""
+    fsm = OcrRoundFSM()
+    seq = [
+        ("prep", 0.0, 30.0, True),
+        ("combat", 1.0, 95.0, True),
+        ("combat", 2.0, 94.0, True),
+        ("combat", 3.0, 93.0, True),
+        ("combat", 4.0, 92.0, True),
+        ("settle", 5.0, None, False),
+        # 结算后超过 45s，新的真实满钟读数应触发降级 next_combat。
+        ("neutral", 20.0, None, False),
+        ("combat", 51.0, 95.0, True),
+        ("combat", 52.0, 94.0, True),
+    ]
+
+    rounds = _feed_labels(fsm, seq, broadcast_mode=True)
+
+    assert len(rounds) == 1
+    assert rounds[0]["start"] == 1.0
+    assert rounds[0]["end"] == 51.0
+    assert rounds[0]["end_by"] == "next_combat"
+    assert rounds[0]["confirm_status"] == "pending"
 
 
 def test_settle_prep_too_close_to_result_ignored():

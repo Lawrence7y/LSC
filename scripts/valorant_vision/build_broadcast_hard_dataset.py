@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 from collections import Counter, defaultdict
@@ -18,13 +19,16 @@ import numpy as np
 
 from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
 
-ANN = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"
-DATA = Path.home() / "LSC" / "datasets" / "valorant_phase"
-CODEX = Path(
-    r"D:\Project\直播切片多人\.worktrees\valorant-frame-labeling-pilot"
-    r"\datasets\valorant_phase\annotations\new_broadcast_20260721"
+_BASE_DATA = Path(os.environ.get("LSC_VALORANT_DATA_DIR", "")) if os.environ.get("LSC_VALORANT_DATA_DIR") else (Path.home() / "LSC" / "datasets" / "valorant_phase")
+ANN = _BASE_DATA / "annotate"
+DATA = _BASE_DATA
+_ENV_CODEX = os.environ.get("LSC_CODEX_DIR", "")
+CODEX = (
+    Path(_ENV_CODEX)
+    if _ENV_CODEX
+    else _BASE_DATA / "annotations"
 )
-BLIND = Path.home() / "LSC" / "datasets" / "valorant_phase" / "blind_pakki"
+BLIND = _BASE_DATA / "blind_pakki"
 VAL_RATIO = 0.18
 SEED = 42
 HARD_OVERSAMPLE = 4

@@ -384,12 +384,14 @@ class ProbeService:
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen) -> None:
+        from lsc.utils.process_launcher import kill_process_tree
+
         try:
             process.terminate()
             process.wait(timeout=1)
         except (OSError, subprocess.TimeoutExpired):
             try:
-                process.kill()
+                kill_process_tree(process)
                 process.wait(timeout=1)
             except (OSError, subprocess.TimeoutExpired):
                 pass

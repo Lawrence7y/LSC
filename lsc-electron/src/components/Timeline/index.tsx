@@ -12,6 +12,12 @@ export interface TimelineClip {
   uid?: string
 }
 
+export interface TimelineBufferedRange {
+  /** 显示轴绝对秒数，不是 video.currentTime 的相对值。 */
+  start: number
+  end: number
+}
+
 interface TimelineProps {
   duration: number
   currentTime: number
@@ -21,12 +27,20 @@ interface TimelineProps {
   /** 开始 scrub 时传入当前绝对 windowStart，供父级冻结坐标系 */
   onScrubStart?: (windowStart: number) => void
   onScrubEnd?: (finalTime?: number) => void
-  onMarkIn: () => void
-  onMarkOut: () => void
+  /** scrub 拖拽移动时实时触发绝对秒数，用于画面跟手平滑预览 */
+  onScrubMove?: (time: number) => void
+  /**
+   * @deprecated 打标已统一由 I / O 键与入出点按钮承担；时间线点击只 scrub 播放头。
+   * 保留签名以免调用方被动重构，本组件不再读取这两个回调。
+   */
+  onMarkIn?: () => void
+  onMarkOut?: () => void
   onMarkerDrag?: (type: 'in' | 'out', time: number) => void
   onMarkerDragEnd?: (type: 'in' | 'out', time: number) => void
   onDeleteMarker?: (type: 'in' | 'out') => void
   buffered?: number
+  /** 实际 MSE buffered ranges，允许存在空洞；优先于 buffered 单值。 */
+  bufferedRanges?: TimelineBufferedRange[]
   clips?: TimelineClip[]
   highlights?: TimelineHighlightBand[]
   waveformPeaks?: number[]
@@ -133,8 +147,16 @@ export function findSnapTarget(
   currentTime: number,
   tickInterval: number,
   highlights: TimelineHighlightBand[] = [],
-  opts?: { skipCurrentTime?: boolean; clips?: TimelineClip[]; dvrStartRel?: number | null; recordedEnd?: number | null },
+  opts?: {
+    skipCurrentTime?: boolean
+    clips?: TimelineClip[]
+    dvrStartRel?: number | null
+    recordedEnd?: number | null
+    snapThreshold?: number
+  },
 ): number {
+  const threshold = typeof opts?.snapThreshold === 'number' ? opts.snapThreshold : SNAP_THRESHOLD
+  if (threshold <= 0) return rawTime
   const targets: SnapTarget[] = []
   if (markIn !== null) targets.push({ time: markIn, priority: 100, type: 'mark' })
   if (markOut !== null) targets.push({ time: markOut, priority: 100, type: 'mark' })
@@ -160,7 +182,7 @@ export function findSnapTarget(
   }
   targets.sort((a, b) => b.priority - a.priority || Math.abs(a.time - rawTime) - Math.abs(b.time - rawTime))
   for (const target of targets) {
-    if (Math.abs(target.time - rawTime) <= SNAP_THRESHOLD) {
+    if (Math.abs(target.time - rawTime) <= threshold) {
       return target.time
     }
   }
@@ -175,12 +197,12 @@ export function Timeline({
   onSeek,
   onScrubStart,
   onScrubEnd,
-  onMarkIn,
-  onMarkOut,
+  onScrubMove,
   onMarkerDrag,
   onMarkerDragEnd,
   onDeleteMarker,
   buffered = 0,
+  bufferedRanges = [],
   clips = [],
   highlights = [],
   waveformPeaks: _waveformPeaks = [],
@@ -226,14 +248,17 @@ export function Timeline({
   const followLiveRef = useRef(followLive)
   const isScrubbingPropRef = useRef(isScrubbing)
   const effectiveDurationRef = useRef(1)
+  // 一次 pointer 手势内冻结轨道长度，避免录制时长增长导致目标像素漂移。
+  const dragDurationRef = useRef(1)
 
   // 最新回调进 ref，window 监听始终读最新闭包
   const getTimeFromXRef = useRef<(clientX: number) => number>(() => 0)
-  const snapTimeRef = useRef<(raw: number, skipCurrent?: boolean) => number>((t) => t)
+  const snapTimeRef = useRef<(raw: number, skipCurrent?: boolean, altKey?: boolean) => number>((t) => t)
   const onSeekRef = useRef(onSeek)
   const onMarkerDragRef = useRef(onMarkerDrag)
   const onMarkerDragEndRef = useRef(onMarkerDragEnd)
   const onScrubEndRef = useRef(onScrubEnd)
+  const onScrubMoveRef = useRef(onScrubMove)
   const wsRef = useRef(ws)
   const triggerSnapFlashRef = useRef<(time: number, type: SnapType | 'in' | 'out' | 'playhead') => void>(() => {})
 
@@ -282,12 +307,32 @@ export function Timeline({
     if (!track) return 0
     const rect = track.getBoundingClientRect()
     const ratio = clamp((clientX - rect.left) / rect.width, 0, 1)
-    return ratio * effectiveDuration
+    const durationForGesture = isDraggingRef.current ? dragDurationRef.current : effectiveDuration
+    return ratio * durationForGesture
   }, [effectiveDuration])
 
-  const dvrStartRel = dvrStart !== null ? dvrStart - ws : null
+  const pxPerSec = Math.max(1, trackWidth) / Math.max(0.1, effectiveDuration)
+  // 约 8px 吸附半径，放大时自动细化到 0.04s，最大不超过 0.85s
+  const dynamicSnapThreshold = useMemo(() => {
+    return Math.min(0.85, Math.max(0.04, 8 / Math.max(0.001, pxPerSec)))
+  }, [pxPerSec])
 
-  const snapTime = useCallback((rawTime: number, skipCurrentTime = false) => {
+  const dvrStartRel = dvrStart !== null ? dvrStart - ws : null
+  const visibleBufferedRanges = useMemo(() => {
+    return bufferedRanges
+      .map((range) => ({
+        start: Math.max(0, Number(range.start) - ws),
+        end: Math.min(effectiveDuration, Number(range.end) - ws),
+      }))
+      .filter((range) => (
+        Number.isFinite(range.start)
+        && Number.isFinite(range.end)
+        && range.end > range.start
+      ))
+  }, [bufferedRanges, ws, effectiveDuration])
+
+  const snapTime = useCallback((rawTime: number, skipCurrentTime = false, altKey = false) => {
+    if (altKey) return rawTime
     return findSnapTarget(
       rawTime,
       effectiveDuration,
@@ -296,9 +341,15 @@ export function Timeline({
       currentTime,
       tickInterval,
       highlights,
-      { skipCurrentTime, clips, dvrStartRel, recordedEnd: recordedEnd != null ? recordedEnd - ws : null },
+      {
+        skipCurrentTime,
+        clips,
+        dvrStartRel,
+        recordedEnd: recordedEnd != null ? recordedEnd - ws : null,
+        snapThreshold: dynamicSnapThreshold,
+      },
     )
-  }, [effectiveDuration, markIn, markOut, currentTime, tickInterval, highlights, clips, dvrStartRel, recordedEnd, ws])
+  }, [effectiveDuration, markIn, markOut, currentTime, tickInterval, highlights, clips, dvrStartRel, recordedEnd, ws, dynamicSnapThreshold])
 
   const triggerSnapFlash = useCallback((time: number, type: SnapType | 'in' | 'out' | 'playhead') => {
     setSnapFlash({ time, type })
@@ -309,25 +360,29 @@ export function Timeline({
     }, 180)
   }, [])
 
+  const lastScrubPreviewMsRef = useRef(0)
+  const isAltActiveRef = useRef(false)
+
   getTimeFromXRef.current = getTimeFromX
   snapTimeRef.current = snapTime
   onSeekRef.current = onSeek
   onMarkerDragRef.current = onMarkerDrag
   onMarkerDragEndRef.current = onMarkerDragEnd
   onScrubEndRef.current = onScrubEnd
+  onScrubMoveRef.current = onScrubMove
   wsRef.current = ws
   dvrStartRef.current = dvrStart
   recordedEndRef.current = recordedEnd
   triggerSnapFlashRef.current = triggerSnapFlash
 
-  const clampToDvrStart = useCallback((relTime: number, absWs: number): number => {
-    const dvrStartAbs = dvrStartRef.current
-    if (dvrStartAbs == null) return relTime
-    const dvrStartRel = dvrStartAbs - absWs
-    return relTime < dvrStartRel ? dvrStartRel : relTime
+  const clampToDvrStart = useCallback((relTime: number, _absWs: number): number => {
+    // 允许用户点击/回看早于当前 MSE 内存缓冲的内容（通过录制文件回看模式承接），
+    // 仅保证 relTime 不小于 0，不再强制锁死吸附在 dvrStart 上导致画面卡死。
+    return Math.max(0, relTime)
   }, [])
 
-  const applyPointerTime = useCallback((clientX: number, seekPlayhead: boolean) => {
+  const applyPointerTime = useCallback((clientX: number, seekPlayhead: boolean, altKey = false) => {
+    isAltActiveRef.current = altKey
     const time = getTimeFromXRef.current(clientX)
     pendingTimeRef.current = time
     setHoverTime(time)
@@ -338,35 +393,71 @@ export function Timeline({
       if (t === null) return
       const marker = draggingMarkerRef.current
       const absWs = wsRef.current
+      const isAlt = isAltActiveRef.current
       if (marker && onMarkerDragRef.current) {
-        const snapped = snapTimeRef.current(t, false)
-        if (Math.abs(snapped - t) > 0.01) {
+        const snapped = snapTimeRef.current(t, false, isAlt)
+        if (!isAlt && Math.abs(snapped - t) > 0.01) {
           triggerSnapFlashRef.current(snapped, marker)
         }
         onMarkerDragRef.current(marker, snapped + absWs)
         return
       }
       if (seekPlayhead && isDraggingRef.current) {
-        // scrub 中不磁吸旧播放头；光标只走本地 dragTime，不中途 onSeek（避免父级缩轨/video 抢回最右）
-        let snapped = snapTimeRef.current(t, true)
+        // scrub 中不磁吸旧播放头；按住 Alt 禁用磁吸
+        let snapped = snapTimeRef.current(t, true, isAlt)
         snapped = clampToDvrStart(snapped, absWs)
-        if (Math.abs(snapped - t) > 0.01) {
+        if (!isAlt && Math.abs(snapped - t) > 0.01) {
           triggerSnapFlashRef.current(snapped, 'playhead')
         }
         setDragTime(snapped)
-        lastPreviewSeekTimeRef.current = snapped + absWs
+        const absTime = snapped + absWs
+        lastPreviewSeekTimeRef.current = absTime
+
+        // 直写播放头 DOM 样式，实现 60fps 极限丝滑跟随
+        const dur = effectiveDurationRef.current
+        const pct = clamp((snapped / Math.max(dur, 1e-6)) * 100, 0, 100)
+        if (playheadRef.current) playheadRef.current.style.left = `${pct}%`
+        if (progressFillRef.current) progressFillRef.current.style.width = `${pct}%`
+
+        // 拖动过程中平滑节流（~25ms）通知上层精准刷新画面，不卡顿
+        const now = Date.now()
+        if (now - lastScrubPreviewMsRef.current >= 25) {
+          lastScrubPreviewMsRef.current = now
+          if (onScrubMoveRef.current) {
+            onScrubMoveRef.current(absTime)
+          } else {
+            const registry = (window as unknown as { __msePlayers?: Record<string, { player?: { videoElement?: HTMLVideoElement; markSeeked?: () => void } }> })?.__msePlayers
+            if (registry) {
+              for (const rid of Object.keys(registry)) {
+                const player = registry[rid]?.player
+                const video = player?.videoElement
+                if (video && video.buffered.length > 0) {
+                  const bStart = video.buffered.start(0)
+                  const bEnd = video.buffered.end(video.buffered.length - 1)
+                  if (absTime >= bStart && absTime <= bEnd) {
+                    try {
+                      video.currentTime = absTime
+                      player.markSeeked?.()
+                    } catch { /* ignore */ }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     })
-  }, [])
+  }, [clampToDvrStart])
 
   const endPointerDrag = useCallback(() => {
     windowDragCleanupRef.current?.()
     windowDragCleanupRef.current = null
 
+    const isAlt = isAltActiveRef.current
     if (draggingMarkerRef.current && onMarkerDragEndRef.current) {
       const t = pendingTimeRef.current
       if (t !== null) {
-        const snapped = snapTimeRef.current(t, false)
+        const snapped = snapTimeRef.current(t, false, isAlt)
         onMarkerDragEndRef.current(draggingMarkerRef.current, snapped + wsRef.current)
       }
     }
@@ -383,7 +474,7 @@ export function Timeline({
     if (wasScrubbing) {
       let finalAbs: number | undefined
       if (finalRel !== null) {
-        const snapped = clampToDvrStart(snapTimeRef.current(finalRel, true), wsRef.current)
+        const snapped = clampToDvrStart(snapTimeRef.current(finalRel, true, isAlt), wsRef.current)
         finalAbs = snapped + wsRef.current
         lastPreviewSeekTimeRef.current = finalAbs
       }
@@ -393,12 +484,12 @@ export function Timeline({
     } else {
       setDragTime(null)
     }
-  }, [])
+  }, [clampToDvrStart])
 
   const attachWindowDragListeners = useCallback(() => {
     windowDragCleanupRef.current?.()
     const onMove = (e: MouseEvent) => {
-      applyPointerTime(e.clientX, isDraggingRef.current)
+      applyPointerTime(e.clientX, isDraggingRef.current, e.altKey)
     }
     const onUp = () => {
       endPointerDrag()
@@ -413,32 +504,31 @@ export function Timeline({
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (draggingMarkerRef.current) return
-    const time = getTimeFromX(e.clientX)
-    if (e.shiftKey) {
-      e.preventDefault()
-      onMarkIn()
-      return
-    }
-    if (e.ctrlKey || e.metaKey) {
-      e.preventDefault()
-      onMarkOut()
-      return
-    }
+    // 时间线上只保留一种语义：按下即 scrub 播放头。
+    // 旧实现把 Shift / Ctrl+点击当作「标入点 / 标出点」，但 onMarkIn/onMarkOut
+    // 读的是播放头时间而非点击位置——用户点 100s 实际标在 500s，且该修饰键
+    // 无任何提示。打标统一走 I / O 键与入出点按钮。
     e.preventDefault()
     isDraggingRef.current = true
+    dragDurationRef.current = effectiveDuration
     setIsDragging(true)
+    isAltActiveRef.current = e.altKey
     // 同步挂监听，不要等 useEffect
     attachWindowDragListeners()
     onScrubStart?.(ws)
-    const snapped = clampToDvrStart(snapTime(time, true), ws)
-    if (Math.abs(snapped - time) > 0.01) {
+    const time = getTimeFromX(e.clientX)
+    const snapped = clampToDvrStart(snapTime(time, true, e.altKey), ws)
+    if (!e.altKey && Math.abs(snapped - time) > 0.01) {
       triggerSnapFlash(snapped, 'playhead')
     }
     setDragTime(snapped)
     pendingTimeRef.current = snapped
+    const absTime = snapped + ws
     // 按下只动本地光标；正式 seek 在松手 onScrubEnd
-    lastPreviewSeekTimeRef.current = snapped + ws
-  }, [getTimeFromX, onMarkIn, onMarkOut, onScrubStart, snapTime, clampToDvrStart, ws, triggerSnapFlash, attachWindowDragListeners])
+    lastPreviewSeekTimeRef.current = absTime
+    // 首次按下立即同步画面预览
+    onScrubMove?.(absTime)
+  }, [getTimeFromX, onScrubStart, onScrubMove, snapTime, clampToDvrStart, ws, effectiveDuration, triggerSnapFlash, attachWindowDragListeners])
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     // 非拖拽时只更新 hover；拖拽由 window listener 处理
@@ -635,7 +725,28 @@ export function Timeline({
             ref={trackRef}
           >
             {/* 波形已去除（档 B） */}
-            <div className="lsc-timeline__buffered" style={{ width: `${bufferedPct}%` }} />
+            {dvrStartPct !== null && (
+              <div
+                className="lsc-timeline__dvr-zone"
+                style={{
+                  left: `${dvrStartPct}%`,
+                  width: `${Math.max(0, 100 - dvrStartPct)}%`,
+                }}
+                aria-hidden="true"
+              />
+            )}
+            {visibleBufferedRanges.length > 0
+              ? visibleBufferedRanges.map((range, index) => (
+                <div
+                  key={`buffered-${index}-${range.start.toFixed(3)}`}
+                  className="lsc-timeline__buffered"
+                  style={{
+                    left: `${(range.start / effectiveDuration) * 100}%`,
+                    width: `${((range.end - range.start) / effectiveDuration) * 100}%`,
+                  }}
+                />
+              ))
+              : <div className="lsc-timeline__buffered" style={{ width: `${bufferedPct}%` }} />}
             <div
               ref={progressFillRef}
               className={`lsc-timeline__progress${snapFlash ? ' lsc-timeline__progress--snap' : ''}`}
@@ -670,12 +781,13 @@ export function Timeline({
               const dur = h.end - h.start
               const isAudioPending = h.confirm_status === 'audio_pending'
               const isPending = h.confirm_status === 'pending' || h.confirm_status === 'refining'
-              const statusLabel = h.confirm_status === 'audio_pending' ? t('音频待复核')
-                : h.confirm_status === 'pending' ? t('待确认')
-                : h.confirm_status === 'refining' ? t('调整中')
-                : h.confirm_status === 'user_confirmed' ? t('已确认')
-                : h.confirm_status === 'ocr_confirmed' ? t('AI可导')
-                : h.confirm_status === 'vision_confirmed' ? t('视觉确认')
+              // 标签只描述「现在该做什么」，不抖后端内部子状态名：
+              // 旧版把 ocr_confirmed / vision_confirmed 分别叫「AI可导」「视觉确认」，
+              // 用户面对的是同一件事——可以导了。
+              const statusLabel = isPending ? t('待确认')
+                : isAudioPending ? t('复核中（自动）')
+                : h.confirm_status === 'user_confirmed' ? t('已确认 · 可导出')
+                : h.confirm_status === 'ocr_confirmed' || h.confirm_status === 'vision_confirmed' ? t('可导出')
                 : ''
               const precisionLabel = h.boundary_precision === 'audio_approximate' ? t('音频粗定位') : ''
               const title = [
@@ -748,8 +860,11 @@ export function Timeline({
                   snapFlash?.type === 'record' ? ' lsc-timeline__record-end--snap' : ''
                 }`}
                 style={{ left: `${dvrStartPct}%` }}
-                title={t('DVR 左边界 {time}：约实时−2分钟，左侧回跟播，右侧可回看', { time: formatTime(dvrStart!) })}
-              />
+                aria-label={t('即时回放起点')}
+                title={t('即时回放起点 {time}：右侧可立即回放；更早录制内容需要加载文件回看', { time: formatTime(dvrStart!) })}
+              >
+                <span className="lsc-timeline__record-end-label">{t('即时回放起点')} {formatTime(dvrStart!)}</span>
+              </div>
             )}
 
             {markerInPct !== null && (
@@ -759,6 +874,7 @@ export function Timeline({
                 }`}
                 style={{ left: `${markerInPct}%` }}
                 onMouseDown={(e) => handleMarkerMouseDown(e, 'in')}
+                title={t('入点：左右拖动微调，右键删除')}
                 onContextMenu={(e) => {
                   e.preventDefault()
                   e.stopPropagation()
@@ -776,6 +892,7 @@ export function Timeline({
                 }`}
                 style={{ left: `${markerOutPct}%` }}
                 onMouseDown={(e) => handleMarkerMouseDown(e, 'out')}
+                title={t('出点：左右拖动微调，右键删除')}
                 onContextMenu={(e) => {
                   e.preventDefault()
                   e.stopPropagation()
@@ -795,7 +912,15 @@ export function Timeline({
             />
 
             {hoverPct !== null && (
-              <div className="lsc-timeline__tooltip" style={{ left: `${hoverPct}%` }}>
+              <div
+                className="lsc-timeline__tooltip"
+                style={{ left: `${hoverPct}%` }}
+                title={visibleBufferedRanges.some((range) => (
+                  hoverTime! >= range.start && hoverTime! <= range.end
+                ))
+                  ? t('缓冲内·秒开')
+                  : t('缓冲外·将从录制文件回看，可能需要加载')}
+              >
                 {formatTime(hoverTime! + ws)}
               </div>
             )}

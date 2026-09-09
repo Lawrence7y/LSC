@@ -27,6 +27,7 @@ vi.mock('@/hooks/useRoomActions', () => ({
     handleToggleMute: vi.fn(),
     handleStartRecord: vi.fn(),
     handleStopRecord: vi.fn(),
+    requestStopRecord: vi.fn(),
     handleTogglePreview: vi.fn(),
     handleFullscreen: vi.fn(),
     handleCollapse: vi.fn(),
@@ -36,10 +37,13 @@ vi.mock('@/hooks/useRoomActions', () => ({
   }),
 }))
 
-vi.mock('@/hooks/useKeyboardShortcuts', () => ({
-  useKeyboardShortcuts: vi.fn(),
-  PLAYBACK_RATE_STEPS: [0.5, 1, 1.5, 2],
-}))
+vi.mock('@/hooks/useKeyboardShortcuts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useKeyboardShortcuts')>()
+  return {
+    ...actual,
+    useKeyboardShortcuts: vi.fn(),
+  }
+})
 
 vi.mock('@/hooks/useTimelineViewModel', () => ({
   useTimelineViewModel: () => null,
@@ -89,10 +93,6 @@ vi.mock('./components/RoomCard', () => ({
 
 vi.mock('./components/ControlBar', () => ({
   ControlBar: () => <div data-testid="control-bar" />,
-}))
-
-vi.mock('./components/ExportQueuePanel', () => ({
-  ExportQueuePanel: () => <div data-testid="export-queue-panel" />,
 }))
 
 vi.mock('./components/Onboarding', () => ({
@@ -225,7 +225,7 @@ describe('Workbench 渲染', () => {
 
   it('无房间时显示空态引导', () => {
     render(<Workbench />)
-    expect(screen.getByText('暂无房间，请添加直播间地址')).toBeTruthy()
+    expect(screen.getByText('暂无房间 · 在上方粘贴直播间链接开始')).toBeTruthy()
   })
 
   it('有房间时渲染 RoomCard', () => {

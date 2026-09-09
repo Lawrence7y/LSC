@@ -14,7 +14,7 @@ from pathlib import Path
 from lsc.config import LscConfig
 from lsc.platforms.base import headers_to_ffmpeg_input_args
 from lsc.recorder.manifest import ManifestStore, RecordingManifest
-from lsc.utils.process_launcher import prepare_launch
+from lsc.utils.process_launcher import kill_process_tree, prepare_launch
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +195,7 @@ class SegmentedRecorder:
                 try:
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    kill_process_tree(process)
                     process.wait(timeout=2)
                     unclean = True
         if self._stderr_thread is not None:

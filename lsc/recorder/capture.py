@@ -14,6 +14,7 @@ from threading import Lock, Thread
 from lsc import get_logger
 from lsc.config import LscConfig
 from lsc.platforms.redaction import redact_text
+from lsc.utils.process_launcher import kill_process_tree
 
 _log = get_logger(__name__)
 
@@ -554,7 +555,7 @@ class StreamCapture:
                 # Level 4: force kill
                 _log.warning("FFmpeg didn't terminate in 3s, force killing")
                 try:
-                    proc.kill()
+                    kill_process_tree(proc)
                 except Exception as exc:
                     _log.warning("FFmpeg kill failed: %s", exc)
                 if not _wait_with_deadline(5):
@@ -562,6 +563,7 @@ class StreamCapture:
                     orphaned_pid_final: int | str = "?"
                     try:
                         orphaned_pid = proc.pid
+                        orphaned_pid_final = proc.pid
                     except Exception as exc:
                         _log.debug("操作异常（已忽略）: %s", exc)
                     _log.error(
@@ -681,7 +683,7 @@ class StreamCapture:
                         proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         _log.warning("FFmpeg %d did not terminate, killing", pid)
-                        proc.kill()
+                        kill_process_tree(proc)
                         try:
                             proc.wait(timeout=5)
                         except subprocess.TimeoutExpired:

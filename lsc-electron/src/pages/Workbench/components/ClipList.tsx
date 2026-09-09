@@ -10,11 +10,11 @@ import {
   CheckOutlined,
   ReloadOutlined,
   MoreOutlined,
-  InfoCircleOutlined,
 } from '@ant-design/icons'
 import { ClipSegment } from '@/types'
 import { formatTime } from '@/utils/time'
 import { formatClipHoverTitle } from '@/utils/clipNaming'
+import { canExportOrConfirmExport } from '@/utils/clipExportPolicy'
 import { useI18n } from '@/i18n'
 import './ClipList.css'
 
@@ -24,9 +24,16 @@ const VIRTUALIZE_THRESHOLD = 40
 const ROW_HEIGHT = 80
 const OVERSCAN = 6
 
+import { canExportClip as canExportClipPolicy } from '@/utils/clipExportPolicy'
+
 /** Stable list identity: clip_id preferred, then round_key, then composite fallback. */
 export function getClipStableId(clip: ClipSegment): string {
   return clip.clip_id || clip.round_key || `${clip.room_id}-${clip.start}-${clip.end}`
+}
+
+export function canExportClip(clip: ClipSegment): boolean {
+  // clip.confirm_status === 'vision_confirmed'
+  return canExportClipPolicy(clip)
 }
 
 export interface ExportProgressInfo {
@@ -52,6 +59,8 @@ interface ClipListProps {
   onSelectedClipIdsChange?: (ids: Set<string>) => void
   /** 批量确认全部待调切片（不改边界） */
   onConfirmAll?: (clips: ClipSegment[]) => void
+  onDeleteMany?: (clipIds: string[]) => void
+  onClearExported?: () => void
 }
 
 function formatDuration(seconds: number): string {
@@ -61,18 +70,19 @@ function formatDuration(seconds: number): string {
   return `0:${s.toString().padStart(2, '0')}`
 }
 
-function needsConfirm(clip: ClipSegment): boolean {
-  return clip.confirm_status === 'pending' || clip.confirm_status === 'refining'
-}
 
-/** 音频路径产出的回合，需要 OCR 复核后才能导出 */
-function needsOcrReview(clip: ClipSegment): boolean {
-  return clip.confirm_status === 'audio_pending'
-}
-
-/** 需要用户/后端继续处理：待确认边界 或 待 OCR 复核（用于「待调」tab 与计数） */
-function needsAttention(clip: ClipSegment): boolean {
-  return needsConfirm(clip) || needsOcrReview(clip)
+/**
+ * 判定切片来源：区分持续分析产出还是手动切片
+ * 持续分析：携带 ai_highlight / round_key / boundary_source / 自动分析识别
+ * 手动切片：用户在时间轴打点添加 (source === 'manual')
+ * 切片精度支持 mark_precision (exact / approximate 近似)
+ */
+export function isContinuousAnalysisClip(clip: ClipSegment): boolean {
+  if (clip.source === 'manual') return false
+  if (clip.source === 'ai_highlight' || clip.is_ai_highlight) return true
+  if (Boolean(clip.round_key) || Boolean(clip.boundary_source)) return true
+  if (clip.confirm_status === 'ocr_confirmed' || clip.confirm_status === 'vision_confirmed' || clip.confirm_status === 'audio_pending') return true
+  return false
 }
 
 function getActualRecordingRange(clip: ClipSegment): { start: number; end: number } | null {
@@ -85,44 +95,29 @@ function getActualRecordingRange(clip: ClipSegment): { start: number; end: numbe
   return { start, end }
 }
 
-function canExportClip(clip: ClipSegment): boolean {
-  const confirmed = !clip.confirm_status ||
-    clip.confirm_status === 'user_confirmed' ||
-    clip.confirm_status === 'ocr_confirmed' ||
-    clip.confirm_status === 'vision_confirmed'
-  if (!confirmed) return false
-  // audio_pending 需要 OCR 复核后才能导出
-  if (needsOcrReview(clip)) return false
-  if (clip.export_status === 'queued' || clip.export_status === 'exporting') return false
-  return true
-}
-
-/** 单条「确认并导出」可用；批量 actionableClips 不得使用此函数 */
-function canExportOrConfirmExport(clip: ClipSegment, hasConfirmAndExport: boolean): boolean {
-  if (clip.export_status === 'queued' || clip.export_status === 'exporting') return false
-  if (canExportClip(clip)) return true
-  return hasConfirmAndExport && needsConfirm(clip)
-}
-
-/** 状态 → 色轨修饰类（语义：待调=琥珀 / AI=紫 / 可导=品牌青 / 已导=绿 / 失败=红 / 进行中=青 / 音频待复核=橙） */
-function railClass(clip: ClipSegment, isRefining: boolean, isExporting: boolean): string {
+/**
+ * 状态 → 色轨修饰类：可导出(青) / 导出中(青蓝) / 已导出(绿) / 失败(红)
+ */
+function railClass(clip: ClipSegment, _isRefining: boolean, isExporting: boolean): string {
   if (isExporting || clip.export_status === 'queued') return 'rail-busy'
   if (clip.export_status === 'failed') return 'rail-failed'
-  if (clip.confirm_status === 'audio_pending') return 'rail-audio-pending'
-  if (isRefining || clip.confirm_status === 'pending') return 'rail-pending'
-  if (clip.confirm_status === 'ocr_confirmed' || clip.confirm_status === 'vision_confirmed') return 'rail-ai'
   if (clip.exported) return 'rail-exported'
   return 'rail-ready'
 }
 
-export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange, onConfirmAll }: ClipListProps) {
+/** 色轨含义的唯一说明源 */
+export const RAIL_LEGEND: Record<string, string> = {
+  'rail-ready': '可导出',
+  'rail-busy': '正在导出',
+  'rail-exported': '已导出完成',
+  'rail-failed': '导出失败 · 可重试',
+}
+
+export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport: _onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange, onConfirmAll: _onConfirmAll, onDeleteMany, onClearExported }: ClipListProps) {
   const { t } = useI18n()
   const [internalSelected, setInternalSelected] = useState<Set<string>>(new Set())
   const controlled = externalSelected != null
   const selectedClipIds = controlled ? externalSelected : internalSelected
-
-  /** 列表筛选：全部 / 仅待调 */
-  const [filter, setFilter] = useState<'all' | 'pending'>('all')
 
   const setSelectedClipIds = (updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
     const next = typeof updater === 'function' ? updater(selectedClipIds) : updater
@@ -130,26 +125,20 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
     onSelectedClipIdsChange?.(next)
   }
 
-  const hasConfirmAndExport = !!onConfirmAndExport
   const actionableClips = useMemo(
-    () => clips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
-    [clips, hasConfirmAndExport],
+    () => clips.filter(c => canExportOrConfirmExport(c)),
+    [clips],
   )
   const selectedClips = useMemo(
     () => clips.filter(c => selectedClipIds.has(getClipStableId(c))),
     [clips, selectedClipIds],
   )
   const selectedActionable = useMemo(
-    () => selectedClips.filter(c => canExportOrConfirmExport(c, hasConfirmAndExport)),
-    [selectedClips, hasConfirmAndExport],
+    () => selectedClips.filter(c => canExportOrConfirmExport(c)),
+    [selectedClips],
   )
-  const pendingCount = useMemo(() => clips.filter(needsAttention).length, [clips])
-  const confirmAllClips = useMemo(() => clips.filter(needsConfirm), [clips])
   const multiRoom = useMemo(() => new Set(clips.map(c => c.room_id)).size > 1, [clips])
-  const filteredClips = useMemo(
-    () => (filter === 'all' ? clips : clips.filter(needsAttention)),
-    [clips, filter],
-  )
+  const filteredClips = clips
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const useVirtual = filteredClips.length >= VIRTUALIZE_THRESHOLD
@@ -178,35 +167,32 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
     const isExporting = !!prog || clip.export_status === 'exporting'
     const isRefining = clip.confirm_status === 'refining' ||
       (refiningClipId != null && (clip.clip_id === refiningClipId || clip.round_key === refiningClipId))
-    const awaitingConfirm = needsConfirm(clip)
-    const exportAllowed = canExportClip(clip)
-    const confirmAndExportAllowed = canExportOrConfirmExport(clip, !!onConfirmAndExport)
-    const isApprox = clip.mark_precision === 'approximate' ||
-      (clip.mark_precision !== 'exact' &&
-        !clip.clip_snapshot_id &&
-        (clip.mark_in_wallclock == null || clip.mark_out_wallclock == null))
-    const isAI = clip.confirm_status === 'ocr_confirmed' || clip.confirm_status === 'vision_confirmed'
+    const isContinuous = isContinuousAnalysisClip(clip)
+    // 切片状态已全部取消（包括 isApprox / clip-row-v2__tag--approx 近似），仅保留持续分析与手动切片
     const actualRange = getActualRecordingRange(clip)
     const shownStart = actualRange?.start ?? clip.start
     const shownEnd = actualRange?.end ?? clip.end
     const shownDuration = Math.max(0, shownEnd - shownStart)
-    const timeAxisLabel = actualRange ? '录制轴（实际导出）' : '预览轴（导出范围待确认）'
     const hoverTitle = formatClipHoverTitle(clip.label || t('切片'), {
       roomName: clip.room_name,
       start: clip.start,
       end: clip.end,
       formatTime,
     })
-      + (isApprox ? ` · ${t('近似定位')}` : '')
-      + (clip.boundary_evidence?.length ? `\n${clip.boundary_evidence.join(' · ')}` : '')
-      + `\n${timeAxisLabel}：${formatTime(shownStart)}→${formatTime(shownEnd)}`
+      + ` · ${isContinuous ? t('持续分析') : t('手动切片')}`
+      + `\n${formatTime(shownStart)}→${formatTime(shownEnd)}`
+      + (clip.boundary_quality_reason_code
+        ? `\n${t('边界质量')}: ${clip.boundary_quality ?? 'review'} (${clip.boundary_quality_reason_code})`
+        : '')
       + (clip.export_status === 'failed' && clip.export_error ? `\n${clip.export_error}` : '')
+
+    const rail = railClass(clip, isRefining, isExporting)
 
     return (
       <div
         key={clipId}
         onClick={() => !isRefining && onSelectClip?.(clip)}
-        className={`clip-row-v2 ${railClass(clip, isRefining, isExporting)}${selectedClipIds.has(clipId) ? ' is-sel' : ''}${isRefining ? ' is-refining' : ''}`}
+        className={`clip-row-v2 ${rail}${selectedClipIds.has(clipId) ? ' is-sel' : ''}${isRefining ? ' is-refining' : ''}`}
         style={useVirtual ? {
           position: 'absolute' as const,
           top: 0,
@@ -218,7 +204,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
           containIntrinsicSize: `0 ${ROW_HEIGHT}px`,
         }}
       >
-        <span className="clip-row-v2__rail" />
+        <span className="clip-row-v2__rail" title={t(RAIL_LEGEND[rail] ?? '')} />
         <Checkbox
           checked={selectedClipIds.has(clipId)}
           onClick={e => e.stopPropagation()}
@@ -235,19 +221,10 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
             <Tooltip title={hoverTitle} placement="top" mouseEnterDelay={0.25}>
               <span className="clip-row-v2__label">{clip.label}</span>
             </Tooltip>
-            {isAI && <span className="clip-row-v2__tag clip-row-v2__tag--ai">AI</span>}
-            {needsOcrReview(clip) && (
-              <Tooltip title={t('音频路径检测到，等待 OCR 复核边界；复核完成后会自动升格，无需手动确认')}>
-                <span className="clip-row-v2__tag clip-row-v2__tag--audio-pending">{t('OCR 复核中')}</span>
-              </Tooltip>
-            )}
-            {clip.confirm_status === 'user_confirmed' && (
-              <span className="clip-row-v2__tag clip-row-v2__tag--confirmed">{t('已确认')}</span>
-            )}
-            {isApprox && (
-              <Tooltip title={t('近似定位：边界为音频推断，建议精修后导出')}>
-                <span className="clip-row-v2__tag clip-row-v2__tag--approx">{t('近似')}</span>
-              </Tooltip>
+            {isContinuous ? (
+              <span className="clip-row-v2__tag clip-row-v2__tag--ai">{t('持续分析')}</span>
+            ) : (
+              <span className="clip-row-v2__tag clip-row-v2__tag--manual">{t('手动切片')}</span>
             )}
           </div>
           <div className="clip-row-v2__bottom" onClick={e => e.stopPropagation()}>
@@ -264,47 +241,34 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                 </span>
             ) : (
               <span className="clip-row-v2__time">
-                <span className="clip-row-v2__axis">{actualRange ? '录制' : '预览'}</span>{formatTime(shownStart)}<i className="sep-dot">→</i>{formatTime(shownEnd)}<i className="sep-dot">·</i><span className="dur">{formatDuration(shownDuration)}</span>
+                {formatTime(shownStart)}<i className="sep-dot">→</i>{formatTime(shownEnd)}<i className="sep-dot">·</i><span className="dur">{formatDuration(shownDuration)}</span>
               </span>
             )}
-            {clip.boundary_evidence?.length ? (
-              <Tooltip title={clip.boundary_evidence.join('\n')} placement="top">
-                <InfoCircleOutlined style={{ fontSize: 12, color: 'var(--text-tertiary)', flexShrink: 0, cursor: 'help' }} />
-              </Tooltip>
-            ) : null}
             <span className="clip-row-v2__acts">
-              {(isRefining || clip.confirm_status === 'pending') && onConfirmClip && (
-                <Tooltip title={t('确认边界后即可导出')} placement="top">
-                  <Button
-                    type="text"
-                    size="small"
-                    className="act-warn"
-                    icon={<CheckOutlined />}
-                    onClick={() => onConfirmClip(clip)}
-                  />
+              {isRefining && onConfirmClip && (
+                <Tooltip title={t('确认当前边界')} placement="top">
+                  <span style={{ display: 'inline-flex' }}>
+                    <Button
+                      type="text"
+                      size="small"
+                      className="act-warn"
+                      icon={<CheckOutlined />}
+                      onClick={() => onConfirmClip(clip)}
+                    />
+                  </span>
                 </Tooltip>
               )}
               {!isExporting && clip.export_status !== 'queued' && (
                 <Tooltip
                   placement="top"
-                  title={
-                    !confirmAndExportAllowed
-                      ? t('请先确认后再导出')
-                      : awaitingConfirm && onConfirmAndExport
-                        ? t('确认并导出')
-                        : clip.export_status === 'failed' ? t('重新导出') : t('导出')
-                  }
+                  title={clip.export_status === 'failed' ? t('重新导出') : t('导出')}
                 >
                   <Button
                     size="small"
                     className={clip.export_status === 'failed' ? '' : 'act-primary'}
                     type={clip.export_status === 'failed' ? 'text' : 'primary'}
                     icon={clip.export_status === 'failed' ? <ReloadOutlined /> : <ExportOutlined />}
-                    disabled={!confirmAndExportAllowed}
-                    onClick={() => {
-                      if (awaitingConfirm && onConfirmAndExport) onConfirmAndExport(clip)
-                      else if (exportAllowed) onExport(clip)
-                    }}
+                    onClick={() => onExport(clip)}
                   />
                 </Tooltip>
               )}
@@ -339,12 +303,13 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                   </Tooltip>
                 </>
               )}
-              <Tooltip title={t('删除')} placement="top">
+              <Tooltip title={isExporting ? t('正在导出，请先取消再删除') : t('删除')} placement="top">
                 <Button
                   type="text"
                   size="small"
                   icon={<DeleteOutlined />}
-                  danger
+                  danger={!isExporting}
+                  disabled={isExporting}
                   onClick={() => onDelete(clipId)}
                 />
               </Tooltip>
@@ -353,7 +318,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         </div>
       </div>
     )
-  }, [exportProgress, refiningClipId, selectedClipIds, onConfirmAndExport, onConfirmClip, onSelectClip, onDelete, onExport, onCancelExport, onOpenFile, toggleSelected, useVirtual, multiRoom])
+  }, [exportProgress, refiningClipId, selectedClipIds, onConfirmClip, onSelectClip, onDelete, onExport, onCancelExport, onOpenFile, toggleSelected, useVirtual, multiRoom])
 
   return (
     <Card
@@ -363,17 +328,12 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         <span className="clip-card-head">
           <span>{t('切片列表')}<span className="clip-title-num">· {clips.length}</span></span>
           <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
-            <span className="seg-mini">
-              <button className={filter === 'all' ? 'on' : ''} onClick={() => setFilter('all')}>{t('全部')}</button>
-              <button className={filter === 'pending' ? 'on' : ''} onClick={() => setFilter('pending')}>
-                {t('待调')}{pendingCount > 0 ? ` ${pendingCount}` : ''}
-              </button>
-            </span>
             <Dropdown
               trigger={['click']}
               placement="bottomRight"
               menu={{
                 items: [
+                  // 切片页取消待确认状态：无需单独“确认全部”，所有有效切片均直接支持导出全部
                   {
                     key: 'export-all',
                     icon: <ExportOutlined />,
@@ -388,14 +348,29 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
                     disabled: selectedActionable.length === 0,
                     onClick: () => onExportMany?.(selectedActionable),
                   },
-                  { type: 'divider' },
                   {
-                    key: 'confirm-all',
-                    icon: <CheckOutlined />,
-                    // 仅确认待确认边界的回合；audio_pending 等 OCR 复核自动升格，批量确认会跳过复核
-                    label: t('确认全部（{count}）', { count: confirmAllClips.length }),
-                    disabled: confirmAllClips.length === 0,
-                    onClick: () => onConfirmAll?.(confirmAllClips),
+                    type: 'divider',
+                  },
+                  {
+                    key: 'delete-sel',
+                    icon: <DeleteOutlined />,
+                    danger: true,
+                    label: t('删除所选（{count}）', { count: selectedClipIds.size }),
+                    disabled: selectedClipIds.size === 0,
+                    onClick: () => {
+                      const ids = Array.from(selectedClipIds)
+                      onDeleteMany?.(ids)
+                      setSelectedClipIds(new Set())
+                    },
+                  },
+                  {
+                    key: 'clear-exported',
+                    icon: <DeleteOutlined />,
+                    label: t('清除已导出切片（{count}）', {
+                      count: clips.filter(c => c.exported).length,
+                    }),
+                    disabled: clips.filter(c => c.exported).length === 0,
+                    onClick: () => onClearExported?.(),
                   },
                 ],
               }}
@@ -405,21 +380,27 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
           </span>
         </span>
       }
+      variant="borderless"
       style={{
-        margin: '8px 16px 16px',
+        margin: 0,
         flex: 1,
         minHeight: 0,
         overflow: 'hidden',
         display: 'flex',
         flexDirection: 'column',
-        background: 'var(--bg-secondary)',
+        background: 'transparent',
+        borderRadius: 0,
       }}
       styles={{
+        header: {
+          padding: '8px 12px',
+          borderBottom: '1px solid var(--border-hairline)',
+        },
         body: {
           flex: 1,
           minHeight: 0,
           overflow: 'hidden',
-          padding: '0 6px 0',
+          padding: '4px 6px',
           display: 'flex',
           flexDirection: 'column',
         }
@@ -429,12 +410,6 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
           description={<span style={{ color: 'var(--text-tertiary)' }}>{t('暂无切片')}</span>}
-          style={{ margin: '16px 0' }}
-        />
-      ) : filteredClips.length === 0 ? (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description={<span style={{ color: 'var(--text-tertiary)' }}>{t('没有待调切片')}</span>}
           style={{ margin: '16px 0' }}
         />
       ) : (
@@ -478,7 +453,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
           )}
         </div>
       )}
-      <div className="clip-list-hint">{t('单击定位与回看 · I/O 精调入出点')}</div>
+      <div className="clip-list-hint">{t('单击定位与回看 · I/O 打标 · ,/. 微调 0.2s · [ ] 移出点 / Shift+[ ] 移入点 · Esc 退出精修')}</div>
     </Card>
   )
 }

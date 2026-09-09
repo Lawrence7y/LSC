@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { Button, message } from 'antd'
+import { Button, App } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { useI18n } from '@/i18n'
 
@@ -9,6 +9,7 @@ type LogFile = 'debug.log' | 'backend.log' | 'backend-stdout.log'
 
 export default function LogViewer() {
   const { t } = useI18n()
+  const { message } = App.useApp()
   const [content, setContent] = useState('')
   const [logFile, setLogFile] = useState<LogFile>('debug.log')
   const [loading, setLoading] = useState(false)
@@ -31,7 +32,7 @@ export default function LogViewer() {
     } finally {
       setLoading(false)
     }
-  }, [t])
+  }, [t, message])
 
   return (
     <div>

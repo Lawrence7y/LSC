@@ -5,6 +5,7 @@ import {
   VideoCameraOutlined,
   ScissorOutlined,
   ExportOutlined,
+  SyncOutlined,
 } from '@ant-design/icons'
 import { useI18n } from '@/i18n'
 
@@ -33,8 +34,8 @@ export function Onboarding() {
     {
       icon: <LinkOutlined />,
       title: t('添加直播间'),
-      desc: t('把直播间链接粘贴到顶部输入框，支持抖音、B站、虎牙等多平台，一次最多添加 12 路。'),
-      hint: t('多路同步监播，是直播切片的第一步。'),
+      desc: t('把直播间链接粘贴到房间区上方的输入框，支持抖音、B站、虎牙等多平台；一行一个，最多一次添加 12 路。'),
+      hint: t('回车直接添加，Shift + 回车换行输入下一条。'),
     },
     {
       icon: <VideoCameraOutlined />,
@@ -43,10 +44,16 @@ export function Onboarding() {
       hint: t('快捷键 R 可一键开始/停止录制。'),
     },
     {
+      icon: <SyncOutlined />,
+      title: t('多房间先对齐'),
+      desc: t('监看多路同一场比赛时，选中房间后点「一键对齐」：并行比对各路声音建立公共时间轴，各路切片才能同步对齐。未对齐时只能单路切片。'),
+      hint: t('刷新预览、重连后对齐会失效，按提示重新对齐即可。'),
+    },
+    {
       icon: <ScissorOutlined />,
       title: t('标记切片'),
-      desc: t('在时间线上用 I / O 设置入点与出点，点击「添加切片」加入列表。也可开启 AI 持续分析自动检出高光回合。'),
-      hint: t('空格键播放/暂停，方向键微调播放头。'),
+      desc: t('在时间线上用 I / O 设置入点与出点，点击「添加到切片」加入列表。也可开启 AI 持续分析自动检出高光回合。'),
+      hint: t('空格键播放/暂停，方向键微调播放头，所有键位在「设置 › 快捷键与鼠标操作」可查。'),
     },
     {
       icon: <ExportOutlined />,
@@ -99,7 +106,7 @@ export function Onboarding() {
           justifyContent: 'center',
           fontSize: 30,
           color: '#fff',
-          background: 'var(--brand-500, #31B3AE)',
+          background: 'var(--brand-500)',
           marginBottom: 18,
         }}>
           {current.icon}
@@ -110,7 +117,7 @@ export function Onboarding() {
         <div style={{ fontSize: 13, lineHeight: 1.7, color: 'var(--text-secondary)', marginBottom: 8, minHeight: 66 }}>
           {current.desc}
         </div>
-        <div style={{ fontSize: 12, color: 'var(--brand-400, #4DC4BF)', marginBottom: 20 }}>
+        <div style={{ fontSize: 12, color: 'var(--brand-400)', marginBottom: 20 }}>
           {current.hint}
         </div>
 
@@ -124,7 +131,7 @@ export function Onboarding() {
                 width: i === step ? 20 : 7,
                 height: 7,
                 borderRadius: 4,
-                background: i === step ? 'var(--brand-500, #31B3AE)' : 'var(--bg-tertiary, #3a3a3c)',
+                background: i === step ? 'var(--brand-500)' : 'var(--bg-tertiary, #3a3a3c)',
                 cursor: 'pointer',
                 transition: 'all 0.2s ease',
               }}

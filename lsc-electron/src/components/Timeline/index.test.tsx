@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render } from '@testing-library/react'
+import { render, fireEvent } from '@testing-library/react'
 import {
   Timeline,
   formatTickTime,
@@ -154,6 +154,17 @@ describe('findSnapTarget（磁吸坐标计算）', () => {
     const result = findSnapTarget(40.3, 120, null, null, 90, 10, [], { clips })
     expect(result).toBe(40)
   })
+
+  it('支持自定义 snapThreshold（精细吸附与禁用）', () => {
+    const resultFine = findSnapTarget(30.2, 120, null, null, 90, 10, [], { snapThreshold: 0.05 })
+    expect(resultFine).toBe(30.2)
+
+    const resultFineHit = findSnapTarget(30.03, 120, null, null, 90, 10, [], { snapThreshold: 0.05 })
+    expect(resultFineHit).toBe(30)
+
+    const resultDisabled = findSnapTarget(30.03, 120, null, null, 90, 10, [], { snapThreshold: 0 })
+    expect(resultDisabled).toBe(30.03)
+  })
 })
 
 // ─── 组件渲染：播放头 / 选区 / 标记坐标 ─────────────────────────────
@@ -234,5 +245,82 @@ describe('Timeline 组件渲染', () => {
       <Timeline {...baseProps} duration={0} currentTime={0} />,
     )
     expect(container.querySelector('.lsc-timeline')).toBeTruthy()
+  })
+})
+
+// ─── 时间线点击语义 ────────────────────────────────────────────
+
+describe('Timeline 点击语义：只有 scrub，没有隐藏修饰键', () => {
+  /**
+   * 回归目标：旧实现把 Shift+点击 / Ctrl+点击当作「标入点 / 标出点」，
+   * 但 onMarkIn/onMarkOut 读的是播放头时间而非点击位置——在 100s 处点下去
+   * 实际标在播放头（例如 500s），而且该修饰键在任何提示/文档里都不存在。
+   */
+  const makeProps = () => ({
+    ...baseProps,
+    onMarkIn: vi.fn(),
+    onMarkOut: vi.fn(),
+    onScrubStart: vi.fn(),
+  })
+
+  const scrollOf = (container: HTMLElement) =>
+    container.querySelector('.lsc-timeline__scroll') as Element
+
+  it.each([
+    ['普通点击', {}],
+    ['Shift+点击', { shiftKey: true }],
+    ['Ctrl+点击', { ctrlKey: true }],
+  ])('%s 不会打标，而是开始 scrub', (_label, init) => {
+    const props = makeProps()
+    const { container, unmount } = render(<Timeline {...props} />)
+    fireEvent.mouseDown(scrollOf(container), { clientX: 100, ...init })
+
+    expect(props.onMarkIn).not.toHaveBeenCalled()
+    expect(props.onMarkOut).not.toHaveBeenCalled()
+    expect(props.onScrubStart).toHaveBeenCalledTimes(1)
+
+    // 结束拖拽，避免 window 监听泄到下一个用例
+    fireEvent.mouseUp(window)
+    unmount()
+  })
+
+  it('入出点标记提示了右键删除（原本只能靠口头传播）', () => {
+    const { container } = render(<Timeline {...makeProps()} markIn={30} markOut={90} />)
+    const markerIn = container.querySelector('.lsc-timeline__marker--in') as HTMLElement
+    const markerOut = container.querySelector('.lsc-timeline__marker--out') as HTMLElement
+    expect(markerIn.getAttribute('title')).toContain('右键删除')
+    expect(markerOut.getAttribute('title')).toContain('右键删除')
+  })
+
+  it('时间线按下与拖动时触发 onScrubMove 供画面丝滑预览', () => {
+    const onScrubMove = vi.fn()
+    const props = {
+      ...baseProps,
+      windowStart: 100,
+      duration: 120,
+      onScrubMove,
+    }
+    const { container, unmount } = render(<Timeline {...props} />)
+    const scroll = scrollOf(container)
+    // 模拟 getBoundingClientRect
+    vi.spyOn(container.querySelector('.lsc-timeline__track') as HTMLElement, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 1000,
+      height: 60,
+      right: 1000,
+      bottom: 60,
+      x: 0,
+      y: 0,
+      toJSON: () => {},
+    })
+
+    fireEvent.mouseDown(scroll, { clientX: 500 })
+    expect(onScrubMove).toHaveBeenCalledTimes(1)
+    // 500px / 1000px = 50% * 120s = 60s + ws(100s) = 160s
+    expect(onScrubMove).toHaveBeenCalledWith(160)
+
+    fireEvent.mouseUp(window)
+    unmount()
   })
 })

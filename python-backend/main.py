@@ -262,8 +262,10 @@ class LSCWebSocketBackend:
             _log.info("WebSocket server thread exited")
 
     async def _broadcast_coroutine(self):
-        """协程版广播循环：从 bridge 队列取消息并发送（事件驱动唤醒）。"""
-        from server import _json_dumps, drain_merge_broadcasts
+        """协程版广播循环：从 bridge 队列取消息并发送（事件驱动唤醒）。
+        Note: server.broadcast uses _json_dumps internally.
+        """
+        from server import drain_merge_broadcasts
         wake = asyncio.Event()
         self.bridge.bind_async_wake(asyncio.get_running_loop(), wake)
         while not self._shutdown:
@@ -277,35 +279,13 @@ class LSCWebSocketBackend:
                         pass
                     continue
                 for msg in merged:
-                    # Use the numpy-aware serializer (consistent with
-                    # server.py dispatch/broadcast). Plain json.dumps
-                    # raises TypeError on numpy int64/float64 values
-                    # produced by the audio-analysis code; the broad
-                    # except below silently dropped those broadcasts.
-                    data = _json_dumps(msg)
-                    clients = list(self.server.clients)
-                    if not clients:
-                        continue
-
-                    async def _send_with_timeout(client, payload: str) -> bool:
-                        """带超时发送：慢客户端/半开连接不得阻塞整个广播队列。
-
-                        与 server.py broadcast 的 1s 超时 + 剔除策略保持一致。
-                        """
-                        try:
-                            await asyncio.wait_for(client.send(payload), timeout=1.0)
-                            return True
-                        except Exception as exc:
-                            self.server.clients.discard(client)
-                            _log.warning(
-                                "Removed slow WebSocket client (broadcast coroutine): %s",
-                                type(exc).__name__,
-                            )
-                            return False
-
-                    await asyncio.gather(
-                        *[_send_with_timeout(c, data) for c in clients],
-                        return_exceptions=True,
+                    # 统一委托 server.broadcast：复用其 _redact_public_payload
+                    # 脱敏边界与 2s/15s 慢客户端契约（单次超时只标记、持续慢才剔除、
+                    # 硬异常立即剔除）。旧本地实现是 1s 超时 + 单次异常立即踢人，
+                    # 违反 2026-09 收紧契约（渲染进程单次卡顿被踢 → 全房预览停摆）。
+                    await self.server.broadcast(
+                        str(msg.get('type', '')),
+                        msg.get('data'),
                     )
             except Exception:
                 _log.exception("broadcast error, retrying in 1s")

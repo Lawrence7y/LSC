@@ -51,4 +51,59 @@ def probe_duration(video_path: str, ffprobe: str = "ffprobe") -> float:
         return 0.0
 
 
-__all__ = ["fmt_time", "open_in_explorer", "probe_duration"]
+VALID_VIDEO_EXTENSIONS = {
+    ".mp4", ".mkv", ".flv", ".ts", ".mov", ".avi", ".webm", ".m4v"
+}
+
+
+def resolve_real_video_path(video_path: str) -> str:
+    """当录制文件在停止录制时被重命名（如 _录制中.mp4 -> _至_*.mp4）时，
+    自动解析并重定向到最新存在的实际文件路径。"""
+    if not video_path:
+        return ""
+    if os.path.isfile(video_path):
+        return video_path
+
+    parent = os.path.dirname(video_path)
+    base = os.path.basename(video_path)
+    if not parent or not os.path.isdir(parent):
+        return video_path
+
+    orig_ext = os.path.splitext(base)[1].lower()
+
+    prefix = ""
+    for marker in ("_录制中", "_in_progress"):
+        if marker in base:
+            prefix = base.split(marker, 1)[0]
+            break
+
+    if prefix:
+        try:
+            candidates: list[tuple[int, float, str]] = []
+            for fname in os.listdir(parent):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in VALID_VIDEO_EXTENSIONS:
+                    continue
+                if fname.startswith(prefix) and (
+                    "_至_" in fname or "_to_" in fname or not any(m in fname for m in ("_录制中", "_in_progress"))
+                ):
+                    candidate = os.path.join(parent, fname)
+                    if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                        has_range = ("_至_" in fname or "_to_" in fname)
+                        matches_ext = (ext == orig_ext) if orig_ext in VALID_VIDEO_EXTENSIONS else True
+                        score = (2 if has_range else 0) + (1 if matches_ext else 0)
+                        try:
+                            mtime = os.path.getmtime(candidate)
+                        except OSError:
+                            mtime = 0.0
+                        candidates.append((score, mtime, candidate))
+            if candidates:
+                candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                return candidates[0][2]
+        except OSError:
+            pass
+
+    return video_path
+
+
+__all__ = ["fmt_time", "open_in_explorer", "probe_duration", "resolve_real_video_path", "VALID_VIDEO_EXTENSIONS"]

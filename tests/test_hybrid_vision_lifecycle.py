@@ -125,8 +125,11 @@ def test_stop_sets_stopping_until_resources_exit(tmp_path, monkeypatch) -> None:
         assert stop_result["success"] is True
         assert stop_result.get("status") == "stopping"
         assert stop_result.get("status") != "stopped"
-        assert state.get("cancelled") is True
-        assert state.get("scan_abort") is True
+        # 录制中停止：先补扫尾部再退出（stop_tail_scan），不立即掐断在途扫描；
+        # 后台审计先行中止（refine_abort）以缩短停止等待。
+        assert state.get("stop_tail_scan") is True
+        assert state.get("cancelled") is not True
+        assert state.get("refine_abort") is True
         assert state.get("status") == "stopping"
         assert created_tasks[0].cancelled_called is False
         assert state.get("session_id")

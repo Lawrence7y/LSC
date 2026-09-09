@@ -64,6 +64,7 @@ def _rows_for_split(manifest_path: Path, split: str) -> list[dict]:
         {
             "video_id": row.video_id,
             "video_path": row.video_path,
+            "frame_path": row.frame_path,
             "timestamp_sec": row.timestamp_sec,
             "label": row.label,
             "split": row.split,
@@ -127,7 +128,13 @@ def main(argv: list[str] | None = None) -> int:
     classifier = ValorantFrameClassifier(model_dir=args.model_dir)
 
     def load_frame(row: dict) -> np.ndarray:
-        image_path = output_path_for(ManifestRow.from_dict(row), args.data_dir)
+        frame_ref = row.get("frame_path")
+        if frame_ref:
+            image_path = Path(str(frame_ref))
+            if not image_path.is_absolute():
+                image_path = (_ROOT / image_path).resolve()
+        else:
+            image_path = output_path_for(ManifestRow.from_dict(row), args.data_dir)
         frame = cv2.imread(str(image_path))
         if frame is None:
             raise ValueError(f"无法解码 JPEG: {image_path}")

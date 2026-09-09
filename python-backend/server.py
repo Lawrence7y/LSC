@@ -99,6 +99,13 @@ class LSCWebSocketServer:
     def on(self, message_type: str, handler: Callable | None = None):
         """注册消息处理器，支持装饰器用法：@server.on('type')"""
         def decorator(fn: Callable) -> Callable:
+            if message_type in self.handlers:
+                prev = self.handlers[message_type]
+                raise ValueError(
+                    f"Duplicate handler registration for '{message_type}': "
+                    f"already registered to {getattr(prev, '__name__', '?')} in {getattr(prev, '__module__', '?')}, "
+                    f"attempted override by {getattr(fn, '__name__', '?')} in {getattr(fn, '__module__', '?')}"
+                )
             self.handlers[message_type] = fn
             _log.debug("registered handler: %s -> %s", message_type, getattr(fn, '__name__', '?'))
             return fn
@@ -359,10 +366,20 @@ class LSCWebSocketServer:
         """广播原始二进制帧（用于 MSE fMP4，避免 base64）。"""
         await self._send_all(payload, 'bytes')
 
-    async def broadcast_mse(self, kind: str, room_id: str, payload: bytes) -> None:
-        """广播 MSE init/segment 为二进制帧。"""
+    async def broadcast_mse(
+        self,
+        kind: str,
+        room_id: str,
+        payload: bytes,
+        *,
+        channel: str = "live",
+        stream_id: str = "",
+    ) -> None:
+        """广播 MSE init/segment 为二进制帧（支持 channel 与 stream_id 路由）。"""
         from mse_ws_frames import pack_mse_frame
-        await self.broadcast_bytes(pack_mse_frame(kind, room_id, payload))
+        await self.broadcast_bytes(
+            pack_mse_frame(kind, room_id, payload, channel=channel, stream_id=stream_id)
+        )
 
     async def _heartbeat_loop(self):
         """定期广播心跳（P3-2: 后端心跳检测）。"""

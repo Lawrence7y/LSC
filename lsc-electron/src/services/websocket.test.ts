@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { shouldQueueWhenDisconnected, WebSocketClient, isHighFrequencyWsType } from './websocket'
+import { describeWebSocketError, shouldQueueWhenDisconnected, WebSocketClient, isHighFrequencyWsType } from './websocket'
 
 class MockWebSocket {
   static readonly CONNECTING = 0
@@ -68,6 +68,15 @@ describe('websocket service', () => {
       // Verify the module exports the expected functions
       expect(typeof shouldQueueWhenDisconnected).toBe('function')
     })
+
+    it('formats structured error details without serializing a URL', () => {
+      expect(describeWebSocketError(
+        { type: 'error', message: '', code: 1006, reason: '', wasClean: false },
+        { readyState: 3 },
+      )).toContain('event_code=1006')
+      expect(describeWebSocketError(new Event('error'), { readyState: 0 }))
+        .toContain('ready_state=0')
+    })
   })
 
   it('认证完成前排队业务消息，并保证 auth 是第一帧', async () => {
@@ -100,5 +109,39 @@ describe('websocket service', () => {
       { type: 'get_rooms', data: {} },
     ])
     expect(client.connected).toBe(true)
+  })
+
+  describe('backend heartbeat watchdog', () => {
+    it('僵死 episode 只广播一次 backend_crashed，恢复消息由 backend_revived 复位', () => {
+      vi.useFakeTimers()
+      try {
+        const client = new WebSocketClient(null)
+        const crashed = vi.fn()
+        const revived = vi.fn()
+        client.on('backend_crashed' as never, crashed)
+        client.on('backend_revived' as never, revived)
+
+        const anyClient = client as unknown as {
+          _startHeartbeatCheck(): void
+          _noteBackendAlive(): void
+        }
+        anyClient._startHeartbeatCheck()
+
+        // 15s 阈值 + 5s 轮询相位：首个触发的 tick 在 20s（15s 整不满足 >）
+        vi.advanceTimersByTime(21_000)
+        expect(crashed).toHaveBeenCalledTimes(1)
+        // 持续僵死：5s 轮询不得重复广播
+        vi.advanceTimersByTime(10_000)
+        expect(crashed).toHaveBeenCalledTimes(1)
+
+        // 收到任意消息（后端恢复）→ backend_revived 恰好一次，之后不再重复
+        anyClient._noteBackendAlive()
+        expect(revived).toHaveBeenCalledTimes(1)
+        anyClient._noteBackendAlive()
+        expect(revived).toHaveBeenCalledTimes(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
   })
 })

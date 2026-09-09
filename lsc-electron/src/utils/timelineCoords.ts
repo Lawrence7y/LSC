@@ -2,6 +2,46 @@ import type { TimelineContext, TimelineProgressSummary, ContinuousAnalysisStatus
 
 export type TimelineAlignStatus = 'ready' | 'local' | 'invalidated'
 
+export type RecordingPreviewClock = {
+  recording_to_preview_delta?: number | null
+  preview_clock_epoch_id?: string | null
+  preview_epoch_id?: string | null
+}
+
+/** 将录制文件本地秒数转换为当前直播 MSE 预览轴秒数。 */
+export function recordingToPreviewLocal(
+  room: RecordingPreviewClock | null | undefined,
+  recordingTime: number,
+): number | null {
+  const rawDelta = room?.recording_to_preview_delta
+  if (rawDelta == null) return null
+  const delta = Number(rawDelta)
+  if (
+    room?.preview_clock_epoch_id
+    && room?.preview_epoch_id
+    && room.preview_clock_epoch_id !== room.preview_epoch_id
+  ) return null
+  if (!Number.isFinite(delta) || !Number.isFinite(recordingTime)) return null
+  return recordingTime + delta
+}
+
+/** 将当前直播 MSE 预览轴秒数转换为录制文件本地秒数。 */
+export function previewToRecordingLocal(
+  room: RecordingPreviewClock | null | undefined,
+  previewTime: number,
+): number | null {
+  const rawDelta = room?.recording_to_preview_delta
+  if (rawDelta == null) return null
+  const delta = Number(rawDelta)
+  if (
+    room?.preview_clock_epoch_id
+    && room?.preview_epoch_id
+    && room.preview_clock_epoch_id !== room.preview_epoch_id
+  ) return null
+  if (!Number.isFinite(delta) || !Number.isFinite(previewTime)) return null
+  return previewTime - delta
+}
+
 export function previewToCommon(ctx: TimelineContext, roomId: string, previewTime: number): number {
   const snap = ctx.room_snapshots[roomId]
   if (!snap) throw new Error(`room ${roomId} not in timeline`)
@@ -142,6 +182,7 @@ export function resolveLiveContentSpan(opts: {
   previewEnabled?: boolean
   recordingReview?: boolean
   followLive?: boolean
+  isRecording?: boolean
 }): number {
   let span = Math.max(0, Number(opts.axisProgress) || 0)
   if (opts.clipEnds) {
@@ -151,6 +192,7 @@ export function resolveLiveContentSpan(opts: {
     }
   }
   const allowRecorded =
+    Boolean(opts.isRecording) ||
     Boolean(opts.recordingReview) ||
     !opts.previewEnabled ||
     opts.followLive === false

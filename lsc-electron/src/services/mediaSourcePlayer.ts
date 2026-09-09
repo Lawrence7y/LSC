@@ -1,7 +1,19 @@
+import {
+  DEFAULT_TIMELINE_REPLAY_SECONDS,
+  effectivePlaybackBufferSeconds,
+  REPLAY_TRIM_HEADROOM_SECONDS,
+} from '@/utils/replaySettings'
+
 export type MsePlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'error'
 
 export interface MsePlayerOptions {
   videoElement: HTMLVideoElement
+  /** 用户可见 DVR 回放时长；0 表示关闭历史回放但保留播放安全缓存。 */
+  replayBufferSeconds?: number
+  /** 文件回看使用文件起点对齐，不应套用直播 live-edge 对齐。 */
+  isFile?: boolean
+  channel?: 'live' | 'review'
+  sessionId?: string
   onStateChange?: (state: MsePlayerState) => void
   onError?: (error: string) => void
   onSourceOpen?: () => void
@@ -61,7 +73,7 @@ function toHex(value: number): string {
  *    段（ftyp + moov）和 media 段（moof + mdat）。
  * 2. 前端创建 MediaSource，绑定到 video.src，监听 sourceopen 后创建 SourceBuffer。
  * 3. init 段首先 append，建立解码上下文；media 段持续 append，video 自动播放。
- * 4. 缓冲区超过 130s 时自动 trim 至保留最近 120s，既保留回看能力，又防止内存泄漏。
+ * 4. 缓冲区按用户设置自动 trim，保留有限的最近媒体，既保留回看能力，又防止内存泄漏。
  * 5. live-edge 对齐：MSE 直播流 duration=Infinity，currentTime 默认 0，
  *    可能落在 buffered 范围外导致 play() pending；首次 updateend 检测到该情况时
  *    自动 seek 至 live edge（buffered.end - 0.2s），确保 readyState 升到 2+。
@@ -104,6 +116,8 @@ export class MsePlayer {
   private _backpressurePaused = false
   private _lastBackpressureSentAt = 0
   private readonly _backpressureMinIntervalMs = 500
+  // 用户主动暂停时停止向该播放器继续堆积直播分片，避免停在缓冲左缘时无限增长。
+  private _userPaused = false
   // 卡顿检测：记录上次 currentTime 变化的时间和位置
   private _stallCheckTimer: ReturnType<typeof setInterval> | null = null
   private _lastStallTime = 0
@@ -121,6 +135,16 @@ export class MsePlayer {
   // 防止"buffer 持续增长掩盖 media clock 冻结"时无限 seek 死循环。
   private _forcedSeekRecoveryCount = 0
   private _currentBlobUrl: string | null = null
+  // 记录最近一次主动 seek 的时间戳，用于卡顿恢复保护期
+  private _lastSeekTime = 0
+  // 配额超出连续恢复计数，成功写入后归零
+  private _quotaRetryCount = 0
+  // 当前 MSE 实际保留时长。0（关闭 DVR）映射为短安全缓存，而不是完全无缓存。
+  private _replayBufferSeconds: number
+  // 文件回看首个 media 到达时，从文件缓冲起点启动；直播才跳到 live edge。
+  private readonly _isFile: boolean
+  public readonly channel: 'live' | 'review'
+  public sessionId?: string
 
   constructor(options: MsePlayerOptions) {
     this._video = options.videoElement
@@ -129,6 +153,12 @@ export class MsePlayer {
     this._onSourceOpen = options.onSourceOpen
     this._onBackpressure = options.onBackpressure
     this._debug = options.debug ?? false
+    this._isFile = options.isFile === true
+    this.channel = options.channel ?? (this._isFile ? 'review' : 'live')
+    this.sessionId = options.sessionId
+    this._replayBufferSeconds = effectivePlaybackBufferSeconds(
+      options.replayBufferSeconds ?? DEFAULT_TIMELINE_REPLAY_SECONDS,
+    )
   }
 
   get state(): MsePlayerState {
@@ -137,6 +167,12 @@ export class MsePlayer {
 
   get videoElement(): HTMLVideoElement {
     return this._video
+  }
+
+  /** 动态更新 MSE 缓冲保留时长；已被 remove 的历史分片不会重新出现。 */
+  setReplayBufferSeconds(seconds: number): void {
+    this._replayBufferSeconds = effectivePlaybackBufferSeconds(seconds)
+    this._flushPending()
   }
 
   /** Start receiving init + media segments.
@@ -161,6 +197,8 @@ export class MsePlayer {
     this._stallRecoveryCount = 0
     this._playExhausted = false
     this._forcedSeekRecoveryCount = 0
+    this._lastSeekTime = 0
+    this._backpressurePaused = false
     this._setState('loading')
     this._initMediaSource()
     this._startStallDetection()
@@ -179,13 +217,40 @@ export class MsePlayer {
    * @param data - init segment 的原始二进制数据（ArrayBuffer）
    */
   feedInit(data: ArrayBuffer): void {
-    if (this._state === 'error') return
-    if (this._initReceived) {
+    const isError = this._state === 'error'
+    const newBytes = new Uint8Array(data)
+    let isDifferent = false
+    if (this._initSegment && this._initSegment.byteLength === newBytes.byteLength) {
+      for (let i = 0; i < newBytes.byteLength; i++) {
+        if (this._initSegment[i] !== newBytes[i]) {
+          isDifferent = true
+          break
+        }
+      }
+    } else if (this._initSegment) {
+      isDifferent = true
+    }
+
+    if (this._initReceived && !isError && !isDifferent) {
       this._log('Init already received, ignoring duplicate')
       return
     }
+
+    // 收到新的不同 init 段（推流源切换如录制回看/直播切换）或从错误中恢复
+    if (this._initReceived && (isDifferent || isError)) {
+      this._log(`New init segment received (different=${isDifferent}, recovering=${isError}), resetting stream pipeline`)
+      this._setState('loading')
+      this._initReceived = true
+      this._initSegment = newBytes
+      this._initAppended = false
+      this._liveEdgeAligned = false
+      this._pendingSegments = []
+      this._initMediaSource()
+      return
+    }
+
     this._initReceived = true
-    this._initSegment = new Uint8Array(data)
+    this._initSegment = newBytes
 
     if (!this._sourceBuffer && this._mediaSource?.readyState === 'open') {
       this._createSourceBuffer()
@@ -234,6 +299,9 @@ export class MsePlayer {
    */
   feedMedia(data: ArrayBuffer): void {
     if (this._state === 'error') return
+    // 直播用户暂停时不追赶直播沿；文件回看必须继续接收有限分片，
+    // 否则暂停期间文件流走完后再播放会找不到连续的 SourceBuffer 数据。
+    if (this._userPaused && !this._isFile) return
 
     const seg = new Uint8Array(data)
     if (!this._initAppended || (this._sourceBuffer && this._sourceBuffer.updating)) {
@@ -251,11 +319,12 @@ export class MsePlayer {
       try {
         this._sourceBuffer.appendBuffer(seg.buffer.slice(seg.byteOffset, seg.byteOffset + seg.byteLength) as ArrayBuffer)
         this._log(`Media segment appended (${data.byteLength} bytes)`)
+        this._quotaRetryCount = 0
         // 持续收到媒体分段说明流正在播放，确保状态为 playing。
         this._markPlaying()
         this._maybeEmitBackpressure()
       } catch (e) {
-        this._handleError(`Media segment append failed: ${e}`)
+        this._handleAppendError(e, seg, 'Media segment append')
       }
     } else {
       this._pendingSegments.push(seg)
@@ -285,9 +354,20 @@ export class MsePlayer {
     }
   }
 
+  private _setUserPaused(paused: boolean): void {
+    if (this._userPaused === paused) return
+    this._userPaused = paused
+    try {
+      this._onBackpressure?.(paused ? 'pause' : 'resume', this._pendingSegments.length)
+    } catch (e) {
+      this._log(`user pause backpressure callback failed: ${e}`)
+    }
+  }
+
   /** Play the video. */
   play(): void {
     if (this._video && this._state !== 'error') {
+      this._setUserPaused(false)
       this._video.play().catch((err) => {
         console.warn('[MsePlayer] play() failed:', err)
       })
@@ -296,6 +376,7 @@ export class MsePlayer {
 
   /** Pause the video. */
   pause(): void {
+    this._setUserPaused(true)
     if (this._video) {
       this._video.pause()
     }
@@ -311,13 +392,28 @@ export class MsePlayer {
    */
   seek(time: number): void {
     if (!this._video) return
+    this._lastSeekTime = Date.now()
+    this._setUserPaused(false)
+    if (this._state === 'paused') {
+      this._setState('playing')
+    }
     if (this._video.buffered.length > 0) {
-      const bufStart = this._video.buffered.start(0)
-      const bufEnd = this._video.buffered.end(this._video.buffered.length - 1)
-      this._video.currentTime = Math.min(Math.max(time, bufStart), bufEnd)
+      const ranges = this.getBufferedRanges()
+      const activeRange = ranges.find(range => time >= range.start && time <= range.end)
+      const range = activeRange ?? ranges[0]
+      if (!range) return
+      const safeStart = Math.min(range.end, range.start + 0.3)
+      this._video.currentTime = Math.min(Math.max(time, safeStart), range.end)
+      this._tryPlay(0)
     } else if (Number.isFinite(this._video.duration) && this._video.duration > 0) {
       this._video.currentTime = Math.min(time, this._video.duration)
+      this._tryPlay(0)
     }
+  }
+
+  /** 标记发生过主动 seek，激活 3 秒卡顿保护窗口（防止卡顿自恢复误跳直播沿） */
+  markSeeked(): void {
+    this._lastSeekTime = Date.now()
   }
 
   /** Toggle mute. */
@@ -348,8 +444,9 @@ export class MsePlayer {
    * @remarks
    * 仅当状态非 idle/error 时生效；paused 状态不自动恢复（尊重用户主动暂停）。
    */
-  resumePlayback(userInitiated = false): void {
+  resumePlayback(_userInitiated = false): void {
     if (this._state === 'error' || this._state === 'idle') return
+    this._setUserPaused(false)
     if (this._video && this._video.buffered.length > 0) {
       const bufStart = this._video.buffered.start(0)
       const bufEnd = this._video.buffered.end(this._video.buffered.length - 1)
@@ -358,13 +455,8 @@ export class MsePlayer {
       }
     }
     this._liveEdgeAligned = false
-    if (userInitiated && this._state === 'paused') {
-      this._setState('playing')
-      return
-    }
-    if (this._state !== 'paused') {
-      this._tryPlay(0)
-    }
+    this._setState('playing')
+    this._tryPlay(0)
   }
 
   /**
@@ -374,30 +466,55 @@ export class MsePlayer {
    * seek 到缓冲区末尾附近，用于控制栏“直播”按钮。
    */
   goLive(): void {
-    if (this._state === 'error' || this._state === 'idle') return
+    this._setUserPaused(false)
+    if (this._state === 'error') {
+      this._log('goLive: recovering from error state, re-initializing media source')
+      this._setState('loading')
+      this._initReceived = false
+      this._initAppended = false
+      this._liveEdgeAligned = false
+      this._initMediaSource()
+      return
+    }
+    if (this._state === 'idle') return
     if (this._video && this._video.buffered.length > 0) {
       const bufStart = this._video.buffered.start(0)
       const bufEnd = this._video.buffered.end(this._video.buffered.length - 1)
+      const safeStart = Math.min(bufEnd, bufStart + 0.3)
       const target = Math.max(bufStart, bufEnd - 0.3)
-      this._video.currentTime = target
+      const safeTarget = Math.max(safeStart, target)
+      this._lastSeekTime = Date.now()
+      this._video.currentTime = target // this._video.currentTime = target (safeTarget fallback)
+      this._video.currentTime = safeTarget
     } else {
       this._log('goLive: buffer empty, waiting for next segment')
     }
     this._liveEdgeAligned = false
     if (this._state === 'paused') {
       this._setState('playing')
-    } else {
-      this._tryPlay(0)
     }
+    this._tryPlay(0)
   }
 
-  /** 返回当前 SourceBuffer 可 seek 区间（preview 轴秒）；无缓冲则 null */
+  /** 返回当前 SourceBuffer 的所有连续 seek 区间（preview 轴秒）。 */
+  getBufferedRanges(): Array<{ start: number; end: number }> {
+    if (!this._video || this._video.buffered.length === 0) return []
+    const ranges: Array<{ start: number; end: number }> = []
+    for (let i = 0; i < this._video.buffered.length; i += 1) {
+      const start = this._video.buffered.start(i)
+      const end = this._video.buffered.end(i)
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        ranges.push({ start, end })
+      }
+    }
+    return ranges
+  }
+
+  /** 返回当前 SourceBuffer 的整体边界（兼容旧调用方）。 */
   getBufferedRange(): { start: number; end: number } | null {
-    if (!this._video || this._video.buffered.length === 0) return null
-    const start = this._video.buffered.start(0)
-    const end = this._video.buffered.end(this._video.buffered.length - 1)
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null
-    return { start, end }
+    const ranges = this.getBufferedRanges()
+    if (ranges.length === 0) return null
+    return { start: ranges[0].start, end: ranges[ranges.length - 1].end }
   }
 
   /** Get current playback time. */
@@ -423,6 +540,8 @@ export class MsePlayer {
       this._playRetryTimer = null
     }
     this._setState('idle')
+    this._userPaused = false
+    this._backpressurePaused = false
     // S5: abort SourceBuffer 防止 pending 的 append 阻塞 _cleanup
     if (this._sourceBuffer) {
       try { this._sourceBuffer.abort() } catch {}
@@ -504,8 +623,8 @@ export class MsePlayer {
    * - append 后若 buffer 仍在 updating，立即退出，等待下一次 updateend 触发继续。
    *
    * 缓冲区管理（trim 策略）：
-   * - 当 buffered 总时长超过 310s 时，移除 [bufStart, bufEnd - 300] 区间的旧数据，
-   *   保留最近 5 分钟供用户回看。
+   * - 当 buffered 总时长超过“用户设置时长 + headroom”时，移除旧数据，
+   *   保留用户设置的最近媒体供回看；关闭 DVR 时仅保留短安全缓存。
    * - 使用 _isTrimming 标志防止 remove() 触发的 updateend 递归进入 trim 分支，
    *   避免链式回调导致 SourceBuffer 卡在 updating=true。
    *
@@ -539,23 +658,35 @@ export class MsePlayer {
       try {
         this._sourceBuffer.appendBuffer(seg.buffer.slice(seg.byteOffset, seg.byteOffset + seg.byteLength) as ArrayBuffer)
         this._log(`Flushed pending segment (${seg.byteLength} bytes)`)
+        this._quotaRetryCount = 0
         this._maybeEmitBackpressure()
       } catch (e) {
-        this._handleError(`Pending segment append failed: ${e}`)
+        this._handleAppendError(e, seg, 'Pending segment append')
       }
     }
 
-    // Trim SourceBuffer to prevent memory leak（保留最近 120s 供时间线回看）
-    // 阈值 130s：超过后移除 [bufStart, bufEnd-120] 区间的旧数据
+    // Trim SourceBuffer to prevent memory leak.
+    // 保留时长由用户设置（如 300s/600s）；额外留出少量 headroom，避免每个分片都触发 remove。
+    // 内存保护由 QuotaExceededError 机制自适应兜底，不人为硬编码截断用户设置。
     if (!wasTrimming && this._sourceBuffer && !this._sourceBuffer.updating && this._video) {
       const buffered = this._video.buffered
       if (buffered.length > 0) {
         const bufStart = buffered.start(0)
         const bufEnd = buffered.end(buffered.length - 1)
         const bufDuration = bufEnd - bufStart
-        if (bufDuration > 130) {
-          const removeEnd = bufEnd - 120
-          if (removeEnd > bufStart) {
+        const targetReplaySeconds = Math.max(30, this._replayBufferSeconds)
+        const trimThreshold = targetReplaySeconds + REPLAY_TRIM_HEADROOM_SECONDS
+        if (bufDuration > trimThreshold) {
+          let removeEnd = bufEnd - targetReplaySeconds
+          // 保护当前播放头：绝不能移除当前播放头前至少 20 秒的数据。
+          const curTime = this._video.currentTime
+          if (curTime >= bufStart && curTime < bufEnd) {
+            removeEnd = Math.min(
+              removeEnd,
+              Math.max(bufStart, curTime - REPLAY_TRIM_HEADROOM_SECONDS),
+            )
+          }
+          if (removeEnd > bufStart + 5) {
             try {
               this._isTrimming = true
               this._sourceBuffer.remove(bufStart, removeEnd)
@@ -635,19 +766,20 @@ export class MsePlayer {
         // readyState 已升到 2+：正常播放
         this._markPlaying()
       } else if (this._video && this._video.readyState < 2 && bufLen > 0 && !this._liveEdgeAligned) {
-        // live-edge 对齐：duration=Infinity 的 MSE 直播流，currentTime 默认为 0，
-        // 但首段 tfdt 可能不为 0，导致 currentTime 落在 buffered 之外，
-        // play() Promise 一直 pending，readyState 卡在 1。
-        // 一次性跳到 live edge（buffered.end - 0.2），让 currentTime 进入缓冲区。
+        // 首段 tfdt 可能不从 0 开始，currentTime 落在 buffered 之外时必须先对齐。
+        // 直播从 live edge 启动；文件回看从请求对应的 buffered 起点启动，
+        // 绝不能把用户点选的历史位置改成文件末端。
         this._liveEdgeAligned = true
-        const target = Math.max(bufStart, bufEnd - 0.2)
-        // 仅当 currentTime 不在缓冲区内时才 seek
+        const target = this._isFile
+          ? Math.min(bufEnd, bufStart + 0.3)
+          : Math.max(bufStart, bufEnd - 0.2)
         if (curTime < bufStart || curTime > bufEnd) {
-          this._log(`Live-edge align: currentTime ${curTime.toFixed(2)} -> ${target.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
+          this._log(`${this._isFile ? 'File-start' : 'Live-edge'} align: currentTime ${curTime.toFixed(2)} -> ${target.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
           try {
+            this._lastSeekTime = Date.now()
             this._video.currentTime = target
           } catch (e) {
-            this._log(`Live-edge align failed: ${e}`)
+            this._log(`${this._isFile ? 'File-start' : 'Live-edge'} align failed: ${e}`)
           }
         } else {
           this._log(`currentTime ${curTime.toFixed(2)} already in buffered range, no seek needed`)
@@ -702,6 +834,22 @@ export class MsePlayer {
         if (this._state !== 'error' && this._state !== 'paused') {
           this._markPlaying()
         }
+      }, videoSignal ? { signal: videoSignal } : undefined)
+      // 原生 controls 触发的暂停/播放也要同步上游背压状态，
+      // 否则用户停在缓冲左缘时仍会持续积累直播分片。
+      this._video.addEventListener('pause', () => {
+        // seeking 期间或刚执行过主动 seek（3 秒内）触发的 pause 属于浏览器内部行为，
+        // 绝不是用户主动暂停，禁止触发上游背压丢弃分片与 UI 暂停遮罩！
+        if (this._video?.seeking || Date.now() - this._lastSeekTime < 3000) {
+          return
+        }
+        if (this._state === 'playing') {
+          this._setUserPaused(true)
+          this._setState('paused')
+        }
+      }, videoSignal ? { signal: videoSignal } : undefined)
+      this._video.addEventListener('play', () => {
+        this._setUserPaused(false)
       }, videoSignal ? { signal: videoSignal } : undefined)
     }
   }
@@ -817,6 +965,77 @@ export class MsePlayer {
     }, retry === 0 ? 50 : 200)
   }
 
+  private _isQuotaExceededError(e: unknown): boolean {
+    if (e instanceof DOMException) {
+      return e.name === 'QuotaExceededError' || e.code === 22
+    }
+    const str = String(e || '')
+    return str.includes('QuotaExceededError') || str.includes('The SourceBuffer is full') || str.includes('cannot free space')
+  }
+
+  private _handleAppendError(e: unknown, seg: Uint8Array, context: string): void {
+    if (!this._isQuotaExceededError(e)) {
+      this._handleError(`${context} failed: ${e}`)
+      return
+    }
+
+    this._quotaRetryCount++
+    if (this._quotaRetryCount > 3) {
+      this._log(`QuotaExceededError recovery exhausted (${this._quotaRetryCount}/3), aborting`)
+      this._handleError(`Media buffer quota exceeded: ${e}`)
+      return
+    }
+
+    // 将当前未写入的 segment 重新推入待处理队列前端
+    this._pendingSegments.unshift(seg)
+
+    // 自适应缩减保留时长：配额紧张时逐步减半，最低保留 30 秒
+    this._replayBufferSeconds = Math.max(30, Math.floor(this._replayBufferSeconds * 0.6))
+    this._log(`QuotaExceededError handled: buffer target reduced to ${this._replayBufferSeconds}s, triggering emergency eviction`)
+
+    // 立即执行紧急驱逐腾出空间
+    this._emergencyEvict()
+  }
+
+  /**
+   * 紧急驱逐：当发生 QuotaExceededError 时，立刻释放当前播放头安全范围之外的所有缓冲。
+   */
+  private _emergencyEvict(): boolean {
+    if (!this._sourceBuffer || this._sourceBuffer.updating || !this._video) {
+      return false
+    }
+    const buffered = this._video.buffered
+    if (buffered.length === 0) return false
+
+    const bufStart = buffered.start(0)
+    const bufEnd = buffered.end(buffered.length - 1)
+    const curTime = this._video.currentTime
+
+    // 优先清除当前播放头 10 秒之前的历史数据
+    let removeStart = bufStart
+    let removeEnd = Math.max(bufStart, curTime - 10)
+
+    // 如果播放头正好在最左端（回看中），则清除当前播放头 15 秒之后的未来数据
+    if (removeEnd <= bufStart + 2 && bufEnd > curTime + 15) {
+      removeStart = curTime + 15
+      removeEnd = bufEnd
+    }
+
+    if (removeEnd > removeStart + 1) {
+      try {
+        this._isTrimming = true
+        this._log(`Emergency eviction: removing range [${removeStart.toFixed(1)}, ${removeEnd.toFixed(1)}]`)
+        this._sourceBuffer.remove(removeStart, removeEnd)
+        return true
+      } catch (err) {
+        this._isTrimming = false
+        this._log(`Emergency eviction failed: ${err}`)
+        return false
+      }
+    }
+    return false
+  }
+
   private _handleError(msg: string): void {
     this._log(`ERROR: ${msg}`)
     this._setState('error')
@@ -855,6 +1074,10 @@ export class MsePlayer {
     this._stopStallDetection()
     this._stallCheckTimer = setInterval(() => {
       if (this._state !== 'playing') return
+      // 用户主动 seek 保护期（3 秒）：给解码器加载与渲染时间，暂停强制跳回直播沿
+      if (Date.now() - this._lastSeekTime < 3000) {
+        return
+      }
       const ct = this._video?.currentTime ?? 0
 
       // 数据饥饿检测：若 buffer 末端长时间不增长，判定流中断
@@ -913,13 +1136,20 @@ export class MsePlayer {
         return
       }
 
-      const bufEnd = video.buffered.end(video.buffered.length - 1)
-      const bufStart = video.buffered.start(0)
+      const bufferedRanges = this.getBufferedRanges()
+      const bufEnd = bufferedRanges[bufferedRanges.length - 1]?.end ?? video.buffered.end(video.buffered.length - 1)
+      const bufStart = bufferedRanges[0]?.start ?? video.buffered.start(0)
+      const currentRange = bufferedRanges.find(range => ct >= range.start && ct <= range.end)
 
       // 强制 seek 恢复：currentTime 出界，或 media clock 冻结（play() 重试耗尽仍不动）。
-      // 此时 re-trigger play() 无效（日志表现为 play() timeout 无限循环），须 seek 回直播沿。
-      if (ct < bufStart || ct > bufEnd - 0.3 || this._playExhausted) {
-        const target = Math.max(bufStart, bufEnd - 0.3)
+      // 回看时保持当前连续 range；文件流出界则回到文件缓冲起点，直播才回 live edge。
+      if (!currentRange || ct < bufStart || ct > bufEnd - 0.3 || this._playExhausted) {
+        const isReviewing = Boolean(currentRange && bufEnd - ct > 3.0)
+        const target = isReviewing
+          ? Math.max(currentRange!.start, ct)
+          : this._isFile
+            ? Math.min(bufEnd, bufStart + 0.3)
+            : Math.max(bufStart, bufEnd - 0.3)
         this._log(`Stall recovery: force seek ${ct.toFixed(2)} -> ${target.toFixed(2)} (buffered ${bufStart.toFixed(2)}-${bufEnd.toFixed(2)})`)
         // 强制 seek 独立限流：不受 buffer 增长重置（否则"buffer 持续增长 + media clock 冻结"会无限循环）
         this._forcedSeekRecoveryCount++

@@ -21,7 +21,7 @@ from lsc.platforms.base import headers_to_ffmpeg_input_args, network_timeout_arg
 from lsc.platforms.failure import FailureKind, classify_failure
 from lsc.platforms.redaction import redact_text
 from lsc.recorder.manifest import ManifestStore, RecordingManifest
-from lsc.utils.process_launcher import prepare_launch
+from lsc.utils.process_launcher import kill_process_tree, prepare_launch
 
 _log = get_logger(__name__)
 STARTUP_PROBE_TIMEOUT_SEC = 15.0
@@ -33,6 +33,8 @@ _RECORDING_START_STABLE_SEC = 1.0
 _UPSTREAM_NO_DATA_FAST_FAIL_SEC = 13.0
 TS_PACKET_SIZE = 188
 _WRITE_TIMEOUT_SEC = 10.0
+# POSIX 非阻塞 stdin 的 would-block 重试间隔（BlockingIOError / write 返回 None）
+_WRITE_RETRY_INTERVAL_SEC = 0.02
 _RECORDING_OVERFLOW_SEC = 5.0
 # 预览 stdout 超过该秒数无数据视为挂死，触发 on_error / 进程恢复
 _PREVIEW_STDOUT_STALL_SEC = 15.0
@@ -328,7 +330,7 @@ class SharedRoomIngest:
         url: str,
         headers: dict[str, str] | None = None,
         network_context: Mapping[str, object] | None = None,
-        preview_queue_bytes: int = 2 * 1024 * 1024,
+        preview_queue_bytes: int = 8 * 1024 * 1024,
         preview_drop_policy: str = "drop_oldest",
         recording_queue_bytes: int = 2 * 1024 * 1024,
     ):
@@ -360,6 +362,12 @@ class SharedRoomIngest:
         self.preview_media_bytes = 0
         # 预览 sink stdin 实际写入字节数：区分「上游没喂进来」与「喂了但解不出」
         self.preview_input_bytes = 0
+        # Preview decoder recovery telemetry. These counters are cumulative for
+        # the room ingest so a sink restart remains visible to health checks.
+        self.preview_stall_count = 0
+        self.preview_recovery_count = 0
+        self.preview_last_stall_mono = 0.0
+        self.preview_last_recovery_mono = 0.0
 
         self._lock = threading.RLock()
         self._preview_condition = threading.Condition(self._lock)
@@ -902,9 +910,12 @@ class SharedRoomIngest:
             "-map", "0:a?",
         ]
         if width > 0 and height > 0:
+            # force_divisible_by=2：force_original_aspect_ratio=decrease 按源 AR 反算
+            # 输出，源与目标框 AR 不一致时会产出奇数（如 853x480），libx264+yuv420p
+            # 要求偶数，否则预览进程秒退、mse_init 永远不就绪。
             command += [
                 "-vf",
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
             ]
         if use_nvenc:
             bitrate = video_bitrate or "2500k"
@@ -1152,6 +1163,7 @@ class SharedRoomIngest:
             "preview_pipe": preview_pipe,
         }
         with self._lock:
+            recovering = bool(self.preview_error)
             self._preview_options = options
             self._preview_requested = True
             if not self._preview_subscribers:
@@ -1162,6 +1174,9 @@ class SharedRoomIngest:
                     media_ready=bool(self._preview_has_init and self._preview_has_media_segment),
                 )
             self.preview_error = ""
+            if recovering:
+                self.preview_recovery_count += 1
+                self.preview_last_recovery_mono = time.monotonic()
         command = self.build_preview_command(**cast(Any, options))
         try:
             proc = self._launch_process(command)
@@ -1680,13 +1695,26 @@ class SharedRoomIngest:
         while offset < len(view):
             if time.monotonic() > deadline:
                 raise TimeoutError(f"stdin write timed out after {_WRITE_TIMEOUT_SEC}s")
-            written = stream.write(view[offset:])
+            try:
+                written = stream.write(view[offset:])
+            except BlockingIOError:
+                # POSIX：stdin 已设 O_NONBLOCK（_launch_process）。管道瞬时背压
+                # 属正常现象，让出 CPU 后重试——旧实现把异常抛给
+                # _write_recording_input_loop，会误杀健康的录制 sink。
+                time.sleep(_WRITE_RETRY_INTERVAL_SEC)
+                continue
             if written is None:
-                written = len(view) - offset
+                # 非阻塞流 would-block：本轮无进展，重试直至 deadline。
+                # 旧实现把它当「全部写完」会静默丢掉剩余数据。
+                time.sleep(_WRITE_RETRY_INTERVAL_SEC)
+                continue
             if written <= 0:
                 raise OSError("stdin write returned no progress")
             offset += written
         stream.flush()
+        # 注：deadline 保护在 POSIX（非阻塞写）上生效；Windows 的 stdin 为
+        # 阻塞写，单次 write 可超过 deadline，依赖下游
+        # _RECORDING_OVERFLOW_SEC 队列溢出强杀兜底（见 CLAUDE.md §11.2）。
 
     def _enqueue_preview_ts(self, batch: bytes) -> None:
         with self._preview_condition:
@@ -1825,12 +1853,16 @@ class SharedRoomIngest:
                         dropped_bytes = self.preview_dropped_bytes
                         dropped_batches = self.preview_dropped_batches
                         queued_batches = len(self._preview_ts_queue)
+                        self.preview_stall_count += 1
+                        self.preview_last_stall_mono = time.monotonic()
+                        stall_count = self.preview_stall_count
                     # 停滞诊断必须一次带全：stderr 尾部定位解码故障（TS 丢包洞/
                     # 时间戳断裂），dropped/queued 判定是否队列溢出抠流，
                     # media_bytes 区分「从未产出」与「中途停滞」。
                     _log.error(
                         "shared preview stdout stalled (%ds) room=%s "
-                        "media_bytes=%d segments=%d dropped=%dB/%d queued=%d upstream_bytes=%d stderr=%s",
+                        "media_bytes=%d segments=%d dropped=%dB/%d queued=%d "
+                        "upstream_bytes=%d stall_count=%d stderr=%s",
                         _PREVIEW_STDOUT_STALL_SEC,
                         self.room_id,
                         self.preview_media_bytes,
@@ -1839,11 +1871,12 @@ class SharedRoomIngest:
                         dropped_batches,
                         queued_batches,
                         self.upstream_bytes,
+                        stall_count,
                         self._stderr_tail(self._preview_stderr_buffer) or "<empty>",
                     )
-                    # kill 失败时尝试 terminate + 关闭 stdin 作为备用方案
+                    # 树杀失败时尝试 terminate + 关闭 stdin 作为备用方案
                     try:
-                        proc.kill()
+                        kill_process_tree(proc)
                     except Exception as exc:
                         _log.warning(
                             "shared preview stall kill failed room=%s: %s, trying terminate",
@@ -2225,7 +2258,7 @@ class SharedRoomIngest:
                 try:
                     proc.wait(timeout=remaining(3.0))
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    kill_process_tree(proc)
                     # Once the hard deadline is reached, keep a small fixed
                     # reap window so the killed child is not left as a zombie.
                     try:

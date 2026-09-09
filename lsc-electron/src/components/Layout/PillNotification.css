@@ -1,0 +1,136 @@
+/* ===== 顶栏状态胶囊灵动气泡通知（Dynamic Pill Notification） ===== */
+
+.pill-notification-wrapper {
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  pointer-events: none;
+  white-space: nowrap;
+  perspective: 600px;
+}
+
+/* 入场过渡 */
+.pill-notification-wrapper--entering {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-10px) scale(0.88);
+  transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 活跃态（正常展示） */
+.pill-notification-wrapper--active {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0) scale(1);
+  transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 离场过渡（向上收回状态胶囊） */
+.pill-notification-wrapper--exiting {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-8px) scale(0.92);
+  transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 气泡本体 */
+.pill-notification-body {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px 0 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-primary, #f5f5f7);
+  background: rgba(22, 26, 34, 0.92);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-hairline, rgba(255, 255, 255, 0.12));
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.35),
+    0 1px 4px rgba(0, 0, 0, 0.2);
+  user-select: none;
+}
+
+/* 浅色主题适配 */
+:root:not(.dark) .pill-notification-body {
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--text-primary, #1d1d1f);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  box-shadow:
+    0 4px 18px rgba(0, 0, 0, 0.1),
+    0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+/* 语义色调发光 */
+.pill-notification-body--record {
+  border-color: rgba(255, 69, 58, 0.35);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 0 12px rgba(255, 69, 58, 0.25);
+}
+
+.pill-notification-body--align {
+  border-color: rgba(77, 196, 191, 0.4);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 0 12px rgba(49, 179, 174, 0.25);
+}
+
+.pill-notification-body--success {
+  border-color: rgba(52, 199, 89, 0.35);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 0 10px rgba(52, 199, 89, 0.2);
+}
+
+.pill-notification-body--warning {
+  border-color: rgba(255, 159, 10, 0.35);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 0 10px rgba(255, 159, 10, 0.2);
+}
+
+.pill-notification-body--error {
+  border-color: rgba(255, 69, 58, 0.4);
+  box-shadow:
+    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 0 12px rgba(255, 69, 58, 0.25);
+}
+
+/* 图标容器 */
+.pill-notification-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+/* 录制红点呼吸动画 */
+.pill-dot--record {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--state-error, #ff453a);
+  box-shadow: 0 0 8px #ff453a;
+  animation: pillRecordPulse 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes pillRecordPulse {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.7;
+    box-shadow: 0 0 4px #ff453a;
+  }
+  100% {
+    transform: scale(1.15);
+    opacity: 1;
+    box-shadow: 0 0 10px #ff453a;
+  }
+}
+
+.pill-notification-text {
+  letter-spacing: 0.01em;
+}

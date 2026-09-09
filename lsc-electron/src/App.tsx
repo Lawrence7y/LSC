@@ -120,7 +120,7 @@ function App() {
           borderRadius: 8,
           borderRadiusLG: 14,
           borderRadiusSM: 6,
-          fontFamily: "'SF Pro Display', 'PingFang SC', system-ui, -apple-system, sans-serif",
+          fontFamily: "'SF Pro Display', 'PingFang SC', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', Roboto, sans-serif",
         },
       }}
     >

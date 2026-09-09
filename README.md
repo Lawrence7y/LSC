@@ -269,7 +269,7 @@ cd lsc-electron && npx tsc --noEmit   # TypeScript 类型检查
 | 日志 | `%APPDATA%\lsc-electron\logs\` | 单文件 ~2MB × 5 自动滚动 |
 | 日志级别 | 环境变量 `LSC_LOG_LEVEL` | 默认 `INFO` |
 
-常用设置键：`encoder`（编码器）、`crf`（质量）、`bitrate`（码率）、`quality`（画质）、`shared_ingest_enabled`（共享进样）、`export_max_concurrent`（导出并发 1/2）、`ocr_accel`（OCR 加速 auto/dml/cuda/cpu）、`preview_quality`（预览画质）。
+常用设置键：`encoder`（编码器）、`crf`（质量）、`bitrate`（码率）、`quality`（画质）、`shared_ingest_enabled`（共享进样）、`export_max_concurrent`（导出并发 1/2）、`ocr_accel`（OCR 加速 auto/dml/cuda/cpu）、`preview_quality`（预览画质）、`timeline_replay_seconds`（时间线回放 0/120/300/600 秒）。
 
 ---
 

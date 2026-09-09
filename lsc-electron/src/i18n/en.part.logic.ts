@@ -19,7 +19,7 @@ export const enPartLogic: Record<string, string> = {
   '该房间已退出持续分析映射，后续回合可能仅入列主房': 'This room exited the continuous-analysis mapping; subsequent rounds may only be queued to the main room',
   '确认断开': 'Confirm Disconnect',
   '断开将停止录制「{name}」': 'Disconnecting will stop the recording for "{name}"',
-  '未知主播': 'unknown streamer',
+  '未知主播': 'Unknown streamer',
   '确认': 'Confirm',
 
   // useClipDelete.tsx
@@ -56,7 +56,7 @@ export const enPartLogic: Record<string, string> = {
   '导出失败：{err}': 'Export failed: {err}',
   '导出失败：未知错误。请点击切片列表中的「打开输出文件夹」排查或重试。': 'Export failed: unknown error. Please click "Open Output Folder" in the clip list to investigate or retry.',
   '导出失败': 'Export failed',
-  '未知错误': 'unknown error',
+  '未知错误': 'Unknown error',
   '取消导出失败：{err}': 'Failed to cancel export: {err}',
   '任务可能已结束': 'The task may have already finished',
 
@@ -68,9 +68,11 @@ export const enPartLogic: Record<string, string> = {
   '录制已开始': 'Recording started',
   '录制启动失败': 'Failed to start recording',
   '房间连接失败': 'Room connection failed',
-  '连接失败': 'connection failed',
+  '连接失败': 'Connection failed',
   '后端连接断开': 'Backend connection lost',
   'WebSocket 重连失败，请检查后端状态': 'WebSocket reconnect failed, please check the backend status',
+  '后端无响应': 'Backend is not responding',
+  '后端心跳超时，请在顶栏点击「重新连接」重启后端': 'Backend heartbeat timed out. Click "Reconnect" in the top bar to restart the backend',
   '磁盘空间不足': 'Not enough disk space',
   '录制已停止': 'Recording stopped',
   '后端启动失败': 'Backend failed to start',
@@ -78,4 +80,6 @@ export const enPartLogic: Record<string, string> = {
   // clipNaming.ts
   '未知': 'Unknown',
   '切片': 'clip',
+
+  '撤销上一步入出点操作（打标 / 微调 / 拖标 / 删标）': 'Undo the last in/out point change (mark / nudge / drag / delete)',
 }

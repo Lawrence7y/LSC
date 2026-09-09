@@ -609,11 +609,33 @@ def download_ffmpeg() -> bool:
                     pass
         else:
             raise RuntimeError(f"全部下载源失败: {last_error}")
-        _emit_progress(phase, 99, 100, "下载完成，正在解压...")
 
-        # 解压
+        # 计算并校验 SHA-256 摘要
+        import hashlib
+        hasher = hashlib.sha256()
+        with open(zip_path, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        calc_sha256 = hasher.hexdigest()
+        expected_sha256 = os.environ.get("LSC_FFMPEG_SHA256", "").strip().lower()
+        if expected_sha256 and calc_sha256.lower() != expected_sha256:
+            raise RuntimeError(f"FFmpeg SHA-256 校验失败: 期望 {expected_sha256}, 实际 {calc_sha256}")
+
+        _emit_progress(phase, 99, 100, f"校验成功 ({calc_sha256[:12]}...)，正在安全解压...")
+
+        # 安全解压（防御 Zip Slip 路径穿越漏洞）
+        extracted_root = (tmp_dir / "extracted").resolve()
+        extracted_root.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(tmp_dir / "extracted")
+            for member in zf.infolist():
+                member_path = (extracted_root / member.filename).resolve()
+                try:
+                    member_path.relative_to(extracted_root)
+                except ValueError as err:
+                    raise RuntimeError(
+                        f"Zip Slip 安全告警：非法文件路径 {member.filename}"
+                    ) from err
+            zf.extractall(extracted_root)
 
         # 查找 bin 目录
         extracted_root = tmp_dir / "extracted"

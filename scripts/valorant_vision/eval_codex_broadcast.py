@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -12,9 +13,11 @@ import numpy as np
 
 from lsc.analyzer.valorant_frame_classifier import _CLASS_NAMES, ValorantFrameClassifier
 
-DEFAULT_ANNOTATION_DIR = Path(
-    r"D:\Project\直播切片多人\.worktrees\valorant-frame-labeling-pilot"
-    r"\datasets\valorant_phase\annotations\new_broadcast_20260721"
+_ENV_ANN = os.environ.get("LSC_ANNOTATION_DIR", "")
+DEFAULT_ANNOTATION_DIR = (
+    Path(_ENV_ANN)
+    if _ENV_ANN
+    else Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotations"
 )
 DEFAULT_OUT_DIR = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"
 

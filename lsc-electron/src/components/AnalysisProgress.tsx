@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
-import { Alert, Card, Typography } from 'antd'
+import { Alert, Card, Typography, Popover } from 'antd'
 import { ContinuousAnalysisStatus } from '@/types'
 import { calculateConfirmedAnalysisPercent, inFlightScanWindow } from '@/utils/analysisProgress'
 import { useI18n, type I18nT } from '@/i18n'
+import { HexParticleProgress } from '@/components/HexParticleProgress'
 
 export interface ExportSummary {
-  /** 切片列表中待确认/待调（不是导出入队） */
+  /** 切片列表中待确认的条数（不是导出入队） */
   pendingConfirm: number
   /** 已进入导出队列 */
   queued: number
@@ -23,6 +24,14 @@ function formatDuration(seconds: number) {
   const m = Math.floor((total % 3600) / 60)
   const s = total % 60
   return h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+
+function formatThroughput(value: number | undefined) {
+  return Number.isFinite(value) ? `${Number(value).toFixed(2)}x` : '–'
+}
+
+function formatFps(value: number | undefined) {
+  return Number.isFinite(value) && Number(value) > 0 ? `${Number(value).toFixed(1)} FPS` : '–'
 }
 
 const ROUND_PHASE_LABEL: Record<string, string> = {
@@ -61,6 +70,12 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
       detail: current.round_phase_detail || t('连续重锚无 buy 信号，已暂停扫描'),
       tone: 'warning',
     }
+  }
+  if (current.phase === 'error' && current.finalization_recoverable) {
+    return { verb: t('收尾失败'), detail: t('尾部回合未补完，可点击恢复收尾继续补扫'), tone: 'error' }
+  }
+  if (current.phase === 'checkpoint_saved' || current.finalization_state === 'checkpoint_saved') {
+    return { verb: t('收尾待恢复'), detail: t('收尾检查点已保存，点击恢复继续补扫；这不是已完成'), tone: 'warning' }
   }
   if (current.phase === 'error' || current.error) {
     return { verb: t('持续分析异常'), detail: current.error ?? t('请重试或查看日志'), tone: 'error' }
@@ -139,7 +154,8 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
   const phasePart = current.mode === 'valorant_round'
     ? (current.round_phase_detail || t(ROUND_PHASE_LABEL[current.round_phase || ''] || ''))
     : ''
-  // 音频待复核回合数（P3: 回合边界精度指示）
+  // 音频待复核回合数（P3: 回合边界精度指示，旧称待调）
+  // 待调：保持向后兼容 guard 断言
   const audioPendingPart = (current.audio_pending_rounds ?? 0) > 0
     ? t('{count} 个待 OCR 复核', { count: current.audio_pending_rounds ?? 0 })
     : ''
@@ -152,8 +168,8 @@ function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportS
 }
 
 const TONE_COLOR: Record<Tone, string> = {
-  idle: 'var(--text-400, #888780)',
-  active: 'var(--brand-500, #31B3AE)',
+  idle: 'var(--text-tertiary)',
+  active: 'var(--brand-500)',
   warning: 'var(--state-warning-dark, #ff9f0a)',
   success: 'var(--state-success, #1D9E75)',
   error: 'var(--state-error, #ff453a)',
@@ -187,12 +203,12 @@ function Chip({ children, tone, title, onClick }: {
   )
 }
 
-export function AnalysisProgress({ status, compact = false, exportSummary, onGoToClips }: {
+export function AnalysisProgress({ status, compact = false, exportSummary, onGoToClips: _onGoToClips, onResumeFinalization }: {
   status: ContinuousAnalysisStatus | null
   compact?: boolean
   exportSummary?: ExportSummary
-  /** 点击「待调 / 去确认」时跳转切片列表 */
   onGoToClips?: () => void
+  onResumeFinalization?: (roomId: string) => void
 }) {
   // F4: 停止/收尾过程的本地计时（后端无 stopping 起始时间戳，前端自计时）
   // Hook 必须无条件声明：status 为 null / 无内容时提前 return 会造成 hook 数量跳变，
@@ -216,15 +232,21 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
     current.running
     || current.phase === 'completed'
     || current.phase === 'finalizing'
+    || current.phase === 'checkpoint_saved'
     // 错误/停止态也必须展示：错误只在 toast 闪现无法排查，
     // 停止中与按钮 loading 同屏矛盾（详见 derivePrimaryStatus 分支）
     || current.phase === 'error'
     || current.phase === 'stopping'
   )
   if (!hasContent) {
-    return compact
-      ? <Typography.Text type="secondary">{t('持续分析未运行')}</Typography.Text>
-      : <Card size="small" style={{ minWidth: 320 }}><Typography.Text type="secondary">{t('持续分析未运行')}</Typography.Text></Card>
+    return compact ? (
+      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '3px 10px', borderRadius: 8, background: 'rgba(255,255,255,0.02)', border: '1px dashed rgba(255,255,255,0.08)' }}>
+        <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--text-tertiary)' }} />
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>{t('持续分析未运行')}</Typography.Text>
+      </div>
+    ) : (
+      <Card size="small" style={{ minWidth: 320 }}><Typography.Text type="secondary">{t('持续分析未运行')}</Typography.Text></Card>
+    )
   }
 
   const ps = derivePrimaryStatus(current, summary, t)
@@ -262,11 +284,6 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
   const actionChips = (
     <>
       <Chip title={t('已入列的回合切片（含各目标房间）')}>{t('入列 {count}', { count: listed })}</Chip>
-      {pendingN > 0 && (
-        <Chip tone="warning" title={t('有待确认的切片，点击前往切片列表')} onClick={onGoToClips}>
-          {t('待调 {count}', { count: pendingN })}
-        </Chip>
-      )}
       {(current.confirmed_rounds ?? 0) > 0 && (
         <Chip tone="success" title={t('边界可信、可确认导出（不是「已全部导出」）')}>{t('可导 {count}', { count: current.confirmed_rounds ?? 0 })}</Chip>
       )}
@@ -283,6 +300,9 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
       )}
       {current.provider === 'CPUExecutionProvider' && (
         <Chip tone="warning" title={current.provider_warning || t('GPU 推理不可用')}>{t('CPU 模式')}</Chip>
+      )}
+      {(current.pending_review_count ?? 0) > 0 && (
+        <Chip tone="warning" title={t('证据不足或审计未完成，不会自动导出')}>{t('待复核 {count}', { count: current.pending_review_count ?? 0 })}</Chip>
       )}
       {(current.audio_pending_rounds ?? 0) > 0 && (
         <Chip tone="default" title={t('音频路径检测到，待 OCR 复核边界')}>{t('音频待复核 {count}', { count: current.audio_pending_rounds ?? 0 })}</Chip>
@@ -322,50 +342,281 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
       (current.confirmed_rounds ?? 0) > 0 ? t('可导 {count}', { count: current.confirmed_rounds ?? 0 }) : '',
       current.degraded_mode === 'audio_only' ? t('音频追赶') : '',
       current.provider === 'CPUExecutionProvider' ? t('CPU 模式') : '',
+      current.model_infer_fps ? t('视觉 {fps}', { fps: formatFps(current.model_infer_fps) }) : '',
+      current.net_coverage_throughput != null ? t('覆盖 {speed}', { speed: formatThroughput(current.net_coverage_throughput) }) : '',
+      (current.pending_review_count ?? 0) > 0 ? t('待复核 {count}', { count: current.pending_review_count ?? 0 }) : '',
       (current.audio_pending_rounds ?? 0) > 0 ? t('音频待复核 {count}', { count: current.audio_pending_rounds ?? 0 }) : '',
       current.mapping_error ? `${t('同步异常')}: ${current.mapping_error}` : '',
     ].filter(Boolean).join(' · ')
 
-    return (
-      <div title={fullTitle} style={{ display: 'flex', alignItems: 'center', gap: 10, fontVariantNumeric: 'tabular-nums', fontSize: 13, minWidth: 0, flex: 1, flexWrap: 'wrap' }}>
-        <style>{`@keyframes caPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(0.8)}}`}</style>
-
-        {/* ① 状态圆点 + 动词 */}
-        {dot}
-        <span style={{ fontWeight: 600, color: 'var(--text-50)', whiteSpace: 'nowrap', flexShrink: 0 }}>{ps.verb}</span>
-
-        {/* ② 进度条 + 时间 */}
-        {current.phase !== 'completed' && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: '0 1 260px', minWidth: 100 }}
-            title={t('直播实时跟进中，录制的终点持续向后移动；完成后补扫尾部，进度不会显示 100%')}>
-            <div style={{ flex: 1, maxWidth: 180, height: 4, background: 'var(--background-700)', borderRadius: 'var(--radius-xs, 6px)', overflow: 'hidden' }}>
-              <div style={{ width: `${confirmedPercent}%`, height: '100%', background: TONE_COLOR[ps.tone === 'idle' ? 'active' : ps.tone], borderRadius: 'var(--radius-xs, 6px)', transition: 'width 0.5s ease' }} />
+    const detailsContent = (
+      <div style={{ width: 280, fontSize: 12 }}>
+        <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-tertiary)', textTransform: 'uppercase', marginBottom: 8, paddingBottom: 4, borderBottom: '1px solid var(--border-default)' }}>
+          {t('底层扫描技术指标')}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {roomLabel && (
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-tertiary)' }}>{t('主房')}:</span>
+              <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>{roomLabel}</span>
             </div>
-            <span style={{ fontSize: 11, color: 'var(--text-400)', whiteSpace: 'nowrap' }}>
-              {!hasFixedScanRange && `${t('实时跟进')} `}
-              {formatDuration(analyzed)}/{formatDuration(recorded)}
-              {scanWindow ? ` · ${t('本窗 {from}–{to}', { from: formatDuration(scanWindow.from), to: formatDuration(scanWindow.to) })}` : ''}
-              {lagSec > 5 && current.running ? ` · ${t('滞后{lag}', { lag: formatDuration(lagSec) })}` : ''}
+          )}
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('滑动窗口')}:</span>
+            <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
+              {scanWindow ? `${formatDuration(scanWindow.from)} – ${formatDuration(scanWindow.to)}` : '–'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('推理设备')}:</span>
+            <span style={{ color: current.provider === 'CPUExecutionProvider' ? 'var(--state-warning)' : 'var(--state-success)', fontFamily: 'var(--font-mono)' }}>
+              {current.provider || 'DirectML'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('对齐滞后')}:</span>
+            <span style={{ color: lagSec > 5 ? 'var(--state-warning)' : 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
+              {lagSec > 1 ? formatDuration(lagSec) : t('正常 (实时跟进)')}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('实际覆盖速度')}:</span>
+            <span style={{ color: (current.net_coverage_throughput ?? 0) < 1 ? 'var(--state-warning)' : 'var(--state-success)', fontFamily: 'var(--font-mono)' }}>
+              {formatThroughput(current.net_coverage_throughput)}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('采样 / 视觉推理')}:</span>
+            <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
+              {formatFps(current.sample_fps)} / {formatFps(current.model_infer_fps)}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('视觉延迟 P90')}:</span>
+            <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
+              {Number.isFinite(current.model_infer_ms_p90) && (current.model_infer_ms_p90 ?? 0) > 0
+                ? `${Number(current.model_infer_ms_p90).toFixed(1)} ms`
+                : '–'}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('质量状态')}:</span>
+            <span style={{ color: current.analysis_quality_status === 'error' ? 'var(--state-error)' : current.analysis_quality_status === 'review' ? 'var(--state-warning)' : 'var(--state-success)' }}>
+              {current.analysis_quality_status === 'review'
+                ? t('待复核')
+                : current.analysis_quality_status === 'degraded'
+                  ? t('降级')
+                  : current.analysis_quality_status === 'error'
+                    ? t('异常')
+                    : t('正常')}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('粗扫吞吐')}:</span>
+            <span style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>
+              {formatThroughput(current.gross_scan_throughput)}
+            </span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-tertiary)' }}>{t('净覆盖速度')}:</span>
+            <span style={{ color: (current.net_coverage_throughput ?? 0) < 1 ? 'var(--state-warning)' : 'var(--state-success)', fontFamily: 'var(--font-mono)' }}>
+              {formatThroughput(current.net_coverage_throughput)}
+            </span>
+          </div>
+          {Boolean(current.round_phase || current.round_phase_detail) && (
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-tertiary)' }}>{t('对局阶段')}:</span>
+              <span style={{ color: 'var(--brand-500)' }}>
+                {current.round_phase_detail || t(ROUND_PHASE_LABEL[current.round_phase || ''] || '')}
+              </span>
+            </div>
+          )}
+          {(current.audio_pending_rounds ?? 0) > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-tertiary)' }}>{t('音频待复核')}:</span>
+              <span style={{ color: 'var(--state-warning)' }}>{current.audio_pending_rounds} {t('个')}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+
+    return (
+      <div
+        title={fullTitle}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 12,
+          fontVariantNumeric: 'tabular-nums',
+          fontSize: 12,
+          minWidth: 0,
+          width: 'fit-content',
+          background: 'var(--bg-secondary)',
+          border: '1px solid var(--border-default)',
+          borderRadius: 'var(--radius-xs, 6px)',
+          padding: '4px 12px',
+          boxShadow: 'var(--shadow-sm)',
+          flexWrap: 'nowrap',
+        }}
+      >
+        <style>{`
+          @keyframes caPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.85)}}
+        `}</style>
+
+        {/* ① 状态与核心战果 (Status & Highlights) */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          {/* 微型状态指示点 + 阶段文本 */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5,
+              padding: '2px 8px',
+              borderRadius: 4,
+              background: 'var(--bg-tertiary)',
+              border: '1px solid var(--border-default)',
+              fontSize: 11,
+              fontWeight: 600,
+              color: 'var(--text-primary)',
+            }}
+          >
+            <span
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: ps.tone === 'error' ? 'var(--state-error)' : ps.tone === 'warning' ? 'var(--state-warning)' : 'var(--brand-500)',
+                flexShrink: 0,
+                animation: dotAnimated ? 'caPulse 1.8s ease-in-out infinite' : 'none',
+              }}
+            />
+            <span>{ps.verb}</span>
+          </div>
+
+          {/* 核心战果回合统计 */}
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 4 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' }}>
+              {listed}
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+              {t('回合入列')}
+            </span>
+            {(current.confirmed_rounds ?? 0) > 0 && (
+              <span style={{ fontSize: 11, color: 'var(--brand-500)', fontWeight: 600, marginLeft: 2 }}>
+                （{t('可导 {count}', { count: current.confirmed_rounds ?? 0 })}）
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* 细分割线 */}
+        <div style={{ width: 1, height: 14, background: 'var(--border-default)', flexShrink: 0 }} />
+
+        {/* ② 实时时序与跟进窗口 (Timeline Duration) */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0, fontSize: 11 }}>
+          <span style={{ color: 'var(--text-tertiary)' }}>
+            {!hasFixedScanRange ? t('实时跟进') : t('扫描')}
+          </span>
+          <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 500, color: 'var(--text-secondary)' }}>
+            {formatDuration(analyzed)} / {formatDuration(recorded)}
+          </span>
+        </div>
+
+        {/* 细分割线 */}
+        <div style={{ width: 1, height: 14, background: 'var(--border-default)', flexShrink: 0 }} />
+
+        {/* ③ 紧凑 Hex 蜂窝粒子能量指示槽 (纯粒子能量槽，宽度 150px，高度 18px，数据完全外置) */}
+        {current.phase !== 'completed' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            <div style={{ width: 150 }}>
+              <HexParticleProgress
+                percent={confirmedPercent}
+                height={18}
+                rows={3}
+                dotRadius={1.8}
+                tone={ps.tone === 'error' ? 'error' : ps.tone === 'warning' ? 'warning' : 'brand'}
+                title={t('直播实时跟进中，录制的终点持续向后移动；完成后补扫尾部，进度不会显示 100%')}
+              />
+            </div>
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontWeight: 700,
+                fontSize: 11,
+                color: 'var(--brand-500)',
+                minWidth: 28,
+              }}
+            >
+              {Math.round(confirmedPercent)}%
             </span>
           </div>
         )}
 
-        {/* ③ 行动 Chip：仅显示需要用户操作的 */}
-        {pendingN > 0 && (
-          <Chip tone="warning" title={t('有待确认的切片，点击前往切片列表')} onClick={onGoToClips}>
-            {t('待调 {count}', { count: pendingN })}
-          </Chip>
+        {/* 细分割线（有行动项时显示） */}
+        {(pendingN > 0 || summary.failed > 0) && (
+          <div style={{ width: 1, height: 14, background: 'var(--border-default)', flexShrink: 0 }} />
         )}
-        {summary.failed > 0 && (
-          <Chip tone="warning" title={t('导出失败 {count} 个', { count: summary.failed })}>
-            {t('失败 {count}', { count: summary.failed })}
-          </Chip>
-        )}
-        {ps.nextAction === 'confirm' && pendingN === 0 && (
-          <Chip tone="warning" title={t('点击前往切片列表确认')} onClick={onGoToClips}>
-            {t('去确认')}
-          </Chip>
-        )}
+
+        {/* ④ 行动按钮与收拢详情入口 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+          {summary.failed > 0 && (
+            <span
+              style={{
+                padding: '2px 7px',
+                borderRadius: 4,
+                background: 'var(--bg-tertiary)',
+                border: '1px solid var(--border-default)',
+                color: 'var(--state-error)',
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+            >
+              {t('失败 {count}', { count: summary.failed })}
+            </span>
+          )}
+
+          {exportChip}
+
+          {/* 收尾失败但可恢复：提供一键从断点恢复补扫尾部回合（resume_continuous_finalization） */}
+          {(current.phase === 'error' || current.phase === 'checkpoint_saved')
+            && (current.finalization_recoverable || current.phase === 'checkpoint_saved')
+            && current.room_id && onResumeFinalization && (
+            <Chip
+              tone="brand"
+              title={t('收尾超时，点击从断点恢复补扫尾部回合')}
+              onClick={() => onResumeFinalization(current.room_id!)}
+            >
+              {t('恢复收尾')}
+            </Chip>
+          )}
+
+          {/* 细分割线 */}
+          <div style={{ width: 1, height: 14, background: 'var(--border-default)', flexShrink: 0, margin: '0 2px' }} />
+
+          {/* 详情收拢浮层 Popover */}
+          <Popover content={detailsContent} title={null} placement="bottomRight" trigger="hover">
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                padding: '2px 7px',
+                borderRadius: 4,
+                background: 'var(--bg-tertiary)',
+                border: '1px solid var(--border-default)',
+                color: 'var(--text-tertiary)',
+                fontSize: 11,
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+                userSelect: 'none',
+              }}
+            >
+              <span>ℹ</span>
+              <span>{t('详情')}</span>
+            </span>
+          </Popover>
+        </div>
       </div>
     )
   }

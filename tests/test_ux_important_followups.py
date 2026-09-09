@@ -8,10 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_align_failure_and_low_confidence_clear_align_group_id() -> None:
     """可信不足或低置信房间必须清除 align_group_id，避免分析门槛被旧组绕过。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
-    body = source.split("async def handle_align_preview_audio", 1)[1].split(
-        "async def handle_check_dependencies", 1
-    )[0]
+    source = (ROOT / "python-backend/handlers/alignment_handlers.py").read_text(encoding="utf-8")
+    body = source.split("@server.on('align_preview_audio')", 1)[1]
     assert "align_group_id = ''" in body or 'align_group_id = ""' in body
     # 失败路径（trusted < 2）也要清组
     fail_branch = body.split("if len(trusted) < 2:", 1)[1].split("import time as _align_time", 1)[0]
@@ -78,14 +76,14 @@ def test_mse_reconnect_uses_compute_preview_quality_params() -> None:
 
 def test_recording_queue_when_multiple_starting() -> None:
     """Semaphore 未 locked 但已有 ≥2 路正在启动时，新请求也应进入排队。"""
-    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    source = (ROOT / "python-backend/handlers/recording_handlers.py").read_text(encoding="utf-8")
     body = source.split("async def handle_start_recording", 1)[1].split(
-        "async def handle_stop_recording", 1
+        "@server.on('stop_recording')", 1
     )[0]
     assert "recording_queue" in body
-    assert "_recording_starting" in body
+    assert "recording_starting" in body
     # 排队条件不只看 locked()
-    assert "len(_recording_starting)" in body or "starting_others" in body
+    assert "len(recording_starting)" in body or "starting_others" in body
 
 
 def test_single_room_align_does_not_claim_success() -> None:

@@ -30,6 +30,7 @@ from lsc.analyzer.ocr_accel import (
     ffmpeg_hwaccel_args,
     read_settings_ocr_accel,
 )
+from lsc.platforms.redaction import redact_text
 
 _log = logging.getLogger(__name__)
 
@@ -50,16 +51,29 @@ _MIDSTREAM_STREAK = 3        # 中段切入：连续 N 帧交战钟且递减才�
 _MIDSTREAM_DECREASE_SEC = 1.0
 # 边界局部密扫：粗扫（1fps）定位候选后，±3s @5fps 精确定位转换首帧
 _REFINE_WINDOW_SEC = 3.0
+_REFINE_END_FALLBACK_WINDOW_SEC = 15.0
 _REFINE_FPS = 5.0
 _REFINE_RUN_FRAMES = 2       # 密扫连续帧确认阈值（5fps 下 2 帧即 0.4s）
 _REFINE_MAX_FRAMES_PER_BOUNDARY = 80  # 密扫单边界最大帧数：超限等距抽样兜底
 # 结算后 ≥此时长的非游戏段标注为回放（仅 broadcast 赛事流）
 _REPLAY_MIN_SEC = 5.0
 _NEW_ROUND_CLOCK_MIN = 85.0
+_NEW_ROUND_TIMER_RESET_SEC = 20.0
 _NEW_ROUND_AFTER_RESULT_SEC = 45.0
+_CENTER_SENTINEL_SEC = 4.0
+_ROI_CACHE_W = 160
+_ROI_DIFF_THRESHOLD = 2.0
+_ROI_CACHE_BLACKOUT_FRAMES = 2
 _CENTER_BANNER_SCALE = 3     # 中央横幅放大倍数（小图 OCR 对中文不稳）
-_TOP_BAND_RATIO = 0.12       # 顶部条占帧高比例
-_CENTER_CROP_RATIO = (0.34, 0.09, 0.32, 0.56)
+_TOP_BAND_RATIO = 0.12       # POV 顶部条占帧高比例
+_CENTER_CROP_RATIO = (0.34, 0.09, 0.32, 0.56)  # POV 中央横幅
+# broadcast 画面常有比分板缩放/黑边/赛事包装；保留 POV ROI，同时
+# 增加较宽的候选 ROI，避免用单一硬编码裁剪直接把 OCR 证据裁掉。
+_BROADCAST_TOP_BAND_RATIOS = (0.12, 0.18)
+_BROADCAST_CENTER_CROP_RATIOS = (
+    _CENTER_CROP_RATIO,
+    (0.20, 0.06, 0.60, 0.72),
+)
 
 _PREP_BANNER_KEYWORDS = (
     "购买阶段", "准备阶段", "购买",
@@ -128,30 +142,16 @@ def _apply_phase_cycle_prior(labels: list[str]) -> list[str]:
     return out
 
 
-def _read_top_anchors(frame_bgr: np.ndarray) -> tuple[float | None, int | None, int | None]:
-    """OCR 顶部条：回合计时器（m:ss）+ 左右比分；失败返回 None（绝不为 0）。"""
-    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
-        return None, None, None
-    try:
-        from lsc.analyzer.ocr_detector import _get_ocr
+def _parse_top_anchor_lines(
+    confident_lines: list,
+) -> tuple[float | None, int | None, int | None]:
+    """从顶部条 OCR 行解析 (timer_seconds, left_score, right_score)。
 
-        ocr = _get_ocr()
-    except Exception as exc:  # noqa: BLE001
-        _log.debug("top OCR unavailable: %s", exc)
-        return None, None, None
-
-    crop_h = max(1, int(frame_bgr.shape[0] * _TOP_BAND_RATIO))
-    top = frame_bgr[:crop_h, :]
-    try:
-        result_ocr, _ = ocr(top)
-    except Exception as exc:  # noqa: BLE001
-        _log.debug("top OCR failed: %s", exc)
-        return None, None, None
-
-    confident_lines = [line for line in (result_ocr or []) if len(line) >= 3 and line[2] >= 0.40]
+    与多 ROI 抽帧解耦，供 _read_top_anchors 在每个 ROI 后增量判断是否已拿到
+    完整读数（early-exit），以及最终合并解析。行为与原内联解析完全一致。
+    """
     if not confident_lines:
         return None, None, None
-
     timer_seconds: float | None = None
     score_candidates: list[tuple[float, int]] = []
     timer_pattern = re.compile(r"(\d{1,2})\s*:\s*(\d{2})")
@@ -176,7 +176,6 @@ def _read_top_anchors(frame_bgr: np.ndarray) -> tuple[float | None, int | None, 
                 except (TypeError, ValueError, IndexError, ZeroDivisionError):
                     x_center = float(len(score_candidates))
                 score_candidates.append((x_center, value))
-
     left_score: int | None = None
     right_score: int | None = None
     if len(score_candidates) >= 2:
@@ -188,33 +187,113 @@ def _read_top_anchors(frame_bgr: np.ndarray) -> tuple[float | None, int | None, 
     return timer_seconds, left_score, right_score
 
 
-def _read_center_banner(frame_bgr: np.ndarray) -> tuple[bool, bool]:
-    """OCR 中央横幅竖带：返回 (prep_banner, end_banner)。"""
-    h, w = frame_bgr.shape[:2]
-    x = int(w * _CENTER_CROP_RATIO[0])
-    y = int(h * _CENTER_CROP_RATIO[1])
-    bw = int(w * _CENTER_CROP_RATIO[2])
-    bh = int(h * _CENTER_CROP_RATIO[3])
-    crop = frame_bgr[y : y + bh, x : x + bw]
-    if crop.size == 0:
-        return False, False
-    try:
-        import cv2
+def _read_top_anchors(
+    frame_bgr: np.ndarray,
+    source_profile: str | None = None,
+) -> tuple[float | None, int | None, int | None]:
+    """OCR 顶部条：计时器（m:ss）+ 左右比分；失败返回 None（绝不为 0）。
 
-        crop = cv2.resize(crop, (bw * _CENTER_BANNER_SCALE, bh * _CENTER_BANNER_SCALE))
-    except ImportError:
-        pass
+    broadcast 使用两个高度候选，但仍优先保留原 POV ROI；这样赛事包装/黑边
+    改变有效坐标时不会把唯一证据裁掉。
+    """
+    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+        return None, None, None
     try:
         from lsc.analyzer.ocr_detector import _get_ocr
 
         ocr = _get_ocr()
-        result_ocr, _ = ocr(crop)
     except Exception as exc:  # noqa: BLE001
-        _log.debug("center banner OCR failed: %s", exc)
-        return False, False
-    text = " ".join(
-        str(line[1]) for line in (result_ocr or []) if len(line) >= 3 and line[2] >= 0.40
+        _log.debug("top OCR unavailable: %s", exc)
+        return None, None, None
+
+    profile = str(source_profile or "pov").lower()
+    ratios = _BROADCAST_TOP_BAND_RATIOS if profile == "broadcast" else (_TOP_BAND_RATIO,)
+    all_lines: list = []
+    for index, ratio in enumerate(ratios):
+        crop_h = max(1, int(frame_bgr.shape[0] * ratio))
+        try:
+            result_ocr, _ = ocr(frame_bgr[:crop_h, :])
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("top OCR failed profile=%s ratio=%.2f: %s", profile, ratio, exc)
+            continue
+        all_lines.extend(
+            line for line in (result_ocr or [])
+            if len(line) >= 3 and line[2] >= 0.40
+        )
+        # early-exit：主 ROI（首个、最紧的 POV ROI）已拿到完整读数（计时器 +
+        # 双比分）时，跳过更宽的候选 ROI。宽 ROI 是为赛事黑边/包装 shift
+        # 兜底；主 ROI 完整时它只会多一次昂贵 OCR 并可能引入冗余行污染比分
+        # 排序。读数不完整时才继续跑宽 ROI 兜底（与原多 ROI 行为一致）。
+        if index < len(ratios) - 1:
+            _t, _l, _r = _parse_top_anchor_lines(all_lines)
+            if _t is not None and _l is not None and _r is not None:
+                break
+
+    return _parse_top_anchor_lines(all_lines)
+
+
+def _read_center_banner(
+    frame_bgr: np.ndarray,
+    source_profile: str | None = None,
+) -> tuple[bool, bool]:
+    """OCR 中央横幅候选 ROI：返回 (prep_banner, end_banner)。"""
+    h, w = frame_bgr.shape[:2]
+    profile = str(source_profile or "pov").lower()
+    ratios = (
+        _BROADCAST_CENTER_CROP_RATIOS
+        if profile == "broadcast"
+        else (_CENTER_CROP_RATIO,)
     )
+    try:
+        from lsc.analyzer.ocr_detector import _get_ocr
+
+        ocr = _get_ocr()
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("center banner OCR unavailable: %s", exc)
+        return False, False
+
+    texts: list[str] = []
+    for index, ratio in enumerate(ratios):
+        x = int(w * ratio[0])
+        y = int(h * ratio[1])
+        bw = int(w * ratio[2])
+        bh = int(h * ratio[3])
+        crop = frame_bgr[y : y + bh, x : x + bw]
+        if crop.size == 0:
+            continue
+        try:
+            import cv2
+
+            crop = cv2.resize(crop, (bw * _CENTER_BANNER_SCALE, bh * _CENTER_BANNER_SCALE))
+        except ImportError:
+            pass
+        try:
+            result_ocr, _ = ocr(crop)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug(
+                "center banner OCR failed profile=%s ratio=%s: %s",
+                profile,
+                ratio,
+                exc,
+            )
+            continue
+        texts.extend(
+            str(line[1])
+            for line in (result_ocr or [])
+            if len(line) >= 3 and line[2] >= 0.40
+        )
+        # early-exit：首个 ROI 已命中横幅关键词即跳过更宽候选。关键词是
+        # any 匹配，更宽 ROI 只会重复命中同一横幅；未命中才继续跑宽 ROI
+        # 兜底赛事包装/黑边 shift（与原多 ROI 行为一致）。
+        if index < len(ratios) - 1 and texts:
+            _joined = " ".join(texts).lower()
+            if (
+                any(k in _joined for k in _PREP_BANNER_KEYWORDS)
+                or any(k in _joined for k in _END_BANNER_KEYWORDS)
+            ):
+                break
+
+    text = " ".join(texts)
     if not text:
         return False, False
     lower = text.lower()
@@ -223,6 +302,36 @@ def _read_center_banner(frame_bgr: np.ndarray) -> tuple[bool, bool]:
     if prep or end:
         _log.debug("center_banner ts_text=%s prep=%s end=%s", text[:60], prep, end)
     return prep, end
+
+
+def _read_top_anchors_for_profile(
+    frame_bgr: np.ndarray,
+    source_profile: str | None,
+) -> tuple[float | None, int | None, int | None]:
+    """Call the profile-aware OCR reader while keeping legacy test hooks valid."""
+    if str(source_profile or "").lower() != "broadcast":
+        return _read_top_anchors(frame_bgr)
+    try:
+        return _read_top_anchors(frame_bgr, "broadcast")
+    except TypeError as exc:
+        # Existing plugins/tests may inject the historical one-argument reader.
+        if "argument" not in str(exc).lower() and "positional" not in str(exc).lower():
+            raise
+        return _read_top_anchors(frame_bgr)
+
+
+def _read_center_banner_for_profile(
+    frame_bgr: np.ndarray,
+    source_profile: str | None,
+) -> tuple[bool, bool]:
+    if str(source_profile or "").lower() != "broadcast":
+        return _read_center_banner(frame_bgr)
+    try:
+        return _read_center_banner(frame_bgr, "broadcast")
+    except TypeError as exc:
+        if "argument" not in str(exc).lower() and "positional" not in str(exc).lower():
+            raise
+        return _read_center_banner(frame_bgr)
 
 
 @dataclass
@@ -262,6 +371,9 @@ class OcrRoundFSM:
         self._mid_streak = 0
         self._mid_first_timer: float | None = None
         self._mid_start_ts: float | None = None
+        # 用于识别“错过准备阶段后重新出现的满回合计时器”，避免把
+        # 同一回合内的正常交战钟误认为新回合。
+        self._last_raw_timer: float | None = None
 
     def clone(self) -> OcrRoundFSM:
         other = OcrRoundFSM()
@@ -275,13 +387,30 @@ class OcrRoundFSM:
         timer: float | None,
         timer_raw: bool = False,
         cand_ts: float | None = None,
+        prep_banner: bool | None = None,
+        broadcast_mode: bool = False,
     ) -> list[dict[str, Any]]:
         """推进一帧，返回本帧新闭合的回合（正常 0/1）。
 
         timer_raw：本帧计时器是否来自原始 OCR 读数（外推值不得触发新回合判定）。
         cand_ts：交战钟连续确认的首帧真实 PTS（入点回溯，消除两帧确认带来的延迟）。
+        prep_banner：本帧是否由中央“购买/准备阶段”横幅确认；直接调用 FSM 的
+            旧测试不传此值时保持兼容，真实 OCR 路径会传入实际值。
         """
         closed: list[dict[str, Any]] = []
+
+        strong_prep_signal = True if prep_banner is None else bool(prep_banner)
+        fresh_clock = (
+            timer_raw
+            and timer is not None
+            and self._last_raw_timer is not None
+            and float(timer) >= _NEW_ROUND_CLOCK_MIN
+            and float(timer) - float(self._last_raw_timer) >= _NEW_ROUND_TIMER_RESET_SEC
+            and self._combat_start is not None
+            and ts - self._combat_start >= _MIN_PREP_AFTER_COMBAT_SEC
+        )
+        if timer_raw and timer is not None:
+            self._last_raw_timer = float(timer)
 
         if self._state == _State.WAIT:
             if label == "prep":
@@ -314,6 +443,24 @@ class OcrRoundFSM:
             return closed
 
         if self._state == _State.COMBAT:
+            if label == "combat" and fresh_clock:
+                if broadcast_mode:
+                    _log.info(
+                        "赛事回放保护：忽略未伴随准备阶段的新交战钟 (state=COMBAT, ts=%.1f, timer=%.1f)",
+                        ts,
+                        float(timer) if timer is not None else -1.0,
+                    )
+                    return closed
+                # 准备阶段漏检时，新的满回合计时器是比低计时器更可靠的
+                # 分界信号。旧回合以 pending 闭合，避免提前确认或吞掉新回合。
+                close = self._close(
+                    end=cand_ts if cand_ts is not None else ts,
+                    end_by="next_combat",
+                )
+                if close is not None:
+                    closed.append(close)
+                self._open_combat(cand_ts if cand_ts is not None else ts)
+                return closed
             if label == "settle":
                 self._state = _State.SETTLE
                 self._result_ts = ts
@@ -362,6 +509,29 @@ class OcrRoundFSM:
                     self._state = _State.PREP
                 return closed
             if label == "combat":
+                if broadcast_mode:
+                    if not timer_raw or timer is None:
+                        return closed
+                    _since_result = (ts - self._result_ts) if self._result_ts is not None else None
+                    _fresh_clock = fresh_clock
+                    _late_raw_combat = (
+                        _is_combat_timer(timer)
+                        and _since_result is not None
+                        and _since_result >= _NEW_ROUND_AFTER_RESULT_SEC
+                    )
+                    if (_fresh_clock or _late_raw_combat) and (
+                        _since_result is None or _since_result >= _PREP_AFTER_RESULT_SEC
+                    ):
+                        close = self._close(end=cand_ts if cand_ts is not None else ts, end_by="next_combat")
+                        if close is not None:
+                            closed.append(close)
+                            _log.info(
+                                "赛事 SETTLE 未见准备阶段，降级闭合 next_combat (ts=%.1f, timer=%.1f)",
+                                ts,
+                                float(timer),
+                            )
+                        self._open_combat(cand_ts if cand_ts is not None else ts)
+                    return closed
                 # 错过准备信号直接见新交战钟：以降级出点 next_combat 闭合旧回合
                 # （pending，可入列待调），再开新回合——禁止整回合放弃造成长空窗漏检。
                 # 外推残余钟（timer_raw=False）永不触发；须原始读数：
@@ -370,7 +540,12 @@ class OcrRoundFSM:
                 _since_result = (ts - self._result_ts) if self._result_ts is not None else None
                 if not timer_raw or timer is None:
                     return closed
-                _fresh_clock = float(timer) >= _NEW_ROUND_CLOCK_MIN
+                # 已经进入 SETTLE 且距结算足够久时，满钟本身就是新回合信号；
+                # 不再要求与上一读数相差固定阈值，兼容跨窗口缺少中间读数的情况。
+                _fresh_clock = (
+                    fresh_clock
+                    or float(timer) >= _NEW_ROUND_CLOCK_MIN
+                )
                 _late_raw_combat = (
                     _is_combat_timer(timer)
                     and _since_result is not None
@@ -464,16 +639,20 @@ def _refine_boundary_ts(
     *,
     min_start_ts: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    window_sec: float | None = None,
+    source_profile: str | None = None,
 ) -> float | None:
     """边界局部密扫：粗扫候选 ±3s @5fps，找连续 ≥2 帧目标标签游程的首帧真实 PTS。
 
-    target="combat"：交战钟（>45s）首现帧；target="prep"：准备信号（≤45s 或横幅）首现帧。
+    target="combat"：交战钟（>45s）首现帧；target="prep"：准备信号（≤45s 或横幅）首现帧；
+    target="end_or_prep"：结束横幅或准备横幅首现帧，用于纠正无结算信号时的早出点。
     min_start_ts：游程首帧不得早于该时刻（prep 密扫排除结算画面低倒计时）。
     密扫失败返回 None（保留粗扫值，宁用粗值不丢回合）。
     优化：combat 密扫跳过中央横幅 OCR，prep 密扫优先读顶部计时器并支持提前退出。
     """
-    t0 = max(0.0, float(center_ts) - _REFINE_WINDOW_SEC)
-    t1 = float(center_ts) + _REFINE_WINDOW_SEC
+    refine_window = _REFINE_WINDOW_SEC if window_sec is None else max(0.0, float(window_sec))
+    t0 = max(0.0, float(center_ts) - refine_window)
+    t1 = float(center_ts) + refine_window
     try:
         frames = extract_frames_cancellable(
             video_path,
@@ -500,25 +679,35 @@ def _refine_boundary_ts(
             return None
         if target == "combat":
             try:
-                timer, _, _ = _read_top_anchors(img)
+                timer, _, _ = _read_top_anchors_for_profile(img, source_profile)
             except Exception as exc:  # noqa: BLE001
                 _log.debug("边界密扫 top OCR 失败: %s", exc)
                 run = 0
                 run_start = None
                 continue
             hit = timer is not None and _is_combat_timer(timer)
+        elif target == "end_or_prep":
+            try:
+                prep_banner, end_banner = _read_center_banner_for_profile(img, source_profile)
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("边界密扫 end/prep OCR 失败: %s", exc)
+                prep_banner = False
+                end_banner = False
+            hit = (prep_banner or end_banner) and (
+                min_start_ts is None or ts >= float(min_start_ts)
+            )
         else:
             # target == "prep"
             timer = None
             try:
-                timer, _, _ = _read_top_anchors(img)
+                timer, _, _ = _read_top_anchors_for_profile(img, source_profile)
             except Exception as exc:  # noqa: BLE001
                 _log.debug("边界密扫 top OCR 失败: %s", exc)
             if timer is not None and _is_prep_timer(timer):
                 hit = min_start_ts is None or ts >= float(min_start_ts)
             else:
                 try:
-                    prep_banner, _ = _read_center_banner(img)
+                    prep_banner, _ = _read_center_banner_for_profile(img, source_profile)
                 except Exception as exc:  # noqa: BLE001
                     _log.debug("边界密扫 center OCR 失败: %s", exc)
                     prep_banner = False
@@ -535,7 +724,10 @@ def _refine_boundary_ts(
     return None
 
 
-def _annotate_replay(round_data: dict[str, Any], labels: list[tuple[float, str, float | None, bool]]) -> None:
+def _annotate_replay(
+    round_data: dict[str, Any],
+    labels: list[tuple[float, str, float | None, bool, float | None]],
+) -> None:
     """结算后 ≥5s 的 neutral 段标注为回放（赛事流特征），非游戏阶段透明。"""
     result_ts = round_data.get("result_ts")
     if result_ts is None:
@@ -544,7 +736,13 @@ def _annotate_replay(round_data: dict[str, Any], labels: list[tuple[float, str, 
     segs: list[list[float]] = []
     run_start: float | None = None
     last_neutral_ts: float | None = None
-    for ts, label, _, _ in labels:
+    # 当前 OCR 标签包含五项：(ts, label, timer, timer_raw, combat_cand_ts)。
+    # 这里仅需要前两项，不能再按旧版四元组解包，否则 broadcast profile
+    # 会在每个扫描窗口触发 "too many values to unpack" 并丢弃全部回合。
+    for row in labels:
+        if len(row) < 2:
+            continue
+        ts, label = row[0], row[1]
         if ts < float(result_ts) or ts > end:
             continue
         if label == "neutral":
@@ -577,6 +775,7 @@ def refine_valorant_round_boundaries(
     *,
     cancel_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[str, float, str], None] | None = None,
+    source_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """对已闭合回合做边界局部密扫（±3s@10fps），返回新列表（原地亦可）。
 
@@ -584,27 +783,67 @@ def refine_valorant_round_boundaries(
     """
     if not rounds:
         return []
+    from lsc.utils.helpers import resolve_real_video_path
+    video_path = resolve_real_video_path(video_path)
     out = [dict(r) for r in rounds]
     total = len(out)
     t0 = time.monotonic()
+
+    def _call_refine(
+        center: float,
+        target: str,
+        *,
+        min_start_ts: float | None = None,
+        window_sec: float | None = None,
+    ) -> float | None:
+        kwargs: dict[str, Any] = {"cancel_check": cancel_check}
+        if min_start_ts is not None:
+            kwargs["min_start_ts"] = min_start_ts
+        if window_sec is not None:
+            kwargs["window_sec"] = window_sec
+        if source_profile:
+            kwargs["source_profile"] = source_profile
+        try:
+            return _refine_boundary_ts(
+                video_path, ffmpeg_path, center, target, **kwargs,
+            )
+        except TypeError as exc:
+            # 保持第三方/旧版插件注入的一参签名可用；真实 reader 支持 profile。
+            if "source_profile" not in str(exc):
+                raise
+            kwargs.pop("source_profile", None)
+            return _refine_boundary_ts(
+                video_path, ffmpeg_path, center, target, **kwargs,
+            )
+
     for idx, r in enumerate(out, 1):
         if cancel_check and cancel_check():
             break
         if progress_callback and total:
             progress_callback("refine", idx / max(total, 1), f"边界精修 {idx}/{total}")
-        start_ts = _refine_boundary_ts(
-            video_path, ffmpeg_path, float(r["start"]), "combat", cancel_check=cancel_check,
-        )
+        start_ts = _call_refine(float(r["start"]), "combat")
         if start_ts is not None:
             r["start"] = round(start_ts, 3)
         if r.get("confirm_status") == "vision_confirmed" and r.get("end_by") == "next_prep":
             _min_prep_ts = None
             if r.get("result_ts") is not None:
                 _min_prep_ts = float(r["result_ts"]) + _PREP_AFTER_RESULT_SEC
-            end_ts = _refine_boundary_ts(
-                video_path, ffmpeg_path, float(r["end"]), "prep",
-                min_start_ts=_min_prep_ts, cancel_check=cancel_check,
-            )
+            if r.get("result_ts") is None:
+                # 无比分/结束横幅时，粗扫的 next_prep 可能是交战中的低计时器
+                # 误读。向后扩大窗口寻找真正的结束/准备横幅，避免只在错误点
+                # 附近 ±3s 内重复确认同一个误读。
+                end_ts = _call_refine(
+                    float(r["end"]),
+                    "end_or_prep",
+                    min_start_ts=float(r["end"]),
+                    window_sec=_REFINE_END_FALLBACK_WINDOW_SEC,
+                )
+            else:
+                end_ts = _call_refine(
+                    float(r["end"]),
+                    "prep",
+                    min_start_ts=_min_prep_ts,
+                )
             if end_ts is not None and end_ts > float(r["start"]) + _MIN_ROUND_SEC:
                 r["end"] = round(end_ts, 3)
         r["boundary_refined"] = True
@@ -633,12 +872,16 @@ def detect_valorant_rounds_ocr(
     source_profile: str | None = None,
     ocr_sample_interval: float = 1.0,
     refine_boundaries: bool = True,
+    fast_mode: bool = False,
 ) -> list[dict[str, Any]]:
     """ocr_sample_interval 秒抽一帧 → fps；默认 1.0 = 1fps，保持既有全量分析行为。
 
     refine_boundaries：是否立即做边界密扫。持续分析增量传 False，先入列粗边界，
     再由 Worker 调用 refine_valorant_round_boundaries 异步精修。
+    fast_mode：实时追赶时保留顶部逐帧 OCR，中央横幅降低为隔帧采样；收尾不得启用。
     """
+    from lsc.utils.helpers import resolve_real_video_path
+    video_path = resolve_real_video_path(video_path)
     if not os.path.isfile(video_path):
         _log.warning("视频文件不存在: %s", video_path)
         return []
@@ -654,6 +897,9 @@ def detect_valorant_rounds_ocr(
         return []
 
     state = runtime_state if runtime_state is not None else {}
+    # 上层只有在至少抽到一帧时才能登记 coverage；空输出可能是文件尾部
+    # 尚未写稳或 FFmpeg 解码失败，不能被当作成功扫描。
+    state["scan_succeeded"] = False
     last_processed_ts = float(state.get("last_processed_ts", -1.0))
 
     # OCR 预热：避免首窗懒加载撞上推理引擎争用导致读取率 0
@@ -691,8 +937,22 @@ def detect_valorant_rounds_ocr(
     # 出现空档（钟走完）后再见准备/交战，或中央准备横幅 / 满钟新回合。
     post_settle_hold = bool(state.get("post_settle_hold", False))
     post_settle_gap = bool(state.get("post_settle_gap", False))
+    settle_result_ts: float | None = state.get("settle_result_ts")
+    _center_sentinel_raw = state.get("center_sentinel_sec")
+    center_sentinel_sec = (
+        float(_center_sentinel_raw)
+        if _center_sentinel_raw is not None
+        else _CENTER_SENTINEL_SEC
+    )
+    roi_cache_enabled = bool(state.get("roi_cache_enabled", True))
+    next_center_sample_ts = float(state.get("next_center_sample_ts", -1.0))
+    prev_top_roi = state.get("prev_top_roi")
+    prev_top_result = state.get("prev_top_result", (None, None, None))
+    prev_center_roi = state.get("prev_center_roi")
+    _top_cache_blackout = int(state.get("_top_cache_blackout", 0) or 0)
 
     labels: list[tuple[float, str, float | None, bool, float | None]] = []
+    prep_banner_flags: list[bool] = []
     closed_rounds: list[dict[str, Any]] = []
 
     # 子窗口分块扫描：整窗抽帧会把追赶窗（最长 480s @1fps ≈ 330MB）帧全部驻留
@@ -704,7 +964,7 @@ def detect_valorant_rounds_ocr(
     any_frames = False
     while sub_start < scan_end:
         sub_end = min(scan_end, sub_start + _SUB_WINDOW_SEC)
-        frames = extract_frames_cancellable(
+        extracted_frames = extract_frames_cancellable(
             video_path,
             start_sec=sub_start,
             end_sec=sub_end,
@@ -713,17 +973,125 @@ def detect_valorant_rounds_ocr(
             cancel_check=cancel_check,
             overlap_sec=2.0,
         )
-        frames = [item for item in frames if item[0] > last_processed_ts + 0.001]
+        if extracted_frames:
+            # 即使全部帧因跨窗口去重被过滤，FFmpeg 也已成功读到该窗口。
+            any_frames = True
+        frames = [item for item in extracted_frames if item[0] > last_processed_ts + 0.001]
         if not frames:
             sub_start = sub_end
             continue
-        any_frames = True
+
         total_frames += len(frames)
-        for _, (ts, img) in enumerate(frames):
+        for frame_index, (ts, img) in enumerate(frames):
             if cancel_check and cancel_check():
                 raise FFmpegCancelled("cancelled during ocr scan")
-            raw_timer, left, right = _read_top_anchors(img)
-            prep_banner, end_banner = _read_center_banner(img)
+
+            try:
+                import cv2
+
+                _top_h = max(
+                    1,
+                    int(
+                        img.shape[0]
+                        * (
+                            _BROADCAST_TOP_BAND_RATIOS[0]
+                            if source_profile == "broadcast"
+                            else _TOP_BAND_RATIO
+                        )
+                    ),
+                )
+                _top_roi = cv2.resize(
+                    img[:_top_h, :],
+                    (_ROI_CACHE_W, max(1, int(_ROI_CACHE_W * (_top_h / max(1, img.shape[1]))))),
+                )
+            except Exception:  # noqa: BLE001 - cv2 缺失/形状异常时退化为每帧 OCR
+                _top_roi = None
+            is_dummy_frame = img is None or not img.any()
+            _top_changed = (
+                is_dummy_frame
+                or prev_top_roi is None
+                or _top_roi is None
+                or float(
+                    np.abs(_top_roi.astype(np.int16) - prev_top_roi.astype(np.int16)).mean()
+                ) > _ROI_DIFF_THRESHOLD
+            )
+            if _top_changed or _top_cache_blackout > 0 or not roi_cache_enabled:
+                raw_timer, left, right = _read_top_anchors_for_profile(img, source_profile)
+            else:
+                raw_timer, left, right = prev_top_result
+            _top_cache_blackout = max(0, _top_cache_blackout - 1)
+            if (raw_timer, left, right) != prev_top_result:
+                # 读数变化 = 画面在动（帧差阈值可能吞掉局部数字变化），
+                # 黑名单续期，未来几帧强制真实 OCR，禁止复用旧读数。
+                _top_cache_blackout = _ROI_CACHE_BLACKOUT_FRAMES
+            prev_top_roi = _top_roi
+            prev_top_result = (raw_timer, left, right)
+            # 中央横幅是高成本 OCR（A-04）。顶部计时器保持逐帧读取（1fps 由
+            # 抽帧保证），中央横幅改为「哨兵 + 事件触发」采样：
+            #   每 center_sentinel_sec 一次哨兵 + 计时器跳变 + 比分变化 +
+            #   post_settle_hold（结算关键期）+ FSM SETTLE（上帧状态，1 帧延迟可接受）。
+            # 收尾（finalize）为出点精度保持逐帧采样。
+            timer_jump = (
+                raw_timer is not None
+                and last_raw_timer is not None
+                and (
+                    float(raw_timer) - float(last_raw_timer) >= _NEW_ROUND_TIMER_RESET_SEC
+                    or abs(float(raw_timer) - float(last_raw_timer)) > 5.0
+                )
+            )
+            score_changed = (
+                (left is not None and prev_left is not None and left != prev_left)
+                or (right is not None and prev_right is not None and right != prev_right)
+            )
+            sample_center = (
+                is_dummy_frame
+                or finalize
+                or center_sentinel_sec <= 0.0
+                or ts >= next_center_sample_ts
+                or timer_jump
+                or score_changed
+                or post_settle_hold
+                or fsm._state == _State.SETTLE
+            )
+            if sample_center:
+                # 哨兵帧画面未变（中央 ROI 复用缓存）：横幅是瞬态出现物，
+                # 画面无变化即无横幅，直接复用 False，省一次昂贵中央 OCR。
+                try:
+                    import cv2
+
+                    _cratio = (
+                        _BROADCAST_CENTER_CROP_RATIOS[0]
+                        if source_profile == "broadcast"
+                        else _CENTER_CROP_RATIO
+                    )
+                    _ch, _cw = img.shape[:2]
+                    _cx = int(_cw * _cratio[0])
+                    _cy = int(_ch * _cratio[1])
+                    _cbw = int(_cw * _cratio[2])
+                    _cbh = int(_ch * _cratio[3])
+                    _center_roi = cv2.resize(
+                        img[_cy : _cy + _cbh, _cx : _cx + _cbw],
+                        (_ROI_CACHE_W, max(1, int(_ROI_CACHE_W * (_cbh / max(1, _cbw))))),
+                    )
+                except Exception:  # noqa: BLE001
+                    _center_roi = None
+                _center_changed = (
+                    is_dummy_frame
+                    or prev_center_roi is None
+                    or _center_roi is None
+                    or float(
+                        np.abs(_center_roi.astype(np.int16) - prev_center_roi.astype(np.int16)).mean()
+                    ) > _ROI_DIFF_THRESHOLD
+                )
+                if _center_changed:
+                    prep_banner, end_banner = _read_center_banner_for_profile(img, source_profile)
+                else:
+                    prep_banner, end_banner = False, False
+                prev_center_roi = _center_roi
+            else:
+                prep_banner, end_banner = False, False
+            if sample_center and ts >= next_center_sample_ts:
+                next_center_sample_ts = ts + center_sentinel_sec
 
             # ── 计时器可信度（相近相似原则） ──
             timer = raw_timer
@@ -842,6 +1210,7 @@ def detect_valorant_rounds_ocr(
                 combat_cand_ts = None
                 post_settle_hold = True
                 post_settle_gap = False
+                settle_result_ts = ts
                 label = "settle"
             elif post_settle_hold:
                 # 结算后残余倒计时会从 50 连降到 ≤45，不得当成买枪准备（否则出点
@@ -898,6 +1267,7 @@ def detect_valorant_rounds_ocr(
             else:
                 label = "neutral"
             labels.append((ts, label, timer, timer_raw, combat_cand_ts))
+            prep_banner_flags.append(bool(prep_banner))
 
             _log.debug(
                 "ocr_label ts=%.1f label=%s timer=%s raw=%s anchor=%s hold=%s gap=%s",
@@ -915,11 +1285,21 @@ def detect_valorant_rounds_ocr(
 
     if not any_frames:
         return []
+    state["scan_succeeded"] = True
 
     # 循环先验平滑（帧级，仅删孤立 combat 噪点，不补缝——非游戏阶段透明）
     smoothed = _apply_phase_cycle_prior([label for _, label, _, _, _ in labels])
-    for (ts, _, timer, timer_raw, cand_ts), label in zip(labels, smoothed, strict=True):
-        closed = fsm.feed(label, ts, timer, timer_raw=timer_raw, cand_ts=cand_ts)
+    for (ts, _, timer, timer_raw, cand_ts), label, prep_banner in zip(
+        labels, smoothed, prep_banner_flags, strict=True
+    ):
+        closed = fsm.feed(
+            label,
+            ts,
+            timer,
+            timer_raw=timer_raw,
+            cand_ts=cand_ts,
+            prep_banner=prep_banner,
+        )
         if closed:
             closed_rounds.extend(closed)
 
@@ -936,6 +1316,7 @@ def detect_valorant_rounds_ocr(
             ffmpeg_path,
             cancel_check=cancel_check,
             progress_callback=progress_callback,
+            source_profile=source_profile,
         )
     else:
         for r in closed_rounds:
@@ -973,6 +1354,8 @@ def detect_valorant_rounds_ocr(
     state["timer_streak"] = timer_streak
     state["timer_streak_val"] = timer_streak_val
     state["last_processed_ts"] = last_processed_ts
+    state["next_center_sample_ts"] = next_center_sample_ts
+    state["settle_result_ts"] = settle_result_ts
 
     for r in closed_rounds:
         if source_profile:
@@ -1009,6 +1392,9 @@ def extract_frames_cancellable(
     scan_duration = max(0.0, scan_end - scan_start)
     if scan_duration <= 0.0:
         return []
+
+    from lsc.utils.helpers import resolve_real_video_path
+    video_path = resolve_real_video_path(video_path)
 
     try:
         import cv2
@@ -1137,7 +1523,9 @@ def extract_frames_cancellable(
             pass
         finally:
             if cancelled:
-                proc.kill()
+                from lsc.utils.process_launcher import kill_process_tree
+
+                kill_process_tree(proc)
             proc.wait(timeout=10)
             stderr_thread.join(timeout=5)
 
@@ -1146,10 +1534,20 @@ def extract_frames_cancellable(
 
         if proc.returncode != 0 and not frames:
             last_err = b"".join(stderr_chunks).decode("utf-8", errors="replace")[-500:]
+            safe_err = redact_text(last_err.replace("\r", " ").replace("\n", " | "))
             if attempt_i + 1 < len(attempts):
-                _log.warning("frame extract hwaccel 失败 (code=%s)，回退软解", proc.returncode)
+                _log.warning(
+                    "frame extract hwaccel 失败 (code=%s attempt=%d/%d raw=%s)，回退软解；stderr=%s",
+                    proc.returncode,
+                    attempt_i + 1,
+                    len(attempts),
+                    is_raw,
+                    safe_err or "<empty>",
+                )
                 continue
-            raise RuntimeError(f"frame extract failed rc={proc.returncode}: {last_err}")
+            raise RuntimeError(
+                f"frame extract failed rc={proc.returncode}: {safe_err}"
+            )
 
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
         precise_timestamps: list[float] = []

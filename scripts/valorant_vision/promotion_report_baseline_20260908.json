@@ -1,0 +1,17 @@
+{
+  "report_version": 1,
+  "model_sha256": "e477222567f9e58d8e420f846b3c65f05b7aef24b0f8ed2c95b7511b862766bf",
+  "evaluation_mode": "plain_frame",
+  "gates_passed": false,
+  "gate_failures": [
+    {
+      "check": "production_equivalent_evaluation_missing",
+      "message": "baseline retained until broadcast_runtime evaluation on an independent multi-session test set"
+    }
+  ],
+  "data_summary": {
+    "note": "This is a rollback baseline marker, not a promotion approval.",
+    "source_sessions_by_type": {}
+  },
+  "promotion_state": "baseline"
+}

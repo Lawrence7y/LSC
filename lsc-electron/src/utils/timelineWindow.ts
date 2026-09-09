@@ -3,12 +3,16 @@
  * 与 CLAUDE.md §8.7 一致：只用 preview/common 轴秒，禁止录制墙钟推窗。
  */
 import { panTimelineWindowStart } from '@/utils/timelineCoords'
+import {
+  DEFAULT_TIMELINE_REPLAY_SECONDS,
+  normalizeReplayBufferSeconds,
+} from '@/utils/replaySettings'
 
 /** 长内容默认滑窗上限（秒）；1x Live 时不再使用，整段从 0 压缩。 */
 export const TIMELINE_MAX_WINDOW = 600
 
 /** 紫线 / 预览条左端：liveEdge − 此时长（秒）。 */
-export const DVR_LOOKBACK_SEC = 120
+export const DVR_LOOKBACK_SEC = DEFAULT_TIMELINE_REPLAY_SECONDS // DVR_LOOKBACK_SEC = 120 (fallback constant)
 
 export type RefineRange = { start: number; end: number }
 
@@ -30,9 +34,13 @@ export type TimelineWindowResult = {
 }
 
 /** 预览/common 轴上的 DVR 左边界（紫线）。 */
-export function computeDvrLeftEdge(liveEdgeSec: number): number {
+export function computeDvrLeftEdge(
+  liveEdgeSec: number,
+  replaySeconds: number = DVR_LOOKBACK_SEC,
+): number {
   if (!Number.isFinite(liveEdgeSec) || liveEdgeSec <= 0) return 0
-  return Math.max(0, liveEdgeSec - DVR_LOOKBACK_SEC)
+  const lookback = normalizeReplayBufferSeconds(replaySeconds)
+  return Math.max(0, liveEdgeSec - lookback)
 }
 
 export type ExpandedPreviewWindowInput = {
@@ -46,6 +54,8 @@ export type ExpandedPreviewWindowInput = {
   markOut?: number | null
   /** Live 必须忽略；回看也只用 file/preview 秒，不用录制墙钟。 */
   recordedHint?: number
+  /** 用户设置的直播 DVR 时长；0 表示关闭历史回放。 */
+  replaySeconds?: number
   /** Live 默认 true：播放头钉在右沿。DVR 回看传 false。 */
   followLive?: boolean
 }
@@ -59,6 +69,9 @@ export type ExpandedPreviewWindow = {
   playheadPct: number
   fillLeftPct: number
   fillWidthPct: number
+  /** 用户设置的回看时长与当前真实可用时长，供 UI 区分两者。 */
+  configuredReplaySeconds: number
+  availableReplaySeconds: number
 }
 
 function finiteNonNeg(n: number | null | undefined): number {
@@ -66,7 +79,7 @@ function finiteNonNeg(n: number | null | undefined): number {
 }
 
 /**
- * 放大预览条窗口：Live 左端 = 紫线 = liveEdge − 120s。
+ * 放大预览条窗口：Live 左端 = 紫线 = liveEdge − 用户配置的回放时长。
  * liveEdge 优先 buffered.end，无效时用 previewPos；禁止录制墙钟。
  */
 export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput): ExpandedPreviewWindow {
@@ -93,6 +106,8 @@ export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput):
       playheadPct,
       fillLeftPct: 0,
       fillWidthPct: playheadPct,
+      configuredReplaySeconds: 0,
+      availableReplaySeconds: end,
     }
   }
 
@@ -103,8 +118,26 @@ export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput):
     && typeof bufEnd === 'number' && Number.isFinite(bufEnd)
     && bufEnd - bufStart > 1
   const liveEdge = hasBuffer ? Math.max(0, bufEnd as number) : pos
-  const purple = computeDvrLeftEdge(liveEdge)
-  const start = purple
+  const replaySeconds = normalizeReplayBufferSeconds(input.replaySeconds)
+  // 关闭 DVR 时仍保留当前直播沿作为唯一可回放位置，避免 UI 暗示存在历史缓存。
+  if (replaySeconds === 0) {
+    return {
+      start: liveEdge,
+      end: liveEdge,
+      purple: liveEdge,
+      liveEdge,
+      hasLiveDvr: false,
+      playheadPct: 100,
+      fillLeftPct: 0,
+      fillWidthPct: 100,
+      configuredReplaySeconds: 0,
+      availableReplaySeconds: 0,
+    }
+  }
+  const desiredStart = computeDvrLeftEdge(liveEdge, replaySeconds)
+  // 浏览器可能因自身配额提前驱逐旧数据，实际 buffered.start 才是可信下界。
+  const start = hasBuffer ? Math.max(desiredStart, bufStart as number) : desiredStart
+  const purple = start
   const end = Math.max(liveEdge, start)
   const span = Math.max(end - start, 1e-6)
   const followLive = input.followLive !== false
@@ -120,6 +153,8 @@ export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput):
     playheadPct,
     fillLeftPct: 0,
     fillWidthPct: playheadPct,
+    configuredReplaySeconds: replaySeconds,
+    availableReplaySeconds: Math.max(0, end - start),
   }
 }
 

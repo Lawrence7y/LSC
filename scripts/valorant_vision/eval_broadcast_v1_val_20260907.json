@@ -1,0 +1,74 @@
+{
+  "macro_f1": 0.8821068168249176,
+  "total": 778,
+  "confusion": {
+    "non_game": {
+      "non_game": 154,
+      "buy": 2,
+      "combat": 16,
+      "result": 1,
+      "replay": 0
+    },
+    "buy": {
+      "non_game": 4,
+      "buy": 128,
+      "combat": 0,
+      "result": 1,
+      "replay": 0
+    },
+    "combat": {
+      "non_game": 5,
+      "buy": 17,
+      "combat": 383,
+      "result": 7,
+      "replay": 0
+    },
+    "result": {
+      "non_game": 1,
+      "buy": 8,
+      "combat": 3,
+      "result": 21,
+      "replay": 0
+    },
+    "replay": {
+      "non_game": 0,
+      "buy": 0,
+      "combat": 0,
+      "result": 0,
+      "replay": 27
+    }
+  },
+  "per_class": {
+    "non_game": {
+      "precision": 0.9390243902439024,
+      "recall": 0.8901734104046243,
+      "f1": 0.9139465875370919,
+      "support": 173
+    },
+    "buy": {
+      "precision": 0.8258064516129032,
+      "recall": 0.9624060150375939,
+      "f1": 0.888888888888889,
+      "support": 133
+    },
+    "combat": {
+      "precision": 0.9527363184079602,
+      "recall": 0.9296116504854369,
+      "f1": 0.941031941031941,
+      "support": 412
+    },
+    "result": {
+      "precision": 0.7,
+      "recall": 0.6363636363636364,
+      "f1": 0.6666666666666666,
+      "support": 33
+    },
+    "replay": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 27
+    }
+  },
+  "gates_passed": false
+}

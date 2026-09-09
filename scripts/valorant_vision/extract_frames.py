@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,13 +22,14 @@ DEFAULT_OUTPUT = Path.home() / "LSC" / "datasets" / "valorant_phase"
 @dataclass(frozen=True)
 class ManifestRow:
     video_id: str
-    video_path: str
+    video_path: str | None
     timestamp_sec: float
     label: str
     split: str
     source_type: str
     session_id: str
     notes: str = ""
+    frame_path: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict) -> ManifestRow:
@@ -35,7 +37,6 @@ class ManifestRow:
             k
             for k in (
                 "video_id",
-                "video_path",
                 "timestamp_sec",
                 "label",
                 "split",
@@ -46,6 +47,10 @@ class ManifestRow:
         ]
         if missing:
             raise ValueError(f"manifest 缺少字段: {missing}")
+        video_path = raw.get("video_path")
+        frame_path = raw.get("frame_path")
+        if not video_path and not frame_path:
+            raise ValueError("manifest 必须提供 video_path 或 frame_path")
         label = str(raw["label"])
         split = str(raw["split"])
         if label not in LABELS:
@@ -54,13 +59,14 @@ class ManifestRow:
             raise ValueError(f"非法 split: {split!r}")
         return cls(
             video_id=str(raw["video_id"]),
-            video_path=str(raw["video_path"]),
+            video_path=str(video_path) if video_path else None,
             timestamp_sec=float(raw["timestamp_sec"]),
             label=label,
             split=split,
             source_type=str(raw["source_type"]),
             session_id=str(raw["session_id"]),
             notes=str(raw.get("notes", "")),
+            frame_path=str(frame_path) if frame_path else None,
         )
 
 
@@ -110,6 +116,8 @@ def extract_single_frame(
     cancel_event: list[bool] | None = None,
 ) -> None:
     """用 FFmpeg 在 timestamp 处抽一帧；cancel_event[0] 为 True 时终止子进程。"""
+    if not row.video_path:
+        raise ValueError("frame-only manifest 不能调用 FFmpeg 抽帧")
     dest.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         ffmpeg,
@@ -192,7 +200,7 @@ def run_extraction(
                 "[%d/%d] dry-run %s @ %.3fs -> %s",
                 idx,
                 planned,
-                row.video_path,
+                row.video_path or row.frame_path,
                 row.timestamp_sec,
                 dest,
             )
@@ -201,17 +209,26 @@ def run_extraction(
             "[%d/%d] 抽取 %s @ %.3fs -> %s",
             idx,
             planned,
-            row.video_path,
+            row.video_path or row.frame_path,
             row.timestamp_sec,
             dest,
         )
-        extract_single_frame(
-            row,
-            dest,
-            ffmpeg=ffmpeg,
-            timeout_sec=timeout_sec,
-            cancel_event=cancel,
-        )
+        if row.video_path:
+            extract_single_frame(
+                row,
+                dest,
+                ffmpeg=ffmpeg,
+                timeout_sec=timeout_sec,
+                cancel_event=cancel,
+            )
+        else:
+            frame_path = Path(str(row.frame_path))
+            if not frame_path.is_absolute():
+                frame_path = (Path.cwd() / frame_path).resolve()
+            if not frame_path.is_file():
+                raise RuntimeError(f"frame-only manifest 源帧不存在: {frame_path}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(frame_path, dest)
         extracted += 1
     return planned, extracted, skipped
 

@@ -26,6 +26,271 @@ def test_skip_sleep_has_ceiling() -> None:
     assert "_skip_sleep_ticks" in src
 
 
+def test_rejected_broadcast_candidate_is_removed_from_pending_once() -> None:
+    """2026-09-06 回归：终态 rejected 不得被当成 pending 反复审计。"""
+    from lsc.analyzer.valorant_broadcast import BroadcastAuditOutcome
+
+    candidate = {"start": 32.0, "end": 462.0, "source_profile": "broadcast"}
+    pending = [dict(candidate)]
+    produced: list[dict] = []
+    task_state: dict = {}
+    outcome = BroadcastAuditOutcome(
+        status="rejected",
+        candidate={
+            **candidate,
+            "broadcast_audit": "rejected_long_or_invalid",
+        },
+        reason="long_or_invalid",
+    )
+
+    consumed = room_handler._consume_broadcast_audit_outcome(
+        pending,
+        0,
+        outcome,
+        produced,
+        task_state,
+        current_duration=636.0,
+    )
+
+    assert consumed is True
+    assert pending == []
+    assert produced == []
+    assert task_state["audit_rejected_count"] == 1
+    assert task_state["last_audit_rejection"] == {
+        "start": 32.0,
+        "end": 462.0,
+        "reason": "long_or_invalid",
+    }
+
+
+def test_incident_scan_metrics_exclude_lookback_from_net_throughput() -> None:
+    """179.5s 墙钟扫 120s 窗，但只覆盖 90s 新媒体。"""
+    metrics = room_handler._continuous_scan_metrics(
+        scan_in=695.969,
+        scan_out=815.969,
+        analyzed_before=725.969,
+        analyzed_after=815.969,
+        recorded_before=1075.869,
+        recorded_after=1255.384,
+        scan_wall_sec=179.515,
+    )
+
+    assert metrics["gross_scanned_sec"] == 120.0
+    assert metrics["newly_covered_sec"] == 90.0
+    assert metrics["gross_scan_throughput"] == 0.668
+    assert metrics["net_coverage_throughput"] == 0.501
+    assert metrics["lag_delta_sec"] == 89.515
+    assert metrics["lag_slope"] == 0.499
+
+
+def test_scheduler_prefers_net_coverage_history_with_legacy_fallback() -> None:
+    assert room_handler._continuous_throughput_history({
+        "scan_throughput_history": [0.7, 0.8],
+        "net_coverage_throughput_history": [0.4, 0.5],
+    }) == [0.4, 0.5]
+    assert room_handler._continuous_throughput_history({
+        "scan_throughput_history": [0.7, 0.8],
+    }) == [0.7, 0.8]
+
+
+def test_broadcast_refine_yields_to_coarse_coverage_during_catchup() -> None:
+    assert room_handler._should_run_broadcast_refine(30.0) is True
+    assert room_handler._should_run_broadcast_refine(90.0) is True
+    assert room_handler._should_run_broadcast_refine(90.1) is False
+    assert room_handler._should_run_broadcast_refine(240.0, finalizing=True) is True
+    # Pending candidates are durable; they must not block coarse coverage when
+    # the live analysis is already behind.
+    assert room_handler._should_run_broadcast_refine(240.0, pending_count=1) is False
+    assert room_handler._should_run_broadcast_refine(
+        30.0, pending_count=1, refine_elapsed_sec=120.0
+    ) is False
+
+
+def test_broadcast_refine_gate_uses_live_duration_after_slow_scan() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
+        encoding="utf-8"
+    )
+    assert "_live_current_dur = max(" in source
+    assert "task_state.get('recorded_duration')" in source
+    assert "_live_current_dur - float(completed_dur)" in source
+
+
+def test_refine_running_within_budget_is_not_unconditionally_aborted() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
+        encoding="utf-8"
+    )
+    assert "_BCAST_REFINE_KEEP_LAG_SEC = 90.0" in source
+    assert "_BCAST_REFINE_KEEP_MAX_SEC = 120.0" in source
+    # A-05: 审计与粗扫解耦后，审计是否被抢占由 worker 内按实时 backlog 判定：
+    # 仅当 backlog 超过抢占阈值或审计超预算时才中止审计（保证覆盖游标前进）；
+    # 低滞后窗口内审计应继续跑完，不允许无条件中止。
+    assert "_REFINE_PREEMPT_BACKLOG_SEC = 60.0" in source
+    assert "task_state.get('refine_running') or task_state.get('refine_pending')" in source
+    assert "_backlog_now > _REFINE_PREEMPT_BACKLOG_SEC" in source
+    assert "_refine_elapsed >= _BCAST_REFINE_KEEP_MAX_SEC" in source
+    assert "task_state['refine_abort'] = bool(" in source
+    # 审计使用独立 asyncio 信号量，不再与粗扫共享同一把。
+    assert "_refine_semaphore = asyncio.Semaphore(1)" in source
+    assert "async with _refine_semaphore:" in source
+    assert "pending_count=_bcast_pending_cnt" in source
+    assert "or _pending_refine_count > 0" not in source
+
+
+def test_refine_task_is_singleton_and_shutdown_awaited() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
+        encoding="utf-8"
+    )
+    assert "task_state.get('refine_task')" in source
+    assert "task_state['refine_task'] = _refine_task" in source
+    assert "stop_state.get('refine_task')" in source
+    assert "边界精修硬超时仍未退出" in source
+
+
+def test_one_shot_valorant_analysis_shares_thread_semaphore() -> None:
+    room_source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
+        encoding="utf-8"
+    )
+    analysis_source = (ROOT / "python-backend/handlers/analysis_handlers.py").read_text(
+        encoding="utf-8"
+    )
+    assert "_analysis_thread_semaphore = threading.Semaphore(1)" in room_source
+    assert "analysis_thread_semaphore=_analysis_thread_semaphore" in room_source
+    assert "def _run_analysis_guarded" in analysis_source
+    assert "def _run_analysis_export_guarded" in analysis_source
+
+
+def test_precise_broadcast_round_with_refined_combat_start_is_listable() -> None:
+    round_data = {
+        "start": 0.2,
+        "end": 99.141,
+        "start_by": "refined_combat",
+        "end_by": "broadcast_exclusion",
+        "boundary_source": "valorant_ocr_v1",
+        "source_profile": "broadcast",
+        "broadcast_audit": "passed",
+        "broadcast_audit_reason": "broadcast_replay_or_non_game",
+        "confirm_status": "vision_confirmed",
+        "boundary_refined": True,
+        "boundary_quality": "precise",
+        "start_delta": 0.2,
+        "start_confidence": 0.95,
+        "end_delta": 0.25,
+        "end_confidence": 0.92,
+    }
+
+    assert room_handler._is_listable_ocr_round(round_data) is True
+    assert room_handler._is_auto_exportable_valorant_round(round_data) is True
+
+
+def test_background_refine_has_hard_time_budget() -> None:
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
+        encoding="utf-8"
+    )
+    assert "timeout=_BCAST_REFINE_KEEP_MAX_SEC" in source
+    assert "timeout_state['refine_abort'] = True" in source
+    assert "边界审计超过预算" in source
+
+
+def test_refine_partial_results_survive_abort_and_preempt() -> None:
+    """第一候选完成后第二候选超时，第一候选必须留在可靠交付队列。"""
+    from lsc.analyzer.valorant_broadcast import BroadcastAuditOutcome
+
+    first = {"start": 10.0, "end": 70.0, "round_key": "round-1"}
+    second = {"start": 100.0, "end": 160.0, "round_key": "round-2"}
+    pending = [dict(first), dict(second)]
+    produced: list[dict] = []
+    state = {"room_id": "room-1", "recording_id": "recording-1"}
+
+    def run_batch() -> None:
+        room_handler._consume_broadcast_audit_outcome(
+            pending,
+            0,
+            BroadcastAuditOutcome("accepted", dict(first), "broadcast_replay_or_non_game"),
+            produced,
+            state,
+            current_duration=180.0,
+        )
+        raise TimeoutError("second candidate exceeded audit budget")
+
+    try:
+        run_batch()
+    except TimeoutError:
+        pass
+
+    assert [item["round_key"] for item in produced] == ["round-1"]
+    assert [item["round_key"] for item in pending] == ["round-2"]
+    queued = room_handler._peek_refine_results(state)
+    assert [item["candidate"]["round_key"] for item in queued] == ["round-1"]
+    assert state["audit_accepted_count"] == 1
+    assert state["audit_delivery_gap"] == 1
+
+
+def test_refine_result_delivery_is_idempotent() -> None:
+    candidate = {"start": 10.0, "end": 70.0, "round_key": "round-1"}
+    state = {"room_id": "room-1", "recording_id": "recording-1"}
+
+    assert room_handler._enqueue_refine_result(state, candidate) is True
+    assert room_handler._enqueue_refine_result(state, candidate) is False
+    assert len(room_handler._peek_refine_results(state)) == 1
+    assert state["audit_accepted_count"] == 1
+
+
+def test_stop_tail_scan_targeted_window_and_audit_quota() -> None:
+    """2026-09-08 调优：
+    1. 停止补扫窗口定向瞄准 stop_tail_target（单窗 _STOP_TAIL_WINDOW_CAP_SEC），
+       不再套用 90s 自适应追赶预算，缩短停止收尾时长；
+    2. 审计批配额收紧为 2，避免单批撑满 120s 总预算被中止（实测 4+ 候选批
+       让单窗滞后 +107s）。"""
+    source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
+        encoding="utf-8"
+    )
+    assert "_STOP_TAIL_WINDOW_CAP_SEC = 120.0" in source
+    assert "state.get('stop_tail_scan')" in source
+    assert "_stop_end_win = min(" in source
+    assert "_stop_target_win" in source
+    assert "max_audit_quota = 2" in source
+    assert "max_audit_quota = 4" not in source
+
+
+def test_broadcast_profile_mismatch_requires_explicit_ui_confirmation() -> None:
+    source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "likelyBroadcastProfileMismatch" in source
+    assert "valorantSourceProfile === 'broadcast'" in source
+    assert "视角策略与直播信息不匹配" in source
+    assert "继续使用 broadcast" in source
+
+
+def test_shutdown_recording_stop_can_wait_for_file_finalization() -> None:
+    source = (ROOT / "python-backend/handlers/recording_handlers.py").read_text(
+        encoding="utf-8"
+    )
+    body = source.split("async def handle_stop_recording(data):", 1)[1].split(
+        "@server.on(", 1
+    )[0]
+
+    assert "wait_for_finalize = bool(data.get('wait_for_finalize'))" in body
+    assert "manager.stop_recording(room_id)" in body
+    assert "manager.stop_recording_async(room_id)" in body
+
+
+def test_electron_window_close_waits_for_renderer_cleanup_ack() -> None:
+    source = (ROOT / "lsc-electron/electron/main.ts").read_text(encoding="utf-8")
+    close_body = source.split("mainWindow.on('close', (e) => {", 1)[1].split(
+        "mainWindow.webContents.once", 1
+    )[0]
+    quit_body = source.split("app.on('before-quit', (event) => {", 1)[1].split(
+        "process.on('exit'", 1
+    )[0]
+
+    assert "e.preventDefault()" in close_body
+    assert "requestGracefulAppQuit('window_close')" in close_body
+    assert "cleanup-all-rooms-complete" in source
+    assert "requestGracefulAppQuit('before_quit')" in quit_body
+    assert "setTimeout(resolve, 10000)" not in quit_body
+
+
 def test_continuous_alignment_has_safe_periodic_refresh_guard() -> None:
     """持续分析须定期重对齐，且 DVR 回看时不得强制跳直播沿。
 
@@ -322,8 +587,10 @@ def test_new_rounds_releases_pending_round_when_hybrid_confirms() -> None:
 
 
 def test_valorant_incremental_lookback_is_bounded() -> None:
-    # 纯 OCR 固定 lookback=30（与 valorant_plugin 一致），不随相位变化
+    # 稳态 8s（净吞吐优化：FSM/锚点跨窗口持久化，回看只承担 seek 稳定性缓冲）；
+    # 失败/重连/首窗兜底 30s。均不随相位变化。
     assert room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC == 30.0
+    assert room_handler._VALORANT_STEADY_LOOKBACK_SEC == 8.0
     assert room_handler._VALORANT_MAX_CATCHUP_SEC > 0.0
 
 
@@ -362,7 +629,7 @@ def test_first_scan_of_short_recording_covers_all() -> None:
 
 
 def test_known_throughput_can_still_take_large_catchup() -> None:
-    """有吞吐历史时仍允许放大追赶窗（上限 MAX 480s）。"""
+    """有吞吐历史时仍允许放大追赶窗（上限 MAX 480s）；稳态 lookback 8s。"""
     from lsc.analyzer.valorant_plugin import MAX_CATCHUP_SEC, compute_valorant_scan_budget
 
     scan_range, _, _, full = compute_valorant_scan_budget(
@@ -373,9 +640,21 @@ def test_known_throughput_can_still_take_large_catchup() -> None:
         throughput_history=[10.0],
         kick_interval=60.0,
     )
-    assert scan_range[0] == 70.0
+    assert scan_range[0] == 100.0 - 8.0
     assert scan_range[1] == 100.0 + MAX_CATCHUP_SEC
     assert full is False
+
+    # 失败/重连兜底：显式传 lookback_sec=30 时仍从 last-30 起扫
+    retry_range, _, _, _ = compute_valorant_scan_budget(
+        mode="valorant_round",
+        last_analyzed=100.0,
+        current_dur=3600.0,
+        pressure={"level": "normal"},
+        throughput_history=[10.0],
+        kick_interval=60.0,
+        lookback_sec=30.0,
+    )
+    assert retry_range[0] == 100.0 - 30.0
 
 
 def test_continuous_valorant_budget_uses_first_full_scan_then_catchup_window() -> None:
@@ -400,8 +679,8 @@ def test_continuous_valorant_budget_uses_first_full_scan_then_catchup_window() -
     )
 
     assert (first_range, first_ocr, first_full) == ((0.0, 45.0), True, False)
-    # 回看 30s → 570，无历史时向前追赶 MIN 45s → 645；不得变成 current-lookback=690 而跳过中段
-    assert (normal_range, normal_ocr, normal_full) == ((570.0, 645.0), True, False)
+    # 稳态回看 8s → 592，无历史时向前追赶 MIN 45s → 645；不得变成 current-lookback=690 而跳过中段
+    assert (normal_range, normal_ocr, normal_full) == ((592.0, 645.0), True, False)
     # 纯 OCR 路径：pressure 不关 OCR
     assert critical_ocr is True
     assert critical_full is False
@@ -428,7 +707,7 @@ def test_continuous_valorant_budget_does_not_skip_middle_when_falling_behind() -
     # 无吞吐历史时按短窗追赶，不得跳到尾部，也不得一次吞到 277
     assert scan_range[1] <= 25.0 + MIN_CATCHUP_SEC + 1.0
     assert scan_range[0] < 217.0
-    assert scan_range[0] <= max(0.0, 25.0 - 30.0) + 1.0
+    assert scan_range[0] <= max(0.0, 25.0 - room_handler._VALORANT_STEADY_LOOKBACK_SEC) + 1.0
 
 
 def test_continuous_valorant_budget_does_not_expand_with_recording_length() -> None:
@@ -445,7 +724,7 @@ def test_continuous_valorant_budget_does_not_expand_with_recording_length() -> N
         current_dur=3600.0,
         pressure={"level": "normal"},
     )
-    lookback = room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC
+    lookback = room_handler._VALORANT_STEADY_LOOKBACK_SEC
     max_catchup = room_handler._VALORANT_MAX_CATCHUP_SEC
     assert short_range[0] == max(0.0, 600.0 - lookback)
     assert short_range[1] == 645.0
@@ -462,7 +741,7 @@ def test_continuous_valorant_budget_caps_catchup_span() -> None:
         current_dur=3600.0,
         pressure={"level": "normal"},
     )
-    assert scan_range[1] - scan_range[0] <= room_handler._VALORANT_MAX_CATCHUP_SEC + room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC + 1.0
+    assert scan_range[1] - scan_range[0] <= room_handler._VALORANT_MAX_CATCHUP_SEC + room_handler._VALORANT_STEADY_LOOKBACK_SEC + 1.0
     assert scan_range[0] <= 100.0
     assert scan_range[1] < 3600.0
 
@@ -475,7 +754,7 @@ def test_continuous_valorant_budget_post_combat_caps_catchup_span() -> None:
         current_dur=3600.0,
         pressure={"level": "normal"},
     )
-    lookback = room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC
+    lookback = room_handler._VALORANT_STEADY_LOOKBACK_SEC
     max_catchup = room_handler._VALORANT_MAX_CATCHUP_SEC
     assert scan_range[1] - scan_range[0] <= max_catchup + lookback + 1.0
     assert scan_range[0] <= 100.0
@@ -511,7 +790,7 @@ def test_valorant_round_scan_uses_catchup_window_after_first_scan() -> None:
         "valorant_round", 600.0, 720.0, {"level": "normal", "analysis_window_sec": 180}
     )
 
-    assert (scan_range, use_ocr, full_rescan) == ((570.0, 645.0), True, False)
+    assert (scan_range, use_ocr, full_rescan) == ((592.0, 645.0), True, False)
 
 
 def test_valorant_round_scan_only_first_pass_is_full() -> None:
@@ -523,8 +802,8 @@ def test_valorant_round_scan_only_first_pass_is_full() -> None:
     )
 
     assert (first_range, first_full) == ((0.0, 45.0), False)
-    # 固定 lookback=30 → max(0, 600-30)=570，无历史时向前追赶 MIN 45s → 645
-    assert later_range[0] == max(0.0, 600.0 - room_handler._VALORANT_INCREMENTAL_LOOKBACK_SEC)
+    # 稳态 lookback=8 → max(0, 600-8)=592，无历史时向前追赶 MIN 45s → 645
+    assert later_range[0] == max(0.0, 600.0 - room_handler._VALORANT_STEADY_LOOKBACK_SEC)
     assert later_range[0] <= 600.0
     assert later_range[1] == 645.0
     assert later_full is False
@@ -776,8 +1055,8 @@ def test_vision_confirmed_is_exportable_gate() -> None:
     assert room_handler._is_listable_ocr_round(rd) is True
 
 
-def test_long_round_duration_anomaly_demotes_to_pending() -> None:
-    """过长回合须降级 pending，仍可入列不可自动导出（阈值 150s，覆盖买枪+交战+结算）。"""
+def test_long_round_duration_anomaly_keeps_confirmation_and_blocks_export() -> None:
+    """过长回合用边界质量表达异常，不篡改确认状态。"""
     assert room_handler._VALORANT_MAX_ROUND_DURATION_SEC == 150.0
     # 93s（现场常见）不触发
     ok = {
@@ -803,7 +1082,7 @@ def test_long_round_duration_anomaly_demotes_to_pending() -> None:
     }
     assert room_handler._is_listable_ocr_round(long_rd) is True
     assert long_rd.get("duration_anomaly") is True
-    assert long_rd.get("confirm_status") == "pending"
+    assert long_rd.get("confirm_status") == "vision_confirmed"
     assert room_handler._is_auto_exportable_valorant_round(long_rd) is False
 
 
@@ -935,7 +1214,10 @@ def test_stop_handler_sets_stopping_not_stopped() -> None:
     )[0]
     assert "'status': 'stopping'" in stop_fn or '"status": "stopping"' in stop_fn
     assert "'phase': 'stopping'" in stop_fn or '"phase": "stopping"' in stop_fn
-    assert "scan_abort" in stop_fn
+    # 录制中停止：先补扫尾部再退出（stop_tail_scan），并提前中止后台审计
+    # 以缩短停止等待；不立即掐断在途粗扫（否则尾部补扫无游标可续）。
+    assert "stop_tail_scan" in stop_fn
+    assert "refine_abort" in stop_fn
     # 停止中不得广播 running=True，否则前端会把按钮弹回「分析中」
     assert "'running': False" in stop_fn or '"running": False' in stop_fn
 
@@ -998,6 +1280,19 @@ def test_finalize_continues_from_cursor_not_full_rescan() -> None:
     assert "last_analyzed" in finalize_block
     assert "full_rescan = False" in finalize_block or "full_rescan=False" in finalize_block
     assert "(0.0, float(current_dur))" not in finalize_block
+
+
+def test_fresh_finalization_is_chunked_and_reports_boundary_pass() -> None:
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(
+        encoding="utf-8"
+    )
+    loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
+        "async def _export_and_broadcast", 1
+    )[0]
+    assert "_FINALIZATION_CHUNK_SEC = 90.0" in src
+    assert "finalization_scan_cursor" in loop
+    assert "_scan_reason = 'finalize_full_chunk'" in loop
+    assert "finalize_boundary_pass" in loop
 
 
 def test_status_payload_reports_provider_and_latest_error() -> None:
@@ -1333,3 +1628,108 @@ def test_merge_round_windows_protects_existing_ocr_start_from_truncated_window()
     assert merged[0]["start"] == 200.4  # 必须保护早先已确认的完整起点，不能被篡改为 217.2
     assert merged[0]["round_key"] == "round-000019"
 
+
+def test_merge_round_windows_does_not_reverse_stretch_split_children() -> None:
+    """回归测试：超长候选拆分后的子块严禁被旧父候选逆向拉伸。
+
+    模拟事故场景：
+    - 旧候选 existing: start=763.187, end=1002.58
+    - 拆分后子候选 window:
+      chunk 0: start=763.4, end=854.1, round_key=round-000076-s0, split_from_oversize=True, split_index=0
+      chunk 1: start=913.4, end=982.2, round_key=round-000076-s1, split_from_oversize=True, split_index=1
+    合并后：
+    - chunk 1 绝不能被拉伸回 763.187 导致 219s 异常时长；
+    - chunk 0 绝不能被覆盖丢失；
+    - 两个子块都作为有效回合保留，且时长均 <= 150s。
+    """
+    existing = [
+        {
+            "start": 763.187,
+            "end": 1002.58,
+            "round_key": "round-000076",
+            "boundary_source": "valorant_ocr_v1",
+            "confirm_status": "vision_confirmed",
+            "start_by": "ocr_combat",
+            "end_by": "broadcast_exclusion",
+        }
+    ]
+    window = [
+        {
+            "start": 763.4,
+            "end": 854.1,
+            "round_key": "round-000076-s0",
+            "split_from_oversize": True,
+            "split_index": 0,
+            "boundary_source": "valorant_ocr_v1",
+            "confirm_status": "vision_confirmed",
+            "start_by": "ocr_combat",
+            "end_by": "broadcast_exclusion",
+        },
+        {
+            "start": 913.4,
+            "end": 982.2,
+            "round_key": "round-000076-s1",
+            "split_from_oversize": True,
+            "split_index": 1,
+            "boundary_source": "valorant_ocr_v1",
+            "confirm_status": "vision_confirmed",
+            "start_by": "ocr_combat",
+            "end_by": "broadcast_exclusion",
+        },
+    ]
+    merged = room_handler._merge_round_windows(existing, window)
+    assert len(merged) == 2
+    assert merged[0]["round_key"] == "round-000076-s0"
+    assert merged[0]["start"] == 763.4
+    assert merged[0]["end"] == 854.1
+    assert merged[1]["round_key"] == "round-000076-s1"
+    assert merged[1]["start"] == 913.4
+    assert merged[1]["end"] == 982.2
+    # 两者均可正常入列与自动导出
+    assert room_handler._is_listable_ocr_round(merged[0]) is True
+    assert room_handler._is_auto_exportable_valorant_round(merged[0]) is True
+    assert room_handler._is_listable_ocr_round(merged[1]) is True
+    assert room_handler._is_auto_exportable_valorant_round(merged[1]) is True
+
+
+def test_center_banner_sampling_is_sentinel_and_event_driven() -> None:
+    """P0b: 中央横幅 OCR 必须为「哨兵 + 事件触发」采样，禁止每帧读取。
+
+    顶部计时器保持逐帧（1fps），中央横幅只在哨兵周期/计时器跳变/比分变化/
+    post_settle_hold/FSM SETTLE 时采样；收尾 finalize 才逐帧保出点精度。
+    """
+    src = (ROOT / "lsc/analyzer/valorant_ocr_rounds.py").read_text(encoding="utf-8")
+    assert "ts >= next_center_sample_ts" in src          # 哨兵周期触发
+    assert "timer_jump" in src                            # 计时器跳变触发
+    assert "score_changed" in src                         # 比分变化触发
+    assert "post_settle_hold" in src                      # 结算关键期立即采样
+    assert "fsm._state == _State.SETTLE" in src           # FSM SETTLE 立即采样
+    assert "next_center_sample_ts = ts + center_sentinel_sec" in src  # 哨兵推进
+    assert "center_sentinel_sec" in src                   # 间隔可配置（backlog 放大）
+
+
+def test_top_hud_sampling_keeps_1fps() -> None:
+    """P0b: 顶部 HUD 恒 1fps——ocr_sample_interval 不得再进入降频链路，
+    中央横幅降本走独立哨兵间隔，二者采样决策必须解耦。"""
+    src = (ROOT / "lsc/analyzer/valorant_ocr_rounds.py").read_text(encoding="utf-8")
+    # 顶部读取逐帧执行，不经过任何 sample_center 节流
+    top_call = src.find("_read_top_anchors_for_profile(img, source_profile)")
+    center_gate = src.find("sample_center = (")
+    assert top_call > 0
+    assert center_gate > 0
+    # sample_center 判定不得引用 ocr_sample_interval / fast_mode 隔帧
+    center_block = src[center_gate : center_gate + 400]
+    assert "ocr_sample_interval" not in center_block
+    assert "frame_index % 2" not in center_block
+    # 顶部保持 1fps：采样间隔下限不低于 1.0（顶部固定 1fps 由抽帧保证）
+    assert "sample_fps = max(0.25, 1.0 / max(float(ocr_sample_interval), 0.1))" in src
+
+
+def test_top_roi_cache_reuses_unchanged_frames() -> None:
+    """P0c: 顶部条 ROI 画面未变化时复用上一帧 OCR 读数，跳过重复推理。"""
+    src = (ROOT / "lsc/analyzer/valorant_ocr_rounds.py").read_text(encoding="utf-8")
+    assert "prev_top_roi" in src
+    assert "prev_top_result" in src
+    assert "_ROI_DIFF_THRESHOLD" in src
+    assert "raw_timer, left, right = prev_top_result" in src  # 复用分支
+    assert "_top_changed" in src                               # 变化判定驱动 OCR/复用

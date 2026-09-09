@@ -807,7 +807,9 @@ function spawnBackend(): void {
     LSC_PARENT_PID: String(process.pid),
     LSC_WS_TOKEN: backendWsToken,
     LSC_WS_TOKEN_REQUIRED: '1',
-    PYTHONPATH: [getRuntimePackagesDir(), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    // 仅注入打包 runtime packages 目录；严禁透传父进程 PYTHONPATH
+    // （CLAUDE.md §11.2：防止通过环境变量注入恶意 Python 模块路径）
+    PYTHONPATH: getRuntimePackagesDir(),
   }
   for (const key of ['LSC_VALORANT_MODEL_DIR', 'LSC_VALORANT_VISION_SHADOW'] as const) {
     if (process.env[key]) {
@@ -1136,16 +1138,19 @@ function _isSafePath(p: string): boolean {
   const allowedRootsNorm = allowedRoots.map((dir) => path.resolve(dir) + path.sep)
   // Windows 路径大小写不敏感，比较时统一小写；POSIX 保持原样
   const norm = (s: string) => (process.platform === 'win32' ? s.toLowerCase() : s)
-  // 同时检查 resolved 和 realResolved，确保符号链接也无法绕过
-  const isAllowed = allowedRootsNorm.some((root) =>
-    norm(realResolved + path.sep).startsWith(norm(root)) ||
-    norm(resolved + path.sep).startsWith(norm(root))
-  )
-  if (!isAllowed) {
+  // resolved 与 realResolved 必须都在白名单内（AND 语义）：
+  // 旧 OR 实现下，白名单目录内的 junction/symlink 指向外部时会被
+  // resolved 命中短路放行，符号链接防护失效
+  const insideWhitelist = (target: string) =>
+    allowedRootsNorm.some((root) => norm(target + path.sep).startsWith(norm(root)))
+  if (!insideWhitelist(resolved) || !insideWhitelist(realResolved)) {
     return false
   }
-  // 扩展名黑名单：拒绝可执行文件类型，防止通过 openPath 触发 RCE
-  const ext = path.extname(realResolved).toLowerCase()
+  // 扩展名黑名单：拒绝可执行文件类型，防止通过 openPath 触发 RCE。
+  // Win32 ShellExecute 会剥离文件名尾部的点与空格（"file.exe." / "file.exe "
+  // 实际按 .exe 执行），先剥掉再取扩展名，避免黑名单被尾缀绕过。
+  const strippedName = path.basename(realResolved).replace(/[. ]+$/, '')
+  const ext = path.extname(strippedName).toLowerCase()
   const blockedExts = ['.exe', '.bat', '.ps1', '.cmd', '.vbs', '.scr', '.com', '.pif', '.hta', '.msi', '.reg', '.lnk']
   if (blockedExts.includes(ext)) {
     return false
@@ -1183,6 +1188,24 @@ function registerWindowIpc(): void {
   ipcMain.handle('close-window', () => {
     appLog('INFO', 'IPC', '关闭窗口')
     mainWindow?.close()
+  })
+
+  ipcMain.on('cleanup-all-rooms-complete', (event, result) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+      appLog('WARN', 'App', '忽略非主窗口发送的退出清理确认')
+      return
+    }
+    if (!shutdownCleanupInProgress) {
+      return
+    }
+    const success = result?.success === true
+    const errors = Array.isArray(result?.errors) ? result.errors.length : 0
+    appLog(
+      success ? 'INFO' : 'WARN',
+      'App',
+      `收到退出清理确认: success=${success}, errors=${errors}, finalization_state=${result?.finalization_state || 'unknown'}, finalization_job_id=${result?.finalization_job_id || '<none>'}`,
+    )
+    void finishGracefulAppQuit(success ? 'renderer_ack' : 'renderer_ack_with_errors')
   })
 
   ipcMain.handle('select-directory', async () => {
@@ -1536,9 +1559,14 @@ function registerWindowIpc(): void {
 }
 
 function createWindow() {
+  const defaultWindowWidth = 1520
+  const defaultWindowHeight = 920
+  // 保留现有工作台窗口比例。Electron 原生窗口会在拖动任意边缘时
+  // 联动调整宽高，只有等比例的边/角缩放，不会把工作台内容横向或纵向拉扁。
+  const windowAspectRatio = defaultWindowWidth / defaultWindowHeight
   mainWindow = new BrowserWindow({
-    width: 1520,
-    height: 920,
+    width: defaultWindowWidth,
+    height: defaultWindowHeight,
     minWidth: 1360,
     minHeight: 800,
     icon: path.join(__dirname, '../../assets/icon.ico'),
@@ -1553,6 +1581,9 @@ function createWindow() {
     show: false,
     autoHideMenuBar: true,
   });
+
+  // 不设置 resizable: false：窗口仍可调整大小，但始终保持当前工作台比例。
+  mainWindow.setAspectRatio(windowAspectRatio)
 
   // S-1: Content-Security-Policy — 限制脚本/样式/连接来源，防止 XSS 加载外部资源
   // 开发模式 Vite 需要 unsafe-inline + unsafe-eval 用于 HMR/React Refresh
@@ -1647,13 +1678,19 @@ function createWindow() {
 
   // 最小化到托盘
   mainWindow.on('close', (e) => {
-    if (settingsCache.minimizeToTray && tray && mainWindow && !mainWindow.isDestroyed()) {
+    if (!isQuitting && settingsCache.minimizeToTray && tray && mainWindow && !mainWindow.isDestroyed()) {
       e.preventDefault();
       mainWindow.hide();
       appLog('INFO', 'createWindow', '拦截窗口关闭，最小化到系统托盘');
-    } else {
-      appLog('INFO', 'createWindow', '窗口即将关闭并退出进程');
+      return
     }
+    if (!isQuitting && backendProcess) {
+      e.preventDefault()
+      appLog('INFO', 'createWindow', '拦截窗口关闭，等待录制封尾与收尾 checkpoint')
+      requestGracefulAppQuit('window_close')
+      return
+    }
+    appLog('INFO', 'createWindow', '窗口即将关闭并退出进程');
   });
 
   mainWindow.webContents.once('did-finish-load', () => {
@@ -1701,6 +1738,49 @@ function registerAppSettingsIpc(): void {
 // ===== 生命周期 =====
 
 let isQuitting = false
+let shutdownCleanupInProgress = false
+let shutdownCleanupTimer: ReturnType<typeof setTimeout> | null = null
+const SHUTDOWN_CLEANUP_TIMEOUT_MS = 45_000
+
+function requestGracefulAppQuit(reason: string): void {
+  if (isQuitting || shutdownCleanupInProgress) {
+    return
+  }
+  if (!backendProcess) {
+    isQuitting = true
+    app.quit()
+    return
+  }
+  shutdownCleanupInProgress = true
+  appLog('INFO', 'App', `开始退出清理握手: reason=${reason}`)
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('cleanup-all-rooms')
+    appLog('INFO', 'App', '已通知渲染进程持久化收尾任务并封尾录制')
+  } else {
+    appLog('WARN', 'App', '渲染进程不可用，无法执行退出清理握手')
+    void finishGracefulAppQuit('renderer_unavailable')
+    return
+  }
+  shutdownCleanupTimer = setTimeout(() => {
+    appLog('WARN', 'App', `退出清理握手超时 (${SHUTDOWN_CLEANUP_TIMEOUT_MS}ms)`)
+    void finishGracefulAppQuit('renderer_timeout')
+  }, SHUTDOWN_CLEANUP_TIMEOUT_MS)
+}
+
+async function finishGracefulAppQuit(reason: string): Promise<void> {
+  if (isQuitting) {
+    return
+  }
+  isQuitting = true
+  shutdownCleanupInProgress = false
+  if (shutdownCleanupTimer) {
+    clearTimeout(shutdownCleanupTimer)
+    shutdownCleanupTimer = null
+  }
+  appLog('INFO', 'App', `退出清理握手结束: reason=${reason}`)
+  await killBackendAndWait(5000)
+  app.quit()
+}
 
   // ===== 依赖安装 IPC =====
 
@@ -1871,28 +1951,12 @@ let isQuitting = false
     if (isQuitting) {
       return
     }
-
-    appLog('INFO', 'App', '应用即将退出，正在清理全部房间...')
-
-    // 通知渲染进程通过 WebSocket 清理所有房间（停止录制/预览/分析）
-    try {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('cleanup-all-rooms')
-        appLog('INFO', 'App', '已通知渲染进程清理全部房间')
-      }
-    } catch (err) {
-      appLog('ERROR', 'App', `通知渲染进程清理失败: ${err}`)
-    }
-
     if (!backendProcess) {
+      isQuitting = true
       return
     }
-
     event.preventDefault()
-    isQuitting = true
-    new Promise<void>((resolve) => setTimeout(resolve, 1500))
-      .then(() => killBackendAndWait(5000))
-      .finally(() => app.quit())
+    requestGracefulAppQuit('before_quit')
   })
 
   process.on('exit', () => {

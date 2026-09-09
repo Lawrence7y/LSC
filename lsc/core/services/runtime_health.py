@@ -7,7 +7,7 @@ from typing import Any
 
 from lsc.config import is_platform_pipeline_v2_enabled, load_config
 from lsc.platforms.capabilities import get_platform_capabilities
-from lsc.platforms.failure import normalize_failure_kind
+from lsc.platforms.failure import FailureKind, classify_failure, normalize_failure_kind
 from lsc.platforms.redaction import redact_text
 
 _log = logging.getLogger(__name__)
@@ -72,6 +72,19 @@ def build_room_health(room: Any, *, supervisor: Any | None = None) -> dict[str, 
         if raw_failure_kind
         else ""
     )
+    if not failure_kind:
+        # Legacy connection attempts do not have an ingest supervisor yet, but
+        # StreamInfo still carries a typed adapter result. Preserve that
+        # result in the health projection so an offline room is not inferred
+        # as an authentication failure from passive credential metadata.
+        stream_info = getattr(room, "stream_info", None)
+        info_code = str(getattr(stream_info, "error_code", "") or "").strip().lower()
+        if info_code == "offline":
+            failure_kind = FailureKind.OFFLINE.value
+        elif error:
+            inferred = classify_failure(error)
+            if inferred is not FailureKind.UNKNOWN:
+                failure_kind = inferred.value
 
     platform_status = (
         "AUTH_REQUIRED" if failure_kind in {"AUTH_REQUIRED", "AUTH_EXPIRED"} else

@@ -234,16 +234,27 @@ def register_recording_handlers(
     async def handle_stop_recording(data):
         """停止录制指定房间。"""
         room_id = data.get('room_id')
+        wait_for_finalize = bool(data.get('wait_for_finalize'))
         if not room_id:
             return {'error': 'room_id is required'}
-        _log.info("停止录制: room_id=%s", room_id)
+        _log.info(
+            "停止录制: room_id=%s, wait_for_finalize=%s",
+            room_id,
+            wait_for_finalize,
+        )
 
         def _stop_async():
+            if wait_for_finalize:
+                return manager.stop_recording(room_id)
             return manager.stop_recording_async(room_id)
 
         try:
             success = await asyncio.get_running_loop().run_in_executor(
-                bridge_executor, lambda: bridge.manager.call(_stop_async, timeout=5.0)
+                bridge_executor,
+                lambda: bridge.manager.call(
+                    _stop_async,
+                    timeout=25.0 if wait_for_finalize else 10.0,
+                ),
             )
         except Exception as exc:
             _log.error("停止录制异常: room_id=%s, error=%s", room_id, exc)
@@ -263,7 +274,14 @@ def register_recording_handlers(
             save_recording_history(recording_history)
 
         broadcast_rooms()
-        return {'success': bool(success)}
+        room = manager.get_room(room_id)
+        return {
+            'success': bool(success),
+            'room_id': room_id,
+            'output_path': getattr(room, 'record_output_path', '') if room else '',
+            'recording_id': getattr(room, 'recording_id', '') if room else '',
+            'finalization_state': 'completed' if success else 'error',
+        }
 
     @server.on('repair_recording')
     async def handle_repair_recording(data):

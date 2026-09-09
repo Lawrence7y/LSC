@@ -62,21 +62,26 @@ describe('ClipList 渲染', () => {
     expect(screen.getByText('· 2')).toBeTruthy()
   })
 
-  it('待确认切片显示「待调」计数', () => {
+  it('全部切片直接展示在列表中', () => {
     const clips = [
       makeClip({ confirm_status: 'pending' }),
       makeClip({ clip_id: 'clip-002', confirm_status: 'user_confirmed' }),
     ]
     render(<ClipList {...defaultProps} clips={clips} />)
-    expect(screen.getByText('待调 1')).toBeTruthy()
+    expect(screen.getByText('· 2')).toBeTruthy()
   })
 
-  it('audio_pending 切片显示「OCR 复核中」标签', () => {
-    render(<ClipList {...defaultProps} clips={[makeClip({ confirm_status: 'audio_pending' })]} />)
-    expect(screen.getByText('OCR 复核中')).toBeTruthy()
+  it('持续分析产出的切片显示「持续分析」标签', () => {
+    render(<ClipList {...defaultProps} clips={[makeClip({ source: 'ai_highlight' })]} />)
+    expect(screen.getByText('持续分析')).toBeTruthy()
   })
 
-  it('优先显示后端确认的实际录制轴范围', () => {
+  it('手动切片显示「手动切片」标签', () => {
+    render(<ClipList {...defaultProps} clips={[makeClip({ source: 'manual' })]} />)
+    expect(screen.getByText('手动切片')).toBeTruthy()
+  })
+
+  it('时间直接展示，取消「实际/预估」等状态标记', () => {
     render(
       <ClipList
         {...defaultProps}
@@ -84,7 +89,8 @@ describe('ClipList 渲染', () => {
       />,
     )
     const time = document.querySelector('.clip-row-v2__time')
-    expect(time?.textContent).toContain('录制00:01:34→00:02:04')
+    expect(time?.textContent).toContain('00:01:34→00:02:04')
+    expect(document.querySelector('.clip-row-v2__axis')).toBeNull()
   })
 })
 
@@ -96,6 +102,7 @@ describe('ClipList 删除交互', () => {
     render(<ClipList {...defaultProps} clips={[makeClip()]} onDelete={onDelete} />)
     // 删除按钮带 danger + DeleteOutlined，通过 tooltip title 定位
     const deleteBtn = document.querySelector('.clip-row-v2__acts button[aria-label="delete"], .clip-row-v2__acts .ant-btn-dangerous')
+
     expect(deleteBtn).toBeTruthy()
     fireEvent.click(deleteBtn!)
     expect(onDelete).toHaveBeenCalledWith('clip-001')
@@ -136,26 +143,10 @@ describe('ClipList 选择交互', () => {
   })
 })
 
-// ─── 交互：筛选与搜索 ────────────────────────────────────────────────
-
-describe('ClipList 筛选', () => {
-  const clips = [
-    makeClip({ clip_id: 'c1', label: '精彩击杀', confirm_status: 'user_confirmed' }),
-    makeClip({ clip_id: 'c2', label: '待调回合', confirm_status: 'pending', start: 300, end: 340 }),
-  ]
-
-  it('点击「待调」tab 只显示待处理切片', () => {
-    render(<ClipList {...defaultProps} clips={clips} />)
-    fireEvent.click(screen.getByText('待调 1'))
-    expect(screen.queryByText('精彩击杀')).toBeNull()
-    expect(screen.getByText('待调回合')).toBeTruthy()
-  })
-})
-
 // ─── 交互：导出 ──────────────────────────────────────────────────────
 
 describe('ClipList 导出交互', () => {
-  it('已确认切片可导出，点击导出按钮回调 onExport', () => {
+  it('切片可直接导出，点击导出按钮回调 onExport', () => {
     const onExport = vi.fn()
     render(<ClipList {...defaultProps} clips={[makeClip()]} onExport={onExport} />)
     const exportBtn = document.querySelector('.clip-row-v2__acts .act-primary')
@@ -164,13 +155,14 @@ describe('ClipList 导出交互', () => {
     expect(onExport).toHaveBeenCalledWith(expect.objectContaining({ clip_id: 'clip-001' }))
   })
 
-  it('pending 状态切片导出按钮禁用（无 confirmAndExport）', () => {
-    render(<ClipList {...defaultProps} clips={[makeClip({ confirm_status: 'pending' })]} />)
+  it('未确认边界切片取消待确认状态，导出按钮立即可用', () => {
+    const onExport = vi.fn()
+    render(<ClipList {...defaultProps} clips={[makeClip({ confirm_status: 'pending' })]} onExport={onExport} />)
     const exportBtn = document.querySelector('.clip-row-v2__acts .act-primary') as HTMLButtonElement | null
-    // 按钮要么不存在要么 disabled
-    if (exportBtn) {
-      expect(exportBtn.disabled).toBe(true)
-    }
+    expect(exportBtn).toBeTruthy()
+    expect(exportBtn?.disabled).toBe(false)
+    fireEvent.click(exportBtn!)
+    expect(onExport).toHaveBeenCalled()
   })
 
   it('导出中状态显示进度', () => {

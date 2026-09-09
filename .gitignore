@@ -165,6 +165,15 @@ _archive_20260819/
 .qoder/
 datasets/_seg*.mp4
 
+# Source-separated Valorant training outputs and local manifests.
+# They contain materialized frames and machine-specific paths; keep the
+# reproducible builder/schema in Git instead of the generated artifacts.
+datasets/valorant_phase_broadcast/
+datasets/valorant_phase_pov/
+scripts/valorant_vision/manifest_*.jsonl
+!scripts/valorant_vision/example_manifest.jsonl
+models/
+
 
 # AI review/tool history (local, not source)
 .mimosa/
@@ -178,3 +187,17 @@ scripts/analyze_platform_test.py
 
 # Backup files (tracked .bak files remain; new backups ignored)
 *.bak
+
+# AI & editor workspaces
+.agents/
+.cursor/
+.gemini/
+
+# Scratch & patch files
+diff_*.txt
+*.patch
+
+# Datasets and model backups
+datasets/valorant_phase_broadcast*/
+lsc/analyzer/models/backups/
+docs/reports/*.json

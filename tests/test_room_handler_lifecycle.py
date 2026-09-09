@@ -89,7 +89,7 @@ class _FakeServer:
     async def broadcast(self, name, data):
         self.broadcasts.append((name, data))
 
-    async def broadcast_mse(self, kind, room_id, payload):
+    async def broadcast_mse(self, kind, room_id, payload, *args, **kwargs):
         """MSE 二进制广播替身（shared ingest 路径使用）。"""
         self.broadcasts.append((f"mse_{kind}", {"room_id": room_id, "bytes": len(payload or b"")}))
 

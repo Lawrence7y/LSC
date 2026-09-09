@@ -1,5 +1,5 @@
-/* 切片列表 · 新设计语言
-   语义色轨（待调=琥珀 / AI=紫 / 可导=品牌青 / 已导=绿 / 失败=红 / 进行中=青）
+/* 切片列表 · 现代极简设计语言
+   语义色轨（待调=琥珀 / AI=柔紫 / 可导=品牌青 / 已导=绿 / 失败=红 / 进行中=青）
    悬停显操作，静止时只留信息 */
 
 .clip-list-v2 .clip-card-head {
@@ -13,98 +13,101 @@
   color: var(--text-tertiary);
   font-weight: 400;
   margin-left: 5px;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .clip-list-v2 .seg-mini {
   display: inline-flex;
   padding: 2px;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border-default);
-  border-radius: 7px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xs);
 }
 
 .clip-list-v2 .seg-mini button {
-  height: 22px;
-  padding: 0 10px;
+  height: 20px;
+  padding: 0 8px;
   font-size: 11px;
   border: none;
-  border-radius: 5px;
+  border-radius: 4px;
   background: transparent;
   color: var(--text-tertiary);
   cursor: pointer;
   font-family: var(--font-sans);
-  transition: all 0.15s;
+  transition: all 0.12s ease;
 }
 
 .clip-list-v2 .seg-mini button.on {
-  background: var(--background-800);
+  background: var(--surface-0);
   color: var(--text-primary);
+  font-weight: 600;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
 }
 
 html:not(.dark) .clip-list-v2 .seg-mini button.on {
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 
 .clip-list-v2 .clip-list-hint {
-  padding: 7px 10px;
+  padding: 6px 12px;
   font-size: 10.5px;
   color: var(--text-tertiary);
-  border-top: 1px solid var(--border-default);
+  border-top: 1px solid var(--border-hairline);
   flex-shrink: 0;
+  background: var(--surface-1);
 }
 
 /* ---- 行 ---- */
 .clip-row-v2 {
   display: grid;
   grid-template-columns: 3px 16px 1fr;
-  column-gap: 10px;
+  column-gap: 8px;
   align-items: stretch;
   width: 100%;
-  min-height: 76px;
+  min-height: 70px;
   box-sizing: border-box;
-  padding: 10px 10px 10px 0;
+  padding: 8px 8px 8px 0;
   margin: 0;
   background: transparent;
-  border-radius: 8px;
+  border-radius: var(--radius-xs);
   cursor: pointer;
-  transition: background 0.12s;
+  transition: background 0.12s ease;
   /* 浏览器原生“虚拟滚动”：跳过屏外布局/绘制 */
   content-visibility: auto;
   contain-intrinsic-size: 0 52px;
 }
 
 .clip-row-v2:hover {
-  background: var(--bg-tertiary);
+  background: var(--surface-2);
 }
 
 .clip-row-v2.is-sel {
-  background: rgba(49, 179, 174, 0.07);
+  background: rgba(49, 179, 174, 0.08);
 }
 
 .clip-row-v2.is-refining {
-  background: rgba(77, 196, 191, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(77, 196, 191, 0.3);
+  background: rgba(49, 179, 174, 0.08);
+  box-shadow: inset 0 0 0 1px var(--brand-500);
 }
 
 .clip-row-v2__rail {
-  border-radius: 2px;
+  border-radius: 1.5px;
   background: transparent;
 }
 
-.clip-row-v2.rail-pending .clip-row-v2__rail { background: var(--state-warning-dark, #ff9f0a); }
-.clip-row-v2.rail-ai .clip-row-v2__rail { background: #bf5af2; }
-.clip-row-v2.rail-ready .clip-row-v2__rail { background: var(--brand-500, #31b3ae); }
-.clip-row-v2.rail-exported .clip-row-v2__rail { background: var(--state-success-dark, #30d158); }
-.clip-row-v2.rail-failed .clip-row-v2__rail { background: var(--state-error-dark, #ff453a); }
-.clip-row-v2.rail-busy .clip-row-v2__rail { background: var(--brand-400, #4dc4bf); }
+/* 一个颜色 = 一个可执行动作；与 ClipList.tsx 的 railClass / RAIL_LEGEND 对应 */
+.clip-row-v2.rail-pending .clip-row-v2__rail { background: var(--state-warning-on-surface); }
+.clip-row-v2.rail-ready .clip-row-v2__rail { background: var(--brand-500); }
+.clip-row-v2.rail-exported .clip-row-v2__rail { background: var(--state-success-on-surface); }
+.clip-row-v2.rail-failed .clip-row-v2__rail { background: var(--state-error-on-surface); }
+/* 导出中：不再与「可导出」同为品牌青，改用进度系青蓝，配合行内进度条 */
+.clip-row-v2.rail-busy .clip-row-v2__rail { background: #3f83f8; }
 
 .clip-row-v2__main {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .clip-row-v2__top {
@@ -118,9 +121,9 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
   font-size: 10px;
   line-height: 16px;
   padding: 0 5px;
-  border-radius: 4px;
-  background: var(--background-700);
-  color: var(--text-300);
+  border-radius: 3px;
+  background: var(--surface-2);
+  color: var(--text-tertiary);
   max-width: 66px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -132,8 +135,8 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
 .clip-row-v2__label {
   flex: 1;
   min-width: 0;
-  font-size: 12.5px;
-  font-weight: 550;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -145,28 +148,23 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
   font-weight: 600;
   padding: 0 5px;
   line-height: 15px;
-  border-radius: 4px;
+  border-radius: 3px;
   flex-shrink: 0;
 }
 
 .clip-row-v2__tag--ai {
-  color: #bf5af2;
-  background: rgba(191, 90, 242, 0.12);
+  color: var(--brand-500, #31b3ae);
+  background: rgba(49, 179, 174, 0.12);
+}
+
+.clip-row-v2__tag--manual {
+  color: var(--text-tertiary);
+  background: var(--surface-2);
 }
 
 .clip-row-v2__tag--approx {
-  color: var(--state-warning-dark, #ff9f0a);
-  background: rgba(255, 159, 10, 0.12);
-}
-
-.clip-row-v2__tag--audio-pending {
-  color: var(--state-warning-dark, #ff9f0a);
-  background: rgba(255, 159, 10, 0.12);
-}
-
-.clip-row-v2__tag--confirmed {
-  color: var(--state-success, #1D9E75);
-  background: rgba(29, 158, 117, 0.12);
+  display: none;
+  color: #ff9f0a;
 }
 
 .clip-row-v2__bottom {
@@ -178,7 +176,7 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
 }
 
 .clip-row-v2__time {
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-family: var(--font-mono, monospace);
   font-size: 11px;
   color: var(--text-tertiary);
   white-space: nowrap;
@@ -187,7 +185,7 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
 
 .clip-row-v2__time .sep-dot {
   opacity: 0.4;
-  margin: 0 6px;
+  margin: 0 4px;
   font-style: normal;
 }
 
@@ -198,13 +196,18 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
 .clip-row-v2__time .clip-row-v2__axis {
   color: var(--brand-400, #4dc4bf);
   font-size: 10px;
-  margin-right: 5px;
+  margin-right: 4px;
+}
+
+/* 「预估」：边界尚未确认，时间还不是最终导出范围，语气要比「实际」弱 */
+.clip-row-v2__time .clip-row-v2__axis.is-est {
+  color: var(--text-tertiary);
 }
 
 .clip-row-v2__acts {
   display: none;
   align-items: center;
-  gap: 1px;
+  gap: 2px;
   flex-shrink: 0;
 }
 
@@ -222,13 +225,13 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
   height: 22px;
   min-width: 22px;
   padding: 0 5px;
-  font-size: 12px;
-  border-radius: 5px;
+  font-size: 11px;
+  border-radius: 4px;
 }
 
 .clip-row-v2__acts .act-primary {
-  background: var(--brand-500, #31b3ae) !important;
-  border-color: var(--brand-500, #31b3ae) !important;
+  background: var(--brand-500) !important;
+  border-color: var(--brand-500) !important;
   color: #fff !important;
 }
 
@@ -255,12 +258,12 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
 
 .clip-row-v2__prog .pbar-line {
   flex: 1;
-  height: 6px;
+  height: 5px;
   min-width: 40px;
 }
 
 .clip-row-v2__pct {
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
+  font-family: var(--font-mono, monospace);
   font-size: 10.5px;
   color: var(--brand-400, #4dc4bf);
   flex-shrink: 0;

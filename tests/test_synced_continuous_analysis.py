@@ -270,7 +270,9 @@ def test_stop_continuous_analysis_accepts_synced_target_room_id(tmp_path, monkey
         assert list(room_handler._continuous_tasks) == ["main"]
         assert stop_result["success"] is True
         assert created_tasks[0].cancelled_called is False
-        assert room_handler._continuous_tasks["main"]["cancelled"] is True
+        # 录制中停止：主房进入尾部补扫流程（stop_tail_scan），随后的有界
+        # 补扫窗口完成后主循环自行置 cancelled 退出，handler 不立即掐断。
+        assert room_handler._continuous_tasks["main"]["stop_tail_scan"] is True
     finally:
         room_handler._continuous_tasks.clear()
 

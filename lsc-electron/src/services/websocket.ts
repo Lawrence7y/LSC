@@ -55,6 +55,32 @@ function truncateLogData(data: unknown): unknown {
   return logData
 }
 
+/**
+ * 结构化 WebSocket 错误，避免 renderer 只输出 `[object Event]`。
+ * 不输出完整 URL，防止 query token 被写入日志。
+ */
+export function describeWebSocketError(
+  error: unknown,
+  socket?: Pick<WebSocket, 'readyState'> | null,
+): string {
+  const event = error as {
+    type?: unknown
+    message?: unknown
+    code?: unknown
+    reason?: unknown
+    wasClean?: unknown
+  } | null
+  const parts = [
+    `type=${String(event?.type || 'error')}`,
+    `message=${String(event?.message || '') || '<none>'}`,
+    `event_code=${String(event?.code ?? '') || '<none>'}`,
+    `event_reason=${String(event?.reason || '') || '<none>'}`,
+    `was_clean=${String(event?.wasClean ?? '') || '<none>'}`,
+    `ready_state=${String(socket?.readyState ?? '') || '<unknown>'}`,
+  ]
+  return parts.join(' ')
+}
+
 /** 将 WebSocket 载荷规范为 UTF-8 文本（兼容误发为二进制帧的 JSON）。 */
 export function normalizeWebSocketPayload(data: unknown): string | Promise<string> {
   if (typeof data === 'string') {
@@ -117,6 +143,8 @@ export class WebSocketClient {
   // P3-2: 后端心跳检测
   private lastHeartbeat = 0
   private heartbeatCheckTimer: ReturnType<typeof setInterval> | null = null
+  // 当前僵死 episode 是否已广播过 backend_crashed（防止 5s 轮询重复 emit）
+  private _heartbeatCrashEmitted = false
   private readonly usesDynamicBackendUrl: boolean
 
   constructor(url: string | null = null) {
@@ -255,6 +283,8 @@ export class WebSocketClient {
               if (message.type === 'heartbeat') {
                 this.lastHeartbeat = Date.now()
               }
+              // 僵死 episode 期间收到任何消息 → 后端恢复
+              this._noteBackendAlive()
               if (isDev) {
                 if (!isHighFrequencyWsType(message.type)) {
                   console.log(`[WebSocket] Received message type=${message.type}, data=`, truncateLogData(message.data))
@@ -267,11 +297,16 @@ export class WebSocketClient {
           }
 
           try {
-            // MSE 二进制帧优先：magic=MSE，避免把 fMP4 当 UTF-8 JSON
+            // MSE 二进制帧优先：magic=MSE/MS2，避免把 fMP4 当 UTF-8 JSON，支持 channel 路由
             if (event.data instanceof ArrayBuffer) {
               const mse = tryParseMseBinaryFrame(event.data)
               if (mse) {
-                this.emit(mse.type, { room_id: mse.roomId, data: mse.payload })
+                this.emit(mse.type, {
+                  room_id: mse.roomId,
+                  data: mse.payload,
+                  channel: mse.channel,
+                  stream_id: mse.streamId,
+                })
                 return
               }
             }
@@ -288,9 +323,12 @@ export class WebSocketClient {
           }
         }
 
-        socket.onclose = () => {
+        socket.onclose = (event) => {
           clearTimeout(connectTimeout)
-          console.log('WebSocket disconnected')
+          console.warn(
+            `[WebSocket] disconnected ${describeWebSocketError(event, socket)} `
+            + `reconnect_attempt=${this.reconnectAttempts}`,
+          )
           this.isConnected = false
           this.pendingConnect = null
           // 断连期间停止心跳检测，避免旧 interval 在断连 15s 后误报 backend_crashed
@@ -304,7 +342,10 @@ export class WebSocketClient {
 
         socket.onerror = (error) => {
           clearTimeout(connectTimeout)
-          console.error('WebSocket error:', error)
+          console.error(
+            `[WebSocket] error ${describeWebSocketError(error, socket)} `
+            + `reconnect_attempt=${this.reconnectAttempts}`,
+          )
           reject(error)
         }
       }))
@@ -351,11 +392,16 @@ export class WebSocketClient {
     // 旧 interval（断连→重连循环后累积多个 5s 定时器，且断连期间会重复 emit）
     this._stopHeartbeatCheck()
     this.lastHeartbeat = Date.now()
+    this._heartbeatCrashEmitted = false
     this.heartbeatCheckTimer = setInterval(() => {
       if (Date.now() - this.lastHeartbeat > 15000) {
-        // 超过 15 秒无心跳，认为后端异常
-        console.warn('[WebSocket] Backend heartbeat timeout')
-        this.emit('backend_crashed', null)
+        // 超过 15 秒无心跳，认为后端异常（每个僵死 episode 只广播一次，
+        // 复位由 onmessage 命中任何消息时的 backend_revived 负责）
+        if (!this._heartbeatCrashEmitted) {
+          this._heartbeatCrashEmitted = true
+          console.warn('[WebSocket] Backend heartbeat timeout')
+          this.emit('backend_crashed', null)
+        }
       }
     }, 5000)
   }
@@ -365,6 +411,13 @@ export class WebSocketClient {
       clearInterval(this.heartbeatCheckTimer)
       this.heartbeatCheckTimer = null
     }
+  }
+
+  /** 僵死 episode 期间收到任何消息：复位标记并广播 backend_revived。 */
+  private _noteBackendAlive(): void {
+    if (!this._heartbeatCrashEmitted) return
+    this._heartbeatCrashEmitted = false
+    this.emit('backend_revived', null)
   }
 
   // 重连成功后将队列中暂存的消息依次发送

@@ -210,13 +210,10 @@ def _train_and_export(
         ml_augment = None
 
     train_tf = transforms.Compose([
-        transforms.Resize((INPUT_SIZE + 16, INPUT_SIZE + 16)),
-        transforms.RandomCrop((INPUT_SIZE, INPUT_SIZE)),
+        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
         ml_augment if ml_augment else transforms.Lambda(lambda x: x),  # 多语言 UI 增强
-        transforms.ColorJitter(brightness=0.35, contrast=0.4, saturation=0.3, hue=0.05),
-        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.25),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03),
         transforms.ToTensor(),
-        transforms.RandomErasing(p=0.2, scale=(0.02, 0.12)),
         transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
     ])
     eval_tf = transforms.Compose([
@@ -249,18 +246,19 @@ def _train_and_export(
         worker_init_fn=worker_init,
     )
 
-    # Inverse-frequency class weights (combat dominates POV datasets).
+    # Smoothed inverse-frequency class weights to prevent over-represented classes from being suppressed.
     class_counts = torch.zeros(len(LABELS), dtype=torch.float32)
     for _, y in train_samples:
         class_counts[y] += 1.0
     class_counts = torch.clamp(class_counts, min=1.0)
-    weights = (class_counts.sum() / (len(LABELS) * class_counts)).to(device)
+    raw_weights = class_counts.sum() / (len(LABELS) * class_counts)
+    weights = torch.clamp(torch.sqrt(raw_weights), min=0.6, max=3.5).to(device)
     criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
 
     best_state = None
-    best_bal = -1.0
+    best_macro_f1 = -1.0
     best_acc = -1.0
     best_epoch = 0
 
@@ -279,8 +277,7 @@ def _train_and_export(
         model.eval()
         correct = 0
         total = 0
-        per_correct = [0] * len(LABELS)
-        per_total = [0] * len(LABELS)
+        confusion = [[0] * len(LABELS) for _ in range(len(LABELS))]
         with torch.no_grad():
             for batch_x, batch_y in val_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -288,29 +285,34 @@ def _train_and_export(
                 correct += int((preds == batch_y).sum().item())
                 total += int(batch_y.size(0))
                 for t, p in zip(batch_y.tolist(), preds.tolist(), strict=True):
-                    per_total[t] += 1
-                    if t == p:
-                        per_correct[t] += 1
+                    confusion[t][p] += 1
         acc = (correct / total) if total else 0.0
-        recalls = [
-            (per_correct[i] / per_total[i]) if per_total[i] else 0.0
-            for i in range(len(LABELS))
-        ]
-        bal = sum(recalls) / len(LABELS)
+        f1s = []
+        recalls = []
+        for i in range(len(LABELS)):
+            tp = confusion[i][i]
+            fp = sum(confusion[r][i] for r in range(len(LABELS)) if r != i)
+            fn = sum(confusion[i][c] for c in range(len(LABELS)) if c != i)
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+            f1s.append(f1)
+            recalls.append(rec)
+        macro_f1 = sum(f1s) / len(LABELS)
         print(
             f"epoch {epoch}/{epochs} loss={running_loss / max(len(train_loader), 1):.4f} "
-            f"val_acc={acc:.4f} bal_acc={bal:.4f} "
-            + " ".join(f"{LABELS[i]}={recalls[i]:.2f}" for i in range(len(LABELS)))
+            f"val_acc={acc:.4f} macro_f1={macro_f1:.4f} "
+            + " ".join(f"{LABELS[i]}_f1={f1s[i]:.2f}" for i in range(len(LABELS)))
         )
-        if bal > best_bal or (abs(bal - best_bal) < 1e-6 and acc > best_acc):
-            best_bal = bal
+        if macro_f1 > best_macro_f1 or (abs(macro_f1 - best_macro_f1) < 1e-6 and acc > best_acc):
+            best_macro_f1 = macro_f1
             best_acc = acc
             best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state is not None:
         model.load_state_dict(best_state)
-        print(f"using best checkpoint epoch={best_epoch} bal_acc={best_bal:.4f} val_acc={best_acc:.4f}")
+        print(f"using best checkpoint epoch={best_epoch} macro_f1={best_macro_f1:.4f} val_acc={best_acc:.4f}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_path = out_dir / "valorant_phase_v1.onnx"

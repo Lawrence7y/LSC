@@ -277,6 +277,45 @@ def save_analysis_results(
         return False
 
 
+def _finalization_json_path(video_path: str) -> Path:
+    """收尾任务状态与录制文件绑定，避免依赖内存或 WebSocket。"""
+    p = Path(video_path)
+    return p.with_name(p.stem + ".finalization.json")
+
+
+def save_finalization_job(video_path: str, job: dict[str, Any]) -> bool:
+    """原子保存持续分析收尾任务状态。"""
+    file_path = _finalization_json_path(video_path)
+    try:
+        with _persist_lock:
+            _ensure_dir(file_path.parent)
+            tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(job, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(file_path)
+        _log.info("收尾任务已保存: %s", file_path.name)
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        _log.error("保存收尾任务失败: %s", exc, exc_info=True)
+        return False
+
+
+def load_finalization_job(video_path: str) -> dict[str, Any] | None:
+    """读取可恢复的收尾任务状态；文件缺失或损坏时返回 None。"""
+    file_path = _finalization_json_path(video_path)
+    if not file_path.exists():
+        return None
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        _log.warning("加载收尾任务失败: %s", exc)
+        return None
+
+
 def load_analysis_results(video_path: str) -> dict[str, Any] | None:
     """读取录制文件同目录的分析结果 JSON。
 

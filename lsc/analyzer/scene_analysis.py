@@ -9,19 +9,24 @@ import subprocess
 from collections.abc import Callable
 from typing import Any
 
-from lsc.utils.process_launcher import prepare_launch, run_hidden, set_stream_nonblocking
+from lsc.utils.process_launcher import (
+    kill_process_tree,
+    prepare_launch,
+    run_hidden,
+    set_stream_nonblocking,
+)
 
 _log = logging.getLogger(__name__)
 
 
 def safe_terminate(proc: subprocess.Popen) -> None:
-    """安全终止子进程：terminate → 等 5s → kill 兜底。"""
+    """安全终止子进程：terminate → 等 5s → 树杀兜底。"""
     try:
         proc.terminate()
         proc.wait(timeout=5)
     except Exception:
         try:
-            proc.kill()
+            kill_process_tree(proc)
             proc.wait(timeout=3)
         except Exception as exc:
             _log.debug("操作异常（已忽略）: %s", exc)

@@ -35,6 +35,15 @@ class ClipDraftSource:
     precision: str = "exact"  # exact | approximate
     confirm_status: str | None = None
     room_id: str | None = None
+    # 赛事审计字段（从 clip_queued / 后端权威快照透传，用于失败关闭门禁）
+    source_profile: str | None = None
+    broadcast_audit: str | None = None
+    broadcast_review_required: bool = False
+    duration_anomaly: bool = False
+    end_by: str | None = None
+
+
+_BROADCAST_VALID_END_BY = frozenset({"next_prep", "broadcast_exclusion"})
 
 
 def sanitize_draft_token(name: str) -> str:
@@ -91,15 +100,68 @@ def map_clip_timeranges(
     return (t_start, s_dur, s_start, s_dur, clamped)
 
 
+def _broadcast_gate_passed(
+    *,
+    confirm_status: str | None,
+    source_profile: str | None,
+    broadcast_audit: str | None,
+    broadcast_review_required: bool,
+    duration_anomaly: bool,
+    end_by: str | None,
+    include_pending: bool,
+) -> bool:
+    """赛事（broadcast）草稿失败关闭门禁。
+
+    - 人工确认（user_confirmed）可绕过审计缺失（用户已复核）；
+    - 手动勾选「包含待确认切片」（include_pending=True）时允许 pending/refining
+      以暂定出点入草稿；
+    - 除此之外，broadcast 切片必须 vision_confirmed + broadcast_audit==passed
+      + 无复核标记 + 无时长异常 + 出点为 next_prep / broadcast_exclusion。
+    """
+    status = str(confirm_status or "").strip().lower()
+    if str(source_profile or "").strip().lower() != "broadcast":
+        return True
+    if status == "user_confirmed":
+        return True
+    if status in ("pending", "refining") and include_pending:
+        return True
+    if status != "vision_confirmed":
+        return False
+    if str(broadcast_audit or "").strip().lower() != "passed":
+        return False
+    if broadcast_review_required:
+        return False
+    if duration_anomaly:
+        return False
+    if str(end_by or "") not in _BROADCAST_VALID_END_BY:
+        return False
+    return True
+
+
 def clip_source_usable(
     *,
     precision: str,
     confirm_status: str | None,
     include_pending: bool = False,
+    source_profile: str | None = None,
+    broadcast_audit: str | None = None,
+    broadcast_review_required: bool = False,
+    duration_anomaly: bool = False,
+    end_by: str | None = None,
 ) -> bool:
     if precision == "approximate":
         return False
-    return not (confirm_status in ("pending", "refining") and not include_pending)
+    if confirm_status in ("pending", "refining") and not include_pending:
+        return False
+    return _broadcast_gate_passed(
+        confirm_status=confirm_status,
+        source_profile=source_profile,
+        broadcast_audit=broadcast_audit,
+        broadcast_review_required=broadcast_review_required,
+        duration_anomaly=duration_anomaly,
+        end_by=end_by,
+        include_pending=include_pending,
+    )
 
 
 def clip_allowed_for_draft(clip: dict, *, include_pending: bool = False) -> bool:
@@ -107,7 +169,17 @@ def clip_allowed_for_draft(clip: dict, *, include_pending: bool = False) -> bool
     status = clip.get("confirm_status")
     if status in ("pending", "refining") and not include_pending:
         return False
-    return clip.get("mark_precision") != "approximate"
+    if clip.get("mark_precision") == "approximate":
+        return False
+    return _broadcast_gate_passed(
+        confirm_status=status,
+        source_profile=clip.get("source_profile"),
+        broadcast_audit=clip.get("broadcast_audit"),
+        broadcast_review_required=bool(clip.get("broadcast_review_required")),
+        duration_anomaly=bool(clip.get("duration_anomaly")),
+        end_by=clip.get("end_by"),
+        include_pending=include_pending,
+    )
 
 
 def resolve_common_range(clip: dict[str, Any], ctx: Any) -> tuple[float, float, str] | None:
@@ -430,11 +502,16 @@ def build_session_draft(
                 precision=c.precision,
                 confirm_status=c.confirm_status,
                 include_pending=options.include_pending,
+                source_profile=c.source_profile,
+                broadcast_audit=c.broadcast_audit,
+                broadcast_review_required=c.broadcast_review_required,
+                duration_anomaly=c.duration_anomaly,
+                end_by=c.end_by,
             )
         ]
         skipped = len(clips) - len(usable_clips)
         if skipped:
-            warnings.append(f"已排除 {skipped} 条 pending/approximate 切片")
+            warnings.append(f"已排除 {skipped} 条 pending/approximate 或未通过赛事审计的切片")
 
         if options.include_clips:
             # 每条切片只进「其所属房间」的切片轨：主/副房同回合切片在公共轴上的

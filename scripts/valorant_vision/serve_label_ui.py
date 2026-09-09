@@ -32,6 +32,7 @@ _MAX_BODY_BYTES = 2 * 1024 * 1024
 _SERVER_HOLDER: list[ThreadingHTTPServer] = []
 
 ROOT = DEFAULT_ROOT
+FRAME_ROOT = ROOT
 QUEUE = ROOT / "queue.json"
 LABELS = ROOT / "labels.json"
 MANIFEST = ROOT / "manifest_labeled.jsonl"
@@ -267,6 +268,8 @@ function render() {
   if (q.priority) hint.push(`复核:${q.priority}`);
   if (q.current_label) hint.push(`原标:${LABEL_ZH[q.current_label] || q.current_label}`);
   if (q.suggested_label) hint.push(`建议:${LABEL_ZH[q.suggested_label] || q.suggested_label}`);
+  if (q.coarse_confidence != null) hint.push(`粗标置信度:${Number(q.coarse_confidence).toFixed(3)}`);
+  if (q.duplicate_count > 1) hint.push(`重复内容:${q.duplicate_count}份`);
   const reason = q.reason || q.notes || "";
   document.getElementById("meta").innerHTML =
     `<span class="tag">${SOURCE_ZH[q.source_type] || q.source_type}</span>` +
@@ -301,7 +304,7 @@ function render() {
 async function saveLabel(label) {
   const q = current();
   const notes = document.getElementById("notes").value.trim();
-  labels[q.id] = { label, notes, timestamp_sec: q.timestamp_sec, video_id: q.video_id };
+  labels[q.id] = { label, notes, annotator: "human", timestamp_sec: q.timestamp_sec, video_id: q.video_id };
   await fetch("/api/labels", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(labels) });
   go(1);
 }
@@ -695,7 +698,7 @@ class Handler(BaseHTTPRequestHandler):
             rel = unquote(path[len("/frame/") :])
             # normpath 防 .. 穿越，但不 resolve 以免穿透 junction/symlink
             try:
-                fp = resolve_frame_path(ROOT, rel)
+                fp = resolve_frame_path(FRAME_ROOT, rel)
             except ValueError:
                 self._json(404, {"error": "missing"})
                 return
@@ -769,6 +772,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Annotation root containing queue.json and labels.json "
         "(default: ~/LSC/datasets/valorant_phase/annotate)",
     )
+    parser.add_argument(
+        "--frame-root",
+        type=Path,
+        default=None,
+        help="Frame root when queue paths are relative to a different dataset root",
+    )
     parser.add_argument("--port", type=int, default=PORT, help=f"HTTP port (default: {PORT})")
     parser.add_argument("--token", default=None, help="Optional token required by the local UI")
     parser.add_argument("--max-threads", type=int, default=8, help="Compatibility option for the local server")
@@ -776,17 +785,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    global _AUTH_TOKEN
+    global _AUTH_TOKEN, FRAME_ROOT
     args = build_parser().parse_args(argv)
     if args.token is not None:
         _AUTH_TOKEN = str(args.token)
     paths = configure_paths(args.root)
+    FRAME_ROOT = (args.frame_root or paths.root).resolve()
     if not paths.queue.exists():
         raise SystemExit(f"missing {paths.queue}; run build_round_boundary_queue.py first")
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     _SERVER_HOLDER.append(server)
     print(f"Label UI: http://127.0.0.1:{args.port}/")
-    print(f"Frames root: {paths.root}")
+    print(f"Frames root: {FRAME_ROOT}")
     server.serve_forever()
 
 

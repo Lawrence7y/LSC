@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 
 from lsc.platforms.base import headers_to_ffmpeg_input_args
-from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
+from lsc.utils.process_launcher import kill_process_tree, prepare_launch, set_stream_nonblocking
 
 _log = logging.getLogger(__name__)
 
@@ -129,7 +129,7 @@ def extract_audio_pcm(
         try:
             raw, _ = proc.communicate(timeout=duration + 20)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            kill_process_tree(proc)
             proc.communicate()
             _log.warning("FFmpeg 音频提取超时: source=%s", source[:200])
             return np.array([], dtype=np.float32)

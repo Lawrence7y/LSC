@@ -44,6 +44,7 @@
 | `audio_codec` | str | 无默认（不存在） | 前端默认 `AAC 128k` | 无后端读取方（冗余透传键） | — |
 | `audio_bitrate` | str | `128k` | 录制 `128k` `192k` `256k`；导出允许 `96k` 等 | 不在集合 → `128k` | 录制/导出音频码率 |
 | `preview_quality` | str | `高清` | `原画` `高清` `标清` `流畅`（分辨率/码率见 `_PREVIEW_QUALITY_PRESETS`） | 未知 → `高清` | MSE 预览画质 |
+| `timeline_replay_seconds` | int | `300` | `0`（关闭历史回放，仅保留播放缓存）、`120`、`300`、`600` 秒 | 非法值 → `300` | 时间线直播 DVR 缓冲时长 |
 | `preset` | str | 读取处兜底 `medium` | UI `ultrafast` `fast` `medium` `slow`；硬件映射见 `lsc/config.py:133-159` | 缺失 → `medium` | 编码预设 |
 | `ocr_accel` | str | `dml` | `auto` `dml` `cuda` `cpu`（别名 `automatic/directml/gpu` 归一化） | 非法 → `auto`；声明后端不可用 → `cpu`；变更时 `invalidate_ocr()` | OCR/回合检测/帧分类推理加速 |
 | `export_max_concurrent` | int | `2` | **仅 `1` 或 `2`** | 其他值/非 int → `2` | 全局导出 Semaphore 并发上限 |

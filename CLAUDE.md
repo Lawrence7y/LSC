@@ -128,7 +128,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 
 | 配置键 | 默认值 | 可选范围 / 说明 |
 | :--- | :--- | :--- |
-| `output_dir` | `~/LSC/output` | 录制产物主目录。支持 Windows 绝对路径或带 `~` 的家目录。⚠️ **默认值存在两处不一致**：settings/handler 层默认 `~/LSC/output`（`room_handler.py` 等），而 `lsc/config.py` 的 `LscConfig` 默认 `~/LSC/recordings`（config.py:244），待统一。 |
+| `output_dir` | `~/LSC/output` | 录制产物主目录。支持 Windows 绝对路径或带 `~` 的家目录。settings/handler 层与 `lsc/config.py` 的 `LscConfig` 默认值已统一为 `~/LSC/output`；orchestrator 预检失败的回退目录也已统一为 `~/LSC/output`（注意 `~/.lsc/cookies` 是 Cookie 存储，属另一机制，不冲突）。 |
 | `encoder` | `h264_nvenc` | `libx264` (CPU H264), `libx265` (CPU H265), `h264_nvenc` (Nvidia), `h264_qsv` (Intel), `h264_amf` (AMD), `copy` (直接拷贝) |
 | `crf` | `23` | `0` 到 `51`，越低画质越高。 |
 | `param_mode` | `"CRF 质量"` | `"CRF 质量"` 或 `"自定义码率"` |
@@ -140,6 +140,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 | `audio_codec` | `"AAC 128k"` | 音频参数配置。 |
 | `audio_bitrate`| `"128k"` | 导出音频码率：`"96k"`、`"128k"`、`"256k"` 等。 |
 | `preview_quality`| `"高清"` | MSE 预览的转码分辨率参考预设。 |
+| `timeline_replay_seconds` | `300` | 时间线直播 DVR 回放缓存时长；`0` 关闭历史回放但保留播放所需短缓存，可选 `120`/`300`/`600` 秒。 |
 | `shared_ingest_enabled` | `False` | 是否启用共享进样模式（共享远端上游 FFmpeg，录制/预览各自独立 sink）。`True` 开启共享上游，`False` 使用独立双进程。 |
 | `shared_ingest_preview_crf` | `23` | 共享进样模式下预览流的 CRF 值（0-51），越低画质越高。默认 23。 |
 | `shared_ingest_preview_preset`| `"veryfast"` | 共享进样模式下预览流的编码预设。可选 `ultrafast`/`superfast`/`veryfast`/`faster`/`fast`/`medium` 等。 |
@@ -168,7 +169,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 *   **TTL 缓存控制**：`registry.py` 内置线程安全的 `_ParseCache`，提供不同级别的生存时间 (TTL) 防御机制：
     *   **解析成功**：TTL = `30.0` 秒。防止高频轮询直播流导致平台 API 熔断。
     *   **解析失败**：TTL = `10.0` 秒。防止前端短时间内紧密重试压垮网络。
-    *   **定时清理**：每访问 `20` 次触发一次守护线程后台清理过期缓存。
+    *   **定时清理**：由 `__init__` 启动的单守护线程每 `60` 秒清理一次过期缓存（旧「每访问 20 次触发」机制已废弃）。
 *   **平台快速路由**：内置 `_URL_ROUTER` 路由映射表。`parse_stream()` 会优先提取 URL 的 host 路由到特定适配器，跳过无关平台，避免盲目尝试网络请求。若路由未匹配，才会进行全局线性扫描。
 
 ### 4.3 平台支持列表与错误码
@@ -200,7 +201,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 *   **FFmpeg 参数控制**：通过 `LscConfig` 内的参数动态拼装命令：
     *   如果编码器为 `copy`，则使用 `-c:v copy -c:a copy` 直出。
     *   非 copy 模式下，注入 `-c:v {codec}`、恒定质量因子（NVENC 下为 `-rc vbr -cq {crf}`；CPU 下为 `-crf {crf}`）以及预设参数 `-preset {preset}`。
-*   **磁盘满保护防线**：在录制状态轮询中（每 5 秒），系统会检测录制输出所在磁盘的可用空间，若**剩余空间低于 2GB** (`_MIN_FREE_BYTES_WHILE_RECORDING`)，则强制安全关停 FFmpeg 录制并抛出错误状态，确保操作系统及录制数据不损毁。
+*   **磁盘满保护防线**：在录制状态轮询中（低频 tick，约每 12 秒 = 4 tick × 3s），系统会检测录制输出所在磁盘的可用空间，若**剩余空间低于 2GB** (`_MIN_FREE_BYTES_WHILE_RECORDING`)，则强制安全关停 FFmpeg 录制并抛出错误状态，确保操作系统及录制数据不损毁。
 
 #### 5.1.1 录制文件三层验证机制 (`validate_recording`)
 
@@ -222,7 +223,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 *   **⚠️ Semaphore 热更新禁区**：`_ensure_export_queue` 调整并发上限时，**禁止**读取 `asyncio.Semaphore._waiters` 或调用 `_waiters.__len__()`。Python 3.10+ 在无等待者时 `_waiters` 为 `None`，会导致每次导出入队报 `'NoneType' object has no attribute '__len__'`。必须用模块级 `_export_semaphore_limit` 记录已配置上限，与 `desired` 比较后再替换 Semaphore。
 *   **竖屏导出算法**：当选择“竖屏 (9:16)”时，FFmpeg 滤镜为 **letterbox 等比缩放 + 补黑边**（保留完整原画面，不再中心裁剪）：
     `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black`
-*   **错误友好转化**：后端内置了面向用户的友好错误友好化映射工具 (`utils/error_messages.py`)。它包含 19 组正则表达式（含 2 组保留原始路径的 `_PRESERVE_RAW_PATTERNS` 和 17 组 `_PATTERNS`），捕获 FFmpeg 的底层报错（如 "Server returned 403 Forbidden"、"Connection refused"、"磁盘空间不足" 等中英文错误）并自动转换为中文友好提示。同时提供 `is_recoverable_error()` 判断是否值得自动重连。
+*   **错误友好转化**：后端内置了面向用户的友好错误友好化映射工具 (`utils/error_messages.py`)。它包含 23 组正则表达式（含 2 组保留原始路径的 `_PRESERVE_RAW_PATTERNS` 和 21 组 `_PATTERNS`，2026-09 新增 startup-probe/shared-ingest/refresh/rapidocr 四组），捕获 FFmpeg 的底层报错（如 "Server returned 403 Forbidden"、"Connection refused"、"磁盘空间不足" 等中英文错误）并自动转换为中文友好提示。同时提供 `is_recoverable_error()` 判断是否值得自动重连。
 
 ### 5.3 音频对齐技术 (`audio_aligner.py`)
 
@@ -320,7 +321,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 3.  **Box 分解与边界检测**：
     *   读取 stdout 字节流，定位 `ftyp` 和 `moov` 标签，合并生成 **初始化分片 (Init Segment)**，该片段只发送一次。
     *   实时检测 `moof`（Movie Fragment Header）和 `mdat`（Media Data）Box，根据特征拼接为单独的 **数据分片 (Media Segment)**。
-    *   如果连续读取未检测到分片边界且累积超过 **512KB** (`_MAX_SEGMENT_BYTES`)，则强制切分，防止缓冲区溢出。
+    *   如果缓冲无法解析出完整 box 且累积超过解析缓冲上限（`_MAX_SEGMENT_BYTES` = 512KB 的 2 倍 = 1MB），解析器会**从最近的 `ftyp`/`moof` 标记处丢弃积压数据**（截断丢弃，不是"切分出合法分片"）；正常参数下每段约 300KB，该路径实战几乎不触发。
 4.  **前端消费机制**：前端通过 `mediaSourcePlayer.ts` 接收 WebSocket 消息。首帧写入 `SourceBuffer.appendBuffer(initSegment)`，后续高频追加 `mediaSegment`，当缓冲区超出时间阈值时，自动执行清理以保证预览低延迟。
 
 ### 7.3 预览流与录制流架构模式
@@ -375,7 +376,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 *   **独立启动时机**：用户点击"开始录制"触发 `start_recording`；用户点击"预览"触发 `enable_preview {mode: "mse"}`。两者完全解耦，可以只录不看、只看不录、或同时进行。
 *   **并发上限**：
     *   预览最多 **4路**（`MAX_CONCURRENT_PREVIEWS`，MSE 路径硬上限，超限拒绝启动），≥3 路时动态降分辨率 ≤ 854×480@20fps，≥4 路时限制 ≤ 640×360@15fps（压力等级 critical/pressure 亦触发）。
-    *   录制最多 **12路**（`MAX_CONCURRENT_RECORDINGS`），启动并发用 `asyncio.Semaphore(2)` 限制，防止多路 HTTP 刷新同时阻塞。
+    *   录制并发无独立符号上限（`MAX_CONCURRENT_RECORDINGS` 不存在；受房间数上限 `MAX_ROOMS = 12` 间接约束），启动并发用 `asyncio.Semaphore(2)` 限制，防止多路 HTTP 刷新同时阻塞。
 *   **init 段竞态修复**：`mse_init` 消息可能早于 `rooms_updated` 到达前端（前端 VideoPreview 组件尚未挂载）。`SharedRoomIngest` 内部缓存最近一次 init 段（`last_init_segment`），前端挂载后主动发送 `request_mse_init`，后端通过 `replay_init()` 补发，解决竞态。
 *   **MSE 事件契约**：`broadcast_mse(kind, ...)` 的 `kind` 统一使用 `init` / `segment`，禁止调用方重复传入 `mse_` 前缀。前端 `preview_phase` 等事件态须同时镜像到 `uiState` 与 `RoomSession`，`rooms_updated` 整表替换时必须保留，否则会导致 LIVE 状态丢失和 watchdog 在 `refreshing_url/probing` 阶段误重连。
 *   **心跳隔离**：单房 controller 的 `tick()` / `watchdog_check()` 缺失或抛错不得终止 `RoomOrchestrator` 线程；必须记录告警并继续推进其它房间的录制、预览和重连。
@@ -489,7 +490,7 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 持续分析检出的 AI 回合（纯 OCR 确认，入点+出点齐备）`confirm_status='vision_confirmed'`，经 `clip_queued` 入切片列表并直接自动导出；用户手动标记的切片以 `user_confirmed` 计。
 
-*   **导出门禁**：`confirm_status` 为 `pending` / `refining` 时不可直接导出；须 `user_confirmed` 或 `ocr_confirmed`（或无 `confirm_status` 的手动切片）。
+*   **导出门禁**（2026-09 产品变更，以 `lsc-electron/src/utils/clipExportPolicy.ts` 的 `canExportClip` 为唯一判定入口，列表页按钮、批量导出、Ctrl+E 快捷键共用）：`pending`（OCR 已识别、等待确认）可直接导出；`user_confirmed` / `ocr_confirmed` / `vision_confirmed` 及无 `confirm_status` 的手动切片可导出；`audio_pending` / `refining` 不可导出；`export_status` 为 `queued`/`exporting` 时不可重复导出。
 *   **交互**：用户可点选切片进入精修（拖时间线调入出点 →「确认」），或直接点「确认并导出」（`handleConfirmClip` 后立即打开导出预览弹窗）。
 *   **涉及文件**：`ClipList.tsx`（`canExportClip` / `onConfirmAndExport`）、`Workbench/index.tsx`（`handleConfirmClip`、`handleConfirmAndExport`）、后端 `confirm_highlight_clip`。
 
@@ -509,31 +510,81 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 ### 8.6 持续分析（多房间同步）
 
 *   **只分析主房录制文件**；副房通过 `_map_highlight_to_room`（`recording_start_mono` + `content_offset` 差值）映射后 `clip_queued`。
-*   **分析导出 Modal**：打开时冻结 `continuousTargetRoomIds = currentTargetIds`（含单房 `selectedRoomId` 回退）。主房 Radio 与确认启动时的 `target_room_ids` **必须同源**（一律用 `continuousTargetRooms` / `continuousTargetRoomIds`），禁止在 `selectedRoomList` 与冻结列表间切换导致「只能选一间 / 只分析一间」。
+*   **分析导出 Modal**：打开期间 `continuousTargetRoomIds` **持续跟随当前多选/单选**（`selectedRoomIds` 变化即重写，守卫测试 `test_continuous_modal_syncs_target_rooms_while_open` 固化该契约；旧「打开时快照冻结」语义已废弃）。主房 Radio 与确认启动时的 `target_room_ids` **必须同源**（一律用 `continuousTargetRooms` / `continuousTargetRoomIds`），禁止在 `selectedRoomList` 与该列表间切换导致「只能选一间 / 只分析一间」。
 *   若打开 Modal 时已多选 ≥2 房，但确认时 `target_room_ids.length < 2`，须拦截并提示保持多选。
 *   映射校验失败回退仅主房时，广播 `continuous_highlights` 须带 `mapping_fallback: true` + `error`，前端 toast「副房间映射失败」。
 *   录制重连导致对齐 epoch 失效时，主房检测结果继续正常入列；副房映射暂停，不得复用旧 `content_offset`。用户重新一键对齐后恢复多房同步。
 *   “停止录制并收尾”只允许停止当前分析快照 `target_room_ids` 中仍在录制的房间，禁止停止未参与本次分析的其它独立录制任务；每次打开确认框必须重置停止模式，不能复用上次选择。
 *   直播跟进没有固定终点，运行中即使 `analyzed_duration == recorded_duration`，进度展示也不得冒充任务已 100% 完成；须标记为“实时跟进”，固定范围只用于停录收尾/已完成阶段。
 
-### 8.6.1 纯 OCR 检测架构（2026-08-05 简化）
+### 8.6.1 Valorant 按来源分层检测架构（2026-09）
 
-持续分析（valorant_round）与录制后全量分析统一走 `lsc/analyzer/valorant_ocr_rounds.py` 纯 OCR 检测器，
-不再依赖 ONNX 模型 / 音频钟声 / 相位调度 / 密扫精修：
+持续分析（valorant_round）与录制后全量分析以 `lsc/analyzer/valorant_ocr_rounds.py` 为粗定位基础，
+再按 `valorant_profile` 分流：`pov`（主播/第一视角）保持纯 OCR 行为，`broadcast`（官方赛事/二路）
+追加五分类视觉阶段审计和暂停计时器冻结检查。两条路径均不使用音频钟声作为 Valorant 边界主信号：
 
 *   **扫描区域**（每帧 1fps 双区域 OCR）：顶部计分板 + 回合计时器（`_read_top_anchors`）、
     中央回合横幅竖带（`_read_center_banner`，准备/结算关键词）。
-*   **切片语义**：入点 = 交战阶段第一帧（交战钟 >45s 连续确认），出点 = 下回合准备阶段第一帧
-    （新买枪倒计时或"购买阶段"横幅）；交战 + 结算 + 回放（赛事流）均在切片内。
-    检测器返回 (start, end) 即经 `_export_and_broadcast` → `clip_queued` 直接入切片列表与时间线。
+*   **POV 切片语义**：入点 = 交战阶段第一帧，出点 = 下回合准备阶段第一帧；保留原有
+    `pending` 和跨窗口 FSM 行为。
+*   **赛事切片语义**：OCR 只产生候选；候选必须通过 `valorant_broadcast.py` 的 `combat/result`
+    视觉审计。稳定 Replay、非游戏、买枪或官方暂停在其开始前截断，`pending`、`next_combat`、
+    `open_tail` 不得进入默认列表或剪映草稿。模型不可用时赛事候选安全拒绝，不回退为猜测切片。
+    赛事候选结束点以 OCR 粗结束为起点向后审计最多 90 秒；交战钟仍递减时忽略短暂的
+    `unknown/non_game` 误判。直播文件尚未写满后视窗口时保存在 `ocr_runtime_state`，不得提前发布粗结束点，
+    录制完成的最终扫描再定稿。审计会缓存已检查的 PTS，后续窗口只补扫新增尾部；赛事审计定稿后跳过通用边界精修。
 *   **OCR 先验**：
     *   相近相似原则：时间相近的两帧属性大致相同 → 计时器外推、两帧确认、冻结读数忽略（回放残留）；
     *   循环原则：POV = 准备→交战→结算，赛事 = 准备→交战→结算→回放；只有交战阶段确定
         （交战钟锚点），其余相位不确定但顺序固定；非游戏画面可任意穿插。
 *   **防误判窗口**：结算画面 5s 倒计时不得当准备（距 result <6s 忽略）；无结算信号的 prep 需
     连续 ≥4 帧且距交战 ≥30s；交战尾段残余钟（锚点 stale 后）不得开新回合。
-*   **增量扫描**：固定 lookback 30s + 追赶 480s（`compute_valorant_scan_budget`），
-    FSM/锚点/外推基准跨窗口持久化于 `ocr_runtime_state`。
+    *   **增量扫描与解耦（2026-09-06）**：通过纯函数 `_select_scan_window` 统一计算预算，消除兼容覆盖；
+        粗扫推进 coverage 与 broadcast 深度视觉审计解耦，粗扫每周期推进，审计按有界 quota (<=1~2)
+        消费，严禁在单次 kick 中全量阻塞审计导致滞后发散。
+        `broadcast` 严格证据驱动：仅当检出真实 replay/pause 截断或强 next_prep 局部复核通过才标通过，
+        `reason=none` 保持 `pending_no_exclusion` 并进入已审计待人工确认终态，严禁伪造
+        `broadcast_exclusion` 或假 `precise`。
+    *   **审计调度解耦（A-05，2026-09-08）**：审计改用独立 `_refine_semaphore`，不再与粗扫共享
+        asyncio semaphore。粗扫 kick 时按实时 backlog 决定是否抢占审计：
+        `backlog > _REFINE_PREEMPT_BACKLOG_SEC(60s)` 或审计超预算（`_BCAST_REFINE_KEEP_MAX_SEC`）
+        时置 `refine_abort`，审计经 cancel_check 数秒内释放线程 semaphore；低滞后窗口内粗扫等待
+        审计跑完一个批次（有界），保证审计能完整定稿（工作缓存于 audit_cache，抢占后廉价续扫）。
+        旧实现审计与粗扫共享唯一 semaphore，一次审计批可让覆盖停滞 60–90s，滞后永远追不平。
+    *   **回放截断边界门禁（2026-09-08）**：`classify_boundary_quality` 对 `end_by=broadcast_exclusion`
+        且 `broadcast_audit=passed` 的回合免除 end_delta 的 ±3s 采样容差——回放/暂停截断是结构性修正
+        （粗 OCR 出点在回放/买枪之后，视觉审计把终点截回真实交战结束，实测截断 15–65s），
+        终点证据由审计本身背书；起点精修仍受 3s 容差约束。旧实现把这类正常回合全部判 invalid，
+        导致 0 自动导出、全部永久 pending。
+    *   **超长候选分裂（2026-09-08）**：粗 FSM 漏检 prep 横幅合并出的 >150s 候选不再整条
+        `rejected_long_or_invalid`（内部真实回合全部丢失），由 `_expand_oversize_candidates`
+        按 ≤150s 切块后每块独立走视觉审计，`round_key` 追加 `-sN` 去重。
+    *   **审计结果永不丢失（2026-09-08）**：后台审计批超预算（`_BCAST_REFINE_KEEP_MAX_SEC`）
+        中止、被粗扫抢占或抽帧异常时，已定稿回合必须随 `_publish_refine_results` 发布，
+        不得随 executor 线程丢弃（实测：120s 预算中止整批 `vision_confirmed` 丢失，列表
+        永久停在 `pending_lookahead`）；`refine_abort` 只中止未完成部分。发布时 
+        `current_dur` 以 `max(_dur, recorded_duration)` 兜底，防止主循环游标回退重扫。
+    *   **停止补扫尾部（2026-09-08）**：录制中停止持续分析不再立即 `cancelled`，先进入
+        `stop_tail_scan`（target 冻结在停止时刻，最多 `_STOP_TAIL_MAX_WINDOWS` 窗）补扫未覆盖
+        尾部后自行退出；补扫期间审计中止（refine_abort）且不再启动新审计。
+        补扫窗口定向瞄准 target（单窗 `_STOP_TAIL_WINDOW_CAP_SEC=120s`），不套用 90s
+        自适应预算，缩短停止收尾时长；停止路径与“停止录制并收尾”互斥：补扫仅在无收尾
+        任务时生效。
+    *   **审计批配额（2026-09-08）**：后台审计单批配额 `max_audit_quota=2`。单候选
+        密扫+lookahead 审计 30–55s，4+ 候选必然撑满 `_BCAST_REFINE_KEEP_MAX_SEC=120s`
+        预算被中止（实测 5 候选批让单窗滞后 +107s）；收紧后批次在预算内完整结束，
+        未定稿候选在后续扫描间隙续扫。
+    *   **精修结果可靠交付（2026-09-08）**：`accepted` / `manual_review` 终态必须先
+        写入 `refine_result_queue`（以 `room_id + recording_id + round_key` 幂等），再从
+        `broadcast_pending_rounds` 删除；收尾 sidecar 同步持久化该队列。主循环消费并合并
+        后才确认 delivery，`audit_delivery_gap != 0` 必须记录 ERROR。禁止用单个
+        `scan_result_container` 或审计线程局部列表承载终态结果。
+    *   **收尾状态协议（2026-09-08）**：`finalization_state` 只有
+        `checkpoint_saved`（可恢复，不代表完成）、`finalizing`（后端正在执行）和
+        `completed`（coverage、审计和结果交付均完成）三类业务态；退出握手采用有界等待，
+        超预算必须保留 checkpoint。应用启动查询房间对应 sidecar，Workbench 必须提供
+        `resume_continuous_finalization` 恢复入口，并在恢复前校验源文件、录制 epoch、时长
+        未回退及 broadcast 模型契约。
 
 ### 8.7 时间线坐标系契约（进度条 / windowStart）
 
@@ -547,6 +598,29 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 *   `ControlBar` / `timelineView` 计算 `windowStart`、`displayCurrent`、进度条位置时，`elapsed` **只**允许使用与播放头同一轴的时间（common 或 preview）。
 *   **禁止**用 `record_started_at` 墙钟差或 `recorded_duration` 直接参与 `windowStart`（会导致录制已久、预览较晚时播放头被钳到 0%）。
+*   高频播放头同步也必须遵守同一轴契约：`preview_local` 写入时间线前，单房录制轴须先经 `previewToRecordingLocal` 转换；`recording_review` 则直接使用录制文件轴，禁止把原始 MSE `currentTime` 覆盖回显示轴。
+
+### 8.8 Live/Review 双通道播放与回放契约（2026-09-06）
+
+为彻底解决文件回看重启直播流、公共轴击穿失效、播放器反复重置问题，系统采用 Live/Review 双通道隔离架构：
+
+1.  **后端分频道管理**：
+    *   直播预览句柄与文件回看句柄物理隔离：`_preview_stream_registry` 管理直播流，`_review_streamers` 管理文件回看流（全局并发限制 ≤ 2）。
+    *   启动文件回看绝不停止正在录制与推流的 live preview sink。
+2.  **Epoch 严格拆分**：
+    *   `preview_epoch_id` 只代表直播预览流版本；文件回看拥有独立的 `review_session_id`。
+    *   进入或离开文件回看**严禁**调用 `_set_preview_epoch` 或 `TimelineService.on_preview_epoch_change`，公共轴与用户标记（`commonMarkIn`/`commonMarkOut`）全程受保护不失效。
+3.  **MSE 二进制帧双通道协议**：
+    *   v1 帧（`b'MSE'`）：默认直播流媒体分片。
+    *   v2 帧（`b'MS2'`）：携带 `channel`（`0=live`, `1=review`）与 `stream_id`（epoch 或 session_id）。前端精准路由，旧 session 迟到分片自动丢弃。
+4.  **前端双播放器叠放**：
+    *   `VideoPreview` 同时维护 `livePlayer` 与按需创建的 `reviewPlayer` 两个实例。
+    *   切入回看仅切换激活通道（可见性与静音控制），不调用 `disposePlayerFully`，后台 `livePlayer` 持续收流更新缓冲。
+    *   Web Audio 对齐仅采样 `liveVideo`，保证录制同步不受文件回看音频干扰。
+5.  **真实回放起点与回直播收敛**：
+    *   时间线“即时回放起点”严格取 LivePlayer 真实连续 `buffered.start` 映射到显示轴（右侧可即时无缝回看；更早录制区域为需加载文件回看）。
+    *   回放起点标签在进入回看时保持稳定，不跳变到 0s 基座。
+    *   “回到直播”单一收口于 `enterTimelineLive`，健康 live sink 下零 `enable_preview` 请求，直接切回直播沿。
 
 ---
 
@@ -593,6 +667,11 @@ LSC 实现了**手动触发的轻量更新检测**，通过直接调用 GitHub A
 *   **下载方式**：发现新版本后，"前往下载"按钮调用 `shell.openExternal(releaseUrl)` 跳转浏览器打开对应 GitHub Release 页，由用户手动下载安装包。**不实现自动下载/自动安装**，避免未签名安装包触发系统安全拦截。
 
 ### 9.3 WebSocket 状态消息格式
+
+持续分析状态补充约束：`continuous_analysis_status` / `get_continuous_analysis_status_response`
+必须携带 `phase` 与 `finalization_state`；`phase=checkpoint_saved` 只表示已保存检查点，
+不得渲染为“已完成”。可观测字段 `audit_terminal_total`、`audit_delivered_total`、
+`audit_delivery_gap`、`pending_queue_depth`、`refine_result_queue_depth` 用于对账。
 
 主进程通过 `mainWindow.webContents.send('update-status', payload)` 推送更新状态，preload.ts 通过 `onUpdateStatus` 回调转发到 React 组件：
 
@@ -755,8 +834,8 @@ Electron 应用使用 `electron-builder` 进行打包：
 ### 11.2 子进程运行安全设计
 
 *   **进程环境变量白名单**：启动 Python 后端子进程时，严禁污染或直接透传全部父进程环境变量。只透传精简的安全环境变量：
-    `PATH`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP`、`HOME`、`SYSTEMROOT`、`PATHEXT`、`PYTHONUNBUFFERED=1`（另加 `LSC_*` 必要项）。⚠️ `PYTHONPATH` **不在**白名单内（`process_launcher.py` 已移除——防止通过环境变量注入恶意 Python 模块路径）。
-*   **非阻塞管道防死锁**：在 MSE 转码或录制捕获子进程读取数据时，必须对 stdout/stderr 描述符调用 `_set_stream_nonblocking()`（POSIX 下使用 `fcntl` 接口设置 `O_NONBLOCK`）。**Windows 下读侧保持阻塞 no-op**（实测非阻塞 fd 上 `BufferedReader.readline` 无数据时返回 `b''`，会把逐行迭代误判为 EOF 提前退出读线程，导致管道积压）；写侧（共享进样 stdin）由 `shared_ingest` 单独 `os.set_blocking(fd, False)` + `_write_all` 捕获 `BlockingIOError` 重试至 deadline，保证超时保护真正生效。
+    `PATH`、`USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`TEMP`、`TMP`、`HOME`、`SYSTEMROOT`、`PATHEXT`、`PYTHONUNBUFFERED=1`（另加 `LSC_*` 必要项）。⚠️ `PYTHONPATH` **不在**白名单内——后端 spawn 仅注入打包 runtime packages 目录，禁止透传父进程 `PYTHONPATH`（防止环境变量注入恶意 Python 模块路径）。**文档化例外**：`getDependencyEnv()`（Electron 主进程的依赖安装子进程）为完成 pip/git/FFmpeg 下载需继承用户完整环境（代理/PATH 等），由主进程直接发起、不触达后端运行时，风险接受。
+*   **非阻塞管道防死锁**：在 MSE 转码或录制捕获子进程读取数据时，必须对 stdout/stderr 描述符调用 `_set_stream_nonblocking()`（POSIX 下使用 `fcntl` 接口设置 `O_NONBLOCK`）。**Windows 下读侧保持阻塞 no-op**（实测非阻塞 fd 上 `BufferedReader.readline` 无数据时返回 `b''`，会把逐行迭代误判为 EOF 提前退出读线程，导致管道积压）；写侧（共享进样 stdin）由 `shared_ingest` 的 `_write_all` 捕获 `BlockingIOError` / `write() → None` 并重试至 deadline（`_WRITE_RETRY_INTERVAL_SEC`）——**deadline 保护在 POSIX（非阻塞写）上生效；Windows 的 stdin 为阻塞写，单次 write 可超过 deadline，依赖下游 `_RECORDING_OVERFLOW_SEC` 队列溢出强杀兜底**。瞬时背压重试不得把 BlockingIOError 抛给写循环（会误杀健康录制 sink）。
 *   **Windows 权限防御**：后端可写目录已统一指向 userData（`LSC_DATA_DIR`），`detached` 恒为 `false` 使后端跟随 Electron 生命周期（防孤儿分析进程），不再依赖 detached 绕过 WinError 5。
 
 ### 11.3 崩溃容错与日志滚动体系
@@ -841,9 +920,9 @@ Electron 应用使用 `electron-builder` 进行打包：
 | `core/services/export_service.py: ExportService` | 仅测试引用 | 真实导出统一走 `export_handlers` 的 asyncio 全局队列。 |
 | `utils/cancellable_ffmpeg.py: CancellableFFmpeg` | 仅测试引用 | 产品导出仍用裸 `subprocess.Popen` + 自绘 watchdog。 |
 | `utils/error_stats.py: ErrorStats` | 无业务调用 | 错误统计预留模块，仅测试引用。 |
-| `room_handler.py` L8485/L8671 的 `start_continuous_analysis` / `stop_continuous_analysis` | 覆盖死代码 | `register_analysis_handlers` 后注册，`server.on` 覆盖语义下永不触发（同批还有 `start_recording` / `align_preview_audio` / `confirm_highlight_clip` 等，见 2026-09-01 深调研）。 |
+| ~~`room_handler.py` 的 `start_continuous_analysis` / `stop_continuous_analysis` 等 8 个覆盖死 handler~~ | **条目已失效（2026-09-05 核实）** | `server.on()` 现对重复注册抛 `ValueError`（server.py:102-108），覆盖注册在语义上已不可能；相关 handler 已全部迁至子模块（analysis/alignment/recording/export/timeline/jianying_handlers），room_handler 内 41 个 `@server.on` 无重复。 |
 | `analyzer/generic_plugin.py: scan_window` | 恒返回空 | 只更新扫描游标，持续分析主路径不再使用；`scene_analysis` / `sound_detector` 为遗留分支（约 900 行）。 |
-| `export_handlers._deferred_export_jobs` | 死代码 | 无任何 append 调用方（代码注释已标注）。 |
+| `export_handlers._deferred_export_jobs` | **条目已失效** | 队列现位于 `room_handler.py`（`_deferred_export_jobs`），有活的生产者与消费者 `_flush_deferred_exports`（逐项容错：单项异常上报失败并回滚去重标记，不丢剩余任务）。 |
 
 **另注（文档≠代码，均已在上文相关章节标注）**：`stop.signal` 优雅停机机制不存在（实为 `LSC_PARENT_PID` watchdog，§11.3）；`PYTHONPATH` 已移出环境白名单（§11.2）；`output_dir` 默认值两处不一致（§3.2）；WS 端口 `9876`（main.py）与类默认 `19876`（server.py）不一致（§2.2）。
 
@@ -909,4 +988,3 @@ npx tsc --noEmit
 *   **本地日志存储绝对路径**：
     *   Windows 后端：`%APPDATA%\lsc-electron\logs\backend.log` 滚动日志。
     *   主进程与日志记录器：`%APPDATA%\lsc-electron\logs\debug.log`。
-

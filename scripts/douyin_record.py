@@ -22,10 +22,6 @@ except ModuleNotFoundError:  # direct ``python scripts/douyin_record.py`` usage
     from lsc.platforms.redaction import redact_text, redact_url
 
 log = logging.getLogger("lsc.douyin")
-logging.basicConfig(
-    level=os.environ.get("LSC_LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 
 # Unified HTTP defaults (mirrors lsc.platforms.base to avoid importing lsc here).
 _HTTP_TIMEOUT = 20
@@ -483,3 +479,13 @@ def extract_ssr_data(html: str) -> dict[str, object]:
                 break
 
     return info
+
+
+if __name__ == "__main__":
+    # 独立运行本脚本时才配置 root logging；被 lsc.platforms.douyin 经
+    # importlib exec 加载时不得携带该全局副作用（会改写应用已配置的
+    # root logger 级别与 handler）。
+    logging.basicConfig(
+        level=os.environ.get("LSC_LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )

@@ -20,6 +20,12 @@ from lsc.exporter.jianying_draft import (
 
 _log = logging.getLogger(__name__)
 
+# 由 register_jianying_handlers 注入的后端权威切片快照（room_handler 的
+# _continuous_tasks / _analysis_jobs 中的 listed_clips）。草稿门禁必须以此为
+# 准合并赛事审计字段，不能只信任前端薄投影。
+_continuous_tasks: dict[str, dict[str, Any]] = {}
+_analysis_jobs: dict[str, dict[str, Any]] = {}
+
 _ERROR_CODES = (
     "draft_dir_missing",
     "no_rooms",
@@ -65,6 +71,92 @@ def _derive_room_deltas_from_clips(clips: list[dict]) -> dict[str, float]:
     for rid, vals in deltas.items():
         out[rid] = sum(vals) / len(vals)
     return out
+
+
+_AUTHORITATIVE_AUDIT_FIELDS = (
+    "source_profile",
+    "broadcast_audit",
+    "broadcast_audit_reason",
+    "broadcast_excluded_reason",
+    "broadcast_review_required",
+    "duration_anomaly",
+    "end_by",
+    "start_by",
+    "boundary_source",
+    "broadcast_model_version",
+    "broadcast_model_provider",
+    "model_version",
+)
+
+
+def _lookup_continuous_clip(clip: dict) -> dict[str, Any] | None:
+    """从后端权威快照（listed_clips）找回完整赛事审计元数据。
+
+    后端优先于前端：前端可以覆盖 start/end/confirm_status（人工复核），
+    但不得伪造 source_profile / broadcast_audit / duration_anomaly 等审计字段。
+    """
+    rid = str(clip.get("room_id") or "")
+    rk = str(clip.get("round_key") or clip.get("clip_id") or "")
+    if not rid or not rk:
+        return None
+    primary_key = f"{rid}:{rk}"
+
+    def _match_in_listed(listed: Any) -> dict[str, Any] | None:
+        if isinstance(listed, dict):
+            item = listed.get(primary_key)
+            if isinstance(item, dict):
+                return item
+            for value in listed.values():
+                if not isinstance(value, dict):
+                    continue
+                if (
+                    str(value.get("room_id") or "") == rid
+                    and (
+                        str(value.get("round_key") or "") == rk
+                        or str(value.get("clip_id") or "") == rk
+                    )
+                ):
+                    return value
+            return None
+        if isinstance(listed, list):
+            for value in listed:
+                if not isinstance(value, dict):
+                    continue
+                if (
+                    str(value.get("room_id") or "") == rid
+                    and (
+                        str(value.get("round_key") or "") == rk
+                        or str(value.get("clip_id") or "") == rk
+                    )
+                ):
+                    return value
+        return None
+
+    for task in _continuous_tasks.values():
+        found = _match_in_listed(task.get("listed_clips"))
+        if found:
+            return found
+    for job in _analysis_jobs.values():
+        found = _match_in_listed(job.get("listed_clips"))
+        if found:
+            return found
+    return None
+
+
+def _merge_authoritative_clip(clip: dict) -> dict:
+    """把后端权威审计字段合并进前端切片 dict（后端字段优先）。"""
+    merged = dict(clip)
+    auth = _lookup_continuous_clip(clip)
+    if not auth:
+        return merged
+    for key in _AUTHORITATIVE_AUDIT_FIELDS:
+        if key in auth and auth[key] is not None:
+            merged[key] = auth[key]
+    # 后端权威坐标/round_key 优先，避免前端改动边界后漏改审计关系
+    for key in ("round_key", "clip_id"):
+        if key in auth and auth[key]:
+            merged[key] = auth[key]
+    return merged
 
 
 def _collect_draft_inputs(
@@ -226,14 +318,19 @@ def _collect_draft_inputs(
 
     clip_sources: list[ClipDraftSource] = []
     if inline_clips:
-        for c in inline_clips:
+        for raw_c in inline_clips:
+            # 后端权威审计字段优先（失败关闭门禁不能只信前端）。
+            c = _merge_authoritative_clip(raw_c)
             cid = c.get("clip_id") or c.get("clip_snapshot_id")
             if clip_ids and cid not in clip_ids:
                 continue
             if not clip_allowed_for_draft(c, include_pending=include_pending):
                 label = c.get("label") or cid or "切片"
-                warnings.append(f"切片 {label} 未确认或为近似定位，已跳过")
+                warnings.append(f"切片 {label} 未确认/近似定位/未通过赛事审计，已跳过")
                 continue
+            if include_pending and c.get("confirm_status") in ("pending", "refining"):
+                label = c.get("label") or cid or "切片"
+                warnings.append(f"切片 {label} 的边界仍待确认，已按暂定出点加入草稿")
             if ctx is None and derived_deltas:
                 # 无 ctx 兜底：缺 common 坐标时用反推 delta 补全（start+delta）
                 rid = c.get("room_id")
@@ -261,6 +358,11 @@ def _collect_draft_inputs(
                     precision=prec,
                     confirm_status=c.get("confirm_status"),
                     room_id=str(c.get("room_id") or ""),
+                    source_profile=c.get("source_profile"),
+                    broadcast_audit=c.get("broadcast_audit"),
+                    broadcast_review_required=bool(c.get("broadcast_review_required")),
+                    duration_anomaly=bool(c.get("duration_anomaly")),
+                    end_by=c.get("end_by"),
                 )
             )
     elif clip_ids:
@@ -290,8 +392,14 @@ def register_jianying_handlers(
     bridge,
     manager,
     load_settings: Callable[[], dict],
+    continuous_tasks: dict | None = None,
+    analysis_jobs: dict | None = None,
 ) -> None:
     """注册剪映相关 WS handlers。"""
+    if continuous_tasks is not None:
+        _continuous_tasks = continuous_tasks
+    if analysis_jobs is not None:
+        _analysis_jobs = analysis_jobs
 
     @server.on("get_jianying_draft_dir")
     async def handle_get_jianying_draft_dir(data: dict[str, Any] | None):

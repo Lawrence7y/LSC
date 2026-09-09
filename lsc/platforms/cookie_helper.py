@@ -42,6 +42,36 @@ def _sanitize_cookie_map(cookies: dict[str, str]) -> dict[str, str]:
     return cleaned
 
 
+_DPAPI_PREFIX = b"ENC:DPAPI:"
+
+
+def _encrypt_dpapi(data: bytes) -> bytes:
+    """使用 Windows DPAPI 加密凭据（绑定当前 Windows 登录用户）。"""
+    try:
+        import win32crypt  # type: ignore[import-untyped]
+        encrypted = win32crypt.CryptProtectData(data, "LSC_COOKIE", None, None, None, 0)
+        if encrypted:
+            return _DPAPI_PREFIX + encrypted
+    except Exception as exc:
+        _log.debug("DPAPI 加密不可用/失败: %s", exc)
+    return data
+
+
+def _decrypt_dpapi(data: bytes) -> bytes:
+    """解密经 Windows DPAPI 加密的凭据。"""
+    if data.startswith(_DPAPI_PREFIX):
+        try:
+            import win32crypt  # type: ignore[import-untyped]
+            encrypted = data[len(_DPAPI_PREFIX):]
+            decrypted = win32crypt.CryptUnprotectData(encrypted, None, None, None, 0)
+            if decrypted and decrypted[1]:
+                return decrypted[1]
+        except Exception as exc:
+            _log.warning("DPAPI 凭据解密失败: %s", exc)
+            return b"{}"
+    return data
+
+
 def _decrypt_chrome_value(encrypted_value: bytes) -> str:
     """解密 Chrome/Edge 在 Windows 上加密的 Cookie 值。
 
@@ -184,8 +214,10 @@ def load_cookies_from_file(cookie_file: str) -> dict[str, str]:
         return cookies
 
     try:
-        with open(cookie_file, encoding="utf-8") as f:
-            content = f.read()
+        with open(cookie_file, "rb") as f:
+            raw_bytes = f.read()
+        decrypted_bytes = _decrypt_dpapi(raw_bytes)
+        content = decrypted_bytes.decode("utf-8", errors="ignore")
 
         # 尝试JSON格式
         stripped = content.strip()
@@ -512,18 +544,62 @@ def cookies_to_header(cookies: dict[str, str]) -> str:
     return "; ".join(f"{k}={v}" for k, v in cleaned.items())
 
 
-def save_cookies(cookies: dict[str, str], platform: str = "bilibili") -> None:
-    """保存cookies到配置文件（原子写入）。"""
+def save_cookies(cookies: dict[str, str], platform: str = "bilibili", *, encrypt: bool | None = None) -> None:
+    """保存cookies到配置文件（原子写入 + 权限保护 + 可选DPAPI加密）。"""
     config_dir = os.path.expanduser("~/.lsc/cookies")
     os.makedirs(config_dir, exist_ok=True)
 
     cookie_file = os.path.join(config_dir, f"{platform}.json")
     tmp_file = cookie_file + ".tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, indent=2, ensure_ascii=False)
+    should_encrypt = (
+        encrypt
+        if encrypt is not None
+        else os.environ.get("LSC_ENCRYPT_COOKIES", "").strip().lower() in ("1", "true", "yes")
+    )
+    if should_encrypt:
+        raw_payload = json.dumps(cookies, indent=2, ensure_ascii=False).encode("utf-8")
+        encrypted_payload = _encrypt_dpapi(raw_payload)
+        with open(tmp_file, "wb") as f:
+            f.write(encrypted_payload)
+    else:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, indent=2, ensure_ascii=False)
+    try:
+        os.chmod(tmp_file, 0o600)
+    except OSError:
+        pass
     os.replace(tmp_file, cookie_file)
+    try:
+        os.chmod(cookie_file, 0o600)
+    except OSError:
+        pass
 
-    _log.info("Cookies已保存到: %s", cookie_file)
+    _log.info("Cookies已安全保存到: %s (encrypted=%s)", cookie_file, should_encrypt)
+
+
+def clear_cookies(platform: str | None = None) -> bool:
+    """安全清除已保存的 Cookie 凭据。"""
+    config_dir = os.path.expanduser("~/.lsc/cookies")
+    if not os.path.isdir(config_dir):
+        return True
+    if platform:
+        p = os.path.join(config_dir, f"{platform}.json")
+        if os.path.isfile(p):
+            try:
+                os.remove(p)
+                _log.info("已删除 %s Cookie 凭据", platform)
+            except OSError as e:
+                _log.warning("删除 %s Cookie 失败: %s", platform, e)
+                return False
+        return True
+    for fn in os.listdir(config_dir):
+        if fn.endswith(".json"):
+            try:
+                os.remove(os.path.join(config_dir, fn))
+            except OSError:
+                pass
+    _log.info("已清空所有已保存的 Cookie 凭据")
+    return True
 
 
 if __name__ == "__main__":

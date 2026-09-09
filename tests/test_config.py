@@ -269,7 +269,7 @@ class TestLscConfig:
 
     def test_default_output_dir(self):
         config = LscConfig()
-        expected = os.path.join(os.path.expanduser("~"), "LSC", "recordings")
+        expected = os.path.join(os.path.expanduser("~"), "LSC", "output")
         assert config.output_path == expected
         assert config.output_dir == config.output_path
 

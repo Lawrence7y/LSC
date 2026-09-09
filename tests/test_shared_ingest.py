@@ -381,7 +381,7 @@ def test_preview_command_matches_mse_streamer_software_parameters():
         crf_value=26,
     )
 
-    assert "scale=960:540:force_original_aspect_ratio=decrease" in command
+    assert any("scale=960:540:force_original_aspect_ratio=decrease" in arg for arg in command)
     assert command[command.index("-c:v") + 1] == "libx264"
     assert command[command.index("-crf") + 1] == "26"
     assert command[command.index("-b:v") + 1] == "1800k"

@@ -2,7 +2,12 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import { getLocale, setLocale } from './i18n'
+import { useAppStore } from './store/appStore'
 import './styles/global.css'
+
+if (typeof window !== 'undefined') {
+  ;(window as any).__appStore__ = useAppStore
+}
 
 // 全局错误捕获 - 输出到 Electron 主进程控制台
 window.addEventListener('error', (e) => {

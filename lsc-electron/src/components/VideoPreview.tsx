@@ -1,11 +1,22 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
 import { LoadingOutlined, PlayCircleOutlined, PauseCircleOutlined } from '@ant-design/icons'
 import { MsePlayer, MsePlayerState } from '@/services/mediaSourcePlayer'
-import { clearMseRoomCache, drainPendingMseSegments, getMseInitCache, wsClient } from '@/hooks/useWebSocket'
+import {
+  clearMseRoomCache,
+  drainPendingMseReviewSegments,
+  drainPendingMseSegments,
+  getMseInitCache,
+  getMseReviewInitCache,
+  wsClient,
+} from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
 import { isMuteSyncSuppressed, withMuteSyncSuppressed } from '@/utils/muteSyncGuard'
 import { useI18n } from '@/i18n'
+import {
+  DEFAULT_TIMELINE_REPLAY_SECONDS,
+  normalizeReplayBufferSeconds,
+} from '@/utils/replaySettings'
 
 interface VideoPreviewProps {
   /** Room ID for the video stream */
@@ -39,10 +50,14 @@ export function VideoPreview({
   const { t } = useI18n()
   const videoRef = useRef<HTMLVideoElement>(null)
   const playerRef = useRef<MsePlayer | null>(null)
+  const reviewVideoRef = useRef<HTMLVideoElement>(null)
+  const reviewPlayerRef = useRef<MsePlayer | null>(null)
   const audioSourceRef = useRef<MediaElementAudioSourceNode | null>(null)
   const gainNodeRef = useRef<GainNode | null>(null)
   const [state, setState] = useState<MsePlayerState>('idle')
   const [error, setError] = useState<string | null>(null)
+  const [reviewState, setReviewState] = useState<MsePlayerState>('idle')
+  const [reviewError, setReviewError] = useState<string | null>(null)
   // 后端自动重连状态（从 uiState 读取，避免 rooms_updated 冲掉）
   const mseReconnecting = useAppStore(
     (s) => s.uiState[roomId]?.mse_reconnecting
@@ -54,9 +69,30 @@ export function VideoPreview({
   const previewMode = useAppStore(
     (s) => s.rooms.find((r) => r.room_id === roomId)?.preview_mode,
   )
+  const replayBufferSeconds = useAppStore(
+    (s) => s.settings.timeline_replay_seconds,
+  )
   const previewEpochId = useAppStore(
     (s) => s.rooms.find((r) => r.room_id === roomId)?.preview_epoch_id,
   )
+  const recordingId = useAppStore(
+    (s) => s.rooms.find((r) => r.room_id === roomId)?.recording_id,
+  )
+  const recordingMediaStart = useAppStore(
+    (s) => {
+      const r = s.rooms.find((item) => item.room_id === roomId)
+      return r?.recording_media_start_mono ?? (r?.recording_start_mono ? Number(r.recording_start_mono) : undefined)
+    },
+  )
+  const activePreviewChannel = useAppStore(
+    (s) => s.rooms.find((r) => r.room_id === roomId)?.active_preview_channel,
+  )
+  const reviewSessionId = useAppStore(
+    (s) => s.rooms.find((r) => r.room_id === roomId)?.review_session_id,
+  )
+  const isReviewActive = (activePreviewChannel === 'review' || previewMode === 'recording_review') && Boolean(reviewSessionId)
+  const previewClockAcceptedRef = useRef<string | null>(null)
+  const previewClockSampleEpochRef = useRef<number | null>(null)
   // 预览源切换（live ↔ recording_review / epoch 轮换）时递增，强制重建 MsePlayer
   const [playerGeneration, setPlayerGeneration] = useState(0)
   const previewSourceRef = useRef<{ mode: string; epoch: string } | null>(null)
@@ -79,6 +115,67 @@ export function VideoPreview({
   onErrorRef.current = onError
   sendRef.current = send
   mutedRef.current = muted
+
+  // 设置页修改回放时长后，已存在的播放器即时收敛到新上限；
+  // 已经清理的历史分片不会被重新构造。
+  useEffect(() => {
+    playerRef.current?.setReplayBufferSeconds(
+      normalizeReplayBufferSeconds(replayBufferSeconds ?? DEFAULT_TIMELINE_REPLAY_SECONDS),
+    )
+  }, [replayBufferSeconds])
+
+  // 直播 MSE 首次稳定播放后采集一次预览时钟样本。样本绑定 recording/preview
+  // 两个 epoch；录制首帧校正或预览重建时依赖变化会自动重新采样。
+  useEffect(() => {
+    if (!active || state !== 'playing' || (previewMode ?? 'live_mse') !== 'live_mse' || !recordingId) return
+    const sampleKey = [
+      previewEpochId || '',
+      recordingId || '',
+      recordingMediaStart == null ? '' : String(recordingMediaStart),
+    ].join(':')
+    if (previewClockAcceptedRef.current === sampleKey) return
+
+    let stopped = false
+    let retryTimer: number | null = null
+    const stop = () => {
+      stopped = true
+      if (retryTimer !== null) window.clearInterval(retryTimer)
+      window.clearTimeout(initialTimer)
+      window.clearTimeout(expiryTimer)
+      unsubscribe()
+    }
+    const report = () => {
+      if (stopped) return
+      const video = videoRef.current
+      const currentTime = video?.currentTime
+      if (!video || currentTime == null || !Number.isFinite(currentTime) || currentTime < 0) return
+      const sampleEpochMs = Date.now()
+      previewClockSampleEpochRef.current = sampleEpochMs
+      sendRef.current('set_preview_clock', {
+        room_id: roomId,
+        preview_epoch_id: previewEpochId || '',
+        preview_current_time: currentTime,
+        sample_epoch_ms: sampleEpochMs,
+      })
+    }
+    const unsubscribe = wsClient.on('set_preview_clock_response', (data: any) => {
+      if (
+        data?.success
+        && data.room_id === roomId
+        && data.sample_epoch_ms === previewClockSampleEpochRef.current
+        && (!data.preview_clock_epoch_id || !previewEpochId || data.preview_clock_epoch_id === previewEpochId)
+      ) {
+        previewClockAcceptedRef.current = sampleKey
+        stop()
+      }
+    })
+    const initialTimer = window.setTimeout(() => {
+      report()
+      if (!stopped) retryTimer = window.setInterval(report, 1000)
+    }, 250)
+    const expiryTimer = window.setTimeout(stop, 20000)
+    return stop
+  }, [active, state, roomId, previewMode, previewEpochId, recordingId, recordingMediaStart])
 
   // 本地静音覆盖：解决全屏原生控件改变静音后经 WS→后端节流→rooms_updated
   // 用 stale prop 覆盖用户操作的竞态问题
@@ -135,20 +232,28 @@ export function VideoPreview({
     }, 3000)
   }, [retrying, cleanupPlayer, roomId])
 
-  // Feed init segment to player
+  // Feed init segment to player (双通道路由)
   const feedInit = useCallback((data: ArrayBuffer) => {
     hasReceivedDataRef.current = true
-    playerRef.current?.feedInit(data)
-  }, [])
+    if (isReviewActive && reviewPlayerRef.current) {
+      reviewPlayerRef.current.feedInit(data)
+    } else {
+      playerRef.current?.feedInit(data)
+    }
+  }, [isReviewActive])
 
-  // Feed media segment to player
+  // Feed media segment to player (双通道路由)
   const feedMedia = useCallback((data: ArrayBuffer) => {
     hasReceivedDataRef.current = true
-    playerRef.current?.feedMedia(data)
-  }, [])
+    if (isReviewActive && reviewPlayerRef.current) {
+      reviewPlayerRef.current.feedMedia(data)
+    } else {
+      playerRef.current?.feedMedia(data)
+    }
+  }, [isReviewActive])
 
-  // 预览源切换：live_mse ↔ recording_review 或 preview_epoch_id 轮换时重建播放器，
-  // 避免旧实例 _initReceived=true 丢弃新 mse_init。
+  // 预览源切换：直播 preview_epoch_id 真正变化时重建 LivePlayer；
+  // recording_review 由独立的 reviewPlayer 处理，切换 mode 不会销毁 LivePlayer。
   useEffect(() => {
     if (!active) return
 
@@ -157,9 +262,9 @@ export function VideoPreview({
     const prev = previewSourceRef.current
 
     if (prev !== null) {
-      const modeChanged = prev.mode !== mode
       const epochChanged = epoch !== '' && prev.epoch !== epoch
-      if (modeChanged || epochChanged) {
+      // 只有直播 epoch 真正变化才触发 LivePlayer 重建与缓存清理（review 由独立 ReviewPlayer 承载）
+      if (epochChanged) {
         disposePlayerFully()
         clearMseRoomCache(roomId)
         setPlayerGeneration((g) => g + 1)
@@ -218,6 +323,10 @@ export function VideoPreview({
 
     const player = new MsePlayer({
       videoElement: videoRef.current,
+      replayBufferSeconds: normalizeReplayBufferSeconds(
+        replayBufferSeconds ?? DEFAULT_TIMELINE_REPLAY_SECONDS,
+      ),
+      isFile: previewMode === 'recording_review',
       debug: false,
       onStateChange: (newState) => {
         setState(newState)
@@ -272,7 +381,9 @@ export function VideoPreview({
             ...(registry[roomId] || {}),
             feedInit,
             feedMedia,
-            player: playerRef.current,
+            player: isReviewActive && reviewPlayerRef.current ? reviewPlayerRef.current : playerRef.current,
+            live: playerRef.current,
+            review: reviewPlayerRef.current,
             audioSource: audioSourceRef.current,
             gainNode: gainNodeRef.current,
           }
@@ -361,7 +472,9 @@ export function VideoPreview({
         ...(prev || {}),
         feedInit,
         feedMedia,
-        player: playerRef.current,
+        player: isReviewActive && reviewPlayerRef.current ? reviewPlayerRef.current : playerRef.current,
+        live: playerRef.current,
+        review: reviewPlayerRef.current,
         // feed 回调重建时勿用 null 冲掉已创建的 Web Audio 图（否则对齐走 captureStream 易采到静音）
         audioSource: audioSourceRef.current ?? prev?.audioSource ?? null,
         gainNode: gainNodeRef.current ?? prev?.gainNode ?? null,
@@ -461,7 +574,96 @@ export function VideoPreview({
     return () => video.removeEventListener('volumechange', handleVolumeChange)
   }, [active, roomId])
 
-  const showError = state === 'error' || error
+  // 录制文件回看独立播放器管理（C-01/C-03）
+  useEffect(() => {
+    if (!active || !isReviewActive || !reviewVideoRef.current || !reviewSessionId) {
+      if (reviewPlayerRef.current) {
+        reviewPlayerRef.current.stop()
+        reviewPlayerRef.current = null
+      }
+      const registry = window.__msePlayers || {}
+      if (registry[roomId]) {
+        registry[roomId].review = null
+        registry[roomId].player = playerRef.current
+      }
+      setReviewState('idle')
+      setReviewError(null)
+      return
+    }
+
+    if (!reviewPlayerRef.current || reviewPlayerRef.current.sessionId !== reviewSessionId) {
+      if (reviewPlayerRef.current) {
+        reviewPlayerRef.current.stop()
+        reviewPlayerRef.current = null
+      }
+      const revPlayer = new MsePlayer({
+        videoElement: reviewVideoRef.current,
+        channel: 'review',
+        sessionId: reviewSessionId,
+        isFile: true,
+        replayBufferSeconds: 60,
+        debug: false,
+        onStateChange: (s) => setReviewState(s),
+        onError: (err) => setReviewError(err),
+      })
+      revPlayer.start('')
+      reviewPlayerRef.current = revPlayer
+
+      // 1. 立即更新全局注册表，确保后续 WS 帧能命中 review player
+      const registry = window.__msePlayers || {}
+      registry[roomId] = {
+        ...(registry[roomId] || {}),
+        player: revPlayer,
+        review: revPlayer,
+        live: playerRef.current,
+        feedInit,
+        feedMedia,
+      }
+      window.__msePlayers = registry
+
+      // 2. 补喂已缓存的 review init 段，消除早到竞态
+      const cachedRevInit = getMseReviewInitCache(roomId, reviewSessionId)
+      if (cachedRevInit) {
+        revPlayer.feedInit(cachedRevInit)
+      } else {
+        sendRef.current('request_mse_init', { room_id: roomId, channel: 'review' })
+      }
+
+      // 3. 回放已排队的 review media 段
+      const pendingRevSegments = drainPendingMseReviewSegments(roomId, reviewSessionId)
+      if (pendingRevSegments.length > 0) {
+        setTimeout(() => {
+          pendingRevSegments.forEach((buf) => {
+            try {
+              revPlayer.feedMedia(buf)
+            } catch (e) {
+              console.warn(`[VideoPreview] drain pending review segment failed for ${roomId}:`, e)
+            }
+          })
+        }, 0)
+      }
+    }
+  }, [active, isReviewActive, reviewSessionId, roomId, feedInit, feedMedia])
+
+  // 回看视频元素静音同步
+  useEffect(() => {
+    if (reviewVideoRef.current) {
+      reviewVideoRef.current.muted = Boolean(localMutedOverride ?? muted)
+    }
+  }, [muted, localMutedOverride, isReviewActive])
+
+  // 监听 reviewVideo controls 的静音变化
+  useEffect(() => {
+    if (!active || !reviewVideoRef.current || !isReviewActive) return
+    const v = reviewVideoRef.current
+    const onVol = () => {
+      setLocalMutedOverride(v.muted)
+    }
+    v.addEventListener('volumechange', onVol)
+    return () => v.removeEventListener('volumechange', onVol)
+  }, [active, isReviewActive])
+
+  const showError = (isReviewActive ? (reviewState === 'error' || reviewError) : (state === 'error' || error))
   const showIdle = state === 'idle'
   // 暂停态是用户主动操作，不算"未出画"：不得显示"正在拉流/转码…"
   const isPaused = state === 'paused'
@@ -489,7 +691,8 @@ export function VideoPreview({
         position: 'relative',
         width: '100%',
         height: '100%',
-        minHeight: 120,
+        // 父容器负责 16:9 尺寸；子元素不能用最小高度破坏比例。
+        minHeight: 0,
         background: 'var(--background-900)',
         borderRadius: 8,
         overflow: 'hidden',
@@ -508,7 +711,24 @@ export function VideoPreview({
         style={{
           width: '100%',
           height: '100%',
-          display: state === 'idle' ? 'none' : 'block',
+          display: isReviewActive ? 'none' : (state === 'idle' ? 'none' : 'block'),
+          objectFit: 'contain',
+          background: '#000',
+          willChange: 'transform',
+          transform: 'translateZ(0)',
+          backfaceVisibility: 'hidden',
+        }}
+      />
+      <video
+        ref={reviewVideoRef}
+        data-room-id={roomId}
+        controls={controls}
+        muted={Boolean(localMutedOverride ?? muted)}
+        playsInline
+        style={{
+          width: '100%',
+          height: '100%',
+          display: isReviewActive ? (reviewState === 'idle' ? 'none' : 'block') : 'none',
           objectFit: 'contain',
           background: '#000',
           willChange: 'transform',
@@ -535,7 +755,7 @@ export function VideoPreview({
           <LoadingOutlined style={{ fontSize: 24, color: 'var(--brand-500)' }} />
           <span style={{ fontSize: 12, color: 'var(--text-300)' }}>{phaseText}</span>
           {phaseHint && (
-            <span style={{ fontSize: 11, color: 'var(--text-400)' }}>{phaseHint}</span>
+            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{phaseHint}</span>
           )}
         </div>
       )}
@@ -559,8 +779,8 @@ export function VideoPreview({
             pointerEvents: 'none',
           }}
         >
-          <PauseCircleOutlined style={{ fontSize: 13, color: 'var(--text-200, #c7c7cc)' }} />
-          <span style={{ fontSize: 11, color: 'var(--text-200, #c7c7cc)' }}>{t('已暂停')}</span>
+          <PauseCircleOutlined style={{ fontSize: 13, color: 'var(--text-secondary)' }} />
+          <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{t('已暂停')}</span>
         </div>
       )}
 

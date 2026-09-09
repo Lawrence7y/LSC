@@ -1,21 +1,21 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
-import { Outlet, useNavigate, useLocation } from 'react-router-dom'
-import { Layout, Menu, Button, Drawer } from 'antd'
+import { Outlet, useNavigate } from 'react-router-dom'
+import { Layout, Button, Modal, Tooltip } from 'antd'
 import {
-  DesktopOutlined,
   SettingOutlined,
   BulbOutlined,
   ReloadOutlined,
 } from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAppStore } from '@/store/appStore'
-import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
+import { useKeyboardShortcuts, WORKBENCH_SHORTCUTS } from '@/hooks/useKeyboardShortcuts'
 import { useI18n } from '@/i18n'
 import type { ConnectionStatus } from '@/store/appStore'
 import SystemMonitor from './SystemMonitor'
+import { PillNotification } from './PillNotification'
 import Settings from '@/pages/Settings'
 
-const { Sider, Content } = Layout
+const { Content } = Layout
 
 const connectionDotColors: Record<ConnectionStatus, string> = {
   connected: 'var(--state-success)',
@@ -26,10 +26,10 @@ const connectionDotColors: Record<ConnectionStatus, string> = {
 
 export default function MainLayout() {
   const navigate = useNavigate()
-  const location = useLocation()
   const { t } = useI18n()
   const { send, reconnect, restartBackend } = useWebSocket()
   const connectionStatus = useAppStore((state) => state.connectionStatus)
+  const backendUnresponsive = useAppStore((state) => state.backendUnresponsive)
   const appSettings = useAppStore((state) => state.appSettings)
   const setAppSettings = useAppStore((state) => state.setAppSettings)
   const settingsDrawerOpen = useAppStore((state) => state.settingsDrawerOpen)
@@ -44,26 +44,12 @@ export default function MainLayout() {
     reconnect_failed: t('连接失败'),
   }
 
-  const menuItems = [
-    {
-      key: '/workbench',
-      icon: <DesktopOutlined />,
-      label: t('多房间管理'),
-    },
-    {
-      key: '/settings',
-      icon: <SettingOutlined />,
-      label: t('设置'),
-    },
-  ]
-
   // 卸载时清理主题过渡定时器
   useEffect(() => () => {
     if (themeTransitionTimerRef.current) clearTimeout(themeTransitionTimerRef.current)
   }, [])
 
   // 连接断开时延迟 2 秒再显示 banner，避免 WS 短暂重连期间误报「无法连接到后端」。
-  // 连接恢复时立即隐藏 banner。与 Workbench 的 Alert 防抖保持一致。
   useEffect(() => {
     if (connectionStatus === 'disconnected') {
       const timer = setTimeout(() => setConnectionVisible(true), 2000)
@@ -81,9 +67,8 @@ export default function MainLayout() {
     }
   }, [appSettings.theme])
 
-  // 主题切换：更新 store + 实时切换 class + 持久化到后端
+  // 主题切换：更新 store + 实时切换 class + 持久化到后端（青黑 / 青白）
   const handleToggleTheme = () => {
-    // settings 经 getState 现取，避免为单次读取订阅整个 settings 对象引发整树重渲染
     const { settings, appSettings: currentAppSettings } = useAppStore.getState()
     const newTheme = currentAppSettings.theme === 'dark' ? 'light' : 'dark'
     document.documentElement.classList.add('theme-transition')
@@ -104,12 +89,12 @@ export default function MainLayout() {
     })
   }
 
-  // 全局页面导航快捷键
+  // 全局页面导航快捷键（键位与 Workbench 共用同一张表）
   useKeyboardShortcuts(
     [
-      { key: '1', ctrl: true, id: 'page:workbench' },
-      { key: '2', ctrl: true, id: 'page:settings' },
-      { key: 'F5', id: 'page:reload' },
+      WORKBENCH_SHORTCUTS.PAGE_WORKBENCH,
+      WORKBENCH_SHORTCUTS.PAGE_SETTINGS,
+      WORKBENCH_SHORTCUTS.RELOAD_PAGE,
     ],
     useCallback(
       (id: string) => {
@@ -122,196 +107,221 @@ export default function MainLayout() {
   )
 
   return (
-    <Layout style={{ height: '100vh', overflow: 'hidden' }}>
-      <Sider
-        width={200}
+    <Layout style={{ height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column', background: 'var(--bg-primary)' }}>
+      {/* 现代化顶栏 Command Header (42px 极窄精密质感) */}
+      <header
         style={{
-          background: 'var(--background-800)',
-          borderRight: '1px solid var(--border-default)',
-          height: '100vh',
-          overflow: 'hidden',
-          display: 'flex',
-          flexDirection: 'column',
-        }}
-      >
-        {/* Logo */}
-        <div style={{
+          height: 42,
+          background: 'var(--surface-1)',
+          borderBottom: '1px solid var(--border-hairline)',
           display: 'flex',
           alignItems: 'center',
-          gap: 10,
-          padding: '20px 16px 24px',
-          borderBottom: '1px solid var(--border-default)',
-        }}>
-          <img 
-            src="./assets/logo.png" 
-            alt="LSC Logo" 
+          justifyContent: 'space-between',
+          padding: '0 16px',
+          flexShrink: 0,
+          zIndex: 50,
+          userSelect: 'none',
+        }}
+      >
+        {/* 左侧：Logo 与产品名 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 9 }}>
+          <img
+            src="./assets/logo.png"
+            alt="LSC Logo"
             style={{
-              width: 32,
-              height: 32,
-              borderRadius: 'var(--radius-md)',
+              width: 24,
+              height: 24,
+              borderRadius: 'var(--radius-xs)',
               objectFit: 'cover',
               flexShrink: 0,
-            }} 
+            }}
           />
-          <div>
-            <div style={{
-              fontSize: 15,
-              fontWeight: 700,
-              letterSpacing: '0.02em',
-              color: 'var(--text-50)',
-              lineHeight: 1,
-            }}>LSC</div>
-            <div style={{
-              fontSize: 10,
-              fontWeight: 400,
-              color: 'var(--text-400)',
-              marginTop: 2,
-              letterSpacing: '0.01em',
-            }}>Live Stream Clipper</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+            <span
+              style={{
+                fontSize: 14,
+                fontWeight: 700,
+                letterSpacing: '0.04em',
+                color: 'var(--text-primary)',
+                lineHeight: 1,
+              }}
+            >
+              LSC
+            </span>
+            <span
+              style={{
+                fontSize: 11,
+                color: 'var(--text-tertiary)',
+                fontWeight: 400,
+                letterSpacing: '0.02em',
+              }}
+            >
+              Live Stream Clipper
+            </span>
           </div>
         </div>
 
-        {/* Navigation */}
-        <Menu
-          mode="inline"
-          selectedKeys={[location.pathname]}
-          items={menuItems}
-          onClick={({ key }) => {
-            if (key === '/settings') {
-              setSettingsDrawerOpen(true)
-            } else {
-              navigate(key)
-            }
-          }}
-          style={{
-            flex: 1,
-            background: 'transparent',
-            borderRight: 'none',
-            padding: '12px 0',
-          }}
-        />
-
-        {/* Footer — 连接状态(4种) + 重连按钮 + 主题切换(底部居中) */}
-        <div style={{
-          padding: '10px 12px 14px',
-          borderTop: '1px solid var(--border-default)',
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          gap: 8,
-        }}>
-          {/* 连接状态指示器 (4种状态) */}
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            padding: '4px 10px',
-            borderRadius: 6,
-            background: 'var(--bg-tertiary)',
-            border: '1px solid var(--border-default)',
-            width: '100%',
-            justifyContent: 'center',
-          }}>
-            <div style={{
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              background: connectionDotColors[connectionStatus],
-              boxShadow:
-                connectionStatus === 'connecting'
-                  ? `0 0 0 2px rgba(255, 149, 0, 0.2), 0 0 8px ${connectionDotColors[connectionStatus]}`
-                  : `0 0 8px ${connectionDotColors[connectionStatus]}`,
-              flexShrink: 0,
-            }} />
-            <span style={{
-              fontSize: 12,
-              fontWeight: 500,
-              color: 'var(--text-secondary)',
-            }}>
-              {connectionLabels[connectionStatus]}
-            </span>
+        {/* 中间：集群连接状态与系统负载胶囊（下方挂载灵动通知） */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ position: 'relative', display: 'inline-flex' }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '2px 10px',
+                borderRadius: 'var(--radius-xs)',
+                background: 'var(--surface-2)',
+                border: '1px solid var(--border-hairline)',
+                fontSize: 11,
+                height: 26,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <div
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: '50%',
+                  background: connectionDotColors[connectionStatus],
+                  boxShadow:
+                    connectionStatus === 'connecting'
+                      ? `0 0 0 2px rgba(255, 149, 0, 0.2), 0 0 8px ${connectionDotColors[connectionStatus]}`
+                      : `0 0 8px ${connectionDotColors[connectionStatus]}`,
+                  flexShrink: 0,
+                }}
+              />
+              <span style={{ fontWeight: 600, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+                {connectionLabels[connectionStatus]}
+              </span>
+              <span style={{ color: 'var(--border-hairline)', margin: '0 2px' }}>|</span>
+              <SystemMonitor />
+            </div>
+            {/* 灵动通知层：从状态框下边缘向下冒出 */}
+            <PillNotification />
           </div>
-          <SystemMonitor />
-          {/* 重连按钮：仅在断开/失败时显示。
-              断开（后端可能还活着）→ 纯 WS 重连；
-              重连耗尽（后端大概率已死亡）→ 重启后端进程后再重连。 */}
-          {(connectionStatus === 'disconnected' || connectionStatus === 'reconnect_failed') && (
+
+          {/* 重连按钮：仅在断开/后端假死时显示（backendUnresponsive = 心跳超时，WS 仍连着） */}
+          {(connectionStatus === 'disconnected' || connectionStatus === 'reconnect_failed' || backendUnresponsive) && (
             <Button
               size="small"
               icon={<ReloadOutlined />}
-              onClick={connectionStatus === 'reconnect_failed' ? restartBackend : reconnect}
-              style={{ fontSize: 12 }}
+              onClick={connectionStatus === 'reconnect_failed' || backendUnresponsive ? restartBackend : reconnect}
+              style={{ fontSize: 11, height: 26, borderRadius: 'var(--radius-xs)' }}
             >
               {t('重新连接')}
             </Button>
           )}
-          {/* 主题切换按钮 — 底部居中 */}
+        </div>
+
+        {/* 右侧：双主题切换与设置 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Tooltip title={appSettings.theme === 'dark' ? t('切换为浅色模式（青+白）') : t('切换为暗色模式（青+黑）')}>
+            <Button
+              type="text"
+              size="small"
+              icon={<BulbOutlined style={{ color: 'var(--brand-500)', fontSize: 13 }} />}
+              onClick={handleToggleTheme}
+              style={{
+                color: 'var(--text-secondary)',
+                fontSize: 11,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                height: 26,
+                padding: '0 8px',
+                borderRadius: 'var(--radius-xs)',
+              }}
+            >
+              {appSettings.theme === 'dark' ? t('青黑') : t('青白')}
+            </Button>
+          </Tooltip>
+
           <Button
             type="text"
             size="small"
-            icon={<BulbOutlined />}
-            onClick={handleToggleTheme}
-            style={{ color: 'var(--text-50)', fontSize: 12, marginTop: 4 }}
+            icon={<SettingOutlined style={{ fontSize: 13 }} />}
+            onClick={() => setSettingsDrawerOpen(true)}
+            style={{
+              color: 'var(--text-secondary)',
+              fontSize: 11,
+              height: 26,
+              padding: '0 8px',
+              borderRadius: 'var(--radius-xs)',
+            }}
           >
-            {appSettings.theme === 'dark' ? t('浅色') : t('深色')}
+            {t('设置')}
           </Button>
         </div>
-      </Sider>
+      </header>
 
-      <Layout>
-        {/* Connection Status Banner（统一由 store.connectionStatus 派生，不再混用 hook 返回值） */}
-        {connectionStatus !== 'connected' && connectionVisible && (
-          <div style={{
-            height: 36,
+      {/* Connection Status Banner */}
+      {connectionStatus !== 'connected' && connectionVisible && (
+        <div
+          style={{
+            height: 32,
             background: 'var(--state-error)',
-            color: 'var(--text-50)',
+            color: '#ffffff',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
             gap: 8,
-            fontSize: 13,
-          }}>
-            <span>{t('⚠️ 无法连接到后端服务，请确保 Python 后端已启动')}</span>
-            <button 
-              onClick={() => setConnectionVisible(false)}
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: 'var(--text-50)',
-                cursor: 'pointer',
-                fontSize: 12,
-                opacity: 0.8,
-              }}
-            >
-              {t('隐藏')}
-            </button>
-          </div>
-        )}
+            fontSize: 12,
+            zIndex: 40,
+          }}
+        >
+          <span>{t('⚠️ 无法连接到后端服务，请确保 Python 后端已启动')}</span>
+          <button
+            onClick={() => setConnectionVisible(false)}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              color: '#ffffff',
+              cursor: 'pointer',
+              fontSize: 11,
+              opacity: 0.8,
+            }}
+          >
+            {t('隐藏')}
+          </button>
+        </div>
+      )}
 
-        {/* Content — 问题7：删除了顶部标题和右侧连接状态指示器 */}
-        <Content style={{
+      {/* Main Content Area */}
+      <Content
+        style={{
           flex: 1,
-          overflow: 'auto',
-          background: 'var(--background-900)',
-        }}>
-          <Outlet />
-        </Content>
-      </Layout>
+          overflow: 'hidden',
+          background: 'var(--bg-primary)',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+        <Outlet />
+      </Content>
 
-      {/* 设置抽屉 — 侧边弹出，不离开工作台，保持 Workbench 状态 */}
-      <Drawer
-        title={t('设置')}
-        placement="right"
-        width={520}
+      {/* 设置模态窗 — 宽幅双栏，舒展不挤压 */}
+      <Modal
+        title={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 15, fontWeight: 700 }}>
+            <SettingOutlined style={{ color: 'var(--brand-500)' }} />
+            <span>{t('系统全局设置')}</span>
+          </div>
+        }
         open={settingsDrawerOpen}
-        onClose={() => setSettingsDrawerOpen(false)}
-        destroyOnClose={false}
+        onCancel={() => setSettingsDrawerOpen(false)}
+        footer={null}
+        width={920}
+        centered
+        destroyOnHidden={false}
         styles={{
-          body: { padding: 0, background: 'var(--background-900)', overflow: 'hidden' },
+          content: { padding: 0, overflow: 'hidden', borderRadius: 'var(--radius)' },
+          header: { padding: '16px 24px', borderBottom: '1px solid var(--border-default)', margin: 0 },
+          body: { height: '78vh', padding: 0, overflow: 'hidden', background: 'var(--bg-primary)' },
         }}
       >
         <Settings />
-      </Drawer>
+      </Modal>
     </Layout>
   )
 }

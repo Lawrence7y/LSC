@@ -102,10 +102,12 @@ class KuaishouAdapter(BasePlatformAdapter):
         liveroom = liveroom if isinstance(liveroom, dict) else {}
         play_list = liveroom.get("playList") or []
         if not isinstance(play_list, list) or not play_list:
+            # 未开播必须归为 offline：restricted 会被 V2 失败分类匹配为
+            # AUTH_REQUIRED，触发不必要的凭据失效刷新循环。
             return self._failed(
                 clean_url,
-                "快手直播间未找到播放列表，可能需要登录或房间已下播。",
-                ERROR_RESTRICTED,
+                "快手直播间未找到播放列表，房间可能未开播或已下播。",
+                ERROR_OFFLINE,
                 raw=data,
             )
 

@@ -1,5 +1,5 @@
 import { createElement, useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
-import { App, message } from 'antd'
+import { App } from 'antd'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
 import {
@@ -7,6 +7,7 @@ import {
   recordingSpecFromSettings,
 } from '@/components/RecordingSpecSelector'
 import { t } from '@/i18n'
+import { confirmDangerous, stopRecordConfirmContent } from '@/utils/confirmDangerous'
 
 // send 返回 boolean：false 表示断连且消息被丢弃（useWebSocket.send 已统一弹提示）
 type SendFn = (type: string, data?: any) => boolean
@@ -24,6 +25,8 @@ export function useRoomActions(opts: {
   handleToggleMute: (roomId: string) => void
   handleStartRecord: (roomId: string) => void
   handleStopRecord: (roomId: string) => void
+  /** 带二次确认的停录入口（确认文案与 R 键 / 批量路径同源） */
+  requestStopRecord: (roomId: string) => void
   handleTogglePreview: (roomId: string, enabled: boolean) => void
   handleFullscreen: (roomId: string) => void
   handleCollapse: (roomId: string) => void
@@ -37,9 +40,9 @@ export function useRoomActions(opts: {
     setSelectedRoomIds,
     pendingRoomSavesRef,
   } = opts
-  // context 版 modal：消费 ConfigProvider 主题/locale，避免静态 Modal.confirm 的
-  // antd v5 deprecation 警告与上下文丢失
-  const { modal } = App.useApp()
+  // context 版 modal / message：消费 ConfigProvider 主题与 locale。
+  // 静态 Modal.confirm / message.* 在 antd v5 下不走主题，暗色界面会弹浅色气泡。
+  const { modal, message } = App.useApp()
 
   const handleToggleMute = useCallback((roomId: string) => {
     const room = useAppStore.getState().rooms.find((r) => r.room_id === roomId)
@@ -86,7 +89,27 @@ export function useRoomActions(opts: {
     if (analyzingThisRoom) {
       message.info(t('录制已停止。请稍候，持续分析正在收尾并将回合入列待确认，请勿立刻停止分析'), 6)
     }
-  }, [send])
+  }, [send, message])
+
+  /**
+   * 单房间「停止录制」带二次确认入口：确认文案与 R 键 / 批量路径同源。
+   * 卡片以前自己弹一份简化确认（不提持续分析收尾），导致同一动作按入口
+   * 给不同信息量；现在统一走这里。
+   */
+  const requestStopRecord = useCallback((roomId: string) => {
+    const st = useAppStore.getState()
+    const room = st.rooms.find(r => r.room_id === roomId)
+    const ca = st.continuousAnalysisStatus
+    const analyzingThisRoom = Boolean(
+      ca?.running && (ca.room_id === roomId || (ca.target_room_ids || []).includes(roomId)),
+    )
+    confirmDangerous(
+      modal,
+      t('确认停止录制'),
+      stopRecordConfirmContent([room?.streamer_name || t('未知主播')], analyzingThisRoom),
+      () => handleStopRecord(roomId),
+    )
+  }, [modal, handleStopRecord])
 
   const handleTogglePreview = useCallback((roomId: string, enabled: boolean) => {
     if (enabled) {
@@ -112,22 +135,45 @@ export function useRoomActions(opts: {
   }, [setExpandedRoomId])
 
   const handleRemove = useCallback((roomId: string) => {
-    setExpandedRoomId(prev => (prev === roomId ? null : prev))
-    const continuousStatus = useAppStore.getState().continuousAnalysisStatus
-    if (continuousStatus?.running) {
-      const targets = continuousStatus.target_room_ids || []
-      if (continuousStatus.room_id === roomId || targets.includes(roomId)) {
-        send('stop_continuous_analysis', { main_room_id: continuousStatus.room_id })
+    const room = useAppStore.getState().rooms.find(r => r.room_id === roomId)
+    const name = room?.streamer_name || t('该直播间')
+    const isRecording = !!room?.is_recording
+
+    const doRemove = () => {
+      setExpandedRoomId(prev => (prev === roomId ? null : prev))
+      const continuousStatus = useAppStore.getState().continuousAnalysisStatus
+      if (continuousStatus?.running) {
+        const targets = continuousStatus.target_room_ids || []
+        if (continuousStatus.room_id === roomId || targets.includes(roomId)) {
+          send('stop_continuous_analysis', { main_room_id: continuousStatus.room_id })
+        }
       }
+      if (isRecording) {
+        send('stop_recording', { room_id: roomId })
+      }
+      if (room?.preview_enabled) {
+        send('enable_preview', { room_id: roomId, enabled: false, mode: 'mse' })
+      }
+      pendingRoomSavesRef.current += 1
+      send('remove_room', { room_id: roomId })
+      setSelectedRoomIds(prev => {
+        const next = new Set(prev)
+        next.delete(roomId)
+        return next
+      })
     }
-    pendingRoomSavesRef.current += 1
-    send('remove_room', { room_id: roomId })
-    setSelectedRoomIds(prev => {
-      const next = new Set(prev)
-      next.delete(roomId)
-      return next
+
+    modal.confirm({
+      title: isRecording ? t('确认停止录制并删除房间？') : t('确认删除房间？'),
+      content: isRecording
+        ? t('「{name}」当前正在录制中！删除将立即中止录制，并从工作台移除该房间。', { name })
+        : t('将从工作台移除「{name}」，已录制的文件不受影响。', { name }),
+      okText: isRecording ? t('停止并删除') : t('确认删除'),
+      okButtonProps: { danger: true },
+      cancelText: t('取消'),
+      onOk: doRemove,
     })
-  }, [send, setExpandedRoomId, setSelectedRoomIds, pendingRoomSavesRef])
+  }, [modal, send, setExpandedRoomId, setSelectedRoomIds, pendingRoomSavesRef])
 
   const handleConnect = useCallback((roomId: string) => {
     useAppStore.getState().updateRoom(roomId, { is_connecting: true, last_error: '' })
@@ -173,6 +219,7 @@ export function useRoomActions(opts: {
     handleToggleMute,
     handleStartRecord,
     handleStopRecord,
+    requestStopRecord,
     handleTogglePreview,
     handleFullscreen,
     handleCollapse,

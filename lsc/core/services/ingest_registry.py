@@ -109,7 +109,7 @@ class SharedIngestRegistry:
                     drop_policy = cfg.shared_ingest_preview_drop_policy
                     recording_queue_bytes = cfg.shared_ingest_recording_queue_bytes
                 except Exception:
-                    queue_bytes = 2 * 1024 * 1024
+                    queue_bytes = 8 * 1024 * 1024
                     drop_policy = "drop_oldest"
                     recording_queue_bytes = 2 * 1024 * 1024
                 ingest = SharedRoomIngest(

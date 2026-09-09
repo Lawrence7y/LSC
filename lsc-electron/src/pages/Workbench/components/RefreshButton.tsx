@@ -3,29 +3,6 @@ import { Button, Tooltip } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import { useI18n } from '@/i18n'
 
-/* ── Types ── */
-
-interface BubbleParticle {
-  id: number
-  x: number
-  startY: number
-  riseY: number
-  size: number
-  opacity: number
-  delay: number
-}
-
-interface ShatterParticle {
-  id: number
-  x: number
-  y: number
-  scatterX: number
-  scatterY: number
-  size: number
-  rotation: number
-  color: string
-}
-
 interface RefreshButtonProps {
   onShortClick: () => void
   onLongPress: () => void
@@ -33,183 +10,23 @@ interface RefreshButtonProps {
   tooltip?: string
 }
 
-/* ── Constants（主题色：accent-primary 青绿 #4dc4bf / #31b3ae） ── */
-
 const PROGRESS_MS = 800
-const MAX_BUBBLES = 22
-const SHATTER_COUNT_MIN = 18
-const SHATTER_COUNT_MAX = 26
-const FILL_TOP = '#5ad8c7'     // 填充顶（亮青绿）
-const FILL_BOTTOM = '#2bb5a8'  // 填充底（主题 accent 深一档）
-const BUBBLE_COLORS = [
-  'hsla(172, 62%, 72%,',
-  'hsla(168, 70%, 66%,',
-  'hsla(176, 78%, 74%,',
-]
-
-/* ── CSS ── */
 
 let cssInjected = false
 function injectCss() {
   if (cssInjected) return
   cssInjected = true
   const s = document.createElement('style')
-  s.id = 'refresh-btn-v2'
+  s.id = 'refresh-btn-hex-v1'
   s.textContent = `
-    @keyframes rfbFlash {
-      0% { background: rgba(255,255,255,0); }
-      40% { background: rgba(255,255,255,0.65); }
-      100% { background: rgba(255,255,255,0); }
+    @keyframes rfbHexFlash {
+      0% { opacity: 0; }
+      40% { opacity: 0.85; }
+      100% { opacity: 0; }
     }
   `
   document.head.appendChild(s)
 }
-
-/* ── Helpers ── */
-
-function randomBubbleColor(): string {
-  return BUBBLE_COLORS[Math.floor(Math.random() * BUBBLE_COLORS.length)]
-}
-
-function randomShatterColor(): string {
-  // 主题青绿色系
-  const h = 168 + Math.floor(Math.random() * 12)
-  const s = 65 + Math.floor(Math.random() * 25)
-  const l = 42 + Math.floor(Math.random() * 26)
-  return `hsl(${h}, ${s}%, ${l}%)`
-}
-
-function generateShatterPolygon(): string {
-  const n = 10 + Math.floor(Math.random() * 6)
-  const pts: string[] = []
-  for (let i = 0; i < n; i++) {
-    const a = (i / n) * Math.PI * 2 + (Math.random() - 0.5) * 0.35
-    const r = 30 + Math.random() * 85
-    const x = 50 + Math.cos(a) * r / 2
-    const y = 50 + Math.sin(a) * r / 2
-    pts.push(`${x.toFixed(1)}% ${y.toFixed(1)}%`)
-  }
-  return `polygon(${pts.join(', ')})`
-}
-
-/** 在填充液面处生成上浮气泡（长按进度视觉：按钮从底部变绿，光点随液面上升） */
-function spawnBubble(id: number, w: number, h: number, liquidPct: number): BubbleParticle {
-  const size = 2 + Math.random() * 3
-  const pad = 4
-  const liquidY = h - (h * Math.min(100, liquidPct)) / 100
-  return {
-    id,
-    x: pad + Math.random() * (w - pad * 2),
-    startY: Math.max(0, liquidY - 2),
-    riseY: Math.max(0, liquidY - 2 - (14 + Math.random() * 30)),
-    size,
-    opacity: 0.45 + Math.random() * 0.45,
-    delay: Math.random() * 60,
-  }
-}
-
-/* ── Sub component: rising bubble ── */
-
-const BubbleParticleDiv = memo(function BubbleParticleDiv({
-  particle,
-}: {
-  particle: BubbleParticle
-}) {
-  const divRef = useRef<HTMLDivElement>(null)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  useEffect(() => {
-    const el = divRef.current
-    if (!el) return
-
-    el.style.transition = 'none'
-    el.style.left = `${particle.x}px`
-    el.style.top = `${particle.startY}px`
-    el.style.opacity = '0'
-    void el.offsetHeight
-
-    const delay = particle.delay
-    timerRef.current = setTimeout(() => {
-      if (!el) return
-      el.style.transition = `top 0.45s ease-out, opacity 0.45s ease-out`
-      el.style.top = `${particle.riseY}px`
-      el.style.opacity = `${particle.opacity}`
-      // 上升结束后淡出
-      setTimeout(() => {
-        if (!el) return
-        el.style.transition = 'opacity 0.15s ease-out'
-        el.style.opacity = '0'
-      }, 380)
-    }, delay)
-
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current)
-    }
-  }, [particle])
-
-  return (
-    <div
-      ref={divRef}
-      style={{
-        position: 'absolute',
-        width: particle.size,
-        height: particle.size,
-        borderRadius: '50%',
-        background: `${randomBubbleColor()} ${particle.opacity})`,
-        boxShadow: `0 0 ${particle.size + 2}px ${randomBubbleColor()} 0.5)`,
-        pointerEvents: 'none',
-        zIndex: 2,
-        willChange: 'top, opacity',
-      }}
-    />
-  )
-})
-
-/* ── Sub component: shatter particle ── */
-
-const ShatterParticleDiv = memo(function ShatterParticleDiv({
-  particle,
-}: {
-  particle: ShatterParticle
-}) {
-  const divRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    const el = divRef.current
-    if (!el) return
-
-    // 立即触发向外飞散
-    el.style.transition = 'none'
-    el.style.transform = 'translate(0, 0) rotate(0deg)'
-    el.style.opacity = '0.9'
-    void el.offsetHeight
-
-    el.style.transition = 'transform 0.35s cubic-bezier(.25,.46,.45,.94), opacity 0.3s ease-out'
-    el.style.transform = `translate(${particle.scatterX}px, ${particle.scatterY}px) rotate(${particle.rotation}deg)`
-    el.style.opacity = '0'
-  }, [particle])
-
-  return (
-    <div
-      ref={divRef}
-      style={{
-        position: 'absolute',
-        left: particle.x,
-        top: particle.y,
-        width: particle.size,
-        height: particle.size,
-        borderRadius: '50%',
-        background: particle.color,
-        boxShadow: `0 0 ${particle.size}px ${particle.color}`,
-        pointerEvents: 'none',
-        zIndex: 3,
-        willChange: 'transform, opacity',
-      }}
-    />
-  )
-})
-
-/* ── Main component ── */
 
 export const RefreshButton = memo(function RefreshButton({
   onShortClick,
@@ -219,231 +36,194 @@ export const RefreshButton = memo(function RefreshButton({
 }: RefreshButtonProps) {
   const { t } = useI18n()
   const resolvedTooltip = tooltip ?? t('点按刷新预览；长按 0.8s 刷新全部（将停止录制，需确认）')
-  // ── Render state ──
-  // 长按进度 = 按钮从底部向上整体填充主题青绿（按键全绿），
-  // 液面处生成上浮光点；完成时白光一闪 + 主题色碎片向外爆发。
+
   const [fillProgress, setFillProgress] = useState(0)
-  const [bubbles, setBubbles] = useState<BubbleParticle[]>([])
-  const [shatterParticles, setShatterParticles] = useState<ShatterParticle[]>([])
+  const [isFadingOut, setIsFadingOut] = useState(false)
   const [showFlash, setShowFlash] = useState(false)
 
-  // ── Refs (for event handlers to read latest values) ──
   const buttonRef = useRef<HTMLButtonElement>(null)
   const fillProgressRef = useRef(0)
-  const phaseRef = useRef<'idle' | 'triggered'>('idle')
-  const particleIdRef = useRef(0)
+  const phaseRef = useRef<'idle' | 'pressing' | 'triggered'>('idle')
   const progressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const bubbleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const shatterPolygonRef = useRef<string>('inset(0)')
-  const shatterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // 长按已触发标记：粒子动画结束后 phaseRef 复位，但本次按压尚未松手，
-  // 用该标记吞掉后续 mouseup/mouseleave，防止长按后松手误触发短按。
+  const fadeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const longPressFiredRef = useRef(false)
   const mountedRef = useRef(true)
 
-  // Inject CSS once
-  useEffect(() => { injectCss() }, [])
+  useEffect(() => {
+    injectCss()
+  }, [])
 
-  // ── Mounted guard ──
   useEffect(() => {
     mountedRef.current = true
-    return () => { mountedRef.current = false }
-  }, [])
-
-  // ── Cleanup timers ──
-  // ⚠️ 不要清理 shatterTimerRef：粒子动画的清理定时器属于「已触发」展示阶段。
-  // 若被 mouseup/mouseleave 清掉，shatter 粒子将永不消失，且 phaseRef 卡在
-  // 'triggered'，后续所有 mousedown 都会被拦截（按钮「失灵」）。
-  const cleanupTimers = useCallback(() => {
-    if (progressTimerRef.current) { clearTimeout(progressTimerRef.current); progressTimerRef.current = null }
-    if (bubbleTimerRef.current) { clearTimeout(bubbleTimerRef.current); bubbleTimerRef.current = null }
-    if (flashTimerRef.current) { clearTimeout(flashTimerRef.current); flashTimerRef.current = null }
-  }, [])
-
-  // ── Trigger shatter (solid green → particles fly outward) ──
-  const triggerShatter = useCallback(() => {
-    const rect = buttonRef.current?.getBoundingClientRect() ?? { width: 72, height: 24 }
-
-    // Generate shatter polygon
-    shatterPolygonRef.current = generateShatterPolygon()
-
-    // Generate shatter particles
-    const count = SHATTER_COUNT_MIN + Math.floor(Math.random() * (SHATTER_COUNT_MAX - SHATTER_COUNT_MIN))
-    const particles: ShatterParticle[] = []
-    for (let i = 0; i < count; i++) {
-      const pid = particleIdRef.current++
-      const size = 3 + Math.random() * 5
-      const spread = 1.5 + Math.random() * 1.0
-      const angle = Math.random() * Math.PI * 2
-      particles.push({
-        id: pid,
-        x: 3 + Math.random() * (rect.width - 6),
-        y: 3 + Math.random() * (rect.height - 6),
-        scatterX: Math.cos(angle) * rect.width * spread,
-        scatterY: Math.sin(angle) * rect.height * spread,
-        size,
-        rotation: Math.random() * 720,
-        color: randomShatterColor(),
-      })
+    return () => {
+      mountedRef.current = false
     }
-    setShatterParticles(particles)
-    setBubbles([])
+  }, [])
 
-    // After 380ms, clean up everything
-    shatterTimerRef.current = setTimeout(() => {
-      shatterTimerRef.current = null
+  const cleanupTimers = useCallback(() => {
+    if (progressTimerRef.current) {
+      clearTimeout(progressTimerRef.current)
+      progressTimerRef.current = null
+    }
+    if (tickTimerRef.current) {
+      clearTimeout(tickTimerRef.current)
+      tickTimerRef.current = null
+    }
+    if (flashTimerRef.current) {
+      clearTimeout(flashTimerRef.current)
+      flashTimerRef.current = null
+    }
+  }, [])
+
+  // 逐渐褪去进度并重置
+  const fadeOutAndReset = useCallback((durationMs = 650) => {
+    if (!mountedRef.current) return
+    setIsFadingOut(true)
+    if (fadeTimerRef.current) clearTimeout(fadeTimerRef.current)
+    fadeTimerRef.current = setTimeout(() => {
       if (!mountedRef.current) return
       setFillProgress(0)
       fillProgressRef.current = 0
-      setShatterParticles([])
+      setIsFadingOut(false)
       phaseRef.current = 'idle'
-    }, 380)
+      fadeTimerRef.current = null
+    }, durationMs)
   }, [])
 
-  // ── Handle mouse down ──
   const handleMouseDown = useCallback(() => {
     if (disabled) return
     if (phaseRef.current !== 'idle') return
 
-    longPressFiredRef.current = false // 新一轮按压开始，重置长按标记
-    phaseRef.current = 'triggered' // prevent double entry
+    longPressFiredRef.current = false
+    phaseRef.current = 'pressing'
     fillProgressRef.current = 0
     setFillProgress(0)
-    setBubbles([])
-    setShatterParticles([])
+    setIsFadingOut(false)
+    if (fadeTimerRef.current) {
+      clearTimeout(fadeTimerRef.current)
+      fadeTimerRef.current = null
+    }
 
-    // Start progress timer (800ms → triggered)
+    const startTime = Date.now()
+
+    // 800ms 达到长按阈值触发
     progressTimerRef.current = setTimeout(() => {
-      // Long press triggered!
+      if (!mountedRef.current) return
       phaseRef.current = 'triggered'
       fillProgressRef.current = 100
       setFillProgress(100)
       setShowFlash(true)
+      longPressFiredRef.current = true
 
-      // Flash 200ms then shatter + callback
+      // 闪光 150ms 结束
       flashTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return
         setShowFlash(false)
-        longPressFiredRef.current = true
-        triggerShatter()
+        // 触发外部二次确认弹窗
         onLongPress()
-      }, 200)
+        // 长按后进度逐渐褪去（650ms 优雅淡出）
+        fadeOutAndReset(650)
+      }, 150)
     }, PROGRESS_MS)
 
-    // 填充进度：按钮从底部向上整体变绿（16 tick × 6.25% = 800ms 满），
-    // 液面处持续生成上浮光点
+    // 进度动画更新（每 30ms 刷新一次）
     const tick = () => {
-      if (progressTimerRef.current === null && flashTimerRef.current === null) return
-      const current = fillProgressRef.current
-      if (current >= 100) return
-      const next = Math.min(100, current + 6.25)
-      fillProgressRef.current = next
-      setFillProgress(next)
+      if (phaseRef.current !== 'pressing') return
+      const elapsed = Date.now() - startTime
+      const progress = Math.min(99, (elapsed / PROGRESS_MS) * 100)
+      fillProgressRef.current = progress
+      setFillProgress(progress)
 
-      // 按进度生成气泡（液面附近）
-      const rect = buttonRef.current?.getBoundingClientRect() ?? { width: 72, height: 24 }
-      setBubbles(prev => {
-        if (prev.length >= MAX_BUBBLES) return prev
-        const count = next < 30 ? 1 : next < 70 ? 2 : 2
-        const news: BubbleParticle[] = []
-        for (let i = 0; i < count; i++) {
-          if (prev.length + news.length >= MAX_BUBBLES) break
-          news.push(spawnBubble(particleIdRef.current++, rect.width, rect.height, next))
-        }
-        return [...prev, ...news]
-      })
-
-      bubbleTimerRef.current = setTimeout(tick, 50)
+      if (progress < 99) {
+        tickTimerRef.current = setTimeout(tick, 30)
+      }
     }
-    bubbleTimerRef.current = setTimeout(tick, 50)
-  }, [disabled, triggerShatter, onLongPress])
+    tickTimerRef.current = setTimeout(tick, 30)
+  }, [disabled, onLongPress, fadeOutAndReset])
 
-  // ── Handle mouse up ──
   const handleMouseUp = useCallback(() => {
     cleanupTimers()
 
-    if (phaseRef.current === 'triggered' && fillProgressRef.current >= 100) {
-      // Long press already handled, shatter already triggered
+    // 若已经触发了长按
+    if (phaseRef.current === 'triggered' || fillProgressRef.current >= 100) {
       return
     }
 
     if (longPressFiredRef.current) {
-      // 长按已触发（粒子动画结束、phaseRef 已复位），本次按压的松手
-      // 只负责结束按压，不得再触发短按
       longPressFiredRef.current = false
       return
     }
 
-    // Short click: shatter + callback
+    // 短按
     const progress = fillProgressRef.current
     if (progress > 0) {
-      triggerShatter()
+      fadeOutAndReset(250)
+    } else {
+      phaseRef.current = 'idle'
     }
-    fillProgressRef.current = 0
-    setFillProgress(0)
-    setBubbles([])
-    phaseRef.current = 'idle'
     onShortClick()
-  }, [cleanupTimers, triggerShatter, onShortClick])
+  }, [cleanupTimers, fadeOutAndReset, onShortClick])
 
-  // ── Handle mouse leave ──
   const handleMouseLeave = useCallback(() => {
     cleanupTimers()
 
-    if (phaseRef.current === 'triggered' && fillProgressRef.current >= 100) {
-      // Long press already handled
+    if (phaseRef.current === 'triggered' || fillProgressRef.current >= 100) {
       return
     }
 
     if (longPressFiredRef.current) {
-      // 长按已触发，鼠标移出只结束按压，不触发短按
       longPressFiredRef.current = false
       return
     }
 
-    // Cancel: shatter without callback
-    const progress = fillProgressRef.current
-    if (progress > 0) {
-      triggerShatter()
+    // 取消长按：平滑淡出并复位
+    if (fillProgressRef.current > 0) {
+      fadeOutAndReset(250)
+    } else {
+      phaseRef.current = 'idle'
     }
-    fillProgressRef.current = 0
-    setFillProgress(0)
-    setBubbles([])
-    phaseRef.current = 'idle'
-  }, [cleanupTimers, triggerShatter])
+  }, [cleanupTimers, fadeOutAndReset])
 
-  // ── Handle keyboard (accessibility) ──
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (disabled) return
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault()
-      // Enter/Space 视为短按
-      onShortClick()
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (disabled) return
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        onShortClick()
+      }
+    },
+    [disabled, onShortClick],
+  )
+
+  useEffect(() => {
+    return () => {
+      cleanupTimers()
+      if (fadeTimerRef.current) clearTimeout(fadeTimerRef.current)
     }
-  }, [disabled, onShortClick])
-
-  // ── Unmount cleanup ──
-  // 卸载时需完整清理（含 shatter 粒子动画定时器，防止卸载后 setState）
-  useEffect(() => () => {
-    cleanupTimers()
-    if (shatterTimerRef.current) { clearTimeout(shatterTimerRef.current); shatterTimerRef.current = null }
   }, [cleanupTimers])
 
-  // ── Determine button text color based on fill depth ──
-  const textColor = fillProgress > 55 ? 'var(--overlay-text, #f5f5f7)' : undefined
+  const [isDark, setIsDark] = useState(
+    typeof document !== 'undefined' ? document.documentElement.classList.contains('dark') : true,
+  )
+  useEffect(() => {
+    const checkDark = () => setIsDark(document.documentElement.classList.contains('dark'))
+    checkDark()
+    const observer = new MutationObserver(checkDark)
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
 
-  // ── Shatter clip-path (only applied when shattering) ──
-  const clipPath = shatterParticles.length > 0 ? shatterPolygonRef.current : 'inset(0)'
-  const isShattering = shatterParticles.length > 0
+  const isHolding = fillProgress > 0
 
   return (
-    <Tooltip title={disabled ? '' : resolvedTooltip}>
+    <Tooltip title={disabled ? t('刷新暂不可用：请等待当前刷新完成') : resolvedTooltip}>
+      <span style={{ display: 'inline-flex' }}>
       <Button
         ref={buttonRef}
         size="middle"
         className="workbench-toolbar__refresh"
-        icon={<ReloadOutlined />}
         disabled={disabled}
         onMouseDown={handleMouseDown}
         onMouseUp={handleMouseUp}
@@ -453,63 +233,112 @@ export const RefreshButton = memo(function RefreshButton({
           position: 'relative',
           overflow: 'hidden',
           userSelect: 'none',
+          backgroundColor: isHolding ? (isDark ? '#0a1012' : 'rgba(49, 179, 174, 0.08)') : undefined,
+          borderColor: isHolding ? (isDark ? 'rgba(49, 179, 174, 0.45)' : 'var(--brand-500)') : undefined,
+          transition: 'border-color 0.2s ease, background-color 0.2s ease',
         }}
       >
-        {/* ① Green fill layer：从底部向上整体填充（主题青绿），长按过程按键逐渐全绿 */}
+        {/* ① 底层蜂窝点阵槽（按压时浮现，浅色/暗色自适应） */}
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            opacity: isHolding ? (isFadingOut ? 0 : 1) : 0,
+            backgroundColor: isDark ? '#0a1012' : 'rgba(49, 179, 174, 0.06)',
+            backgroundImage: isDark
+              ? `
+                radial-gradient(circle, rgba(49, 179, 174, 0.16) 2px, transparent 2.3px),
+                radial-gradient(circle, rgba(49, 179, 174, 0.16) 2px, transparent 2.3px)
+              `
+              : `
+                radial-gradient(circle, rgba(49, 179, 174, 0.22) 2px, transparent 2.3px),
+                radial-gradient(circle, rgba(49, 179, 174, 0.22) 2px, transparent 2.3px)
+              `,
+            backgroundSize: '9px 13px',
+            backgroundPosition: '0 0, 4.5px 6.5px',
+            pointerEvents: 'none',
+            zIndex: 1,
+            transition: isFadingOut ? 'opacity 0.65s ease-out' : 'opacity 0.15s ease',
+          }}
+        />
+
+        {/* ② 动态青色高亮蜂窝填充层（横向推进充电，触发后逐渐褪去） */}
         <div
           style={{
             position: 'absolute',
             left: 0,
-            right: 0,
+            top: 0,
             bottom: 0,
-            height: `${fillProgress}%`,
-            background: `linear-gradient(180deg, ${FILL_TOP}, ${FILL_BOTTOM})`,
-            borderRadius: 'inherit',
+            width: `${fillProgress}%`,
+            opacity: isHolding ? (isFadingOut ? 0 : 1) : 0,
+            backgroundColor: isDark ? 'rgba(28, 125, 122, 0.45)' : 'rgba(49, 179, 174, 0.3)',
+            backgroundImage: isDark
+              ? `
+                radial-gradient(circle, #66cfcf 2.2px, transparent 2.4px),
+                radial-gradient(circle, #31b3ae 2.2px, transparent 2.4px)
+              `
+              : `
+                radial-gradient(circle, #279e99 2.2px, transparent 2.4px),
+                radial-gradient(circle, #31b3ae 2.2px, transparent 2.4px)
+              `,
+            backgroundSize: '9px 13px',
+            backgroundPosition: '0 0, 4.5px 6.5px',
+            borderRight: fillProgress > 0 && fillProgress < 100 ? '2px solid var(--brand-500)' : undefined,
+            boxShadow:
+              fillProgress > 0
+                ? isDark
+                  ? '3px 0 12px rgba(77, 196, 191, 0.9), 0 0 16px rgba(49, 179, 174, 0.4)'
+                  : '3px 0 8px rgba(49, 179, 174, 0.6), 0 0 10px rgba(49, 179, 174, 0.25)'
+                : undefined,
             pointerEvents: 'none',
-            zIndex: 1,
-            clipPath,
-            transition: isShattering
-              ? 'clip-path 0.35s ease-out'
-              : 'height 0.05s linear',
+            zIndex: 2,
+            transition: isFadingOut
+              ? 'opacity 0.65s cubic-bezier(0.4, 0, 0.2, 1)'
+              : 'width 0.04s linear, opacity 0.15s ease',
           }}
         />
 
-        {/* ② Flash overlay */}
+        {/* ③ 100% 达成时的青白柔光闪烁 */}
         {showFlash && (
           <div
             style={{
               position: 'absolute',
               inset: 0,
-              animation: 'rfbFlash 0.2s ease-out forwards',
-              borderRadius: 'inherit',
+              background: 'radial-gradient(ellipse at center, rgba(255,255,255,0.7) 0%, rgba(77,196,191,0.5) 50%, rgba(49,179,174,0) 100%)',
+              animation: 'rfbHexFlash 0.15s ease-out forwards',
               pointerEvents: 'none',
-              zIndex: 2,
+              zIndex: 3,
             }}
           />
         )}
 
-        {/* ③ Rising bubbles（沿填充液面上浮的主题色光点） */}
-        {bubbles.map(p => (
-          <BubbleParticleDiv key={p.id} particle={p} />
-        ))}
-
-        {/* ④ Shatter particles (fly outward) */}
-        {shatterParticles.map(p => (
-          <ShatterParticleDiv key={p.id} particle={p} />
-        ))}
-
-        {/* ⑤ Button text (always on top) */}
+        {/* ④ 前景图标（长按过程随蜂窝进度平滑旋转 360°）与文字 */}
         <span
           style={{
             position: 'relative',
             zIndex: 4,
-            color: textColor,
-            transition: 'color 0.15s ease',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            color: fillProgress > 25 ? (isDark ? '#ffffff' : '#0a3d39') : undefined,
+            textShadow: fillProgress > 25
+              ? isDark
+                ? '0 1px 3px rgba(0,0,0,0.95), 0 0 6px rgba(0,0,0,0.9)'
+                : '0 1px 2px rgba(255,255,255,0.95)'
+              : undefined,
+            transition: isFadingOut ? 'color 0.65s ease, text-shadow 0.65s ease' : 'color 0.15s ease',
           }}
         >
-          {t('刷新')}
+          <ReloadOutlined
+            style={{
+              transform: `rotate(${fillProgress * 3.6}deg)`,
+              transition: isHolding && !isFadingOut ? 'none' : 'transform 0.3s ease',
+            }}
+          />
+          <span>{t('刷新')}</span>
         </span>
       </Button>
+      </span>
     </Tooltip>
   )
 })

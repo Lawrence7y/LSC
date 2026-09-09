@@ -32,6 +32,7 @@ interface AppState {
   settings: RecordSettings
   appSettings: AppSettings
   connectionStatus: ConnectionStatus
+  backendUnresponsive: boolean
   systemStats: SystemStats | null
   dependencyStatus: DependencyStatus | null
   timelineContext: TimelineContext | null
@@ -57,6 +58,7 @@ interface AppActions {
   setSettings: (settings: Partial<RecordSettings>) => void
   setAppSettings: (s: Partial<AppSettings>) => void
   setConnectionStatus: (status: ConnectionStatus) => void
+  setBackendUnresponsive: (v: boolean) => void
   setSystemStats: (stats: SystemStats | null) => void
   setDependencyStatus: (status: DependencyStatus | null) => void
   setTimelineContext: (ctx: TimelineContext | null) => void
@@ -84,6 +86,7 @@ const defaultSettings: RecordSettings = {
   audio_codec: 'AAC 128k',
   audio_bitrate: '128k',
   preview_quality: '高清',
+  timeline_replay_seconds: 300,
   preset: 'medium',
   ocr_accel: 'auto',
   export_max_concurrent: 2,
@@ -96,6 +99,9 @@ const defaultAppSettings: AppSettings = {
   autoLaunch: false,
   minimizeToTray: false,
   default_export_preset: 'douyin_vertical',
+  workbenchViewMode: 'compact',
+  autoAlignOnLive: true,
+  defaultMuteAll: true,
 }
 
 /** rooms_updated 浅比较：字段全同则跳过 set，避免无意义整树替换。 */
@@ -140,6 +146,7 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
   settings: defaultSettings,
   appSettings: defaultAppSettings,
   connectionStatus: 'disconnected',
+  backendUnresponsive: false,
   systemStats: null,
   dependencyStatus: null,
   timelineContext: null,
@@ -160,12 +167,29 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
     const mergedRooms = rooms.map((incoming) => {
       const prev = previousById.get(incoming.room_id)
       const ui = state.uiState[incoming.room_id]
+      const hasClockFields = Object.prototype.hasOwnProperty.call(incoming, 'recording_to_preview_delta')
+      const preserveAcceptedClock = Boolean(
+        prev?.recording_to_preview_delta != null
+        && incoming.preview_enabled
+        && incoming.recording_id === prev.recording_id
+        && incoming.preview_epoch_id
+        && incoming.preview_epoch_id === prev.preview_clock_epoch_id
+        && incoming.recording_to_preview_delta == null,
+      )
       return {
         ...incoming,
         preview_phase: incoming.preview_phase ?? ui?.preview_phase ?? prev?.preview_phase,
         mse_error: incoming.mse_error ?? ui?.mse_error ?? prev?.mse_error,
         mse_reconnecting: incoming.mse_reconnecting ?? ui?.mse_reconnecting ?? prev?.mse_reconnecting,
         preview_frame_data: incoming.preview_frame_data ?? ui?.preview_frame_data ?? prev?.preview_frame_data,
+        // 后端新版本会显式返回 null 清理过期映射；旧版本未返回时才保留
+        // 当前运行时值，避免兼容期间一次 rooms_updated 丢失本地校准。
+        recording_to_preview_delta: hasClockFields
+          ? (preserveAcceptedClock ? prev?.recording_to_preview_delta : incoming.recording_to_preview_delta)
+          : prev?.recording_to_preview_delta,
+        preview_clock_epoch_id: Object.prototype.hasOwnProperty.call(incoming, 'preview_clock_epoch_id')
+          ? (preserveAcceptedClock ? prev?.preview_clock_epoch_id : incoming.preview_clock_epoch_id)
+          : prev?.preview_clock_epoch_id,
       }
     })
     if (roomsShallowEqual(state.rooms, mergedRooms)) return state
@@ -270,6 +294,8 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
     })),
 
   setConnectionStatus: (connectionStatus) => set((state) => state.connectionStatus === connectionStatus ? state : { connectionStatus }),
+
+  setBackendUnresponsive: (v) => set((state) => state.backendUnresponsive === v ? state : { backendUnresponsive: v }),
 
   setSystemStats: (systemStats) =>
     set((state) => {

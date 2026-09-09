@@ -196,6 +196,20 @@ class DouyuAdapter(BasePlatformAdapter):
 
         if not stream_url:
             _log.warning("Douyu: live room %s has no playable preview/hls URL", real_rid)
+            # 开播但无流地址必须按失败返回：若伪装成成功，registry 会把空 URL
+            # 状态按成功缓存 30 秒，录制/预览拿到空地址且轮询期间无法修复。
+            return self._failed(
+                clean_url,
+                "斗鱼直播间开播但未取到流地址，稍后将自动重试",
+                ERROR_PARSE_FAILED,
+                raw={
+                    "confidence": 0.5,
+                    "state_source": "room_api" if room_info is not None else "room_page",
+                    "room_id": real_rid,
+                    "title": title or f"斗鱼直播间 {room_id}",
+                    "is_live": True,
+                },
+            )
 
         return self._success(
             clean_url,
@@ -203,13 +217,13 @@ class DouyuAdapter(BasePlatformAdapter):
             title=title or f"斗鱼直播间 {room_id}",
             streamer=streamer or "斗鱼主播",
             is_live=True,
-            quality_urls={"source": stream_url} if stream_url else {},
-            selected_quality="source" if stream_url else "",
+            quality_urls={"source": stream_url},
+            selected_quality="source",
             headers=headers,
             category=category,
             raw={
                 "source_kind": "official",
-                "confidence": 0.8 if stream_url else 0.5,
+                "confidence": 0.8,
                 "state_source": "room_api" if room_info is not None else "room_page",
                 "room_id": real_rid,
             },

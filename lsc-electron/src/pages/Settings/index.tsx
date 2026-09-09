@@ -1,7 +1,24 @@
 import { useEffect, useState, useRef } from 'react'
-import { Button, message, Slider, Input, Select, Tooltip } from 'antd'
-import { FolderOpenOutlined, ReloadOutlined, DownloadOutlined, FolderOutlined } from '@ant-design/icons'
+import type { ReactNode } from 'react'
+import { Button, App, Slider, Input, Select, Tooltip } from 'antd'
+import {
+  FolderOpenOutlined,
+  ReloadOutlined,
+  DownloadOutlined,
+  FolderOutlined,
+  SettingOutlined,
+  DesktopOutlined,
+  ToolOutlined,
+  VideoCameraOutlined,
+  ThunderboltOutlined,
+  UserOutlined,
+  KeyOutlined,
+  InfoCircleOutlined,
+  FileTextOutlined,
+  DragOutlined,
+} from '@ant-design/icons'
 import { useWebSocket } from '@/hooks/useWebSocket'
+import { SHORTCUT_DOCS, MOUSE_DOCS } from '@/hooks/useKeyboardShortcuts'
 import { useAppStore } from '@/store/appStore'
 import LogViewer from '@/components/LogViewer'
 import { useI18n, LOCALES, type I18nT } from '@/i18n'
@@ -11,20 +28,24 @@ import { SettingsSection } from './SettingsSection'
 import { SettingsRow } from './SettingsRow'
 import { ToggleSwitch } from './ToggleSwitch'
 import { DepStatus } from './DepStatus'
+import {
+  DEFAULT_TIMELINE_REPLAY_SECONDS,
+  REPLAY_BUFFER_OPTIONS,
+} from '@/utils/replaySettings'
 import './settings.css'
 
-function getSections(t: I18nT): { id: string; label: string }[] {
+function getSections(t: I18nT): { id: string; label: string; icon?: ReactNode }[] {
   return [
-    { id: 'general', label: t('通用') },
-    { id: 'preview', label: t('预览体验') },
-    { id: 'env', label: t('系统环境') },
-    { id: 'recording', label: t('录制与编码') },
-    { id: 'ai', label: t('AI 分析') },
-    { id: 'storage', label: t('存储与草稿') },
-    { id: 'account', label: t('平台账号') },
-    { id: 'shortcuts', label: t('快捷键') },
-    { id: 'about', label: t('关于与更新') },
-    { id: 'logs', label: t('日志') },
+    { id: 'general', label: t('通用偏好'), icon: <SettingOutlined /> },
+    { id: 'workbench', label: t('监看与工作台'), icon: <DesktopOutlined /> },
+    { id: 'env', label: t('系统环境诊断'), icon: <ToolOutlined /> },
+    { id: 'recording', label: t('录制与编码'), icon: <VideoCameraOutlined /> },
+    { id: 'ai', label: t('AI 智能分析'), icon: <ThunderboltOutlined /> },
+    { id: 'storage', label: t('存储与草稿'), icon: <FolderOpenOutlined /> },
+    { id: 'account', label: t('平台凭证 Cookie'), icon: <UserOutlined /> },
+    { id: 'shortcuts', label: t('快捷键与鼠标操作'), icon: <KeyOutlined /> },
+    { id: 'about', label: t('关于与更新'), icon: <InfoCircleOutlined /> },
+    { id: 'logs', label: t('运行日志'), icon: <FileTextOutlined /> },
   ]
 }
 
@@ -43,8 +64,20 @@ function KeyBadge({ keys }: { keys: string[] }) {
   )
 }
 
+/** 鼠标手势位：复用 kbd 的视觉语言，但不伪装成按键 */
+function MouseBadge({ label }: { label: string }) {
+  return (
+    <span className="key-badge">
+      <DragOutlined style={{ color: 'var(--text-tertiary)', fontSize: 12 }} />
+      <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{label}</span>
+    </span>
+  )
+}
+
 export default function Settings() {
   const { t, locale, setLocale } = useI18n()
+  // context 版 message：静态调用在 antd v5 下不跟随 ConfigProvider 主题
+  const { message } = App.useApp()
   const SECTIONS = getSections(t)
   const { isConnected, send, on } = useWebSocket()
   const settings = useAppStore((state) => state.settings)
@@ -85,6 +118,7 @@ export default function Settings() {
   } | null>(null)
   const [savingHuyaCookie, setSavingHuyaCookie] = useState(false)
   const [detectedJianyingDir, setDetectedJianyingDir] = useState('')
+  const [activeSection, setActiveSection] = useState('general')
 
   useEffect(() => {
     window.electronAPI?.getAppVersion().then((v: string) => setAppVersion(v)).catch((e: unknown) => console.error('[Settings] getAppVersion failed:', e))
@@ -412,17 +446,28 @@ export default function Settings() {
             <button
               key={s.id}
               type="button"
-              className="settings-nav__item"
-              onClick={() => scrollToSection(s.id)}
+              className={`settings-nav__item${activeSection === s.id ? ' is-active' : ''}`}
+              onClick={() => {
+                setActiveSection(s.id)
+                scrollToSection(s.id)
+              }}
             >
-              {s.label}
+              {s.icon}
+              <span>{s.label}</span>
             </button>
           ))}
         </nav>
 
         <div className="settings-main">
-          <SettingsSection id="general" title={t('通用')}>
-            <SettingsRow label={t('语言')}>
+          <SettingsSection
+            id="general"
+            title={t('通用偏好')}
+            description={t('配置界面基础语言、外观主题与启动行为')}
+          >
+            <SettingsRow
+              label={t('界面语言')}
+              description={t('支持简体中文与 English 即时热切换')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
@@ -431,53 +476,123 @@ export default function Settings() {
                 options={LOCALES}
               />
             </SettingsRow>
-            <SettingsRow label={t('主题')}>
+            <SettingsRow
+              label={t('色彩外观')}
+              description={t('素雅矿物青与高对比石板灰，长时间监看更护眼')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
                 value={appSettings.theme}
                 onChange={(v) => handleThemeChange(v as AppSettings['theme'])}
                 options={[
-                  { value: 'dark', label: t('深色') },
-                  { value: 'light', label: t('浅色') },
+                  { value: 'dark', label: t('深色模式') },
+                  { value: 'light', label: t('浅色模式') },
                 ]}
               />
             </SettingsRow>
-            <SettingsRow label={t('开机自启')}>
+            <SettingsRow
+              label={t('开机自启')}
+              description={t('启动计算机时在后台自动拉起客户端')}
+            >
               <ToggleSwitch checked={appSettings.autoLaunch} onChange={handleAutoLaunchChange} />
             </SettingsRow>
-            <SettingsRow label={t('最小化到托盘')}>
+            <SettingsRow
+              label={t('最小化到托盘')}
+              description={t('关闭窗口时最小化至托盘，保证后台录制不中断')}
+            >
               <ToggleSwitch checked={appSettings.minimizeToTray} onChange={handleMinimizeToTrayChange} />
             </SettingsRow>
           </SettingsSection>
 
-          <div id="preview" className="settings-section">
-            <div className="settings-section__title" style={{ marginBottom: 0 }}>
-              <span style={{ whiteSpace: 'nowrap' }}>{t('预览体验')}</span>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, textTransform: 'none', letterSpacing: 'normal' }}>
-                <span style={{ fontSize: 13, fontWeight: 400, color: 'var(--text-50)', whiteSpace: 'nowrap', flexShrink: 0 }}>{t('预览画质')}</span>
-                <Select
-                  size="small"
-                  style={{ width: 150, maxWidth: '100%' }}
-                  value={settings.preview_quality}
-                  onChange={(v) => {
-                    handleRecordChange('preview_quality', v)
-                    message.warning(t('更改预览画质会重启预览，公共轴可能失效，请重新一键对齐'), 4)
-                  }}
-                  options={[
-                    { value: '原画', label: t('原画（不缩放）') },
-                    { value: '高清', label: t('高清 720p') },
-                    { value: '标清', label: t('标清 480p') },
-                    { value: '流畅', label: t('流畅 360p') },
-                  ]}
-                />
-              </div>
-            </div>
-          </div>
+          <SettingsSection
+            id="workbench"
+            title={t('监看与工作台')}
+            description={t('控制多路画面排布、网格密度与时间戳对齐策略')}
+          >
+            <SettingsRow
+              label={t('工作台默认视图')}
+              description={t('紧凑模式收拢次要浮层，6 路画面 100% 满屏无纵向滚动条')}
+            >
+              <Select
+                size="small"
+                style={SELECT_W}
+                value={appSettings.workbenchViewMode || 'compact'}
+                onChange={(v) => handleAppSettingChange('workbenchViewMode', v)}
+                options={[
+                  { value: 'compact', label: t('紧凑无滚动模式 (推荐)') },
+                  { value: 'standard', label: t('标准网格模式') },
+                ]}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={t('开播自动时间戳对齐')}
+              description={t('多路流建立连接后，自动以首个关键帧对齐播放头')}
+            >
+              <ToggleSwitch
+                checked={appSettings.autoAlignOnLive ?? true}
+                onChange={(v) => handleAppSettingChange('autoAlignOnLive', v)}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={t('多流监看默认静音全部')}
+              description={t('防止 6 路音频同时回放产生混杂刺耳爆音')}
+            >
+              <ToggleSwitch
+                checked={appSettings.defaultMuteAll ?? true}
+                onChange={(v) => handleAppSettingChange('defaultMuteAll', v)}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={t('预览画质')}
+              description={t('更改画质将重启预览通道，降低画质可减轻多流解码显存')}
+            >
+              <Select
+                size="small"
+                style={SELECT_W}
+                value={settings.preview_quality}
+                onChange={(v) => {
+                  handleRecordChange('preview_quality', v)
+                  message.warning(t('更改预览画质会重启预览，公共轴可能失效，请重新一键对齐'), 4)
+                }}
+                options={[
+                  { value: '原画', label: t('原画（不缩放）') },
+                  { value: '高清', label: t('高清 720p') },
+                  { value: '标清', label: t('标清 480p') },
+                  { value: '流畅', label: t('流畅 360p') },
+                ]}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={t('时间线回放')}
+              description={t('选择直播沿前可回看的时长；关闭可降低 Electron 内存占用，重新开启后从新收到的分片开始积累')}
+            >
+              <Select
+                size="small"
+                style={SELECT_W}
+                value={settings.timeline_replay_seconds ?? DEFAULT_TIMELINE_REPLAY_SECONDS}
+                onChange={(v) => {
+                  const seconds = Number(v)
+                  handleRecordChange('timeline_replay_seconds', seconds)
+                  message.success(t(
+                    seconds === 0 ? '已关闭时间线回放（仅保留播放缓存）' : '时间线回放已设为 {time}',
+                    { time: seconds >= 60 ? `${seconds / 60} 分钟` : `${seconds} 秒` },
+                  ), 2)
+                }}
+                options={[
+                  { value: REPLAY_BUFFER_OPTIONS[0], label: t('关闭回放（最低占用）') },
+                  { value: REPLAY_BUFFER_OPTIONS[1], label: t('2 分钟') },
+                  { value: REPLAY_BUFFER_OPTIONS[2], label: t('5 分钟（推荐）') },
+                  { value: REPLAY_BUFFER_OPTIONS[3], label: t('10 分钟（高内存）') },
+                ]}
+              />
+            </SettingsRow>
+          </SettingsSection>
 
           <SettingsSection
             id="env"
-            title={t('系统环境')}
+            title={t('系统环境诊断')}
+            description={t('底层视频推流、转码与通信管道健康状态诊断')}
             extra={
               <Button
                 type="text"
@@ -490,27 +605,39 @@ export default function Settings() {
               </Button>
             }
           >
-            <SettingsRow label={t('FFmpeg')}>
+            <SettingsRow
+              label={t('FFmpeg 转码引擎')}
+              description={t('视频切片流提取与封装核心组件')}
+            >
               <DepStatus
                 ok={dependencyStatus?.ffmpeg.available}
                 version={dependencyStatus?.ffmpeg.version}
                 path={dependencyStatus?.ffmpeg.path}
               />
             </SettingsRow>
-            <SettingsRow label={t('FFprobe')}>
+            <SettingsRow
+              label={t('FFprobe 媒体探针')}
+              description={t('媒体元数据分析与时间戳探查工具')}
+            >
               <DepStatus
                 ok={dependencyStatus?.ffprobe.available}
                 version={dependencyStatus?.ffprobe.version}
                 path={dependencyStatus?.ffprobe.path}
               />
             </SettingsRow>
-            <SettingsRow label={t('NVENC 硬件编码')}>
+            <SettingsRow
+              label={t('NVENC 硬件加速')}
+              description={t('NVIDIA 独立显卡 GPU 视频硬件编码支持')}
+            >
               <DepStatus
                 ok={dependencyStatus?.nvenc.available}
                 version={dependencyStatus?.nvenc.available ? t('h264_nvenc 可用') : t('不可用')}
               />
             </SettingsRow>
-            <SettingsRow label={t('Python')}>
+            <SettingsRow
+              label={t('Python 运行时')}
+              description={t('本地高并发录制分析后台守护服务')}
+            >
               <DepStatus
                 ok={dependencyStatus?.python.version ? true : undefined}
                 version={dependencyStatus?.python.version}
@@ -519,8 +646,15 @@ export default function Settings() {
             </SettingsRow>
           </SettingsSection>
 
-          <SettingsSection id="recording" title={t('录制与编码')}>
-            <SettingsRow label={t('默认画质')}>
+          <SettingsSection
+            id="recording"
+            title={t('录制与编码')}
+            description={t('调优 GPU 硬件加速编解码器与视频画质参数')}
+          >
+            <SettingsRow
+              label={t('默认画质')}
+              description={t('多路录制的基础输出分辨率档位')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
@@ -535,7 +669,10 @@ export default function Settings() {
                 ]}
               />
             </SettingsRow>
-            <SettingsRow label={t('默认编码器')}>
+            <SettingsRow
+              label={t('默认编码器')}
+              description={t('优先选用 GPU 硬件加速，可大幅降低系统 CPU 占用')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
@@ -552,7 +689,10 @@ export default function Settings() {
                 ]}
               />
             </SettingsRow>
-            <SettingsRow label={t('编码参数')}>
+            <SettingsRow
+              label={t('编码参数')}
+              description={t('支持固定 CRF 质量、自定义目标码率或直拷不限制')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
@@ -565,7 +705,10 @@ export default function Settings() {
                 ]}
               />
             </SettingsRow>
-            <SettingsRow label={t('编码预设')}>
+            <SettingsRow
+              label={t('编码预设')}
+              description={t('速度越快 CPU 占用越低，较慢预设画面压缩率更高')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
@@ -668,8 +811,15 @@ export default function Settings() {
             </SettingsRow>
           </SettingsSection>
 
-          <SettingsSection id="ai" title={t('AI 分析')}>
-            <SettingsRow label={t('OCR 加速')}>
+          <SettingsSection
+            id="ai"
+            title={t('AI 智能分析')}
+            description={t('配置 OCR 文字识别加速与高光切片并发导出参数')}
+          >
+            <SettingsRow
+              label={t('OCR 加速引擎')}
+              description={t('用于识别游戏内比分与击杀字幕的计算加速后端')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
@@ -686,21 +836,22 @@ export default function Settings() {
                 ]}
               />
             </SettingsRow>
-            <SettingsRow label={t('共享进样')}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <span style={{ color: 'var(--text-40)', fontSize: 12 }}>
-                  {t('预览与录制共用同一进程，录制中断会导致预览短暂重连')}
-                </span>
-                <ToggleSwitch
-                  checked={!!settings.shared_ingest_enabled}
-                  onChange={(v) => {
-                    handleRecordChange('shared_ingest_enabled', v)
-                    message.success(t(v ? '已开启共享进样（新预览/录制生效）' : '已关闭共享进样（新预览/录制生效）'), 2)
-                  }}
-                />
-              </div>
+            <SettingsRow
+              label={t('共享进样')}
+              description={t('预览与录制共用同一进程，节省近 50% 系统显存')}
+            >
+              <ToggleSwitch
+                checked={!!settings.shared_ingest_enabled}
+                onChange={(v) => {
+                  handleRecordChange('shared_ingest_enabled', v)
+                  message.success(t(v ? '已开启共享进样（新预览/录制生效）' : '已关闭共享进样（新预览/录制生效）'), 2)
+                }}
+              />
             </SettingsRow>
-            <SettingsRow label={t('并发导出数')}>
+            <SettingsRow
+              label={t('并发导出数')}
+              description={t('限制后台同时渲染导出的切片任务数量')}
+            >
               <Select
                 size="small"
                 style={SELECT_W}
@@ -710,12 +861,15 @@ export default function Settings() {
                   message.success(t(Number(v) === 1 ? '已设为单路导出（降低 CPU 负载）' : '已设为双路并发导出'), 2)
                 }}
                 options={[
-                  { value: 2, label: t('2 路（默认）') },
-                  { value: 1, label: t('1 路（低负载）') },
+                  { value: 2, label: t('2 路并发（默认推荐）') },
+                  { value: 1, label: t('1 路顺序导出（低负载模式）') },
                 ]}
               />
             </SettingsRow>
-            <SettingsRow label={t('默认导出预设')}>
+            <SettingsRow
+              label={t('默认导出预设')}
+              description={t('一键导出切片或生成剪映草稿时应用的画幅比例与参数')}
+            >
               <Tooltip title={(() => {
                 const preset = EXPORT_PRESETS.find(p => p.id === (appSettings.default_export_preset || 'douyin_vertical'))
                 return preset ? `${preset.name} — ${preset.description}` : ''
@@ -734,8 +888,15 @@ export default function Settings() {
             </SettingsRow>
           </SettingsSection>
 
-          <SettingsSection id="storage" title={t('存储与草稿')}>
-            <SettingsRow label={t('存储路径')}>
+          <SettingsSection
+            id="storage"
+            title={t('存储与草稿')}
+            description={t('管理原始视频切片落盘路径与剪映项目工程草稿位置')}
+          >
+            <SettingsRow
+              label={t('存储路径')}
+              description={t('所有录制视频与切片片段的本地存储目录')}
+            >
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', maxWidth: 360 }}>
                 <span className="settings-path">{settings.output_dir}</span>
                 <button type="button" onClick={() => { void handleBrowse() }} className="browse-btn">
@@ -744,7 +905,10 @@ export default function Settings() {
                 </button>
               </div>
             </SettingsRow>
-            <SettingsRow label={t('剪映草稿目录')}>
+            <SettingsRow
+              label={t('剪映草稿目录')}
+              description={t('自动定位剪映专业版草稿项目库，支持一键生成剪映时间线')}
+            >
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%', maxWidth: 360 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%' }}>
                   <span
@@ -773,17 +937,19 @@ export default function Settings() {
 
           <SettingsSection
             id="account"
-            title={t('平台账号')}
+            title={t('平台凭证 Cookie')}
+            description={t('配置各直播平台的高清流解析登录凭证')}
             bodyStyle={{ padding: 0, background: 'transparent', overflow: 'visible' }}
           >
             <div style={{
-              background: 'var(--background-800)',
-              borderRadius: 'var(--radius)',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border-default)',
+              borderRadius: 'var(--radius-md, 8px)',
               overflow: 'hidden',
               padding: 16,
               marginBottom: 16,
             }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-50)', marginBottom: 8 }}>{t('抖音 Cookie')}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>{t('抖音 Cookie')}</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: douyinCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
                 {douyinCookieStatus?.configured
                   ? <>
@@ -822,13 +988,14 @@ export default function Settings() {
             </div>
 
             <div style={{
-              background: 'var(--background-800)',
-              borderRadius: 'var(--radius)',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border-default)',
+              borderRadius: 'var(--radius-md, 8px)',
               overflow: 'hidden',
               padding: 16,
               marginBottom: 16,
             }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-50)', marginBottom: 8 }}>{t('B站 Cookie')}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>{t('B站 Cookie')}</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: bilibiliCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
                 {bilibiliCookieStatus?.configured
                   ? <>
@@ -867,12 +1034,13 @@ export default function Settings() {
             </div>
 
             <div style={{
-              background: 'var(--background-800)',
-              borderRadius: 'var(--radius)',
+              background: 'var(--bg-secondary)',
+              border: '1px solid var(--border-default)',
+              borderRadius: 'var(--radius-md, 8px)',
               overflow: 'hidden',
               padding: 16,
             }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-50)', marginBottom: 8 }}>{t('虎牙 Cookie')}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>{t('虎牙 Cookie')}</div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: huyaCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
                 {huyaCookieStatus?.configured
                   ? <>
@@ -911,30 +1079,38 @@ export default function Settings() {
             </div>
           </SettingsSection>
 
-          <SettingsSection id="shortcuts" title={t('快捷键')}>
-            <SettingsRow label={t('页面：工作台')}><KeyBadge keys={['Ctrl', '1']} /></SettingsRow>
-            <SettingsRow label={t('页面：设置')}><KeyBadge keys={['Ctrl', '2']} /></SettingsRow>
-            <SettingsRow label={t('刷新页面')}><KeyBadge keys={['F5']} /></SettingsRow>
-            <SettingsRow label={t('播放/暂停')}><KeyBadge keys={['Space']} /></SettingsRow>
-            <SettingsRow label={t('标记入点')}><KeyBadge keys={['I']} /></SettingsRow>
-            <SettingsRow label={t('标记出点')}><KeyBadge keys={['O']} /></SettingsRow>
-            <SettingsRow label={t('切换录制')}><KeyBadge keys={['R']} /></SettingsRow>
-            <SettingsRow label={t('静音/取消静音')}><KeyBadge keys={['M']} /></SettingsRow>
-            <SettingsRow label={t('放大预览')}><KeyBadge keys={['F']} /></SettingsRow>
-            <SettingsRow label={t('批量开始录制')}><KeyBadge keys={['Ctrl', 'R']} /></SettingsRow>
-            <SettingsRow label={t('批量停止录制')}><KeyBadge keys={['Ctrl', 'Shift', 'R']} /></SettingsRow>
-            <SettingsRow label={t('全选房间')}><KeyBadge keys={['Ctrl', 'Shift', 'A']} /></SettingsRow>
-            <SettingsRow label={t('导出切片')}><KeyBadge keys={['Ctrl', 'E']} /></SettingsRow>
+          <SettingsSection
+            id="shortcuts"
+            title={t('快捷键与鼠标操作')}
+            description={t('键位与 WORKBENCH_SHORTCUTS 表同源自动生成，不会与实际键位漂移')}
+          >
+            {SHORTCUT_DOCS.map(row => (
+              <SettingsRow key={row.ids.join('+')} label={t(row.label)}>
+                <KeyBadge keys={row.keys} />
+              </SettingsRow>
+            ))}
+            {MOUSE_DOCS.map(row => (
+              <SettingsRow key={row.label} label={t(row.label)} description={t(row.desc)}>
+                <MouseBadge label={t('鼠标')} />
+              </SettingsRow>
+            ))}
           </SettingsSection>
 
-          <SettingsSection id="about" title={t('关于与更新')}>
-            <SettingsRow label={t('版本')}>
-              <span style={{ fontSize: 13, color: 'var(--text-400)' }}>v{appVersion || '1.0.0'}</span>
+          <SettingsSection
+            id="about"
+            title={t('关于与更新')}
+            description={t('客户端版本信息与自动更新检查')}
+          >
+            <SettingsRow
+              label={t('当前版本')}
+              description={t('Live Stream Clipper 多人协作版')}
+            >
+              <span style={{ fontSize: 13, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>v{appVersion || '1.0.0'}</span>
             </SettingsRow>
-            <SettingsRow label="">
+            <SettingsRow label={t('在线更新')}>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
                 {updateStatus?.type === 'checking' && (
-                  <span style={{ fontSize: 12, color: 'var(--text-400)' }}>{t('正在检查更新...')}</span>
+                  <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{t('正在检查更新...')}</span>
                 )}
                 {updateStatus?.type === 'not-available' && (
                   <span style={{ fontSize: 12, color: 'var(--state-success)' }}>
@@ -949,7 +1125,7 @@ export default function Settings() {
                     {updateStatus.releaseNotes && (
                       <span style={{
                         fontSize: 11,
-                        color: 'var(--text-400)',
+                        color: 'var(--text-tertiary)',
                         maxWidth: 220,
                         whiteSpace: 'pre-wrap',
                         wordBreak: 'break-word',
@@ -982,7 +1158,8 @@ export default function Settings() {
 
           <SettingsSection
             id="logs"
-            title={t('日志')}
+            title={t('运行日志')}
+            description={t('查看与导出客户端与后端的实时运行日志')}
             extra={
               <Button
                 type="text"

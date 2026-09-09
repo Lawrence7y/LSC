@@ -1008,19 +1008,14 @@ def test_preview_phase_broadcast_and_ui() -> None:
     assert "getRoomBufferedRange" in dvr_block
 
 
-def test_frontend_no_longer_offers_valorant_perspective() -> None:
-    """分析入口已合并视角：不再提供游戏视角/赛事解说选择，也不再发送 valorant_profile。"""
+def test_frontend_offers_valorant_source_profile() -> None:
+    """Valorant 必须提供来源策略选择（主播第一视角 / 官方赛事二路 / 自动），支持用户显式切换。"""
     wb = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    assert "游戏视角" not in wb or "自动适配游戏视角与赛事解说" in wb
-    assert 'Radio.Button value="pov"' not in wb
-    assert 'Radio.Button value="broadcast"' not in wb
-    # 启动 payload 不再带 valorant_profile
+    assert 'Radio.Button value="pov"' in wb
+    assert 'Radio.Button value="broadcast"' in wb
+    # 启动 payload 必须带 valorant_profile
     start_block = wb.split("send('start_continuous_analysis'", 1)[1].split("})", 1)[0]
-    assert "valorant_profile" not in start_block
-    # 进度条不再展示视角分流
-    progress = (ROOT / "lsc-electron/src/components/AnalysisProgress.tsx").read_text(encoding="utf-8")
-    assert "PROFILE_LABEL" not in progress
-    assert "视角：" not in progress
+    assert "valorant_profile" in start_block
 
 
 def test_mse_error_does_not_unconditionally_stop_recording() -> None:

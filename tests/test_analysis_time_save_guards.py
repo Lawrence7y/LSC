@@ -2,7 +2,11 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HANDLER = (ROOT / "python-backend" / "handlers" / "room_handler.py").read_text(encoding="utf-8")
+HANDLER = (
+    (ROOT / "python-backend" / "handlers" / "room_handler.py").read_text(encoding="utf-8")
+    + "\n"
+    + (ROOT / "python-backend" / "handlers" / "analysis_handlers.py").read_text(encoding="utf-8")
+)
 
 
 def test_analysis_export_defines_analysis_time_before_save():

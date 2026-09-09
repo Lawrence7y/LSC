@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from typing import Any
 
 _log = logging.getLogger(__name__)
@@ -153,6 +154,44 @@ def run_hidden(cmd: list[str] | tuple[str, ...], /, **kwargs: object) -> subproc
     return subprocess.run(cmd, **hidden_run_kwargs(**kwargs))  # type: ignore[arg-type, call-overload, no-any-return]  # noqa: S603
 
 
+def kill_process_tree(proc: Any, grace_sec: float = 3.0) -> None:
+    """强杀整个进程树——分级优雅停机最后一级的统一入口（CLAUDE.md §11.3）。
+
+    Windows: ``taskkill /T /F``（树杀 + 强制；容忍目标已退出的竞态）。
+    POSIX: SIGTERM → 非阻塞轮询 ``grace_sec`` → SIGKILL。
+    分级停机（q/terminate → 等待 → 强杀）的最终一级必须走本函数，
+    禁止直接 ``proc.kill()``（Windows 上只杀主进程、不杀树）。
+    进程已退出时静默返回（PID 竞态安全）。
+    """
+    pid = getattr(proc, "pid", None)
+    if pid is None:
+        return
+    if _IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+                **hidden_run_kwargs(),
+            )
+        except Exception as exc:
+            _log.debug("taskkill /T /F failed for pid=%s: %s", pid, exc)
+        return
+    try:
+        proc.terminate()
+    except Exception as exc:
+        _log.debug("terminate failed pid=%s: %s", pid, exc)
+    deadline = time.monotonic() + grace_sec
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.05)
+    try:
+        proc.kill()
+    except Exception as exc:
+        _log.debug("kill failed pid=%s: %s", pid, exc)
+
+
 def set_stream_nonblocking(pipe: Any) -> None:
     """Set a subprocess pipe (stdout/stderr) to non-blocking mode.
 
@@ -187,5 +226,6 @@ __all__ = [
     "prepare_launch",
     "hidden_run_kwargs",
     "run_hidden",
+    "kill_process_tree",
     "set_stream_nonblocking",
 ]

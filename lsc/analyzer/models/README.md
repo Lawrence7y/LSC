@@ -9,6 +9,12 @@
 
 `ValorantFrameClassifier` 启动时校验 json 与 onnx 的 SHA-256 一致。
 
+生产目录只接受 `scripts/valorant_vision/eval_source_dataset.py --mode
+broadcast_runtime` 生成且 `gates_passed=true` 的 promotion report。使用
+`promote_model.py` 激活；门禁失败、缺少独立来源会话或 SHA 不一致时保持当前
+模型不变，并返回非零退出码。元数据中的 `promotion_state`、`promotion_report_path`
+和 `rollback_model_sha` 用于追踪发布与回滚。
+
 ## 获取模型
 
 1. **训练导出**（需标注数据集）：
@@ -27,6 +33,6 @@
 
 ## 注意
 
-- 仓库内**不**包含真实生产 ONNX（体积大、需标注数据训练）。
-- 模型缺失时 Valorant 持续分析会报 `ModelContractError` 并禁用自动切片，不会回退旧音频/OCR 边界算法。
-- `valorant_round` 持续分析与同步导出均以混合视觉（`valorant_hybrid_v1`）为唯一边界权威；legacy OCR/音频回合不可入列。
+- `pov` 普通直播路径不加载该模型，继续使用纯 OCR 回合检测。
+- `broadcast` 官方赛事/二路路径缺失模型、契约不匹配或推理失败时安全拒绝候选，禁止回退为猜测边界。
+- `broadcast` 模型只作为 OCR 候选的阶段审计，不直接把单帧分类结果当作回合边界。

@@ -208,3 +208,39 @@ class TestErrorStats:
             t.join(timeout=10)
         assert not errors, f"concurrent access raised: {errors}"
         assert all(not t.is_alive() for t in threads), "threads deadlocked"
+
+
+class TestResolveRealVideoPath:
+    """Test resolve_real_video_path behavior and regression against sidecars."""
+
+    def test_existing_file_returns_as_is(self, tmp_path):
+        from lsc.utils.helpers import resolve_real_video_path
+
+        p = tmp_path / "recording_录制中.mp4"
+        p.write_bytes(b"data")
+        assert resolve_real_video_path(str(p)) == str(p)
+
+    def test_ignores_json_and_sidecars(self, tmp_path):
+        from lsc.utils.helpers import resolve_real_video_path
+
+        in_progress = tmp_path / "2026-09-07_12-25-51_录制中.mp4"
+        # Renamed video exists
+        final_mp4 = tmp_path / "2026-09-07_12-25-51_至_2026-09-07_13-22-36.mp4"
+        final_mp4.write_bytes(b"video data")
+
+        # Sidecars with names that precede .mp4 alphabetically
+        final_json = tmp_path / "2026-09-07_12-25-51_至_2026-09-07_13-22-36.finalization.json"
+        final_json.write_text('{"job_id": "test"}', encoding="utf-8")
+        analysis_json = tmp_path / "2026-09-07_12-25-51_至_2026-09-07_13-22-36.analysis.json"
+        analysis_json.write_text('{"analysis": "test"}', encoding="utf-8")
+
+        resolved = resolve_real_video_path(str(in_progress))
+        assert resolved == str(final_mp4)
+        assert not resolved.endswith(".json")
+
+    def test_empty_or_nonexistent_directory(self):
+        from lsc.utils.helpers import resolve_real_video_path
+
+        assert resolve_real_video_path("") == ""
+        assert resolve_real_video_path("/non/existent/dir/file.mp4") == "/non/existent/dir/file.mp4"
+

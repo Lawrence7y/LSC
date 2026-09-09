@@ -207,13 +207,15 @@ class LscConfig:
     ffprobe_path: str = ""
     output_path: str = ""
     output_dir: str = ""
-    shared_ingest_enabled: bool = False
-    shared_ingest_preview_queue_bytes: int = 2 * 1024 * 1024
+    shared_ingest_enabled: bool = True
+    shared_ingest_preview_queue_bytes: int = 8 * 1024 * 1024
     shared_ingest_preview_drop_policy: str = "drop_oldest"
     shared_ingest_preview_crf: int = 23
     shared_ingest_preview_preset: str = "veryfast"
     shared_ingest_recording_queue_bytes: int = 2 * 1024 * 1024
-    # 多平台 V2 管线默认关闭，通过平台 allowlist 灰度启用。
+    # V2 管线为双闸启用：platform_pipeline_v2_enabled 与 allowlist 必须
+    # 同时满足（见 is_platform_pipeline_v2_enabled）。默认双关，生产走
+    # legacy parse_stream；开启灰度时同时配置 allowlist。
     platform_pipeline_v2_enabled: bool = False
     platform_pipeline_v2_allowlist: list[str] = field(default_factory=list)
     # Optional rollout dimensions. Empty means unrestricted for that
@@ -222,13 +224,13 @@ class LscConfig:
     platform_pipeline_v2_user_allowlist: list[str] = field(default_factory=list)
     platform_pipeline_v2_account_allowlist: list[str] = field(default_factory=list)
     platform_pipeline_v2_app_version_allowlist: list[str] = field(default_factory=list)
-    segmented_recording_enabled: bool = False
+    segmented_recording_enabled: bool = True
     # 子能力开关默认开启，但仍受上面的全局开关与平台 allowlist 约束。
     unified_resolver_v2: bool = True
     media_probe_v2: bool = True
     stream_lease_v2: bool = True
     ingest_supervisor_v2: bool = True
-    segmented_recording_v2: bool = False
+    segmented_recording_v2: bool = True
     runtime_events_v2: bool = True
     # 资源限制（可通过 settings.json 覆盖）
     max_rooms: int = 12
@@ -241,7 +243,7 @@ class LscConfig:
         if not self.ffprobe_path:
             self.ffprobe_path = _find_executable("ffprobe")
         if not self.output_path:
-            self.output_path = os.path.join(os.path.expanduser("~"), "LSC", "recordings")
+            self.output_path = os.path.join(os.path.expanduser("~"), "LSC", "output")
         if not self.output_dir:
             self.output_dir = self.output_path
         _log.debug("LscConfig initialized: ffmpeg=%s ffprobe=%s output=%s",

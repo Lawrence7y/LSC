@@ -21,7 +21,6 @@ from typing import Any
 from lsc.config import ExportProfile
 from lsc.core.recording_layout import resolve_clip_output_dir
 from lsc.core.services.mse_streamer import _check_nvenc
-from lsc.core.services.resource_monitor import get_resource_pressure
 from lsc.utils.error_messages import humanize_error
 
 _log = logging.getLogger('lsc.handlers')
@@ -48,8 +47,6 @@ _export_total = 0
 _export_completed = 0
 _export_batch_id = ""
 
-# 延后导出队列（持续分析先入列，压力缓解后再导出）
-_deferred_export_jobs: list[dict[str, Any]] = []
 
 
 def _set_export_job_state(job_id: str, status: str, **fields: Any) -> None:
@@ -367,6 +364,18 @@ async def _process_export_job_impl(job):
                     state = _export_job_states.get(job_id) or {}
                     if state.get('status') not in {'completed', 'failed', 'cancelled'}:
                         export_jobs[job_id] = clip_id
+        except AttributeError as exc:
+            # 跨版本 controller 缺少导出方法时，保留明确的接口错误，
+            # 不让前端只看到 "'x' object has no attribute ..."。
+            missing = str(exc)
+            result['error'] = f"导出接口缺失或不兼容：{missing}"
+            _log.exception(
+                "导出控制器接口异常: room=%s job=%s detail=%s",
+                room_id,
+                job_id,
+                missing,
+            )
+            loop.call_soon_threadsafe(done_event.set)
         except Exception as exc:
             result['error'] = str(exc)
             loop.call_soon_threadsafe(done_event.set)
@@ -501,7 +510,11 @@ def register_export_handlers(
     def _build_export_profile(settings, preset_id=None):
         """全系统唯一的 ExportProfile 构建入口。"""
         encoder = settings.get('encoder', 'h264_nvenc')
-        crf_val = int(settings.get('crf', 23))
+        try:
+            crf_val = int(settings.get('crf', 23))
+        except (TypeError, ValueError):
+            _log.warning("settings.crf 非法（%r），回退默认 23", settings.get('crf'))
+            crf_val = 23
         resolution = settings.get('resolution', '')
         framerate = settings.get('framerate', '原画')
         audio_br = settings.get('audio_bitrate', '128k')
@@ -674,50 +687,6 @@ def register_export_handlers(
     # 暴露 queue_export 供外部模块使用
     _queue_export_fn = queue_export
 
-    async def flush_deferred_exports(force: bool = False) -> int:
-        """压力缓解或收尾时，把延后队列真正送进导出 worker。
-
-        ⚠️ 死代码：消费的是本模块的 ``_deferred_export_jobs``（无人 append），
-        实际延后列表在 room_handler 内（由持续分析写入，经其 _flush_deferred_exports
-        消费）。保留仅为兼容旧调用方；若需统一延后导出请接线 room_handler 的列表。
-        """
-        if not _deferred_export_jobs:
-            return 0
-        pressure = get_resource_pressure()
-        if not force and (
-            pressure.get('pause_analysis')
-            or pressure.get('level') == 'critical'
-        ):
-            return 0
-        jobs = list(_deferred_export_jobs)
-        _deferred_export_jobs.clear()
-        flushed = 0
-        for job in jobs:
-            result = await queue_export(
-                job['room_id'], job['start'], job['end'],
-                label=job['label'], preset_id=job.get('preset_id', ''),
-                source='ai_highlight', job_id=job['job_id'],
-            )
-            if result.get('success'):
-                flushed += 1
-                bridge.queue_broadcast({
-                    'type': 'clip_export_started',
-                    'data': {
-                        'clip_id': job.get('clip_id'),
-                        'job_id': job['job_id'],
-                        'room_id': job['room_id'],
-                    },
-                })
-                _log.info("延后导出入队: room=%s, job_id=%s", job['room_id'], job['job_id'])
-            else:
-                _deferred_export_jobs.append(job)
-                _log.warning("延后导出入队失败: %s", result.get('error'))
-        return flushed
-
-    # 将 flush_deferred_exports 挂到模块级供 analysis_handlers 使用
-    global _flush_deferred_exports_fn
-    _flush_deferred_exports_fn = flush_deferred_exports
-
     # ── WebSocket handlers ──────────────────────────────────────────
 
     @server.on('export_clip')
@@ -788,12 +757,14 @@ def register_export_handlers(
                 with _export_jobs_lock:
                     export_jobs.pop(job_id, None)
                 _set_export_job_state(job_id, 'cancelled', error='导出已取消')
+                await server.broadcast('export_cancelled', {'job_id': job_id})
                 _log.info("导出已取消: job_id=%s", job_id)
                 return {'success': True}
             return {'success': False, 'error': 'job not found'}
 
         _export_cancelled_jobs.add(job_id)
         _set_export_job_state(job_id, 'cancelled', error='导出已取消')
+        await server.broadcast('export_cancelled', {'job_id': job_id})
         _log.info("取消导出(排队中): job_id=%s", job_id)
         return {'success': True, 'note': 'queued job marked as cancelled'}
 
@@ -814,15 +785,6 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
-# 模块级引用：flush_deferred_exports（由 register 设置）
-_flush_deferred_exports_fn = None
-
-
 def get_queue_export():
     """获取 queue_export 函数引用（供 timeline_handlers / analysis_handlers 使用）。"""
     return _queue_export_fn
-
-
-def get_flush_deferred_exports():
-    """获取 flush_deferred_exports 函数引用（供 analysis_handlers 使用）。"""
-    return _flush_deferred_exports_fn
