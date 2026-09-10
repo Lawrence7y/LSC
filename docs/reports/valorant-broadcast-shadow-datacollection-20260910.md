@@ -110,7 +110,7 @@ item["start_confidence"] = 0.95 if item["start_delta"] is not None else 0.70
 → **R3 结论（`precise` 无独立精度证据）依然成立，但机制描述需更正**；
 → **A4 的正确落点是 `valorant_broadcast.py:519`**（把二值代理换成实测值），而非原写的 `valorant_ocr_rounds.py:873`。
 
-### 4.3 🔴（新，未修）收尾改名不幂等 → 每次退出多一份完整录像副本
+### 4.3 ✅（已修 `8ba9a67`）收尾改名不幂等 → 每次退出多一份完整录像副本
 
 录制目录中出现**逐字节相同**（md5 一致、NTFS File ID 各异、硬链接数 1）的重复录像：
 
@@ -125,7 +125,22 @@ item["start_confidence"] = 0.95 if item["start_delta"] is not None else 0.70
 - **连带风险**：sidecar 命名分裂——录像已改名为 `..._至_..._18-29-22.mp4`，但分析 sidecar 仍是 `2026-09-10_18-05-24_录制中.analysis.json`，而 `.finalization.json` 只有最后一个副本有对应项。这会威胁 `docs/spec-jianying-draft-export.md` 要求的 `recording_id + round_key + sidecar` 三重校验。
 - 另有 `2026-09-10_00-41-10_录制中.mp4` **始终未改名**（未收尾的孤儿录像）。
 
-**建议**：列为 P1 单独立项（收尾/改名幂等性），修前不要依赖"一个会话一个 mp4"这一假设。
+**已修复（`8ba9a67`）**——根因与修法：
+
+- **根因**：`orchestrator._finalize_and_commit_recording` 固定重试 3 次、每轮取
+  `datetime.now()` 作结束时刻（故 3 个不同文件名）；`recording_layout.finalize_recording_file`
+  原先直接用 `shutil.move`——源被占用时 `os.rename` 抛错 → 回退 `copy2`（成功）+
+  `unlink`（失败）→ 抛异常，**而已复制出来的目标留在磁盘**。每重试一次多一份，正好 3 份。
+  占用者不是录制 FFmpeg（已被 `proc.wait` 等退），而是退出时仍在读录像的**并发分析/ffprobe**
+  ——这也解释了它只在退出时复现。
+- **验证**：对照实验在"源被占用 + 重试 3 次"下，旧实现留 **3 份**（文件名与磁盘实测的
+  `18-29-20/21/22` **完全一致**），新实现留 **0 份**。
+- **修法**：① `finalize_recording_file` 改用 `os.replace`（原子改名），仅在确属跨盘
+  （EXDEV）时才复制+删源且删源失败须回滚目标，其余错误直接上抛——**源被占用时绝不复制**；
+  ② 调用方重试改为幂等（源消失即复用，不再改名）+ 有界 5s 等待窗口 + 超时保留原「录制中」
+  名并告警（宁可没改名也不留副本）。
+- **遗留**：sidecar 命名分裂（分析 sidecar 仍叫 `_录制中`）**未在本次修复范围内**，
+  仍会威胁剪映导出的三重校验——见上文「连带风险」。
 
 ### 4.4 ⚠️ broadcast 档分析滞后
 
