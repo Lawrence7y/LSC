@@ -26,6 +26,9 @@ from lsc.analyzer.ocr_accel import (
 _log = logging.getLogger(__name__)
 
 _CLASS_NAMES = ("non_game", "buy", "combat", "result", "replay")
+# B5：不参与顶部 HUD 融合的类别。回放水印在画面底部，顶部裁剪看不到它，
+# 融合权重会系统性压低该类置信度（详见 predict_broadcast_batch 文档）。
+_FUSION_BYPASS_CLASSES: tuple[str, ...] = ("replay",)
 _DEFAULT_DIR = Path(
     os.environ.get("LSC_VALORANT_MODEL_DIR", "")
     or (Path(__file__).resolve().parent / "models")
@@ -258,7 +261,14 @@ class ValorantFrameClassifier:
         return probs
 
     def predict_broadcast_batch(self, frames_bgr: list[np.ndarray]) -> np.ndarray:
-        """Fuse full-frame and top-HUD predictions for configured broadcast models."""
+        """Fuse full-frame and top-HUD predictions for configured broadcast models.
+
+        ``replay`` 例外（B5）：回放水印位于画面**底部**，而融合的第二路只看顶部 34%
+        HUD 区域、看不到水印，其权重会把整帧的高置信度回放判定拉到阈值以下
+        （2026-09-10 实测：整帧 0.96–0.99 被拉到 0.58–0.75，而阈值为 0.77，导致
+        72 帧水印确证回放全部漏检）。故 ``_FUSION_BYPASS_CLASSES`` 中的类别不参与
+        顶部融合、直接采用整帧概率，再重新归一化以维持"概率行"契约。
+        """
         self.load()
         if not frames_bgr:
             return np.zeros((0, len(_CLASS_NAMES)), dtype=np.float32)
@@ -280,7 +290,29 @@ class ValorantFrameClassifier:
         full_probs = self.predict_batch(frames_bgr, _record_telemetry=False)
         top_probs = self.predict_batch(top_frames, _record_telemetry=False)
         self._record_inference(len(frames_bgr), time.perf_counter() - started)
-        return (full_probs * full_weight + top_probs * top_weight).astype(np.float32)
+        fused = (full_probs * full_weight + top_probs * top_weight).astype(np.float32)
+        bypass = [
+            _CLASS_NAMES.index(name)
+            for name in _FUSION_BYPASS_CLASSES
+            if name in _CLASS_NAMES
+        ]
+        if bypass:
+            for index in bypass:
+                fused[:, index] = full_probs[:, index]
+            # 条件归一化：**保持被豁免类别（replay）的取值不变**，把其余类别按比例
+            # 缩放到行和为 1。若改用"整行除以总和"，会把刚抬上来的 replay 值又压回
+            # 阈值下（实测 0.77 下检出会从 12/72 掉到 6/72），等于白改。
+            bypass_total = fused[:, bypass].sum(axis=1, keepdims=True)
+            other = np.delete(fused, bypass, axis=1)
+            other_total = other.sum(axis=1, keepdims=True)
+            scale = np.clip((1.0 - bypass_total) / np.clip(other_total, 1e-6, None), 0.0, None)
+            for index in range(len(_CLASS_NAMES)):
+                if index not in bypass:
+                    fused[:, index] = fused[:, index] * scale[:, 0]
+            # 极端情形（豁免类之和已 ≥1）下兜底再归一，仍保证"概率行"契约
+            row_total = fused.sum(axis=1, keepdims=True)
+            fused = (fused / np.clip(row_total, 1e-6, None)).astype(np.float32)
+        return fused
 
     def _preprocess_batch(self, frames_bgr: list[np.ndarray]) -> np.ndarray:
         import cv2
