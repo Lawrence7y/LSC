@@ -385,3 +385,72 @@ def test_shutdown_idempotent_after_start():
         assert o.shutdown(timeout_sec=5.0) == {}
     finally:
         o.shutdown(timeout_sec=5.0)
+
+
+# ── P1 回归守卫（2026-09-10）：停录定稿改名不得累积副本 ──────────────────
+
+
+def test_finalize_and_commit_recording_is_idempotent(tmp_path):
+    """同一路径重复调用不得产出第二份录像（重试/重复停录都要安全）。
+
+    历史缺陷：finalize 在源被并发读者占用时会「复制成功但删源失败」，而调用方固定
+    重试 3 次且每次取 datetime.now() 作结束时刻 → 一次退出留下多份完整副本。
+    """
+    from datetime import datetime
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    o = _bare_orchestrator()
+    src = tmp_path / "2026-09-10_18-05-24_录制中.mp4"
+    src.write_bytes(b"video-bytes")
+    room = SimpleNamespace(
+        room_id="r-p1",
+        record_output_path="",
+        controller=None,
+        record_started_at=datetime(2026, 9, 10, 18, 5, 24),
+        output_bundle_dir="",
+    )
+
+    first = o._finalize_and_commit_recording(room, str(src))
+    assert Path(first).is_file()
+    assert not src.exists(), "定稿后源「录制中」文件必须消失"
+
+    # 第二次以同一（已消失的）路径调用：必须幂等，不得再改名复制出第二份
+    second = o._finalize_and_commit_recording(room, str(src))
+    assert second == first
+    mp4s = sorted(p.name for p in tmp_path.glob("*.mp4"))
+    assert len(mp4s) == 1, f"必须只留一份定稿文件，实际: {mp4s}"
+
+
+def test_finalize_and_commit_recording_keeps_source_on_persistent_busy(tmp_path, monkeypatch):
+    """源长时间被占用：保留「录制中」名并告警，绝不复制出副本。"""
+    from datetime import datetime
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import lsc.core.recording_layout as layout
+    import lsc.core.orchestrator as orch_mod
+
+    # 不真的等 5s
+    monkeypatch.setattr(orch_mod, "_FINALIZE_LAYOUT_TIMEOUT_SEC", 0.0)
+
+    def _busy(*_a, **_k):
+        raise PermissionError("busy (simulated)")
+
+    monkeypatch.setattr(layout.os, "replace", _busy)
+
+    o = _bare_orchestrator()
+    src = tmp_path / "2026-09-10_18-05-24_录制中.mp4"
+    src.write_bytes(b"video-bytes")
+    room = SimpleNamespace(
+        room_id="r-p1-busy",
+        record_output_path="",
+        controller=None,
+        record_started_at=datetime(2026, 9, 10, 18, 5, 24),
+        output_bundle_dir="",
+    )
+
+    result = o._finalize_and_commit_recording(room, str(src))
+    assert result == str(src), "改名失败时保留原路径"
+    assert src.is_file(), "源文件必须完好保留（不能丢数据）"
+    assert list(tmp_path.glob("*_至_*.mp4")) == [], "不得复制出副本"

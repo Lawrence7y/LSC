@@ -6,11 +6,14 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 from datetime import datetime
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 _ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _IN_PROGRESS_SUFFIX = "_录制中.mp4"
@@ -164,6 +167,16 @@ def recording_dest_dir(room: Any, base_dir: str) -> str:
     return dest
 
 
+def _is_cross_device(exc: OSError) -> bool:
+    """判断 OSError 是否为「跨盘」错误（只有这种情况才必须复制+删源）。"""
+    import errno
+
+    if exc.errno == errno.EXDEV:
+        return True
+    # Windows: ERROR_NOT_SAME_DEVICE
+    return getattr(exc, "winerror", None) == 17
+
+
 def finalize_recording_file(
     source_path: str,
     *,
@@ -171,6 +184,20 @@ def finalize_recording_file(
     ended_at: datetime,
     dest_dir: str,
 ) -> str:
+    """把「录制中」文件改名为「起_至_止」定稿名。
+
+    ⚠️ 幂等性契约（P1 修复）：**源被占用时绝不回退为复制**。
+    原实现直接用 ``shutil.move``：Windows 上若源被其他进程占用（录制 FFmpeg 尚未
+    释放句柄，或并发分析/预览正读该录像），``os.rename`` 抛 ``PermissionError`` →
+    ``shutil`` 回退 ``copy2``（复制成功）+ ``unlink``（源仍被占用→失败）→ 抛异常。
+    调用方 ``orchestrator._finalize_and_commit_recording`` 有 3 次重试，且每次都取
+    ``datetime.now()`` 作结束时刻（名字各不相同），于是**每重试一次就多留下一份完整
+    副本**——实测一次退出留下 3 份 1045MB 的同内容录像。故此处改为：
+
+    1. 优先 ``os.replace``（原子改名；同盘不会在失败时留下任何副本）；
+    2. 仅在**确属跨盘**时才复制+删源，且删源失败必须回滚已复制的目标；
+    3. 其余 OSError（源被占用等）直接抛出，交由调用方在句柄释放后重试。
+    """
     if not source_path:
         return source_path
     os.makedirs(dest_dir, exist_ok=True)
@@ -181,5 +208,21 @@ def finalize_recording_file(
         return dest
     if not os.path.isfile(source_path):
         return source_path
-    shutil.move(source_path, dest)
+    try:
+        os.replace(source_path, dest)
+        return dest
+    except OSError as exc:
+        if not _is_cross_device(exc):
+            raise
+    # 跨盘：只能复制 + 删源。
+    shutil.copy2(source_path, dest)
+    try:
+        os.unlink(source_path)
+    except OSError:
+        # 删源失败必须回滚目标，否则调用方重试会累积出多份完整副本。
+        try:
+            os.unlink(dest)
+        except OSError as cleanup_exc:  # noqa: BLE001
+            _log.warning("回滚未完成的定稿副本失败 path=%s: %s", dest, cleanup_exc)
+        raise
     return dest

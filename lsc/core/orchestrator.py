@@ -115,6 +115,11 @@ _RECONNECT_DELAY_SEC = 2.0  # Base delay for exponential backoff
 _RECONNECT_MAX_DELAY_SEC = 30.0  # Maximum delay between attempts
 _RECONNECT_BACKOFF_FACTOR = 2.0  # Exponential backoff multiplier
 
+# 停录定稿改名的有界等待窗口。改名可能被并发读者（收尾分析 / ffprobe 探测）短暂挡住
+# 文件句柄；给足时间等其释放，但绝不无限等——超时保留「录制中」名并告警，不复制文件
+# （见 _finalize_and_commit_recording 与 recording_layout.finalize_recording_file）。
+_FINALIZE_LAYOUT_TIMEOUT_SEC = 5.0
+
 # 流 URL 主动刷新阈值：过期前 60 秒主动刷新（与 registry 一致）
 _STREAM_URL_REFRESH_THRESHOLD_SEC = 60
 # 连接成功后房间级流缓存复用窗口：预览/录制启动时跳过重复 HTTP 解析
@@ -2854,11 +2859,28 @@ class RoomOrchestrator:
         return "", 0.0, str(result_error)
 
     def _finalize_and_commit_recording(self, room: RoomSession, output_path: str) -> str:
-        """停录后把「录制中」改名为时间至时间，若已对齐则搬进组合目录。"""
+        """停录后把「录制中」改名为时间至时间，若已对齐则搬进组合目录。
+
+        ⚠️ 幂等性契约（P1 修复）：重试**不得累积副本**。
+        原实现固定重试 3 次、每次间隔 0.15s，且每次都取 ``datetime.now()`` 作结束
+        时刻；配合 ``finalize_recording_file`` 当时会在源被占用时"复制成功但删源
+        失败"，每重试一次就多留一份完整录像副本（实测一次退出留 3 份 1045MB）。
+        现在改为：源文件消失即视为已定稿并直接复用（幂等），并给出更长的有界等待
+        窗口等并发读者（收尾分析/ffprobe）释放句柄；仍未成功则保留原「录制中」名
+        并告警——宁可"没改名"也绝不留下重复副本。
+        """
         if not output_path:
             return ""
         last_error: OSError | None = None
-        for _attempt in range(3):
+        deadline = time.monotonic() + _FINALIZE_LAYOUT_TIMEOUT_SEC
+        while True:
+            if not os.path.isfile(output_path):
+                # 源已不在：上一轮改名已成功（或文件被外部移走）。此时不得再改名，
+                # 否则会以新的结束时刻复制出第二份副本。
+                committed = str(getattr(room, "record_output_path", "") or "")
+                if committed and committed != output_path and os.path.isfile(committed):
+                    return committed
+                return output_path
             try:
                 new_path = finalize_room_recording(room, output_path)
                 room.record_output_path = new_path
@@ -2868,7 +2890,9 @@ class RoomOrchestrator:
                 return new_path
             except OSError as exc:
                 last_error = exc
-                time.sleep(0.15)
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.2)
         _log.warning(
             "finalize recording layout failed (file may be busy) room=%s path=%s: %s",
             room.room_id,
