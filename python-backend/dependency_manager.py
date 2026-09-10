@@ -164,8 +164,7 @@ def _emit_error(phase: str, message: str) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 # 核心依赖（必须安装）
-# 注：PySide6 已移除——recording_controller/common_workers 通过
-# lsc.gui.qt_compat 标准库兼容层运行（见 requirements.txt 注释）。
+# 注：PySide6 已移除；原 Qt 前端组件（lsc/gui/）已删除，核心依赖不需要 Qt。
 _CORE_DEPS = [
     ("numpy", "numpy"),
     ("websockets", "websockets"),

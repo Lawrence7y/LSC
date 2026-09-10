@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 from handlers import room_handler
 
-from lsc.gui.multi_room.session import RoomSession
+from lsc.core.session import RoomSession
 
 ROOT = Path(__file__).resolve().parents[1]
 

@@ -53,7 +53,7 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
     *   `recorder/`：FFmpeg 录制控制与文件有效性验证。
     *   `exporter/`：FFmpeg 切片剪辑与直拷/转码导出。
     *   `editor/audio_aligner.py`：基于音频信号互相关的对齐补偿模块。
-    *   `core/orchestrator.py`：`RoomOrchestrator` 纯 Python 编排核心（运行在独立编排线程；`gui/multi_room/manager.py` 为迁移前遗留）。
+    *   `core/orchestrator.py`：`RoomOrchestrator` 纯 Python 编排核心（运行在独立编排线程）。
 *   `lsc-electron/`：前端桌面包。
     *   `electron/main.ts`：Electron 主进程，控制窗口、系统托盘、自动启动、Python 进程检测与生命周期保护。
     *   `src/store/appStore.ts`：基于 Zustand 的全局前端状态管理。
@@ -298,7 +298,8 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 ### 7.1 原生桌面预览 (libmpv) — ⚠️ 已弃用
 
 > [!CAUTION]
-> PySide6 GUI 已弃用，Electron 为唯一前端。以下保留供历史参考，不再维护。
+> PySide6 GUI 已弃用，Electron 为唯一前端。原 `lsc/gui/` Qt 组件（MultiRoomManager /
+> RecordingController / 兼容层）已于 2026-09-10 删除。以下保留供历史参考。
 
 针对 Python 原生 GUI 启动方式，曾采用 `python-mpv` 调用本地 `libmpv`，将其渲染句柄嵌入到 PySide6 的 `MpvWidget` 中。该方案具备极低延迟与对硬件解码的完美支持，但现已弃用。
 
@@ -804,7 +805,7 @@ Electron 应用使用 `electron-builder` 进行打包：
 
 *   **安装包内容**：仅包含 Electron 壳 + Python 嵌入版（~15MB）+ lsc/python-backend/scripts 源码
 *   **运行时下载**：首次启动时通过 `dependency_manager.py` 检测并安装缺失依赖：
-    1.  Python 核心依赖（PySide6、numpy、websockets、psutil）— 约 700MB
+    1.  Python 核心依赖（numpy、websockets、psutil）— 约 700MB
     2.  AI 分析依赖（torch、faster-whisper、rapidocr 等）— 约 800MB
     3.  FFmpeg + FFprobe — 约 170MB
 *   **下载流程**：

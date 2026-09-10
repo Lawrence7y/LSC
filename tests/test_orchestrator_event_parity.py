@@ -1,11 +1,14 @@
-"""Event parity between RoomOrchestrator (EventBus) and MultiRoomManager (Qt Signals)."""
+"""RoomOrchestrator (EventBus) 事件序列守卫。
+
+历史背景：本文件原含 RoomOrchestrator 与 MultiRoomManager(Qt Signals) 的事件
+一致性对比测试。PySide6 原生 GUI 已弃用并移除，一致性基线不复存在，故仅保留
+对编排器自身事件序列的守卫。
+"""
 from __future__ import annotations
 
 import threading
 import time
 from collections.abc import Callable
-
-import pytest
 
 from lsc.config import LscConfig
 from lsc.platforms.base import StreamInfo
@@ -145,51 +148,6 @@ def _run_orchestrator_scenario(monkeypatch, tmp_path) -> EventCollector:
     return collector
 
 
-def _run_manager_scenario(monkeypatch, tmp_path, qtbot) -> EventCollector:
-    pytest.importorskip("PySide6")
-
-    from lsc.gui.multi_room.manager import MultiRoomManager
-
-    _patch_parse(monkeypatch, "lsc.gui.multi_room.manager")
-    _patch_parse(monkeypatch, "lsc.core.orchestrator")
-    _patch_recording_config(monkeypatch, "lsc.gui.multi_room.manager")
-    _patch_recording_config(monkeypatch, "lsc.core.orchestrator")
-    monkeypatch.setattr("lsc.gui.multi_room.manager.MultiRoomManager.save_rooms", lambda self: 0)
-    monkeypatch.setattr("lsc.core.orchestrator.RoomOrchestrator.save_rooms", lambda self: 0)
-
-    collector = EventCollector()
-    manager = MultiRoomManager(controller_factory=FakeController)
-
-    for signal_name in TRACKED_EVENTS:
-        signal = getattr(manager, signal_name)
-
-        def _handler(*args, _name=signal_name):
-            collector.record(_name, *args)
-
-        signal.connect(_handler)
-
-    room = manager.add_room(ROOM_URL)
-    assert room is not None
-
-    with qtbot.waitSignal(manager.room_connect_finished, timeout=5000) as blocker:
-        assert manager.connect_room(room.room_id, async_mode=True) is True
-    assert blocker.args == [room.room_id, True, ""]
-
-    assert manager.start_recording(room.room_id, str(tmp_path), "Copy", 23) is True
-    assert manager.stop_recording(room.room_id) is True
-
-    for _ in range(TICK_COUNT):
-        manager._on_global_tick()
-
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication.instance()
-    if app is not None:
-        app.processEvents()
-
-    return collector
-
-
 def _tick_signature(collector: EventCollector) -> dict[str, int]:
     counts = collector.counts()
     return {name: counts.get(name, 0) for name in ("global_tick", "medium_tick", "low_tick")}
@@ -208,25 +166,3 @@ def test_orchestrator_event_sequence(monkeypatch, tmp_path) -> None:
     assert ticks["global_tick"] == TICK_COUNT
     assert ticks["medium_tick"] == TICK_COUNT
     assert ticks["low_tick"] == 1
-
-
-def test_manager_orchestrator_event_parity(monkeypatch, tmp_path, qtbot) -> None:
-    pytest.importorskip("PySide6")
-
-    orch_collector = _run_orchestrator_scenario(monkeypatch, tmp_path)
-    mgr_collector = _run_manager_scenario(monkeypatch, tmp_path, qtbot)
-
-    orch_connect = [
-        args for name, args in orch_collector.events if name == "room_connect_finished"
-    ]
-    mgr_connect = [
-        args for name, args in mgr_collector.events if name == "room_connect_finished"
-    ]
-    assert len(orch_connect) == 1
-    assert len(mgr_connect) == 1
-    assert orch_connect[0][1:] == mgr_connect[0][1:]
-
-    assert _tick_signature(orch_collector) == _tick_signature(mgr_collector)
-
-    assert orch_collector.counts().get("recording_stopped", 0) == 0
-    assert mgr_collector.counts().get("recording_stopped", 0) == 0

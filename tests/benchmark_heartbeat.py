@@ -11,13 +11,15 @@ def benchmark_heartbeat_iterations(num_rooms=12, num_ticks=100):
     """Benchmark heartbeat iterations with simulated rooms."""
     from unittest.mock import MagicMock
 
-    from lsc.gui.multi_room.manager import MultiRoomManager, RoomSession
+    from lsc.core.orchestrator import RoomOrchestrator
+    from lsc.core.session import RoomSession
 
-    # Create manager without Qt app
-    manager = MultiRoomManager(
+    # Create orchestrator without Qt app
+    orch = RoomOrchestrator(
         controller_factory=lambda: MagicMock(),
         preview_factory=lambda: MagicMock(),
     )
+    orch.start()
 
     # Add simulated rooms
     rooms = []
@@ -25,38 +27,40 @@ def benchmark_heartbeat_iterations(num_rooms=12, num_ticks=100):
         room = RoomSession(
             room_id=f"room_{i}",
             room_url=f"https://example.com/room_{i}",
-            controller=MagicMock(),
-            preview_widget=None,
         )
+        room.controller = MagicMock()
         room.is_recording = (i % 3 == 0)  # Every 3rd room is recording
         room.preview_enabled = (i % 2 == 0)  # Every 2nd room has preview
-        manager._rooms[room.room_id] = room
+        orch._rooms[room.room_id] = room
         rooms.append(room)
 
-    # Benchmark high-frequency operations only
-    start = time.perf_counter()
-    for _ in range(num_ticks):
-        manager._tick_counter += 1
-        for room in rooms:
-            if room.is_recording:
-                room.controller.tick()
-    high_freq_only_time = time.perf_counter() - start
+    try:
+        # Benchmark high-frequency operations only
+        start = time.perf_counter()
+        for _ in range(num_ticks):
+            orch._tick_counter += 1
+            for room in rooms:
+                if room.is_recording:
+                    room.controller.tick()
+        high_freq_only_time = time.perf_counter() - start
 
-    # Benchmark full tick (old behavior)
-    start = time.perf_counter()
-    for _ in range(num_ticks):
-        for room in rooms:
-            if room.is_recording:
-                room.controller.tick()
-            if room.is_recording and room.record_output_path:
-                pass  # Simulate file size check
-            if room.preview_enabled and not room.preview_paused:
-                pass  # Simulate position sync
-            if room.is_recording:
-                room.controller.watchdog_check()
-            if room.is_recording:
-                pass  # Simulate disk check
-    full_tick_time = time.perf_counter() - start
+        # Benchmark full tick (old behavior)
+        start = time.perf_counter()
+        for _ in range(num_ticks):
+            for room in rooms:
+                if room.is_recording:
+                    room.controller.tick()
+                if room.is_recording and room.record_output_path:
+                    pass  # Simulate file size check
+                if room.preview_enabled and not room.preview_paused:
+                    pass  # Simulate position sync
+                if room.is_recording:
+                    room.controller.watchdog_check()
+                if room.is_recording:
+                    pass  # Simulate disk check
+        full_tick_time = time.perf_counter() - start
+    finally:
+        orch.shutdown(timeout_sec=3.0)
 
     return {
         "num_rooms": num_rooms,

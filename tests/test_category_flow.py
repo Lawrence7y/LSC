@@ -10,7 +10,7 @@ if _python_backend not in sys.path:
     sys.path.insert(0, _python_backend)
 
 
-from lsc.gui.multi_room.session import RoomSession
+from lsc.core.session import RoomSession
 from lsc.platforms.base import BasePlatformAdapter, StreamInfo
 
 

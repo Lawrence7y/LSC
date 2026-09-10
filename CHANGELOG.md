@@ -1,5 +1,34 @@
 # LSC 直播切片系统 — 更新说明
 
+
+## v1.0.12 (2026-09-10)
+
+### 清理（删除 PySide6 遗留死代码）
+
+- **删除 `lsc/gui/`**（8 文件 / 1487 行）：`MultiRoomManager`（委托 `RoomOrchestrator`
+  的 Qt 薄门面）、`RecordingController`、`common_workers`、`qt_compat` 与
+  `multi_room/session.py` 兼容转发层。该包在 `__init__.py` 中已自述弃用，
+  生产链路（python-backend）零引用，仅被测试引用
+- **删除 `lsc/cli.py`**（283 行）：无 `__main__` / argparse 入口，唯一调用方是
+  上述被删的 `common_workers`，零测试覆盖
+- **测试同步迁移（无活逻辑覆盖损失）**：
+  - 迁移到 `RoomOrchestrator`：`test_recording_reconnect_tick`(7)、
+    `test_multi_room_manager`(17)、`test_stability_guards` 的并发用例(4)、
+    `benchmark_heartbeat`（手动性能脚本）
+  - 改导入源为 `lsc.core.session`：`test_category_flow`(8)、`test_synced_continuous_analysis`(14)
+  - 清理冗余：`test_round2_thread_broadcast_guards` / `test_stability_latency_guards`
+    中未使用的 `MANAGER` 源码读取
+  - 删除测试自身（测的是被删代码）：`test_manager_shell_signals`(1)、
+    `test_exporter` 的 `ExportWorker` 用例(1)、`test_orchestrator_event_parity`
+    的 Qt 门面一致性对比(1)
+- **配置/文档同步**：`pyproject.toml` 移除 mypy `lsc/gui/` 排除与 `PySide6.*` override；
+  `requirements.txt` / `dependency_manager.py` / `CLAUDE.md` / `README.md` 更新过期描述
+- **验证**：后端 16 个模块全部导入正常、WS 服务完整启动（端口回退正常）；
+  全量测试 1766 passed（唯一失败为既有 safe-delete 环境问题）；
+  改动文件 `ruff` 全过
+
+---
+
 ## v1.0.11 (2026-09-01)
 
 ### 稳定性

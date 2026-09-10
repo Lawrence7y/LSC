@@ -8,7 +8,6 @@ ROOM_HANDLER = (ROOT / "python-backend" / "handlers" / "room_handler.py").read_t
 ALIGN_HANDLER = (ROOT / "python-backend" / "handlers" / "alignment_handlers.py").read_text(encoding="utf-8")
 EXPORT_HANDLER = (ROOT / "python-backend" / "handlers" / "export_handlers.py").read_text(encoding="utf-8")
 TIMELINE_HANDLERS = (ROOT / "python-backend" / "handlers" / "timeline_handlers.py").read_text(encoding="utf-8")
-MANAGER = (ROOT / "lsc" / "gui" / "multi_room" / "manager.py").read_text(encoding="utf-8")
 RECORDING_SERVICE = (ROOT / "lsc" / "core" / "services" / "recording_service.py").read_text(encoding="utf-8")
 MSE_STREAMER = (ROOT / "lsc" / "core" / "services" / "mse_streamer.py").read_text(encoding="utf-8")
 SHARED_INGEST = (ROOT / "lsc" / "core" / "services" / "shared_ingest.py").read_text(encoding="utf-8")
@@ -167,3 +166,16 @@ def test_server_websocket_max_size_accommodates_align_payload() -> None:
     assert "max_size=16 * 1024 * 1024" in serve_body
     # legacy websockets 无 close_on_message_too_big 参数，误加会在运行时抛 TypeError
     assert "close_on_message_too_big" not in serve_body
+
+
+def test_mse_streamer_low_latency_encode_flags():
+    """预览低延迟编码/mux 守卫。
+
+    - NVENC 路径已有 `-tune ll`；
+    - CPU 回退路径（libx264）必须有 `-tune zerolatency`，否则软编预览会明显
+      落后直播（禁用 B 帧与 lookahead 是软编低延迟的关键）；
+    - `-flush_packets 1` 让 muxer 分片生成后立即写出管道，不再内部缓冲。
+    """
+    assert '"-tune", "ll"' in MSE_STREAMER
+    assert '"-tune", "zerolatency"' in MSE_STREAMER
+    assert '"-flush_packets", "1"' in MSE_STREAMER

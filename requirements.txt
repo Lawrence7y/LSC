@@ -3,9 +3,8 @@
 # Install with:  pip install -r requirements.txt
 # For development/testing:  pip install -r requirements.txt pytest
 
-# 注：PySide6 已移除。历史遗留组件 lsc/gui/pages/recording_controller.py 与
-# lsc/gui/common_workers.py 顶部通过 try/except 切换 lsc.gui.qt_compat
-# 标准库兼容层（QThread/QTimer/Signal），无 Qt 环境（Store/内置包）亦可运行。
+# 注：PySide6 已移除，且历史遗留的 Qt 前端组件（原 lsc/gui/）已于 2026-09-10 删除。
+# Electron 为唯一前端，后端为纯 Python，不需要任何 Qt 运行时。
 
 # Python WebSocket backend (Electron version)
 websockets>=12.0

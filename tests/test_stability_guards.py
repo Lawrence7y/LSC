@@ -2,7 +2,7 @@
 
 覆盖：
 1. persistence.py 房间配置备份/恢复机制
-2. MultiRoomManager _rooms 并发访问安全
+2. RoomOrchestrator _rooms 并发访问安全
 3. SharedRoomIngest stderr 线程清理（防内存泄漏）
 4. StreamCapture 孤儿进程标志位
 """
@@ -21,7 +21,7 @@ if _python_backend not in sys.path:
 
 from persistence import load_rooms, save_rooms
 
-from lsc.gui.multi_room.manager import MultiRoomManager
+from lsc.core.orchestrator import RoomOrchestrator
 
 
 class TestRoomsBackupRecovery:
@@ -60,84 +60,102 @@ class TestRoomsBackupRecovery:
         assert load_rooms(path=tmp_path / "nonexistent.json") == []
 
 
-class TestManagerRoomsConcurrency:
-    """MultiRoomManager._rooms 并发读写不应崩溃或丢数据。"""
+class TestOrchestratorRoomsConcurrency:
+    """RoomOrchestrator._rooms 并发读写不应崩溃或丢数据。"""
 
-    def test_manager_has_lock(self):
-        manager = MultiRoomManager(controller_factory=lambda: SimpleNamespace())
-        assert hasattr(manager, "_lock")
+    @staticmethod
+    def _start() -> RoomOrchestrator:
+        orch = RoomOrchestrator(controller_factory=lambda: SimpleNamespace())
+        orch.start()
+        return orch
+
+    def test_orchestrator_has_lock(self):
+        orch = self._start()
+        try:
+            assert hasattr(orch, "_lock")
+        finally:
+            orch.shutdown(timeout_sec=3.0)
 
     def test_concurrent_add_and_list_rooms(self):
-        manager = MultiRoomManager(controller_factory=lambda: SimpleNamespace())
-        errors: list[Exception] = []
+        orch = self._start()
+        try:
+            errors: list[Exception] = []
 
-        def _add(idx: int):
-            try:
-                manager.add_room(f"https://example.com/live-{idx}.m3u8")
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
+            def _add(idx: int):
+                try:
+                    orch.add_room(f"https://example.com/live-{idx}.m3u8")
+                except Exception as exc:  # pragma: no cover
+                    errors.append(exc)
 
-        def _list():
-            try:
-                for _ in range(50):
-                    manager.list_rooms()
-                    manager.room_count()
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
+            def _list():
+                try:
+                    for _ in range(50):
+                        orch.list_rooms()
+                        orch.room_count()
+                except Exception as exc:  # pragma: no cover
+                    errors.append(exc)
 
-        threads = [threading.Thread(target=_add, args=(i,)) for i in range(8)]
-        threads += [threading.Thread(target=_list) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
+            threads = [threading.Thread(target=_add, args=(i,)) for i in range(8)]
+            threads += [threading.Thread(target=_list) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
 
-        assert not errors
-        assert manager.room_count() == 8
+            assert not errors
+            assert orch.room_count() == 8
+        finally:
+            orch.shutdown(timeout_sec=3.0)
 
     def test_add_room_respects_max_rooms_under_concurrency(self):
-        manager = MultiRoomManager(controller_factory=lambda: SimpleNamespace())
-        results: list[object] = []
-        lock = threading.Lock()
+        orch = self._start()
+        try:
+            results: list[object] = []
+            lock = threading.Lock()
 
-        def _add(idx: int):
-            room = manager.add_room(f"https://example.com/live-{idx}.m3u8")
-            with lock:
-                results.append(room)
+            def _add(idx: int):
+                room = orch.add_room(f"https://example.com/live-{idx}.m3u8")
+                with lock:
+                    results.append(room)
 
-        threads = [threading.Thread(target=_add, args=(i,)) for i in range(20)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
+            threads = [threading.Thread(target=_add, args=(i,)) for i in range(20)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
 
-        added = [r for r in results if r is not None]
-        # MAX_ROOMS=12：并发加房也不应突破上限
-        assert len(added) <= 12
-        assert manager.room_count() == len(added)
+            added = [r for r in results if r is not None]
+            # MAX_ROOMS=12：并发加房也不应突破上限
+            assert len(added) <= 12
+            assert orch.room_count() == len(added)
+        finally:
+            orch.shutdown(timeout_sec=3.0)
 
     def test_remove_room_thread_safe(self):
-        manager = MultiRoomManager(controller_factory=lambda: SimpleNamespace())
-        room = manager.add_room("https://example.com/live.m3u8")
-        assert room is not None
+        orch = self._start()
+        try:
+            room = orch.add_room("https://example.com/live.m3u8")
+            assert room is not None
 
-        results: list[bool] = []
-        lock = threading.Lock()
+            results: list[bool] = []
+            lock = threading.Lock()
 
-        def _remove():
-            ok = manager.remove_room(room.room_id)
-            with lock:
-                results.append(ok)
+            def _remove():
+                ok = orch.remove_room(room.room_id)
+                with lock:
+                    results.append(ok)
 
-        threads = [threading.Thread(target=_remove) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
+            threads = [threading.Thread(target=_remove) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
 
-        # 只有一个线程能成功移除（pop 原子性）
-        assert results.count(True) == 1
-        assert manager.room_count() == 0
+            # 只有一个线程能成功移除（pop 原子性）
+            assert results.count(True) == 1
+            assert orch.room_count() == 0
+        finally:
+            orch.shutdown(timeout_sec=3.0)
 
 
 class TestSharedIngestStderrThreadCleanup:

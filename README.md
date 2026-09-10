@@ -244,8 +244,7 @@ cd lsc-electron && npx tsc --noEmit   # TypeScript 类型检查
 │   ├── core/services/         # 录制 / 导出 / MSE / 共享进样 / 时间线
 │   ├── platforms/             # 平台适配器（Protocol + Registry）
 │   ├── recorder/ · exporter/  # FFmpeg 控制
-│   ├── editor/audio_aligner.py# 音频互相关对齐
-│   └── gui/multi_room/        # 多房间管理编排
+│   └── editor/audio_aligner.py# 音频互相关对齐
 ├── python-backend/            # WebSocket 桥接服务
 │   ├── main.py · server.py    # 入口 / WS 服务器
 │   └── handlers/              # 房间 / 时间线 / 分析 / 导出 / 对齐 / 剪映

@@ -4,7 +4,6 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MANAGER = (ROOT / "lsc/gui/multi_room/manager.py").read_text(encoding="utf-8")
 ORCHESTRATOR = (ROOT / "lsc/core/orchestrator.py").read_text(encoding="utf-8")
 SERVER = (ROOT / "python-backend/server.py").read_text(encoding="utf-8")
 ROOM_HANDLER = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
