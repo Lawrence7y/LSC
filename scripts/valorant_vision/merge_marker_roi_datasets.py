@@ -115,10 +115,15 @@ def merge(sources: list[Path], out_dir: Path) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--source", nargs="+", type=Path, required=True)
+    # 两种写法都要支持：`--source A B C` 与 `--source A --source B`。
+    # ⚠️ 只用 nargs="+" 时 argparse 对**重复出现的选项只保留最后一次** —— 实测踩过：
+    # `--source A --source B --source C` 静默只吃到 C，合并结果只剩 1/3，
+    # 而下游训练只会报"训练集或验证集为空"，很难往回追。
+    parser.add_argument("--source", nargs="+", action="append", type=Path, required=True,
+                        help="源 ROI 数据集目录（可重复给 --source，也可一次给多个值）")
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    sources = [s.expanduser().resolve() for s in args.source]
+    sources = [s.expanduser().resolve() for group in args.source for s in group]
     for source in sources:
         if not source.is_dir():
             print(f"!! 源目录不存在: {source}", file=sys.stderr)

@@ -93,3 +93,26 @@ def test_merge_records_missing_files_instead_of_crashing(tmp_path) -> None:
     report = merge([source], tmp_path / "merged")
     assert report["rows"] == 0
     assert report["missing"] and "gone.jpg" in report["missing"][0]
+
+
+def test_cli_accepts_repeated_and_grouped_sources(tmp_path) -> None:
+    """两种写法都必须吃到**全部**源。
+
+    ⚠️ 实测踩过：argparse 对非 append 的 `--source` 只保留最后一次 →
+    `--source A --source B --source C` 静默只吃到 C，合并结果只剩 1/3，
+    而下游只会报"训练集或验证集为空"，很难往回追。
+    """
+    from scripts.valorant_vision.merge_marker_roi_datasets import main
+
+    a = _source(tmp_path / "a", [("train", "replay")], name_prefix="a")
+    b = _source(tmp_path / "b", [("train", "non_game")], name_prefix="b")
+
+    repeated = tmp_path / "out_repeated"
+    assert main(["--source", str(a), "--source", str(b), "--out-dir", str(repeated)]) == 0
+    rows = (repeated / "manifest_marker_roi.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(rows) == 2
+
+    grouped = tmp_path / "out_grouped"
+    assert main(["--source", str(a), str(b), "--out-dir", str(grouped)]) == 0
+    rows = (grouped / "manifest_marker_roi.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(rows) == 2

@@ -88,6 +88,10 @@ ROIS: dict[str, tuple[float, float, float, float]] = {
 # 2) 位置是**会新增的**：2026-09-11 实测 2026 进化者杯的标记落在"顶部居中"，
 #    此前只用 右上角+右下角 两个框时，该整段素材命中 **0**（1200 个裁剪全负），
 #    所以新增素材后**必须复核每个来源的命中率**，0 就是"框没覆盖到"的信号。
+# 3) `top_left_small` 目前是**惰性 ROI**：它在数据集与挖掘素材里的正样本实测都是 **0**
+#    （逐裁剪 OCR 读不出该字号的字形）——留着只多一路推理开销、不产生检出。
+#    修法：标注口径换成"整帧 OCR 取框 + 按几何归属到 ROI"（整帧 2× 下该字置信度 ≥0.99），
+#    但要重跑 数据集+挖掘+训练，故暂留并在此留档。
 DEFAULT_DATA_DIR = _ROOT / "datasets/valorant_phase_broadcast"
 DEFAULT_OUT_DIR = Path("D:/lsc_models/broadcast_marker_roi")
 
