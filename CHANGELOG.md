@@ -27,6 +27,23 @@
   全量测试 1766 passed（唯一失败为既有 safe-delete 环境问题）；
   改动文件 `ruff` 全过
 
+### 新增（broadcast_mode 影子模式，切换前取数）
+
+- **背景**：`OcrRoundFSM.feed(broadcast_mode=True)` 的赛事回放保护（忽略未伴随准备阶段的
+  新交战钟）此前**仅被测试覆盖、未接入生产**。真实录像实测：3 个 19/23/26s 碎片回合
+  **100% 由 `next_combat` 闭合**，而正常回合（46–232s）全部由 `next_prep`/
+  `broadcast_exclusion` 闭合（详见 `docs/reports/replay-vs-nextcombat-experiment-20260910.md`）
+- **影子模式**：新增环境变量 `LSC_VALORANT_BROADCAST_MODE_SHADOW`。开启后，`broadcast` 档位
+  会用**同一批 OCR 标签**并行跑一份 `broadcast_mode=True` 的 FSM，产出两份回合列表的
+  差异摘要（独有/缺失/时长变化/`next_combat` 计数）与累计统计，写入运行时状态并输出
+  INFO 日志；**生效回合列表不受任何影响**
+- **生效路径零改动**：生效 `fsm.feed(...)` 仍不传 `broadcast_mode`；影子 FSM 独立持久化于
+  `state["ocr_fsm_broadcast_shadow"]`；回放标注、`round_key`、边界密扫仍只作用于生效列表
+- **守卫**：新增 `tests/test_broadcast_mode_shadow.py`（24 条），含「影子开关默认关闭」
+  「影子不改变生效结果」「`broadcast_mode=True` 全模块仅一处代码调用」等 AST 级源码守卫
+- **验证**：真实录像端到端对照（同一时间范围跑影子关/开两次）→ 生效回合列表**完全一致**，
+  影子摘要与累计统计正常产出；分析器相关套件 233 passed
+
 ---
 
 ## v1.0.11 (2026-09-01)

@@ -61,6 +61,21 @@ _NEW_ROUND_CLOCK_MIN = 85.0
 _NEW_ROUND_TIMER_RESET_SEC = 20.0
 _NEW_ROUND_AFTER_RESULT_SEC = 45.0
 _CENTER_SENTINEL_SEC = 4.0
+
+# ── broadcast_mode 影子对比 ───────────────────────────────────────────
+# 赛事流的 FSM 级「回放保护」(`OcrRoundFSM.feed(broadcast_mode=True)`) 目前未接入
+# 生产（见 docs/reports/replay-vs-nextcombat-experiment-20260910.md）。切换前先做
+# 影子模式：用同一批 OCR 标签并行跑一份 broadcast_mode=True 的 FSM，只记录
+# 两份回合列表的差异，**不改变任何生效结果**。开关：环境变量置 1/true/yes/on。
+BROADCAST_MODE_SHADOW_ENV = "LSC_VALORANT_BROADCAST_MODE_SHADOW"
+_SHADOW_MATCH_TOLERANCE_SEC = 5.0   # 两份回合列表比对时的起点配对容差
+
+
+def broadcast_mode_shadow_enabled() -> bool:
+    """影子模式开关：只记录 broadcast_mode=True 的差异，不改变生效结果。"""
+    return os.environ.get(BROADCAST_MODE_SHADOW_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 _ROI_CACHE_W = 160
 _ROI_DIFF_THRESHOLD = 2.0
 _ROI_CACHE_BLACKOUT_FRAMES = 2
@@ -860,6 +875,69 @@ def refine_valorant_round_boundaries(
     return kept
 
 
+def _summarize_broadcast_mode_shadow(
+    primary: list[dict[str, Any]],
+    shadow: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """比对「生效回合列表」与「broadcast_mode=True 影子列表」。
+
+    只产出可持久化的差异摘要，供切换决策取数；**不参与任何生效判定**。
+    起点差距在 ``_SHADOW_MATCH_TOLERANCE_SEC`` 内视为同一回合。
+    """
+    tolerance = _SHADOW_MATCH_TOLERANCE_SEC
+
+    def _spans(rounds: list[dict[str, Any]]) -> list[tuple[float, float]]:
+        spans: list[tuple[float, float]] = []
+        for item in rounds:
+            try:
+                spans.append((float(item["start"]), float(item["end"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return spans
+
+    primary_spans = _spans(primary)
+    shadow_spans = _spans(shadow)
+    matched_primary: set[int] = set()
+    paired: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    shadow_only: list[tuple[float, float]] = []
+    for shadow_start, shadow_end in shadow_spans:
+        hit = None
+        for index, (primary_start, _) in enumerate(primary_spans):
+            if index not in matched_primary and abs(primary_start - shadow_start) <= tolerance:
+                hit = index
+                break
+        if hit is None:
+            shadow_only.append((shadow_start, shadow_end))
+        else:
+            matched_primary.add(hit)
+            paired.append((primary_spans[hit], (shadow_start, shadow_end)))
+    primary_only = [
+        span for index, span in enumerate(primary_spans) if index not in matched_primary
+    ]
+    resized = [
+        {
+            "start": round(pair[0][0], 3),
+            "primary_sec": round(pair[0][1] - pair[0][0], 3),
+            "shadow_sec": round(pair[1][1] - pair[1][0], 3),
+        }
+        for pair in paired
+        if abs((pair[0][1] - pair[0][0]) - (pair[1][1] - pair[1][0])) > 1.0
+    ]
+    return {
+        "primary_rounds": len(primary_spans),
+        "shadow_rounds": len(shadow_spans),
+        "shadow_only": [[round(a, 3), round(b, 3)] for a, b in shadow_only],
+        "primary_only": [[round(a, 3), round(b, 3)] for a, b in primary_only],
+        "resized": resized[:20],
+        "primary_next_combat": sum(
+            1 for item in primary if str(item.get("end_by") or "") == "next_combat"
+        ),
+        "shadow_next_combat": sum(
+            1 for item in shadow if str(item.get("end_by") or "") == "next_combat"
+        ),
+    }
+
+
 def detect_valorant_rounds_ocr(
     video_path: str,
     *,
@@ -1289,6 +1367,18 @@ def detect_valorant_rounds_ocr(
 
     # 循环先验平滑（帧级，仅删孤立 combat 噪点，不补缝——非游戏阶段透明）
     smoothed = _apply_phase_cycle_prior([label for _, label, _, _, _ in labels])
+    # broadcast_mode 影子：并行喂一份 broadcast_mode=True 的 FSM，只记录差异。
+    # 仅在 broadcast 档启用（该分支语义只对赛事流成立），且**绝不改变生效结果**：
+    # 影子回合只进 shadow_rounds，不参与后续 round_key / 密扫 / 回放标注。
+    shadow_fsm: OcrRoundFSM | None = None
+    shadow_rounds: list[dict[str, Any]] = []
+    if broadcast_mode_shadow_enabled() and str(source_profile or "").lower() == "broadcast":
+        stored_shadow = state.get("ocr_fsm_broadcast_shadow")
+        shadow_fsm = (
+            stored_shadow.clone()
+            if isinstance(stored_shadow, OcrRoundFSM)
+            else OcrRoundFSM()
+        )
     for (ts, _, timer, timer_raw, cand_ts), label, prep_banner in zip(
         labels, smoothed, prep_banner_flags, strict=True
     ):
@@ -1302,12 +1392,73 @@ def detect_valorant_rounds_ocr(
         )
         if closed:
             closed_rounds.extend(closed)
+        if shadow_fsm is not None:
+            shadow_closed = shadow_fsm.feed(
+                label,
+                ts,
+                timer,
+                timer_raw=timer_raw,
+                cand_ts=cand_ts,
+                prep_banner=prep_banner,
+                broadcast_mode=True,
+            )
+            if shadow_closed:
+                shadow_rounds.extend(shadow_closed)
 
     # 收尾例外：扫描末端强制闭合未结束回合（open_tail + pending，防最后一回合丢失）
     if finalize:
         closed = fsm.force_close(end_ts=float(scan_end))
         if closed:
             closed_rounds.extend(closed)
+        if shadow_fsm is not None:
+            shadow_closed = shadow_fsm.force_close(end_ts=float(scan_end))
+            if shadow_closed:
+                shadow_rounds.extend(shadow_closed)
+
+    if shadow_fsm is not None:
+        diff = _summarize_broadcast_mode_shadow(closed_rounds, shadow_rounds)
+        state["ocr_fsm_broadcast_shadow"] = shadow_fsm
+        state["broadcast_mode_shadow"] = diff
+        totals = state.setdefault(
+            "broadcast_mode_shadow_totals",
+            {
+                "scans": 0,
+                "primary_rounds": 0,
+                "shadow_rounds": 0,
+                "primary_next_combat": 0,
+                "shadow_next_combat": 0,
+                "shadow_only": 0,
+                "primary_only": 0,
+                "resized": 0,
+            },
+        )
+        totals["scans"] += 1
+        for key in (
+            "primary_rounds",
+            "shadow_rounds",
+            "primary_next_combat",
+            "shadow_next_combat",
+        ):
+            totals[key] += int(diff[key])
+        totals["shadow_only"] += len(diff["shadow_only"])
+        totals["primary_only"] += len(diff["primary_only"])
+        totals["resized"] += len(diff["resized"])
+        _log.info(
+            "broadcast_mode 影子对比 (range=%.1f-%.1f): 生效=%d 影子=%d | "
+            "next_combat 生效=%d 影子=%d | 影子独有=%d 生效独有=%d | 时长变化=%d",
+            scan_start,
+            scan_end,
+            diff["primary_rounds"],
+            diff["shadow_rounds"],
+            diff["primary_next_combat"],
+            diff["shadow_next_combat"],
+            len(diff["shadow_only"]),
+            len(diff["primary_only"]),
+            len(diff["resized"]),
+        )
+        if diff["shadow_only"] or diff["primary_only"] or diff["resized"]:
+            _log.info("broadcast_mode 影子差异明细: %s", diff)
+
 
     if refine_boundaries and closed_rounds:
         closed_rounds = refine_valorant_round_boundaries(
@@ -1567,9 +1718,12 @@ def extract_frames_cancellable(
 
 __all__ = [
     "BOUNDARY_SOURCE",
+    "BROADCAST_MODE_SHADOW_ENV",
     "BUY_TIMER_MAX_SEC",
     "OcrRoundFSM",
+    "broadcast_mode_shadow_enabled",
     "detect_valorant_rounds_ocr",
     "extract_frames_cancellable",
     "_apply_phase_cycle_prior",
+    "_summarize_broadcast_mode_shadow",
 ]
