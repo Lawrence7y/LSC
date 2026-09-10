@@ -17,7 +17,7 @@
 | **已产出文档** | 3 份（根因分析、对照实验、本文件） |
 | **待决策** | 是否正式开启 `broadcast_mode`（需先取数） |
 | **待动手（会改变切片结果）** | 入点侧引入模型回放否决；`start_delta` 改为交叉证据 |
-| **⚠️ 交付状态** | **本次全部产物均未提交**（11 untracked / 11 deleted / 60 modified），且与另外 **4 条**工作流存在行级交织 → **先做 §3 第 0 步** |
+| **交付状态** | 本工作流可切分部分**已提交**（`3821ffb` 死代码清理 / `05ba92d` 三份文档 / `0f86d48` 影子模式）；其余 **4 条**工作流的改动仍在工作区，勿打包 → 见 §3 第 0 步执行记录 |
 | **回归基线** | 全量 pytest **1791 passed / 0 failed**（2026-09-10 复核复现；须配合 §6 的 ASCII `TMP/TEMP`，否则 `test_recording_asset_timeline` 可能被 safe-delete 拦截） |
 
 ---
@@ -215,6 +215,29 @@
 **硬约束**：影子模式的**实现**（`valorant_ocr_rounds.py` 的 6 个 hunk）必须与 `tests/test_broadcast_mode_shadow.py` **同批落盘**——否则该提交点的测试是红的（测试引用的影子函数只存在于工作区）。
 
 **验收**：本次产物在 `git status` 中清零；且**在每个提交点上** `pytest tests/test_broadcast_mode_shadow.py` 全绿。
+
+#### ✅ 执行记录（2026-09-10 已执行）
+
+| 提交 | 内容 | 规模 |
+| :--- | :--- | :--- |
+| `3821ffb` | `refactor: 删除 PySide6 遗留死代码` | 27 文件 / +304 −2143 |
+| `05ba92d` | `docs: 工作流状态、根因分析与对照实验` | 4 文件 / +1129 |
+| `0f86d48` | `feat: broadcast_mode 影子模式（切换前取数）` | 3 文件 / +423 |
+
+**切分手法（供后续参考）**：`CHANGELOG.md` / `CLAUDE.md` 是单 hunk 或跨工作流混合，无法用
+`git add -p` 直接切；改为**构造"中间版本"**——备份工作区版本 → 只写入本工作流相关内容 →
+`git add` → 提交 → 从备份还原工作区版本。`valorant_ocr_rounds.py` 同理：从 20 个 hunk 中筛出
+7 个影子 hunk（并剔除 hunk 17 内混入的 `round_key` 身份块），用"锚点插入"重建中间版本。
+
+**验证**：
+- 影子守卫 **24 passed**；且在 **`git worktree` 检出的 `0f86d48` 隔离副本**中同样 24 passed
+  → 证明该提交点**自包含**（不依赖工作区里的 `frame_provider.py` 等未提交文件）
+- `tests/test_valorant_ocr_rounds.py` 在该提交点只有 2 个**属于边界质量工作流**的新测试失败
+  （预期，其实现未包含在本提交内），其余 32 个全过 → 切分未伤及既有测试
+- 工作区全量 pytest **1791 passed / 0 failed**
+
+**仍未提交（保留在工作区，等各自工作流落盘）**：`CHANGELOG.md` / `CLAUDE.md` 中其余 4 条
+工作流的条目、`valorant_ocr_rounds.py` 的帧缓存与 HUD ROI 改动、以及 ②③④⑤ 的全部文件。
 
 ### 第 1 步：取数（**前置，零风险**）
 
