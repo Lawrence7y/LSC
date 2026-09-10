@@ -105,44 +105,76 @@ python scripts/valorant_vision/reeval_replay_verified.py \
 
 ---
 
-## 4. 晋级（仅在 3.2 达标后执行）
+## 4. 晋级：**口径分两套**（2026-09-10 按决策 (A) 改写）
+
+### 4.1 关键结论：现有门禁是**两来源**门禁，只适用于通用/POV 系模型
+
+代码实测（非文档转述）：
+
+- `eval_gates.SOURCE_TYPES = ("broadcast", "pov")`，并对**每个**来源分别要求
+  `by_source_type[st].macro_f1 >= 0.94`（缺该来源评估块 → `{st}_missing` 直接失败）；
+- `promote_model.promotion_failures()` 要求
+  `source_session_count >= 3` **且** `source_sessions_by_type["broadcast"] >= 3`
+  **且** `source_sessions_by_type["pov"] >= 3`；
+- 还要求 `class_support` 五类齐全、`evaluation_mode == "broadcast_runtime"`、
+  `gate_failures` 为空、候选 ONNX SHA-256 与生产目录一致。
+
+→ 这套门禁**按设计面向"广播+POV 双来源通用模型"**（生产根目录
+`lsc/analyzer/models/valorant_phase_v1.*`）。而本工作流要重训的是**广播档模型**
+（带 `full 0.7 + top_HUD 0.3` 融合、独立目录）——把它放到含 POV 帧的合并集上评，
+Macro F1 仅 **0.7635**（它没在 POV 上训练过）。
+
+**因此：广播档模型不能走 `promote_model.py`**，需要一套尚未定义的广播档晋级口径（见 4.3）。
+
+### 4.2 通用模型（若要晋级）——命令与前置已就绪
 
 ```bash
 # ① 生成 promotion report（必须带 --manifest 才有来源会话；--rounds 供回合级门禁）
-python scripts/valorant_vision/eval_source_dataset.py \
-  --model-dir <out-dir> \
-  --data-dir datasets/valorant_phase_broadcast \
-  --split val --mode broadcast_runtime \
-  --manifest scripts/valorant_vision/manifest_broadcast.jsonl \
-  --rounds <完整录像回合报告 json> \
-  --output <report.json>
+python scripts/valorant_vision/eval_source_dataset.py   --model-dir <候选模型目录>   --data-dir datasets/valorant_phase   --split val --mode broadcast_runtime   --manifest scripts/valorant_vision/manifest_phase_combined.jsonl   --rounds <完整录像回合报告 json>   --output <report.json>
 
 # ② 激活（失败保持当前模型不变并返回非零退出码）
-python scripts/valorant_vision/promote_model.py \
-  --candidate-dir <out-dir> \
-  --production-dir lsc/analyzer/models/<目标目录> \
-  --promotion-report <report.json>
+python scripts/valorant_vision/promote_model.py   --candidate-dir <候选模型目录>   --production-dir lsc/analyzer/models   --promotion-report <report.json>
 ```
 
-`promote_model.py` 的硬要求（代码实测，非文档转述）：
+**本轮已把两个前置障碍清掉**（实测）：
 
-1. `report["gates_passed"] is True`；
-2. `data_summary.source_session_count >= 3`，且 `source_sessions_by_type[source] >= 3`；
-3. 候选与生产目录的 ONNX **SHA-256 一致**。
+| 项 | 之前 | 现在 |
+| :--- | :--- | :--- |
+| 合并集溯源清单 | **不存在**（合并集用前缀式命名 `ann_broadcast_<会话>_<ts>`，与既有清单的后缀式命名 basename 完全不重叠 → 直接评估得到 `source_session_count = 0`） | **`scripts/valorant_vision/manifest_phase_combined.jsonl`**（7875 条，从文件名派生；未归属帧仅 247 个且全在 train） |
+| `pov` 来源会话数 | val 只有 **2**（`ling_*` / `tangqihua_*`） | **3**：新增 `fish_live`（111 帧，取自 `valorant_phase_pov/test/`，**复制**而非移动，原处保持完整；该会话不在任何 train 中，无泄漏） |
 
-分类器的加载契约：仅当元数据 `promotion_state == "active"` 时才要求
-`gate_results.gates_passed is True`；否则（如 `null`）正常加载 —— 因此**重训出的模型可直接
-用于复核**，无需先过门禁。
+官方脚本实测结果：`source_session_count: 6`、`source_sessions_by_type: {'pov': 3, 'broadcast': 3}`
+、`class_support` 五类齐全 → **会话相关门禁全部 PASS**。
 
-### ⚠️ 当前已知阻塞（晋级前必须先解）
+**剩余阻塞**（与来源会话无关）：
 
-1. **来源会话数不足**：`val` 只有 **2** 个来源会话（要求 ≥3）。需补第三个独立来源会话的帧
-   （例如另一场赛事的录像）并在 manifest 中标注 `source_type`/`session_id`。
-2. **回合级报告缺失**：`check_all_gates` 在 `rounds=None` 时直接给
-   `rounds_missing` 失败 → 必须先产出完整录像的回合级 GT/预测 JSON（见
-   `eval_source_dataset.py --rounds` 与 `eval_gates.compute_round_report`）。
-3. **帧级门禁**：即使标签纠正，`Result Precision`（0.8889）与 `Macro F1`（0.8935）
-   也需一并改善，否则 `gates_passed` 仍为 false。
+1. **帧级指标未达标**：`macro_f1`、`buy_precision`、`result_precision`、`replay_recall`、
+   `non_game_recall`，以及 `broadcast_macro_f1` / `pov_macro_f1` 两条分来源门；
+2. **回合级报告缺失**：`check_all_gates` 在 `rounds=None` 时给 `rounds_missing` 失败
+   （见 `eval_source_dataset.py --rounds` 与 `eval_gates.compute_round_report`）。
+
+### 4.3 广播档模型（B1 的目标）——晋级口径**待定义**
+
+建议的广播档口径（与现有门禁同构，但只保留 broadcast 一侧）：
+
+1. 帧级五项门禁在**广播专用、≥3 个广播来源会话**的评估集上判定
+   （现有 broadcast 侧已有 3 个会话：`hanghang_20260721` / `valorant_esports_20260721` /
+   `yuezi_20260720_202557`）；
+2. **`test/replay`（32 帧水印确证）单独设门**——这是"模型能否认出回放"的唯一直接证据，
+   而它在 2026-09-10 之前**完全没有测试覆盖**（`test/replay` 为 0 帧）；
+3. 保留回合级门禁；
+4. 实现方式二选一：
+   - **(i)** 给 `eval_gates` / `promote_model` 增加 `--source-scope broadcast`（更正规，动官方脚本）；
+   - **(ii)** 广播档不纳入 `promote_model`，以本文 §3 的 `reeval_replay_verified.py`
+     输出作为验收凭据（零改动，但缺"激活/回滚"的机制）。
+
+**在 4.3 定下来之前，广播档模型只能"训练 + 复核"，不能"晋级"**；但 §2–§3 不受影响。
+
+### 4.4 分类器加载契约（与晋级无关）
+
+仅当元数据 `promotion_state == "active"` 时才要求 `gate_results.gates_passed is True`；
+否则（如当前广播档模型为 `null`）正常加载 —— 因此**重训出的模型可直接用于复核**，
+无需先过门禁。
 
 ---
 
