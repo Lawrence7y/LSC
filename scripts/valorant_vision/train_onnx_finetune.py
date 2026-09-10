@@ -98,24 +98,48 @@ def _read_image(path: Path):
     return image
 
 
-def _make_datasets(samples: list[Sample], validation: list[tuple[Path, int]], teacher):
+def _train_transform(*, horizontal_flip: bool = True):
+    """训练期增广。``horizontal_flip`` 默认保持原行为（旧脚本一直开着）。"""
+    from torchvision import transforms
+
+    steps = [transforms.Resize((INPUT_SIZE, INPUT_SIZE))]
+    # 水平翻转会把画面里的**文字镜像**（如回放标记 `REPLAY`）。训练"从标记裁图读字"
+    # 这类任务时它是有害噪声（配 `--no-flip` 关掉）。
+    if horizontal_flip:
+        steps.append(transforms.RandomHorizontalFlip(p=0.15))
+    steps.append(
+        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02)
+    )
+    steps += [
+        transforms.ToTensor(),
+        transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
+    ]
+    return transforms.Compose(steps)
+
+
+def _eval_transform():
+    from torchvision import transforms
+
+    return transforms.Compose([
+        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
+    ])
+
+
+def _make_datasets(
+    samples: list[Sample],
+    validation: list[tuple[Path, int]],
+    teacher,
+    *,
+    horizontal_flip: bool = True,
+):
     import torch
     from PIL import Image
     from torch.utils.data import Dataset
-    from torchvision import transforms
 
-    train_tf = transforms.Compose([
-        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
-        transforms.RandomHorizontalFlip(p=0.15),
-        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02),
-        transforms.ToTensor(),
-        transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
-    ])
-    eval_tf = transforms.Compose([
-        transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize(NORMALIZE_MEAN, NORMALIZE_STD),
-    ])
+    train_tf = _train_transform(horizontal_flip=horizontal_flip)
+    eval_tf = _eval_transform()
 
     class TrainDataset(Dataset):
         def __len__(self):
@@ -180,6 +204,7 @@ def train(
     out_dir: Path,
     epochs: int,
     seed: int,
+    horizontal_flip: bool = True,
 ) -> None:
     import torch
     import torch.nn.functional as F
@@ -189,7 +214,9 @@ def train(
     model = _load_trainable_onnx(teacher_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    train_dataset, val_dataset = _make_datasets(samples, validation, teacher_targets)
+    train_dataset, val_dataset = _make_datasets(
+        samples, validation, teacher_targets, horizontal_flip=horizontal_flip,
+    )
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=0)
 
@@ -301,6 +328,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--teacher-cache", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--no-flip", action="store_true",
+                        help="关闭训练期水平翻转（从裁图读文字的任务必须关：翻转会把字形镜像）")
     parser.add_argument("--seed", type=int, default=20260907)
     return parser
 
@@ -326,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=out_dir,
         epochs=max(1, int(args.epochs)),
         seed=int(args.seed),
+        horizontal_flip=not args.no_flip,
     )
     return 0
 

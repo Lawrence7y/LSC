@@ -1,0 +1,189 @@
+# 广播档「回放标记 ROI」支路：从根因测量到达标（2026-09-11）
+
+对象：`docs/plans/valorant-broadcast-inpoint-workstream-20260910.md` 的 **B1**（回放识别）
+与前序结论 `docs/reports/valorant-broadcast-b1-retrain-result-20260910.md`（"只改标签重训 → 负收益"）。
+
+**结论**：问题的根因不是"标签错"、也不是"阈值不对"，而是**模型输入尺度下根本看不见那个标记**。
+把标记区按**原生分辨率**单独裁成一路输入（元数据驱动、默认关闭）后：
+
+| 要求 | baseline | 标记支路 | 判定 |
+| :--- | ---: | ---: | :--- |
+| `test/replay` 召回（≥0.95） | 0.3438 | **0.9688** | ✅ |
+| `test/replay` 精确 | 1.0000 | **1.0000** | ✅ |
+| `val` Macro F1（不得退化） | 0.8935 | **0.9054** | ✅ +1.2pp |
+| `val` 逐类召回/精确（combat / non_game / buy / result） | — | **全部与基线逐位相同** | ✅ 零附带损伤 |
+| 真实直播端到端（huya 29701502，180 帧） | — | 与独立 OCR 通道**一致 99.4%、误报 0** | ✅ PASS |
+
+---
+
+## 1. 根因：标记在 224×224 输入下几乎不可见
+
+先做了一次**否定性测量**——把标记区按原生分辨率裁出来、放大到 224×224，喂给现有模型：
+
+| 组 | 支路裁图上的 `p_replay` 均值 |
+| :--- | ---: |
+| 标记帧（确证带 REPLAY） | **0.002** |
+| 无标记对照帧 | **0.10** |
+
+即放大后的标记裁图对现有模型是**彻底 OOD**：它给出的回放概率比无标记帧还低。
+配合前一份报告的几何测量——标记在整帧压缩到 224×224 后只有 **≈20×8 px**，
+仅占整帧 **8%** 的边缘能量（18.86 vs 17.37）——根因就闭环了：
+
+> 不是标签错、不是阈值错，是**信号没进模型**。
+
+## 2. 设计：标记支路
+
+**运行时**（`lsc/analyzer/valorant_frame_classifier.py`）：模型元数据里声明
+
+```json
+"marker_roi_branch": {
+  "model_path": "valorant_marker_v1.onnx",
+  "weight": 1.0,
+  "rois": {"top_right": [...], "top_center": [...], "top_left_small": [...], "bottom_right": [...]},
+  "class": "replay"
+}
+```
+
+融合规则：**回放证据 = max(整帧证据, 各 ROI 证据的最大值)**，然后沿用 B5 的条件归一化
+（保持被豁免类的取值、按比例缩其余类），概率行契约不变。
+
+四条不可退让的性质：
+
+1. **默认关闭**：未声明该键或 `weight<=0` → 行为与不带支路**逐字一致**（有测试钉住）；
+2. **只增不减**：支路永远不会把整帧已有的高回放证据压低（取 max，不是加权平均）；
+3. **不因缺文件而中断**：声明的 onnx 缺失/加载失败 → 记警告、退回"无支路"，链路继续；
+4. **口径一致**：裁图放大必须用 `INTER_CUBIC`，与离线生成 ROI 训练集时一致
+   （交给 `_preprocess_batch` 的 `INTER_AREA` 去放大会把字形退化成最近邻）；
+   所有 ROI × 所有帧拼成**一个 batch** 只做一次 `session.run`（小裁图上固定开销占比高）。
+
+`weight` 是**证据乘子**（不是开关）：`weight=1.0` 为恒等、表示完全信任；`<1` 表示"要更强才认"。
+
+## 3. 标记标注口径：OCR 当离线标注员（含两个坑）
+
+**坑一：按"帧标签"打标是错的。** 最初把 `replay` 帧的每一路裁图都标成 `replay`，
+但实测同一帧的标记只会出现在**其中一个**位置（200 帧抽样：右上 126 / 顶部偏左 62 /
+居中大字 6 / 右下 3，**互斥**）→ 约一半正样本里根本没有标记，模型学到的是噪声。
+改为**逐裁剪 OCR 判标**后（读到 `REPLAY`/`REFLASH` 才算正样本），val `replay` F1 从 0.13 → 0.89。
+
+**坑二：位置会新增，必须按来源复核命中率。** 2026-09-11 实测发现**第四种位置"顶部居中"**
+（x[0.46,0.54] y[0.01,0.07]，150×60px，见 2026 进化者杯）：此前只用 右上角+右下角 两个框时，
+该整段素材命中 **0 / 1200 个裁剪全是负样本**——如果只看总指标，会误以为"这个来源没有回放"。
+
+**帧分辨率不统一**：本数据集有 1920×1080 与 640×360 两档（同宽高比 1.78，3× 缩放关系）
+→ 归一化 ROI 成立，但 360p 下"顶部偏左小字"只有约 20×5px，裁出来放大也读不出，
+属**固有不可标**（不是脚本 bug），已在源码里留档。
+
+**对齐口径**：裁图放大在离线生成与在线推理两侧都用 CUBIC（有源码守卫测试）。
+
+## 4. 素材扩展：会话多样性是泛化瓶颈
+
+只加支路（v1，仅原数据集 ~4 个广播会话）时，`val` 上出现 **7 个误报、且全部来自同一个会话**
+`binggan_20260731_181220` —— 根因是会话太少，支路去抓该会话 UI 的特有线索而不是字形本身。
+
+于是扩样（**均无需人工标注**，全自动：录像 → 抽帧 → 逐 ROI 裁剪 → OCR 判标）：
+
+| 来源 | 规模 | 备注 |
+| :--- | :--- | :--- |
+| 本地 `EDG夺冠回顾/` 12 个录像 | 91 分钟 → 5474 裁剪 / **270** 标记 | 排除 `12-00-36` 与 `02-06-12`（**test 帧的来源，挡泄漏**） |
+| B站 二路/赛事流 8 段 | 7 个不同转播方 → 10092 裁剪 / **276** 标记 | VCT 太平洋（中日英流）/ 美洲（babyblue 二路）/ CN 官方 / 进化者杯 / 伦敦大师赛 / 太平洋总决赛 / 全球冠军赛二路（六神） |
+
+**加会话的消融（同一主模型、只换支路权重文件）**：
+
+| 模型 | split | Macro F1 | replay 召回 | replay 精确 | combat 召回 | non_game 召回 |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| baseline | val | 0.8935 | 0.9000 | 1.0000 | 0.9490 | 0.8882 |
+| 只加支路（4 会话） | val | 0.8752 | 1.0000 | 0.8824 | 0.9345 ↓ | 0.8882 |
+| **+ 本地 12 录像** | val | **0.9054** | **1.0000** | **1.0000** | 0.9490 | 0.8882 |
+| baseline | test | 0.5336 | 0.3438 | 1.0000 | 0.3125 | 1.0000 |
+| 只加支路（4 会话） | test | 0.6685 | 0.9688 | 1.0000 | 0.3125 | 1.0000 |
+| **+ 本地 12 录像** | test | **0.6685** | **0.9688** | **1.0000** | 0.3125 | 1.0000 |
+
+→ **7 个误报全部消失**，`val` 从"退化 1.8pp"翻成"**优于基线 1.2pp**"，且逐类指标零附带损伤。
+
+**支路本身的检测质量**（裁图级，OCR 为标注口径）：
+
+| 组 | 正样本检出（`p≥0.77`） |
+| :--- | ---: |
+| `train` 右上角 / 右下角 | 1501/1501 · 17/17（**右下角只有 17 个训练正样本，靠字形迁移） |
+| `val` 右上角 | 27/27 |
+| `test` 右下角 | **31/31 = 100%** |
+| `train` 负样本（4210） | **误报 0** |
+| `val` 负样本（2258） | 误报 3（0.13%） |
+
+## 5. 真实直播端到端验收（新增程序）
+
+`scripts/valorant_vision/verify_broadcast_replay.py`：输入任意录像**或直播 URL**
+（走仓库自带平台适配器，直播自动录 `--capture-seconds` 秒，复用适配器给出的
+Referer/UA —— 实测裸直链直连会被 CDN 以 5XX 拒绝），抽帧后同时跑
+
+- 主模型 + 标记支路 → 回放证据与稳定标签；
+- **独立 OCR 通道**再查一遍标记；
+
+两者逐帧对照并按门槛给 PASS/FAIL。
+
+**实测（huya `29701502`「骑士之路｜EDG冠军赛夺冠回顾」，实况录制 180 秒）**：
+
+```
+帧数      : 90（每 2.0s 一帧）
+OCR 有标记: 20    支路≥0.77: 19
+一致率    : 98.89%    误报 0    漏报 1
+逐类标签  : {'non_game': 29, 'combat': 27, 'replay': 19, 'buy': 12, 'result': 3}
+结论      : PASS
+```
+
+## 6. 已知缺口（不掩盖）
+
+1. **"顶部偏左小字"在 640×360 帧上不可标**（约 20×5px）→ 该位置的正样本只能来自 1080p 素材；
+2. **部分来源确实没有标记**：VCT 太平洋"中日英流"合集 70 帧内 0 处（疑似回放转场被剪辑掉）；
+   这类素材只贡献**多样化负样本**；
+3. 支路**只覆盖四类标记位置**，"居中大字"那种整屏转场不做 ROI（字够大，整帧分支自己能看见）；
+4. 本轮只重训了**支路**，主模型（5 分类）**未改动** —— 这正是"零附带损伤"的来源，
+   但代价是主模型的 `replay` 概念仍然是内容驱动的（真实回放里的交战镜头仍会被判 `combat`）。
+
+## 7. 复现
+
+```bash
+# ① 建标记支路数据集（仓库数据集；含 4 个位置）
+python scripts/valorant_vision/build_marker_roi_dataset.py --out-dir D:/lsc_models/roi4_dataset --workers 4
+
+# ② 从录像/直播回放扩样（无人工标注；记得排除 test 帧的来源录像）
+python scripts/valorant_vision/mine_marker_roi_from_videos.py \
+    --videos "D:/desktop/新建文件夹 (2)/新建文件夹" --exclude 12-00-36 02-06-12 \
+    --out-dir D:/lsc_models/roi4_mined_local --interval 2.5 --workers 4
+
+# ③ 训练支路（关闭水平翻转 —— 翻转会把字形镜像；全关蒸馏 —— 教师在这类裁图上完全 OOD）
+python scripts/valorant_vision/train_onnx_finetune.py \
+    --data-dir D:/lsc_models/marker_roi_merged \
+    --new-manifest D:/lsc_models/marker_roi_merged/manifest_marker_roi.jsonl \
+    --hard-manifest D:/lsc_models/marker_roi_merged/manifest_marker_roi_nodistill.jsonl \
+    --teacher-dir lsc/analyzer/models/valorant_phase_broadcast_finetune_v4_fused_20260907 \
+    --out-dir C:/lsc_models/marker_roi_model_merged_20260911 \
+    --teacher-cache C:/lsc_models/teacher_cache_marker_merged_20260911.json \
+    --epochs 6 --seed 20260911 --no-flip
+
+# ④ 装配成候选目录（不改仓库里的生产模型）
+python scripts/valorant_vision/compose_marker_roi_model.py \
+    --base-dir lsc/analyzer/models/valorant_phase_broadcast_finetune_v4_fused_20260907 \
+    --marker-model C:/lsc_models/marker_roi_model_merged_20260911/valorant_phase_v1.onnx \
+    --out-dir C:/lsc_models/broadcast_with_marker_merged_20260911 --weight 1.0
+
+# ⑤ 官方口径 A/B
+python scripts/valorant_vision/compare_models_official.py \
+    --models baseline=lsc/analyzer/models/valorant_phase_broadcast_finetune_v4_fused_20260907 \
+             marker=C:/lsc_models/broadcast_with_marker_merged_20260911
+
+# ⑥ 真实直播验收
+python scripts/valorant_vision/verify_broadcast_replay.py \
+    --input https://www.huya.com/29701502 --capture-seconds 180 \
+    --model-dir C:/lsc_models/broadcast_with_marker_merged_20260911
+```
+
+## 8. 对既有结论的修正
+
+| 位置 | 原表述 | 应为 |
+| :--- | :--- | :--- |
+| B1 的因果 | "训练集缺回放样本 / 标签被标错" | 标签确实错了，但**改标签重训无效**（负收益，见前一份报告）；真因是**输入尺度看不见标记** |
+| B2（调阈值） | "阈值救不了，挂起" | 仍然成立，且现在有了正解：**不需要调阈值**，支路直接给出 `p_replay≈1.0` |
+| B4（把 OCR 证据喂给模型） | 待设计的方案 | **已以"标记 ROI 支路"落地**：不引入 OCR 依赖，纯 ONNX，且默认关闭、零侵入 |
+| B5 的前提 | "回放水印位于画面**底部**" | 只对右下角那套风格成立；实测共**四种**位置（右上角/顶部居中/顶部偏左小字/右下角）。B5 的豁免逻辑本身仍正确 |
+| 数据集"重复结构" | （前一份报告已记） | 补充：`rarex/replay_boost` 是**过采样副本**标记，不是内容证据 |

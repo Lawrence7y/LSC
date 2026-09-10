@@ -26,9 +26,15 @@ from lsc.analyzer.ocr_accel import (
 _log = logging.getLogger(__name__)
 
 _CLASS_NAMES = ("non_game", "buy", "combat", "result", "replay")
-# B5：不参与顶部 HUD 融合的类别。回放水印在画面底部，顶部裁剪看不到它，
+# B5：不参与顶部 HUD 融合的类别。回放标记在画面边缘，顶部裁剪看不到它，
 # 融合权重会系统性压低该类置信度（详见 predict_broadcast_batch 文档）。
 _FUSION_BYPASS_CLASSES: tuple[str, ...] = ("replay",)
+# 回放标记支路（2026-09-10）：整帧压缩到 224×224 后，回放标记只剩 ≈20×8 px
+# （右上角风格）/ ≈21×14 px（右下角风格），仅占整帧 8% 的边缘能量 → 模型只能改抓
+# 画面内容。故把标记区按**原生分辨率**单独裁出、放大成一路独立输入。
+# 该键缺失或 weight<=0 时**行为与不带该支路完全一致**（默认关闭）。
+_MARKER_ROI_BRANCH_KEY = "marker_roi_branch"
+_MARKER_ROI_DEFAULT_CLASS = "replay"
 _DEFAULT_DIR = Path(
     os.environ.get("LSC_VALORANT_MODEL_DIR", "")
     or (Path(__file__).resolve().parent / "models")
@@ -47,6 +53,80 @@ def _provider_name(accel: str) -> str:
     }[accel]
 
 
+def marker_roi_config(meta: dict[str, Any] | None) -> dict[str, Any] | None:
+    """读取并校验模型元数据里的「回放标记支路」声明；未启用返回 None。
+
+    契约（全部可缺省，缺省即关闭）：
+
+    .. code-block:: json
+
+        "marker_roi_branch": {
+          "model_path": "valorant_marker_v1.onnx",  // 相对主模型目录；也接受绝对路径
+          "weight": 1.0,                            // 证据乘子，<=0 视为关闭，1.0 = 完全信任
+          "rois": {"top_right": [x, y, w, h], ...}, // 归一化坐标
+          "class": "replay"
+        }
+    """
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get(_MARKER_ROI_BRANCH_KEY)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        weight = float(raw.get("weight", 0.0))
+    except (TypeError, ValueError):
+        return None
+    rois = raw.get("rois")
+    if not isinstance(rois, dict) or not rois:
+        return None
+    boxes: dict[str, tuple[float, float, float, float]] = {}
+    for name, box in rois.items():
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return None
+        try:
+            x, y, w, h = (float(v) for v in box)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= x < 1.0 and 0.0 <= y < 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+            return None
+        if x + w > 1.0 + 1e-9 or y + h > 1.0 + 1e-9:
+            return None
+        boxes[str(name)] = (x, y, w, h)
+    model_path = str(raw.get("model_path") or "")
+    if not model_path:
+        return None
+    target = str(raw.get("class") or _MARKER_ROI_DEFAULT_CLASS)
+    if target not in _CLASS_NAMES:
+        return None
+    if weight <= 0.0:
+        return None
+    return {
+        "model_path": model_path,
+        "weight": weight,
+        "rois": boxes,
+        "class": target,
+        "class_index": _CLASS_NAMES.index(target),
+    }
+
+
+def crop_normalized_roi(
+    frame: np.ndarray,
+    box: tuple[float, float, float, float],
+) -> np.ndarray | None:
+    """按归一化 (x, y, w, h) 裁出 ROI；非法/过小返回 None。"""
+    if frame is None or frame.ndim != 3 or frame.shape[0] < 2 or frame.shape[1] < 2:
+        return None
+    height, width = frame.shape[:2]
+    x0, y0, bw, bh = box
+    left, top = int(x0 * width), int(y0 * height)
+    right, bottom = int((x0 + bw) * width), int((y0 + bh) * height)
+    left, top = max(0, left), max(0, top)
+    right, bottom = min(width, right), min(height, bottom)
+    if right - left < 2 or bottom - top < 2:
+        return None
+    return frame[top:bottom, left:right]
+
+
 class ValorantFrameClassifier:
     """线程安全懒加载的 Valorant 五分类器。"""
 
@@ -56,6 +136,9 @@ class ValorantFrameClassifier:
         self._meta: dict[str, Any] | None = None
         self._provider: str | None = None
         self._provider_warning: str | None = None
+        # 回放标记支路（懒加载；未声明或 weight<=0 时永不创建，行为与不带支路一致）
+        self._marker_session: Any = None
+        self._marker_error: str | None = None
         self._lock = threading.Lock()
         self._telemetry_lock = threading.Lock()
         self._inference_frames_total = 0
@@ -260,14 +343,122 @@ class ValorantFrameClassifier:
             self._record_inference(len(frames_bgr), time.perf_counter() - started)
         return probs
 
-    def predict_broadcast_batch(self, frames_bgr: list[np.ndarray]) -> np.ndarray:
-        """Fuse full-frame and top-HUD predictions for configured broadcast models.
+    def _create_marker_session(self, onnx_path: Path) -> Any:
+        """为标记支路建 session。不覆写主模型的 provider 记账（两者互不影响）。"""
+        try:
+            import onnxruntime as ort  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ModelContractError("onnxruntime is unavailable") from exc
+        last_error: Exception | None = None
+        for accel in list_accel_candidates():
+            provider = _provider_name(accel)
+            try:
+                session = ort.InferenceSession(
+                    str(onnx_path), providers=[provider, "CPUExecutionProvider"],
+                )
+                actual = session.get_providers()[0]
+                if accel != "cpu" and actual == "CPUExecutionProvider":
+                    last_error = RuntimeError(f"{provider} unavailable")
+                    continue
+                return session
+            except Exception as exc:  # noqa: BLE001 - 尝试下一个 provider
+                last_error = exc
+        raise ModelContractError(f"failed to init marker roi session: {last_error}")
 
-        ``replay`` 例外（B5）：回放水印位于画面**底部**，而融合的第二路只看顶部 34%
-        HUD 区域、看不到水印，其权重会把整帧的高置信度回放判定拉到阈值以下
-        （2026-09-10 实测：整帧 0.96–0.99 被拉到 0.58–0.75，而阈值为 0.77，导致
-        72 帧水印确证回放全部漏检）。故 ``_FUSION_BYPASS_CLASSES`` 中的类别不参与
-        顶部融合、直接采用整帧概率，再重新归一化以维持"概率行"契约。
+    def _load_marker_session(self) -> Any:
+        if self._marker_session is not None or self._marker_error is not None:
+            return self._marker_session
+        cfg = marker_roi_config(self._meta)
+        if cfg is None:
+            self._marker_error = "marker roi branch not configured"
+            return None
+        path = Path(cfg["model_path"])
+        if not path.is_absolute():
+            path = self._dir / path
+        if not path.is_file():
+            self._marker_error = f"marker roi model missing: {path}"
+            _log.warning("回放标记支路不可用（%s），按整帧证据处理", self._marker_error)
+            return None
+        try:
+            self._marker_session = self._create_marker_session(path)
+            _log.info("回放标记支路已加载: %s", path)
+        except ModelContractError as exc:
+            self._marker_error = str(exc)
+            _log.warning("回放标记支路加载失败（%s），按整帧证据处理", exc)
+            return None
+        return self._marker_session
+
+    def marker_roi_evidence(self, frames_bgr: list[np.ndarray]) -> np.ndarray | None:
+        """回放标记支路对每帧给出的 ``replay`` 证据；未启用/不可用返回 None。
+
+        每一路 ROI 都按**原生分辨率**裁出后用 ``INTER_CUBIC`` 放大到模型输入尺寸
+        ——这一步必须与离线生成 ROI 训练集时一致（`build_marker_roi_dataset.py`
+        用 CUBIC；若交给 `_preprocess_batch` 的 ``INTER_AREA`` 去放大，字形会被
+        退化得像最近邻，和训练分布对不上）。裁剪后尺寸已是输入尺寸，故随后的
+        `_preprocess_batch` 只做归一化（identity resize）。
+
+        多路 ROI 之间取**逐帧最大值**：标记只会出现在其中一个角。
+        """
+        import cv2
+
+        self.load()
+        cfg = marker_roi_config(self._meta)
+        if cfg is None or not frames_bgr or self._meta is None:
+            return None
+        session = self._load_marker_session()
+        if session is None:
+            return None
+        size = int(self._meta["input_size"][0])
+        evidence = np.zeros(len(frames_bgr), dtype=np.float32)
+        try:
+            input_name = session.get_inputs()[0].name
+            # 所有 ROI × 所有帧拼成**一个 batch**，只做一次 session.run
+            # （逐 ROI 调用的固定开销在小裁图上占比很高）。
+            crops: list[np.ndarray] = []
+            owners: list[int] = []
+            for box in cfg["rois"].values():
+                for index, frame in enumerate(frames_bgr):
+                    roi = crop_normalized_roi(frame, box)
+                    if roi is None:
+                        continue
+                    crops.append(cv2.resize(roi, (size, size), interpolation=cv2.INTER_CUBIC))
+                    owners.append(index)
+            if not crops:
+                return None
+            probs = np.asarray(
+                session.run(None, {input_name: self._preprocess_batch(crops)})[0],
+                dtype=np.float32,
+            )
+            if probs.shape != (len(crops), len(_CLASS_NAMES)):
+                raise ModelContractError(
+                    f"marker roi probabilities shape mismatch: {probs.shape}"
+                )
+            for index, value in zip(owners, probs[:, cfg["class_index"]], strict=True):
+                evidence[index] = max(evidence[index], float(value))
+            # `weight` 是**证据乘子**（不是开关）：`weight<1` 表示"要更强才认"。
+            # `weight=1.0` 时是恒等，便于把默认行为写成"完全信任"。
+            if cfg["weight"] != 1.0:
+                evidence = np.clip(evidence * float(cfg["weight"]), 0.0, 1.0)
+        except ModelContractError as exc:
+            self._marker_error = str(exc)
+            _log.warning("回放标记支路推理失败（%s），按整帧证据处理", exc)
+            return None
+        return evidence
+
+    def predict_broadcast_batch(self, frames_bgr: list[np.ndarray]) -> np.ndarray:
+        """Fuse full-frame / top-HUD / replay-marker branches for broadcast models.
+
+        ``replay`` 例外（B5）：回放标记在画面**边缘**，而融合的第二路只看顶部 34%
+        HUD 区域，其权重会把整帧的高置信度回放判定拉到阈值以下（2026-09-10 实测：
+        整帧 0.96–0.99 被拉到 0.58–0.75，而阈值为 0.77，导致 72 帧水印确证回放全部
+        漏检）。故 ``_FUSION_BYPASS_CLASSES`` 中的类别不参与顶部融合、直接采用整帧
+        概率，再重新归一化以维持"概率行"契约。
+
+        **标记支路（可选）**：整帧压缩到 224×224 后标记只剩 ≈20×8 px、仅占整帧 8%
+        的边缘能量，模型实测只能靠画面内容判回放（2026-09-10：纠正标签后重训会把
+        `combat` 召回从 0.9490 打到 0.7937）。元数据声明 ``marker_roi_branch`` 且
+        ``weight>0`` 时，额外把标记区按原生分辨率放大成一路独立输入，并与整帧证据取
+        逐帧最大值（标记**只增不减**回放证据）。未声明时行为与不带该支路完全一致。
         """
         self.load()
         if not frames_bgr:
@@ -278,27 +469,37 @@ class ValorantFrameClassifier:
         top_weight = float(fusion.get("top_hud_weight", 0.0))
         full_weight = float(fusion.get("full_frame_weight", 1.0 - top_weight))
         if top_weight <= 0.0 or full_weight <= 0.0:
-            return self.predict_batch(frames_bgr)
-        total = full_weight + top_weight
-        full_weight /= total
-        top_weight /= total
-        top_frames: list[np.ndarray] = []
-        for frame in frames_bgr:
-            height = max(1, int(frame.shape[0] * 0.34))
-            top_frames.append(frame[:height, :])
-        started = time.perf_counter()
-        full_probs = self.predict_batch(frames_bgr, _record_telemetry=False)
-        top_probs = self.predict_batch(top_frames, _record_telemetry=False)
-        self._record_inference(len(frames_bgr), time.perf_counter() - started)
-        fused = (full_probs * full_weight + top_probs * top_weight).astype(np.float32)
+            # 未配置融合：退化为整帧概率，但**仍然**允许标记支路补强回放证据
+            full_probs = self.predict_batch(frames_bgr)
+            fused = full_probs
+        else:
+            total = full_weight + top_weight
+            full_weight /= total
+            top_weight /= total
+            top_frames: list[np.ndarray] = []
+            for frame in frames_bgr:
+                height = max(1, int(frame.shape[0] * 0.34))
+                top_frames.append(frame[:height, :])
+            started = time.perf_counter()
+            full_probs = self.predict_batch(frames_bgr, _record_telemetry=False)
+            top_probs = self.predict_batch(top_frames, _record_telemetry=False)
+            self._record_inference(len(frames_bgr), time.perf_counter() - started)
+            fused = (full_probs * full_weight + top_probs * top_weight).astype(np.float32)
         bypass = [
             _CLASS_NAMES.index(name)
             for name in _FUSION_BYPASS_CLASSES
             if name in _CLASS_NAMES
         ]
         if bypass:
+            marker = self.marker_roi_evidence(frames_bgr)
             for index in bypass:
-                fused[:, index] = full_probs[:, index]
+                # 回放证据取"整帧"与"标记支路"的逐帧最大值：标记只会**加强**回放证据。
+                # 未声明标记支路时 marker is None，此处逐字等价于原先的
+                # `fused[:, index] = full_probs[:, index]`（B5 行为不变）。
+                evidence = full_probs[:, index]
+                if marker is not None:
+                    evidence = np.maximum(evidence, marker)
+                fused[:, index] = evidence
             # 条件归一化：**保持被豁免类别（replay）的取值不变**，把其余类别按比例
             # 缩放到行和为 1。若改用"整行除以总和"，会把刚抬上来的 replay 值又压回
             # 阈值下（实测 0.77 下检出会从 12/72 掉到 6/72），等于白改。
