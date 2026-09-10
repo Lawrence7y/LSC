@@ -612,6 +612,39 @@ def _start_visual_combat_ratio(
     return round(combat / len(in_window), 3)
 
 
+def _start_window_replay_evidence(
+    samples: list[tuple[float, str, float]] | None,
+    *,
+    start: float,
+    window: float = _START_VISUAL_WINDOW_SEC,
+) -> bool:
+    """起点前视窗口内是否出现**回放/非游戏**帧（任务 A2 的显式化标注）。
+
+    回放转场或回放水印（模型判 ``replay``）以及 ``non_game`` 画面出现在起点处，
+    说明该处的"交战钟"读数很可能是回放画面里的——按 A2，**回放帧上的交战钟
+    不得作为入点锚点**。
+
+    ⚠️ 可达边界（2026-09-10 实测）：视觉模型**分不清"回放中的实战镜头"与实时交战**
+    （该类 ``p_replay`` 仅 0.001–0.041，见根因文档 §1.3），故本判据只覆盖
+    "起点落在回放转场/水印/非游戏画面"这一部分；"回放中的实战镜头"需要前置的
+    OCR 侧回放检测（属 A7 范畴）。本函数只用于标注与审计，**不改动入点**。
+    """
+    if not samples:
+        return False
+    try:
+        start_f = float(start)
+        window_f = float(window)
+    except (TypeError, ValueError):
+        return False
+    for row in samples:
+        if len(row) < 2:
+            continue
+        ts = float(row[0])
+        if start_f <= ts <= start_f + window_f and str(row[1]) in {"replay", "non_game"}:
+            return True
+    return False
+
+
 def _apply_start_visual_confidence(
     item: dict[str, Any],
     samples: list[tuple[float, str, float]] | None,
@@ -1043,6 +1076,16 @@ def audit_broadcast_rounds(
                     cache_item["start_gate_rejected"] = True
                     cache_item["start_gate_reason"] = gate_reason
                     cache_item["start_gate_scan_end"] = round(gate_scan_end, 3)
+                    # A2 显式化：若起点前视窗口内出现回放/非游戏帧，单独标注
+                    # "起点落在回放里"——拒绝结论不变（仍走既有 no_stable_combat
+                    # 链路），只增加可审计依据，便于统计该成因占比。
+                    if _start_window_replay_evidence(decision_samples, start=original_start):
+                        item["broadcast_start_gate_detail"] = "replay_at_start"
+                        cache_item["start_gate_detail"] = "replay_at_start"
+                        _log.info(
+                            "赛事回合入点回放否决(A2): start=%.1f 起点窗口含回放/非游戏帧",
+                            original_start,
+                        )
                     _log.info(
                         "赛事回合入点门禁拒绝: %.1f-%.1f (split=%s, scan_end=%.1f)",
                         original_start,

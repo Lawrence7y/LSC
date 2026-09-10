@@ -1752,3 +1752,48 @@ def test_apply_start_visual_confidence_keeps_fallback_without_samples() -> None:
     assert mod._apply_start_visual_confidence(item, []) is None
     assert item["start_confidence"] == 0.95
     assert "start_confidence_source" not in item
+
+
+# ── A2（2026-09-10）：起点落在回放/非游戏帧上的显式标注 ──────────────────
+
+
+def test_start_window_replay_evidence_detects_replay_at_start() -> None:
+    import lsc.analyzer.valorant_broadcast as mod
+
+    # 起点窗口内出现 replay（回放转场/水印）→ 命中
+    assert mod._start_window_replay_evidence(
+        [(10.0, "unknown", 0.9), (11.0, "replay", 0.9), (12.0, "combat", 0.9)], start=10.0
+    )
+    # non_game（非游戏画面）同样视为不可作为入点锚点
+    assert mod._start_window_replay_evidence(
+        [(10.0, "non_game", 0.9), (11.0, "combat", 0.9)], start=10.0
+    )
+    # 起点之前出现的回放不计入（前视窗口）
+    assert not mod._start_window_replay_evidence(
+        [(8.0, "replay", 0.9), (10.0, "combat", 0.9)], start=10.0
+    )
+    # 超出窗口不计入
+    assert not mod._start_window_replay_evidence(
+        [(10.0, "combat", 0.9), (13.5, "replay", 0.9)], start=10.0
+    )
+    # 纯交战 → 无回放证据
+    assert not mod._start_window_replay_evidence(
+        [(10.0, "combat", 0.9), (11.0, "combat", 0.9)], start=10.0
+    )
+    # 空/None 安全
+    assert not mod._start_window_replay_evidence(None, start=10.0)
+    assert not mod._start_window_replay_evidence([], start=10.0)
+
+
+def test_replay_at_start_is_marked_without_changing_rejection_path() -> None:
+    """A2 必须**纯附加**：拒绝链路与既有 reason 串不得改动（零消费方风险）。"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "lsc/analyzer/valorant_broadcast.py").read_text(
+        encoding="utf-8"
+    )
+    block = src.split('if gate_reason == "no_stable_combat":', 1)[1].split("_record_audit_outcome", 1)[0]
+    assert 'item["broadcast_start_gate_detail"] = "replay_at_start"' in block
+    # 既有字段与 outcome reason 保持不变
+    assert 'item["broadcast_start_gate"] = gate_reason' in block
+    assert 'reason="no_stable_combat_start"' in src
