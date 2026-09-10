@@ -143,7 +143,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     results: dict[str, dict] = {}
-    for split in ("val", "test"):
+    available = [sp for sp in ("val", "test") if (data_dir / sp).is_dir()]
+    skipped = [sp for sp in ("val", "test") if sp not in available]
+    if skipped:
+        print(f"!! 跳过不存在的 split: {', '.join(skipped)}"
+              f"（{data_dir} 下没有这些目录）", file=sys.stderr)
+    for split in available:
         for label, model_dir in (("baseline", baseline), ("candidate", candidate)):
             report = _run_quietly(model_dir, data_dir, split, args.mode, args.rounds,
                                   args.manifest)
@@ -163,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     summary: dict = {"data_dir": str(data_dir), "mode": args.mode,
                      "baseline_dir": str(baseline), "candidate_dir": str(candidate)}
 
-    for split in ("val", "test"):
+    for split in available:
         base, base_gates = rows(f"{split}:baseline")
         cand, cand_gates = rows(f"{split}:candidate")
         tag = "val（官方门禁口径）" if split == "val" else "test（水印确证回放，官方原先无覆盖）"
