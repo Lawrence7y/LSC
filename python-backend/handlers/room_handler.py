@@ -1521,6 +1521,14 @@ def _is_ocr_round(round_data: dict[str, Any]) -> bool:
     return round_data.get("boundary_source") == _OCR_BOUNDARY_SOURCE
 def _set_boundary_quality(round_data: dict[str, Any]) -> str:
     """Attach an explicit physical-boundary quality separate from confirmation."""
+    # 任务 A5：消费 OCR 的回放段。这里是**最终 end + replay_segments 唯一共存**的位置
+    # （检测阶段产出回放段，视觉审计随后还会再裁一次 end），故在此做"终点不得伸进
+    # 赛后回放块"的收口；取审计（像素）与 OCR（计时器不可读）两路证据中更早的一方。
+    # 只改终点，不动入点；未识别到回放段时为空操作。
+    # 局部导入：与本文件其余 lsc.analyzer 引用一致，避免模块加载即拉起分析栈。
+    from lsc.analyzer.valorant_ocr_rounds import apply_replay_end_exclusion
+
+    apply_replay_end_exclusion(round_data)
     quality = classify_boundary_quality(
         confirm_status=round_data.get("confirm_status"),
         end_by=round_data.get("end_by"),

@@ -1176,3 +1176,128 @@ def test_refine_boundary_ts_combat_skips_center_banner_and_early_stops(monkeypat
     assert center_called[0] == 0  # combat 密扫完全跳过 center banner OCR
     assert top_called[0] == 4  # 提前退出：仅运行了 4 帧 OCR，而非全部 30 帧
 
+
+# ── A6（2026-09-10）：关键词表剔除高光叠加字样 + 回放水印否决 ──────────────
+
+
+def test_end_banner_keywords_exclude_highlight_overlays() -> None:
+    """clutch/ace/triple 是解说高光回放的叠加字样，不得再当作回合结束横幅。
+
+    原表中它们与 victory/defeat 同列，会让回放被判为"回合结束"（见根因报告）。
+    """
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    for word in ("clutch", "ace", "triple"):
+        assert word not in mod._END_BANNER_KEYWORDS, f"{word} 应已从结束横幅表移除"
+    # 真结算词必须保留
+    for word in ("victory", "defeat", "eliminated", "获胜", "戰敗"):
+        assert word in mod._END_BANNER_KEYWORDS
+    # 回放正面识别表存在且含中英关键词
+    assert "回放" in mod._REPLAY_BANNER_KEYWORDS
+    assert "replay" in mod._REPLAY_BANNER_KEYWORDS
+
+
+def _stub_center_ocr(monkeypatch, text: str) -> None:
+    """让中央横幅 OCR 对任意 ROI 都返回同一串文本。"""
+    import lsc.analyzer.ocr_detector as ocr_detector
+
+    def _ocr(_image):
+        return ([[(0, 0, 10, 10), text, 0.99]], 0.0)
+
+    monkeypatch.setattr(ocr_detector, "_get_ocr", lambda: _ocr)
+
+
+def test_replay_banner_vetoes_prep_and_end(monkeypatch) -> None:
+    """命中回放/慢动作水印时必须否决 prep/end，不得把回放当边界。"""
+    import numpy as np
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+    # 基线：纯结算横幅仍判 end
+    _stub_center_ocr(monkeypatch, "VICTORY")
+    assert mod._read_center_banner(frame, "broadcast") == (False, True)
+
+    # 基线：纯准备横幅仍判 prep
+    _stub_center_ocr(monkeypatch, "购买阶段")
+    assert mod._read_center_banner(frame, "broadcast") == (True, False)
+
+    # 回放叠加结算字样（英文）→ 否决
+    _stub_center_ocr(monkeypatch, "REPLAY VICTORY")
+    assert mod._read_center_banner(frame, "broadcast") == (False, False)
+
+    # 回放叠加准备字样（中文）→ 否决
+    _stub_center_ocr(monkeypatch, "精彩回放 购买阶段")
+    assert mod._read_center_banner(frame, "broadcast") == (False, False)
+
+    # 慢动作水印 → 否决
+    _stub_center_ocr(monkeypatch, "SLOW MOTION")
+    assert mod._read_center_banner(frame, "broadcast") == (False, False)
+
+
+# ── A5（2026-09-10）：消费 replay_segments，终点不得伸进赛后回放块 ──────────
+
+
+def test_apply_replay_end_exclusion_trims_to_first_segment() -> None:
+    """终点落在回放段之后 → 收到首个回放段起点，并留下审计字段。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 100.0, "end": 200.0, "result_ts": 190.0,
+         "replay_segments": [[195.0, 205.0]]}
+    trimmed = mod.apply_replay_end_exclusion(r)
+    assert trimmed == 5.0
+    assert r["end"] == 195.0
+    assert r["end_before_replay_exclusion"] == 200.0
+    assert r["replay_end_excluded_sec"] == 5.0
+    # 入点不得被这一改动影响
+    assert r["start"] == 100.0
+
+
+def test_apply_replay_end_exclusion_is_noop_without_segments() -> None:
+    """未识别到回放段时为空操作（不得写入任何字段）。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    for r in ({"start": 1.0, "end": 2.0}, {"start": 1.0, "end": 2.0, "replay_segments": []}):
+        before = dict(r)
+        assert mod.apply_replay_end_exclusion(r) is None
+        assert r == before
+
+
+def test_apply_replay_end_exclusion_respects_result_ts_floor() -> None:
+    """回放段起点早于结算瞬间 → 不裁剪（切片必须至少含回合结果）。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 10.0, "end": 100.0, "result_ts": 90.0,
+         "replay_segments": [[50.0, 95.0]]}
+    assert mod.apply_replay_end_exclusion(r) is None
+    assert r["end"] == 100.0
+
+
+def test_apply_replay_end_exclusion_noop_when_end_already_inside() -> None:
+    """终点已不晚于首个回放段起点 → 无需裁剪。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 10.0, "end": 90.0, "result_ts": 80.0,
+         "replay_segments": [[95.0, 99.0]]}
+    assert mod.apply_replay_end_exclusion(r) is None
+    assert r["end"] == 90.0
+
+
+def test_apply_replay_end_exclusion_survives_malformed_segments() -> None:
+    """畸形 segment 不得抛异常（脏数据保护）。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    for bad in ([None], [[1.0]], ["x", 2], [["a", "b"]], {"a": 1}, "nope"):
+        r = {"start": 1.0, "end": 100.0, "result_ts": 90.0, "replay_segments": bad}
+        assert mod.apply_replay_end_exclusion(r) is None
+        assert r["end"] == 100.0
+
+
+def test_apply_replay_end_exclusion_picks_earliest_of_multiple_segments() -> None:
+    """多段时取最早的起点，不取列表首项。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 10.0, "end": 300.0, "result_ts": 200.0,
+         "replay_segments": [[250.0, 260.0], [220.0, 230.0]]}
+    assert mod.apply_replay_end_exclusion(r) == 80.0
+    assert r["end"] == 220.0

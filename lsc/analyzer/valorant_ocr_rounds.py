@@ -103,8 +103,19 @@ _END_BANNER_KEYWORDS = (
     "戰敗", "勝利", "獲勝", "隊伍已被淘汰", "隊伍已淘汰",
     "輻能核心已引爆", "尖刺已引爆", "尖刺已拆除",
     # 英文
-    "victory", "defeat", "eliminated", "clutch", "ace", "triple",
+    # 注：曾含 "clutch"/"ace"/"triple"——它们是**解说高光回放的叠加字样**，
+    # 会让回放被误判为"回合结束"，已移除（见 A6 与
+    # docs/reports/valorant-broadcast-inpoint-rootcause-20260910.md）。
+    "victory", "defeat", "eliminated",
     "spike deton", "spike defus", "time expired",
+)
+
+# 回放正向识别：命中即**否决** prep/end 判定。赛事流的回放/慢动作水印
+# （REPLAY / 重播 / 慢动作）常与被误读的"回合开始/结束"横幅同域出现，
+# 靠词表单独判 prep/end 会把回放当成边界。此处只做否决，不新增边界来源。
+_REPLAY_BANNER_KEYWORDS = (
+    "回放", "重播", "精彩回顾", "慢动作", "慢鏡",
+    "replay", "instant replay", "slow motion", "slowmo",
 )
 
 
@@ -302,6 +313,9 @@ def _read_center_banner(
         # 兜底赛事包装/黑边 shift（与原多 ROI 行为一致）。
         if index < len(ratios) - 1 and texts:
             _joined = " ".join(texts).lower()
+            # 回放水印不算边界命中，不得据此早退：更宽 ROI 里可能才是真横幅。
+            if any(k in _joined for k in _REPLAY_BANNER_KEYWORDS):
+                continue
             if (
                 any(k in _joined for k in _PREP_BANNER_KEYWORDS)
                 or any(k in _joined for k in _END_BANNER_KEYWORDS)
@@ -312,6 +326,11 @@ def _read_center_banner(
     if not text:
         return False, False
     lower = text.lower()
+    # 回放水印优先：命中回放词即否决 prep/end。赛事流的 REPLAY/重播/慢动作字样
+    # 常与"回合开始/结束"同域出现（解说高光回放叠加），单靠词表会把回放当边界。
+    if any(k in lower for k in _REPLAY_BANNER_KEYWORDS):
+        _log.debug("center_banner 回放否决 ts_text=%s", text[:60])
+        return False, False
     prep = any(k in lower for k in _PREP_BANNER_KEYWORDS)
     end = any(k in lower for k in _END_BANNER_KEYWORDS)
     if prep or end:
@@ -781,6 +800,48 @@ def _annotate_replay(
         segs.append([round(run_start, 3), round(last_neutral_ts, 3)])
     if segs:
         round_data["replay_segments"] = segs
+
+
+def apply_replay_end_exclusion(round_data: dict[str, Any]) -> float | None:
+    """消费 ``replay_segments``：终点不得伸进赛后回放块（任务 A5）。
+
+    ``_annotate_replay`` 在检测阶段把「结算后 ≥5s 的 neutral 段」标为回放；但该回合的
+    最终 ``end`` 之后仍会被视觉审计再裁一次（``end_by=broadcast_exclusion``），可能落在
+    回放段**内部**、或把整段回放含进片尾。两个信号独立：审计靠模型像素，回放段靠 OCR
+    的「计时器不可读」间接证据——后者恰好能抓到模型漏掉的实战镜头回放。
+    因此取**更早**的一方：把 ``end`` 收到第一个回放段的起点。
+
+    下限为 ``result_ts``（结算瞬间），保证切片至少含回合结果，不至于裁到回合内容里。
+    返回被裁掉的秒数；未裁剪返回 ``None``。仅写审计字段，不改动入点。
+    """
+    segs = round_data.get("replay_segments")
+    if not isinstance(segs, list) or not segs:
+        return None
+    try:
+        end = float(round_data.get("end") or 0.0)
+        result_ts = float(round_data.get("result_ts") or 0.0)
+        starts = [
+            float(seg[0])
+            for seg in segs
+            if isinstance(seg, (list, tuple)) and len(seg) >= 2
+        ]
+        if not starts:
+            return None
+        first_start = min(starts)
+    except (TypeError, ValueError, IndexError):
+        return None
+    limit = max(result_ts, 0.0)
+    if first_start <= limit or end <= first_start:
+        return None
+    trimmed = round(end - first_start, 3)
+    round_data["end_before_replay_exclusion"] = round(end, 3)
+    round_data["replay_end_excluded_sec"] = trimmed
+    round_data["end"] = round(first_start, 3)
+    _log.info(
+        "回放终点排除(A5): end %.3f -> %.3f (裁掉 %.3fs, result_ts=%.3f, 首回放段起点=%.3f)",
+        end, first_start, trimmed, result_ts, first_start,
+    )
+    return trimmed
 
 
 def refine_valorant_round_boundaries(
@@ -1721,6 +1782,7 @@ __all__ = [
     "BROADCAST_MODE_SHADOW_ENV",
     "BUY_TIMER_MAX_SEC",
     "OcrRoundFSM",
+    "apply_replay_end_exclusion",
     "broadcast_mode_shadow_enabled",
     "detect_valorant_rounds_ocr",
     "extract_frames_cancellable",
