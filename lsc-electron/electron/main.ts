@@ -820,6 +820,11 @@ function spawnBackend(): void {
     // 静默丢弃，导致按文档「开 LSC_VALORANT_BROADCAST_MODE_SHADOW=1 取数」拿到 0 数据。
     // 见 docs/plans/valorant-broadcast-inpoint-workstream-20260910.md §3 第 1 步。
     'LSC_VALORANT_BROADCAST_MODE_SHADOW',
+    // 广播档模型目录覆盖（`ValorantFrameClassifier(profile="broadcast")` 读它）。
+    // 缺此项时**无法在不改仓库的前提下**把广播档切到候选模型做真实环境验证：
+    // 白名单会静默丢弃它，程序照旧加载内置模型，测出来的还是旧模型的结果。
+    // 见 docs/reports/valorant-broadcast-marker-roi-branch-20260911.md §7。
+    'LSC_VALORANT_BROADCAST_MODEL_DIR',
   ] as const) {
     if (process.env[key]) {
       safeEnv[key] = process.env[key]

@@ -11,6 +11,9 @@ def test_electron_passes_valorant_runtime_env_to_backend() -> None:
     # broadcast_mode 影子模式开关必须在白名单内：漏掉会被静默丢弃，导致
     # 「开 LSC_VALORANT_BROADCAST_MODE_SHADOW=1 取数」拿到 0 数据。
     assert "LSC_VALORANT_BROADCAST_MODE_SHADOW" in safe_env
+    # 广播档模型目录覆盖也必须在白名单内：漏掉就**无法在不改仓库的前提下**把广播档
+    # 切到候选模型做真实环境验证（会静默丢弃、照旧加载内置模型，测出来是旧模型的结果）。
+    assert "LSC_VALORANT_BROADCAST_MODEL_DIR" in safe_env
 
 
 def test_broadcast_mode_shadow_env_is_read_by_backend() -> None:
