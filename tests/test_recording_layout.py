@@ -249,3 +249,85 @@ def test_finalize_recording_file_busy_retry_converges_to_single_file(tmp_path, m
     assert len(files) == 1, f"重试后不得留下副本，实际: {[f.name for f in files]}"
     assert Path(result) == files[0]
     assert not src.exists()
+
+
+# ── 命名分裂修复（2026-09-10）：sidecar 必须随录像改名 ────────────────────
+
+
+def test_finalize_recording_file_moves_sidecars_along(tmp_path: Path) -> None:
+    """定稿改名后，analysis / finalization sidecar 必须跟到新名（{stem} 契约）。"""
+    solo = tmp_path / "EDG夺冠回顾"
+    solo.mkdir()
+    src = solo / "2026-09-10_18-05-24_录制中.mp4"
+    src.write_bytes(b"video")
+    (solo / "2026-09-10_18-05-24_录制中.analysis.json").write_text('{"highlights":[]}', encoding="utf-8")
+    (solo / "2026-09-10_18-05-24_录制中.finalization.json").write_text('{"phase":"completed"}', encoding="utf-8")
+
+    result = finalize_recording_file(
+        str(src),
+        started_at=datetime(2026, 9, 10, 18, 5, 24),
+        ended_at=datetime(2026, 9, 10, 18, 29, 20),
+        dest_dir=str(solo),
+    )
+    new_stem = Path(result).stem
+    assert Path(result).is_file()
+    assert (solo / f"{new_stem}.analysis.json").is_file(), "分析 sidecar 未随录像改名"
+    assert (solo / f"{new_stem}.finalization.json").is_file(), "收尾 sidecar 未随录像改名"
+    # 旧名不得残留（否则恢复扫描会同时读到两份）
+    assert not (solo / "2026-09-10_18-05-24_录制中.analysis.json").exists()
+    assert not (solo / "2026-09-10_18-05-24_录制中.finalization.json").exists()
+
+
+def test_finalize_recording_file_without_sidecars_is_fine(tmp_path: Path) -> None:
+    """没有 sidecar 时改名照常成功（不得因缺失而失败）。"""
+    solo = tmp_path / "EDG夺冠回顾"
+    solo.mkdir()
+    src = solo / "2026-09-10_18-05-24_录制中.mp4"
+    src.write_bytes(b"video")
+    result = finalize_recording_file(
+        str(src),
+        started_at=datetime(2026, 9, 10, 18, 5, 24),
+        ended_at=datetime(2026, 9, 10, 18, 29, 20),
+        dest_dir=str(solo),
+    )
+    assert Path(result).is_file()
+    assert not src.exists()
+
+
+def test_move_recording_sidecars_failure_is_non_fatal(tmp_path, monkeypatch):
+    """sidecar 搬运失败只能告警，绝不能影响录像本身的定稿结果。"""
+    import lsc.core.recording_layout as layout
+
+    solo = tmp_path / "EDG夺冠回顾"
+    solo.mkdir()
+    src = solo / "2026-09-10_18-05-24_录制中.mp4"
+    src.write_bytes(b"video")
+    (solo / "2026-09-10_18-05-24_录制中.analysis.json").write_text("{}", encoding="utf-8")
+
+    real_replace = layout.os.replace
+
+    def _flaky(s, d):
+        if str(s).endswith(".analysis.json"):
+            raise PermissionError("sidecar busy (simulated)")
+        return real_replace(s, d)
+
+    monkeypatch.setattr(layout.os, "replace", _flaky)
+    result = layout.finalize_recording_file(
+        str(src),
+        started_at=datetime(2026, 9, 10, 18, 5, 24),
+        ended_at=datetime(2026, 9, 10, 18, 29, 20),
+        dest_dir=str(solo),
+    )
+    assert Path(result).is_file(), "sidecar 失败不得影响录像定稿"
+    assert not src.exists()
+    # sidecar 仍留在旧名（可被后续收尾扫描重建），但录像名已经是最终名
+    assert (solo / "2026-09-10_18-05-24_录制中.analysis.json").is_file()
+
+
+def test_move_recording_sidecars_skips_when_stem_unchanged(tmp_path):
+    """stem 未变（同路径）时不误搬。"""
+    import lsc.core.recording_layout as layout
+
+    same = tmp_path / "a.mp4"
+    same.write_bytes(b"x")
+    assert layout.move_recording_sidecars(str(same), str(same)) == []

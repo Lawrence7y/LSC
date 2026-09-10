@@ -18,6 +18,57 @@ _log = logging.getLogger(__name__)
 _ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _IN_PROGRESS_SUFFIX = "_录制中.mp4"
 
+# 与录像同名的 sidecar 后缀。录像定稿改名（``*_录制中.mp4`` → ``*_至_*.mp4``）时
+# 必须同步改名，否则读取方按最终录像名查 ``{stem}.analysis.json`` /
+# ``{stem}.finalization.json`` 会落空——剪映导出的权威对账依赖分析 sidecar，
+# 落空会让「被拒切片」重新混入草稿。
+#
+# ⚠️ 本列表是 sidecar 后缀的单一事实来源，必须与
+# ``python-backend/persistence.py`` 的 ``_analysis_json_path`` /
+# ``_finalization_json_path`` 保持一致；由
+# ``tests/test_recording_layout_wiring.py`` 守卫（不一致会导致改名漏项）。
+SIDECAR_SUFFIXES: tuple[str, ...] = (
+    ".analysis.json",
+    ".finalization.json",
+    ".finalization.json.bak",
+)
+
+
+def move_recording_sidecars(src_path: str, dest_path: str) -> list[str]:
+    """把与录像同名的 sidecar 一起改名，维持 ``{stem}.*`` 契约。
+
+    只搬**实际存在**的 sidecar；单项失败仅告警，绝不影响录像本身的定稿结果
+    （sidecar 缺失可由后续收尾扫描重建，录像名不一致则会破坏读取契约）。
+    返回成功改名后的新路径列表。
+    """
+    if not src_path or not dest_path:
+        return []
+    src_stem = os.path.splitext(src_path)[0]
+    dest_stem = os.path.splitext(dest_path)[0]
+    if src_stem == dest_stem:
+        return []
+    moved: list[str] = []
+    for suffix in SIDECAR_SUFFIXES:
+        old = src_stem + suffix
+        if not os.path.isfile(old):
+            continue
+        new = dest_stem + suffix
+        try:
+            os.replace(old, new)
+        except OSError as exc:
+            _log.warning(
+                "sidecar 随录像改名失败 old=%s: %s", os.path.basename(old), exc
+            )
+            continue
+        moved.append(new)
+    if moved:
+        _log.info(
+            "sidecar 已随录像定稿改名 %d 项: %s",
+            len(moved),
+            ", ".join(os.path.basename(p) for p in moved),
+        )
+    return moved
+
 
 def sanitize_folder_name(name: str, *, fallback: str = "room", max_len: int = 40) -> str:
     text = _ILLEGAL_FS.sub("_", (name or "").strip())
@@ -210,6 +261,7 @@ def finalize_recording_file(
         return source_path
     try:
         os.replace(source_path, dest)
+        move_recording_sidecars(source_path, dest)
         return dest
     except OSError as exc:
         if not _is_cross_device(exc):
@@ -225,4 +277,5 @@ def finalize_recording_file(
         except OSError as cleanup_exc:  # noqa: BLE001
             _log.warning("回滚未完成的定稿副本失败 path=%s: %s", dest, cleanup_exc)
         raise
+    move_recording_sidecars(source_path, dest)
     return dest
