@@ -153,3 +153,75 @@ python scripts/valorant_vision/promote_model.py \
   `docs/plans/valorant-broadcast-inpoint-workstream-20260910.md` 的 B 附注，
   并据其结果决定 **B2**（阈值重推导）——B2 必须在本测试集上重新推导，不可沿用 §1.5 的
   val 集结论（§1.5 的"0.70→召回 100%"在真实回放上仅 8.3%）。
+
+---
+
+## 6. 补"第三来源会话"——候选清单与实测缺口（2026-09-10）
+
+`promote_model.py` 对**被评估 split 的 `data_summary`** 的硬要求：
+
+```python
+source_session_count >= 3
+source_sessions_by_type["broadcast"] >= 3   且   source_sessions_by_type["pov"] >= 3
+class_support 必须五类齐全（non_game/buy/combat/result/replay）
+```
+
+### 6.1 实测缺口（用合并数据集 `datasets/valorant_phase`）
+
+来源与会话从**文件名**派生（该数据集命名法为 `ann_broadcast_<会话>_<ts>.jpg` /
+`bc_broadcast_…` / `ann_pov_…`；与 `manifest_broadcast.jsonl` 的**后缀式**命名
+（`<会话>_<ts>_ann_broadcast_<会话>_<ts>.jpg`）**完全不重叠**，故既有清单对合并集
+**不提供任何溯源**——这一点本身是个坑，见 6.3）。
+
+| 来源 | val 现有会话 | 是否达标（≥3） |
+| :--- | :--- | :--- |
+| `broadcast` | `hanghang_20260721` / `valorant_esports_20260721` / `yuezi_20260720_202557` = **3** | ✅ 达标 |
+| `pov` | `ling_20260720_134749`(187 帧) / `tangqihua_20260721_141301`(32 帧) = **2** | ❌ **差 1 个** |
+
+**即：只差一个 POV 来源会话**（broadcast 侧已经够了）。
+
+### 6.2 候选（POV 会话清单，来自 `manifest_pov.jsonl`，共 4 个）
+
+| 会话 | 帧数 | 当前位置 | 可用性判断 |
+| :--- | ---: | :--- | :--- |
+| `ling_20260720_134749` | 2771 | `valorant_phase_pov/train/` | 已用于合并集 val |
+| `tangqihua_20260721_141301` | 169 | `valorant_phase_pov/train/` | 已用于合并集 val |
+| **`fish_live`** | **111** | **`valorant_phase_pov/` 的 `test/` 分片** | ⭐ **首选**：训练从未使用（天然留出），无泄漏风险 |
+| `hard_pov_mined` | 325 | `valorant_phase_pov/train/`（non_game 168 / combat 153 / buy 4） | 次选：需从训练集**搬走**（复制会造成 train/val 泄漏） |
+
+**建议：取 `fish_live`（111 帧）**，从 `valorant_phase_pov/test/{类}/` 搬入
+`datasets/valorant_phase/val/{类}/`，并在清单中标注 `source_type: pov`、
+`session_id: fish_live`。搬动量小（111 帧）、来源本就留出、无需改动 pov 训练集。
+
+### 6.3 必须先解决的前置问题：合并集**没有可用的溯源清单**
+
+`evaluate()` 的 `source_type`/`session_id` 只来自 `--manifest`
+（`_load_manifest_index` 按**完整路径与 basename 双键**）。而合并集的文件名与既有两份清单
+不重叠 → 直接在其上评估会得到 `source_session_count = 0`（本会话已实测复现）。
+
+**解法（二选一）**：
+
+1. **生成合并集专用清单**（推荐）：从文件名派生
+   `ann_|bc_ + broadcast|pov + <会话>` → 输出
+   `scripts/valorant_vision/manifest_phase_combined.jsonl`（逐帧含
+   `frame_path/label/split/source_type/session_id`），再追加 `fish_live` 的搬入条目；
+   评估时 `--data-dir datasets/valorant_phase --manifest <该清单>`。
+2. 扩展 `evaluate()` 支持"无清单时从文件名派生溯源"——改动面更大，且影响官方脚本，
+   不如方案 1 干净。
+
+### 6.4 ⚠️ 一个需要你拍板的语义问题
+
+本工作流要重训的是**广播档模型**（带 `full 0.7 + top_HUD 0.3` 融合、目录
+`valorant_phase_broadcast_finetune_v4_fused_*`），而晋级门禁却要求
+**`pov` 来源会话 ≥3**。实测把该广播模型放在含 POV 帧的合并集上评，Macro F1 只有
+**0.7635**（它在 POV 上本就没训练过）。
+
+所以二者必居其一：
+
+- **(A) 门禁本意针对通用/POV 系模型**（生产根目录 `lsc/analyzer/models/valorant_phase_v1.*`）
+  → 那么广播档模型需要**另一套**（尚未定义的）晋级口径，本 runbook 第 4 节需改写；
+- **(B) 门禁确实要求模型对两种来源都稳健** → 那广播档模型也必须纳入 POV 训练数据，
+  重训范围要扩大。
+
+**在 (A)/(B) 定下来之前，第 4 节"晋级"这条路对广播档模型是不可用的**（帧级门禁 + 来源会话
+双未达标）。但**第 2–3 节（重训 + 复核）不受影响**，仍可先跑出 `replay` 召回的变化。
