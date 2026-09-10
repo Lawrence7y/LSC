@@ -188,11 +188,16 @@ def mine(
                         entry["positives"] += 1
             entry["elapsed_sec"] = round(time.perf_counter() - started, 1)
             report["videos"].append(entry)
-            print(
+            line = (
                 f"  {video.name}: {entry['frames']} 帧 → {entry['crops']} 裁剪，"
-                f"命中标记 {entry['positives']}（{entry['elapsed_sec']}s）",
-                file=sys.stderr, flush=True,
+                f"命中标记 {entry['positives']}（{entry['elapsed_sec']}s）"
             )
+            print(line, file=sys.stderr, flush=True)
+            # 逐视频进度**落盘**：长任务常被放进管道（`2>$null | Select-Object -Last 2`），
+            # stderr 会被吞掉，届时只能靠产物大小猜进度 —— 落一份可直接 tail。
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with (out_dir / "_progress.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
             if keep_frames is None:
                 shutil.rmtree(frame_dir, ignore_errors=True)
             else:

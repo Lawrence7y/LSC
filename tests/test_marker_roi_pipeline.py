@@ -107,3 +107,54 @@ def test_marker_rois_stay_within_frame_and_reasonably_sized() -> None:
         # 框太宽会把字形横向压扁到读不出（实测教训），限制一下宽高比
         assert w == pytest.approx(min(w, 0.26)), name
         assert h == pytest.approx(min(h, 0.17)), name
+
+
+def test_mine_end_to_end_writes_progress_and_manifest(tmp_path, monkeypatch) -> None:
+    """`mine()` 全链路：抽帧 → 判标 → 落盘 → 清单 + **逐视频进度落盘**。
+
+    进度落盘不是装饰：长挖掘常被放进管道（`2>$null | Select-Object -Last 2`），
+    stderr 会被吞掉，届时只能靠产物大小猜进度。
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg 不在 PATH")
+
+    import scripts.valorant_vision.mine_marker_roi_from_videos as miner
+    from scripts.valorant_vision.build_marker_roi_dataset import ROIS
+
+    video = tmp_path / "clip.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "testsrc=size=320x240:rate=10:duration=3",
+         "-pix_fmt", "yuv420p", str(video)],
+        check=True, capture_output=True, timeout=120,
+    )
+    # 只让 top_right 那一路命中（按裁剪形状识别是哪一路）
+    x0, y0, bw, bh = ROIS["top_right"]
+    target = (int((y0 + bh) * 240) - int(y0 * 240), int((x0 + bw) * 320) - int(x0 * 320))
+    monkeypatch.setattr(
+        miner, "detect_marker_text",
+        lambda crop: ("REPLAY", 0.95) if tuple(crop.shape[:2]) == target else ("", 0.0),
+    )
+
+    out_dir = tmp_path / "mined"
+    report = miner.mine(
+        videos=[video], out_dir=out_dir, interval=1.0, split="train",
+        rois=ROIS, workers=1, keep_frames=None,
+    )
+
+    assert report["total_crops"] > 0
+    assert report["total_positives"] > 0
+    assert (out_dir / "manifest_marker_roi.jsonl").is_file()
+    assert (out_dir / "manifest_marker_roi_nodistill.jsonl").is_file()
+    progress = (out_dir / "_progress.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(progress) == 1
+    assert "crops" in progress[0] and "positives" in progress[0]
+    # 幂等：重跑同一批素材不应把清单翻倍（按 frame_path 去重）
+    again = miner.mine(
+        videos=[video], out_dir=out_dir, interval=1.0, split="train",
+        rois=ROIS, workers=1, keep_frames=None,
+    )
+    assert again["merged_rows"] == report["merged_rows"]
