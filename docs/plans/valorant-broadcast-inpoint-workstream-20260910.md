@@ -14,9 +14,11 @@
 | **诉求是否成立** | ✅ 成立，且已定位到**可验证的代码级根因**（不是"模型训得不够好"这么笼统） |
 | **最反直觉的结论** | 新训练的**回放标注对入点零影响**——它只被用在**出点截断**；而入点证据链 100% 依赖 OCR 交战钟 |
 | **已落地代码** | `broadcast_mode` **影子模式**（只记录、不生效）+ 24 条守卫测试 |
-| **已产出文档** | 3 份（根因分析、对照实验、本文件） |
-| **待决策** | 是否正式开启 `broadcast_mode`（需先取数） |
-| **待动手（会改变切片结果）** | 入点侧引入模型回放否决；`start_delta` 改为交叉证据 |
+| **已产出文档** | 4 份（根因分析、对照实验、本文件、**取数小结**） |
+| **取数已完成** | ✅ 2026-09-10 实机跑 1 场（`huya/29701502`，1432s，46 次影子扫描）→ **零差异**（生效 10 回合 / 影子 10 回合 / `next_combat` 0:0） |
+| **A1 决策** | ❌ **不接线** `broadcast_mode`——本段无 `next_combat` 闭合即无该类碎片，开关无事可做。详见小结 §3（附局限：未重现另一段录像的碎片形态） |
+| **待动手（会改变切片结果）** | 入点侧引入模型回放否决（A2）；**A4 落点已更正为 `valorant_broadcast.py:519`**，与 A3 合并提前到 A2 之前 |
+| **🔴 新增未修缺陷** | 收尾改名**不幂等** → 每次退出多一份完整录像副本（本次 3×1045MB=3.06GB，逐字节相同）；见小结 §4.3 |
 | **交付状态** | 本工作流可切分部分**已提交**（`3821ffb` 死代码清理 / `05ba92d` 三份文档 / `0f86d48` 影子模式）；其余 **4 条**工作流的改动仍在工作区，勿打包 → 见 §3 第 0 步执行记录 |
 | **回归基线** | 全量 pytest **1791 passed / 0 failed**（2026-09-10 复核复现；须配合 §6 的 ASCII `TMP/TEMP`，否则 `test_recording_asset_timeline` 可能被 safe-delete 拦截） |
 
@@ -45,7 +47,7 @@
 | # | 根因 | 性质 | 关键证据（文件:行号） |
 | :--- | :--- | :--- | :--- |
 | **R1** | OCR FSM 的「赛事回放保护」是**未接线的死代码** | 🔴 缺陷 | `valorant_ocr_rounds.py:416` 参数默认 `False`；生产调用 `:1455` 不传；`broadcast_mode=True` 仅存在于 `tests/test_valorant_ocr_rounds.py:159,183` |
-| **R2** | 入点证据链 **100% 由 OCR 交战钟驱动**，模型回放标签对入点**零影响** | 🔴 设计缺口 | `valorant_ocr_rounds.py:873` 硬编码 `start_confidence=0.95`；`valorant_broadcast.py` 5 处改写 `start`（`:746/:760/:981/:1014/:1228`）无一处来自回放证据 |
+| **R2** | 入点证据链 **100% 由 OCR 交战钟驱动**，模型回放标签对入点**零影响** | 🔴 设计缺口 | `start_confidence` **不是实测值**：`valorant_broadcast.py:519` 写二值代理 `0.95 if start_delta is not None else 0.70`（`valorant_ocr_rounds.py:873` 的 0.95 只是无人设置时的兜底）；`valorant_broadcast.py` 5 处改写 `start`（`:746/:760/:981/:1014/:1228`）无一处来自回放证据 |
 | **R3** | `start_delta` 是**自洽性**指标（粗扫与密扫之差），不是**准确性**指标 | 🔴 缺陷 | `continuous_finalization.py:187-210` 用 `start_delta ≤ 3.0` 判 `precise`；两者同源同盲 → 错入点可被盖章 `precise` 静默通过 |
 | **R4** | `replay` 类阈值 **0.77 高于模型自身概率均值 0.760** | 🟠 标定错误 | 模型元数据 `class_stable_prob={"replay":0.77}`（详见 §1.5 闭环复核） |
 | **R5** | 回放标注只作用于**出点侧**；OCR 自产的回放标注 `replay_segments` **无逻辑消费者** | 🟠 死数据 | `valorant_ocr_rounds.py:805` 写入（会落盘到 sidecar），全仓无代码读取 |
@@ -127,27 +129,38 @@
 | :--- | :--- | :--- | :--- |
 | A1 | 正式接线 `broadcast_mode=True` | `valorant_ocr_rounds.py:1455` | 中（会改变切片结果，需先取数） |
 | A2 | 入点密扫引入**模型回放否决**：回放帧上的交战钟不得作为入点锚点 | `_refine_boundary_ts:659` | 中高（改变入点，需强回归守卫） |
-| A3 | `precise` 需**交叉证据**（起点 ±2s 内视觉 combat 占比），不能只靠 `start_delta` 自洽 | `continuous_finalization.py:187-210`；**已存在的 `confidence < 0.8 → coarse` 门在 `:202`，目前是死门** | 中（影响导出门禁与人工复核量） |
-| A4 | **用实测值填充** `start_confidence`（**不是删掉** 0.95——见下方陷阱说明） | `valorant_ocr_rounds.py:873` | 低（但它是 A3 的开关，须与 A3 合并做） |
+| A3 | `precise` 需**交叉证据**（起点 ±2s 内视觉 combat 占比），不能只靠 `start_delta` 自洽 | `continuous_finalization.py:187-210`；`:202` 的 `confidence < 0.8 → coarse` 门**是活的但冗余**（见下方陷阱说明） | 中（影响导出门禁与人工复核量） |
+| A4 | **用实测值替换二值代理**（`valorant_broadcast.py:519`）——**不是删掉兜底 0.95**（见下方陷阱说明） | **`valorant_broadcast.py:519`**（主）；`valorant_ocr_rounds.py:873`（兜底） | 低（但它是 A3 的开关，须与 A3 合并做） |
 | A5 | **消费** `replay_segments`（作"起点/终点不得落入"的排除区间）或删除该死数据 | `valorant_ocr_rounds.py:805` + 门禁/密扫 | 低 |
 | A6 | 关键词表剔除 `"clutch"/"ace"/"triple"`，并新增"回放/replay/重播"正面识别 | `valorant_ocr_rounds.py:94-111` | 低 |
 | A7 | 非切块候选允许"前导回放"时**前移起点**（而非整条拒绝） | `valorant_broadcast.py:702` | 中（可能引入重复回合） |
 
-> **⚠️ A4 是陷阱，且它实际是 A3 的开关（2026-09-10 复核补充）**
+> **⚠️ A4 的落点是 `valorant_broadcast.py:519`，它仍是 A3 的开关（2026-09-10 实机取数修正）**
 >
-> `continuous_finalization.py:202` **已经存在**一道 `confidence < 0.8 → coarse` 的精度门。
-> 它是**死的**——因为 `start_confidence` 恒为 0.95：`valorant_ocr_rounds.py:873` 写的是
-> `r["start_confidence"] = float(r.get("start_confidence", 0.95))`，即**兜底默认值**，全链路
-> 无任何代码写入实测置信度。推论：**当前 `precise` ⟺ `boundary_refined` 且 `start_delta ≤ 3.0`，
-> 不含任何独立精度证据**——这是 R3 的直接实锤。
+> 实机取数（真实赛事直播，见 `docs/reports/valorant-broadcast-shadow-datacollection-20260910.md` §4.2）
+> 取到 `start_confidence=0.7`，**推翻本文档早先"恒为 0.95 / 全链路无人写入"的判断**。真实机制：
 >
-> **但不能直接删掉 0.95**：同文件 `:906-911` 广播分支要求
-> `start_confidence is not None` 才置 `boundary_refined=True`。删掉默认值 → 该字段变 `None`
-> → **所有广播回合 `boundary_refined=False` → 全部降级 `coarse`**（大面积回归）。
+> ```python
+> # lsc/analyzer/valorant_broadcast.py:519
+> item["start_confidence"] = 0.95 if item["start_delta"] is not None else 0.70
+> ```
 >
-> → 正确做法是**用实测值填充**；而一旦填了真值，`:202` 那道 0.8 门**自动复活**，
-> 这正是 A3 想要的大部分效果。**故建议把 A4 并入 A3，并提前到 A2 之前做**（便宜，
-> 且正好为 A2 提供它需要的回归守卫）。
+> `valorant_ocr_rounds.py:873` 的 `r.get("start_confidence", 0.95)` **只是无人设置时的兜底**，
+> 并非主写入点。因此：
+>
+> - `start_confidence` 是**二值代理**（有没有 delta），**不是实测视觉置信度**；
+> - `continuous_finalization.py:202` 的 `confidence < 0.8 → coarse` 门**是活的**——实测已触发
+>   （0.70 < 0.8 → `start_quality=coarse`）；
+> - 但该门**冗余**：`conf ≥ 0.8` ⟺ `start_delta is not None`，而广播档 `boundary_refined`
+>   本就要求 `start_delta is not None` → **永远提供不了 `boundary_refined` 之外的证据**。
+>   **R3 结论（`precise` 无独立精度证据）依然成立。**
+>
+> **陷阱不变**：不要删 `valorant_ocr_rounds.py:873` 的兜底——同文件 `:906-911` 广播分支要求
+> `start_confidence is not None` 才算 `boundary_refined`，删掉会让**所有广播回合降级 `coarse`**。
+>
+> → 正确做法：把 `:519` 的二值代理换成**实测值**（如起点 ±2s 内视觉 combat 占比）。一旦有真值，
+> `:202` 那道门才真正具备判别力——这正是 A3 想要的效果。**故把 A4 并入 A3，并提前到 A2 之前做**
+> （便宜，且正好为 A2 提供它需要的回归守卫）。
 
 ### B. 模型 / 数据层
 
@@ -257,12 +270,17 @@
 | 顺序 | 任务 | 验收标准 |
 | :--- | :--- | :--- |
 | 2.1 | A5 + A6（低风险先做，不改入点） | `replay_segments` 有明确消费方或被删除；关键词表更新且不引入新回归 |
-| 2.2 | A2（入点密扫回放否决） | 用已知含前置回放的真实录像核对：`start_quality="precise"` 的切片起点帧**不含**回放转场/水印；人工抽检 ≥10 条 |
-| 2.3 | A3（`precise` 交叉证据） | 现有 `tests/test_continuous_finalization.py`、`test_valorant_broadcast.py` 全绿；新增"错入点不得评为 precise"的守卫测试 |
-| 2.4 | A4（去硬编码） | `start_confidence` 反映实测视觉一致性 |
-| 2.5 | A7（前导回放前移） | 无重复回合；`round_key` 去重仍生效 |
+| 2.2 | **A4 + A3**（把 `valorant_broadcast.py:519` 的二值代理换成实测信心，同时激活 `:202` 的判断力） | 现有 `tests/test_continuous_finalization.py`、`test_valorant_broadcast.py` 全绿；新增"错入点不得评为 precise"的守卫测试；广播回合**不得**因 `start_confidence` 缺失而批量降级 `coarse` |
+| 2.3 | A2（入点密扫回放否决） | 用已知含前置回放的真实录像核对：`start_quality="precise"` 的切片起点帧**不含**回放转场/水印；人工抽检 ≥10 条 |
+| 2.4 | A7（前导回放前移） | 无重复回合；`round_key` 去重仍生效 |
 
-**顺序理由**：A5/A6 不改阈值不改入点，先做可积累回归信心；A2 依赖 A5 的排除区间；A3 在 A2 之后才有交叉证据可用。
+**顺序理由**（2026-09-10 实机取数后调整）：
+
+- A5/A6 不碰阈值不碰入点，先做可积累回归信心；
+- **A4 提前到 A2 之前**：它只把 `:519` 的二值代理换成实测值，是**便宜的一步**，而一旦有真值，
+  `:202` 那道已存在的门才真正有判别力——**等于用最小代价先拿到 A3 的护栏**，正好为随后改动入点
+  的 A2 提供回归守卫（原顺序把 A3/A4 排在 A2 之后，反而让最冒险的一步裸奔）；
+- A2 依赖 A5 的排除区间；A3 与 A4 合并做（二者是同一件事的两端）。
 
 ### 第 3 步：模型 / 数据（**周期最长，可与第 2 步并行**）
 
@@ -293,12 +311,13 @@
 | `docs/CODING_STANDARD.md` | 编码规范（异常处理、日志、import 规范） |
 | `CHANGELOG.md` | 本次改动已登记在 v1.0.12（含「清理死代码」与「broadcast_mode 影子模式」两节） |
 
-### 4.2 本次工作产出（**核心，先读这三份**）
+### 4.2 本次工作产出（**核心，先读这四份**）
 
 | 文档 | 内容 |
 | :--- | :--- |
 | `docs/reports/valorant-broadcast-inpoint-rootcause-20260910.md` | **根因分析**：两分支差异对照、入点证据链（7 步）、5 条根因（R1–R5，含文件:行号）、改进建议、验收标准。**开头有追加修正** |
 | `docs/reports/replay-vs-nextcombat-experiment-20260910.md` | **对照实验**：`broadcast_mode` 决策数据、模型 vs OCR 回放识别能力对照、影子模式实施说明（§6）、取数判读规则 |
+| `docs/reports/valorant-broadcast-shadow-datacollection-20260910.md` | **取数小结**（§3 第 1 步的交付物）：实机 1 场 / 46 次扫描的累计统计、**A1 不接线**的判据与局限；含 3 项副发现（白名单缺陷、`start_confidence` 二值代理、**收尾改名不幂等致副本**） |
 | **本文件** | 工作流状态、任务清单、阅读索引 |
 
 ### 4.3 关键源码（定位入点链路，建议按顺序读）
@@ -342,7 +361,7 @@
 | `broadcast_mode` 是否接线 | **否**（仅测试传入） | `valorant_ocr_rounds.py:416,1455`；`tests/test_valorant_ocr_rounds.py:159,183` |
 | 入点精修窗口 | **±3s @5fps**，需连续 2 帧 | `valorant_ocr_rounds.py:53,55,56` |
 | 交战钟判据 | `45 < timer ≤ max` | `_is_combat_timer:646`，`BUY_TIMER_MAX_SEC=45`（`:39`） |
-| 入点 confidence | **硬编码 0.95** | `valorant_ocr_rounds.py:873` |
+| 入点 confidence | **二值代理 `0.95` / `0.70`**（**不是实测值**：有 delta→0.95，无 delta→0.70） | 主写入 `valorant_broadcast.py:519`；`valorant_ocr_rounds.py:873` 为兜底默认 |
 | broadcast `precise` 容差 | `start_delta ≤ 3.0` | `continuous_finalization.py:20,187-190` |
 | 超长切块阈值 | `MAX_BROADCAST_ROUND_SEC = 150.0` | `valorant_broadcast.py:22` |
 | 终段稳定帧数 | `EXCLUSION_STABLE_FRAMES = 4` | `:26` |

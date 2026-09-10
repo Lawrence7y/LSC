@@ -41,7 +41,7 @@
 | # | 根因 | 性质 | 证据 |
 | :--- | :--- | :--- | :--- |
 | **R1** | OCR FSM 的「赛事回放保护」是**未接线的死代码**——`broadcast_mode` 生产链路从不传 `True` | 🔴 缺陷 | `feed()` 默认 `False`（`valorant_ocr_rounds.py:401`）；唯一 `broadcast_mode=True` 出现在 `tests/test_valorant_ocr_rounds.py:159,183` |
-| **R2** | 入点证据链 **100% 由 OCR 交战钟驱动**，模型回放标签对入点**零影响**（只用于出点截断） | 🔴 设计缺口 | `refine_valorant_round_boundaries:858` 硬编码 `start_confidence=0.95`；`valorant_broadcast.py` 中 5 处改写 `start` 无一处来自回放证据 |
+| **R2** | 入点证据链 **100% 由 OCR 交战钟驱动**，模型回放标签对入点**零影响**（只用于出点截断） | 🔴 设计缺口 | `start_confidence` **非实测值**：`valorant_broadcast.py:519` 写二值代理 `0.95 if start_delta is not None else 0.70`（`refine_valorant_round_boundaries` 的 `:873`/原 `:858` 只是兜底）；`valorant_broadcast.py` 中 5 处改写 `start` 无一处来自回放证据 |
 | **R3** | `start_delta` 是**自洽性**指标（粗扫与密扫之差），不是**准确性**指标 → 两个都错也能评为 "precise" | 🔴 缺陷 | `continuous_finalization.py:187-190` 用 `start_delta <= 3.0` 判 `precise`；两者同源同盲 |
 | **R4** | `replay` 类阈值 **0.77 高于模型自身均值 0.760** → 短回放大量漏检 | 🟠 标定错误 | 实测：单帧过阈值率 **42.6%**；5s 回放段检出率仅 **66.5%**；降到 0.70 即 **100%** |
 | **R5** | 回放标注只作用于**出点侧**；OCR 层自产的回放标注 `replay_segments` **无任何消费者** | 🟠 死数据 | `valorant_ocr_rounds.py:790` 写入，全仓仅测试断言读取 |
@@ -88,7 +88,8 @@
 ④ 物理密扫 ±3s @5fps（audit 之后执行）
    refine_valorant_round_boundaries() :793 → _refine_boundary_ts(target="combat") :644
        命中条件：交战钟 > 45s 连续 2 帧（_REFINE_WINDOW_SEC=3.0, _REFINE_RUN_FRAMES=2）
-       → 写 start_refined / start_delta，**start_confidence 硬编码 0.95**（:858）
+       → 写 start_refined / start_delta，start_confidence 取兜底 0.95（:873，旧编号 :858）——
+         实际值多由上游审计在 `valorant_broadcast.py:519` 预设（0.95/0.70 二值代理），此处只兜底
        ↓
 ⑤ 质量裁决
    room_handler._set_boundary_quality() :1527 → continuous_finalization.classify_boundary_quality() :116
@@ -139,7 +140,13 @@ closed = fsm.feed(label, ts, timer, timer_raw=timer_raw, cand_ts=cand_ts, prep_b
 
 ### R2：入点与模型完全解耦
 
-- `refine_valorant_round_boundaries:858` 写入 `start_confidence = 0.95`（固定高置信度，注释自述"没有分类器置信度时使用固定高置信度表示该边界由物理密扫确认"）。
+- `start_confidence` **不是实测视觉置信度**，而是 `valorant_broadcast.py:519` 写的二值代理：
+  `0.95 if item["start_delta"] is not None else 0.70`。`refine_valorant_round_boundaries`
+  （`:873`，旧编号 `:858`）的 `r.get("start_confidence", 0.95)` **只是无人设置时的兜底**。
+  连带的后果：`continuous_finalization.py:202` 的 `confidence < 0.8 → coarse` 门虽然是**活的**
+  （实测 0.70 即触发），却**冗余**——`conf ≥ 0.8` ⟺ `start_delta is not None`，而广播档
+  `boundary_refined` 本就要求它，故该门永远无法提供 `boundary_refined` 之外的证据。
+  （2026-09-10 实机取数修正，见 `valorant-broadcast-shadow-datacollection-20260910.md` §4.2。）
 - `valorant_broadcast.py` 中所有改写 `start` 的位置：`:746`/`:760`（切块算术）、`:981`（复用缓存精修值）、`:1014`（复用门禁后移值）、`:1228`（门禁后移）。**无一处由回放标签驱动**。
 - `_TIMER_OCR_LABELS = {"non_game","buy","result"}`（`:60`）**不含 replay**，即回放帧的计时器 OCR 被主动跳过——但入点密扫（第 ④ 步）是**独立 OCR 调用**，不受该集合约束，照常在回放帧上读到交战钟。
 
@@ -230,7 +237,11 @@ round_data["replay_segments"] = segs
 
 4. **下调 `replay` 阈值**：0.77 → **0.60~0.70**。实测 0.70 即可把 5s 回放检出率从 66.5% 提到 100%，且 combat 误判率仍低（val/combat argmax=replay 仅 1.0%）。建议用 val 集重新标定并补 replay 的 test 集。
 5. **`start_delta` 改为交叉证据**：`precise` 不能只靠"粗扫与密扫自洽"，须叠加**视觉证据**（如起点 ±2s 内模型判为 combat 的比例 ≥ 阈值）。否则 keep as coarse。
-6. **`start_confidence` 去硬编码**：`:858` 的 `0.95` 应改为基于视觉一致性的实测值。
+6. **`start_confidence` 换成实测值**：改 `valorant_broadcast.py:519` 的二值代理
+   （`0.95 if start_delta is not None else 0.70`）为基于视觉一致性的实测值。
+   ⚠️ **不要删** `refine_valorant_round_boundaries`（`:873`）的兜底 `0.95`——同文件 `:906-911`
+   广播分支要求 `start_confidence is not None` 才算 `boundary_refined`，删掉会让所有广播回合
+   降级 `coarse`。（2026-09-10 实机取数修正落点。）
 
 ### P2 — 清理与一致性
 
