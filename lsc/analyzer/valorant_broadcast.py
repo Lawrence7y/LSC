@@ -570,6 +570,70 @@ def _stable_combat_run_start(
     return None
 
 
+# A4/A3：起点实测视觉一致性窗口（秒）。
+#
+# ⚠️ 语义是**前视**窗口 ``[start, start + window]``，不是对称 ±window。
+# 实测依据（2026-09-10 真实赛事录像 7 个回合，见
+# docs/plans/valorant-broadcast-inpoint-workstream-20260910.md §2 2.2）：用对称
+# ±2s 会得到 6/7 个回合 <0.8（例：健康入点的样本是 `buy,unknown,combat,combat`
+# ——起点前本就该是购买阶段），从而把正常回合批量降级；改为前视后只有真正起点
+# 可疑的回合（如样本为 `unknown,non_game,replay,replay`，即起点落在回放里）低分。
+# 无样本时**不写值**（保留既有兜底），避免因缺样本批量降级。
+_START_VISUAL_WINDOW_SEC = 2.0
+
+
+def _start_visual_combat_ratio(
+    samples: list[tuple[float, str, float]] | None,
+    *,
+    start: float,
+    window: float = _START_VISUAL_WINDOW_SEC,
+) -> float | None:
+    """起点**向前** window 秒内视觉判为 ``combat`` 的样本占比。
+
+    这是任务 A3 要求的**交叉证据**：入点是否正确，不能只看 ``start_delta``
+    （粗扫与密扫之差，同源同盲），还要看起点之后的画面是否真在交战。
+    返回 ``None`` 表示窗口内无样本——调用方须保留既有取值，不得写 0.0。
+    """
+    if not samples:
+        return None
+    try:
+        start_f = float(start)
+        window_f = float(window)
+    except (TypeError, ValueError):
+        return None
+    in_window = [
+        row
+        for row in samples
+        if len(row) >= 2 and start_f <= float(row[0]) <= start_f + window_f
+    ]
+    if not in_window:
+        return None
+    combat = sum(1 for row in in_window if str(row[1]) == "combat")
+    return round(combat / len(in_window), 3)
+
+
+def _apply_start_visual_confidence(
+    item: dict[str, Any],
+    samples: list[tuple[float, str, float]] | None,
+) -> float | None:
+    """用实测视觉一致性替换 ``start_confidence`` 的二值代理（任务 A4）。
+
+    原实现（``_stamp_broadcast_decision`` 内）写的是
+    ``0.95 if start_delta is not None else 0.70``——它只复述"有没有 delta"，
+    于是 ``continuous_finalization`` 的 ``confidence < 0.8 → coarse`` 门永远
+    给不出 ``boundary_refined`` 之外的额外证据。换成实测占比后，该门才真正
+    具备判别力：起点不是交战画面的候选**评不上 precise**。
+
+    窗口内无样本时返回 ``None`` 且**不修改** ``item``（保留兜底取值）。
+    """
+    ratio = _start_visual_combat_ratio(samples, start=float(item.get("start") or 0.0))
+    if ratio is None:
+        return None
+    item["start_confidence"] = ratio
+    item["start_confidence_source"] = "visual_combat_ratio"
+    return ratio
+
+
 def _start_gate_decision(
     samples: list[tuple[float, str, float]],
     *,
@@ -1020,6 +1084,10 @@ def audit_broadcast_rounds(
                     item["broadcast_start_gate"] = "ok"
                     item["broadcast_start_gate_from"] = round(original_start, 3)
                     cache_item["start_gate_action"] = "ok"
+                # A4/A3：入点门禁已通过，用**实测**视觉一致性替换 start_confidence
+                # 的二值代理（0.95/0.70）。窗口内无样本时不写值，保留兜底，
+                # 避免因缺样本把广播回合批量降级为 coarse。
+                _apply_start_visual_confidence(item, gate_samples)
 
         cached_samples = [
             tuple(row)

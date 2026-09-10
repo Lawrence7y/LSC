@@ -1689,3 +1689,66 @@ def test_online_start_gate_persists_moved_start_across_pending_retry(monkeypatch
     # 重试必须复用后移后的入点，而不是退回 0.0
     assert second[0]["start"] == 3.0
     assert second[0]["broadcast_start_gate"] == "moved_from_non_combat"
+
+
+# ── A4（2026-09-10）：start_confidence 由二值代理改为实测视觉一致性 ──────────
+
+
+def test_start_visual_combat_ratio_measures_window() -> None:
+    import lsc.analyzer.valorant_broadcast as mod
+
+    samples = [
+        (8.0, "combat", 0.9),     # 起点之前：**不计入**（前视窗口，见函数注释）
+        (10.0, "combat", 0.9),    # 窗口下界 [10.0, 12.0]
+        (11.9, "buy", 0.9),
+        (12.1, "combat", 0.9),    # 超出窗口，不得参与
+        (20.0, "non_game", 0.9),  # 超出窗口，不得参与
+    ]
+    # 前视窗口内 2 个样本、1 个 combat
+    assert mod._start_visual_combat_ratio(samples, start=10.0) == 0.5
+
+
+def test_start_visual_combat_ratio_ignores_pre_start_samples() -> None:
+    """前视语义：起点之前的样本不参与（否则正常的"购买→交战"过渡会被误判低分）。
+
+    实测依据：真实录像里健康入点的样本形如 `buy,unknown,combat,combat`，
+    起点前本就该是购买阶段；对称窗口会把它算成 0.5 而导致批量降级。
+    """
+    import lsc.analyzer.valorant_broadcast as mod
+
+    samples = [
+        (9.0, "buy", 0.9),
+        (10.0, "combat", 0.9),
+        (11.0, "combat", 0.9),
+    ]
+    assert mod._start_visual_combat_ratio(samples, start=10.0) == 1.0
+
+
+def test_start_visual_combat_ratio_returns_none_without_samples() -> None:
+    """窗口内无样本必须返回 None（而不是 0.0），否则会把回合批量降级 coarse。"""
+    import lsc.analyzer.valorant_broadcast as mod
+
+    assert mod._start_visual_combat_ratio([], start=10.0) is None
+    assert mod._start_visual_combat_ratio(None, start=10.0) is None
+    assert mod._start_visual_combat_ratio([(100.0, "combat", 0.9)], start=10.0) is None
+
+
+def test_apply_start_visual_confidence_overwrites_binary_proxy() -> None:
+    import lsc.analyzer.valorant_broadcast as mod
+
+    samples = [(20.0, "combat", 0.9), (20.9, "combat", 0.9), (21.8, "replay", 0.9)]
+    item = {"start": 20.0, "start_confidence": 0.7}  # 旧二值代理
+    ratio = mod._apply_start_visual_confidence(item, samples)
+    assert ratio == 0.667 or ratio == 0.666 or ratio == 0.667
+    assert item["start_confidence"] == ratio
+    assert item["start_confidence_source"] == "visual_combat_ratio"
+
+
+def test_apply_start_visual_confidence_keeps_fallback_without_samples() -> None:
+    """验收要求：缺样本时不得写值，保留兜底 —— 广播回合不得因此批量降级 coarse。"""
+    import lsc.analyzer.valorant_broadcast as mod
+
+    item = {"start": 20.0, "start_confidence": 0.95}
+    assert mod._apply_start_visual_confidence(item, []) is None
+    assert item["start_confidence"] == 0.95
+    assert "start_confidence_source" not in item

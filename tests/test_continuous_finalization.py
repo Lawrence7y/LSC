@@ -622,3 +622,45 @@ def test_finalization_job_persists_and_deduplicates_refine_delivery_queue() -> N
     assert len(restored.refine_result_queue) == 1
     assert restored.ack_refine_results(["room-r:rec-r:round-1"]) == 1
     assert restored.refine_result_queue == []
+
+
+# ── A3 守卫（2026-09-10）：precise 需要**交叉证据**，不能只靠 start_delta 自洽 ──
+
+
+def test_wrong_start_never_precise_when_visual_agreement_is_low() -> None:
+    """起点画面不是交战时不得评为 precise（A3：错入点必须挡住）。
+
+    A4 把 start_confidence 由二值代理（0.95/0.70）换成实测视觉占比后，
+    `confidence < 0.8 → coarse` 这道门才真正具备判别力——此前它只是复述
+    "start_delta 是否存在"，给不出 boundary_refined 之外的任何证据。
+    """
+    # 对照：实测一致性高 + 双向 delta 齐备 → 仍可 precise
+    assert classify_boundary_quality(
+        confirm_status="vision_confirmed",
+        end_by="next_prep",
+        boundary_refined=True,
+        start_confidence=0.9,
+        end_confidence=0.94,
+        start_delta=0.2,
+        end_delta=0.3,
+    ) == "precise"
+    # 起点窗口内只有 1/4 帧是 combat（典型"回放里的实战镜头被当入点"）→ 不得 precise
+    assert classify_boundary_quality(
+        confirm_status="vision_confirmed",
+        end_by="next_prep",
+        boundary_refined=True,
+        start_confidence=0.25,
+        end_confidence=0.94,
+        start_delta=0.2,
+        end_delta=0.3,
+    ) == "coarse"
+    # 边界（恰好 0.8）仍视为达标，避免阈值抖动把正常回合误降级
+    assert classify_boundary_quality(
+        confirm_status="vision_confirmed",
+        end_by="next_prep",
+        boundary_refined=True,
+        start_confidence=0.8,
+        end_confidence=0.94,
+        start_delta=0.2,
+        end_delta=0.3,
+    ) == "precise"
