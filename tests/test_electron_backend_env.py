@@ -8,6 +8,17 @@ def test_electron_passes_valorant_runtime_env_to_backend() -> None:
     safe_env = source.split("const safeEnv", 1)[1].split("backendProcess = spawn", 1)[0]
     assert "LSC_VALORANT_MODEL_DIR" in safe_env
     assert "LSC_VALORANT_VISION_SHADOW" in safe_env
+    # broadcast_mode 影子模式开关必须在白名单内：漏掉会被静默丢弃，导致
+    # 「开 LSC_VALORANT_BROADCAST_MODE_SHADOW=1 取数」拿到 0 数据。
+    assert "LSC_VALORANT_BROADCAST_MODE_SHADOW" in safe_env
+
+
+def test_broadcast_mode_shadow_env_is_read_by_backend() -> None:
+    """白名单透传的开关名必须与后端读取的环境变量名一致（防改名后失联）。"""
+    backend = (ROOT / "lsc/analyzer/valorant_ocr_rounds.py").read_text(encoding="utf-8")
+    electron = (ROOT / "lsc-electron/electron/main.ts").read_text(encoding="utf-8")
+    assert 'BROADCAST_MODE_SHADOW_ENV = "LSC_VALORANT_BROADCAST_MODE_SHADOW"' in backend
+    assert "LSC_VALORANT_BROADCAST_MODE_SHADOW" in electron
 
 
 def test_development_mode_checks_runtime_dependencies() -> None:

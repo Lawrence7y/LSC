@@ -811,7 +811,16 @@ function spawnBackend(): void {
     // （CLAUDE.md §11.2：防止通过环境变量注入恶意 Python 模块路径）
     PYTHONPATH: getRuntimePackagesDir(),
   }
-  for (const key of ['LSC_VALORANT_MODEL_DIR', 'LSC_VALORANT_VISION_SHADOW'] as const) {
+  // 赛事/视觉专项开关白名单：只显式透传与 Valorant 分析相关的开关，其余环境变量
+  // 一律不进后端（见上方 PYTHONPATH 注释与 CLAUDE.md §11.2 的环境变量注入防御）。
+  for (const key of [
+    'LSC_VALORANT_MODEL_DIR',
+    'LSC_VALORANT_VISION_SHADOW',
+    // broadcast_mode 影子模式（赛事回放保护切换前取数）。缺此项时该开关会被白名单
+    // 静默丢弃，导致按文档「开 LSC_VALORANT_BROADCAST_MODE_SHADOW=1 取数」拿到 0 数据。
+    // 见 docs/plans/valorant-broadcast-inpoint-workstream-20260910.md §3 第 1 步。
+    'LSC_VALORANT_BROADCAST_MODE_SHADOW',
+  ] as const) {
     if (process.env[key]) {
       safeEnv[key] = process.env[key]
     }

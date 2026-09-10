@@ -331,3 +331,57 @@ def test_room_stream_not_reusable_after_huya_eof():
         ),
     )
     assert _room_stream_is_reusable(room) is False
+
+
+# ── C2 守卫：房间快照账本路径（2026-09-10 修复）──────────────────────────
+
+
+def _bare_orchestrator() -> RoomOrchestrator:
+    return RoomOrchestrator(controller_factory=lambda: object(), preview_factory=lambda: object())
+
+
+def test_config_file_path_follows_lsc_data_dir(monkeypatch, tmp_path):
+    """编排器房间快照必须跟随 LSC_DATA_DIR，不得写到用户全局 home。
+
+    历史缺陷：无条件硬编码 ``~/.lsc/LiveStreamClipper``，使任何开发/测试进程与
+    打包进程共用同一份全局配置。
+    """
+    from pathlib import Path
+
+    monkeypatch.setenv("LSC_DATA_DIR", str(tmp_path))
+    path = Path(_bare_orchestrator()._config_file_path())
+    assert path.as_posix().startswith(tmp_path.as_posix())
+    assert path.name == "rooms.json"
+    # 必须与后端权威账本 persistence.py 的 <data>/data/rooms.json 不同文件：
+    # 两者 schema 不同，共用会互相覆盖导致 mark/录制/预览状态丢失。
+    assert path.parent.name == "orchestrator"
+
+
+def test_config_file_path_falls_back_to_legacy_global(monkeypatch, tmp_path):
+    """未设 LSC_DATA_DIR 时回退历史全局位置（与 main.py 日志目录回退一致）。"""
+    monkeypatch.delenv("LSC_DATA_DIR", raising=False)
+    monkeypatch.setattr("os.path.expanduser", lambda p: str(tmp_path))
+    path = _bare_orchestrator()._config_file_path()
+    assert "LiveStreamClipper" in path
+    assert path.endswith("rooms.json")
+
+
+def test_shutdown_is_idempotent():
+    """重复 shutdown 不得抛异常（历史缺陷：第二次走 self.call() 抛 TimeoutError）。"""
+    o = _bare_orchestrator()
+    first = o.shutdown(timeout_sec=2.0)
+    assert isinstance(first, dict) and "rooms" in first
+    assert o.shutdown(timeout_sec=2.0) == {}
+    assert o.shutdown(timeout_sec=2.0) == {}
+
+
+def test_shutdown_idempotent_after_start():
+    """正常 start() 之后重复 shutdown 同样幂等，且首次仍完成资源清理。"""
+    o = _bare_orchestrator()
+    o.start()
+    try:
+        first = o.shutdown(timeout_sec=5.0)
+        assert isinstance(first, dict) and "rooms" in first
+        assert o.shutdown(timeout_sec=5.0) == {}
+    finally:
+        o.shutdown(timeout_sec=5.0)

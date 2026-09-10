@@ -551,6 +551,10 @@ class RoomOrchestrator:
         self._cmd_queue: queue.Queue[Any] = queue.Queue(maxsize=self._MAX_QUEUED_COMMANDS)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # shutdown() 幂等守卫：历史缺陷是第二次调用会向已停止的循环投递回调并抛
+        # TimeoutError（幂等性原由已删除的 Qt 门面用 _shut_down 标志提供）。
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = False
         self._pending_count = 0
         self._pending_lock = threading.Lock()
         self._rooms: dict[str, RoomSession] = {}
@@ -1003,12 +1007,30 @@ class RoomOrchestrator:
     # ── Persistence ─────────────────────────────────────────
 
     def _config_file_path(self) -> str:
-        """Return the JSON config file path for room persistence."""
-        base = os.path.join(
-            os.path.expanduser("~"),
-            ".lsc",
-            "LiveStreamClipper",
-        )
+        """Return the JSON config file path for room persistence.
+
+        根目录优先取 ``LSC_DATA_DIR``（Electron 启动后端时指向其 userData），使编排器
+        的房间快照与后端权威持久化（``persistence.py`` 的 ``data/rooms.json``）落在同一
+        数据根下；未设置时回退到历史全局位置 ``~/.lsc/LiveStreamClipper``，与
+        ``python-backend/main.py`` 的日志目录回退约定保持一致。
+
+        修复背景：此前无条件硬编码 ``~/.lsc/LiveStreamClipper``，使**任何**开发/测试
+        进程与打包进程共用同一份用户全局配置（该文件在生产链路无人读取：
+        ``load_rooms()`` 无调用方，见 ``tests/test_frontend_stability_guards.py``）。
+
+        ⚠️ 文件名刻意与 ``persistence.py`` 的 ``data/rooms.json`` 区分：两者 schema
+        不同（本文件只存房间标识/标题等纯数据，不存 mark/录制/预览状态），若共用同一
+        文件会互相覆盖导致状态丢失。
+        """
+        data_dir = os.environ.get("LSC_DATA_DIR", "").strip()
+        if data_dir:
+            base = os.path.join(data_dir, "orchestrator")
+        else:
+            base = os.path.join(
+                os.path.expanduser("~"),
+                ".lsc",
+                "LiveStreamClipper",
+            )
         os.makedirs(base, exist_ok=True)
         return os.path.join(base, "rooms.json")
 
@@ -3103,7 +3125,15 @@ class RoomOrchestrator:
         This is an application-exit cleanup path. It intentionally does not
         call save_rooms(), because shutdown should not overwrite the user's
         persisted room list with an empty runtime state.
+
+        幂等：重复调用（含并发调用）直接返回空统计，不再重复清理。
         """
+        with self._shutdown_lock:
+            if self._shutdown_done:
+                _log.debug("RoomOrchestrator.shutdown 重复调用，已忽略")
+                return {}
+            self._shutdown_done = True
+
         if self._thread is not None and threading.current_thread() is not self._thread:
             stats = self.call(type(self)._shutdown_resources, self, timeout_sec)
         else:

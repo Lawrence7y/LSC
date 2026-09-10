@@ -293,6 +293,17 @@ class LSCWebSocketBackend:
 
     def start(self):
         _log.info("Starting LSC Electron backend...")
+        # 赛事回放保护影子模式（切换前取数，见
+        # docs/plans/valorant-broadcast-inpoint-workstream-20260910.md §3 第 1 步）。
+        # 启动即自证开关是否真的透传到了后端：Electron 侧对后端子进程使用环境变量
+        # 白名单（CLAUDE.md §11.2），漏配会被静默丢弃，导致「以为开了」却录完整场
+        # 也拿不到影子统计。此处只打印原始值，判定逻辑仍以
+        # valorant_ocr_rounds.broadcast_mode_shadow_enabled() 为唯一权威。
+        _log.info(
+            "broadcast_mode 影子开关 %s=%r",
+            "LSC_VALORANT_BROADCAST_MODE_SHADOW",
+            os.environ.get("LSC_VALORANT_BROADCAST_MODE_SHADOW", ""),
+        )
         self._start_parent_watchdog()
 
         self._ws_thread = threading.Thread(target=self._run_ws_server, daemon=True)
