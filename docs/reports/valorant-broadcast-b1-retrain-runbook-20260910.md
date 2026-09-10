@@ -49,22 +49,48 @@ EOF
 
 ## 2. 训练（增量蒸馏微调）
 
+> ⚠️ **本节已被 2026-09-10 的实跑修正**——下面这条命令**不能直接照跑**，
+> 会同时踩两个坑（详见 `docs/reports/valorant-broadcast-b1-retrain-result-20260910.md` §1）：
+>
+> 1. **导出元数据会丢掉运行时契约**：`train_onnx_finetune.py` 原实现写出的
+>    `valorant_phase_v1.json` 不含教师的 `broadcast_input_fusion`（0.7/0.3）与
+>    `class_stable_prob`（`{"replay":0.77}`）→ 候选在运行时**静默退回"无融合 + 默认阈值"**，
+>    与基线**不可比**。→ 已加 `_inherit_runtime_meta()` 修好（脚本会自动继承并打印）。
+> 2. **`--new-manifest` 会让蒸馏项反向拉扯刚纠正的标签**：教师在被纠正的 455 帧上
+>    **454/455 判 `non_game`、平均 p(non_game)=0.983**，而 `--new-manifest` 给这些帧
+>    `distill_weight=0.5` → KL 项把标签**往回拉**。→ 必须用 `--hard-manifest`
+>    把这批帧的 `hard_distill_weight` 设为 **0.0**。
+>
+> 另注：`manifest_broadcast.jsonl` **没有** `label_source`/`coarse_confidence` 字段，
+> 故 `--new-manifest` 下所有帧都落在 `pseudo_sample_weight(0.0)=0.05` 这一档，
+> **只有相对权重有意义**（CE 是加权平均）。
+
 ```bash
+# ① 先生成两份清单（uniform 基线权重 + 455 帧纠正样本 distill=0 + 教师错误证据）
+python scripts/valorant_vision/build_retrain_manifests.py --hard-weight 1.0 --date-tag 20260910_k1
+
+# ② 再训练
 python scripts/valorant_vision/train_onnx_finetune.py \
   --data-dir datasets/valorant_phase_broadcast \
-  --new-manifest scripts/valorant_vision/manifest_broadcast.jsonl \
+  --new-manifest scripts/valorant_vision/manifest_broadcast_retrain_20260910_k1.jsonl \
+  --hard-manifest scripts/valorant_vision/manifest_broadcast_relabel_hard_20260910_k1.jsonl \
   --teacher-dir lsc/analyzer/models/valorant_phase_broadcast_finetune_v4_fused_20260907 \
-  --out-dir   <输出目录，如 C:/lsc_models/broadcast_retrain_20260910> \
-  --teacher-cache <缓存目录，如 C:/lsc_models/teacher_cache> \
+  --out-dir   C:/lsc_models/broadcast_retrain_k1_20260910 \
+  --teacher-cache C:/lsc_models/teacher_cache_broadcast_retrain_20260910.json \
   --epochs 10 --seed 20260907
 ```
 
 - `--teacher-dir` 指向**当前广播档模型**（蒸馏教师）。
 - 训练样本来自 `data_dir/{train}/{类}/*.jpg` → **目录即标签**，故标签纠正直接生效；
-  `--new-manifest` 只用于**样本权重**（`human`=2.0 / 伪标按置信度）。
-- `--hard-manifest` 可选（难例加权）。
+  `--new-manifest`/`--hard-manifest` 只影响**样本权重**。
+- **`hard_weight` 不是杠杆**（实测 1 与 4 几乎无差）；权重口径应按**唯一源帧**算
+  （`train/replay` 1587 帧 = 158 唯一源，10.04×；被纠正的 455 帧 = 35 唯一源）。
 - 输出：`<out-dir>/valorant_phase_v1.onnx` + `.json`。
 - 备选：`train_export.py --data-dir ... --out-dir ...`（非蒸馏路线）。
+
+**实跑结果（2026-09-10）**：`val` Macro F1 **0.8935 → 0.7821**、`combat` 召回
+0.9490 → 0.7937、`replay` 精确率 1.0000 → 0.5000；`test` replay 召回 0.3438 → **0.6250**。
+**净收益为负，五项帧级门禁全不过** → 见结果报告 §4–§6。
 
 ---
 
@@ -97,11 +123,38 @@ python scripts/valorant_vision/reeval_replay_verified.py \
 > 注意：当前广播模型 **5 项帧级门禁有 4 项不合格**，且来源会话数不足——
 > 它自身也不是"已晋级"状态（元数据 `promotion_state: null`，故分类器不做门禁校验）。
 
-### 3.2 判读标准
+### 3.2 判读标准（2026-09-10 实跑后修订）
 
 - **首要**：`test` 的 **Replay Recall 从 0.3438 显著上升**（这是标签纠正是否奏效的直接证据）；
-- 次要：`val` 的 Replay Recall / Non-Game Recall 不得因搬运样本而下降；
+- ~~次要：`val` 的 Replay Recall / Non-Game Recall 不得因搬运样本而下降~~
+  → **改为硬停止条件：`val` Macro F1 不得退化**。原表述只盯 replay / non_game 两类召回，
+  而本次实跑恰恰是**这两类召回一模一样（0.9000 / 0.8882）**、代价全在 **`combat` 召回**
+  （0.9490 → 0.7937）与由此而来的 **Macro F1 −0.1114** —— 按原标准会被误判为"达标"。
 - 目标：`val` 五项全过（Macro F1 ≥0.94、Replay/Non-game Recall ≥0.95、Buy/Result Precision ≥0.97）。
+
+**必做的两个对照（本次经验）**：
+1. **不换标签的对照**（同配方/同权重/同关蒸馏，仅 455 帧保持原标签）——否则无法区分
+   "配方问题"与"标签问题"。本次对照 ≈ baseline（0.8838 vs 0.8935），据此才敢把归因钉在标签上；
+2. **基线同口径取值**：runbook 里的 0.8935 是 `broadcast_runtime` 口径，而训练脚本内部的
+   `_metrics` 是**纯整帧 argmax** 口径（基线同口径 = **0.8950**）。两者混用会把口径差
+   误读成掉点/涨点。
+
+实测终表（官方 `broadcast_runtime` 口径）：
+
+| 模型 | split | Macro F1 | replay 召回 | replay 精确 | combat 召回 |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| baseline | val | **0.8935** | 0.9000 | 1.0000 | 0.9490 |
+| 对照（不换标签，同配方） | val | 0.8838 | 0.9000 | 0.9643 | 0.9612 |
+| 重训（`hard_weight=1`） | val | 0.7821 | 0.9000 | 0.5000 | 0.7937 |
+| 重训（`hard_weight=4`） | val | 0.7771 | 0.9000 | 0.4426 | 0.7864 |
+| baseline | test | 0.5336 | 0.3438 | 1.0000 | 0.3125 |
+| 对照（不换标签，同配方） | test | 0.5491 | 0.4062 | 1.0000 | 0.3125 |
+| 重训（`hard_weight=1`） | test | 0.5340 | **0.6250** | 0.8333 | 0.1875 |
+| 重训（`hard_weight=4`） | test | 0.5158 | **0.6250** | 0.8333 | 0.1875 |
+
+> 读法：`test` 召回的 **+0.0624** 来自纯微调（对照也涨），标签纠正的**净增量**是
+> **0.4062 → 0.6250**；但 `val` 一侧是实打实的退化。**结论见结果报告 §6：先改输入契约（B4），
+> 在此之前不要用该数据集重训广播档模型。**
 
 ---
 
@@ -257,3 +310,30 @@ class_support 必须五类齐全（non_game/buy/combat/result/replay）
 
 **在 (A)/(B) 定下来之前，第 4 节"晋级"这条路对广播档模型是不可用的**（帧级门禁 + 来源会话
 双未达标）。但**第 2–3 节（重训 + 复核）不受影响**，仍可先跑出 `replay` 召回的变化。
+
+---
+
+## 7. 实跑记录（2026-09-10 执行完毕）
+
+第 2–3 节**已实跑四次**（baseline / 不换标签对照 / `hard_weight=1` / `hard_weight=4`），
+结论与全部证据见 **`docs/reports/valorant-broadcast-b1-retrain-result-20260910.md`**。
+
+**要点（详细推导见该报告）**：
+
+| 问题 | 结论 |
+| :--- | :--- |
+| 训练链路能跑通吗 | ✅ 能。onnx2torch → 微调 → 再导出 ONNX **往返数值忠实**（argmax 32/32 一致、概率行和恰为 1）；RTX 3060 Laptop 6GB 上 10 epoch ≈ 20 分钟 |
+| B1 首要判据（`test` replay 召回↑） | ✅ **0.3438 → 0.6250**（其中纯微调贡献到 0.4062，标签纠正净增到 0.6250） |
+| 代价 | ❌ `val` Macro F1 **0.8935 → 0.7821**、`combat` 召回 **0.9490 → 0.7937**、`replay` 精确 **1.0000 → 0.5000**；五项帧级门禁全不过 |
+| 是配方问题还是标签问题 | **标签问题**（单变量对照：不换标签的同配方对照 = 0.8838 ≈ baseline 0.8935） |
+| 调 `hard_weight` 有用吗 | ❌ 1 与 4 几乎无差（0.7986 vs 0.7934 纯整帧口径） |
+| B2（阈值重推导）能补救吗 | ❌ 不能。门扫到 0.98 时 `val` Macro F1 只回到 0.8274，`combat` 召回**一直是 0.79 不动**（降级成 `unknown` 在召回里同样算错），且 `test` 真实回放召回反掉到 0.5312 |
+| 根因 | 标记在 224×224 下只有 **≈20×8 px**（右上角风格）/ **≈21×14 px**（右下角风格），整帧里只占 **8%** 的边缘能量；纠正后的样本只有 **35 个唯一源帧** → 模型改抓**内容/会话近路**，把交战画面判成 `replay` |
+| 下一步 | **先改输入契约**（标记 ROI 独立支路 = B4）；或生产上直接用**已有的 OCR 判据**（两种风格都已实测可读，72/72、≥0.99）。**在此之前不要重训/挂载广播档模型** |
+
+**产物**（仓库外）：`C:/lsc_models/broadcast_retrain_20260910`（k4）、
+`..._k1_20260910`（k1）、`..._control_20260910`（对照）；
+对照集硬链接 `D:/lsc_models/control_broadcast/`（精确复现纠正前分布）。
+
+**§6.4 的语义问题（A)/(B) 仍未定**，且**不因本次实跑而解除**：
+即使门禁口径问题解决了，本次重训的模型也**过不了帧级门禁**（含 `combat` 侧退化）。

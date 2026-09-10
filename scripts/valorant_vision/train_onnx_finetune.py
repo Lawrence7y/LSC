@@ -34,6 +34,39 @@ from train_weighted_distill import (  # noqa: E402
 )
 
 
+# 运行时**后处理契约**：这些键不由训练产生，而是推理侧的行为声明
+# （融合权重 / 类专属稳定阈值）。教师模型靠它们决定"怎么把概率变成标签"，
+# 微调产物必须原样继承，否则导出模型会在运行时静默退回
+# "无融合 + 默认阈值"，与基线不可比（2026-09-10 实测踩到：v4_fused 的
+# broadcast_input_fusion 与 class_stable_prob 会在重训导出时凭空消失）。
+_INHERITED_META_KEYS: tuple[str, ...] = (
+    "thresholds",
+    "class_stable_prob",
+    "broadcast_input_fusion",
+    "calibration_note",
+)
+
+
+def _inherit_runtime_meta(teacher_dir: Path, meta: dict[str, Any]) -> list[str]:
+    """把教师的运行时后处理契约并入导出元数据，返回实际继承到的键名。"""
+    path = teacher_dir / "valorant_phase_v1.json"
+    if not path.is_file():
+        return []
+    try:
+        teacher_meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"警告: 无法读取教师元数据 {path}: {exc}", file=sys.stderr)
+        return []
+    if not isinstance(teacher_meta, dict):
+        return []
+    inherited: list[str] = []
+    for key in _INHERITED_META_KEYS:
+        if teacher_meta.get(key) is not None:
+            meta[key] = teacher_meta[key]
+            inherited.append(key)
+    return inherited
+
+
 def _seed_everything(seed: int) -> None:
     import numpy as np
     import torch
@@ -251,7 +284,9 @@ def train(
         "dataset_digest": _dataset_digest(samples, validation),
         "training_strategy": "onnx_initialized_weighted_human_pseudo_finetune",
     }
+    inherited = _inherit_runtime_meta(teacher_dir, meta)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"继承教师运行时契约: {', '.join(inherited) if inherited else '（无）'}")
     print(f"导出完成: {onnx_path}")
     print(f"元数据:   {meta_path}")
     print(f"sha256:   {digest}")
