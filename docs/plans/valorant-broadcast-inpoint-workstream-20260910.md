@@ -306,6 +306,11 @@ OCR 原文/模型预测）。
 **验证（同权重、仅改融合）**：行和精确=1；72 帧确证集 @0.77 **0/72 → 12/72**；
 val 逐类召回**零回归且全线小涨**（replay 85.2→**100.0%**，non_game/buy/combat/result
 各 +0.5～3.0pp）。仍不能替代 B1（多数水印确证帧被判 `non_game`、`p_replay<0.02`）。
+⚠️ **生效前提**：B5 改的是广播档融合路径（`predict_broadcast_batch` + 该模型的
+`broadcast_input_fusion: 0.7/0.3` 元数据），而**广播档接线（`profile="broadcast"`、
+`_DEFAULT_BROADCAST_MODEL_DIR`）本身属另一条工作流的未提交改动**——HEAD 的
+`audit_broadcast_rounds` 仍构造 `ValorantFrameClassifier()`（POV 基线模型）。
+故 B5 的收益要等广播档接线落盘后才在生产链路体现（提交点自洽性不受影响）。
 
 **⑤ 顺带证实 OCR 回放启发式的误报率很高**：22 段 OCR 回放段里**只有 3 段**出现过字面
 `REPLAY` 水印；其余扫描帧的 OCR 文本多是 `HALFTIME`+`00:00:47`+`6-6`（中场）、
