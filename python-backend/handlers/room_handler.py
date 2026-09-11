@@ -8056,22 +8056,32 @@ def register_room_handlers(server, bridge):
                      and _scanned_recording_id != _current_recording_id)
                     or (_scanned_video and video_path and _scanned_video != video_path)
                 )
+                # `video_path` 在文件切换的瞬间可能为 None（录制器正在换段/停止），
+                # 而 `_stale_scan_result` 只要 recording_id 变了就是 True —— 于是下面那行
+                # 日志 `os.path.basename(None)` 直接抛
+                # `TypeError: expected str, bytes or os.PathLike object, not NoneType`，
+                # **把整个持续分析循环打断**（2026-09-11 实测：验收跑里分析循环因此终止，
+                # 状态轮询拿不到数据、停止时报"该房间没有持续分析任务"）。日志行绝不能
+                # 成为崩溃点，故统一走 `_safe_base()`。
+                def _safe_base(value: object) -> str:
+                    return os.path.basename(str(value)) if value else ""
+
                 if _stale_scan_result:
                     # 若 scanned_video 只是当前 video_path 的更名前身（_录制中.mp4 被重命名），
                     # 说明属于同一段有效内容，无需丢弃，允许正常消费！
-                    _scanned_base = os.path.basename(_scanned_video)
+                    _scanned_base = _safe_base(_scanned_video)
                     if ("_录制中" in _scanned_base or "_in_progress" in _scanned_base) and not os.path.exists(_scanned_video):
                         _stale_scan_result = False
                 if _stale_scan_result and not worker_result:
                     _log.warning(
                         "持续分析跳过旧文件空扫描结果（文件已切换）: room_id=%s, scanned=%s, current=%s",
-                        room_id, os.path.basename(_scanned_video), os.path.basename(video_path),
+                        room_id, _safe_base(_scanned_video), _safe_base(video_path),
                     )
                     last_consumed_at = worker_completed_at
                 elif _stale_scan_result and worker_result:
                     _log.info(
                         "持续分析保留旧分段文件扫描回合入列: room_id=%s, scanned=%s, rounds=%d",
-                        room_id, os.path.basename(_scanned_video), len(worker_result),
+                        room_id, _safe_base(_scanned_video), len(worker_result),
                     )
                 elif can_consume and worker_error:
                     last_consumed_at = worker_completed_at

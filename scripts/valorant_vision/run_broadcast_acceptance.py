@@ -319,6 +319,22 @@ async def run(args) -> dict:
             if room_id:
                 stop_rec = await client.call("stop_recording", {"room_id": room_id}, timeout=180)
                 record("停止录制", bool(stop_rec.get("success", True)), str(stop_rec)[:120])
+                # ⚠️ 程序的停止录制是 `wait_for_finalize=False`（日志实测）——**不在这里等，
+                # 脚本随后杀后端会让"定稿改名"来不及做，录像永远停在 `_录制中`**，
+                # 剪映草稿守卫就会永久拒绝它（正是现场那个现象的成因之一）。
+                target = str(stop_rec.get("output_path") or "")
+                if target:
+                    deadline = time.monotonic() + args.finalize_timeout
+                    while time.monotonic() < deadline:
+                        still = os.path.exists(target) and "_录制中" in os.path.basename(target)
+                        if not still:
+                            break
+                        await asyncio.sleep(2.0)
+                    record(
+                        "停止后已收尾定稿（改名出 '_录制中'）",
+                        not (os.path.exists(target) and "_录制中" in os.path.basename(target)),
+                        os.path.basename(target),
+                    )
     finally:
         await asyncio.sleep(3)
         backend.terminate()
@@ -379,7 +395,19 @@ async def run(args) -> dict:
     if video:
         vp = Path(video)
         record("录像文件存在", vp.is_file(), vp.name)
-        record("录像已收尾定稿（文件名不含 '_录制中'）", "_录制中" not in vp.name, vp.name)
+        # sidecar 里的 video_path 在定稿改名后会失效（程序自身的 move_recording_sidecars
+        # 也只改文件名不改内容）→ 按同一"开始时间戳"找最终文件，而不是只看 sidecar 里的名字。
+        final_path = vp
+        if "_录制中" in vp.name:
+            stamp = vp.name.split("_录制中")[0]
+            candidates = sorted(vp.parent.glob(f"{stamp}_至_*.mp4"))
+            if candidates:
+                final_path = candidates[-1]
+        record(
+            "录像已收尾定稿（文件名不含 '_录制中'）",
+            "_录制中" not in final_path.name and final_path.is_file(),
+            final_path.name,
+        )
         if vp.is_file():
             record("录像时长 > 0", vp.stat().st_size > 100_000, f"{vp.stat().st_size/1e6:.1f}MB")
 
@@ -460,6 +488,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work-dir", type=Path, default=None, help="隔离数据目录（缺省 C:/lsc_models/acceptance/<时间戳>）")
     parser.add_argument("--broadcast-model-dir", type=Path, default=DEFAULT_BROADCAST_MODEL)
     parser.add_argument("--connect-timeout", type=float, default=120.0)
+    parser.add_argument("--finalize-timeout", type=float, default=120.0,
+                        help="停止录制后等待定稿改名的最长秒数")
     parser.add_argument("--start-analysis-timeout", type=float, default=120.0,
                         help="起录后等待'可分析'的最长秒数（起录↔分析之间有竞态）")
     parser.add_argument("--python", default=None,

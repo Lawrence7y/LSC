@@ -526,3 +526,20 @@ def test_fallback_recording_stop_async_delegates_to_capture(tmp_path) -> None:
     controller2 = mod.HeadlessRecordingController()
     controller2._capture = None
     assert controller2.stop_recording_async() is False
+
+
+def test_analysis_loop_log_line_tolerates_none_video_path() -> None:
+    """源码守卫：持续分析循环里的日志行不得对可能为 None 的 video_path 直接 basename。
+
+    实测崩溃：文件切换瞬间 `video_path` 为 None，而 `_stale_scan_result` 只要
+    recording_id 变了就是 True → `os.path.basename(None)` 抛 TypeError，
+    **整个持续分析循环被打断**（状态轮询拿不到数据、停止时报"没有持续分析任务"）。
+    """
+    source = (Path(__file__).resolve().parents[1] / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    block = source[source.index("_stale_scan_result = bool("):]
+    block = block[: block.index("elif can_consume and worker_error")]
+    assert "_safe_base(" in block, "崩溃点应改用容忍 None 的 _safe_base()"
+    for line in block.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        assert "os.path.basename(video_path)" not in line, f"仍在直接 basename(None)：{line.strip()}"
