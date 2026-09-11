@@ -316,11 +316,21 @@ async def run(args) -> dict:
             record("有回合级产出（高光或确认回合 ≥1）", (peak_rounds >= 1) or (peak_highlights >= 1),
                    f"confirmed_rounds={peak_rounds} total_highlights={peak_highlights}")
 
-            stopped = await client.call("stop_continuous_analysis", {"room_id": room_id}, timeout=180)
-            record("停止持续分析", bool(stopped.get("success", True)), str(stopped)[:120])
+            # WS 可能已掉线（实测 ConnectionClosedError）→ 兜住，别让产物校验与报告
+            # 一起丢掉；掉线本身记一条失败项。
+            try:
+                stopped = await client.call("stop_continuous_analysis", {"room_id": room_id}, timeout=180)
+                record("停止持续分析", bool(stopped.get("success", True)), str(stopped)[:120])
+            except Exception as exc:  # noqa: BLE001
+                record("停止持续分析", False, f"WS 中断: {type(exc).__name__}")
             if room_id:
-                stop_rec = await client.call("stop_recording", {"room_id": room_id}, timeout=180)
-                record("停止录制", bool(stop_rec.get("success", True)), str(stop_rec)[:120])
+                try:
+                    stop_rec = await client.call("stop_recording", {"room_id": room_id}, timeout=180)
+                except Exception as exc:  # noqa: BLE001
+                    stop_rec = {}
+                    record("停止录制", False, f"WS 中断: {type(exc).__name__}")
+                else:
+                    record("停止录制", bool(stop_rec.get("success", True)), str(stop_rec)[:120])
                 # ⚠️ 程序的停止录制是 `wait_for_finalize=False`（日志实测）——**不在这里等，
                 # 脚本随后杀后端会让"定稿改名"来不及做，录像永远停在 `_录制中`**，
                 # 剪映草稿守卫就会永久拒绝它（正是现场那个现象的成因之一）。
