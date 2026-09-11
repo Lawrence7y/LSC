@@ -803,8 +803,16 @@ def _annotate_replay(
 
 
 # A5 安全门（2026-09-11）：`replay_segments` 是启发式产物，实测会成片误标
-# （见 apply_replay_end_exclusion 文档里的实证），故裁剪前设幅度上限 + 确认证据门槛。
-_REPLAY_END_EXCLUSION_MAX_SEC = 5.0
+# （见 apply_replay_end_exclusion 文档里的实证），故裁剪前设**确认证据门槛** +
+# **幅度上限**两道门。分工（依据实测校正过）：
+# - 确认证据门槛 = **正确性**门。上轮那次 14.5s 误裁（窗口内 44 帧零标记、全判 combat）
+#   对应回合是 `confirm_status=pending` + `broadcast_audit=pending_no_exclusion`，
+#   由它挡住；
+# - 幅度上限 = **荒谬窗**兜底。原设 5s 经实测**过紧**：同一段 14 分钟真实直播里连拦
+#   6s/11s/16s 三次，而那三次窗口内容是 non_game（7/7、11/12 帧）与 non_game+replay
+#   （11/17 帧带 REPLAY 标记）——按内容本该裁。5s 会把"长回放/长非游戏尾料"一并挡掉，
+#   属于用错判据。放宽到 30s 只用于兜住明显荒谬的声明窗。
+_REPLAY_END_EXCLUSION_MAX_SEC = 30.0
 _REPLAY_END_CONFIRMED_STATUS = frozenset({"vision_confirmed"})
 _REPLAY_END_CONFIRMED_AUDIT = frozenset({"passed"})
 

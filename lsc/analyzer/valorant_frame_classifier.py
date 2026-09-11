@@ -35,6 +35,11 @@ _FUSION_BYPASS_CLASSES: tuple[str, ...] = ("replay",)
 # 该键缺失或 weight<=0 时**行为与不带该支路完全一致**（默认关闭）。
 _MARKER_ROI_BRANCH_KEY = "marker_roi_branch"
 _MARKER_ROI_DEFAULT_CLASS = "replay"
+# 单次 run 的裁图数上限：输入是 `ROI 数 × 帧数` 个 224×224 图，实测 3544 个
+# （886 帧 × 4 路，≈2GB）会让 DML 抛 E_OUTOFMEMORY。分块后峰值有界。
+_MARKER_MAX_CROPS_PER_RUN = 256
+# 推理期连续失败多少次后停用支路（环境性问题继续重试只会刷日志+白烧时间）
+_MARKER_MAX_FAILURES = 3
 _DEFAULT_DIR = Path(
     os.environ.get("LSC_VALORANT_MODEL_DIR", "")
     or (Path(__file__).resolve().parent / "models")
@@ -139,6 +144,7 @@ class ValorantFrameClassifier:
         # 回放标记支路（懒加载；未声明或 weight<=0 时永不创建，行为与不带支路一致）
         self._marker_session: Any = None
         self._marker_error: str | None = None
+        self._marker_failures = 0
         self._lock = threading.Lock()
         self._telemetry_lock = threading.Lock()
         self._inference_frames_total = 0
@@ -425,16 +431,23 @@ class ValorantFrameClassifier:
                     owners.append(index)
             if not crops:
                 return None
-            probs = np.asarray(
-                session.run(None, {input_name: self._preprocess_batch(crops)})[0],
-                dtype=np.float32,
-            )
-            if probs.shape != (len(crops), len(_CLASS_NAMES)):
-                raise ModelContractError(
-                    f"marker roi probabilities shape mismatch: {probs.shape}"
+            # 分块推理：一次 run 的输入是 `ROI 数 × 帧数` 个 224×224 裁图。
+            # 2026-09-11 实测 886 帧 × 4 路 = 3544 个裁图（≈2GB 输入）时 DML 直接
+            # `E_OUTOFMEMORY`。分块后单次输入有界，也顺带限制峰值显存。
+            column: list[float] = []
+            for offset in range(0, len(crops), _MARKER_MAX_CROPS_PER_RUN):
+                chunk = crops[offset : offset + _MARKER_MAX_CROPS_PER_RUN]
+                probs = np.asarray(
+                    session.run(None, {input_name: self._preprocess_batch(chunk)})[0],
+                    dtype=np.float32,
                 )
-            for index, value in zip(owners, probs[:, cfg["class_index"]], strict=True):
-                evidence[index] = max(evidence[index], float(value))
+                if probs.shape != (len(chunk), len(_CLASS_NAMES)):
+                    raise ModelContractError(
+                        f"marker roi probabilities shape mismatch: {probs.shape}"
+                    )
+                column.extend(float(value) for value in probs[:, cfg["class_index"]])
+            for index, value in zip(owners, column, strict=True):
+                evidence[index] = max(evidence[index], value)
             # `weight` 是**证据乘子**（不是开关）：`weight<1` 表示"要更强才认"。
             # `weight=1.0` 时是恒等，便于把默认行为写成"完全信任"。
             if cfg["weight"] != 1.0:
@@ -442,6 +455,28 @@ class ValorantFrameClassifier:
         except ModelContractError as exc:
             self._marker_error = str(exc)
             _log.warning("回放标记支路推理失败（%s），按整帧证据处理", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 - 见下：支路**绝不能**拖垮主链路
+            # 2026-09-11 实测：大批量（886 帧 → 3544 个裁图）时 DML 抛
+            # `E_OUTOFMEMORY`，而 ORT 在拼错误信息时又把它解码成
+            # `UnicodeDecodeError`（非 ModelContractError）→ 异常直接冒泡，
+            # **整个 predict_broadcast_batch 被打断**，广播档连主预测都拿不到。
+            # 支路只是"锦上添花"的证据源，任何推理期异常都必须降级为"无支路证据"。
+            self._marker_failures += 1
+            self._marker_error = f"{type(exc).__name__}: {exc}"
+            if self._marker_failures <= _MARKER_MAX_FAILURES:
+                _log.warning(
+                    "回放标记支路推理异常（%s: %s），本次按整帧证据处理（第 %d 次）",
+                    type(exc).__name__, exc, self._marker_failures,
+                )
+            if self._marker_failures >= _MARKER_MAX_FAILURES:
+                # 连续失败说明是环境性问题（显存/Provider），继续每批重试只会刷日志+白烧时间
+                self._marker_session = None
+                self._marker_error = f"disabled_after_{self._marker_failures}_failures: {exc}"
+                _log.error(
+                    "回放标记支路连续失败 %d 次，已停用（本进程内不再尝试）：%s",
+                    self._marker_failures, exc,
+                )
             return None
         return evidence
 

@@ -1304,13 +1304,14 @@ def test_apply_replay_end_exclusion_picks_earliest_of_multiple_segments() -> Non
     assert r["end"] == 296.0
 
 
-def test_apply_replay_end_exclusion_skips_when_trim_exceeds_cap() -> None:
-    """幅度超限 → 不裁剪，写候选幅度与原因，并要求人工复核。
+def test_apply_replay_end_exclusion_blocks_genuinely_lost_footage() -> None:
+    """现场回归：声明回放窗与真实内容不符时**必须不裁**（否则切掉真实交战）。
 
-    这是 2026-09-11 真实直播里的现场回归：某回合被声明回放段
-    ``[[674.094,679.094],[681.094,688.094]]``，若照裁会砍掉 **14.539s**；
-    实测该区间 44 帧零 REPLAY 标记、模型全判 combat（p_replay ≤ 0.007）
-    —— 砍掉的是真实交战画面。
+    2026-09-11 实测：某回合被声明回放段 ``[[674.094,679.094],[681.094,688.094]]``，
+    照裁会砍掉 **14.539s**；但该区间逐秒 44 帧零 REPLAY 标记、模型全判 combat
+    （p_replay ≤0.007）→ 砍掉的是真实交战画面。该回合的审计状态正是
+    ``confirm_status=pending`` + ``broadcast_audit=pending_no_exclusion``，
+    由"确认证据"这道门挡住（幅度上限已放宽到 30s，不再由它兜这一例）。
     """
     import lsc.analyzer.valorant_ocr_rounds as mod
 
@@ -1319,11 +1320,33 @@ def test_apply_replay_end_exclusion_skips_when_trim_exceeds_cap() -> None:
          "replay_segments": [[674.094, 679.094], [681.094, 688.094]]}
     assert mod.apply_replay_end_exclusion(r) is None
     assert r["end"] == 688.633, "不得改动终点"
-    assert "end_before_replay_exclusion" not in r
-    assert "replay_end_excluded_sec" not in r
-    assert r["replay_end_exclusion_skipped"] == "trim_exceeds_cap"
+    assert "end_before_replay_exclusion" not in r and "replay_end_excluded_sec" not in r
+    assert r["replay_end_exclusion_skipped"] == "boundary_not_confirmed"
     assert r["replay_end_exclusion_candidate_sec"] == 14.539
     assert r["replay_end_exclusion_candidate_from"] == 674.094
+
+
+def test_apply_replay_end_exclusion_allows_long_but_confirmed_trim() -> None:
+    """已确认的回合允许按长窗裁剪：实测该裁的窗口是 6s/11s/16s，5s 上限属用错判据。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 700.0, "end": 776.063, "result_ts": 757.0, "confirm_status": "vision_confirmed",
+         "replay_segments": [[760.063, 766.063], [768.063, 775.063]]}
+    assert mod.apply_replay_end_exclusion(r) == 16.0
+    assert r["end"] == 760.063
+
+
+def test_apply_replay_end_exclusion_caps_absurd_window() -> None:
+    """幅度上限只兜"明显荒谬"的声明窗（>30s），并置人工复核。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    # 回放窗起点必须晚于 result_ts（否则被既有的"不得裁进回合内容"下界先挡掉）
+    r = {"start": 100.0, "end": 500.0, "result_ts": 400.0, "confirm_status": "vision_confirmed",
+         "replay_segments": [[440.0, 460.0]]}
+    assert mod.apply_replay_end_exclusion(r) is None
+    assert r["end"] == 500.0
+    assert r["replay_end_exclusion_skipped"] == "trim_exceeds_cap"
+    assert r["replay_end_exclusion_candidate_sec"] == 60.0
     assert r["boundary_review_required"] is True
 
 

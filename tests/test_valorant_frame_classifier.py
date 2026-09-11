@@ -348,3 +348,109 @@ def test_marker_roi_evidence_weight_is_a_multiplier(monkeypatch) -> None:
         else:
             assert evidence is not None
             assert abs(float(evidence[0]) - expected) < 1e-6
+
+
+def test_marker_branch_is_chunked_to_bound_peak_memory(monkeypatch) -> None:
+    """裁图必须分块推理：一次 run 的输入是 `ROI 数 × 帧数` 个 224×224 图。
+
+    2026-09-11 实测：886 帧 × 4 路 = 3544 个裁图（≈2GB 输入）时 DML 直接
+    `E_OUTOFMEMORY`，而 ORT 拼错误信息时又把它解码成 UnicodeDecodeError。
+    """
+    import numpy as np
+
+    from lsc.analyzer.valorant_frame_classifier import _MARKER_MAX_CROPS_PER_RUN
+
+    class _FakeInput:
+        name = "input"
+
+    seen: list[int] = []
+
+    class _FakeSession:
+        def get_inputs(self):
+            return [_FakeInput()]
+
+        def run(self, _outputs, feed):
+            size = feed["input"].shape[0]
+            seen.append(size)
+            row = np.zeros((1, 5), dtype=np.float32)
+            row[0, 4] = 0.9
+            return [np.tile(row, (size, 1))]
+
+    frames = 400  # × 4 路 = 1600 个裁图 → 应被切成多块
+    model = ValorantFrameClassifier()
+    model._meta = _marker_meta(**_valid_branch())
+    monkeypatch.setattr(model, "load", lambda: None)
+    monkeypatch.setattr(model, "_marker_session", _FakeSession())
+    evidence = model.marker_roi_evidence([np.zeros((120, 160, 3), dtype=np.uint8)] * frames)
+
+    assert evidence is not None and len(evidence) == frames
+    assert len(seen) > 1, f"未分块：单次 run 输入 {seen}"
+    assert max(seen) <= _MARKER_MAX_CROPS_PER_RUN, seen
+
+
+def test_marker_branch_inference_failure_degrades_gracefully(monkeypatch) -> None:
+    """**任何**推理期异常都必须降级为"无支路证据"，不得打断主预测。
+
+    现场：DML 抛 E_OUTOFMEMORY，ORT 把它解码成 UnicodeDecodeError（不是
+    ModelContractError）→ 原先只捕获后者，异常冒泡把整个 predict_broadcast_batch
+    打断，广播档连主预测都拿不到。
+    """
+    import numpy as np
+
+    class _FakeInput:
+        name = "input"
+
+    class _ExplodingSession:
+        def get_inputs(self):
+            return [_FakeInput()]
+
+        def run(self, _outputs, _feed):
+            raise UnicodeDecodeError("utf-8", b"\xb2", 0, 1, "invalid start byte")
+
+    model = _fusion_model_with_marker(
+        monkeypatch,
+        full_row=[0.01, 0.01, 0.01, 0.01, 0.96],
+        top_row=[0.50, 0.20, 0.20, 0.05, 0.05],
+        evidence=None,
+    )
+    monkeypatch.setattr(model, "_marker_session", _ExplodingSession())
+    monkeypatch.setattr(model, "marker_roi_evidence", ValorantFrameClassifier.marker_roi_evidence.__get__(model))
+
+    out = model.predict_broadcast_batch([np.zeros((120, 160, 3), dtype=np.uint8)])
+    # 主链路照常给出结果（回放证据退回整帧），且错误被记下
+    assert float(out[0][4]) > 0.9
+    assert model._marker_error and "UnicodeDecodeError" in model._marker_error
+    assert model._marker_failures == 1
+
+
+def test_marker_branch_disables_after_repeated_failures(monkeypatch) -> None:
+    """连续失败到上限后停用支路（环境性问题不该每批重试刷日志）。"""
+    import numpy as np
+
+    from lsc.analyzer.valorant_frame_classifier import _MARKER_MAX_FAILURES
+
+    class _FakeInput:
+        name = "input"
+
+    calls = {"n": 0}
+
+    class _ExplodingSession:
+        def get_inputs(self):
+            return [_FakeInput()]
+
+        def run(self, _outputs, _feed):
+            calls["n"] += 1
+            raise RuntimeError("boom")
+
+    model = ValorantFrameClassifier()
+    model._meta = _marker_meta(**_valid_branch())
+    monkeypatch.setattr(model, "load", lambda: None)
+    monkeypatch.setattr(model, "_marker_session", _ExplodingSession())
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    for _ in range(_MARKER_MAX_FAILURES):
+        assert model.marker_roi_evidence([frame]) is None
+    assert calls["n"] == _MARKER_MAX_FAILURES
+    # 停用后不再调用 session
+    assert model.marker_roi_evidence([frame]) is None
+    assert calls["n"] == _MARKER_MAX_FAILURES
+    assert model._marker_error.startswith("disabled_after")
