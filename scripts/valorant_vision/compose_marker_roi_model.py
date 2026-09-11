@@ -25,6 +25,7 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +52,57 @@ def _default_rois() -> dict[str, list[float]]:
 
 
 DEFAULT_ROIS: dict[str, list[float]] = _default_rois()
+
+
+def install_in_place(
+    *,
+    base_dir: Path,
+    marker_model: Path,
+    weight: float,
+    rois: dict[str, list[float]],
+    target_class: str,
+) -> dict:
+    """把标记支路**装进生产模型目录本体**（原地），让真实程序无需环境变量即可加载。
+
+    安全性：
+    - **不动** `valorant_phase_v1.onnx`（`sha256` 校验针对它，保持有效）；
+    - 先把原元数据备份为 `valorant_phase_v1.json.bak-<时间戳>`，回滚只需还原该文件；
+    - 已安装过（元数据里已有 `marker_roi_branch`）时**拒绝重复安装**，避免叠加声明。
+    """
+    base_onnx = base_dir / BASE_ONNX
+    base_meta = base_dir / BASE_META
+    for path in (base_onnx, base_meta, marker_model):
+        if not path.is_file():
+            raise SystemExit(f"缺少文件: {path}")
+    meta = json.loads(base_meta.read_text(encoding="utf-8"))
+    if "marker_roi_branch" in meta:
+        raise SystemExit(
+            f"{base_meta} 里已有 marker_roi_branch；要换模型请先回滚（还原 .bak-* 并删 valorant_marker_v1.onnx）"
+        )
+    backup = base_meta.with_name(BASE_META + ".bak-" + time.strftime("%Y%m%d_%H%M%S"))
+    shutil.copyfile(base_meta, backup)
+    shutil.copyfile(marker_model, base_dir / MARKER_ONNX)
+    marker_meta_src = marker_model.with_suffix(".json")
+    if marker_meta_src.is_file():
+        shutil.copyfile(marker_meta_src, base_dir / "valorant_marker_v1.json")
+    meta["marker_roi_branch"] = {
+        "model_path": MARKER_ONNX,
+        "weight": float(weight),
+        "rois": {name: [float(v) for v in box] for name, box in rois.items()},
+        "class": target_class,
+        "note": "标记支路：标记区按原生分辨率放大成独立输入，与整帧证据取 max（只增不减）",
+    }
+    base_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "mode": "in_place",
+        "production_dir": str(base_dir),
+        "meta_backup": str(backup),
+        "marker_onnx": str(base_dir / MARKER_ONNX),
+        "weight": float(weight),
+        "rois": list(rois),
+        "class": target_class,
+        "rollback": f"复制回 {backup} 为 {BASE_META} 并删除 {base_dir / MARKER_ONNX}",
+    }
 
 
 def compose(
@@ -134,7 +186,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-dir", type=Path, required=True)
     parser.add_argument("--marker-model", type=Path, required=True,
                         help="标记模型的 onnx 文件路径")
-    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="候选目录（与 --in-place 二选一）")
+    parser.add_argument("--in-place", action="store_true",
+                        help="装进 --base-dir 生产目录本体（真实环境测试/上线）")
     parser.add_argument("--weight", type=float, default=1.0, help="<=0 等于关闭支路")
     parser.add_argument("--class", dest="target_class", default="replay")
     parser.add_argument("--rois-json", type=Path, default=None,
@@ -145,16 +200,25 @@ def main(argv: list[str] | None = None) -> int:
     rois = DEFAULT_ROIS
     if args.rois_json is not None:
         rois = json.loads(args.rois_json.read_text(encoding="utf-8"))
-    report = compose(
-        base_dir=args.base_dir.expanduser().resolve(),
-        marker_model=args.marker_model.expanduser().resolve(),
-        out_dir=args.out_dir.expanduser().resolve(),
-        weight=args.weight,
-        rois=rois,
-        target_class=args.target_class,
-    )
+    if bool(args.in_place) == bool(args.out_dir):
+        parser.error("必须且只能指定 --out-dir 或 --in-place 之一")
+    base_dir = args.base_dir.expanduser().resolve()
+    marker_model = args.marker_model.expanduser().resolve()
+    if args.in_place:
+        report = install_in_place(
+            base_dir=base_dir, marker_model=marker_model,
+            weight=args.weight, rois=rois, target_class=args.target_class,
+        )
+        target_dir = base_dir
+    else:
+        target_dir = args.out_dir.expanduser().resolve()
+        report = compose(
+            base_dir=base_dir, marker_model=marker_model,
+            out_dir=target_dir, weight=args.weight, rois=rois,
+            target_class=args.target_class,
+        )
     if not args.no_self_check:
-        report["self_check"] = self_check(args.out_dir.expanduser().resolve())
+        report["self_check"] = self_check(target_dir)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

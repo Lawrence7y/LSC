@@ -802,6 +802,13 @@ def _annotate_replay(
         round_data["replay_segments"] = segs
 
 
+# A5 安全门（2026-09-11）：`replay_segments` 是启发式产物，实测会成片误标
+# （见 apply_replay_end_exclusion 文档里的实证），故裁剪前设幅度上限 + 确认证据门槛。
+_REPLAY_END_EXCLUSION_MAX_SEC = 5.0
+_REPLAY_END_CONFIRMED_STATUS = frozenset({"vision_confirmed"})
+_REPLAY_END_CONFIRMED_AUDIT = frozenset({"passed"})
+
+
 def apply_replay_end_exclusion(round_data: dict[str, Any]) -> float | None:
     """消费 ``replay_segments``：终点不得伸进赛后回放块（任务 A5）。
 
@@ -813,6 +820,19 @@ def apply_replay_end_exclusion(round_data: dict[str, Any]) -> float | None:
 
     下限为 ``result_ts``（结算瞬间），保证切片至少含回合结果，不至于裁到回合内容里。
     返回被裁掉的秒数；未裁剪返回 ``None``。仅写审计字段，不改动入点。
+
+    ⚠️ **2026-09-11 加的两道安全门（实测踩到才加的）**：``replay_segments`` 是
+    **启发式**产物（「计时器不可读」≠ 一定是回放），实测有成片误标：
+
+    - 记录 `12-00-36` 起的一段真实直播里，某回合被声明回放段
+      ``[[674.094,679.094],[681.094,688.094]]``，本函数据此裁掉 **14.539s**；
+      但该区间逐秒 44 帧 **零 REPLAY 标记**、模型全判 ``combat``（conf 0.68–0.96、
+      ``p_replay ≤ 0.007``）→ **切掉的是真实交战画面**。
+    - 同一录像另一回合声明回放段 ``[252.391,258.391]``，而真实回放在 ``[269,283]``
+      → 时间戳偏约 17s。
+
+    故裁剪前要求**已有确认证据**，并对幅度设上限；不满足时**不裁剪**、把候选幅度与
+    跳过原因写进审计字段（供人工复核），而不是静默按错窗口动刀。
     """
     segs = round_data.get("replay_segments")
     if not isinstance(segs, list) or not segs:
@@ -833,7 +853,34 @@ def apply_replay_end_exclusion(round_data: dict[str, Any]) -> float | None:
     limit = max(result_ts, 0.0)
     if first_start <= limit or end <= first_start:
         return None
-    trimmed = round(end - first_start, 3)
+
+    def _skip(reason: str, candidate: float) -> None:
+        """不裁剪，但把"本来会裁多少、为什么没裁"落进审计字段（可复核）。"""
+        round_data["replay_end_exclusion_skipped"] = reason
+        round_data["replay_end_exclusion_candidate_sec"] = round(candidate, 3)
+        round_data["replay_end_exclusion_candidate_from"] = round(first_start, 3)
+        if reason == "trim_exceeds_cap":
+            # 幅度超限说明声明窗口很可能有误 → 必须人工看一眼，不能静默放过
+            round_data["boundary_review_required"] = True
+        _log.warning(
+            "回放终点排除(A5) 跳过: 原因=%s, 候选裁剪=%.3fs, end=%.3f, 首回放段起点=%.3f",
+            reason, candidate, end, first_start,
+        )
+
+    candidate_trim = round(end - first_start, 3)
+    if candidate_trim > _REPLAY_END_EXCLUSION_MAX_SEC:
+        _skip("trim_exceeds_cap", candidate_trim)
+        return None
+    confirmed = (
+        str(round_data.get("confirm_status") or "") in _REPLAY_END_CONFIRMED_STATUS
+        or str(round_data.get("broadcast_audit") or "") in _REPLAY_END_CONFIRMED_AUDIT
+    )
+    if not confirmed:
+        # 自己的终点都还没确认（pending）时，不再用第二个未确认信号去裁它
+        _skip("boundary_not_confirmed", candidate_trim)
+        return None
+
+    trimmed = candidate_trim
     round_data["end_before_replay_exclusion"] = round(end, 3)
     round_data["replay_end_excluded_sec"] = trimmed
     round_data["end"] = round(first_start, 3)

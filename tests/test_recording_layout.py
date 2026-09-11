@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -331,3 +332,92 @@ def test_move_recording_sidecars_skips_when_stem_unchanged(tmp_path):
     same = tmp_path / "a.mp4"
     same.write_bytes(b"x")
     assert layout.move_recording_sidecars(str(same), str(same)) == []
+
+
+# ── 孤儿录制自愈（2026-09-11）───────────────────────────────────────────────
+# 现场：录制 07:41:32→07:52:47（history 已写结束时间），但收尾改名失败 → 文件名仍是
+# `_录制中`；而剪映草稿守卫只按文件名判"仍在录制" → 这段录像**永久导不出草稿**，
+# 且 is_recording 已是 False，用户也无法靠"停止录制"再触发一次。
+
+
+def _orphan(directory, stamp="2026-09-11_07-41-32", *, mtime=None, suffix="_录制中.mp4"):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{stamp}{suffix}"
+    path.write_bytes(b"mp4")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_stale_in_progress_finds_idle_orphan_only(tmp_path) -> None:
+    from datetime import datetime
+
+    from lsc.core.recording_layout import stale_in_progress_recordings
+
+    old = (datetime(2026, 9, 11, 8, 0, 0)).timestamp()
+    orphan = _orphan(tmp_path, mtime=old - 600)          # 已停写 10 分钟 → 孤儿
+    fresh = _orphan(tmp_path, stamp="2026-09-11_08-30-00", mtime=old - 5)  # 刚在写 → 不算
+    finished = tmp_path / "2026-09-11_06-00-00_至_2026-09-11_06-10-00.mp4"
+    finished.write_bytes(b"mp4")                          # 已定稿 → 不算
+
+    found = stale_in_progress_recordings([str(tmp_path)], now=datetime(2026, 9, 11, 8, 0, 0))
+    paths = [p for p, _, _ in found]
+    assert paths == [orphan]
+    _, started, ended = found[0]
+    assert started.strftime("%Y-%m-%d_%H-%M-%S") == "2026-09-11_07-41-32"  # 文件名解析
+    assert abs(ended.timestamp() - (old - 600)) < 1.0                     # 结束时间取 mtime
+
+    # 被排除的活跃路径不算孤儿
+    assert stale_in_progress_recordings(
+        [str(tmp_path)], active_paths=[str(orphan)], now=datetime(2026, 9, 11, 8, 0, 0)
+    ) == []
+    assert fresh.is_file() and finished.is_file()
+
+
+def test_heal_stale_in_progress_renames_and_moves_sidecars(tmp_path) -> None:
+    from datetime import datetime
+
+    from lsc.core.recording_layout import heal_stale_in_progress_recordings
+
+    orphan = _orphan(tmp_path, mtime=datetime(2026, 9, 11, 7, 52, 47).timestamp())
+    (tmp_path / "2026-09-11_07-41-32_录制中.analysis.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "2026-09-11_07-41-32_录制中.finalization.json").write_text("{}", encoding="utf-8")
+
+    healed = heal_stale_in_progress_recordings(
+        [str(tmp_path)], now=datetime(2026, 9, 11, 8, 0, 0)
+    )
+    assert len(healed) == 1
+    new_path = Path(healed[0])
+    assert new_path.name == "2026-09-11_07-41-32_至_2026-09-11_07-52-47.mp4"
+    assert new_path.is_file() and not orphan.exists()
+    # sidecar 必须同步改名，否则按最终录像名查会落空
+    assert (tmp_path / "2026-09-11_07-41-32_至_2026-09-11_07-52-47.analysis.json").is_file()
+    assert (tmp_path / "2026-09-11_07-41-32_至_2026-09-11_07-52-47.finalization.json").is_file()
+    # 幂等：再跑一次已经没有孤儿了（也证明改名后不再被误判）
+    assert heal_stale_in_progress_recordings(
+        [str(tmp_path)], now=datetime(2026, 9, 11, 8, 0, 0)
+    ) == []
+
+
+def test_heal_tolerates_missing_dirs_and_bad_names(tmp_path) -> None:
+    from datetime import datetime
+
+    from lsc.core.recording_layout import heal_stale_in_progress_recordings
+
+    _orphan(tmp_path, stamp="不是时间戳", mtime=datetime(2026, 9, 11, 7, 0, 0).timestamp())
+    healed = heal_stale_in_progress_recordings(
+        [str(tmp_path), str(tmp_path / "不存在")], now=datetime(2026, 9, 11, 8, 0, 0)
+    )
+    assert len(healed) == 1  # 名字解析失败也照样收尾（回退用 mtime）
+
+
+def test_startup_heals_orphan_recordings() -> None:
+    """源码守卫：启动期必须调用自愈，否则这类录像永远导不出草稿。"""
+    from pathlib import Path as _Path
+
+    source = (_Path(__file__).resolve().parents[1] / "python-backend/main.py").read_text(encoding="utf-8")
+    assert "_heal_orphan_recordings(self.manager)" in source
+    assert "heal_stale_in_progress_recordings" in source
+    # 自愈失败不得拦住启动
+    call_site = source.split("heal_orphan_recordings(self.manager)", 1)[1][:400]
+    assert "except Exception" in call_site

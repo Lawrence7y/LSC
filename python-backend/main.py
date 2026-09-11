@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 
 # 路径设置
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -154,6 +155,43 @@ def _install_exception_hook(log: logging.Logger) -> None:
     threading.excepthook = _thread_hook
 
 
+def _heal_orphan_recordings(manager) -> list[str]:
+    """启动期自愈：把「已停写但仍是 `_录制中` 名」的录像补齐收尾。
+
+    为什么必须在启动期做：`_finalize_and_commit_recording` 的 P1 契约规定"源被占用时
+    宁可没改名也绝不留重复副本"，于是改名失败会**保留 `_录制中` 名**；而剪映草稿的
+    守卫（`python-backend/handlers/jianying_handlers.py`）只按**文件名**判"仍在录制"，
+    于是这段录像**永远导不出草稿**，且 `is_recording` 已是 False、用户也无法靠
+    "停止录制"再触发一次（2026-09-11 实测现场：录制已结束，两次生成草稿都被拒）。
+
+    根目录取 `RoomOrchestrator._output_dir` 与各房间的已知目录；仍在录的房间路径
+    通过 `active_paths` 排除。任何异常都不得拦住启动。
+    """
+    from lsc.core.recording_layout import heal_stale_in_progress_recordings
+
+    roots: list[str] = []
+    active: list[str] = []
+    for attr in ("_output_dir", "output_dir"):
+        value = getattr(manager, attr, "")
+        if value:
+            roots.append(str(value))
+    try:
+        rooms = manager.list_rooms()
+    except Exception:  # noqa: BLE001 - 房间枚举失败不影响自愈以外的启动流程
+        rooms = []
+    for room in rooms or []:
+        current = str(getattr(room, "record_output_path", "") or "")
+        if current:
+            if getattr(room, "is_recording", False):
+                active.append(current)
+            roots.append(str(Path(current).parent))
+        for attr in ("reconnect_output_dir", "output_bundle_dir"):
+            value = getattr(room, attr, "")
+            if value:
+                roots.append(str(value))
+    return heal_stale_in_progress_recordings(roots, active_paths=active)
+
+
 _log = _setup_logging()
 _install_exception_hook(_log)
 
@@ -222,6 +260,20 @@ class LSCWebSocketBackend:
         except Exception:
             # 房间恢复失败不应阻止后端启动；连接后仍可手动重新添加。
             _log.exception("Failed to restore persisted rooms")
+
+        # 启动期自愈：补齐"录制已停、但收尾改名失败"留下的 `_录制中` 录像。
+        # 不做的话这类录像会永久挡住剪映草稿导出（详见 _heal_orphan_recordings 文档）。
+        try:
+            healed = _heal_orphan_recordings(self.manager)
+            if healed:
+                _log.warning(
+                    "启动自愈：已补齐 %d 个未收尾录像（原名含 '_录制中' 会挡住草稿导出）: %s",
+                    len(healed), ", ".join(os.path.basename(p) for p in healed),
+                )
+            else:
+                _log.info("启动自愈：无未收尾录像")
+        except Exception:
+            _log.exception("启动自愈未收尾录像失败（不影响启动）")
 
         register_room_handlers(self.server, self.bridge)
 

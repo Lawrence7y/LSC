@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -33,7 +34,7 @@ def _fake_model_dir(tmp_path, *, with_marker_key: bool = False):
 
 def _marker_model(tmp_path):
     marker_dir = tmp_path / "marker"
-    marker_dir.mkdir()
+    marker_dir.mkdir(exist_ok=True)
     path = marker_dir / "valorant_phase_v1.onnx"
     path.write_bytes(b"marker-onnx")
     (marker_dir / "valorant_phase_v1.json").write_text(
@@ -121,3 +122,93 @@ def test_compose_rejects_missing_inputs(tmp_path) -> None:
             rois=DEFAULT_ROIS,
             target_class="replay",
         )
+
+
+def _prod_dir(tmp_path):
+    """模拟生产模型目录（.gitignore 覆盖，安装它不产生仓库噪音）。"""
+    d = tmp_path / "prod"
+    d.mkdir()
+    (d / "valorant_phase_v1.onnx").write_bytes(b"prod-weights")
+    (d / "valorant_phase_v1.json").write_text(
+        json.dumps(
+            {
+                "model_version": "valorant_phase_v1",
+                "class_names": ["non_game", "buy", "combat", "result", "replay"],
+                "input_size": [224, 224],
+                "color_order": "RGB",
+                "normalize_mean": [0.485, 0.456, 0.406],
+                "normalize_std": [0.229, 0.224, 0.225],
+                "threshold_version": "v1",
+                "sha256": "deadbeef",
+                "dataset_version": "prod",
+                "thresholds": {"stable_prob": 0.55, "high_prob": 0.8},
+                "broadcast_input_fusion": {"full_frame_weight": 0.7, "top_hud_weight": 0.3},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return d
+
+
+def test_install_in_place_adds_branch_and_backs_up_meta(tmp_path) -> None:
+    """原地安装：装进生产目录、**不动权重**、原元数据有备份（回滚可还原）。"""
+    from scripts.valorant_vision.compose_marker_roi_model import MARKER_ONNX, install_in_place
+
+    prod = _prod_dir(tmp_path)
+    original_meta = (prod / "valorant_phase_v1.json").read_text(encoding="utf-8")
+    report = install_in_place(
+        base_dir=prod, marker_model=_marker_model(tmp_path),
+        weight=1.0, rois=DEFAULT_ROIS, target_class="replay",
+    )
+
+    # 权重文件一字未动（sha256 校验针对它）
+    assert (prod / "valorant_phase_v1.onnx").read_bytes() == b"prod-weights"
+    assert (prod / MARKER_ONNX).read_bytes() == b"marker-onnx"
+    # 备份可还原
+    backup = Path(report["meta_backup"])
+    assert backup.is_file() and backup.read_text(encoding="utf-8") == original_meta
+    # 声明已写入，且既有键保留
+    meta = json.loads((prod / "valorant_phase_v1.json").read_text(encoding="utf-8"))
+    assert meta["marker_roi_branch"]["class"] == "replay"
+    assert meta["broadcast_input_fusion"] == {"full_frame_weight": 0.7, "top_hud_weight": 0.3}
+    assert meta["sha256"] == "deadbeef"
+    assert report["mode"] == "in_place"
+
+
+def test_install_in_place_refuses_double_install(tmp_path) -> None:
+    """重复安装会叠加声明 → 必须拒绝，并要求先回滚。"""
+    from scripts.valorant_vision.compose_marker_roi_model import install_in_place
+
+    prod = _prod_dir(tmp_path)
+    install_in_place(base_dir=prod, marker_model=_marker_model(tmp_path),
+                     weight=1.0, rois=DEFAULT_ROIS, target_class="replay")
+    with pytest.raises(SystemExit):
+        install_in_place(base_dir=prod, marker_model=_marker_model(tmp_path),
+                         weight=1.0, rois=DEFAULT_ROIS, target_class="replay")
+
+
+def test_installed_branch_is_loadable_by_runtime(tmp_path) -> None:
+    """装完必须能被运行时解析成"已启用"——否则生产上会静默不生效。"""
+    from lsc.analyzer.valorant_frame_classifier import marker_roi_config
+    from scripts.valorant_vision.compose_marker_roi_model import install_in_place
+
+    prod = _prod_dir(tmp_path)
+    install_in_place(base_dir=prod, marker_model=_marker_model(tmp_path),
+                     weight=1.0, rois=DEFAULT_ROIS, target_class="replay")
+    meta = json.loads((prod / "valorant_phase_v1.json").read_text(encoding="utf-8"))
+    config = marker_roi_config(meta)
+    assert config is not None and config["class_index"] == 4
+    assert set(config["rois"]) == set(DEFAULT_ROIS)
+
+
+def test_cli_requires_exactly_one_target(tmp_path) -> None:
+    from scripts.valorant_vision.compose_marker_roi_model import main
+
+    prod = _prod_dir(tmp_path)
+    marker = _marker_model(tmp_path)
+    with pytest.raises(SystemExit):
+        main(["--base-dir", str(prod), "--marker-model", str(marker)])
+    with pytest.raises(SystemExit):
+        main(["--base-dir", str(prod), "--marker-model", str(marker),
+              "--in-place", "--out-dir", str(tmp_path / "o")])

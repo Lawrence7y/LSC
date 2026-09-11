@@ -1243,7 +1243,7 @@ def test_apply_replay_end_exclusion_trims_to_first_segment() -> None:
     import lsc.analyzer.valorant_ocr_rounds as mod
 
     r = {"start": 100.0, "end": 200.0, "result_ts": 190.0,
-         "replay_segments": [[195.0, 205.0]]}
+         "confirm_status": "vision_confirmed", "replay_segments": [[195.0, 205.0]]}
     trimmed = mod.apply_replay_end_exclusion(r)
     assert trimmed == 5.0
     assert r["end"] == 195.0
@@ -1294,10 +1294,58 @@ def test_apply_replay_end_exclusion_survives_malformed_segments() -> None:
 
 
 def test_apply_replay_end_exclusion_picks_earliest_of_multiple_segments() -> None:
-    """多段时取最早的起点，不取列表首项。"""
+    """多个回放段时取最早那个起点。"""
     import lsc.analyzer.valorant_ocr_rounds as mod
 
-    r = {"start": 10.0, "end": 300.0, "result_ts": 200.0,
-         "replay_segments": [[250.0, 260.0], [220.0, 230.0]]}
-    assert mod.apply_replay_end_exclusion(r) == 80.0
-    assert r["end"] == 220.0
+    r = {"start": 100.0, "end": 300.0, "result_ts": 295.0, "confirm_status": "vision_confirmed",
+         "replay_segments": [[297.0, 305.0], [296.0, 300.0]]}
+    trimmed = mod.apply_replay_end_exclusion(r)
+    assert trimmed == 4.0
+    assert r["end"] == 296.0
+
+
+def test_apply_replay_end_exclusion_skips_when_trim_exceeds_cap() -> None:
+    """幅度超限 → 不裁剪，写候选幅度与原因，并要求人工复核。
+
+    这是 2026-09-11 真实直播里的现场回归：某回合被声明回放段
+    ``[[674.094,679.094],[681.094,688.094]]``，若照裁会砍掉 **14.539s**；
+    实测该区间 44 帧零 REPLAY 标记、模型全判 combat（p_replay ≤ 0.007）
+    —— 砍掉的是真实交战画面。
+    """
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 657.094, "end": 688.633, "result_ts": 668.094,
+         "confirm_status": "pending", "broadcast_audit": "pending_no_exclusion",
+         "replay_segments": [[674.094, 679.094], [681.094, 688.094]]}
+    assert mod.apply_replay_end_exclusion(r) is None
+    assert r["end"] == 688.633, "不得改动终点"
+    assert "end_before_replay_exclusion" not in r
+    assert "replay_end_excluded_sec" not in r
+    assert r["replay_end_exclusion_skipped"] == "trim_exceeds_cap"
+    assert r["replay_end_exclusion_candidate_sec"] == 14.539
+    assert r["replay_end_exclusion_candidate_from"] == 674.094
+    assert r["boundary_review_required"] is True
+
+
+def test_apply_replay_end_exclusion_skips_without_confirming_evidence() -> None:
+    """终点本身尚未确认（pending）时不得用第二个未确认信号去裁它。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 100.0, "end": 200.0, "result_ts": 190.0,
+         "confirm_status": "pending", "replay_segments": [[195.0, 205.0]]}
+    assert mod.apply_replay_end_exclusion(r) is None
+    assert r["end"] == 200.0
+    assert r["replay_end_exclusion_skipped"] == "boundary_not_confirmed"
+    assert r["replay_end_exclusion_candidate_sec"] == 5.0
+    # 幅度没超限 → 不额外要求复核（避免噪音）
+    assert "boundary_review_required" not in r
+
+
+def test_apply_replay_end_exclusion_accepts_broadcast_audit_passed() -> None:
+    """`broadcast_audit=passed` 也算确认证据（与 vision_confirmed 等价）。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 100.0, "end": 200.0, "result_ts": 190.0, "broadcast_audit": "passed",
+         "replay_segments": [[196.0, 205.0]]}
+    assert mod.apply_replay_end_exclusion(r) == 4.0
+    assert r["end"] == 196.0

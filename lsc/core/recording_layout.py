@@ -11,7 +11,8 @@ import os
 import re
 import shutil
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable
 
 _log = logging.getLogger(__name__)
 
@@ -128,6 +129,102 @@ def recording_in_progress_filename(started_at: datetime) -> str:
 def recording_in_progress_path(output_dir: str, started_at: datetime) -> str:
     os.makedirs(output_dir, exist_ok=True)
     return ensure_unique_path(os.path.join(output_dir, recording_in_progress_filename(started_at)))
+
+
+# 「孤儿录制」：录制已结束、但收尾改名失败留下的 `*_录制中.mp4`。
+# 成因：`_finalize_and_commit_recording` 的 P1 契约规定"源被占用时宁可没改名也绝不
+# 留重复副本" —— 于是改名失败就**保留 `_录制中` 名并告警**。本身没错，但下游
+# （剪映草稿的 `_录制中` 守卫，见 python-backend/handlers/jianying_handlers.py）
+# 只按**文件名**判"仍在录制"，于是这段录像**永远导不出草稿**，且因为
+# `is_recording` 已是 False，用户也无法靠"停止录制"再触发一次。
+# 2026-09-11 实测现场：录制 07:41:32→07:52:47（history 已写结束时间），文件仍是
+# `_录制中`，两次生成草稿都被拒（error_code=recording_not_finalized）。
+_STALE_MIN_IDLE_SEC = 60.0
+_IN_PROGRESS_STEM_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
+
+def stale_in_progress_recordings(
+    dirs: Iterable[str],
+    *,
+    active_paths: Iterable[str] = (),
+    now: datetime | None = None,
+    min_idle_sec: float = _STALE_MIN_IDLE_SEC,
+) -> list[tuple[Path, datetime, datetime]]:
+    """找出「已停写但仍是 `_录制中` 名」的录像。
+
+    返回 ``[(path, started_at, ended_at)]``：
+    - ``started_at`` 取文件名前缀里的 ``%Y-%m-%d_%H-%M-%S``（程序命名依据）；
+    - ``ended_at`` 取**文件 mtime**——录制器停写的那一刻，比"现在"更接近真实结束时间。
+
+    判定为"已停写"：不在 ``active_paths``（仍在录的房间路径）里，且 mtime 距 ``now``
+    已超过 ``min_idle_sec``（默认 60s，避免把正在写的文件误判成孤儿）。
+    """
+    moment = now or datetime.now()
+    active = {os.path.normcase(os.path.abspath(str(p))) for p in active_paths if p}
+    found: list[tuple[Path, datetime, datetime]] = []
+    seen_dirs: set[str] = set()
+    for raw in dirs:
+        if not raw:
+            continue
+        directory = os.path.abspath(str(raw))
+        key = os.path.normcase(directory)
+        if key in seen_dirs or not os.path.isdir(directory):
+            continue
+        seen_dirs.add(key)
+        for path in sorted(Path(directory).glob(f"*{_IN_PROGRESS_SUFFIX}")):
+            if os.path.normcase(str(path.resolve())) in active:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            ended_at = datetime.fromtimestamp(stat.st_mtime)
+            if (moment - ended_at).total_seconds() < min_idle_sec:
+                continue
+            started_at = ended_at
+            try:
+                started_at = datetime.strptime(
+                    path.name[: -len(_IN_PROGRESS_SUFFIX)], _IN_PROGRESS_STEM_FORMAT
+                )
+            except ValueError:
+                _log.warning("孤儿录制文件名无法解析开始时间，按 mtime 处理: %s", path.name)
+            found.append((path, started_at, ended_at))
+    return found
+
+
+def heal_stale_in_progress_recordings(
+    dirs: Iterable[str],
+    *,
+    active_paths: Iterable[str] = (),
+    now: datetime | None = None,
+    min_idle_sec: float = _STALE_MIN_IDLE_SEC,
+) -> list[str]:
+    """把「孤儿录制」补齐收尾（改名 + 同步 sidecar），返回新的录像路径。
+
+    单项失败只告警、不影响其它项——这是启动期自愈，**绝不能因此拦住启动**。
+    """
+    healed: list[str] = []
+    for path, started_at, ended_at in stale_in_progress_recordings(
+        dirs, active_paths=active_paths, now=now, min_idle_sec=min_idle_sec
+    ):
+        try:
+            dest = finalize_recording_file(
+                str(path),
+                started_at=started_at,
+                ended_at=ended_at,
+                dest_dir=str(path.parent),
+            )
+            move_recording_sidecars(str(path), dest)
+            healed.append(dest)
+            _log.info(
+                "孤儿录制已补齐收尾: %s -> %s（起 %s / 止 %s）",
+                path.name, Path(dest).name,
+                started_at.strftime(_IN_PROGRESS_STEM_FORMAT),
+                ended_at.strftime(_IN_PROGRESS_STEM_FORMAT),
+            )
+        except (OSError, ValueError) as exc:
+            _log.warning("孤儿录制收尾失败（保留原名，稍后可重试）: %s (%s)", path, exc)
+    return healed
 
 
 def finalize_room_recording(room: Any, source_path: str, *, ended_at: datetime | None = None) -> str:
