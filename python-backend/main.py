@@ -176,6 +176,16 @@ def _heal_orphan_recordings(manager) -> list[str]:
         if value:
             roots.append(str(value))
     try:
+        # 后端是用 `RoomOrchestrator()` 无参构造的，`_output_dir` 可能为空；
+        # 配置里的 output_dir 才是真实录制根（实测默认 ~/LSC/output）。
+        from handlers.room_handler import load_settings  # 定义在 room_handler，不在 lsc.config
+
+        settings_dir = (load_settings() or {}).get("output_dir")
+        if settings_dir:
+            roots.append(str(settings_dir))
+    except Exception:  # noqa: BLE001 - 读不到配置不影响"用房间目录自愈"这条路
+        pass
+    try:
         rooms = manager.list_rooms()
     except Exception:  # noqa: BLE001 - 房间枚举失败不影响自愈以外的启动流程
         rooms = []

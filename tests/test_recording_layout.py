@@ -421,3 +421,108 @@ def test_startup_heals_orphan_recordings() -> None:
     # 自愈失败不得拦住启动
     call_site = source.split("heal_orphan_recordings(self.manager)", 1)[1][:400]
     assert "except Exception" in call_site
+
+
+# ── 单文件录制回退路径（2026-09-11 修死代码）─────────────────────────────
+# 现场：无预览/shared-ingest 的环境（headless 起后端）会回退到
+# controller.start_recording_with_crf，而它调用 `_capture.start_with_crf` ——
+# StreamCapture **从来没有这个方法**（git log -S 为空）→ AttributeError，
+# 录制失败、持续分析随即被拒（"主直播间尚未开始录制"）。
+
+
+def test_fallback_recording_calls_real_capture_api(tmp_path) -> None:
+    import lsc.core.controller as mod
+
+    calls: list[dict] = []
+
+    class _FakeCapture:
+        last_error = ""
+        stderr_tail = ""
+
+        def start(self, url, output_path, *, codec="copy", input_args=None, extra_args=None):
+            calls.append({"url": url, "path": output_path, "codec": codec,
+                          "input_args": input_args, "extra_args": extra_args})
+            import pathlib as _p
+
+            _p.Path(output_path).write_bytes(b"mp4")
+            return True
+
+    controller = mod.HeadlessRecordingController()
+    controller._capture = _FakeCapture()
+    ok, out_path, encoder, err = controller.start_recording_with_crf(
+        "https://example.com/live.flv", str(tmp_path), "h264_nvenc", 23,
+        param_mode="CRF 质量", resolution="1920:1080", framerate="60", audio_bitrate="128k",
+    )
+    assert ok is True and err == "" and encoder == "h264_nvenc"
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["codec"] == "custom", "编码参数必须走 codec=custom + extra_args"
+    assert "-crf" in call["extra_args"] and "23" in call["extra_args"]
+    assert call["extra_args"].count("h264_nvenc") == 1
+    # 产物命名必须与收尾定稿/草稿守卫的契约一致
+    assert Path(out_path).name.endswith("_录制中.mp4")
+    assert Path(out_path).is_file()
+
+
+def test_fallback_recording_reports_failure_without_raising(tmp_path) -> None:
+    """回退路径失败必须转成返回值（含 capture 的错误信息），不能抛穿。"""
+    import lsc.core.controller as mod
+
+    class _FailingCapture:
+        last_error = "ffmpeg: no such stream"
+        stderr_tail = ""
+
+        def start(self, *_a, **_k):
+            return False
+
+    controller = mod.HeadlessRecordingController()
+    controller._capture = _FailingCapture()
+    ok, out_path, _encoder, err = controller.start_recording_with_crf(
+        "https://example.com/live.flv", str(tmp_path), "h264_nvenc", 23,
+    )
+    assert ok is False and out_path == ""
+    assert "no such stream" in err
+
+
+def test_capture_class_exposes_the_api_controller_calls() -> None:
+    """契约守卫：controller 调用的 `start` 必须真的存在于 StreamCapture 上。"""
+    import inspect
+
+    from lsc.core.controller import HeadlessRecordingController
+    from lsc.recorder.capture import StreamCapture
+
+    assert hasattr(StreamCapture, "start"), "StreamCapture 必须提供 start()"
+    source = inspect.getsource(HeadlessRecordingController.start_recording_with_crf)
+    body = source.split('"""', 2)[-1]          # 去掉 docstring（里面引用了旧 bug 名）
+    assert "start_with_crf" not in body, "不得再调用 StreamCapture 上不存在的方法"
+    assert "self._capture.start(" in body
+
+
+def test_fallback_recording_stop_async_delegates_to_capture(tmp_path) -> None:
+    """停止录制的回退路径：orchestrator 调 `stop_recording_async`，控制器必须提供。
+
+    实测现场：停止录制报 ``'HeadlessRecordingController' object has no attribute
+    'stop_recording_async'`` → 录像永远停在 ``_录制中``，草稿被守卫永久拒绝。
+    """
+    import lsc.core.controller as mod
+
+    calls: list[str] = []
+
+    class _FakeCapture:
+        def stop_async(self):
+            calls.append("stop_async")
+
+        def stop(self):
+            calls.append("stop")
+
+    controller = mod.HeadlessRecordingController()
+    controller._capture = _FakeCapture()
+    controller.is_recording = True
+    assert controller.stop_recording_async() is True
+    assert calls == ["stop_async"], "应走非阻塞 stop_async（避免阻塞最长 13s）"
+    assert controller.is_recording is False
+
+    # capture 缺失时不得抛穿，只返回 False
+    controller2 = mod.HeadlessRecordingController()
+    controller2._capture = None
+    assert controller2.stop_recording_async() is False

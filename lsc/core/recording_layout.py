@@ -171,7 +171,15 @@ def stale_in_progress_recordings(
         if key in seen_dirs or not os.path.isdir(directory):
             continue
         seen_dirs.add(key)
-        for path in sorted(Path(directory).glob(f"*{_IN_PROGRESS_SUFFIX}")):
+        # **必须递归**：App 把录像放在 `<root>/<主播名>/` 子目录里（实测孤儿就在
+        # `~/LSC/output/EDG夺冠回顾/` 下），只扫顶层会永远找不到 → 自愈形同虚设。
+        # 限深 4 层，避免误扫到用户自己嵌套很深的目录。
+        for path in sorted(Path(directory).rglob(f"*{_IN_PROGRESS_SUFFIX}")):
+            try:
+                if len(path.relative_to(directory).parts) > 4:
+                    continue
+            except ValueError:
+                continue
             if os.path.normcase(str(path.resolve())) in active:
                 continue
             try:
