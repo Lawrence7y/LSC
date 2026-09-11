@@ -543,3 +543,51 @@ def test_analysis_loop_log_line_tolerates_none_video_path() -> None:
         if line.strip().startswith("#"):
             continue
         assert "os.path.basename(video_path)" not in line, f"仍在直接 basename(None)：{line.strip()}"
+
+
+# ── 换段定稿（2026-09-11）──────────────────────────────────────────────────
+# 实测：录制 epoch 轮转（重连/换段）会直接开新文件，旧文件一直留在 `_录制中`
+# → 草稿守卫按文件名判"仍在录制"，旧录像永远导不出；持续分析还会每 2s 刷
+# "跳过旧文件空扫描结果（文件已切换）"。
+
+
+def test_finalize_in_progress_recording_renames_with_sidecars(tmp_path) -> None:
+    from datetime import datetime
+
+    from lsc.core.recording_layout import finalize_in_progress_recording
+
+    p = _orphan(tmp_path, mtime=datetime(2026, 9, 11, 10, 45, 30).timestamp())
+    (tmp_path / "2026-09-11_07-41-32_录制中.analysis.json").write_text("{}", encoding="utf-8")
+
+    dest = finalize_in_progress_recording(p, now=datetime(2026, 9, 11, 10, 50, 0))
+    assert dest is not None
+    assert Path(dest).name == "2026-09-11_07-41-32_至_2026-09-11_10-45-30.mp4"
+    assert Path(dest).is_file() and not p.exists()
+    assert (tmp_path / "2026-09-11_07-41-32_至_2026-09-11_10-45-30.analysis.json").is_file()
+
+
+def test_finalize_in_progress_recording_skips_busy_file(tmp_path) -> None:
+    """mtime 很新 = 仍在写 → 绝不能动（否则会把正在录的文件剪断）。"""
+    from datetime import datetime
+
+    from lsc.core.recording_layout import finalize_in_progress_recording
+
+    now = datetime(2026, 9, 11, 10, 50, 0)
+    busy = _orphan(tmp_path, mtime=now.timestamp() - 1.0)      # 1s 前还在写
+    assert finalize_in_progress_recording(busy, min_idle_sec=3.0, now=now) is None
+    assert busy.is_file() and "_录制中" in busy.name
+
+    # 已定稿的文件、空路径、不存在的文件都不动
+    done = tmp_path / "2026-09-11_06-00-00_至_2026-09-11_06-10-00.mp4"
+    done.write_bytes(b"mp4")
+    assert finalize_in_progress_recording(done, now=now) is None
+    assert finalize_in_progress_recording("", now=now) is None
+    assert finalize_in_progress_recording(tmp_path / "nope.mp4", now=now) is None
+    assert done.is_file()
+
+
+def test_start_recording_finalizes_previous_segment() -> None:
+    """源码守卫：开新录（换段）前必须定稿上一段，否则孤儿只能等下次启动自愈。"""
+    source = (Path(__file__).resolve().parents[1] / "lsc/core/orchestrator.py").read_text(encoding="utf-8")
+    assert "finalize_in_progress_recording(previous_output_path)" in source
+    assert "finalize_in_progress_recording," in source      # 已导入

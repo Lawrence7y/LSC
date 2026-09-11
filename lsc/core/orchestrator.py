@@ -27,6 +27,7 @@ from lsc.config import (
 )
 from lsc.core.events import EventBus
 from lsc.core.recording_layout import (
+    finalize_in_progress_recording,
     finalize_room_recording,
     recording_in_progress_path,
     room_recording_dir,
@@ -2480,6 +2481,23 @@ class RoomOrchestrator:
         stream_url = controller.stream_url
         input_args = controller.input_args
         _log.info("[录制诊断] stream refreshed, stream_url=%s", bool(stream_url))
+
+        # 换段（重连/epoch 轮转）前把**上一段仍在 `_录制中` 的录像定稿**。
+        # 实测该路径会直接开新文件、把旧文件一直留在 `_录制中`：剪映草稿守卫按文件名
+        # 判"仍在录制" → 旧录像永远导不出草稿；持续分析还会每 2s 刷"跳过旧文件空扫描
+        # 结果"。原先只靠"下次启动自愈"事后补救，这里在切换点即时做掉。
+        # helper 内部按 mtime 静默（<3s 视为仍在写）判断，重复调用/正在录时自动跳过。
+        previous_output_path = getattr(room, "record_output_path", "") or ""
+        if previous_output_path:
+            try:
+                finalized = finalize_in_progress_recording(previous_output_path)
+                if finalized:
+                    _log.warning(
+                        "换段：上一段录像已定稿 %s（原名含 '_录制中' 会挡住草稿导出）",
+                        os.path.basename(finalized),
+                    )
+            except OSError as exc:
+                _log.warning("换段定稿失败（不影响新录制）: %s", exc)
 
         # Per-room output directory: {output}/{streamer}/，已存在则复用。
         # 新开录（非重连）清掉上一场对齐组合目录，避免新录像写进旧的 A+B 文件夹。

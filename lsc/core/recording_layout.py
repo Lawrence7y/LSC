@@ -189,15 +189,59 @@ def stale_in_progress_recordings(
             ended_at = datetime.fromtimestamp(stat.st_mtime)
             if (moment - ended_at).total_seconds() < min_idle_sec:
                 continue
-            started_at = ended_at
-            try:
-                started_at = datetime.strptime(
-                    path.name[: -len(_IN_PROGRESS_SUFFIX)], _IN_PROGRESS_STEM_FORMAT
-                )
-            except ValueError:
-                _log.warning("孤儿录制文件名无法解析开始时间，按 mtime 处理: %s", path.name)
+            started_at = _in_progress_started_at(path, ended_at)
             found.append((path, started_at, ended_at))
     return found
+
+
+def _in_progress_started_at(path: Path, fallback: datetime) -> datetime:
+    """从 ``*_录制中.mp4`` 的文件名前缀取开始时间，失败则回退。"""
+    try:
+        return datetime.strptime(path.name[: -len(_IN_PROGRESS_SUFFIX)], _IN_PROGRESS_STEM_FORMAT)
+    except ValueError:
+        return fallback
+
+
+def finalize_in_progress_recording(
+    path: str | os.PathLike[str],
+    *,
+    min_idle_sec: float = 3.0,
+    now: datetime | None = None,
+) -> str | None:
+    """把**单个**仍在 ``_录制中`` 名的录像定稿（改名 + sidecar）；不适合则返回 None。
+
+    与 ``heal_stale_in_progress_recordings`` 的区别：那个是**启动期**批量兜底，
+    这个是**切换点**即时收尾。用于录制 epoch 轮转（重连/换段）——实测该路径会直接
+    开新文件而把旧文件一直留在 ``_录制中``：
+    - 剪映草稿守卫按文件名判"仍在录制" → 旧录像**永远导不出草稿**；
+    - 持续分析每 2s 刷一条"跳过旧文件空扫描结果（文件已切换）"的告警。
+    原先只能靠"下次启动自愈"事后补救。
+
+    ``min_idle_sec`` 内仍被写入（mtime 很新）的文件视为**正在录**，不动它——避免把
+    并发写同一文件的进程剪断。
+    """
+    if not path:
+        return None
+    target = Path(path)
+    if not target.is_file() or not target.name.endswith(_IN_PROGRESS_SUFFIX):
+        return None
+    try:
+        ended_at = datetime.fromtimestamp(target.stat().st_mtime)
+    except OSError:
+        return None
+    if ((now or datetime.now()) - ended_at).total_seconds() < min_idle_sec:
+        return None
+    started_at = _in_progress_started_at(target, ended_at)
+    dest = finalize_recording_file(
+        str(target), started_at=started_at, ended_at=ended_at, dest_dir=str(target.parent)
+    )
+    move_recording_sidecars(str(target), dest)
+    _log.info(
+        "换段定稿: %s -> %s（起 %s / 止 %s）",
+        target.name, Path(dest).name,
+        started_at.strftime(_IN_PROGRESS_STEM_FORMAT), ended_at.strftime(_IN_PROGRESS_STEM_FORMAT),
+    )
+    return dest
 
 
 def heal_stale_in_progress_recordings(

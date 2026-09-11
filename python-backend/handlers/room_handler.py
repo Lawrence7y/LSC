@@ -380,6 +380,15 @@ _STOP_TAIL_MAX_WINDOWS = 3  # 停止持续分析时的尾部补扫窗口上限�
 _STOP_TAIL_WINDOW_CAP_SEC = 120.0  # 尾部补扫单窗媒体上限（与全局单窗保护一致）；定向瞄准
                                   # 停止时刻 target，不再套用 90s 自适应追赶预算，提速停止收尾
 _SCAN_MIN_RETRY_WINDOW_SEC = 5.0  # 超时拆分重试的最小窗口；不得跳过未覆盖内容
+class _ScanWindowRetryError(RuntimeError):
+    """扫描窗口未读取到有效帧——**预期内**的可重试状态，不是故障。
+
+    与普通异常分开的原因是日志：外层用 ``exc_info=True`` 记异常，而录制 epoch
+    切换（换段/重连）时"读不到有效帧"是正常结果，打成完整 traceback 会把
+    真正的异常淹掉（2026-09-11 实测）。
+    """
+
+
 _WORKER_MAX_RESTARTS = 3  # worker 崩溃重建上限：超过则终止任务，防止无限重建循环
 _deferred_export_jobs: list[dict[str, Any]] = []  # 延后导出队列（先入列，压力缓解后再导出）
 # ── 质量优先模式 ─────────────────────────────────────────────────────
@@ -6985,7 +6994,11 @@ def register_room_handlers(server, bridge):
                                         room_id,
                                     )
                                     raise asyncio.CancelledError()
-                                raise RuntimeError(
+                                # 实测（2026-09-11）：录制 epoch 切换时窗口**已经**换了文件，
+                                # 于是"读不到有效帧"是**预期**结果，不是故障。原先抛普通
+                                # RuntimeError → 外层 `except Exception` 用 exc_info=True 打出
+                                # 完整 traceback，把日志噪音当成异常。
+                                raise _ScanWindowRetryError(
                                     '扫描未读取到有效帧，保留当前窗口等待重试'
                                 )
                         except TimeoutError:
@@ -7362,7 +7375,7 @@ def register_room_handlers(server, bridge):
                         room_id,
                         exc,
                         scan_timeout,
-                        exc_info=True,
+                        exc_info=not isinstance(exc, _ScanWindowRetryError),
                     )
                     scan_result_container['result'] = []
                     scan_result_container['error'] = repr(exc)
@@ -8073,10 +8086,18 @@ def register_room_handlers(server, bridge):
                     if ("_录制中" in _scanned_base or "_in_progress" in _scanned_base) and not os.path.exists(_scanned_video):
                         _stale_scan_result = False
                 if _stale_scan_result and not worker_result:
-                    _log.warning(
-                        "持续分析跳过旧文件空扫描结果（文件已切换）: room_id=%s, scanned=%s, current=%s",
-                        room_id, _safe_base(_scanned_video), _safe_base(video_path),
-                    )
+                    # 同一对 (scanned, current) 只记一次：换段后旧文件的空扫描结果会持续
+                    # 到达，实测每 ~5s 刷一条、连续数分钟，纯噪音。
+                    _pair = (_safe_base(_scanned_video), _safe_base(video_path))
+                    # 该作用域的状态句柄叫 `state`（`_continuous_tasks.get(room_id)`），
+                    # 不是 worker 里的 `task_state`——用错名字会 NameError 打死整个循环
+                    # （2026-09-11 实测：正是这个笔误把分析循环打断，务必与上面一致）。
+                    if state is not None and state.get('_stale_scan_logged_pair') != _pair:
+                        state['_stale_scan_logged_pair'] = _pair
+                        _log.warning(
+                            "持续分析跳过旧文件空扫描结果（文件已切换）: room_id=%s, scanned=%s, current=%s",
+                            room_id, _pair[0], _pair[1],
+                        )
                     last_consumed_at = worker_completed_at
                 elif _stale_scan_result and worker_result:
                     _log.info(
