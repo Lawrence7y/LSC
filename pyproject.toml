@@ -1,6 +1,6 @@
 [project]
 name = "lsc"
-version = "1.0.11"
+version = "1.0.16"
 description = "Live Stream Clipper - 多直播间切片系统"
 requires-python = ">=3.10"
 # 开发仍推荐 `pip install -r requirements.txt`

@@ -15,7 +15,11 @@ try {
     $node = Get-Command node -ErrorAction Stop
     & $node.Source (Join-Path $ScriptDir "gen-appx-icons.mjs")
     if ($LASTEXITCODE -ne 0) {
-        throw "gen-appx-icons.mjs failed with exit $LASTEXITCODE"
+        if (Test-Path (Join-Path $AppDir "build\appx\StoreLogo.png")) {
+            Write-Host "WARNING: gen-appx-icons.mjs failed, but existing Store tile icons in build\appx will be reused." -ForegroundColor Yellow
+        } else {
+            throw "gen-appx-icons.mjs failed with exit $LASTEXITCODE"
+        }
     }
 } finally {
     Pop-Location

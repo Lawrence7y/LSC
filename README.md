@@ -2,7 +2,7 @@
 
 > 多直播间**录制 + 切片**一体化工具 —— 同时录制多视角直播，跨房间同步预览，一键标记、对齐、批量导出精彩片段。
 
-![version](https://img.shields.io/badge/version-1.0.11-31B3AE)
+![version](https://img.shields.io/badge/version-1.0.16-31B3AE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
 [![Microsoft Store](https://get.microsoft.com/images/en-us/dark.svg)](https://apps.microsoft.com/detail/9NQWM5KPRWF1)
 ![license](https://img.shields.io/badge/license-GPL%20v2-blue)
