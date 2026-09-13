@@ -208,6 +208,9 @@ class LscConfig:
     output_path: str = ""
     output_dir: str = ""
     shared_ingest_enabled: bool = True
+    # 录制镜像（<录制路径去扩展名>.dvr.mp4）：录制中前端本地回看的数据源。
+    # 缺省开；关闭后录制只产出主输出，回看退化为直接播主录制文件。
+    dvr_mirror_enabled: bool = True
     shared_ingest_preview_queue_bytes: int = 8 * 1024 * 1024
     shared_ingest_preview_drop_policy: str = "drop_oldest"
     shared_ingest_preview_crf: int = 23
@@ -304,6 +307,7 @@ def _load_config_overrides() -> dict:
         "output_path",
         "output_dir",
         "shared_ingest_enabled",
+        "dvr_mirror_enabled",
         "shared_ingest_preview_queue_bytes",
         "shared_ingest_preview_drop_policy",
         "shared_ingest_preview_crf",

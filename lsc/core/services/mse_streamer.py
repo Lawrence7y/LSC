@@ -333,8 +333,8 @@ class MseStreamer:
         if self._is_file:
             cmd += ["-re"]
             if self._start_offset_sec > 0:
-                # 文件回看刻意把 MSE 片段归一到本次 -ss 后的 0 秒；
-                # 录制轴基座由 preview_review_start_sec 另行传给前端。
+                # 文件回放刻意把 MSE 片段归一到本次 -ss 后的 0 秒；
+                # 回看已改为前端本地文件播放（方案 A），本文件模式暂无业务调用者。
                 cmd += ["-copyts", "-start_at_zero", "-ss", f"{self._start_offset_sec:.3f}"]
         cmd += [
             "-fflags", "+genpts",
@@ -385,6 +385,10 @@ class MseStreamer:
             cmd += [
                 "-c:v", "libx264",
                 "-preset", "veryfast",
+                # 低延迟：禁用 B 帧与 lookahead（预览实时性优先于压缩效率）。
+                # NVENC 路径已有 -tune ll，CPU 回退路径此前缺等价设置，是软编
+                # 预览延迟偏高的主因（预览比直播慢数秒）。
+                "-tune", "zerolatency",
                 "-crf", str(crf),
                 "-b:v", bitrate,
                 "-maxrate", max_bitrate,
@@ -407,6 +411,8 @@ class MseStreamer:
             "-shortest",
             "-f", "mp4",
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            # muxer 不缓冲：分片一生成立即写出管道，降低 mux 侧延迟
+            "-flush_packets", "1",
             "-frag_duration", "1000000",  # 1000ms fragments
             "pipe:1",
         ]

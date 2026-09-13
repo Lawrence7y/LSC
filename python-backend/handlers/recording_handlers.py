@@ -279,6 +279,7 @@ def register_recording_handlers(
             'success': bool(success),
             'room_id': room_id,
             'output_path': getattr(room, 'record_output_path', '') if room else '',
+            'dvr_output_path': getattr(room, 'dvr_output_path', '') if room else '',
             'recording_id': getattr(room, 'recording_id', '') if room else '',
             'finalization_state': 'completed' if success else 'error',
         }

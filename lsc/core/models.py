@@ -270,6 +270,12 @@ class JianyingDraftResult:
     draft_dir: str = ""
     tracks: int = 0
     segments: int = 0
+    # 实际写入切片轨的视频片段数（重叠被跳过/映射越界的切片不计入）。
+    # 与 gate 通过数（clip_sources）区分：included_clip_count 必须以此为准。
+    placed_clip_count: int = 0
+    # 导出器内部被筛掉的切片（源可用性过滤等）。此前只累加本地计数、从不对外输出，
+    # 导致 requested 与 included 的差额无法逐条对账（L3 实测 6 vs 5）。
+    excluded_clips: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     error: str = ""
     error_code: str = ""

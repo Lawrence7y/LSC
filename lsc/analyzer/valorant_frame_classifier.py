@@ -44,6 +44,13 @@ _DEFAULT_DIR = Path(
     os.environ.get("LSC_VALORANT_MODEL_DIR", "")
     or (Path(__file__).resolve().parent / "models")
 )
+# 官方解说/二路分支使用赛事融合模型（full_frame 0.7 + top_HUD 0.3），POV
+# 继续使用根目录的普通整帧模型。该目录中的 onnx 与根目录文件名相同，但元数据
+# 带 broadcast_input_fusion，因此不能与 POV 共用同一份根目录模型。
+_DEFAULT_BROADCAST_MODEL_DIR = Path(
+    os.environ.get("LSC_VALORANT_BROADCAST_MODEL_DIR", "")
+    or (Path(__file__).resolve().parent / "models" / "valorant_phase_broadcast_finetune_v4_fused_20260907")
+)
 
 
 class ModelContractError(RuntimeError):
@@ -135,8 +142,19 @@ def crop_normalized_roi(
 class ValorantFrameClassifier:
     """线程安全懒加载的 Valorant 五分类器。"""
 
-    def __init__(self, model_dir: Path | None = None) -> None:
-        self._dir = Path(model_dir) if model_dir else _DEFAULT_DIR
+    def __init__(
+        self,
+        model_dir: Path | None = None,
+        *,
+        profile: str | None = None,
+    ) -> None:
+        self._profile = str(profile or "").strip().lower()
+        if model_dir is not None:
+            self._dir = Path(model_dir)
+        elif self._profile == "broadcast":
+            self._dir = _DEFAULT_BROADCAST_MODEL_DIR
+        else:
+            self._dir = _DEFAULT_DIR
         self._session: Any = None
         self._meta: dict[str, Any] | None = None
         self._provider: str | None = None

@@ -71,6 +71,47 @@ def move_recording_sidecars(src_path: str, dest_path: str) -> list[str]:
     return moved
 
 
+# 录制镜像（本地回看数据源）随主录像改名的后缀。镜像名 = 主录像去扩展名 + 该后缀，
+# 所以定稿改名（*_录制中.mp4 -> *_至_*.mp4）时镜像必须同步改名，否则前端按新的
+# record_output_path 推导出的 .dvr.mp4 路径会落空（方案 A「录制中回看」失效）。
+DVR_MIRROR_SUFFIX = ".dvr.mp4"
+
+
+def dvr_mirror_path(record_path: str) -> str:
+    """由录像路径推导录制镜像路径：<录像路径去扩展名>.dvr.mp4。"""
+    if not record_path:
+        return ""
+    stem, _ext = os.path.splitext(record_path)
+    if not stem:
+        return ""
+    return f"{stem}{DVR_MIRROR_SUFFIX}"
+
+
+def move_dvr_mirror(src_path: str, dest_path: str) -> str:
+    """把录制镜像随主录像一起改名，返回新镜像路径（缺失/失败返回空串）。
+
+    镜像只是回看数据源，改名失败只告警、绝不影响录像本身的定稿结果（回看可回退到
+    直接播主录像文件）。
+    """
+    src_mirror = dvr_mirror_path(src_path)
+    dest_mirror = dvr_mirror_path(dest_path)
+    if not src_mirror or not dest_mirror or src_mirror == dest_mirror:
+        return ""
+    if not os.path.isfile(src_mirror):
+        return ""
+    try:
+        os.replace(src_mirror, dest_mirror)
+    except OSError as exc:
+        _log.warning(
+            "录制镜像随录像改名失败 old=%s: %s", os.path.basename(src_mirror), exc
+        )
+        return ""
+    _log.info(
+        "录制镜像已随录像定稿改名: %s -> %s",
+        os.path.basename(src_mirror), os.path.basename(dest_mirror),
+    )
+    return dest_mirror
+
 def sanitize_folder_name(name: str, *, fallback: str = "room", max_len: int = 40) -> str:
     text = _ILLEGAL_FS.sub("_", (name or "").strip())
     text = re.sub(r"_+", "_", text).strip(" ._")
@@ -411,6 +452,7 @@ def finalize_recording_file(
     try:
         os.replace(source_path, dest)
         move_recording_sidecars(source_path, dest)
+        move_dvr_mirror(source_path, dest)
         return dest
     except OSError as exc:
         if not _is_cross_device(exc):
@@ -427,4 +469,5 @@ def finalize_recording_file(
             _log.warning("回滚未完成的定稿副本失败 path=%s: %s", dest, cleanup_exc)
         raise
     move_recording_sidecars(source_path, dest)
+    move_dvr_mirror(source_path, dest)
     return dest

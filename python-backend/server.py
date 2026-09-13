@@ -245,6 +245,11 @@ class LSCWebSocketServer:
                     "Invalid JSON format received (truncated): %s",
                     redact_text(message[:500]),
                 )
+            except websockets.ConnectionClosedOK as exc:
+                # 客户端在 handler 执行/响应发送期间正常关闭（1000 OK），
+                # 属于连接生命周期的一部分，不是后端异常，不得记 ERROR。
+                _log.debug("Client disconnected during %s: %s", msg_type, redact_text(str(exc)))
+                return
             except Exception as exc:
                 _log.error("Error handling message: %s", redact_text(exc), exc_info=True)
                 if msg_type is not None:

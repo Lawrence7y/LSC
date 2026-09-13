@@ -162,6 +162,8 @@ class StreamCapture:
         self._generation = 0
         self._status = CaptureStatus.IDLE
         self._output_path = ""
+        # 录制镜像（回看用）输出路径：<录制路径去扩展名>.dvr.mp4，未启用/不可用时为空串。
+        self._dvr_output_path = ""
         self._start_time = 0.0
         self._last_file_size = 0
         self._stall_checks = 0
@@ -183,6 +185,12 @@ class StreamCapture:
     def last_error(self) -> str:
         """Last error message from a failed start/stop operation."""
         return self._last_error
+
+    @property
+    def dvr_output_path(self) -> str:
+        """录制镜像输出路径（本地回看数据源）；未启用镜像时为空串。"""
+        with self._lock:
+            return self._dvr_output_path
 
     @property
     def is_recording(self) -> bool:
@@ -319,6 +327,35 @@ class StreamCapture:
             return _friendly_ffmpeg_message(proc.returncode or -1, self.stderr_tail)
         return "启动录制失败：没有收到直播数据，请确认直播已开播或链接未过期"
 
+    # 录制镜像（本地回看数据源）文件名后缀：<录制路径去扩展名>.dvr.mp4
+    _DVR_MIRROR_SUFFIX = ".dvr.mp4"
+
+    def _resolve_dvr_output_path(self, output_path: str) -> str:
+        """解析录制镜像输出路径；不启用/路径不可用时返回空串。
+
+        镜像只是「录制中回看」的可选数据源：设置关闭（dvr_mirror_enabled）、
+        路径无法派生或目标不可写时一律返回空串，让录制主输出保持旧行为。
+        第二个输出打不开会让整个 FFmpeg 进程失败，因此这里先用一次空写预检目标
+        可写性——宁可没有镜像，也不能把主录制拖下水。
+        """
+        if not output_path:
+            return ""
+        if not bool(getattr(self.config, "dvr_mirror_enabled", True)):
+            return ""
+        stem, _ext = os.path.splitext(output_path)
+        if not stem:
+            return ""
+        dvr_path = f"{stem}{self._DVR_MIRROR_SUFFIX}"
+        if os.path.abspath(dvr_path) == os.path.abspath(output_path):
+            return ""
+        try:
+            with open(dvr_path, "wb"):
+                pass
+            os.unlink(dvr_path)
+        except OSError as exc:
+            _log.warning("录制镜像路径不可写，跳过镜像输出: %s (%s)", dvr_path, exc)
+            return ""
+        return dvr_path
     def start(self, url: str, output_path: str, *,
               codec: str = "copy",
               input_args: list[str] | None = None,
@@ -351,6 +388,8 @@ class StreamCapture:
         with self._lock:
             already_recording = self._status == CaptureStatus.RECORDING
             self._last_error = ""
+            # 每次启动都重新解析镜像路径，避免上一次的镜像路径残留给上层。
+            self._dvr_output_path = ""
 
         if already_recording:
             _log.warning("Already recording, force-stopping old capture first")
@@ -420,6 +459,19 @@ class StreamCapture:
         # （但 FFmpeg 正常停止时会写完整 moov，且 frag_keyframe 保证每个片段可独立解码）。
         cmd += ["-f", "mp4", "-movflags", "frag_keyframe+faststart", output_path]
 
+        # 录制镜像（第二个输出）：录制中前端的本地回看数据源。
+        # 与主输出同为 MP4，但走 empty_moov + frag_keyframe，让 moov 一次写定、边录边可解析
+        # （主输出需要 moov 持续更新以便 OCR 抽帧，不能改）。镜像缺失/失败只影响回看，
+        # 由 dvr_mirror_enabled 与 _resolve_dvr_output_path 的可写预检保证不牵动主输出。
+        dvr_path = self._resolve_dvr_output_path(output_path)
+        if dvr_path:
+            cmd += [
+                "-c", "copy",
+                "-f", "mp4",
+                "-movflags", "empty_moov+default_base_moof+frag_keyframe",
+                dvr_path,
+            ]
+
         # URL 脱敏：只打印 scheme+host+path，不打印 query（可能含 Token）
         from urllib.parse import urlparse
         _parsed = urlparse(url)
@@ -449,6 +501,7 @@ class StreamCapture:
                 self._process = proc
                 self._generation += 1
                 self._output_path = output_path
+                self._dvr_output_path = dvr_path
                 self._start_time = time.time()
                 self._last_file_size = 0
                 self._stall_checks = 0

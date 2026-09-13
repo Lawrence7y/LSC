@@ -42,15 +42,19 @@ class RoomSession:
     preview_enabled: bool = False
     preview_paused: bool = False
     preview_error: str = ""
-    # live_mse | recording_review | degraded
+    # live_mse | degraded
+    # （2026-09-11 方案 A：回看不再经后端流通道，改由前端直接播本地录制文件，
+    # 因此不再有文件回看模式与回看时间基座字段。）
     preview_mode: str = "live_mse"
-    # 文件回看 MSE 的时间基座：video.currentTime 从 0 开始时对应录制轴的秒数。
-    preview_review_start_sec: float = 0.0
     include_in_cut: bool = True
     is_connecting: bool = False
     is_connected: bool = False
     is_recording: bool = False
     record_output_path: str = ""
+    # 录制镜像（<录制路径去扩展名>.dvr.mp4）：录制中前端本地回看的数据源。
+    # 与 record_output_path 同生命周期：录制启动时设置、停止时保留、随归档重命名
+    # 同步改名，无镜像（未启用/失败）时为空串。
+    dvr_output_path: str = ""
     # Segmented V2 recordings expose their durable asset separately from the
     # legacy single-file path; the latter remains untouched during migration.
     record_manifest_path: str = ""
@@ -129,11 +133,7 @@ class RoomSession:
     _shared_ingest_stall_checks: int = 0
     # 预览 epoch ID：每次预览启动/重建时生成新 UUID，用于检测预览流版本变化
     preview_epoch_id: str = ""
-    # 录制文件回看（C-01/C-05：独立生命周期，不破坏直播 preview_epoch_id）
-    active_preview_channel: str = "live"
-    review_session_id: str = ""
-    review_start_sec: float = 0.0
-    review_window_end_sec: float = 0.0
+
     # 直播 MSE 预览轴相对录制文件轴的运行时映射。
     # 约定：preview_local = recording_local + recording_to_preview_delta。
     # 预览晚于录制 15 秒时，该值为 -15；仅在当前预览/录制 epoch 内有效，不持久化。

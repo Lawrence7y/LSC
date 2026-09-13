@@ -900,7 +900,11 @@ class RoomOrchestrator:
                     shared_ingest = get_shared_ingest_registry().get(room_id)
                 except Exception:
                     shared_ingest = None
-                if shared_ingest is not None and not bool(getattr(shared_ingest, "recording_active", False)):
+                if (
+                    shared_ingest is not None
+                    and not bool(getattr(shared_ingest, "recording_active", False))
+                    and not bool(getattr(shared_ingest, "recording_failover_in_progress", False))
+                ):
                     is_recording = False
                     shared_error = str(getattr(shared_ingest, "recording_error", "") or "")
                     if shared_error:
@@ -2000,6 +2004,7 @@ class RoomOrchestrator:
                 if (
                     shared is not None
                     and not getattr(shared, "recording_active", False)
+                    and not getattr(shared, "recording_failover_in_progress", False)
                     and getattr(shared, "preview_subscribers", 0) > 0
                 ):
                     force_fresh = True
@@ -2533,6 +2538,8 @@ class RoomOrchestrator:
             media_start_mono = shared_media_start
             room.is_recording = True
             room.record_output_path = output_path
+            # 共享进样当前只有主录制 sink；若磁盘上确无镜像则为空串（回看退化为播主文件）。
+            room.dvr_output_path = self._present_dvr_mirror(output_path)
             room.record_started_at = keep_started_at or room.record_started_at or datetime.now()
             # 共享进样模式也需要同步 controller.video_path，否则导出时找不到文件
             if controller is not None:
@@ -2576,6 +2583,7 @@ class RoomOrchestrator:
                 )
                 room.is_recording = False
                 room.record_output_path = ""
+                room.dvr_output_path = ""
                 room.record_started_at = None
                 room.recording_start_mono = None
                 room.recording_media_start_mono = None
@@ -2606,6 +2614,10 @@ class RoomOrchestrator:
         _log.info("[录制诊断] start_recording_with_crf returned ok=%s, error_msg=%s", ok, error_msg)
         room.is_recording = ok
         room.record_output_path = output_path
+        # StreamCapture 在配置允许时会追加 .dvr.mp4 镜像输出（本地回看数据源）。
+        room.dvr_output_path = (
+            str(getattr(controller, "dvr_output_path", "") or "") if ok else ""
+        )
         room.record_started_at = (keep_started_at or room.record_started_at or datetime.now()) if ok else None
         if ok:
             room.recording_start_mono = getattr(controller, 'recording_start_mono', 0.0) or _time.monotonic()
@@ -2876,6 +2888,19 @@ class RoomOrchestrator:
         _log.warning("shared ingest recording failed room=%s: %s", room.room_id, result_error)
         return "", 0.0, str(result_error)
 
+    @staticmethod
+    def _present_dvr_mirror(record_path: str) -> str:
+        """返回实际存在于磁盘的录制镜像路径（<录像去扩展名>.dvr.mp4）。
+
+        镜像只是「录制中本地回看」的数据源，属可选增强：定稿改名后按**新录像名**
+        推导镜像名（改名动作已由 finalize_recording_file 同步完成），不存在即返回
+        空串，让上层/前端回退到直接播主录制文件。
+        """
+        from lsc.core.recording_layout import dvr_mirror_path
+
+        candidate = dvr_mirror_path(record_path)
+        return candidate if candidate and os.path.isfile(candidate) else ""
+
     def _finalize_and_commit_recording(self, room: RoomSession, output_path: str) -> str:
         """停录后把「录制中」改名为时间至时间，若已对齐则搬进组合目录。
 
@@ -2897,11 +2922,15 @@ class RoomOrchestrator:
                 # 否则会以新的结束时刻复制出第二份副本。
                 committed = str(getattr(room, "record_output_path", "") or "")
                 if committed and committed != output_path and os.path.isfile(committed):
+                    room.dvr_output_path = self._present_dvr_mirror(committed)
                     return committed
                 return output_path
             try:
                 new_path = finalize_room_recording(room, output_path)
                 room.record_output_path = new_path
+                # 镜像随录像定稿同步改名（finalize_recording_file 内已改名），
+                # 这里只把房间字段指向改名后的镜像路径；无镜像则留空串。
+                room.dvr_output_path = self._present_dvr_mirror(new_path)
                 controller = room.controller
                 if controller is not None and getattr(controller, "video_path", None):
                     controller.video_path = new_path
@@ -2938,7 +2967,10 @@ class RoomOrchestrator:
         controller = room.controller
         registry = get_shared_ingest_registry()
         shared_ingest = registry.get(room_id)
-        if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
+        if shared_ingest is not None and (
+            getattr(shared_ingest, "recording_active", False)
+            or getattr(shared_ingest, "recording_failover_in_progress", False)
+        ):
             output_path = room.record_output_path or getattr(shared_ingest, "_recording_path", "")
             if self._pipeline_component_enabled("ingest_supervisor_v2", room):
                 registry.get_supervisor(
@@ -2999,7 +3031,10 @@ class RoomOrchestrator:
         controller = room.controller
         registry = get_shared_ingest_registry()
         shared_ingest = registry.get(room_id)
-        if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
+        if shared_ingest is not None and (
+            getattr(shared_ingest, "recording_active", False)
+            or getattr(shared_ingest, "recording_failover_in_progress", False)
+        ):
             output_path = room.record_output_path or getattr(shared_ingest, "_recording_path", "")
             if self._pipeline_component_enabled("ingest_supervisor_v2", room):
                 registry.get_supervisor(
@@ -3738,7 +3773,10 @@ class RoomOrchestrator:
             # ponytail: shared ingest 走快速路径，避免 stop_recording_sink 先重启为 preview-only 再被 start_recording 杀死的双重重启
             registry = get_shared_ingest_registry()
             shared_ingest = registry.get(room.room_id)
-            if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
+            if shared_ingest is not None and (
+                getattr(shared_ingest, "recording_active", False)
+                or getattr(shared_ingest, "recording_failover_in_progress", False)
+            ):
                 lookup_supervisor = getattr(registry, "get_supervisor_if_exists", None)
                 supervisor = (
                     lookup_supervisor(room.room_id)
@@ -3860,7 +3898,10 @@ class RoomOrchestrator:
             registry = get_shared_ingest_registry()
             shared = registry.get(room.room_id)
             if shared is not None and (
-                getattr(shared, "recording_active", False)
+                (
+                    getattr(shared, "recording_active", False)
+                    or getattr(shared, "recording_failover_in_progress", False)
+                )
                 and not getattr(shared, "recording_error", "")
                 and not getattr(shared, "upstream_error", "")
                 and not getattr(shared, "is_stopped", False)
@@ -3894,7 +3935,10 @@ class RoomOrchestrator:
         try:
             registry = get_shared_ingest_registry()
             shared_ingest = registry.get(room.room_id)
-            if shared_ingest is not None and getattr(shared_ingest, "recording_active", False):
+            if shared_ingest is not None and (
+                getattr(shared_ingest, "recording_active", False)
+                or getattr(shared_ingest, "recording_failover_in_progress", False)
+            ):
                 lookup_supervisor = getattr(registry, "get_supervisor_if_exists", None)
                 supervisor = (
                     lookup_supervisor(room.room_id)
@@ -4101,6 +4145,7 @@ class RoomOrchestrator:
                     if (
                         room.is_recording
                         and not getattr(ingest, "recording_active", False)
+                        and not getattr(ingest, "recording_failover_in_progress", False)
                         and not room.is_reconnecting
                     ):
                         err = getattr(ingest, "recording_error", "") or getattr(ingest, "upstream_error", "")
@@ -4207,7 +4252,11 @@ class RoomOrchestrator:
                         elif room.preview_enabled and self._use_supervised_recovery(room):
                             self._start_supervised_recovery(room, ingest_error)
                     elif room_medium and not room.is_reconnecting:
-                        if getattr(ingest, "recording_active", False) and room.record_output_path:
+                        if (
+                            getattr(ingest, "recording_active", False)
+                            and not getattr(ingest, "recording_failover_in_progress", False)
+                            and room.record_output_path
+                        ):
                             stall_msg = self._check_shared_ingest_file_stall(room)
                             if stall_msg:
                                 _log.warning("Room %s shared ingest stall: %s", room.room_id, stall_msg)

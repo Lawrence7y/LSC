@@ -35,15 +35,48 @@ BROADCAST_TIMER_SAMPLE_INTERVAL_SEC = 4.0
 BROADCAST_BOUNDARY_REFINE_SEC = 6.0
 # 首次审计优先检查候选结束点附近；候选起点已经由 OCR 连续交战确认，
 # 只有尾部没有看到 combat 时才需要扩展回完整候选区间。
-BROADCAST_AUDIT_TAIL_LOOKBACK_SEC = 30.0
+#
+# ⚠️ 30s 不够（2026-09-12 19:14 现场实测 round-000071）：OCR 粗出点现在落在
+# **下一回合买枪首帧**（≤45s 计时器判据删除后的正常形态），而回合的真实出点常在其
+# 前 30~60s。回看 30s 会让窗口从"回合已结束之后"开始：尾部没看到 combat，
+# `_first_stable_exclusion` 就认不出"战斗→终态"的边界 ⇒ `no_exclusion_evidence`
+# ⇒ 整条真实回合进不了草稿。A/B（同一候选、同一录像）：
+#   lookback=30 → manual_review/no_exclusion_evidence（丢回合）
+#   lookback=45 → accepted, end=803.25, broadcast_exclusion, precise
+#   lookback=60 → 同上
+BROADCAST_AUDIT_TAIL_LOOKBACK_SEC = 60.0
+AUDIT_MICRO_STEP_SEC = 18.0
+NEXT_PREP_COMBAT_VETO_WINDOW_SEC = 8.0
+# 分裂块专用：截断点之后重新出现的满钟阈值（与 OCR FSM _NEW_ROUND_CLOCK_MIN 同值）。
+# 用于区分"回放/非游戏夹在两回合之间"（新回合满钟）与"同一回合仍在交战"。
+FRESH_ROUND_CLOCK_MIN = 85.0
+NEXT_PREP_COMBAT_VETO_MIN_FRAMES = 3
+# L1 区间内边界自检：跨回合候选的前缀裁剪上限（超过则整条拒绝，避免"为凑切片而编造起点"）
+INTERIOR_TRIM_MAX_SEC = 20.0
+INTERIOR_TRIM_MAX_FRACTION = 0.5
+RESULT_PRESENTATION_TAIL_SEC = 2.5
 PAUSE_MIN_SEC = 2.5
 # 入点门禁：定稿/离线审计时，候选起点必须由连续 visual combat 确认，
 # 不允许把 replay/non_game/result 或超长固定切块的块头直接当作回合起点。
 # 普通候选只看开头一小段即可；split_from_oversize 子块没有真实起点，必须
 # 扫描到 MAX_BROADCAST_ROUND_SEC 以寻找块内真实 combat 锚点。
+# 普通候选若头部一小段找不到 combat，允许向后再找一段：赛事回放段可能
+# 覆盖开头 15s，真实交战随后才开始；仍找不到才真正拒绝。
 START_GATE_SCAN_LIMIT_SEC = 15.0
+START_GATE_EXTENDED_SCAN_LIMIT_SEC = 35.0
 START_GATE_COMBAT_MIN_SEC = 2.0
 START_GATE_MAX_GAP_SEC = 2.0
+# 起点门禁的入点容差：候选起点与"窗口内首个稳定 combat 游程起点"的最大允许偏差。
+# 1fps 采样下候选起点那一帧若恰好落在低置信/unknown 过渡帧，首个 combat 游程会
+# 晚一个采样间隔出现；旧实现要求偏差 ≤1e-6s，于是整条真实回合被拒并从前端列表删除
+# （实测 2026-09-12 11:32：start=230.187 首帧 unknown(0.3565) → onset 231.187 →
+# rejected_no_stable_combat_start；同样内容 start=230.200 首帧 combat 即通过）。
+# 给 2.5 个采样间隔：抖动被吸收，而"窗口内先回放、10s 后才交战"的伪候选偏差远大于
+# 容差仍被拒；纯回放/非游戏窗口本来就没有 combat 游程，不受影响。
+START_GATE_ONSET_TOLERANCE_SEC = 2.5
+# A5 缩窗余量：审计要在回放块起点之后取到稳定终态游程（EXCLUSION_STABLE_FRAMES 帧）
+# 并允许 ±6s 边界复核，故窗口压到「回放块起点 + 8s」；压窗后无 cutoff 会回退完整窗口。
+A5_WINDOW_CAP_MARGIN_SEC = 8.0
 _CLASS_NAMES = ("non_game", "buy", "combat", "result", "replay")
 _EXCLUSION_LABELS = frozenset({"non_game", "buy", "result", "replay"})
 _TERMINAL_LABELS = frozenset({"non_game", "result", "replay"})
@@ -317,6 +350,194 @@ def _first_frozen_timer(
     return None
 
 
+def _has_decreasing_combat_after(
+    cutoff: float,
+    timer_samples: Iterable[tuple[float, float | None, str]],
+    *,
+    min_decreases: int = 2,
+    fresh_clock_min: float | None = None,
+) -> bool:
+    """Hard veto: combat timer still ticking down after a proposed exclusion.
+
+    A true round end is followed by replay/non-game, not by an ongoing combat
+    timer. If the proposed ``cutoff`` is before a run of combat frames whose
+    timer keeps decreasing, the exclusion is premature and ``broadcast_exclusion``
+    must not be finalized.
+
+    ``fresh_clock_min``（分裂块专用）：截断点之后若重新出现**满钟**的交战计时器，
+    说明那是一段**新回合**（回放/非游戏夹在两回合之间），不是"同一回合仍在交战"，
+    此时不得否决截断——否则固定切块永远无法在块内回放处定稿（实测：块内 22s 回放
+    之后接下一回合满钟，旧逻辑把正确的截断否决掉了）。
+    """
+    try:
+        boundary = float(cutoff)
+    except (TypeError, ValueError):
+        return False
+    decreasing_pairs = 0
+    previous_timer: float | None = None
+    for ts, timer, label in timer_samples:
+        ts_val = float(ts)
+        if ts_val < boundary:
+            # Keep the last combat timer before the proposed cutoff as the base
+            # for the first post-cutoff comparison; a decreasing run may start
+            # right at the boundary.
+            if str(label) == "combat" and timer is not None:
+                previous_timer = float(timer)
+            continue
+        if str(label) != "combat" or timer is None:
+            decreasing_pairs = 0
+            previous_timer = None
+            continue
+        timer_val = float(timer)
+        if (
+            fresh_clock_min is not None
+            and previous_timer is None
+            and timer_val >= float(fresh_clock_min)
+        ):
+            return False
+        if previous_timer is not None and timer_val < previous_timer:
+            decreasing_pairs += 1
+            if decreasing_pairs >= max(1, int(min_decreases)):
+                return True
+        else:
+            decreasing_pairs = 0
+        previous_timer = timer_val
+    return False
+
+
+def _has_immediate_combat_after(
+    samples: Iterable[tuple[float, str, float]],
+    boundary: float,
+    *,
+    window_sec: float = NEXT_PREP_COMBAT_VETO_WINDOW_SEC,
+    min_frames: int = NEXT_PREP_COMBAT_VETO_MIN_FRAMES,
+) -> bool:
+    """Return whether a purported next-prep boundary is followed by combat."""
+    start = float(boundary)
+    end = start + max(1.0, float(window_sec))
+    run = 0
+    for ts, label, _confidence in samples:
+        point = float(ts)
+        if point <= start + 0.25 or point > end:
+            continue
+        if str(label) == "combat":
+            run += 1
+            if run >= max(1, int(min_frames)):
+                return True
+        else:
+            run = 0
+    return False
+
+
+def _interior_round_boundary(
+    samples: Iterable[tuple[float, str, float]],
+    *,
+    start: float,
+    end: float,
+    min_terminal_frames: int = EXCLUSION_STABLE_FRAMES,
+    min_resume_frames: int | None = None,
+) -> float | None:
+    """候选区间**内部**「回合边界之后重新开战」的时间点（取最后一个；None = 无内部边界）。
+
+    形态：``combat → 终态游程(result/non_game/replay ≥N 帧) → [buy] → combat``，
+    且全部落在 ``(start, end)`` 内。命中即说明该区间跨回合：起点属于前一回合，
+    出点属于后一回合——现场 round-000123 的 ``[1232, 1420.75]`` 内含回合 A 的结束
+    （1315→1349：result/non_game/replay + buy），出点却是回合 B 的结束，于是与
+    round-000135 认领同一条回合 B（"重叠 68.75s"的真实成因）。
+
+    注意：**只看区间内部**。区间之后的下一回合（``ts >= end``）不参与判定，
+    因此 135 这类"出点就是排除点、后面才接下一回合"的候选不会被误伤。
+
+    2026-09-12 修复：**重新开战必须是稳定游程**（≥ ``min_resume_frames``，默认与终态
+    游程同阈值 4 帧）。此前终态游程后出现**单帧** combat 即算重新开战，于是回合结束
+    转场里的 2 帧低置信 combat（实测 round-000099：``result 1081-1083 → combat 1084
+    (0.554) / 1085 (0.648) → non_game/replay 1086+``）被误当成跨回合证据，整条真实
+    回合被 `rejected_interior_boundary` 丢掉。真实重开战是整段交战（≥30s），不受影响。
+    """
+    boundary_start = float(start)
+    boundary_end = float(end)
+    need = max(1, int(min_terminal_frames))
+    need_resume = max(1, int(min_resume_frames if min_resume_frames is not None else need))
+    terminal_run = 0
+    combat_run = 0
+    combat_run_start: float | None = None
+    combat_after_terminal = False
+    last_resume: float | None = None
+    for ts, label, _confidence in samples:
+        point = float(ts)
+        if point <= boundary_start or point >= boundary_end:
+            continue
+        text = str(label)
+        if text == "combat":
+            # 不要求区间内先出现 combat：审计按**尾部窗口**取样本，现场 123 的样本
+            # 正好从回合 A 的终态游程（1316）开始，若要求"先见 combat"就永远判不出边界。
+            if combat_run == 0:
+                combat_run_start = point
+                # 在游程首帧一次性锁存「本段 combat 之前确有足量终态游程」：
+                # 之后 terminal_run 会被清零，不能再依赖它判断。
+                combat_after_terminal = terminal_run >= need
+            combat_run += 1
+            if combat_after_terminal and combat_run >= need_resume:
+                last_resume = combat_run_start
+            terminal_run = 0
+            continue
+        if text in _TERMINAL_LABELS:
+            terminal_run += 1
+            combat_run = 0
+            combat_run_start = None
+            combat_after_terminal = False
+    return last_resume
+
+
+def _interior_boundary_verdict(
+    *,
+    start: float,
+    end: float,
+    resume: float,
+) -> tuple[str, float, float]:
+    """跨回合前缀的处理裁决：小幅前缀→裁剪起点；大面积错位→整条拒绝。
+
+    返回 ``(action, trimmed_sec, kept_sec)``，``action ∈ {"trim", "reject"}``。
+    阈值：裁剪量既超过 ``INTERIOR_TRIM_MAX_SEC`` 又超过总时长的
+    ``INTERIOR_TRIM_MAX_FRACTION``，或裁剪后剩余不足 ``MIN_ACTIVE_SEC`` ⇒ 拒绝。
+    现场 123：总长 188.75s、前缀 118s、剩余 70.75s ⇒ 拒绝（不编造新起点）。
+    """
+    span = max(0.0, float(end) - float(start))
+    trimmed = max(0.0, float(resume) - float(start))
+    kept = max(0.0, float(end) - float(resume))
+    if kept < MIN_ACTIVE_SEC:
+        return "reject", trimmed, kept
+    if trimmed > INTERIOR_TRIM_MAX_SEC and trimmed > INTERIOR_TRIM_MAX_FRACTION * span:
+        return "reject", trimmed, kept
+    return "trim", trimmed, kept
+
+
+def _apply_interior_boundary_trim(
+    item: dict[str, Any],
+    *,
+    resume: float,
+    trimmed: float,
+) -> None:
+    """把起点前移到内部边界之后的重开战处，并**作废原起点的密扫证据**。
+
+    原 ``start_delta`` / ``start_confidence`` 是针对旧起点算出来的，裁剪后不再成立；
+    不清理会让下游（例如落库去重排序里"起点证据强"的判据）误以为这是一条起点
+    有密扫证据的切片——现场形态：123 的起点本在回合 A 内部，裁到回合 B 起点后
+    并没有新的密扫，必须按"起点待复核"对待。
+    """
+    item["start"] = round(float(resume), 3)
+    item["start_refined"] = round(float(resume), 3)
+    item["start_by"] = "interior_boundary_trim"
+    item["interior_boundary_trim_sec"] = round(float(trimmed), 3)
+    item["start_quality"] = "coarse"
+    item["start_review_required"] = True
+    # 起点密扫证据随起点作废（0.70 与 _stamp_broadcast_decision 的"未密扫"默认一致）
+    item["start_delta"] = None
+    item["start_confidence"] = 0.70
+    item["boundary_refined"] = False
+    item["broadcast_review_required"] = True
+
+
 def _first_frozen_frames(
     samples: Iterable[tuple[float, str, float]],
     *,
@@ -473,11 +694,21 @@ def _stamp_broadcast_decision(
         item["boundary_refined"] = _full_evidence
         item["boundary_refined_by"] = "broadcast_audit_v2"
         item["broadcast_review_required"] = not _full_evidence
+        item["start_quality"] = (
+            "precise"
+            if _start_evidence and float(item.get("start_confidence") or 0.0) >= 0.85
+            else "coarse"
+        )
+        item["end_quality"] = "precise"
+        item["start_review_required"] = item["start_quality"] != "precise"
+        item["end_review_required"] = False
         return
 
     # 情况 2：OCR 具备明确的 next_prep 出点且复核通过
     orig_end_by = str(item.get("end_by", "") or "").strip().lower()
-    if orig_end_by == "next_prep":
+    if orig_end_by == "next_prep" and not item.get(
+        "broadcast_next_prep_invalidated"
+    ):
         item["end_refined"] = float(item.get("end_refined", end))
         if "end_delta" not in item:
             item["end_delta"] = round(abs(item["end_refined"] - end_coarse), 3) if item.get("end_refined_done") else None
@@ -494,6 +725,14 @@ def _stamp_broadcast_decision(
         item["boundary_refined"] = _full_evidence
         item["boundary_refined_by"] = "broadcast_audit_v2"
         item["broadcast_review_required"] = not _full_evidence
+        item["start_quality"] = (
+            "precise"
+            if _start_evidence and float(item.get("start_confidence") or 0.0) >= 0.85
+            else "coarse"
+        )
+        item["end_quality"] = "precise" if item.get("end_delta") is not None else "coarse"
+        item["start_review_required"] = item["start_quality"] != "precise"
+        item["end_review_required"] = item["end_quality"] != "precise"
         return
 
     # 情况 3：无截断证据 (reason=none/None)，且出点非 next_prep (如 next_combat / open_tail)
@@ -508,6 +747,10 @@ def _stamp_broadcast_decision(
     item["confirm_status"] = "pending"
     item["boundary_refined"] = False
     item["broadcast_review_required"] = True
+    item["start_quality"] = "coarse"
+    item["end_quality"] = "coarse"
+    item["start_review_required"] = True
+    item["end_review_required"] = True
 
 
 def _stamp_broadcast_passed(
@@ -667,19 +910,75 @@ def _apply_start_visual_confidence(
     return ratio
 
 
+def _a5_window_cap(item: dict[str, Any], *, start: float, end: float) -> float | None:
+    """用 OCR 赛后回放块（A5 ``replay_segments``）压审计扫描窗口（不改出点判据）。
+
+    粗 OCR 出点普遍比真出点晚 30~80s（实测 2026-09-12：167.5→134.11、855.8→775.05、
+    1517.1→1496.75），审计尾部窗口 ``[end-30, end+45]`` 跟着一起漂后：抽帧/推理更贵，
+    真出点还有被挤出窗口的风险（000035 的真出点 449.875 落在 448.125 之外）。
+
+    OCR 侧 A5 已给出"赛后回放块"首帧，审计只需扫到该起点 + 小幅余量即可形成稳定终态
+    游程。**只压窗口**：压窗后若拿不到 cutoff，调用方回退完整窗口重审（``a5_cap_retry``），
+    因此判据与最终结论都不变。
+    """
+    segments = item.get("replay_segments")
+    if not isinstance(segments, (list, tuple)) or not segments:
+        return None
+    starts: list[float] = []
+    for seg in segments:
+        if not isinstance(seg, (list, tuple)) or len(seg) < 2:
+            continue
+        try:
+            seg_start = float(seg[0])
+        except (TypeError, ValueError):
+            continue
+        # 只认候选区间内部、且不贴头的回放块（贴头的属于上一回合尾段）
+        if start + MIN_ACTIVE_SEC <= seg_start <= end:
+            starts.append(seg_start)
+    if not starts:
+        return None
+    return min(starts) + A5_WINDOW_CAP_MARGIN_SEC
+
+
+def _effective_lookahead_sec(
+    *,
+    finalize: bool,
+    available_end: float | None,
+    has_strong_ocr_end: bool,
+    next_prep_invalidated: bool,
+    lookahead_sec: float | None = None,
+) -> float:
+    """Return the tail lookahead budget used to search for the real end.
+
+    OCR 强证据出点（result_ts / next_prep）只需 45s 后视；收尾/离线时录像已定格，
+    也无谓拉长窗口。但**视觉已否决 OCR 出点**（``next_prep_invalidated``）时必须
+    给足 ``END_LOOKAHEAD_SEC``：否则 ``scan_end`` 恒 == ``end + 45``，而"否决后继续
+    扩展"的判定条件恒成立 → 候选无限 pending，收尾永远算不出真出点。
+    实测 2026-09-12：351.312 的假出点 403.125 连跑 8 轮都停在 448.125，而真出点
+    449.875 就在窗外一格（给足 90s 后一次即定稿 broadcast_exclusion/precise）。
+    """
+    if has_strong_ocr_end:
+        return 45.0
+    if not next_prep_invalidated and (finalize or available_end is None):
+        return 45.0
+    return float(lookahead_sec if lookahead_sec is not None else END_LOOKAHEAD_SEC)
+
+
 def _start_gate_decision(
     samples: list[tuple[float, str, float]],
     *,
     start: float,
     split_from_oversize: bool,
+    onset_tolerance_sec: float = START_GATE_ONSET_TOLERANCE_SEC,
 ) -> tuple[float | None, str | None]:
     """Decide whether a broadcast candidate starts on real combat.
 
     Returns ``(new_start, reason)``:
     - ``(start, None)``: existing start is already a stable combat onset.
-    - ``(new_start, "moved_from_non_combat")``: move to the first stable combat.
-    - ``(None, "no_stable_combat")``: no reliable combat onset in the scanned
-      prefix; caller should reject (or merge/delete at a higher level).
+    - ``(new_start, "moved_from_non_combat")``: only for split_from_oversize
+      fixed chunks, move to the first stable combat inside the chunk.
+    - ``(None, "no_stable_combat")``: no reliable combat onset at the OCR start
+      (ordinary candidates) or nowhere inside a split chunk; caller rejects.
     """
     if not samples:
         return None, "no_stable_combat"
@@ -693,8 +992,15 @@ def _start_gate_decision(
     )
     if new_start is None:
         return None, "no_stable_combat"
-    if new_start <= float(start) + 1e-6:
+    if new_start <= float(start) + max(0.0, float(onset_tolerance_sec)):
+        # 偏差在容差内视为同一入点：候选起点那一帧的低置信/unknown 抖动不得
+        # 否决整条真实回合（见 START_GATE_ONSET_TOLERANCE_SEC 注释）。
         return float(start), None
+    # 普通 OCR 候选起点必须已经落在真实 combat 上。官方解说流中 replay/result/
+    # non_game 开头通常属于上一回合的回放尾段；后移生成“下一条真回合”会与后续
+    # OCR 候选重复，因此直接拒绝，只有 split_from_oversize 固定块才允许块内后移。
+    if not split_from_oversize:
+        return None, "no_stable_combat"
     return float(new_start), "moved_from_non_combat"
 
 
@@ -767,6 +1073,56 @@ def _expand_oversize_candidates(
 
 
 
+def _fill_pending_for_undecided(
+    candidates: list[dict[str, Any]],
+    sink: list[BroadcastAuditOutcome] | None,
+    *,
+    available_end: float | None,
+    reason: str = "cancelled_before_decision",
+) -> int:
+    """取消路径：为尚未记录的候选补发 pending，使 outcome 批次保持完整。
+
+    超长候选分裂后一次调用会产出多个 outcome，调用方按"整批"消费：只要批次里
+    还有非终态项，原槽位就保留；批次全为终态才弹出槽位。若审计被 cancel_check
+    中断，已定稿的子候选（rejected/accepted）会留在 sink 里，而**尚未开始**的
+    子候选没有记录——调用方会把这批误判为完整终态并弹掉槽位，未审计的子候选
+    静默消失。这里补齐 pending，使"取消时的批次"与"正常结束时的批次"语义一致。
+    """
+    if sink is None:
+        return 0
+    decided = set()
+    for outcome in sink:
+        candidate = getattr(outcome, "candidate", None)
+        if isinstance(candidate, dict):
+            key = str(candidate.get("round_key") or "").strip()
+            if key:
+                decided.add(key)
+    filled = 0
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        key = str(candidate.get("round_key") or "").strip()
+        if key and key in decided:
+            continue
+        retry_after = available_end
+        if retry_after is None:
+            try:
+                retry_after = float(candidate.get("end", 0.0))
+            except (TypeError, ValueError):
+                retry_after = None
+        _record_audit_outcome(
+            sink,
+            status="pending",
+            candidate=candidate,
+            reason=reason,
+            retry_after_duration=retry_after,
+        )
+        filled += 1
+    if filled:
+        _log.info("赛事审计取消：补发 pending 保持批次完整 %d 项", filled)
+    return filled
+
+
 def audit_broadcast_rounds(
     rounds: list[dict[str, Any]],
     video_path: str,
@@ -780,6 +1136,8 @@ def audit_broadcast_rounds(
     finalize: bool = False,
     lookahead_sec: float | None = None,
     _outcome_sink: list[BroadcastAuditOutcome] | None = None,
+    frame_provider: Any | None = None,
+    max_media_step_sec: float | None = None,
 ) -> list[dict[str, Any]]:
     """Audit OCR candidates; fail closed when the visual model is unavailable.
 
@@ -802,16 +1160,130 @@ def audit_broadcast_rounds(
     if classifier is None:
         from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
 
-        clf = ValorantFrameClassifier()
+        clf = ValorantFrameClassifier(profile="broadcast")
     else:
         clf = classifier
     clf.load()
     stable_prob = float(clf.thresholds.get("stable_prob", 0.55))
     class_stable_prob = getattr(clf, "class_stable_prob", {})
     output: list[dict[str, Any]] = []
-    for original in rounds:
+
+    def _raise_if_cancelled(stage: str) -> None:
         if cancel_check and cancel_check():
-            raise FFmpegCancelled("cancelled during broadcast audit")
+            raise FFmpegCancelled(f"cancelled during broadcast audit ({stage})")
+
+    def _extract(
+        start_sec: float,
+        end_sec: float,
+        fps: float,
+        *,
+        overlap_sec: float = 0.0,
+    ) -> list[tuple[float, Any]]:
+        if frame_provider is not None:
+            return frame_provider.get_frames(
+                video_path,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                fps=fps,
+                ffmpeg_path=ffmpeg_path,
+                cancel_check=cancel_check,
+                overlap_sec=overlap_sec,
+            )
+        return extract_frames_cancellable(
+            video_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            fps=fps,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            overlap_sec=overlap_sec,
+        )
+
+    # Batch callers (offline/finalization or a future multi-candidate scheduler)
+    # can pay one FFmpeg seek for overlapping 1fps gate/tail windows.  Per-item
+    # calls below then reuse the provider and only fill genuinely missing gaps.
+    if frame_provider is not None and len(rounds) > 1 and hasattr(
+        frame_provider, "prefetch_ranges"
+    ):
+        prefetch_ranges: list[tuple[float, float]] = []
+        for candidate in rounds:
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                candidate_start = max(0.0, float(candidate.get("start", 0.0)))
+                candidate_end = float(candidate.get("end", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if candidate_end <= candidate_start:
+                continue
+            gate_limit = (
+                MAX_BROADCAST_ROUND_SEC
+                if candidate.get("split_from_oversize")
+                else START_GATE_SCAN_LIMIT_SEC
+            )
+            gate_end = min(candidate_end, candidate_start + gate_limit)
+            if max_media_step_sec is not None:
+                # 在线微步骤：预取也必须受同一个媒体预算约束。分裂块的门禁窗口
+                # 是 MAX_BROADCAST_ROUND_SEC(150s)，4 块一次性预取实测 ≈514 帧
+                # ≈23s，已超过 20s 墙钟预算 ⇒ 每轮都在预取阶段被腰斩、零结论交付。
+                # 预取只是批量加速；门禁/尾部自己的 _extract 仍会按需抽帧并经
+                # FrameProvider 缓存，判定窗口与语义完全不变。
+                gate_end = min(
+                    gate_end,
+                    candidate_start + max(1.0, float(max_media_step_sec)),
+                )
+            if gate_end > candidate_start:
+                prefetch_ranges.append((candidate_start, gate_end))
+
+            tail_start = max(
+                candidate_start,
+                candidate_end - BROADCAST_AUDIT_TAIL_LOOKBACK_SEC,
+            )
+            result_ts = candidate.get("result_ts")
+            if isinstance(result_ts, (int, float)):
+                tail_start = min(
+                    tail_start,
+                    max(candidate_start, float(result_ts) - 10.0),
+                )
+            has_strong_end = (
+                result_ts is not None
+                or str(candidate.get("end_by", "")).lower()
+                in ("buy_phase", "next_prep")
+            )
+            tail_lookahead = (
+                45.0
+                if (finalize or available_end is None or has_strong_end)
+                else float(
+                    lookahead_sec
+                    if lookahead_sec is not None
+                    else END_LOOKAHEAD_SEC
+                )
+            )
+            tail_end = min(
+                candidate_start + MAX_BROADCAST_ROUND_SEC,
+                candidate_end + tail_lookahead,
+            )
+            if available_end is not None:
+                tail_end = min(tail_end, max(candidate_start, float(available_end)))
+            if max_media_step_sec is not None:
+                tail_end = min(
+                    tail_end,
+                    tail_start + max(1.0, float(max_media_step_sec)),
+                )
+            if tail_end > tail_start:
+                prefetch_ranges.append((tail_start, tail_end))
+        if prefetch_ranges:
+            frame_provider.prefetch_ranges(
+                video_path,
+                prefetch_ranges,
+                fps=max(0.5, float(sample_fps)),
+                ffmpeg_path=ffmpeg_path,
+                cancel_check=cancel_check,
+                merge_gap_sec=2.0,
+            )
+
+    for original in rounds:
+        _raise_if_cancelled("candidate")
         item = dict(original)
         try:
             start = float(item["start"])
@@ -843,7 +1315,10 @@ def audit_broadcast_rounds(
                 reason="long_or_invalid",
             )
             continue
-        cache_key = f"{round(start, 1):.1f}"
+        # Prefer the immutable round identity.  Start-gating/refinement may move
+        # ``start`` by tens of seconds; a start-derived key would orphan the
+        # cached gate/tail evidence and repeat the whole audit under a new key.
+        cache_key = str(item.get("round_key") or f"{round(start, 1):.1f}")
         cache_item: dict[str, Any] | None = None
         if isinstance(audit_cache, dict):
             existing_cache = audit_cache.get(cache_key)
@@ -912,19 +1387,40 @@ def audit_broadcast_rounds(
         # 停录收尾或 OCR 强证据（明确胜利结算横幅或进入下回合买枪）时，
         # lookahead 适度收窄至 45s（已足以覆盖 5-10s 横幅 + 10-20s 回放 + 观察缓冲），
         # 避免在录像已结束时继续抽无谓的长窗口，大幅减轻抽帧与 DirectML 推理耗时。
-        has_strong_ocr_end = (
-            item.get("result_ts") is not None
-            or str(item.get("end_by", "")).lower() in ("buy_phase", "next_prep")
+        next_prep_invalidated = bool(
+            cache_item is not None
+            and cache_item.get("next_prep_invalidated")
         )
-        effective_lookahead = (
-            45.0
-            if (finalize or available_end is None or has_strong_ocr_end)
-            else float(lookahead_sec if lookahead_sec is not None else END_LOOKAHEAD_SEC)
+        if next_prep_invalidated:
+            item["broadcast_next_prep_invalidated"] = True
+        has_strong_ocr_end = (
+            not next_prep_invalidated
+            and (
+                item.get("result_ts") is not None
+                or str(item.get("end_by", "")).lower() in ("buy_phase", "next_prep")
+            )
+        )
+        effective_lookahead = _effective_lookahead_sec(
+            finalize=finalize,
+            available_end=available_end,
+            has_strong_ocr_end=has_strong_ocr_end,
+            next_prep_invalidated=next_prep_invalidated,
+            lookahead_sec=lookahead_sec,
         )
         scan_end = min(
             start + MAX_BROADCAST_ROUND_SEC,
             max(end, end + effective_lookahead),
         )
+        # A5 缩窗：OCR 已给出赛后回放块起点时，只需扫到该起点 + 余量即可判定截断。
+        # 压窗后若拿不到 cutoff，本轮结束会走 a5_cap_retry 回退到完整窗口（见下方分支），
+        # 因此这里只影响成本、不影响判据；重试过的不再压窗。
+        _a5_cap = None
+        if not (cache_item or {}).get("a5_cap_retried"):
+            _a5_cap = _a5_window_cap(item, start=start, end=end)
+        if _a5_cap is not None and _a5_cap < scan_end:
+            scan_end = _a5_cap
+            item["broadcast_audit_window_uncapped_end"] = round(float(scan_end), 3)
+            item["broadcast_audit_window_cap"] = round(float(_a5_cap), 3)
         effective_scan_end = scan_end
         lookahead_incomplete = (
             available_end is not None
@@ -943,85 +1439,91 @@ def audit_broadcast_rounds(
                 audit_cache[cache_key] = cache_item
 
         # ---- 入点门禁（start gating）----
-        # 在线/收尾/离线统一执行：候选的起点是已录制的过去，头部 15s 必然可用，
+        # 在线/收尾/离线统一执行：候选的起点是已录制的过去，头部必然可用，
         # 因此候选一旦形成就立即判定入点，强停时回放开头候选也会被当场拦截，
         # 不再等收尾才执行。split_from_oversize 固定块头照旧整块重找锚点。
+        # 普通候选只查 START_GATE_SCAN_LIMIT_SEC；起点不在真实 combat 上时
+        # 直接拒绝，不再扩展扫描/后移——那只会把上一回合的回放尾段误生成新切片。
         run_start_gate = (
             not cache_item.get("start_gate_done")
             and (bool(item.get("split_from_oversize")) or not item.get("start_delta"))
         )
-        gate_scan_end: float | None = None
-        gate_window_covered = True
+        _start_gate_rejected_candidate = False
+        _start_gate_pending_candidate = False
         if run_start_gate:
-            gate_scan_end = min(
-                float(end),
-                float(start) + (
-                    MAX_BROADCAST_ROUND_SEC
-                    if item.get("split_from_oversize")
-                    else START_GATE_SCAN_LIMIT_SEC
-                ),
-            )
-            # 在线极端情况：头部窗口还没被当前录制覆盖时，不能用截断的头部下
-            # 结论，跳过判定交给 pending_lookahead 重试，防止把尚未写入的
-            # 后续 combat 误判为“找不到真实入点”而提前拒绝。
-            gate_window_covered = (
-                available_end is None
-                or float(available_end) + 0.5 >= gate_scan_end
-            )
-        if run_start_gate and gate_window_covered:
             # 起点门禁的头部样本单独存放到 start_gate_samples，不混入尾部审计
             # 的 samples/scanned_end。否则在线首轮会因缓存“已扫过头部”而从
             # 头部开始连续扫完整回合，暴露回合中段的 replay/result 转场，导致
             # 出点被过早截断、回合不完整。
-            existing_gate_samples = [
-                tuple(row)
-                for row in cache_item.get("start_gate_samples", [])
-                if isinstance(row, (list, tuple)) and len(row) == 3
-            ]
-            existing_gate_cover = (
-                max(float(ts) for ts, _, _ in existing_gate_samples)
-                if existing_gate_samples
-                else start
-            )
-            existing_gate_min = (
-                min(float(ts) for ts, _, _ in existing_gate_samples)
-                if existing_gate_samples
-                else start
-            )
-            # 注意：pending 缓存可能只覆盖尾部（例如 120s~150s），max 很高但
-            # 头部是空的；此时必须补抽 [start, existing_min) 这一段头部。
-            if existing_gate_min > start + 0.5:
-                gate_frames = extract_frames_cancellable(
-                    video_path,
-                    start_sec=start,
-                    end_sec=min(gate_scan_end, existing_gate_min),
-                    fps=max(0.5, float(sample_fps)),
-                    ffmpeg_path=ffmpeg_path,
-                    cancel_check=cancel_check,
-                    overlap_sec=0.0,
+            gate_limit = float(
+                cache_item.get("start_gate_next_limit")
+                or (
+                    MAX_BROADCAST_ROUND_SEC
+                    if item.get("split_from_oversize")
+                    else START_GATE_SCAN_LIMIT_SEC
                 )
-            elif gate_scan_end > existing_gate_cover + 0.5:
-                gate_frames = extract_frames_cancellable(
-                    video_path,
-                    start_sec=max(start, existing_gate_cover),
-                    end_sec=gate_scan_end,
-                    fps=max(0.5, float(sample_fps)),
-                    ffmpeg_path=ffmpeg_path,
-                    cancel_check=cancel_check,
-                    overlap_sec=0.0,
+            )
+            gate_scan_end: float | None = None
+            gate_window_covered = True
+            while True:
+                gate_scan_end = min(
+                    float(end),
+                    float(start) + float(gate_limit),
                 )
-            else:
-                gate_frames = []
-            if gate_frames or existing_gate_samples:
+                # 在线极端情况：头部窗口还没被当前录制覆盖时，不能用截断的头部下
+                # 结论，跳过判定交给 pending_lookahead 重试，防止把尚未写入的
+                # 后续 combat 误判为“找不到真实入点”而提前拒绝。
+                gate_window_covered = (
+                    available_end is None
+                    or float(available_end) + 0.5 >= gate_scan_end
+                )
+                if not gate_window_covered:
+                    break
+                existing_gate_samples = [
+                    tuple(row)
+                    for row in cache_item.get("start_gate_samples", [])
+                    if isinstance(row, (list, tuple)) and len(row) == 3
+                ]
+                existing_gate_cover = (
+                    max(float(ts) for ts, _, _ in existing_gate_samples)
+                    if existing_gate_samples
+                    else start
+                )
+                existing_gate_min = (
+                    min(float(ts) for ts, _, _ in existing_gate_samples)
+                    if existing_gate_samples
+                    else start
+                )
+                # 注意：pending 缓存可能只覆盖尾部（例如 120s~150s），max 很高但
+                # 头部是空的；此时必须补抽 [start, existing_min) 这一段头部。
+                if existing_gate_min > start + 0.5:
+                    gate_frames = _extract(
+                        start,
+                        min(gate_scan_end, existing_gate_min),
+                        max(0.5, float(sample_fps)),
+                    )
+                elif gate_scan_end > existing_gate_cover + 0.5:
+                    gate_frames = _extract(
+                        max(start, existing_gate_cover),
+                        gate_scan_end,
+                        max(0.5, float(sample_fps)),
+                    )
+                else:
+                    gate_frames = []
+                if not gate_frames and not existing_gate_samples:
+                    # 无任何可判定帧：保持未定稿，由后续尾部审计决定 pending/拒绝。
+                    break
                 merged_gate_samples = {
                     round(float(ts), 3): (float(ts), str(label), float(conf))
                     for ts, label, conf in existing_gate_samples
                 }
                 if gate_frames:
+                    _raise_if_cancelled("start gate inference")
                     gate_probs = _predict_broadcast_batch(clf, [img for _, img in gate_frames])
                     for _gate_index, ((gate_ts, _), gate_row) in enumerate(
                         zip(gate_frames, gate_probs, strict=True)
                     ):
+                        _raise_if_cancelled("start gate samples")
                         gate_label, gate_confidence = _stable_visual_label(
                             gate_row,
                             stable_prob=stable_prob,
@@ -1061,13 +1563,17 @@ def audit_broadcast_rounds(
                     for sample in gate_samples
                     if float(sample[0]) <= gate_scan_end + 0.5
                 ]
-                cache_item["start_gate_done"] = True
                 original_start = float(start)
                 new_start, gate_reason = _start_gate_decision(
                     decision_samples,
                     start=start,
                     split_from_oversize=bool(item.get("split_from_oversize")),
                 )
+                # 普通候选不做 15s→35s 扩展：起点不是真实 combat 就当场拒绝，
+                # 省掉额外抽帧/推理（缓解解说流滞后）；split_from_oversize 已经
+                # 一次扫到整块上限，无需扩展。
+                cache_item.pop("start_gate_next_limit", None)
+                cache_item["start_gate_done"] = True
                 if gate_reason == "no_stable_combat":
                     item["broadcast_start_gate"] = gate_reason
                     item["broadcast_start_gate_scan_end"] = round(gate_scan_end, 3)
@@ -1099,7 +1605,8 @@ def audit_broadcast_rounds(
                         candidate=item,
                         reason="no_stable_combat_start",
                     )
-                    continue
+                    _start_gate_rejected_candidate = True
+                    break
                 if new_start is not None and abs(new_start - original_start) > 1e-6:
                     item["start"] = round(new_start, 3)
                     item["start_refined"] = round(new_start, 3)
@@ -1131,7 +1638,31 @@ def audit_broadcast_rounds(
                 # 的二值代理（0.95/0.70）。窗口内无样本时不写值，保留兜底，
                 # 避免因缺样本把广播回合批量降级为 coarse。
                 _apply_start_visual_confidence(item, gate_samples)
-
+                break
+        if _start_gate_rejected_candidate:
+            continue
+        if _start_gate_pending_candidate:
+            continue
+        if (
+            run_start_gate
+            and max_media_step_sec is not None
+            and cache_item.get("start_gate_done")
+        ):
+            # A completed start gate is one bounded micro-step by itself.  Tail
+            # lookahead starts on the next turn so one candidate cannot hold
+            # the analysis resource for gate + tail + dense refine at once.
+            item["broadcast_audit"] = "pending_lookahead"
+            item["broadcast_audit_step"] = "start_gate_complete"
+            item["_audit_continue_ready"] = True
+            output.append(item)
+            _record_audit_outcome(
+                _outcome_sink,
+                status="pending",
+                candidate=item,
+                reason="start_gate_complete",
+                retry_after_duration=float(available_end or end),
+            )
+            continue
         cached_samples = [
             tuple(row)
             for row in cache_item.get("samples", [])
@@ -1159,23 +1690,40 @@ def audit_broadcast_rounds(
             audit_start = max(start, cached_scanned_end - 1.0)
         else:
             audit_start = max(start, end - BROADCAST_AUDIT_TAIL_LOOKBACK_SEC)
+            if item.get("split_from_oversize"):
+                # 分裂块是固定长度切块，没有真实 OCR 出点：回放/非游戏可能落在
+                # 块内任意位置，只扫尾部 30s 会漏掉块中部的回合边界（实测：块内
+                # 22s 回放未被发现，切片跨回合且带污染内容）。整块从头扫起，
+                # 单次仍按 max_media_step_sec 分块（微步骤预算不变）。
+                audit_start = max(start, start)
             result_ts = item.get("result_ts")
             if isinstance(result_ts, (int, float)):
                 audit_start = min(audit_start, max(start, float(result_ts) - 10.0))
         extract_start = max(start, audit_start)
         if cached_samples and cached_scanned_end >= effective_scan_end - 0.5:
             extract_start = effective_scan_end
-        frames = extract_frames_cancellable(
-            video_path,
-            start_sec=extract_start,
-            end_sec=effective_scan_end,
-            fps=max(0.5, float(sample_fps)),
-            ffmpeg_path=ffmpeg_path,
-            cancel_check=cancel_check,
-            overlap_sec=0.0,
+        micro_step_incomplete = False
+        if max_media_step_sec is not None:
+            media_budget = max(1.0, float(max_media_step_sec))
+            step_base = max(extract_start, cached_scanned_end)
+            if effective_scan_end > step_base + media_budget:
+                effective_scan_end = step_base + media_budget
+                micro_step_incomplete = True
+        frames = _extract(
+            extract_start,
+            effective_scan_end,
+            max(0.5, float(sample_fps)),
         )
+        _raise_if_cancelled("tail extraction")
         if not frames and not cached_samples:
-            if lookahead_incomplete:
+            # 收尾/离线（finalize）时录制文件已定格：后视窗口结构性不足
+            # （scan_end 超出可用末尾）不再是"等待更多媒体"的理由。若继续返回
+            # pending，候选会被写回待审计队列且 `_last_audit_dur` 被钉到文件
+            # 时长，此后 room_handler 的 ready/probe 判定（`_dur >= c_end+needed`
+            # 与 `_dur >= last_dur+12`）永不再满足 → 候选永久滞留 → 收尾
+            # `pending_audit` 恒真 → 无限补扫 / 卡死。finalize 阶段必须收敛，
+            # 直接按无帧判定终态。
+            if lookahead_incomplete and not finalize:
                 item["broadcast_audit"] = "pending_lookahead"
                 item["broadcast_audit_scan_end"] = round(scan_end, 3)
                 item["broadcast_audit_available_end"] = round(float(available_end), 3)
@@ -1197,6 +1745,7 @@ def audit_broadcast_rounds(
             )
             continue
         probs = _predict_broadcast_batch(clf, [img for _, img in frames]) if frames else []
+        _raise_if_cancelled("tail inference")
         samples: list[tuple[float, str, float]] = list(cached_samples)
         timer_samples: list[tuple[float, float | None, str]] = list(cached_timer_samples)
         freeze_samples: list[tuple[float, str, float]] = list(cached_freeze_samples)
@@ -1208,7 +1757,9 @@ def audit_broadcast_rounds(
         )
         last_timer_ocr_ts = -999.0
         prev_sample_label: str | None = None
+        online_timer_ocr_count = 0
         for index, (ts, image) in enumerate(frames):
+            _raise_if_cancelled("tail samples")
             row = probs[index]
             label, confidence = _stable_visual_label(
                 row, stable_prob=stable_prob, class_stable_prob=class_stable_prob,
@@ -1243,18 +1794,32 @@ def audit_broadcast_rounds(
             #     避免对连续相同 non_game 帧每一帧都跑通用 OCR，大幅减轻 CPU 负荷。
             should_run_timer = False
             if (
-                (label == "combat" and index % timer_stride == 0)
+                (
+                    max_media_step_sec is None
+                    and label == "combat"
+                    and index % timer_stride == 0
+                )
                 or (
                     label in _TIMER_OCR_LABELS
                     and (
                         label != prev_sample_label
                         or (float(ts) - last_timer_ocr_ts >= 2.0)
                     )
+                    # 在线微步骤只需一个排除帧计时器来否决
+                    # “交战钟仍在走”。正常 combat 的周期 OCR 在
+                    # DirectML 机器上可比整个视觉批次还慢，暂停
+                    # 仍由连续静帧证据检出；收尾/离线审计保留
+                    # 完整计时器序列。
+                    and (
+                        max_media_step_sec is None
+                        or online_timer_ocr_count < 1
+                    )
                 )
             ):
                 should_run_timer = True
 
             if should_run_timer:
+                _raise_if_cancelled("timer OCR")
                 timer = None
                 try:
                     timer, _, _ = _read_top_anchors(image)
@@ -1262,7 +1827,21 @@ def audit_broadcast_rounds(
                     _log.debug("赛事暂停计时器审计 OCR 失败: %s", exc)
                 timer_samples.append((float(ts), timer, label))
                 last_timer_ocr_ts = float(ts)
+                if max_media_step_sec is not None:
+                    online_timer_ocr_count += 1
             prev_sample_label = label
+            # 微步骤可能在下一帧 OCR 期间被抢占。每帧都将
+            # 已完成的证据写入 cache，重试从最后成功 PTS 继续，
+            # 避免超时后反复支付同一批推理/OCR 成本。
+            if max_media_step_sec is not None:
+                cache_item["samples"] = list(samples)
+                cache_item["timer_samples"] = list(timer_samples)
+                cache_item["freeze_samples"] = list(freeze_samples)
+                cache_item["scanned_end"] = max(
+                    cached_scanned_end,
+                    float(ts),
+                )
+            _raise_if_cancelled("tail checkpoint")
         # 仅保留每个 PTS 的最新值，避免 pending 回合跨窗口重审时列表膨胀。
         samples_by_ts = {round(float(ts), 3): (float(ts), label, float(conf)) for ts, label, conf in samples}
         timer_by_ts = {
@@ -1289,23 +1868,42 @@ def audit_broadcast_rounds(
             and extract_start > start + 0.5
             and not cache_item.get("fallback_full_scanned")
         ):
-            cache_item["fallback_full_scanned"] = True
+            fallback_target_end = float(
+                cache_item.get("fallback_full_target_end") or extract_start
+            )
+            cache_item["fallback_full_target_end"] = fallback_target_end
+            # 从尾窗向前搜索，优先找到紧邻 Replay/结算的
+            # 最后一段 combat。正向从候选起点扫在 100s 回合上
+            # 通常要等 4–5 个调度周期，倒序分块多数只需
+            # 1–2 步；样本合并后仍按 PTS 排序，判定语义不变。
+            fallback_end = min(
+                fallback_target_end,
+                float(
+                    cache_item.get("fallback_full_cursor")
+                    or fallback_target_end
+                ),
+            )
+            fallback_start = float(start)
+            if max_media_step_sec is not None:
+                fallback_start = max(
+                    fallback_start,
+                    fallback_end - max(1.0, float(max_media_step_sec)),
+                )
+            _raise_if_cancelled("fallback extraction")
             # 只补抽尚未扫描的头部 [start, extract_start]：尾窗 [extract_start,
             # effective_scan_end] 的样本已在 samples 中，重抽整段会重复抽帧+重复
             # 推理（收尾超时主因之一）。按 ts 合并后覆盖区间与重抽整段完全一致。
-            full_frames = extract_frames_cancellable(
-                video_path,
-                start_sec=start,
-                end_sec=extract_start,
-                fps=max(0.5, float(sample_fps)),
-                ffmpeg_path=ffmpeg_path,
-                cancel_check=cancel_check,
-                overlap_sec=0.0,
+            full_frames = _extract(
+                fallback_start,
+                fallback_end,
+                max(0.5, float(sample_fps)),
             )
+            _raise_if_cancelled("fallback inference")
             if full_frames:
                 full_probs = _predict_broadcast_batch(clf, [img for _, img in full_frames])
                 full_samples: list[tuple[float, str, float]] = []
                 for _, ((full_ts, _), full_row) in enumerate(zip(full_frames, full_probs, strict=True)):
+                    _raise_if_cancelled("fallback samples")
                     full_label, full_confidence = _stable_visual_label(
                         full_row,
                         stable_prob=stable_prob,
@@ -1335,13 +1933,47 @@ def audit_broadcast_rounds(
                 }
                 samples = [samples_by_ts[key] for key in sorted(samples_by_ts)]
                 cache_item["samples"] = samples
+            cache_item["fallback_full_cursor"] = fallback_start
+            if fallback_start > float(start) + 0.5:
+                # 原实现在此绕过 18s 媒体预算，一次回扫
+                # 90s+ 并长时间占住粗扫共用的 OCR/ONNX 锁。
+                # 现在回扫也严格分块，且持久化 cursor。
+                micro_step_incomplete = True
+            else:
+                cache_item["fallback_full_scanned"] = True
+                cache_item.pop("fallback_full_cursor", None)
+                cache_item.pop("fallback_full_target_end", None)
         samples = _stabilize_broadcast_samples(samples)
+        if (
+            str(item.get("end_by", "")).lower() == "next_prep"
+            and not cache_item.get("next_prep_invalidated")
+            and _has_immediate_combat_after(samples, end)
+        ):
+            cache_item["next_prep_invalidated"] = True
+            item["broadcast_next_prep_invalidated"] = True
+            item["broadcast_next_prep_invalidated_reason"] = (
+                "combat_continues_after_ocr_next_prep"
+            )
+            # 可观测性：记录被否决的 OCR 出点原值。该出点此时只是"搜索锚点"，
+            # 真出点必须由视觉证据给出（见 _effective_lookahead_sec：否决后不再
+            # 钉死 +45s 窄窗，否则收尾永远算不出真出点、候选无限 pending）。
+            item["broadcast_ocr_end_invalidated"] = round(float(end), 3)
+            _log.warning(
+                "赛事回合 OCR next_prep 被视觉否决（出点后仍持续交战）: "
+                "start=%.1f, false_end=%.1f",
+                start,
+                end,
+            )
         item_score_cutoff = item.get("score_cutoff") or item.get("score_end_ts")
         cand_score_cutoff = float(item_score_cutoff) if item_score_cutoff is not None else None
         cutoff, reason = audit_broadcast_phase_sequence(
             samples,
             timer_samples,
-            freeze_samples,
+            # 分裂块从块头整段起扫：逐帧"冻结"兜底会把块头静态画面（买枪/观察位）
+            # 误判为技术暂停并给出贴头 cutoff，进而整块被 no_active_span 拒绝。
+            # 固定切块的块头没有语义，故只保留计时器级冻结判定（暂停时 HUD 通常
+            # 可读）；普通候选保持原语义不变。
+            [] if item.get("split_from_oversize") else freeze_samples,
             start=start,
             end=end,
             scan_end=scan_end,
@@ -1359,14 +1991,10 @@ def audit_broadcast_rounds(
             )
             refine_end = min(effective_scan_end, float(cutoff) + 4.0)
             if refine_end > refine_start:
-                refine_frames = extract_frames_cancellable(
-                    video_path,
-                    start_sec=refine_start,
-                    end_sec=refine_end,
-                    fps=2.0,
-                    ffmpeg_path=ffmpeg_path,
-                    cancel_check=cancel_check,
-                    overlap_sec=0.0,
+                refine_frames = _extract(
+                    refine_start,
+                    refine_end,
+                    2.0,
                 )
                 if refine_frames:
                     refine_probs = _predict_broadcast_batch(clf, [img for _, img in refine_frames])
@@ -1415,6 +2043,21 @@ def audit_broadcast_rounds(
                             "赛事回合终点局部复核提前截断: %.1f",
                             float(cutoff),
                         )
+        if (
+            cutoff is not None
+            and reason == "broadcast_replay_or_non_game"
+            and not item.get("broadcast_next_prep_invalidated")
+            and float(item.get("end_coarse", end)) - float(cutoff) >= 3.0
+        ):
+            # 常规赛事候选的粗出点通常包含结算+回放，视觉
+            # 审计会向前截到 ROUND WIN/THRIFTY 刚出现的首帧。
+            # 保留 2.5s 结算尾巴，但“假 next_prep 被否决后向后
+            # 延长”的候选不加尾巴，避免带入选手席/真 Replay。
+            cutoff = min(
+                float(scan_end),
+                float(cutoff) + RESULT_PRESENTATION_TAIL_SEC,
+            )
+            item["broadcast_result_tail_sec"] = RESULT_PRESENTATION_TAIL_SEC
         if reason == "broadcast_no_active_span" or cutoff is not None and cutoff <= start:
             item["broadcast_audit"] = "rejected_no_stable_combat"
             _log.info("赛事回合审计拒绝无稳定交战: %.1f-%.1f", start, end)
@@ -1425,6 +2068,31 @@ def audit_broadcast_rounds(
                 reason="no_stable_combat",
             )
             continue
+        # 硬否决：若提议截断点之后仍有连续递减的交战计时器，说明回合并未真正
+        # 结束（可能是转场/回放夹在回合中），禁止把该点定稿为 broadcast_exclusion。
+        if (
+            cutoff is not None
+            and reason
+            and _has_decreasing_combat_after(
+                cutoff,
+                timer_samples,
+                # 回合化（2026-09-12）：所有候选都允许「满钟=新回合」逃逸。
+                # 该规则本就为「回放后接下一回合满钟」设计（原仅用于固定切块），
+                # 普通候选遇到的正是同一形态——跨回合的钟表递减会误否决正确截断：
+                # 实测 round-000135 的真实出点 1423.2 被误否决（→next_prep/coarse），
+                # 且窗口放宽后 045 的正确截断 514.0 也会被下一回合的钟表误否决
+                # （→重搜接受 672.485，跨回合粘连 +158s）。
+                fresh_clock_min=FRESH_ROUND_CLOCK_MIN,
+            )
+        ):
+            _log.info(
+                "赛事回合终点硬否决（截断后交战计时器仍递减）: %.1f-%.1f, cutoff=%.1f",
+                start,
+                end,
+                float(cutoff),
+            )
+            cutoff = None
+            reason = None
         if cutoff is not None and reason:
             new_end = min(float(scan_end), float(cutoff))
             if new_end - start < MIN_ACTIVE_SEC:
@@ -1441,7 +2109,67 @@ def audit_broadcast_rounds(
             item["end_by"] = "broadcast_exclusion"
             item["broadcast_excluded_reason"] = reason
             item["broadcast_excluded_from"] = round(new_end, 3)
+        if (
+            cutoff is None
+            and cache_item.get("next_prep_invalidated")
+            and scan_end < min(
+                start + MAX_BROADCAST_ROUND_SEC,
+                end + END_LOOKAHEAD_SEC,
+            ) - 0.5
+        ):
+            # 首次按“强 next_prep”只审计 45s；一旦视觉证明该出点是假的，
+            # 下轮扩展到完整 90s/max-round 后视范围，直到找到真实边界。
+            item["broadcast_audit"] = "pending_lookahead"
+            item["broadcast_audit_step"] = "next_prep_veto_extend"
+            item["_audit_continue_ready"] = True
+            output.append(item)
+            _record_audit_outcome(
+                _outcome_sink,
+                status="pending",
+                candidate=item,
+                reason="next_prep_invalidated",
+                retry_after_duration=float(available_end or scan_end),
+            )
+            continue
+        if cutoff is None and not (cache_item or {}).get("a5_cap_retried") and (
+            item.get("broadcast_audit_window_cap") is not None
+        ):
+            # 压窗后没拿到截断证据 ⇒ 回退到完整窗口重审（只一次），避免缩窗把真出点挡在
+            # 窗口外。旧实现只对 next_prep 否决做扩展，这里补上"缩窗失败"这一路。
+            cache_item["a5_cap_retried"] = True
+            item.pop("broadcast_audit_window_cap", None)
+            item.pop("broadcast_audit_window_uncapped_end", None)
+            item["broadcast_audit"] = "pending_lookahead"
+            item["broadcast_audit_step"] = "a5_cap_retry"
+            item["_audit_continue_ready"] = True
+            output.append(item)
+            _record_audit_outcome(
+                _outcome_sink,
+                status="pending",
+                candidate=item,
+                reason="a5_cap_retry",
+                retry_after_duration=float(available_end or end),
+            )
+            _log.info(
+                "赛事回合审计缩窗未获证据，回退完整窗口重审: %.1f-%.1f", start, end,
+            )
+            continue
+        if cutoff is None and micro_step_incomplete:
+            item["broadcast_audit"] = "pending_lookahead"
+            item["broadcast_audit_step"] = "tail"
+            item["broadcast_audit_step_end"] = round(effective_scan_end, 3)
+            item["_audit_continue_ready"] = True
+            output.append(item)
+            _record_audit_outcome(
+                _outcome_sink,
+                status="pending",
+                candidate=item,
+                reason="audit_micro_step",
+                retry_after_duration=float(available_end or effective_scan_end),
+            )
+            continue
         if cutoff is None and lookahead_incomplete:
+            item.pop("_audit_continue_ready", None)
             item["broadcast_audit"] = "pending_lookahead"
             item["broadcast_audit_scan_end"] = round(scan_end, 3)
             item["broadcast_audit_available_end"] = round(float(available_end), 3)
@@ -1461,10 +2189,59 @@ def audit_broadcast_rounds(
                 scan_end,
             )
             continue
+        item.pop("_audit_continue_ready", None)
+        item.pop("broadcast_audit_step", None)
+        item.pop("broadcast_audit_step_end", None)
         item["broadcast_audit_scan_end"] = round(scan_end, 3)
         # 证据驱动盖章：仅当真实发现截断或 OCR next_prep 复核通过时才标 passed/confirmed，
         # reason=none 保持 pending，严禁伪造 broadcast_exclusion。
         _stamp_broadcast_decision(item, clf, cutoff=cutoff, reason=reason)
+        # L1：区间内边界自检。出点定稿不等于区间干净——OCR 起点可能落在上一回合内部，
+        # 区间里含一个完整回合边界，出点却属于后一回合（round-000123 ↔ round-000135）。
+        _interior_resume = _interior_round_boundary(
+            samples, start=start, end=float(item.get("end") or end)
+        )
+        if _interior_resume is not None:
+            _action, _trimmed, _kept = _interior_boundary_verdict(
+                start=start, end=float(item["end"]), resume=_interior_resume
+            )
+            if _action == "reject":
+                item["broadcast_audit"] = "rejected_interior_boundary"
+                item["broadcast_audit_reason"] = "interior_round_boundary"
+                item["interior_boundary_resume_sec"] = round(_interior_resume, 3)
+                item["interior_boundary_trim_sec"] = round(_trimmed, 3)
+                item["confirm_status"] = "pending"
+                # 关键：**不得**把该候选标记为 cache completed。缓存命中分支
+                # （audit_cache[key]["completed"]）会 `item.update(stamped_decision)` 或
+                # 重新 `_stamp_broadcast_decision()` 后直接 append 到 output——拒绝路径
+                # 没有 stamped_decision，下一轮就会被重新盖章成 accepted，把拒绝悄悄翻案。
+                # 与既有拒绝路径（no_stable_combat_start / long_or_invalid）一致：留给下一轮
+                # 重新审一遍，纯函数判定使其结论稳定。
+                _log.info(
+                    "赛事回合区间跨回合拒绝: %.1f-%.1f, 内部边界后重开战=%.1f, 前缀=%.1fs 剩余=%.1fs",
+                    start,
+                    float(item["end"]),
+                    _interior_resume,
+                    _trimmed,
+                    _kept,
+                )
+                _record_audit_outcome(
+                    _outcome_sink,
+                    status="rejected",
+                    candidate=item,
+                    reason="interior_round_boundary",
+                )
+                continue
+            _apply_interior_boundary_trim(
+                item, resume=_interior_resume, trimmed=_trimmed
+            )
+            _log.info(
+                "赛事回合起点前缀裁剪: %.1f-%.1f → 起点 %.1f（裁掉跨回合前缀 %.1fs）",
+                start,
+                float(item["end"]),
+                _interior_resume,
+                _trimmed,
+            )
         cache_item["completed"] = True
         cache_item["final_end"] = float(item["end"])
         cache_item["scan_end"] = scan_end
@@ -1486,6 +2263,11 @@ def audit_broadcast_rounds(
             "boundary_refined": item.get("boundary_refined"),
             "boundary_refined_by": item.get("boundary_refined_by"),
             "broadcast_review_required": item.get("broadcast_review_required"),
+            "start_quality": item.get("start_quality"),
+            "end_quality": item.get("end_quality"),
+            "start_review_required": item.get("start_review_required"),
+            "end_review_required": item.get("end_review_required"),
+            "broadcast_result_tail_sec": item.get("broadcast_result_tail_sec"),
             "broadcast_model_version": item.get("broadcast_model_version"),
             "broadcast_model_provider": item.get("broadcast_model_provider"),
         }
@@ -1538,27 +2320,70 @@ def audit_broadcast_rounds_with_outcomes(
     audit_cache: dict[str, Any] | None = None,
     finalize: bool = False,
     lookahead_sec: float | None = None,
+    frame_provider: Any | None = None,
+    max_media_step_sec: float | None = None,
+    outcome_sink: list[BroadcastAuditOutcome] | None = None,
 ) -> list[BroadcastAuditOutcome]:
     """Audit candidates and return an explicit disposition for each one.
 
     The legacy list-returning function remains available for post-hoc callers.
     Compatibility synthesis below also keeps existing test doubles and plugin
     wrappers that only implement that older contract working.
+
+    ``outcome_sink`` 允许调用方持有 outcome 列表本身。审计被 ``cancel_check``
+    中断（超预算/被抢占/停止）时会抛 ``FFmpegCancelled``，此时**已定稿**的
+    outcome 仍留在该列表里；未开始判定的候选会补发 pending，保证批次完整
+    （见 ``_fill_pending_for_undecided``）。调用方必须消费它——这是
+    「审计结果永不丢失」契约在取消路径上的落点。
     """
-    outcomes: list[BroadcastAuditOutcome] = []
-    returned = audit_broadcast_rounds(
-        rounds,
-        video_path,
-        ffmpeg_path=ffmpeg_path,
-        cancel_check=cancel_check,
-        classifier=classifier,
-        sample_fps=sample_fps,
-        available_end=available_end,
-        audit_cache=audit_cache,
-        finalize=finalize,
-        lookahead_sec=lookahead_sec,
-        _outcome_sink=outcomes,
+    outcomes: list[BroadcastAuditOutcome] = (
+        outcome_sink if outcome_sink is not None else []
     )
+    # 与 audit_broadcast_rounds 内部同源的纯函数展开（幂等），用于在取消路径上
+    # 识别"哪些子候选尚未判定"。
+    expanded_rounds = _expand_oversize_candidates(
+        [dict(item) for item in rounds if isinstance(item, dict)]
+    )
+    # 在线微步骤（max_media_step_sec 非空）：一次调用只推进一个候选/子块。
+    # 分裂出的 4 块若一轮跑完，实测 ≈40s，远超 20s 墙钟预算 ⇒ 每次都在中途被
+    # 腰斩；其余子块以 pending 交回调用方队列，下一轮从 audit_cache 续扫。
+    audit_targets = expanded_rounds
+    deferred_rounds: list[dict[str, Any]] = []
+    if max_media_step_sec is not None and len(expanded_rounds) > 1:
+        audit_targets = expanded_rounds[:1]
+        deferred_rounds = expanded_rounds[1:]
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    try:
+        returned = audit_broadcast_rounds(
+            audit_targets,
+            video_path,
+            ffmpeg_path=ffmpeg_path,
+            cancel_check=cancel_check,
+            classifier=classifier,
+            sample_fps=sample_fps,
+            available_end=available_end,
+            audit_cache=audit_cache,
+            finalize=finalize,
+            lookahead_sec=lookahead_sec,
+            _outcome_sink=outcomes,
+            frame_provider=frame_provider,
+            max_media_step_sec=max_media_step_sec,
+        )
+    except FFmpegCancelled:
+        _fill_pending_for_undecided(
+            expanded_rounds, outcomes, available_end=available_end
+        )
+        raise
+    if deferred_rounds:
+        # 在线微步骤只推进第一个子块；其余以 pending 交回调用方队列续扫
+        # （audit_cache 保证下一轮不重复抽帧）。
+        _fill_pending_for_undecided(
+            deferred_rounds,
+            outcomes,
+            available_end=available_end,
+            reason="deferred_oversize_sibling",
+        )
     if outcomes or not rounds:
         return outcomes
 
@@ -1602,6 +2427,193 @@ def audit_broadcast_rounds_with_outcomes(
     return outcomes
 
 
+
+# ── 收尾缺口补扫（2026-09-12）─────────────────────────────────────────────
+# 在线增量扫描会漏掉"画面静止"区间里的回合：实测 2026-09-12 15:16 会话，录像里
+# 1530-1632 与 1740-1802 两段真实交战（抽帧顶中计时器 1:09 / 1:18 清晰可读）
+# 在 live 扫描里一个候选都没产出，而同一段用 finalize 重扫能检出。
+# 收尾时录像已定格、时间预算充足，故对「无候选」区间做一次低频视觉巡检，
+# 把检出的交战段合成候选，交给**同一套**审计与门禁（判据不变）。
+GAP_SWEEP_BOUNDARY_SOURCE = "valorant_vision_sweep_v1"
+GAP_SWEEP_MIN_GAP_SEC = 60.0        # 只巡「连续 ≥60s 无候选」的区间
+GAP_SWEEP_SAMPLE_FPS = 0.5          # 0.5fps：巡检成本约为正扫的 1/2
+GAP_SWEEP_MIN_COMBAT_SEC = 20.0     # 交战段过短不当回合
+GAP_SWEEP_MAX_LABEL_GAP_SEC = 6.0   # 交战段内的短暂空档（观战/击杀镜头切换）
+GAP_SWEEP_SPLIT_TERMINAL_FRAMES = EXCLUSION_STABLE_FRAMES  # 段内终态游程 = 回合边界
+# 入点前留的余量必须 ≤ START_GATE_ONSET_TOLERANCE_SEC：起点门禁只允许"稳定 combat
+# 游程起点"距候选起点 ≤ 该容差，否则整条被判 rejected_no_stable_combat_start。
+# 2026-09-12 19:14 现场实测：补扫把 17 个回合全检出来了，但 5s 的 pad 让 15 条
+# 全部被门禁拒绝（`入点门禁拒绝: 1619.0-1705.0` …）——pad 必须小于容差。
+GAP_SWEEP_START_PAD_SEC = 1.0
+GAP_SWEEP_END_PAD_SEC = 15.0        # 出点后留结算/回放，供审计定位真出点
+
+
+def _merged_span_gaps(
+    spans: Iterable[tuple[float, float]], *, duration: float, min_gap_sec: float,
+) -> list[tuple[float, float]]:
+    """``[0, duration]`` 减去已覆盖区间后的缺口（按起点排序，只留 ≥min_gap_sec 的）。"""
+    merged: list[list[float]] = []
+    for start, end in sorted((float(a), float(b)) for a, b in spans if float(b) > float(a)):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    gaps: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in merged:
+        if start - cursor >= min_gap_sec:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration - cursor >= min_gap_sec:
+        gaps.append((cursor, duration))
+    return gaps
+
+
+def _combat_run_candidates(
+    samples: list[tuple[float, str, float]],
+    *,
+    duration: float,
+    min_combat_sec: float,
+    max_label_gap_sec: float,
+    split_terminal_frames: int,
+) -> list[tuple[float, float]]:
+    """把巡检标签序列切成"回合级别的交战段"。
+
+    段内允许 ≤max_label_gap_sec 的空档（观战/击杀切换）；段内出现 ≥N 帧终态游程
+    （result/non_game/replay）后**又见 combat** 视为跨回合 → 在该处切段。
+    """
+    runs: list[tuple[float, float]] = []
+    combat_start: float | None = None
+    last_combat: float | None = None
+    terminal_run = 0
+    for ts, label, _conf in samples:
+        point = float(ts)
+        text = str(label)
+        if text == "combat":
+            if combat_start is None:
+                combat_start = point
+            elif last_combat is not None and terminal_run >= split_terminal_frames:
+                # 终态游程后重开战 = 新回合：先收上一段
+                if last_combat - combat_start >= min_combat_sec:
+                    runs.append((combat_start, last_combat))
+                combat_start = point
+            elif last_combat is not None and point - last_combat > max_label_gap_sec:
+                # 长时间没有 combat（>max_label_gap）：原段就此结束
+                if last_combat - combat_start >= min_combat_sec:
+                    runs.append((combat_start, last_combat))
+                combat_start = point
+            last_combat = point
+            terminal_run = 0
+            continue
+        if text in _TERMINAL_LABELS:
+            terminal_run += 1
+    if combat_start is not None and last_combat is not None and last_combat - combat_start >= min_combat_sec:
+        runs.append((combat_start, last_combat))
+    return [(s, min(float(duration), e)) for s, e in runs]
+
+
+def sweep_gap_rounds(
+    video_path: str,
+    candidates: Iterable[dict[str, Any]],
+    *,
+    duration: float,
+    classifier: Any,
+    ffmpeg_path: str = "ffmpeg",
+    cancel_check: Callable[[], bool] | None = None,
+    sample_fps: float = GAP_SWEEP_SAMPLE_FPS,
+    min_gap_sec: float = GAP_SWEEP_MIN_GAP_SEC,
+    min_combat_sec: float = GAP_SWEEP_MIN_COMBAT_SEC,
+    frame_chunk_sec: float = 120.0,
+) -> list[dict[str, Any]]:
+    """在「无候选」区间做低频视觉巡检，把漏掉的交战段合成为候选。
+
+    只**补出候选**，不判定出点：合成候选（``end_by=next_combat`` + 出点后留
+    ``GAP_SWEEP_END_PAD_SEC``）与 OCR 候选走同一套 ``audit_broadcast_rounds``
+    与同一套入列/草稿门禁，因此本函数不放宽任何判据。
+    """
+    if not candidates or duration <= 0:
+        return []
+    from lsc.analyzer.valorant_ocr_rounds import _round_key, extract_frames_cancellable
+
+    spans = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        try:
+            spans.append((float(item.get("start") or 0.0), float(item.get("end") or 0.0)))
+        except (TypeError, ValueError):
+            continue
+    gaps = _merged_span_gaps(spans, duration=float(duration), min_gap_sec=min_gap_sec)
+    if not gaps:
+        return []
+
+    stable_prob = float(classifier.thresholds.get("stable_prob", 0.55))
+    class_stable_prob = getattr(classifier, "class_stable_prob", {})
+    out: list[dict[str, Any]] = []
+    for gap_start, gap_end in gaps:
+        samples: list[tuple[float, str, float]] = []
+        cursor = gap_start
+        while cursor < gap_end:
+            if cancel_check and cancel_check():
+                return out
+            chunk_end = min(gap_end, cursor + max(1.0, float(frame_chunk_sec)))
+            try:
+                frames = extract_frames_cancellable(
+                    video_path, start_sec=cursor, end_sec=chunk_end,
+                    fps=max(0.1, float(sample_fps)), ffmpeg_path=ffmpeg_path,
+                    cancel_check=cancel_check, overlap_sec=0.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - 巡检失败不得影响收尾主流程
+                _log.warning("缺口补扫抽帧失败 %.1f-%.1f: %s", cursor, chunk_end, exc)
+                frames = []
+            if frames:
+                probs = _predict_broadcast_batch(classifier, [img for _ts, img in frames])
+                for (ts, _img), row in zip(frames, probs, strict=True):
+                    label, conf = _stable_visual_label(
+                        row, stable_prob=stable_prob, class_stable_prob=class_stable_prob,
+                    )
+                    samples.append((float(ts), label, float(conf)))
+            cursor = chunk_end
+        if not samples:
+            continue
+        samples = _stabilize_broadcast_samples(sorted(samples, key=lambda item: item[0]))
+        for run_start, run_end in _combat_run_candidates(
+            samples,
+            duration=float(duration),
+            min_combat_sec=float(min_combat_sec),
+            max_label_gap_sec=GAP_SWEEP_MAX_LABEL_GAP_SEC,
+            split_terminal_frames=GAP_SWEEP_SPLIT_TERMINAL_FRAMES,
+        ):
+            # 起点就是 combat 游程首帧（只留 1s 余量，见 GAP_SWEEP_START_PAD_SEC 注释）
+            start = max(0.0, run_start - GAP_SWEEP_START_PAD_SEC)
+            end = min(float(duration), run_end + GAP_SWEEP_END_PAD_SEC)
+            if end <= start:
+                continue
+            out.append({
+                # round_key 必须自带（10s 桶，与 OCR 候选同一约定）：审计缓存键、
+                # 超长分裂后缀、去重与前端身份都依赖它，缺了会退化成 start 派生/None。
+                "round_key": _round_key(start),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "start_by": "vision_gap_sweep",
+                "end_by": "next_combat",
+                "boundary_source": GAP_SWEEP_BOUNDARY_SOURCE,
+                "confirm_status": "pending",
+                "phase": "combat",
+                "reason": "缺口补扫回合交战阶段",
+                "score": 0.7,
+                "gap_sweep": {"gap": [round(gap_start, 3), round(gap_end, 3)],
+                              "combat": [round(run_start, 3), round(run_end, 3)]},
+            })
+    if out:
+        _log.warning(
+            "收尾缺口补扫: 巡检 %d 个无候选区间，合成 %d 条候选: %s",
+            len(gaps), len(out),
+            ", ".join(f"{c['start']:.1f}-{c['end']:.1f}" for c in out),
+        )
+    return out
+
+
 __all__ = [
     "BroadcastAuditOutcome",
     "BroadcastAuditStatus",
@@ -1609,4 +2621,6 @@ __all__ = [
     "audit_broadcast_phase_sequence",
     "audit_broadcast_rounds",
     "audit_broadcast_rounds_with_outcomes",
+    "sweep_gap_rounds",
+    "GAP_SWEEP_BOUNDARY_SOURCE",
 ]

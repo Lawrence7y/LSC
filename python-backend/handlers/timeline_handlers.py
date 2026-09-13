@@ -47,7 +47,7 @@ def register_timeline_handlers(server, *, bridge, manager, queue_export) -> None
     Args:
         server: WebSocket server（提供 .on / .broadcast）。
         bridge: 跨线程消息桥（提供 .queue_broadcast）。
-        manager: MultiRoomManager（用于 export_clip_by_id 读取房间录制文件）。
+        manager: RoomOrchestrator（用于 export_clip_by_id 读取房间录制文件）。
         queue_export: room_handler 内的统一导出入队协程。
     """
     timeline_svc = get_timeline_service()

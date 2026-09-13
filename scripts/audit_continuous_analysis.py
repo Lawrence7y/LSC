@@ -234,6 +234,131 @@ def parse_status_snapshots(
     return snapshots
 
 
+def parse_audit_conclusions(lines: Iterable[str]) -> list[dict[str, Any]]:
+    """解析「赛事回合审计完成」行：每条 = 一个回合的审计结论。
+
+    现场（2026-09-11 20:45）：日志里 8 条结论，durable 终态只有 4 条 ——
+    no-silent-drop 不变量①就是拿这两个数对账。
+    """
+    marker = "赛事回合审计完成:"
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        if marker not in line:
+            continue
+        timestamp = ""
+        m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if m:
+            timestamp = m.group(1)
+        body = line.split(marker, 1)[1].strip()
+        fields = {key: value for key, value in re.findall(r"(\w+)=([^,\s]+)", body)}
+        out.append({
+            "timestamp": timestamp,
+            "span": body.split(",", 1)[0],
+            "audit": fields.get("audit"),
+            "status": fields.get("status"),
+            "end_by": fields.get("end_by"),
+            "reason": fields.get("reason"),
+        })
+    return out
+
+
+def parse_draft_responses(lines: Iterable[str]) -> list[dict[str, Any]]:
+    """解析 `generate_jianying_draft_response` 行：requested / included / skipped 口径与明细有无。"""
+    marker = "generate_jianying_draft_response"
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        if marker not in line:
+            continue
+        entry: dict[str, Any] = {"timestamp": ""}
+        m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if m:
+            entry["timestamp"] = m.group(1)
+        for key in ("requested_clip_count", "included_clip_count", "skipped_clip_count"):
+            mm = re.search(rf"'{key}': (\d+)", line)
+            if mm:
+                entry[key] = int(mm.group(1))
+        entry["has_skipped_details"] = "'skipped': [" in line
+        out.append(entry)
+    return out
+
+
+def build_invariants(
+    *,
+    audit_conclusions: list[dict[str, Any]],
+    finalization: dict[str, Any] | None,
+    analysis: dict[str, Any] | None,
+    draft_responses: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """no-silent-drop 三条不变量（计划 §〇 夹具 C）。
+
+    ① 每条审计结论都必须有 durable 终态（收尾 sidecar 的 accepted/rejected/pending）；
+    ② 分析快照里的每个回合都必须有终态归属；
+    ③ 草稿 requested == included + skipped，且有跳过时必须给逐条明细。
+    """
+    checks: list[dict[str, Any]] = []
+    terminal_keys: set[str] = set()
+    if isinstance(finalization, dict):
+        for bucket in ("accepted_candidates", "rejected_candidates", "pending_candidates"):
+            for item in finalization.get(bucket) or []:
+                if isinstance(item, dict) and item.get("round_key"):
+                    terminal_keys.add(str(item["round_key"]))
+
+    checks.append({
+        "name": "audit_conclusions_have_durable_terminals",
+        "passed": (not audit_conclusions) or len(terminal_keys) >= len(audit_conclusions),
+        "detail": (
+            f"审计结论 {len(audit_conclusions)} 条 vs 收尾 sidecar 终态 {len(terminal_keys)} 条"
+            if audit_conclusions else "无审计结论可对账（日志未提供）"
+        ),
+    })
+
+    unterminal: list[str] = []
+    if isinstance(analysis, dict):
+        for item in analysis.get("highlights") or []:
+            if not isinstance(item, dict):
+                continue
+            round_key = str(item.get("round_key") or "")
+            if round_key and round_key not in terminal_keys:
+                unterminal.append(round_key)
+    checks.append({
+        "name": "listed_clips_have_terminal_attribution",
+        "passed": not unterminal,
+        "detail": (
+            "分析快照里无终态归属的回合: " + ", ".join(unterminal)
+            if unterminal else "全部分析候选都有终态归属（或未提供 sidecar）"
+        ),
+    })
+
+    draft_failures: list[str] = []
+    for response in draft_responses:
+        requested = response.get("requested_clip_count")
+        included = response.get("included_clip_count")
+        skipped = response.get("skipped_clip_count")
+        if None in (requested, included, skipped):
+            continue
+        if included + skipped != requested:
+            draft_failures.append(
+                f"{response.get('timestamp')}: included+skipped={included + skipped} != requested={requested}"
+            )
+        if skipped and not response.get("has_skipped_details"):
+            draft_failures.append(
+                f"{response.get('timestamp')}: {skipped} 条跳过但响应无逐条明细（只有聚合告警）"
+            )
+    checks.append({
+        "name": "draft_skips_are_accountable",
+        "passed": not draft_failures,
+        "detail": "; ".join(draft_failures) if draft_failures else "草稿口径一致且跳过可辨",
+    })
+
+    return {
+        "passed": all(item["passed"] for item in checks),
+        "checks": checks,
+        "audit_conclusion_count": len(audit_conclusions),
+        "durable_terminal_count": len(terminal_keys),
+        "unterminal_round_keys": unterminal,
+    }
+
+
 def _load_json(path: str | Path | None) -> dict[str, Any] | None:
     if not path:
         return None
@@ -520,6 +645,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--room-id", help="只分析指定 room_id")
     parser.add_argument("--analysis", help="分析 JSON 路径（只读）")
+    parser.add_argument(
+        "--finalization",
+        help="收尾 sidecar（*.finalization.json）路径（只读）：no-silent-drop 不变量对账用",
+    )
     parser.add_argument("--video", help="录像路径，仅用于读取 ffprobe 时长")
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe 可执行文件")
     parser.add_argument("--draft", help="剪映 draft_content.json 路径，用于切片对账")
@@ -550,7 +679,10 @@ def main(argv: list[str] | None = None) -> int:
     scans = parse_log(lines, room_id=args.room_id)
     delivery_events = parse_delivery_events(lines, room_id=args.room_id)
     status_snapshots = parse_status_snapshots(lines, room_id=args.room_id)
+    audit_conclusions = parse_audit_conclusions(lines)
+    draft_responses = parse_draft_responses(lines)
     analysis = _load_json(args.analysis)
+    finalization = _load_json(args.finalization)
     video_duration = (
         args.recording_duration
         if args.recording_duration is not None
@@ -565,6 +697,14 @@ def main(argv: list[str] | None = None) -> int:
         draft_path=args.draft,
         recording_path=args.recording,
     )
+    report["audit_conclusions"] = audit_conclusions
+    report["draft_responses"] = draft_responses
+    report["invariants"] = build_invariants(
+        audit_conclusions=audit_conclusions,
+        finalization=finalization,
+        analysis=analysis,
+        draft_responses=draft_responses,
+    )
     payload = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         output = Path(args.output)
@@ -573,6 +713,11 @@ def main(argv: list[str] | None = None) -> int:
         tmp.replace(output)
     else:
         print(payload)
+    # no-silent-drop 不变量失败 = 报告红：脚本给非零退出码，便于 L2 门禁直接失败。
+    if not report["invariants"]["passed"]:
+        failed = [c["name"] for c in report["invariants"]["checks"] if not c["passed"]]
+        print(f"不变量未通过: {', '.join(failed)}", file=sys.stderr)
+        return 1
     return 0
 
 

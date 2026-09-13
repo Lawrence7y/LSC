@@ -8,7 +8,7 @@ from typing import Any
 
 _log = logging.getLogger(__name__)
 
-# 事件名与 MultiRoomManager Signal 一一对应
+# 事件名（原与 MultiRoomManager Signal 同名，Qt 门面已删除，命名保留以兼容订阅方）
 EVENT_ROOM_CONNECT_FINISHED = "room_connect_finished"
 EVENT_BATCH_RECORD_PROGRESS = "batch_record_progress"
 EVENT_BATCH_RECORD_FINISHED = "batch_record_finished"

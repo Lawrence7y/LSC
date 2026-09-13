@@ -30,6 +30,8 @@ class HeadlessRecordingController:
         self.stream_url: str = ""
         self.input_args: list[str] | None = None
         self.video_path: str = ""
+        # 录制镜像路径（本地回看数据源）；无镜像时为空串。
+        self.dvr_output_path: str = ""
         self.record_manifest_path: str = ""
         self.is_recording: bool = False
         self.recording_start_mono: float = 0.0
@@ -107,6 +109,7 @@ class HeadlessRecordingController:
 
         self.stream_url = stream_url
         self.input_args = input_args
+        self.dvr_output_path = ""
         from lsc.core.recording_layout import recording_in_progress_path
 
         output_path = recording_in_progress_path(output_dir, datetime.now())
@@ -129,6 +132,7 @@ class HeadlessRecordingController:
         if ok:
             self.is_recording = True
             self.video_path = output_path
+            self.dvr_output_path = str(getattr(self._capture, "dvr_output_path", "") or "")
             self.recording_start_mono = time.monotonic()
             return True, output_path, encoder, ""
         err = (self._capture.last_error or self._capture.stderr_tail or "capture start failed").strip()

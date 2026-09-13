@@ -878,6 +878,12 @@ class IngestSupervisor:
             "preview_pid": getattr(ingest, "preview_process_id", None),
             "upstream_bytes": int(getattr(ingest, "upstream_bytes", 0) or 0),
             "recording_size_bytes": int(getattr(ingest, "recording_size_bytes", 0) or 0),
+            "recording_failover_count": int(
+                getattr(ingest, "recording_failover_count", 0) or 0
+            ),
+            "recording_failover_in_progress": bool(
+                getattr(ingest, "recording_failover_in_progress", False)
+            ),
             "preview_segment_count": int(
                 getattr(ingest, "preview_segment_count", 0) or 0
             ),

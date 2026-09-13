@@ -48,6 +48,22 @@ def _cap_broadcast_audit_cache(audit_cache: dict[str, Any]) -> None:
             audit_cache.pop(key, None)
 
 
+def _candidate_merge_key(candidate: dict[str, Any]) -> str:
+    """Return the immutable round identity for pending-queue merge.
+
+    Prefer the explicit ``round_key`` assigned at OCR birth; fall back to the
+    legacy 10-second bucket so old in-flight state remains compatible.
+    """
+    key = str(candidate.get("round_key") or "").strip()
+    if key:
+        return key
+    try:
+        start = float(candidate.get("start", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    return f"round-{int(round(start / 10.0)):06d}"
+
+
 def _mark_broadcast_audit_skipped(
     rounds: list[dict[str, Any]],
     error: object,
@@ -111,6 +127,8 @@ def decide_backlog_policy(
     backlog_sec: float,
     throughput_avg: float | None = None,
     audit_queue_depth: int = 0,
+    *,
+    source_profile: str = "pov",
 ) -> tuple[str, dict[str, Any]]:
     """A-02: 自适应 backlog 控制器分层决策。
 
@@ -122,6 +140,10 @@ def decide_backlog_policy(
     ocr_sample_interval 恒为 1.0：顶部计时器必须保持 1fps（计时器跳变/
     短横幅是回合边界证据，降频会漏检）。降本旋钮是 center_sentinel_sec
     （中央横幅哨兵采样间隔，只影响高成本中央 OCR）。
+
+    官方解说 / broadcast 分支以切片质量为最高优先级：即使长时间落后
+    （>180s），也不放大中央哨兵间隔、不缩小单轮审计配额，避免“第一个
+    切片好、后面越来越糙”。
     """
     del throughput_avg
     if backlog_sec <= 30.0:
@@ -140,6 +162,11 @@ def decide_backlog_policy(
         mode = "degraded-catchup"
         audit_quota = 1
         center_sentinel_sec = 8.0
+
+    # 官方解说 / broadcast：不允许因 backlog 降低中央 OCR 采样和审计配额。
+    if source_profile == "broadcast":
+        audit_quota = max(audit_quota, 2)
+        center_sentinel_sec = 4.0
 
     policy = {
         "mode": mode,
@@ -363,7 +390,7 @@ class ValorantAnalyzerPlugin:
                     state["runtime_state"] = runtime_state
                 classifier = runtime_state.get("broadcast_classifier")
                 if not isinstance(classifier, ValorantFrameClassifier):
-                    classifier = ValorantFrameClassifier()
+                    classifier = ValorantFrameClassifier(profile="broadcast")
                     runtime_state["broadcast_classifier"] = classifier
 
                 # 直播尖端刚闭合的 OCR 候选需要等到后视窗口写入文件后再
@@ -382,61 +409,69 @@ class ValorantAnalyzerPlugin:
                 # 阶段一优化：粗筛候选即刻返回给上层先行入列（标记为 pending 待复核），
                 # 消除用户盲等；严禁在 scan_window 同步执行长 lookahead 抽帧卡死主循环。
                 if bool(state.get("deferred_audit")) and not bool(state.get("finalize")):
-                    merged_candidates: dict[float, dict[str, Any]] = {}
+                    merged_candidates: dict[str, dict[str, Any]] = {}
                     for candidate in [*pending, *rounds]:
                         if not isinstance(candidate, dict):
                             continue
-                        try:
-                            candidate_key = round(float(candidate["start"]), 3)
-                        except (KeyError, TypeError, ValueError):
+                        candidate_key = _candidate_merge_key(candidate)
+                        if not candidate_key:
                             continue
                         c = dict(candidate)
+                        c.setdefault("round_key", candidate_key)
                         if "broadcast_audit" not in c:
                             c["broadcast_audit"] = "pending_lookahead"
                             c["confirm_status"] = "pending"
                             c["boundary_refined"] = False
                             c["broadcast_review_required"] = True
                         merged_candidates[candidate_key] = c
-                    runtime_state["broadcast_pending_rounds"] = list(merged_candidates.values())
+                    runtime_state["broadcast_pending_rounds"] = sorted(
+                        merged_candidates.values(),
+                        key=lambda x: float(x.get("start", 0.0) or 0.0),
+                    )
                     state["scan_succeeded"] = True
                     state["last_analyzed"] = window.end_sec
-                    return [dict(c) for c in merged_candidates.values()]
+                    return [dict(c) for c in runtime_state["broadcast_pending_rounds"]]
 
                 # backlog 失控时只保存候选，推迟 90s lookahead 和视觉分类到
                 # 停录收尾；候选保存在 runtime_state，下一窗口可继续复用。
                 if bool(state.get("realtime_fast_mode")) and not bool(state.get("finalize")):
-                    deferred_candidates: dict[float, dict[str, Any]] = {}
+                    deferred_candidates: dict[str, dict[str, Any]] = {}
                     for candidate in [*pending, *rounds]:
                         if not isinstance(candidate, dict):
                             continue
-                        try:
-                            candidate_key = round(float(candidate["start"]), 3)
-                        except (KeyError, TypeError, ValueError):
+                        candidate_key = _candidate_merge_key(candidate)
+                        if not candidate_key:
                             continue
                         deferred = dict(candidate)
+                        deferred.setdefault("round_key", candidate_key)
                         deferred["broadcast_audit"] = "pending_lookahead"
                         deferred["broadcast_review_required"] = True
                         deferred["broadcast_audit_reason"] = "deferred_until_finalization"
                         deferred_candidates[candidate_key] = deferred
-                    runtime_state["broadcast_pending_rounds"] = list(
-                        deferred_candidates.values()
+                    runtime_state["broadcast_pending_rounds"] = sorted(
+                        deferred_candidates.values(),
+                        key=lambda x: float(x.get("start", 0.0) or 0.0),
                     )
                     state["scan_succeeded"] = True
                     state["last_analyzed"] = window.end_sec
                     return []
-                merged_candidates: dict[float, dict[str, Any]] = {}
+                merged_candidates: dict[str, dict[str, Any]] = {}
                 for candidate in [*pending, *rounds]:
                     if not isinstance(candidate, dict):
                         continue
-                    try:
-                        candidate_key = round(float(candidate["start"]), 3)
-                    except (KeyError, TypeError, ValueError):
+                    candidate_key = _candidate_merge_key(candidate)
+                    if not candidate_key:
                         continue
-                    merged_candidates[candidate_key] = dict(candidate)
+                    c = dict(candidate)
+                    c.setdefault("round_key", candidate_key)
+                    merged_candidates[candidate_key] = c
 
                 is_final_scan = bool(state.get("finalize"))
                 available_end = None if is_final_scan else state.get("current_dur")
-                sorted_candidates = [merged_candidates[k] for k in sorted(merged_candidates)]
+                sorted_candidates = sorted(
+                    merged_candidates.values(),
+                    key=lambda x: float(x.get("start", 0.0) or 0.0),
+                )
 
                 # A-02 / A-03: 粗扫与 broadcast 深度审计解耦。
                 # 粗扫优先推进 coverage；深度审计按有界配额消费，
@@ -445,12 +480,47 @@ class ValorantAnalyzerPlugin:
                 remaining_pending: list[dict[str, Any]] = []
 
                 if is_final_scan:
+                    # 收尾缺口补扫：live 增量会漏掉"画面静止"区间里的回合（实测
+                    # 2026-09-12：1530-1632 / 1740-1802 两段真实交战无候选），
+                    # 收尾时对无候选区间做低频视觉巡检并合成候选，与 OCR 候选走
+                    # 同一套审计/门禁（只补候选，不放宽判据）。
+                    # 每个收尾任务只补扫一次：候选列表只含"待审计"项，已定稿的会被移出，
+                    # 不看这个标记就会每个收尾循环都重扫全片（现场实测 4 次 × 16 条，
+                    # 把 20s 审计微步预算挤爆）。重复候选由既有的重叠合并兜底。
+                    _sweep_done = bool(state.get("gap_sweep_done"))
+                    try:
+                        from lsc.analyzer.valorant_broadcast import sweep_gap_rounds
+
+                        _swept = [] if _sweep_done else sweep_gap_rounds(
+                            video_path,
+                            sorted_candidates,
+                            duration=float(state.get("current_dur", 0.0) or 0.0),
+                            classifier=classifier,
+                            ffmpeg_path=state.get("ffmpeg_path") or "ffmpeg",
+                            cancel_check=cancel_check,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 补扫失败不得影响收尾
+                        _log.warning("收尾缺口补扫失败（忽略）: %s", redact_text(exc))
+                        _swept = []
+                    if _swept:
+                        state["gap_sweep_done"] = True
+                    for _item in _swept:
+                        _key = str(_item.get("start", 0.0))
+                        merged_candidates.setdefault(f"gap-{_key}", _item)
+                    if _swept:
+                        sorted_candidates = sorted(
+                            merged_candidates.values(),
+                            key=lambda x: float(x.get("start", 0.0) or 0.0),
+                        )
                     audit_batch = sorted_candidates
                 else:
                     backlog_sec = max(0.0, float(state.get("current_dur", 0.0) or 0.0) - float(window.end_sec))
                     tp_hist = list(state.get("throughput_history") or [])
                     tp_avg = (sum(tp_hist) / len(tp_hist)) if tp_hist else None
-                    mode_name, policy = decide_backlog_policy(backlog_sec, tp_avg, len(sorted_candidates))
+                    mode_name, policy = decide_backlog_policy(
+                        backlog_sec, tp_avg, len(sorted_candidates),
+                        source_profile=state.get("valorant_profile", "pov"),
+                    )
                     state["backlog_mode"] = mode_name
                     state["audit_queue_depth"] = len(sorted_candidates)
                     quota = policy.get("audit_quota", 1)

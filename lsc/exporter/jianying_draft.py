@@ -14,6 +14,7 @@ _log = logging.getLogger(__name__)
 
 _ILLEGAL = re.compile(r'[<>:"/\\|?*]')
 _MIN_SEG_SEC = 0.2
+_MAX_DRAFT_DURATION_SEC = 150.0
 
 
 @dataclass(slots=True)
@@ -39,6 +40,10 @@ class ClipDraftSource:
     source_profile: str | None = None
     broadcast_audit: str | None = None
     broadcast_review_required: bool = False
+    start_quality: str | None = None
+    end_quality: str | None = None
+    start_review_required: bool = False
+    end_review_required: bool = False
     duration_anomaly: bool = False
     end_by: str | None = None
 
@@ -106,6 +111,10 @@ def _broadcast_gate_passed(
     source_profile: str | None,
     broadcast_audit: str | None,
     broadcast_review_required: bool,
+    start_quality: str | None = None,
+    end_quality: str | None = None,
+    start_review_required: bool = False,
+    end_review_required: bool = False,
     duration_anomaly: bool,
     end_by: str | None,
     include_pending: bool,
@@ -119,15 +128,36 @@ def _broadcast_gate_passed(
       + 无复核标记 + 无时长异常 + 出点为 next_prep / broadcast_exclusion。
     """
     status = str(confirm_status or "").strip().lower()
+    audit = str(broadcast_audit or "").strip().lower()
     if str(source_profile or "").strip().lower() != "broadcast":
         return True
+    # 拒绝/纯回放候选永不进入剪映草稿，即使“包含待确认”也不复活。
+    if (
+        status == "rejected"
+        or audit.startswith("rejected")
+    ):
+        return False
     if status == "user_confirmed":
         return True
+    end_is_authoritative = bool(
+        audit == "passed"
+        and str(end_quality or "").strip().lower() == "precise"
+        and not end_review_required
+        and not duration_anomaly
+        and str(end_by or "") in _BROADCAST_VALID_END_BY
+    )
+    # 赛事切片的出点已由视觉审计定稿时，允许带着
+    # coarse 但合法的 OCR 入点进入自动草稿；不再因一个
+    # 聚合的 broadcast_review_required 把整条切片删掉。
+    if status in ("pending", "vision_confirmed") and end_is_authoritative:
+        return True
     if status in ("pending", "refining") and include_pending:
+        if duration_anomaly:
+            return False
         return True
     if status != "vision_confirmed":
         return False
-    if str(broadcast_audit or "").strip().lower() != "passed":
+    if audit != "passed":
         return False
     if broadcast_review_required:
         return False
@@ -146,18 +176,30 @@ def clip_source_usable(
     source_profile: str | None = None,
     broadcast_audit: str | None = None,
     broadcast_review_required: bool = False,
+    start_quality: str | None = None,
+    end_quality: str | None = None,
+    start_review_required: bool = False,
+    end_review_required: bool = False,
     duration_anomaly: bool = False,
     end_by: str | None = None,
 ) -> bool:
     if precision == "approximate":
         return False
-    if confirm_status in ("pending", "refining") and not include_pending:
+    if (
+        confirm_status in ("pending", "refining")
+        and not include_pending
+        and str(source_profile or "").strip().lower() != "broadcast"
+    ):
         return False
     return _broadcast_gate_passed(
         confirm_status=confirm_status,
         source_profile=source_profile,
         broadcast_audit=broadcast_audit,
         broadcast_review_required=broadcast_review_required,
+        start_quality=start_quality,
+        end_quality=end_quality,
+        start_review_required=start_review_required,
+        end_review_required=end_review_required,
         duration_anomaly=duration_anomaly,
         end_by=end_by,
         include_pending=include_pending,
@@ -167,15 +209,32 @@ def clip_source_usable(
 def clip_allowed_for_draft(clip: dict, *, include_pending: bool = False) -> bool:
     """WS/前端切片 dict 是否允许进入草稿（与导出口径一致）。"""
     status = clip.get("confirm_status")
-    if status in ("pending", "refining") and not include_pending:
+    if (
+        status in ("pending", "refining")
+        and not include_pending
+        and str(clip.get("source_profile") or "").strip().lower() != "broadcast"
+    ):
         return False
     if clip.get("mark_precision") == "approximate":
         return False
+    # 无效坐标/异常时长即使 include_pending 也不得进入（仅当调用方提供了坐标时）。
+    if "start" in clip and "end" in clip:
+        try:
+            start = float(clip.get("start") or 0.0)
+            end = float(clip.get("end") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if end <= start or end - start > _MAX_DRAFT_DURATION_SEC:
+            return False
     return _broadcast_gate_passed(
         confirm_status=status,
         source_profile=clip.get("source_profile"),
         broadcast_audit=clip.get("broadcast_audit"),
         broadcast_review_required=bool(clip.get("broadcast_review_required")),
+        start_quality=clip.get("start_quality"),
+        end_quality=clip.get("end_quality"),
+        start_review_required=bool(clip.get("start_review_required")),
+        end_review_required=bool(clip.get("end_review_required")),
         duration_anomaly=bool(clip.get("duration_anomaly")),
         end_by=clip.get("end_by"),
         include_pending=include_pending,
@@ -350,6 +409,8 @@ def build_session_draft(
     draft_root: str,
 ) -> JianyingDraftResult:
     warnings: list[str] = []
+    # 导出器内部筛掉的切片（逐条留痕，供响应逐条对账）
+    excluded_clips: list[dict[str, Any]] = []
     try:
         draft = _import_draft_lib()
     except ImportError:
@@ -380,14 +441,16 @@ def build_session_draft(
             error="没有可用的录制房间",
             error_code="no_rooms",
             warnings=warnings,
+            excluded_clips=list(excluded_clips),
         )
 
     deltas = {r.room_id: r.recording_to_common_delta for r in usable}
     origin = compute_draft_origin(deltas)
     main = next((r for r in usable if r.is_main), usable[0])
+    explicit_name = bool(options.draft_name)
     name = (
         sanitize_draft_token(options.draft_name)
-        if options.draft_name
+        if explicit_name
         else _default_draft_name(main.name)
     )
 
@@ -395,6 +458,18 @@ def build_session_draft(
     draft_dir = os.path.join(draft_root, name)
     try:
         folder = draft.DraftFolder(draft_root)
+        if not explicit_name:
+            # 自动命名只精确到分钟：同一分钟内的两次导出会撞名并互相覆盖
+            # （2026-09-12 09:01 现场：4 段的自动草稿被 3 段的手动导出顶掉）。
+            # 自动命名一律避让；显式命名（前端"重试生成草稿"）仍按调用方意图覆盖。
+            base = name
+            suffix = 1
+            while suffix <= 50 and folder.has_draft(name):
+                suffix += 1
+                name = f"{base}_{suffix}"
+            if suffix > 1:
+                draft_dir = os.path.join(draft_root, name)
+                warnings.append(f"已存在同名草稿，本次写入「{name}」以免覆盖上一份")
         existed = folder.has_draft(name)
         script = folder.create_draft(name, width, height, allow_replace=True)
         if existed:
@@ -407,6 +482,7 @@ def build_session_draft(
             error=f"剪映草稿初始化失败: {exc}",
             error_code="draft_failed",
             warnings=warnings,
+            excluded_clips=list(excluded_clips),
         )
 
     non_main = [r for r in usable if not r.is_main]
@@ -429,6 +505,7 @@ def build_session_draft(
             error="没有可生成的轨道",
             error_code="invalid_state",
             warnings=warnings,
+            excluded_clips=list(excluded_clips),
         )
     try:
         script.append_tracks(specs)
@@ -440,10 +517,12 @@ def build_session_draft(
             error=f"剪映草稿轨道创建失败: {exc}",
             error_code="draft_failed",
             warnings=warnings,
+            excluded_clips=list(excluded_clips),
         )
 
     SEC = draft.SEC
     segments = 0
+    placed_clip_count = 0
     materials: dict[str, Any] = {}
 
     def _material_for(room: RoomDraftSource) -> Any:
@@ -495,20 +574,41 @@ def build_session_draft(
                 script.add_segment(seg, _track_label(r, "录制"))
                 segments += 1
 
-        usable_clips = [
-            c
-            for c in clips
-            if clip_source_usable(
+        usable_clips: list[ClipDraftSource] = []
+        for c in clips:
+            usable = clip_source_usable(
                 precision=c.precision,
                 confirm_status=c.confirm_status,
                 include_pending=options.include_pending,
                 source_profile=c.source_profile,
                 broadcast_audit=c.broadcast_audit,
                 broadcast_review_required=c.broadcast_review_required,
+                start_quality=c.start_quality,
+                end_quality=c.end_quality,
+                start_review_required=c.start_review_required,
+                end_review_required=c.end_review_required,
                 duration_anomaly=c.duration_anomaly,
                 end_by=c.end_by,
             )
-        ]
+            if usable:
+                usable_clips.append(c)
+                continue
+            # 逐条留痕：此前只有一句聚合告警、连标签都不带，导出侧无法对账
+            # （L3 实测 requested−included=6 而明细只有 5 条、找不到是谁）。
+            excluded_clips.append({
+                "clip_id": c.clip_id,
+                "label": c.label,
+                "room_id": c.room_id,
+                "start": c.common_start,
+                "end": c.common_end,
+                "reason_code": "EXCLUDED_BY_SOURCE_FILTER",
+                "reason": "未通过导出器源可用性过滤（pending/近似定位/未通过赛事审计）",
+                "confirm_status": c.confirm_status,
+                "broadcast_audit": c.broadcast_audit,
+                "end_by": c.end_by,
+                "end_quality": c.end_quality,
+            })
+            warnings.append(f"导出器排除切片「{c.label}」（源可用性过滤）")
         skipped = len(clips) - len(usable_clips)
         if skipped:
             warnings.append(f"已排除 {skipped} 条 pending/approximate 或未通过赛事审计的切片")
@@ -553,12 +653,29 @@ def build_session_draft(
                     try:
                         script.add_segment(seg, _track_label(r, "切片"))
                     except Exception as exc:
-                        # 防御：未知边界的重叠段跳过并告警，保证草稿仍可保存打开
+                        # 防御：未知边界的重叠段跳过并告警，保证草稿仍可保存打开。
+                        # 逐条留痕必须进 excluded_clips：只写 warnings 时响应的
+                        # skipped_unaccounted 残差 > 0，对不上账（2026-09-13 现场
+                        # 收尾补扫的 4 条重复候选就是这么"消失"的）。
+                        excluded_clips.append({
+                            "clip_id": c.clip_id,
+                            "label": c.label,
+                            "room_id": c.room_id,
+                            "start": c.common_start,
+                            "end": c.common_end,
+                            "reason_code": "OVERLAP_DEDUP",
+                            "reason": f"与同轨已有片段重叠，已去重跳过: {exc}",
+                            "confirm_status": c.confirm_status,
+                            "broadcast_audit": c.broadcast_audit,
+                            "end_by": c.end_by,
+                            "end_quality": c.end_quality,
+                        })
                         warnings.append(
                             f"房间 {r.name} 片段「{c.label}」与其它片段重叠，已跳过: {exc}"
                         )
                         continue
                     segments += 1
+                    placed_clip_count += 1
 
             if options.text_labels:
                 # 回合标签轨：主/副房同回合标签在公共轴上错位（media_start 差），
@@ -594,6 +711,7 @@ def build_session_draft(
             error=f"剪映草稿生成失败: {exc}",
             error_code="draft_failed",
             warnings=warnings,
+            excluded_clips=list(excluded_clips),
         )
     return JianyingDraftResult(
         success=True,
@@ -601,5 +719,7 @@ def build_session_draft(
         draft_dir=draft_dir,
         tracks=len(specs),
         segments=segments,
+        placed_clip_count=placed_clip_count if options.include_clips else 0,
+        excluded_clips=list(excluded_clips),
         warnings=warnings,
     )

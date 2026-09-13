@@ -302,6 +302,28 @@ def save_finalization_job(video_path: str, job: dict[str, Any]) -> bool:
         return False
 
 
+def archive_finalization_job(video_path: str) -> bool:
+    """归档旧录制路径对应的收尾 sidecar。
+
+    录制停止改名（``*_录制中.mp4 -> *_至_*.mp4``）后调用：新 sidecar 已写入
+    新路径时，把旧 sidecar 改名归档，避免恢复扫描时同时读到两份 checkpoint。
+    """
+    file_path = _finalization_json_path(video_path)
+    if not file_path.exists():
+        return True
+    backup_path = file_path.with_name(file_path.name + ".bak")
+    try:
+        with _persist_lock:
+            if backup_path.exists():
+                backup_path.unlink()
+            file_path.rename(backup_path)
+        _log.info("已归档收尾 sidecar: %s -> %s", file_path.name, backup_path.name)
+        return True
+    except OSError as exc:
+        _log.warning("归档收尾 sidecar 失败: %s", exc)
+        return False
+
+
 def load_finalization_job(video_path: str) -> dict[str, Any] | None:
     """读取可恢复的收尾任务状态；文件缺失或损坏时返回 None。"""
     file_path = _finalization_json_path(video_path)

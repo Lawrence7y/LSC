@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-FINALIZATION_SCHEMA_VERSION = 2
+FINALIZATION_SCHEMA_VERSION = 3
 DEFAULT_FULL_RESCAN_LAG_SEC = 30.0
 DEFAULT_COVERAGE_EPSILON_SEC = 2.0
 DEFAULT_PRECISE_BOUNDARY_DELTA_SEC = 1.0
@@ -95,22 +95,22 @@ def finalization_requires_full_rescan(
     相差超过 ``lag_threshold_sec`` 也不应重复扫描整段历史。延迟本身只代表
     尚未覆盖的尾部长度；是否存在历史缺口由 coverage 账本判断。
     """
-    del lag_threshold_sec
-    if force or scan_error:
+    del lag_threshold_sec, coverage_epsilon_sec
+    # force 仍保留给显式全量收尾。
+    if force:
         return True
-    duration = max(0.0, float(final_duration))
-    analyzed = max(0.0, float(last_analyzed))
-    cursor = min(duration, analyzed)
-    # A gap before the analyzed cursor means a previous scan may have advanced
-    # state without proving the whole history, so a fresh pass is required.
-    return bool(
-        uncovered_ranges(
-            coverage_ranges,
-            0.0,
-            cursor,
-            epsilon=max(0.0, float(coverage_epsilon_sec)),
-        )
-    )
+    ranges = [
+        (float(start), float(end))
+        for start, end in coverage_ranges
+        if float(end) > float(start)
+    ]
+    # 从未成功覆盖任何区间时只能从 0 起扫。
+    if not ranges:
+        return True
+    # 只要已有任意 coverage，收尾就应基于 coverage 账本补真实缺口 + 尾部，
+    # 而不是因为某个中间缺口/一次 scan_error 就把已扫过的历史整段重扫。
+    # scan_error 只表示某个窗口失败，失败窗口本身会作为 uncovered gap 被补扫。
+    return False
 
 
 def classify_boundary_quality(
@@ -328,6 +328,11 @@ class FinalizationJob:
     # This is deliberately separate from pending_candidates: an accepted result
     # must not disappear merely because a later audit candidate timed out.
     refine_result_queue: list[dict[str, Any]] = field(default_factory=list)
+    # Schema v3: durable terminal projections. ``refine_result_queue`` is the
+    # live delivery buffer (drained after merge); accepted/rejected candidates
+    # remain here as the authoritative state projection across a crash/restart.
+    accepted_candidates: list[dict[str, Any]] = field(default_factory=list)
+    rejected_candidates: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def create(
@@ -445,6 +450,46 @@ class FinalizationJob:
         self.updated_at = time.time()
         return True
 
+    @staticmethod
+    def _terminal_key(candidate: dict[str, Any]) -> str:
+        """Return the stable round identity used by accepted/rejected projections."""
+        key = str(candidate.get("round_key") or "").strip()
+        if key:
+            return key
+        try:
+            start = float(candidate.get("start", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        return f"round-{int(round(start / 10.0)):06d}"
+
+    def record_terminal_candidate(
+        self,
+        candidate: dict[str, Any],
+        outcome: str,
+    ) -> bool:
+        """Persist one terminal candidate into the accepted or rejected projection."""
+        if not isinstance(candidate, dict):
+            return False
+        normalized = str(outcome or "").strip().lower()
+        if normalized not in {"accepted", "manual_review", "rejected"}:
+            return False
+        target = (
+            self.accepted_candidates
+            if normalized in {"accepted", "manual_review"}
+            else self.rejected_candidates
+        )
+        key = self._terminal_key(candidate)
+        for index, item in enumerate(target):
+            if isinstance(item, dict) and key and self._terminal_key(item) == key:
+                target[index] = dict(candidate)
+                self.updated_at = time.time()
+                return True
+        target.append(dict(candidate))
+        if len(target) > 512:
+            del target[:256]
+        self.updated_at = time.time()
+        return True
+
     def ack_refine_results(self, delivery_keys: Iterable[str]) -> int:
         """Remove results successfully consumed by the main loop."""
         keys = {str(key) for key in delivery_keys if str(key).strip()}
@@ -498,6 +543,12 @@ class FinalizationJob:
                 for item in self.refine_result_queue
                 if isinstance(item, dict)
             ],
+            "accepted_candidates": [
+                dict(item) for item in self.accepted_candidates if isinstance(item, dict)
+            ],
+            "rejected_candidates": [
+                dict(item) for item in self.rejected_candidates if isinstance(item, dict)
+            ],
         }
 
     @classmethod
@@ -541,6 +592,16 @@ class FinalizationJob:
             refine_result_queue=[
                 dict(item)
                 for item in (payload.get("refine_result_queue") or [])
+                if isinstance(item, dict)
+            ],
+            accepted_candidates=[
+                dict(item)
+                for item in (payload.get("accepted_candidates") or [])
+                if isinstance(item, dict)
+            ],
+            rejected_candidates=[
+                dict(item)
+                for item in (payload.get("rejected_candidates") or [])
                 if isinstance(item, dict)
             ],
         )

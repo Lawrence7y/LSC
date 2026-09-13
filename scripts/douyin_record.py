@@ -11,7 +11,7 @@ import socket
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, getproxies
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 try:
     from lsc.platforms.redaction import redact_text, redact_url
@@ -73,10 +73,21 @@ class _SSRFRedirectHandler(HTTPRedirectHandler):
         return new_req
 
 
+# 默认 opener 显式空 ProxyHandler：禁止隐式采用 env/注册表系统代理，与
+# lsc.platforms.base 的口径一致。2026-09-13 真机：注册表代理指向已死端口时
+# 抖音全部解析报 [WinError 10061]。代理只走显式 scoped proxy_url。
 _SSRF_SAFE_OPENER = build_opener(
     _SSRFRedirectHandler(),
-    ProxyHandler(getproxies()),  # explicit system proxy (env vars / Windows registry)
+    ProxyHandler({}),
 )
+
+
+def _build_scoped_opener(scoped_proxy: str):
+    """构建走显式作用域代理的 SSRF 安全 opener（重定向逐跳复检）。"""
+    return build_opener(
+        _SSRFRedirectHandler(),
+        ProxyHandler({"http": scoped_proxy, "https": scoped_proxy}),
+    )
 
 
 def urlopen(request, *, timeout: float):
@@ -121,10 +132,7 @@ def fetch_page(
             return None, "仅支持 http/https 代理"
         # Keep redirects SSRF-safe while scoping this request to the resolved
         # platform proxy. Do not log or expose proxy credentials.
-        opener = build_opener(
-            _SSRFRedirectHandler(),
-            ProxyHandler({"http": scoped_proxy, "https": scoped_proxy}),
-        )
+        opener = _build_scoped_opener(scoped_proxy)
 
     headers = {
         "User-Agent": (

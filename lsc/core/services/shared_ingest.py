@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -38,6 +39,12 @@ _WRITE_RETRY_INTERVAL_SEC = 0.02
 _RECORDING_OVERFLOW_SEC = 5.0
 # 预览 stdout 超过该秒数无数据视为挂死，触发 on_error / 进程恢复
 _PREVIEW_STDOUT_STALL_SEC = 15.0
+_HOT_FAILOVER_MERGE_TIMEOUT_SEC = 1800.0
+
+_NVENC_LOCK_FAILURE_RE = re.compile(
+    r"failed locking bitstream buffer|h264_nvenc.*invalid param|hevc_nvenc.*invalid param",
+    re.IGNORECASE,
+)
 
 _FfmpegProcess = subprocess.Popen[Any]
 
@@ -370,6 +377,7 @@ class SharedRoomIngest:
         self.preview_last_recovery_mono = 0.0
 
         self._lock = threading.RLock()
+        self._recording_failover_lock = threading.RLock()
         self._preview_condition = threading.Condition(self._lock)
         self._recording_condition = threading.Condition(self._lock)
         self._preview_subscribers: list[PreviewSubscriber] = []
@@ -393,6 +401,13 @@ class SharedRoomIngest:
         self._recording_segments_dir = ""
         self._recording_manifest_store: ManifestStore | None = None
         self._recording_manifest: RecordingManifest | None = None
+        self._recording_original_path = ""
+        self._recording_profile: ExportProfile | None = None
+        self._recording_failover_attempted = False
+        self._recording_failover_in_progress = False
+        self._recording_failover_source_paths: list[str] = []
+        self._recording_failover_current_path = ""
+        self.recording_failover_count = 0
         self._last_command: list[str] = []
         self._last_recording_command: list[str] = []
         self._last_preview_command: list[str] = []
@@ -451,7 +466,13 @@ class SharedRoomIngest:
         with self._lock:
             proc = self._recording_process
             active = self.recording_active
-        return bool(active and proc is not None and self._poll(proc) is None)
+        in_progress = self._recording_failover_in_progress
+        return bool(in_progress or (active and proc is not None and self._poll(proc) is None))
+
+    @property
+    def recording_failover_in_progress(self) -> bool:
+        with self._lock:
+            return bool(self._recording_failover_in_progress)
 
     def preview_sink_is_live(self) -> bool:
         with self._lock:
@@ -581,12 +602,14 @@ class SharedRoomIngest:
             path = self._recording_path
             segments_dir = self._recording_segments_dir
             segmented = self._recording_segmented
-        if not path and not segments_dir:
+            failover_sources = list(self._recording_failover_source_paths)
+        if not path and not segments_dir and not failover_sources:
             return 0
         try:
             targets: list[Path] = []
             if path:
                 targets.append(Path(path))
+            targets.extend(Path(item) for item in failover_sources if item)
             # Segmented recording writes partial/final files into this
             # directory while the public target remains a compatibility path.
             if segmented and segments_dir:
@@ -1006,12 +1029,20 @@ class SharedRoomIngest:
         platform_id: str = "",
         canonical_room_id: str = "",
         manifest_path: str = "",
+        _hot_failover: bool = False,
     ) -> SharedIngestStartResult:
         with self._lock:
             if self._recording_process is not None and self.recording_active:
                 return ingest_start_result(accepted=True, media_ready=True)
+            if not _hot_failover:
+                self._recording_original_path = recording_path
+                self._recording_failover_attempted = False
+                self._recording_failover_source_paths.clear()
+                self._recording_failover_current_path = ""
+                self._recording_stderr_buffer.clear()
+                self.recording_media_start_mono = 0.0
+            self._recording_profile = profile or ExportProfile(codec="copy")
             self.recording_error = ""
-            self.recording_media_start_mono = 0.0
         startup_probe_path = recording_path
         manifest_store: ManifestStore | None = None
         manifest: RecordingManifest | None = None
@@ -1072,8 +1103,9 @@ class SharedRoomIngest:
             self.stop_reason = ""
             self._recording_generation += 1
             recording_generation = self._recording_generation
-            self._recording_ts_queue.clear()
-            self._recording_queued_bytes = 0
+            if not _hot_failover:
+                self._recording_ts_queue.clear()
+                self._recording_queued_bytes = 0
             self._recording_overflow_since = 0.0
         self._start_stderr_reader(proc, self._recording_stderr_buffer, "recording")
         self._recording_input_thread = self._start_thread(
@@ -1124,11 +1156,15 @@ class SharedRoomIngest:
             self._stop_upstream_if_idle(reason=error)
             return self._recording_start_failed(error)
 
+        if _hot_failover:
+            with self._lock:
+                self._recording_failover_current_path = recording_path
         _log.info(
-            "shared recording started room=%s upstream_pid=%s recording_pid=%s",
+            "shared recording started room=%s upstream_pid=%s recording_pid=%s%s",
             self.room_id,
             self.process_id,
             self.recording_process_id,
+            " (hot failover)" if _hot_failover else "",
         )
         return ingest_start_result(accepted=True, media_ready=True)
 
@@ -1751,7 +1787,10 @@ class SharedRoomIngest:
     def _enqueue_recording_ts(self, batch: bytes) -> None:
         overflow_proc = None
         with self._recording_condition:
-            if self._recording_process is None or not self.recording_active:
+            if (
+                self._recording_process is None
+                or (not self.recording_active and not self._recording_failover_in_progress)
+            ):
                 return
             batch_size = len(batch)
             if batch_size > self.recording_queue_bytes:
@@ -1977,29 +2016,289 @@ class SharedRoomIngest:
             time.sleep(0.25)
 
     def _handle_recording_process_exit(self, proc: _FfmpegProcess, error: str) -> None:
+        # A concurrent user stop owns the failover lock. If it won the race,
+        # it has already cleared/terminated this sink and no failure callback
+        # should be emitted. Never wait here: stop joins the watcher thread.
+        if not self._recording_failover_lock.acquire(blocking=False):
+            return
+        try:
+            self._handle_recording_process_exit_locked(proc, error)
+        finally:
+            self._recording_failover_lock.release()
+
+    def _handle_recording_process_exit_locked(
+        self, proc: _FfmpegProcess, error: str
+    ) -> None:
+        failover = False
         with self._recording_condition:
             if self._recording_process is not proc:
                 return
             tail = self._stderr_tail(self._recording_stderr_buffer)
-            self.recording_error = f"{error} | stderr: {tail}" if tail else error
-            self._recording_process = None
-            self.recording_active = False
-            self._recording_generation += 1
-            self._recording_ts_queue.clear()
-            self._recording_queued_bytes = 0
-            self._recording_condition.notify_all()
+            full_error = f"{error} | stderr: {tail}" if tail else error
+            active_profile = self._recording_profile
+            active_codec = str(getattr(active_profile, "codec", "") or "").lower()
+            can_failover = (
+                not self._recording_failover_attempted
+                and not self._recording_segmented
+                and active_codec in {"h264_nvenc", "hevc_nvenc"}
+                and bool(self._recording_original_path)
+                and self._is_nvenc_lock_failure(full_error)
+                and os.path.isfile(self._recording_path or "")
+            )
+            if can_failover:
+                # Keep the ingest and preview alive. Only the failed encoder
+                # sink is replaced; the orchestrator must not see a recording stop.
+                self._recording_failover_attempted = True
+                self._recording_failover_in_progress = True
+                self.recording_error = ""
+                self._recording_failover_source_paths = [
+                    os.path.abspath(self._recording_path)
+                ]
+                self._recording_process = None
+                self.recording_active = False
+                self._recording_generation += 1
+                # Keep TS bytes captured while the replacement encoder starts;
+                # the hot-failover writer drains this queue without clearing it.
+                self._recording_condition.notify_all()
+                failover = True
+            else:
+                self.recording_error = full_error
+                self._recording_process = None
+                self.recording_active = False
+                self._recording_generation += 1
+                self._recording_ts_queue.clear()
+                self._recording_queued_bytes = 0
+                self._recording_condition.notify_all()
             segmented = self._recording_segmented
             manifest_store = self._recording_manifest_store
             segments_dir = self._recording_segments_dir
+            failover_attempted = self._recording_failover_attempted
+
         self._terminate_process_object(proc)
-        self._notify_error("recording", self.recording_error)
+        if failover and self._start_nvenc_hot_failover(full_error):
+            return
+        if failover:
+            full_error = self.recording_error or full_error
+        elif failover_attempted:
+            # The libx264 fallback itself failed. Preserve every already-written
+            # segment before surfacing the recording failure to the supervisor.
+            self._merge_hot_failover_recording()
+            full_error = self.recording_error or full_error
+
+        if not failover:
+            with self._recording_condition:
+                self.recording_error = full_error
+        self._notify_error("recording", self.recording_error or full_error)
         if segmented and manifest_store is not None:
             self._finalize_segmented_manifest(
                 manifest_store,
                 segments_dir,
                 unclean=True,
             )
-        self._stop_upstream_if_idle(reason=self.recording_error)
+        self._stop_upstream_if_idle(reason=self.recording_error or full_error)
+
+    @staticmethod
+    def _is_nvenc_lock_failure(text: str) -> bool:
+        return bool(_NVENC_LOCK_FAILURE_RE.search(str(text or "")))
+
+    @staticmethod
+    def _unique_recording_path(path: str, tag: str) -> str:
+        source = Path(path)
+        candidate = source.with_name(
+            f"{source.stem}{tag}-{uuid.uuid4().hex[:8]}{source.suffix or '.mp4'}"
+        )
+        return str(candidate)
+
+    def _start_nvenc_hot_failover(self, trigger_error: str) -> bool:
+        with self._recording_failover_lock:
+            return self._start_nvenc_hot_failover_locked(trigger_error)
+
+    def _start_nvenc_hot_failover_locked(self, trigger_error: str) -> bool:
+        with self._lock:
+            original_path = str(self._recording_original_path or "")
+            base_profile = self._recording_profile or ExportProfile(codec="h264_nvenc")
+            sources = list(self._recording_failover_source_paths)
+        if not original_path or not sources:
+            with self._lock:
+                self._recording_failover_in_progress = False
+            self.recording_error = (
+                "NVENC hot failover unavailable: recording source path is missing"
+            )
+            return False
+
+        fallback_profile = replace(
+            base_profile,
+            codec="libx264",
+            preset="veryfast",
+            rate_mode="crf",
+            video_bitrate="",
+        )
+        fallback_path = self._unique_recording_path(original_path, ".libx264-fallback")
+        _log.warning(
+            "recording NVENC sink failed; hot failover to libx264 room=%s original=%s fallback=%s trigger=%s",
+            self.room_id,
+            original_path,
+            fallback_path,
+            redact_text(trigger_error)[:500],
+        )
+        try:
+            result = self.start_recording(
+                fallback_path,
+                profile=fallback_profile,
+                _hot_failover=True,
+            )
+        except Exception as exc:
+            result = None
+            start_error = redact_text(exc)
+        else:
+            start_error = str(getattr(result, "error", "") or "")
+        if result is not None and result.ok:
+            with self._lock:
+                self.recording_failover_count += 1
+                self._recording_failover_in_progress = False
+            return True
+
+        with self._recording_condition:
+            self._recording_failover_in_progress = False
+            self._recording_ts_queue.clear()
+            self._recording_queued_bytes = 0
+        self.recording_error = (
+            "NVENC hot failover to libx264 failed: "
+            f"{start_error or 'unknown error'}"
+        )
+        self._merge_hot_failover_recording()
+        return False
+
+    def _merge_hot_failover_recording(
+        self,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> str:
+        with self._lock:
+            original_path = os.path.abspath(self._recording_original_path or "")
+            current_path = os.path.abspath(self._recording_path or "")
+            sources = [
+                os.path.abspath(path)
+                for path in self._recording_failover_source_paths
+                if path
+            ]
+        if current_path:
+            sources.append(current_path)
+        sources = list(dict.fromkeys(
+            path for path in sources
+            if path and os.path.isfile(path) and os.path.getsize(path) > 0
+        ))
+        if not original_path or not sources:
+            return original_path if original_path and os.path.isfile(original_path) else ""
+        if len(sources) == 1:
+            source = sources[0]
+            if os.path.normcase(source) != os.path.normcase(original_path):
+                os.replace(source, original_path)
+            with self._lock:
+                self._recording_path = original_path
+                self._recording_failover_source_paths.clear()
+                self._recording_failover_current_path = ""
+            return original_path
+
+        root = os.path.dirname(original_path) or "."
+        os.makedirs(root, exist_ok=True)
+        descriptor_fd, descriptor_path = tempfile.mkstemp(
+            prefix=".recording-hot-failover-", suffix=".txt", dir=root, text=True
+        )
+        output_fd, output_path = tempfile.mkstemp(
+            prefix=".recording-hot-failover-", suffix=".mp4", dir=root
+        )
+        os.close(output_fd)
+        try:
+            with os.fdopen(descriptor_fd, "w", encoding="utf-8", newline="\n") as handle:
+                for path in sources:
+                    escaped = path.replace("'", "'\\''")
+                    handle.write(f"file '{escaped}'\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            executable = self._ffmpeg_path()
+            env, creation_flags, cwd = prepare_launch(executable)
+            run_kwargs: dict[str, Any] = {
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "check": False,
+                "env": env,
+            }
+            if creation_flags:
+                run_kwargs["creationflags"] = creation_flags
+            if cwd:
+                run_kwargs["cwd"] = cwd
+            commands = [
+                [
+                    executable, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "concat", "-safe", "0", "-i", descriptor_path,
+                    "-map", "0:v:0", "-map", "0:a?", "-c", "copy",
+                    "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+                    output_path,
+                ],
+                [
+                    executable, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "concat", "-safe", "0", "-i", descriptor_path,
+                    "-map", "0:v:0", "-map", "0:a?",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                    "-avoid_negative_ts", "make_zero", "-movflags", "+faststart",
+                    output_path,
+                ],
+            ]
+            last_error = ""
+            for command in commands:
+                timeout = _HOT_FAILOVER_MERGE_TIMEOUT_SEC
+                if deadline_monotonic is not None:
+                    timeout = max(1.0, min(timeout, deadline_monotonic - time.monotonic()))
+                completed = subprocess.run(  # noqa: S603
+                    command,
+                    timeout=timeout,
+                    **run_kwargs,
+                )
+                if completed.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+                    os.replace(output_path, original_path)
+                    for path in sources:
+                        if os.path.normcase(path) == os.path.normcase(original_path):
+                            continue
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                    with self._lock:
+                        self._recording_path = original_path
+                        self._recording_failover_source_paths.clear()
+                        self._recording_failover_current_path = ""
+                        self.recording_manifest_path = ""
+                    _log.info(
+                        "recording hot failover merged room=%s segments=%d output=%s",
+                        self.room_id,
+                        len(sources),
+                        original_path,
+                    )
+                    return original_path
+                last_error = redact_text((completed.stderr or "").strip()[-500:])
+            self.recording_error = (
+                "recording hot failover merge failed: "
+                f"{last_error or 'ffmpeg returned no output'}"
+            )
+            _log.error("recording hot failover merge failed room=%s: %s", self.room_id, self.recording_error)
+            return ""
+        except Exception as exc:
+            self.recording_error = (
+                f"recording hot failover merge failed: {redact_text(exc)}"
+            )
+            _log.error("recording hot failover merge failed room=%s: %s", self.room_id, self.recording_error)
+            return ""
+        finally:
+            for path in (descriptor_path, output_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _handle_preview_process_exit(self, proc: _FfmpegProcess, error: str) -> None:
         with self._preview_condition:
@@ -2080,28 +2379,31 @@ class SharedRoomIngest:
         self._stop_upstream_if_idle(reason=reason)
 
     def _stop_recording_process(self) -> None:
-        with self._recording_condition:
-            proc = self._recording_process
-            self._recording_process = None
-            self.recording_active = False
-            self._recording_generation += 1
-            self._recording_ts_queue.clear()
-            self._recording_queued_bytes = 0
-            self._recording_condition.notify_all()
-            segmented = self._recording_segmented
-            manifest_store = self._recording_manifest_store
-            segments_dir = self._recording_segments_dir
-        if proc is not None:
-            return_code = self._poll(proc)
-            self._terminate_process_object(proc, graceful_stdin=True)
-            if segmented and manifest_store is not None:
-                self._finalize_segmented_manifest(
-                    manifest_store,
-                    segments_dir,
-                    unclean=return_code not in (None, 0),
-                )
-        self._join_thread(self._recording_input_thread)
-        self._join_thread(self._recording_watch_thread)
+        with self._recording_failover_lock:
+            with self._recording_condition:
+                proc = self._recording_process
+                self._recording_process = None
+                self.recording_active = False
+                self._recording_failover_in_progress = False
+                self._recording_generation += 1
+                self._recording_ts_queue.clear()
+                self._recording_queued_bytes = 0
+                self._recording_condition.notify_all()
+                segmented = self._recording_segmented
+                manifest_store = self._recording_manifest_store
+                segments_dir = self._recording_segments_dir
+            if proc is not None:
+                return_code = self._poll(proc)
+                self._terminate_process_object(proc, graceful_stdin=True)
+                if segmented and manifest_store is not None:
+                    self._finalize_segmented_manifest(
+                        manifest_store,
+                        segments_dir,
+                        unclean=return_code not in (None, 0),
+                    )
+            self._join_thread(self._recording_input_thread)
+            self._join_thread(self._recording_watch_thread)
+            self._merge_hot_failover_recording()
 
     @staticmethod
     def _finalize_segmented_manifest(
@@ -2190,6 +2492,7 @@ class SharedRoomIngest:
             self._recording_process = None
             self._preview_process = None
             self.recording_active = False
+            self._recording_failover_in_progress = False
             self.is_stopped = True
             self.stop_reason = reason
             self._preview_requested = False
@@ -2230,6 +2533,7 @@ class SharedRoomIngest:
             self._stderr_threads.clear()
         for thread in stderr_threads:
             self._join_thread(thread, deadline_monotonic=deadline_monotonic)
+        self._merge_hot_failover_recording(deadline_monotonic=deadline_monotonic)
 
     def _terminate_process(self) -> None:
         self._stop_upstream_process()

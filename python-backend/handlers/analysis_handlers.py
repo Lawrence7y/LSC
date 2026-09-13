@@ -305,7 +305,7 @@ def _validate_finalization_model_contract(profile: str) -> str | None:
     try:
         from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
 
-        ValorantFrameClassifier().load()
+        ValorantFrameClassifier(profile=profile).load()
     except Exception as exc:  # noqa: BLE001 - converted to a user-facing reason
         return f"broadcast 视觉模型契约不可用: {exc}"
     return None
@@ -1161,7 +1161,18 @@ def register_analysis_handlers(
                 finalizing = bool(state.get('finalizing'))
                 ever_recorded = float(state.get('recorded_duration') or 0.0) > 0.0
                 stop_with_finalize = bool(data.get('stop_with_finalize'))
-                if finalizing or (not is_recording and ever_recorded) or stop_with_finalize:
+                immediate = bool(data.get('immediate'))
+                if immediate and not finalizing:
+                    # “仅停止分析（立即停止）”语义：不停止录制，也不补扫尾部。
+                    # 直接取消任务并中止在途扫描；已经开始的收尾不可被此路径打断。
+                    state['stop_tail_scan'] = False
+                    state['stop_requested'] = False
+                    state['cancelled'] = True
+                    state['scan_abort'] = True
+                    state['refine_abort'] = True
+                    state['status'] = 'stopping'
+                    state['analysis_stage'] = '停止中'
+                elif finalizing or (not is_recording and ever_recorded) or stop_with_finalize:
                     state['stop_requested'] = True
                     state['status'] = 'stopping'
                     state['analysis_stage'] = '停止中（等待收尾）'
@@ -1411,6 +1422,9 @@ def register_analysis_handlers(
             _log.warning("begin_refine_clip: 缺少 round_key")
             return {'success': False, 'error': 'missing round_key'}
         with _refined_round_keys_lock:
+            # 精修冻结键为 ``room:round_key`` 作用域：同房间新录制 epoch 清理时
+            # 只清理本房间，同号 round_key 在其他房间/其他录制 epoch 不受影响
+            _refined_round_keys.add(f"{room_id}:{round_key}")
             _refined_round_keys.add(round_key)
         _clip_refine_state[round_key] = {
             'status': 'refining', 'room_id': room_id,
@@ -1440,6 +1454,8 @@ def register_analysis_handlers(
             _log.warning("confirm_highlight_clip: 缺少 round_key")
             return {'success': False, 'error': 'missing round_key'}
         with _refined_round_keys_lock:
+            # 与 begin_refine_clip 一致：room 作用域 + 裸键兼容
+            _refined_round_keys.add(f"{room_id}:{round_key}")
             _refined_round_keys.add(round_key)
         _clip_refine_state[round_key] = {
             'status': 'user_confirmed', 'room_id': room_id,
@@ -1505,6 +1521,8 @@ def register_analysis_handlers(
         if saved and not room_id:
             room_id = saved.get('room_id', '')
         with _refined_round_keys_lock:
+            # 两种作用域一并解除（room 作用域为新增写入形式，裸键兼容旧数据）
+            _refined_round_keys.discard(f"{room_id}:{round_key}")
             _refined_round_keys.discard(round_key)
         broadcast_data: dict = {
             'room_id': room_id, 'round_key': round_key, 'confirm_status': 'pending',

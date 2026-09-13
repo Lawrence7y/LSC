@@ -84,7 +84,14 @@ class _SafeRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_SAFE_OPENER = build_opener(_SafeRedirectHandler())
+# 默认 opener 显式空 ProxyHandler：禁止隐式采用 env/注册表系统代理。
+# 2026-09-13 真机：注册表代理指向已死端口时，build_opener 的默认 ProxyHandler
+# 让全平台解析集体报 [WinError 10061]（文案还是"网络错误"，极易误判）。
+# 代理只走调用方显式传入的 scoped proxy_url（_opener_for_proxy）。
+_SAFE_OPENER = build_opener(
+    _SafeRedirectHandler(),
+    ProxyHandler({}),
+)
 
 
 def _opener_for_proxy(proxy_url: str = ""):

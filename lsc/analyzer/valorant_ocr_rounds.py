@@ -35,7 +35,10 @@ from lsc.platforms.redaction import redact_text
 _log = logging.getLogger(__name__)
 
 BOUNDARY_SOURCE = "valorant_ocr_v1"
-# 买枪倒计时通常 ≤45s（手枪局 45s）；交战钟 >45s 且上限 100s。
+# 交战钟下限（沿用历史常量名）：交战计时读数须 >45s，上限 105s。
+# ⚠️ 反向不成立：回合计时器在**最后 45 秒**同样读到 ≤45s，所以 ≤45s 读数
+# 绝不能再被当作「买枪/准备相位」。实测 2026-09-12 赛事流：该推断在锚点失效的
+# 尾段把每个回合的出点提前 ~45s（351.312 的回合被切在 403.125，真实结束 449.875）。
 BUY_TIMER_MAX_SEC = 45.0
 _OCR_TIMER_MAX_PLAUSIBLE_SEC = 105.0
 _OCR_TIMER_JUMP_TOL_SEC = 8.0
@@ -85,6 +88,7 @@ _CENTER_CROP_RATIO = (0.34, 0.09, 0.32, 0.56)  # POV 中央横幅
 # broadcast 画面常有比分板缩放/黑边/赛事包装；保留 POV ROI，同时
 # 增加较宽的候选 ROI，避免用单一硬编码裁剪直接把 OCR 证据裁掉。
 _BROADCAST_TOP_BAND_RATIOS = (0.12, 0.18)
+_BROADCAST_WIDE_ROI_SENTINEL_SEC = 4.0
 _BROADCAST_CENTER_CROP_RATIOS = (
     _CENTER_CROP_RATIO,
     (0.20, 0.06, 0.60, 0.72),
@@ -233,7 +237,11 @@ def _read_top_anchors(
         return None, None, None
 
     profile = str(source_profile or "pov").lower()
-    ratios = _BROADCAST_TOP_BAND_RATIOS if profile == "broadcast" else (_TOP_BAND_RATIO,)
+    ratios = (
+        _BROADCAST_TOP_BAND_RATIOS
+        if profile == "broadcast"
+        else (_TOP_BAND_RATIO,)
+    )
     all_lines: list = []
     for index, ratio in enumerate(ratios):
         crop_h = max(1, int(frame_bgr.shape[0] * ratio))
@@ -341,12 +349,17 @@ def _read_center_banner(
 def _read_top_anchors_for_profile(
     frame_bgr: np.ndarray,
     source_profile: str | None,
+    *,
+    use_wide_fallback: bool = True,
 ) -> tuple[float | None, int | None, int | None]:
     """Call the profile-aware OCR reader while keeping legacy test hooks valid."""
     if str(source_profile or "").lower() != "broadcast":
         return _read_top_anchors(frame_bgr)
     try:
-        return _read_top_anchors(frame_bgr, "broadcast")
+        return _read_top_anchors(
+            frame_bgr,
+            "broadcast" if use_wide_fallback else "broadcast_fast",
+        )
     except TypeError as exc:
         # Existing plugins/tests may inject the historical one-argument reader.
         if "argument" not in str(exc).lower() and "positional" not in str(exc).lower():
@@ -433,7 +446,6 @@ class OcrRoundFSM:
         """
         closed: list[dict[str, Any]] = []
 
-        strong_prep_signal = True if prep_banner is None else bool(prep_banner)
         fresh_clock = (
             timer_raw
             and timer is not None
@@ -463,6 +475,20 @@ class OcrRoundFSM:
                         and float(self._mid_first_timer) - float(timer) >= _MIDSTREAM_DECREASE_SEC
                     )
                     if self._mid_streak >= _MIDSTREAM_STREAK and countdown_ok:
+                        self._open_combat(
+                            self._mid_start_ts if self._mid_start_ts is not None else ts
+                        )
+                        self._reset_mid()
+                elif timer is None and cand_ts is not None:
+                    # 有效计时器被跳变保护置空（结算后残余钟 → 新回合满钟的过渡），
+                    # 此时只能靠原始读数判据：cand_ts 非空 = 原始交战钟已连续确认
+                    # （上游 combat_raw_streak ≥2），再要求 _MIDSTREAM_STREAK 帧。
+                    # 删除「≤45s 计时器 = prep」后，原先借 PREP 状态开局的后门消失，
+                    # 没有这条兜底，跨窗/结算后的新回合会一直开不出来。
+                    if self._mid_streak == 0:
+                        self._mid_start_ts = cand_ts
+                    self._mid_streak += 1
+                    if self._mid_streak >= _MIDSTREAM_STREAK:
                         self._open_combat(
                             self._mid_start_ts if self._mid_start_ts is not None else ts
                         )
@@ -656,8 +682,27 @@ def _is_combat_timer(timer: float | None) -> bool:
     return timer is not None and BUY_TIMER_MAX_SEC < float(timer) <= _OCR_TIMER_MAX_PLAUSIBLE_SEC
 
 
-def _is_prep_timer(timer: float | None) -> bool:
-    return timer is not None and 0.0 < float(timer) <= BUY_TIMER_MAX_SEC
+def _is_buy_phase_onset(prev_raw: float | None, value: float | None) -> bool:
+    """本帧是否为「新买枪阶段首帧」：读数 ≤45s **且**相对上一原始读数上跳 ≥20s。
+
+    买枪倒计时（0:30→0:00）与「交战尾段最后 45 秒」读数都落在 ≤45s，只能靠这个物理
+    上跳区分——买枪阶段由上一回合结束（读数趋 0）跳到 0:30，而交战尾段是同一条回合
+    时钟的**连续下降**：
+
+    - 实测 2026-09-12 赛事流 226s 抽帧 = 买枪/装备界面 + 顶中 `ROUND 5 0:03`
+      （30s 买枪倒计时）⇒ 上跳（≈0 → 30）成立 ⇒ 判买枪相位 ✅；
+    - 同一录像 395–403s 是真实交战尾段：46→45→44 连续下降（Δ=-1）⇒ 不成立 ⇒
+      不再被判成买枪/准备 ✅。旧实现无条件把 ≤45s 判成 prep，于是每条真实回合都在
+      真实出点前 ~45s 被 `next_prep` 收尾（351.312 的回合被切在 403.125，真实 449.875）。
+
+    没有前序读数（录制起点/跨窗首帧）时不判买枪：宁可不闭合，也不开假回合。
+    """
+    if value is None or prev_raw is None:
+        return False
+    current = float(value)
+    if not 0.0 < current <= BUY_TIMER_MAX_SEC:
+        return False
+    return current - float(prev_raw) >= _NEW_ROUND_TIMER_RESET_SEC
 
 
 def _round_key(start: float) -> str:
@@ -675,28 +720,41 @@ def _refine_boundary_ts(
     cancel_check: Callable[[], bool] | None = None,
     window_sec: float | None = None,
     source_profile: str | None = None,
+    frame_provider: Any | None = None,
 ) -> float | None:
     """边界局部密扫：粗扫候选 ±3s @5fps，找连续 ≥2 帧目标标签游程的首帧真实 PTS。
 
-    target="combat"：交战钟（>45s）首现帧；target="prep"：准备信号（≤45s 或横幅）首现帧；
+    target="combat"：交战钟（>45s）首现帧；target="prep"：准备横幅首现帧（不接受
+    ≤45s 计时器读数——回合最后 45 秒同样是 ≤45s，会让出点提前 ~45s）；
     target="end_or_prep"：结束横幅或准备横幅首现帧，用于纠正无结算信号时的早出点。
     min_start_ts：游程首帧不得早于该时刻（prep 密扫排除结算画面低倒计时）。
     密扫失败返回 None（保留粗扫值，宁用粗值不丢回合）。
-    优化：combat 密扫跳过中央横幅 OCR，prep 密扫优先读顶部计时器并支持提前退出。
+    优化：combat 密扫跳过中央横幅 OCR，prep 密扫只读中央横幅并支持提前退出。
     """
     refine_window = _REFINE_WINDOW_SEC if window_sec is None else max(0.0, float(window_sec))
     t0 = max(0.0, float(center_ts) - refine_window)
     t1 = float(center_ts) + refine_window
     try:
-        frames = extract_frames_cancellable(
-            video_path,
-            start_sec=t0,
-            end_sec=t1,
-            fps=_REFINE_FPS,
-            ffmpeg_path=ffmpeg_path,
-            cancel_check=cancel_check,
-            overlap_sec=0.0,
-        )
+        if frame_provider is not None:
+            frames = frame_provider.get_frames(
+                video_path,
+                start_sec=t0,
+                end_sec=t1,
+                fps=_REFINE_FPS,
+                ffmpeg_path=ffmpeg_path,
+                cancel_check=cancel_check,
+                overlap_sec=0.0,
+            )
+        else:
+            frames = extract_frames_cancellable(
+                video_path,
+                start_sec=t0,
+                end_sec=t1,
+                fps=_REFINE_FPS,
+                ffmpeg_path=ffmpeg_path,
+                cancel_check=cancel_check,
+                overlap_sec=0.0,
+            )
     except Exception as exc:  # noqa: BLE001
         _log.debug("边界密扫抽帧失败: %s", exc)
         return None
@@ -732,20 +790,16 @@ def _refine_boundary_ts(
             )
         else:
             # target == "prep"
-            timer = None
+            # 只认中央准备横幅。曾经把「≤45s 计时器读数」当作准备首帧，导致密扫
+            # 在真实出点前 ~45s 处反复"确认"同一个假边界（351.312 回合被密扫到
+            # 403.125 并盖上 end_confidence=0.95）。回合计时器最后 45 秒同样是
+            # ≤45s，因此该读数不含任何出点信息。
+            prep_banner = False
             try:
-                timer, _, _ = _read_top_anchors_for_profile(img, source_profile)
+                prep_banner, _ = _read_center_banner_for_profile(img, source_profile)
             except Exception as exc:  # noqa: BLE001
-                _log.debug("边界密扫 top OCR 失败: %s", exc)
-            if timer is not None and _is_prep_timer(timer):
-                hit = min_start_ts is None or ts >= float(min_start_ts)
-            else:
-                try:
-                    prep_banner, _ = _read_center_banner_for_profile(img, source_profile)
-                except Exception as exc:  # noqa: BLE001
-                    _log.debug("边界密扫 center OCR 失败: %s", exc)
-                    prep_banner = False
-                hit = prep_banner and (min_start_ts is None or ts >= float(min_start_ts))
+                _log.debug("边界密扫 center OCR 失败: %s", exc)
+            hit = prep_banner and (min_start_ts is None or ts >= float(min_start_ts))
         if hit:
             if run == 0:
                 run_start = ts
@@ -888,6 +942,18 @@ def apply_replay_end_exclusion(round_data: dict[str, Any]) -> float | None:
         _skip("boundary_not_confirmed", candidate_trim)
         return None
 
+    # 视觉审计已给出"精确出点"（逐帧证据截断）时，不得再用启发式窗口覆盖它：两条
+    # 信号在描述同一处转场，而 replay_segments 只是"计时器不可读"的间接推断。实测
+    # （2026-09-11）：end_refined=196.25（该区间逐帧 p_combat 0.59–0.82，是真实交战
+    # 结束）被本函数裁到 185.922，白丢 10.3s 画面。只记录"本该裁多少、为什么没裁"。
+    if (
+        str(round_data.get("end_by") or "") == "broadcast_exclusion"
+        and round_data.get("end_refined") is not None
+    ):
+        _skip("visual_end_authoritative", candidate_trim)
+        round_data["boundary_review_required"] = True
+        return None
+
     trimmed = candidate_trim
     round_data["end_before_replay_exclusion"] = round(end, 3)
     round_data["replay_end_excluded_sec"] = trimmed
@@ -907,6 +973,7 @@ def refine_valorant_round_boundaries(
     cancel_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[str, float, str], None] | None = None,
     source_profile: str | None = None,
+    frame_provider: Any | None = None,
 ) -> list[dict[str, Any]]:
     """对已闭合回合做边界局部密扫（±3s@10fps），返回新列表（原地亦可）。
 
@@ -934,6 +1001,8 @@ def refine_valorant_round_boundaries(
             kwargs["window_sec"] = window_sec
         if source_profile:
             kwargs["source_profile"] = source_profile
+        if frame_provider is not None:
+            kwargs["frame_provider"] = frame_provider
         try:
             return _refine_boundary_ts(
                 video_path, ffmpeg_path, center, target, **kwargs,
@@ -952,9 +1021,16 @@ def refine_valorant_round_boundaries(
             break
         if progress_callback and total:
             progress_callback("refine", idx / max(total, 1), f"边界精修 {idx}/{total}")
+        start_coarse = float(r.get("start_coarse", r.get("start", 0.0) or 0.0))
+        end_coarse = float(r.get("end_coarse", r.get("end", 0.0) or 0.0))
         start_ts = _call_refine(float(r["start"]), "combat")
         if start_ts is not None:
-            r["start"] = round(start_ts, 3)
+            r["start_refined"] = round(start_ts, 3)
+            r["start"] = r["start_refined"]
+            r["start_delta"] = round(abs(r["start_refined"] - start_coarse), 3)
+            # 10fps 密扫由连续多帧 OCR 计时器游程背书；没有分类器置信度时使用
+            # 固定高置信度表示“该边界由物理密扫确认”，后续可被视觉审计覆盖。
+            r["start_confidence"] = float(r.get("start_confidence", 0.95))
         if r.get("confirm_status") == "vision_confirmed" and r.get("end_by") == "next_prep":
             _min_prep_ts = None
             if r.get("result_ts") is not None:
@@ -976,8 +1052,22 @@ def refine_valorant_round_boundaries(
                     min_start_ts=_min_prep_ts,
                 )
             if end_ts is not None and end_ts > float(r["start"]) + _MIN_ROUND_SEC:
-                r["end"] = round(end_ts, 3)
-        r["boundary_refined"] = True
+                r["end_refined"] = round(end_ts, 3)
+                r["end"] = r["end_refined"]
+                r["end_delta"] = round(abs(r["end_refined"] - end_coarse), 3)
+                r["end_confidence"] = float(r.get("end_confidence", 0.95))
+        # 不得无条件标记 boundary_refined。广播赛事必须双向物理证据齐备才算
+        # 精修完成；POV/历史路径保留旧语义（任一边际密扫成功即可视为 refined）。
+        is_broadcast = str(source_profile or "").strip().lower() == "broadcast"
+        if is_broadcast:
+            r["boundary_refined"] = bool(
+                r.get("start_delta") is not None
+                and r.get("start_confidence") is not None
+                and r.get("end_delta") is not None
+                and r.get("end_confidence") is not None
+            )
+        elif start_ts is not None or r.get("end_delta") is not None:
+            r["boundary_refined"] = True
     # 相邻回合修整：出点不得越过下一回合入点
     out.sort(key=lambda item: float(item["start"]))
     kept: list[dict[str, Any]] = []
@@ -1119,6 +1209,8 @@ def detect_valorant_rounds_ocr(
     last_timer_ts = float(state.get("last_timer_ts", -1.0))
     last_raw_timer = state.get("last_raw_timer")
     last_raw_ts = float(state.get("last_raw_ts", -1.0))
+    # 买枪阶段窗口右沿（见 _is_buy_phase_onset）：只有在该窗口内，≤45s 读数才判 prep
+    buy_phase_until: float | None = state.get("buy_phase_until")
     anchor = state.get("combat_anchor")  # (timer, ts)
     score_pending: tuple[int, int] | None = state.get("score_pending")
     prev_left = state.get("prev_left")
@@ -1144,6 +1236,9 @@ def detect_valorant_rounds_ocr(
     prev_top_result = state.get("prev_top_result", (None, None, None))
     prev_center_roi = state.get("prev_center_roi")
     _top_cache_blackout = int(state.get("_top_cache_blackout", 0) or 0)
+    next_broadcast_wide_ts = float(
+        state.get("next_broadcast_wide_ts", -1.0)
+    )
 
     labels: list[tuple[float, str, float | None, bool, float | None]] = []
     prep_banner_flags: list[bool] = []
@@ -1209,8 +1304,29 @@ def detect_valorant_rounds_ocr(
                     np.abs(_top_roi.astype(np.int16) - prev_top_roi.astype(np.int16)).mean()
                 ) > _ROI_DIFF_THRESHOLD
             )
-            if _top_changed or _top_cache_blackout > 0 or not roi_cache_enabled:
-                raw_timer, left, right = _read_top_anchors_for_profile(img, source_profile)
+            broadcast_wide_due = bool(
+                source_profile == "broadcast"
+                and (finalize or ts >= next_broadcast_wide_ts)
+            )
+            if (
+                _top_changed
+                or _top_cache_blackout > 0
+                or not roi_cache_enabled
+                or broadcast_wide_due
+            ):
+                raw_timer, left, right = _read_top_anchors_for_profile(
+                    img,
+                    source_profile,
+                    use_wide_fallback=broadcast_wide_due,
+                )
+                if broadcast_wide_due and not finalize:
+                    # 官方包装的宽 ROI 是容错路径，不应在紧 ROI
+                    # 未同时读全计时器+双比分时每帧重复执行。
+                    # 每 4s 探测一次仍可及时捕获偏移 HUD，中间
+                    # 帧由紧 ROI + 计时器外推维持连续性。
+                    next_broadcast_wide_ts = (
+                        float(ts) + _BROADCAST_WIDE_ROI_SENTINEL_SEC
+                    )
             else:
                 raw_timer, left, right = prev_top_result
             _top_cache_blackout = max(0, _top_cache_blackout - 1)
@@ -1305,6 +1421,9 @@ def detect_valorant_rounds_ocr(
                 and abs(float(raw_timer) - float(last_raw_timer)) < 0.5
             )
             if raw_timer is not None and not frozen:
+                # 买枪阶段判据需要"上一帧原始读数"：下面的分支会用本帧值覆盖
+                # last_raw_timer，先在此锁存。
+                prev_raw_reading = last_raw_timer
                 if _is_combat_timer(raw_timer):
                     if combat_raw_streak == 0:
                         combat_cand_ts = ts
@@ -1343,6 +1462,7 @@ def detect_valorant_rounds_ocr(
                 if raw_timer is None:
                     combat_raw_streak = 0
                     combat_cand_ts = None
+                prev_raw_reading = last_raw_timer
                 if extrapolated is not None:
                     timer = extrapolated  # 外推 1:1 走秒
                 else:
@@ -1355,6 +1475,24 @@ def detect_valorant_rounds_ocr(
                     anchor_timer - (ts - anchor_ts) <= 0.0
                 ):
                     anchor = None
+
+            # 买枪阶段窗口：≤45s 读数只有在「新买枪阶段首帧」（相对上一原始读数上跳
+            # ≥20s）之后才判 prep；窗口在该阶段内保持（同一段买枪倒计时不可能每帧都
+            # 再上跳一次）。见到交战钟 / 读数消失 / 超时即关闭。
+            # 这样买枪倒计时（0:30→0:00）仍被正确识别为「下回合准备」，
+            # 而交战尾段最后 45 秒（同一回合时钟连续下降，无上跳）不再被误判
+            # ——旧实现无条件把 ≤45s 判 prep，导致每条真实回合在真实出点前 ~45s
+            # 被 next_prep 收尾（2026-09-12 实测 351.312 → 403.125，真实 449.875）。
+            if buy_phase_until is not None and (
+                timer is None
+                or float(timer) > BUY_TIMER_MAX_SEC
+                or ts > buy_phase_until
+            ):
+                buy_phase_until = None
+            if raw_timer is not None and not frozen and _is_buy_phase_onset(
+                prev_raw_reading, raw_timer
+            ):
+                buy_phase_until = float(ts) + BUY_TIMER_MAX_SEC
 
             # 两帧确认：timer 相位需要连续 2 帧一致读数（递减轨迹中 val 每帧更新）
             timer_phase: str | None = None
@@ -1369,7 +1507,7 @@ def detect_valorant_rounds_ocr(
                 if timer_streak >= 2:
                     if _is_combat_timer(new_val):
                         timer_phase = "combat"
-                    elif _is_prep_timer(new_val):
+                    elif buy_phase_until is not None and new_val <= BUY_TIMER_MAX_SEC:
                         timer_phase = "prep"
             else:
                 timer_streak = 0
@@ -1430,6 +1568,7 @@ def detect_valorant_rounds_ocr(
                     post_settle_gap = True
                     label = "neutral"
                 elif post_settle_gap and timer_phase == "prep":
+                    # 空档之后出现的买枪相位（≤45s **且相对上一读数上跳**）＝新回合准备。
                     post_settle_hold = False
                     post_settle_gap = False
                     label = "prep"
@@ -1438,9 +1577,8 @@ def detect_valorant_rounds_ocr(
                     and fsm._result_ts is not None
                     and ts - fsm._result_ts >= _PREP_AFTER_RESULT_SEC
                 ):
-                    # 关键优化：距结算已超过 6 秒（结算画面倒计时 5s 已结束），
-                    # 连续两帧出现有效买枪准备计时器（<=45s），直接解除 post_settle_hold！
-                    # 不再强求必须出现 raw_timer is None 的 gap，防止买枪阶段被整段吞掉！
+                    # 距结算超过 _PREP_AFTER_RESULT_SEC（结算画面倒计时已结束），出现
+                    # 真买枪相位（上跳判据同上）即解除 hold，避免买枪阶段被整段吞掉。
                     post_settle_hold = False
                     post_settle_gap = False
                     label = "prep"
@@ -1457,6 +1595,8 @@ def detect_valorant_rounds_ocr(
             elif prep_banner:
                 label = "prep"
             elif timer_phase is not None:
+                # 计时器相位：combat（>45s）或 prep（买枪阶段首帧且上跳，见
+                # _is_buy_phase_onset——交战尾段的 ≤45s 连续下降不再算 prep）。
                 label = timer_phase
             else:
                 label = "neutral"
@@ -1575,6 +1715,14 @@ def detect_valorant_rounds_ocr(
         if diff["shadow_only"] or diff["primary_only"] or diff["resized"]:
             _log.info("broadcast_mode 影子差异明细: %s", diff)
 
+    # 候选出生即写入不可变身份：后续 start gate / 10fps 密扫允许移动边界，
+    # 但 round_key 必须保持第一次粗入点的 10s 桶，避免同一回合因起点漂移被
+    # 当成两个候选、或拒绝墓碑无法命中旧 all_highlights 条目。
+    for r in closed_rounds:
+        try:
+            r.setdefault("round_key", _round_key(float(r["start"])))
+        except (TypeError, ValueError):
+            r["round_key"] = ""
 
     if refine_boundaries and closed_rounds:
         closed_rounds = refine_valorant_round_boundaries(
@@ -1609,6 +1757,8 @@ def detect_valorant_rounds_ocr(
     state["last_timer"] = last_timer
     state["last_timer_ts"] = last_timer_ts
     state["last_raw_timer"] = last_raw_timer
+    state["buy_phase_until"] = buy_phase_until
+    state["next_broadcast_wide_ts"] = next_broadcast_wide_ts
     state["last_raw_ts"] = last_raw_ts
     state["combat_anchor"] = anchor
     state["combat_raw_streak"] = combat_raw_streak
