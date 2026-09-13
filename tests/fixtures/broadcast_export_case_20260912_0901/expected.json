@@ -1,0 +1,23 @@
+{
+ "_note": "P1/P2 修复后的期望：065 入列且用权威精修出点 789.75；残差必须为 0。",
+ "counts": {
+  "requested": 9,
+  "included": 4,
+  "skipped": 5,
+  "skipped_unaccounted": 0
+ },
+ "included": [
+  "round-000000",
+  "round-000010-s0",
+  "round-000028",
+  "round-000065"
+ ],
+ "skipped": {
+  "round-000007": "REJECTED",
+  "round-000034": "REJECTED",
+  "round-000036": "REJECTED",
+  "round-000047": "NEVER_AUDITED",
+  "round-000063": "NEVER_AUDITED"
+ },
+ "round_000065_authoritative_end": 789.75
+}

@@ -46,3 +46,10 @@ def test_settings_jianying_draft_dir_row():
 def test_issafe_path_mentions_jianying():
     text = MAIN.read_text(encoding="utf-8")
     assert "jianying" in text.lower() or "Jianying" in text
+
+
+def test_workbench_removes_rejected_clips_on_confirm_status():
+    """审计拒绝终态必须从切片列表移除，而不是残留 pending 版本。"""
+    text = WORKBENCH.read_text(encoding="utf-8")
+    assert "confirm_status === 'rejected'" in text
+    assert "st.clips.filter" in text

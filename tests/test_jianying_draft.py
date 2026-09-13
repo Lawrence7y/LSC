@@ -309,3 +309,35 @@ def test_build_cleans_partial_folder_on_save_failure(monkeypatch, tmp_path: Path
     assert r2.success, r2.error
     content = Path(r2.draft_dir) / "draft_content.json"
     assert content.is_file()
+
+
+@pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg required")
+def test_placed_clip_count_reflects_overlap_skip(tmp_path: Path):
+    """included_clip_count 必须按实际写入切片轨的数量统计。
+
+    同房间两条重叠切片：一条被跳过时，placed_clip_count 不得把跳过的计入
+    （旧实现 requested=8 / included=8 但草稿实际只写 7 条）。
+    """
+    a = tmp_path / "a.mp4"
+    _make_color_mp4(a, 10.0, "red")
+    draft_root = tmp_path / "drafts"
+    draft_root.mkdir()
+    rooms = [RoomDraftSource("r1", "主房", str(a), 0.0, is_main=True)]
+    clips = [
+        ClipDraftSource(
+            "c1", 0.0, 5.0, "R1-a", precision="exact", confirm_status="user_confirmed",
+        ),
+        ClipDraftSource(
+            "c2", 3.0, 8.0, "R1-b", precision="exact", confirm_status="user_confirmed",
+        ),
+    ]
+    result = build_session_draft(
+        rooms=rooms,
+        clips=clips,
+        options=JianyingDraftOptions(draft_name="LSC_overlap_count", text_labels=False),
+        draft_root=str(draft_root),
+    )
+    assert result.success, result.error
+    # 2 条请求、同轨重叠只能写入 1 条切片段
+    assert result.placed_clip_count == 1
+    assert any("重叠" in w for w in result.warnings)

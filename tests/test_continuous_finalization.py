@@ -10,7 +10,11 @@ from continuous_finalization import (
     merge_ranges,
     uncovered_ranges,
 )
-from persistence import load_finalization_job, save_finalization_job
+from persistence import (
+    archive_finalization_job,
+    load_finalization_job,
+    save_finalization_job,
+)
 
 
 def test_merge_ranges_coalesces_overlap_and_adjacent_windows() -> None:
@@ -28,7 +32,7 @@ def test_uncovered_ranges_reports_middle_and_tail() -> None:
     ) == [(5.0, 10.0), (30.0, 40.0)]
 
 
-def test_full_rescan_uses_coverage_gaps_not_tail_lag() -> None:
+def test_full_rescan_only_for_empty_coverage_or_explicit_force() -> None:
     # Continuous coverage reaches the analyzed cursor; the finalizer should
     # scan only the unwritten tail instead of repeating the whole history.
     assert not finalization_requires_full_rescan(
@@ -36,13 +40,15 @@ def test_full_rescan_uses_coverage_gaps_not_tail_lag() -> None:
         last_analyzed=3174.9,
         coverage_ranges=[(0.0, 3174.9)],
     )
-    # A historical coverage gap still requires a fresh pass.
-    assert finalization_requires_full_rescan(
+    # A historical coverage gap is handled by gap-based finalize chunks; it
+    # must NOT trigger a whole-file fresh pass (this was the repeated-rescan bug).
+    assert not finalization_requires_full_rescan(
         final_duration=3746.4,
         last_analyzed=3174.9,
         coverage_ranges=[(0.0, 1200.0), (1300.0, 3174.9)],
     )
-    assert finalization_requires_full_rescan(
+    # A failed window does not discard already covered history either.
+    assert not finalization_requires_full_rescan(
         final_duration=100.0,
         last_analyzed=100.0,
         coverage_ranges=[(0.0, 100.0)],
@@ -52,6 +58,18 @@ def test_full_rescan_uses_coverage_gaps_not_tail_lag() -> None:
         final_duration=100.0,
         last_analyzed=100.0,
         coverage_ranges=[(0.0, 100.0)],
+    )
+    # Only no-coverage or explicit force starts from zero.
+    assert finalization_requires_full_rescan(
+        final_duration=100.0,
+        last_analyzed=0.0,
+        coverage_ranges=[],
+    )
+    assert finalization_requires_full_rescan(
+        final_duration=100.0,
+        last_analyzed=100.0,
+        coverage_ranges=[(0.0, 100.0)],
+        force=True,
     )
 
 
@@ -125,6 +143,24 @@ def test_finalization_job_persists_next_to_recording(tmp_path) -> None:
     assert restored is not None
     assert restored["job_id"] == "job-2"
     assert restored["coverage_ranges"] == [[0.0, 30.0]]
+
+
+def test_archive_finalization_job_moves_old_sidecar(tmp_path) -> None:
+    old_video = tmp_path / "recording_录制中.mp4"
+    old_video.write_bytes(b"mp4")
+    job = FinalizationJob.create(
+        job_id="job-archive",
+        room_id="room-archive",
+        recording_id="recording-archive",
+        source_path=str(old_video),
+        final_duration=30.0,
+    )
+    assert save_finalization_job(str(old_video), job.to_dict())
+    assert (tmp_path / "recording_录制中.finalization.json").exists()
+
+    assert archive_finalization_job(str(old_video)) is True
+    assert not (tmp_path / "recording_录制中.finalization.json").exists()
+    assert (tmp_path / "recording_录制中.finalization.json.bak").exists()
 
 
 def test_stop_checkpoint_is_written_before_loop_can_create_finalization_job(tmp_path) -> None:
@@ -622,6 +658,32 @@ def test_finalization_job_persists_and_deduplicates_refine_delivery_queue() -> N
     assert len(restored.refine_result_queue) == 1
     assert restored.ack_refine_results(["room-r:rec-r:round-1"]) == 1
     assert restored.refine_result_queue == []
+
+
+def test_finalization_job_v3_persists_accepted_and_rejected_projections() -> None:
+    job = FinalizationJob.create(
+        job_id="job-v3",
+        room_id="room-r",
+        recording_id="rec-r",
+        source_path="D:/rec-v3.mp4",
+        final_duration=100.0,
+    )
+    accepted = {"start": 10.0, "end": 70.0, "round_key": "round-1"}
+    rejected = {"start": 90.0, "end": 120.0, "round_key": "round-2"}
+
+    assert job.record_terminal_candidate(accepted, "accepted") is True
+    assert job.record_terminal_candidate(rejected, "rejected") is True
+    # 同 key 更新不重复追加
+    assert job.record_terminal_candidate(
+        {"start": 10.0, "end": 72.0, "round_key": "round-1"}, "manual_review",
+    ) is True
+
+    restored = FinalizationJob.from_dict(job.to_dict())
+    assert len(restored.accepted_candidates) == 1
+    assert restored.accepted_candidates[0]["end"] == 72.0
+    assert len(restored.rejected_candidates) == 1
+    assert restored.rejected_candidates[0]["round_key"] == "round-2"
+    assert restored.accepted_candidates[0]["round_key"] == "round-1"
 
 
 # ── A3 守卫（2026-09-10）：precise 需要**交叉证据**，不能只靠 start_delta 自洽 ──

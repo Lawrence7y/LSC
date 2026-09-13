@@ -317,6 +317,33 @@ def test_get_recording_status_stays_true_during_reconnect(monkeypatch) -> None:
     assert status["is_recording"] is True
 
 
+def test_get_recording_status_stays_true_during_hot_failover(monkeypatch) -> None:
+    from lsc.core.orchestrator import RoomOrchestrator
+
+    orch = RoomOrchestrator(controller_factory=lambda: object(), preview_factory=lambda: object())
+    room = orch.add_room("https://example.com/live.m3u8")
+    room.is_recording = True
+    room.is_reconnecting = False
+
+    class FailingOverIngest:
+        recording_active = False
+        recording_failover_in_progress = True
+        recording_error = ""
+
+    monkeypatch.setattr(
+        "lsc.core.orchestrator.get_shared_ingest_registry",
+        lambda: type(
+            "Reg",
+            (),
+            {"get": staticmethod(lambda _rid: FailingOverIngest())},
+        )(),
+    )
+
+    status = orch.get_recording_status(room.room_id)
+    assert status["exists"] is True
+    assert status["is_recording"] is True
+
+
 def test_parse_failed_reconnect_is_not_treated_as_offline(monkeypatch, tmp_path) -> None:
     import time as _time
 

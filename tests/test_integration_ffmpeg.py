@@ -55,6 +55,7 @@ def _generate_test_video(path: str, duration: int = 3) -> None:
         "-f", "lavfi", "-i", f"testsrc=duration={duration}:size=320x240:rate=25",
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "64k",
         "-f", "mp4", "-movflags", "+faststart",
         path,

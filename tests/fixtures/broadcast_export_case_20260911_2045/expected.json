@@ -1,0 +1,32 @@
+{
+ "_note": "P1 修复后的期望口径：105 因权威快照可达而回归入列；其余保持不放宽（出点未定稿/未审计/无排除证据）。",
+ "counts": {
+  "requested": 8,
+  "included": 4,
+  "skipped": 4
+ },
+ "included": [
+  "round-000045",
+  "round-000055",
+  "round-000070",
+  "round-000105"
+ ],
+ "skipped": {
+  "round-000071": {
+   "reason_code": "END_NOT_FINAL",
+   "note": "audit=passed 但 end_by=next_prep + end_review_required"
+  },
+  "round-000076": {
+   "reason_code": "NEVER_AUDITED",
+   "note": "全程未取得审计结论（pending_lookahead）"
+  },
+  "round-000123": {
+   "reason_code": "NO_EXCLUSION_EVIDENCE",
+   "note": "audit=pending_no_exclusion（审计跑完但无可信出点证据）"
+  },
+  "round-000135": {
+   "reason_code": "END_NOT_FINAL",
+   "note": "20:45:17 audit=passed/next_prep，出点仍未定稿"
+  }
+ }
+}

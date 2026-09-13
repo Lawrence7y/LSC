@@ -5,8 +5,32 @@ from lsc.analyzer.valorant_ocr_rounds import (
     OcrRoundFSM,
     _apply_phase_cycle_prior,
     _is_combat_timer,
-    _is_prep_timer,
 )
+
+
+def test_broadcast_fast_top_roi_skips_per_frame_wide_fallback(monkeypatch):
+    """在线赛事粗扫的普通帧只跑紧 ROI；宽 ROI 仅由周期哨兵调用。"""
+    import numpy as np
+
+    import lsc.analyzer.ocr_detector as ocr_detector
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    calls: list[tuple[int, int]] = []
+
+    def fake_ocr(image):
+        calls.append(tuple(image.shape[:2]))
+        return [], 0.0
+
+    monkeypatch.setattr(ocr_detector, "_get_ocr", lambda: fake_ocr)
+    frame = np.zeros((360, 640, 3), dtype=np.uint8)
+
+    mod._read_top_anchors(frame, "broadcast_fast")
+    assert len(calls) == 1
+    assert calls[0][0] == int(360 * mod._TOP_BAND_RATIO)
+
+    calls.clear()
+    mod._read_top_anchors(frame, "broadcast")
+    assert len(calls) == len(mod._BROADCAST_TOP_BAND_RATIOS)
 
 
 def _feed_labels(
@@ -659,11 +683,73 @@ def test_timer_helpers():
     assert _is_combat_timer(46.0)
     assert _is_combat_timer(100.0)
     assert not _is_combat_timer(106.0)  # 超物理上限（误读）
+    # ≤45s 不是"交战钟"：回合计时器最后 45 秒同样是 ≤45s。
     assert not _is_combat_timer(45.0)
-    assert _is_prep_timer(45.0)
-    assert _is_prep_timer(1.0)
-    assert not _is_prep_timer(0.0)
-    assert not _is_prep_timer(None)
+    assert not _is_combat_timer(1.0)
+    assert not _is_combat_timer(0.0)
+    assert not _is_combat_timer(None)
+
+
+def test_no_prep_phase_is_inferred_from_low_timer(monkeypatch, tmp_path):
+    """删除「≤45s 计时器 = 买枪/准备」推断：锚点失效 + 尾段低计时器不得提前闭合。
+
+    复现 2026-09-12 赛事流：真实出点前 ~45s 处回合计时器读到 ≤45s，旧实现把该帧
+    标成 prep → 4 帧游程后以 next_prep 收尾（351.312 → 403.125，真实 449.875）。
+    新契约：低计时器只算 neutral，必须等结算（比分跳变）或新回合满钟才闭合。
+    """
+    import numpy as np
+
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"dummy")
+
+    # 0-29  交战钟 100→71（建立锚点/回合）
+    # 30-59 交战钟 70→41（继续交战）
+    # 60-74 交战钟 40→1（旧实现把 45 穿越后的连续 ≤45 读数当 prep → 60 处闭合）
+    # 75    结算横幅 → SETTLE
+    # 76-95 HUD 空档（无读数）
+    # 96+   新回合满钟 100 → 旧回合以 next_combat 闭合
+    readings = []
+    for ts in range(0, 120):
+        if ts <= 29:
+            readings.append((100.0 - ts, None, None))
+        elif ts <= 59:
+            readings.append((70.0 - (ts - 30), None, None))
+        elif ts <= 74:
+            readings.append((40.0 - (ts - 60), None, None))
+        elif ts < 96:
+            readings.append((None, None, None))
+        else:
+            readings.append((100.0 - (ts - 96), None, None))
+
+    it = iter(readings)
+
+    def fake_top(img):
+        return next(it, (None, None, None))
+
+    ci = [0]
+
+    def fake_center(img):
+        ci[0] += 1
+        # 第 76 帧（ts=75）命中结算横幅
+        return (False, True) if ci[0] == 76 else (False, False)
+
+    monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: [
+        (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 120)
+    ])
+    monkeypatch.setattr(mod, "_read_top_anchors", fake_top)
+    monkeypatch.setattr(mod, "_read_center_banner", fake_center)
+
+    rounds = mod.detect_valorant_rounds_ocr(
+        str(video), time_range=(0.0, 120.0), runtime_state={}, finalize=False,
+        refine_boundaries=False,
+    )
+    assert len(rounds) == 1
+    assert rounds[0]["start"] == 0.0
+    # 关键：出点必须在新回合满钟（96）附近，而不是尾段低计时器游程起点（旧实现 ≈60）
+    assert rounds[0]["end"] >= 95.0, rounds[0]
+    assert rounds[0]["end_by"] == "next_combat"
 
 
 def test_fsm_clone_is_independent():
@@ -767,7 +853,11 @@ def test_round_key_is_ten_second_bucket():
     assert _round_key(4.0) == _round_key(4.5)
 
 def test_open_round_closes_across_windows(monkeypatch, tmp_path):
-    """跨窗口 FSM 持久化：回合在窗口 A 打开（无出点不产出），窗口 B 见真准备信号后闭合产出。"""
+    """跨窗口 FSM 持久化：回合在窗口 A 打开（无出点不产出），窗口 B 见真准备横幅后闭合产出。
+
+    2026-09-12 契约变更：出点只认中央准备横幅，不再认 ≤45s 计时器读数
+    （窗口 B 仍喂 ≤45s 买枪倒计时，用于证明它**不再**触发出点）。
+    """
     import numpy as np
 
     import lsc.analyzer.valorant_ocr_rounds as mod
@@ -808,7 +898,7 @@ def test_open_round_closes_across_windows(monkeypatch, tmp_path):
                                               runtime_state=state, finalize=False)
     assert rounds1 == []  # 严格契约：无真出点不产出
 
-    # window2 (121..150)：SETTLE 延续 → prep 130-131（两帧确认）→ 闭合产出
+    # window2 (121..150)：SETTLE 延续 → 130 起中央准备横幅 → 闭合产出
     # 注：last_processed_ts=120 会过滤 ≤120 的帧，fake 读数必须与过滤后帧一一对应
     w2_readings = []
     for ts in range(121, 151):
@@ -818,19 +908,26 @@ def test_open_round_closes_across_windows(monkeypatch, tmp_path):
             w2_readings.append((30.0 - (ts - 130), None, None))
 
     it2 = iter(w2_readings)
+    ci2 = [0]
 
     def fake_top2(img):
         return next(it2, (None, None, None))
 
+    def fake_center2(img):
+        ci2[0] += 1
+        # 仅粗扫第 10 帧（ts=130）命中准备横幅；后续（含密扫）保持无横幅，
+        # 避免密扫把 end 再往前 refinement 到别的帧上。
+        return (True, False) if ci2[0] == 10 else (False, False)
+
     monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: _frames_for(121, 150))
     monkeypatch.setattr(mod, "_read_top_anchors", fake_top2)
-    monkeypatch.setattr(mod, "_read_center_banner", lambda img: (False, False))
+    monkeypatch.setattr(mod, "_read_center_banner", fake_center2)
 
     rounds2 = mod.detect_valorant_rounds_ocr(str(video), time_range=(100.0, 150.0),
                                               runtime_state=state, finalize=False)
     assert len(rounds2) == 1
     assert rounds2[0]["start"] == 6.0   # 入点跨窗口持久化（首帧回溯至交战首帧 @6）
-    assert rounds2[0]["end"] == 131.0   # 窗口 B 的真准备信号（两帧确认）
+    assert rounds2[0]["end"] == 130.0   # 窗口 B 的真准备横幅首帧
     assert rounds2[0]["confirm_status"] == "vision_confirmed"
     assert rounds2[0]["end_by"] == "next_prep"
 
@@ -879,7 +976,11 @@ def test_refine_boundary_ts_finds_first_frame(monkeypatch):
 
 
 def test_refine_boundary_ts_respects_min_start(monkeypatch):
-    """prep 密扫 min_start_ts：游程首帧不得早于结算保护线（排除结算画面倒计时）。"""
+    """prep 密扫 min_start_ts：游程首帧不得早于结算保护线（排除结算画面倒计时）。
+
+    2026-09-12 契约变更：prep 密扫**只认中央准备横幅**。≤45s 计时器读数不再算命中
+    ——回合计时器最后 45 秒同样是 ≤45s，旧实现据此把出点钉在假边界上。
+    """
     import numpy as np
 
     import lsc.analyzer.valorant_ocr_rounds as mod
@@ -887,32 +988,43 @@ def test_refine_boundary_ts_respects_min_start(monkeypatch):
     frames = [(90.0 + i * 0.1, np.zeros((360, 640, 3), dtype=np.uint8)) for i in range(61)]
     monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: frames)
 
-    # 前 30 帧（90-93s）结算倒计时（prep 读数），之后（93+）真准备
-    readings = [(30.0 - i * 0.1, None, None) for i in range(30)] + [(28.0, None, None)] * 31
-    it = iter(readings)
-    monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it, (None, None, None)))
+    # 只有 ≤45s 计时器读数（无任何横幅）→ 不得命中（旧实现会返回 90.0）
+    low_readings = [(30.0 - i * 0.1, None, None) for i in range(61)]
+    it_low = iter(low_readings)
+    monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it_low, (None, None, None)))
     monkeypatch.setattr(mod, "_read_center_banner", lambda img: (False, False))
+    assert mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep") is None
 
-    # 无 min_start_ts：选中结算倒计时首帧 90.0
-    ts = mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep")
-    assert ts == 90.0
+    # 准备横幅：前 30 帧（90-93s）与后 21 帧（94-96s）两段游程
+    def _banner_reader():
+        counter = [0]
 
-    # min_start_ts=94.0：结算倒计时（90-93s）被排除，游程从 94.0 起（94-95.9 持续 prep）
-    it2 = iter(readings)
-    monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it2, (None, None, None)))
-    ts2 = mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep", min_start_ts=94.0)
-    assert ts2 == 94.0
+        def read(img):
+            counter[0] += 1
+            return (counter[0] <= 30 or counter[0] > 40, False)
 
-    # min_start_ts=96.0：94-95.9 也排除 → None（保留粗扫值）
-    it3 = iter(readings)
-    monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it3, (None, None, None)))
-    ts3 = mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep", min_start_ts=96.0)
-    assert ts3 is None
+        return read
+
+    reader = _banner_reader()
+    monkeypatch.setattr(mod, "_read_center_banner", reader)
+    # 无 min_start_ts：选中第一段游程首帧 90.0
+    assert mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep") == 90.0
+
+    # min_start_ts=94.0：第一段（90-93s）被排除 → 第二段游程首帧 94.0
+    reader2 = _banner_reader()
+    monkeypatch.setattr(mod, "_read_center_banner", reader2)
+    assert mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep", min_start_ts=94.0) == 94.0
+
+    # min_start_ts=96.0：两段都排除 → None（保留粗扫值）
+    reader3 = _banner_reader()
+    monkeypatch.setattr(mod, "_read_center_banner", reader3)
+    assert mod._refine_boundary_ts("v.mp4", "ffmpeg", 95.0, "prep", min_start_ts=96.0) is None
 
 def test_settle_residual_countdown_not_exported_as_round(monkeypatch, tmp_path):
     """结算后残余交战钟 52→≤45 不得标成 prep/combat，避免导出买枪空窗（观感入出点反了）。
 
-    正确：整段交战+结算保持到 HUD 空档后的真准备，再 next_prep 闭合。
+    正确：整段交战+结算保持到 HUD 空档后的**真准备横幅**，再 next_prep 闭合。
+    2026-09-12 起残段低计时器（≤45）连 prep 也不算了，出点只由横幅驱动。
     """
     import numpy as np
 
@@ -921,7 +1033,7 @@ def test_settle_residual_countdown_not_exported_as_round(monkeypatch, tmp_path):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"dummy")
 
-    # combat 0-12 → settle 13 → 残余钟 52→7 (14-59) → 空档 → prep 70+
+    # combat 0-12 → settle 13 → 残余钟 52→7 (14-59) → 空档 → 准备横幅 70+
     readings = []
     for ts in range(0, 90):
         if ts <= 12:
@@ -943,7 +1055,9 @@ def test_settle_residual_countdown_not_exported_as_round(monkeypatch, tmp_path):
 
     def fake_center(img):
         ci[0] += 1
-        return (False, True) if ci[0] == 14 else (False, False)
+        if ci[0] == 14:
+            return (False, True)      # ts=13 结算横幅
+        return (True, False) if ci[0] == 71 else (False, False)  # ts=70 准备横幅
 
     monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: [
         (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 90)
@@ -975,9 +1089,8 @@ def test_adjacent_rounds_do_not_overlap(monkeypatch, tmp_path):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"dummy")
 
-    # 回合1：prep 0-5 → combat 6-30 → settle 31 → neutral → prep 60 → 闭合 60
-    # 回合2：combat 61 起（新回合交战钟），next_combat 闭合回合1？
-    # 简化：直接构造相邻重叠场景——回合1 end=60.5（密扫后），回合2 start=60.4
+    # 回合1：combat 6-30 → settle 31 → neutral → 准备横幅 60 → 闭合 60
+    # 回合2：combat 63 起（新回合交战钟）
     readings = []
     for ts in range(0, 80):
         if ts <= 5:
@@ -999,7 +1112,10 @@ def test_adjacent_rounds_do_not_overlap(monkeypatch, tmp_path):
 
     def fake_center(img):
         ci[0] += 1
-        return (False, True) if ci[0] == 32 else (False, False)
+        if ci[0] == 32:
+            return (False, True)   # 结算横幅
+        # 准备横幅：给一段连续窗口（粗扫帧与 ts 非严格 1:1，用区间触发更稳）
+        return (True, False) if 32 <= ci[0] <= 70 else (False, False)
 
     monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: [
         (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 80)
@@ -1026,6 +1142,8 @@ def test_detect_skips_boundary_refine_when_disabled(monkeypatch, tmp_path):
 
     # prep 0-5 → combat 6-40 → settle 41 → prep 55 闭合
     readings = []
+    # combat 6-40 → settle 41 → 准备横幅 55 闭合
+    readings = []
     for ts in range(0, 70):
         if ts <= 5:
             readings.append((30.0 - ts, None, None))
@@ -1036,11 +1154,19 @@ def test_detect_skips_boundary_refine_when_disabled(monkeypatch, tmp_path):
         else:
             readings.append((30.0 - (ts - 55), None, None))
     it = iter(readings)
+    ci2 = [0]
+
+    def fake_center2(img):
+        ci2[0] += 1
+        if ci2[0] == 42:
+            return (False, True)  # ts=41 结算横幅
+        return (True, False) if ci2[0] == 56 else (False, False)  # ts=55 准备横幅
+
     monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: [
         (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 70)
     ])
     monkeypatch.setattr(mod, "_read_top_anchors", lambda img: next(it, (None, None, None)))
-    monkeypatch.setattr(mod, "_read_center_banner", lambda img: (False, False))
+    monkeypatch.setattr(mod, "_read_center_banner", fake_center2)
 
     called = {"n": 0}
 
@@ -1092,8 +1218,69 @@ def test_refine_valorant_round_boundaries_updates_and_marks(monkeypatch):
     assert out[0]["boundary_refined"] is True
 
 
-def test_post_settle_recovers_prep_without_gap_after_settle_period(monkeypatch, tmp_path):
-    """结算 6s 之后，即使没有读到 None/<=1.0 的空档，连续两帧读到准备倒计时也应正常解除 hold 并闭合回合。"""
+def test_refine_broadcast_does_not_mark_refined_without_bidirectional_evidence(monkeypatch):
+    """赛事精修只补起点时，不得无条件 boundary_refined=True（双向证据契约）。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    rounds = [{
+        "start": 100.0,
+        "end": 160.0,
+        "source_profile": "broadcast",
+        "confirm_status": "pending",
+        "end_by": "open_tail",
+        "boundary_refined": False,
+    }]
+
+    def fake_refine(_vp, _ff, center, target, *, cancel_check=None):
+        assert target == "combat"
+        return 98.5
+
+    monkeypatch.setattr(mod, "_refine_boundary_ts", fake_refine)
+    out = mod.refine_valorant_round_boundaries(
+        rounds, "v.mp4", "ffmpeg", cancel_check=None, source_profile="broadcast",
+    )
+    assert out[0]["start_refined"] == 98.5
+    assert out[0]["start_delta"] == 1.5
+    assert out[0]["start_confidence"] == 0.95
+    # 缺少 end_delta/end_confidence：广播赛事不能声称边界已完整精修。
+    assert out[0]["boundary_refined"] is False
+
+
+def test_refine_broadcast_complete_when_end_evidence_already_present(monkeypatch):
+    """赛事精修补上起点证据后，若审计已给出终点证据，则可标记 refined。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    rounds = [{
+        "start": 100.0,
+        "end": 160.0,
+        "source_profile": "broadcast",
+        "confirm_status": "vision_confirmed",
+        "end_by": "broadcast_exclusion",
+        "boundary_refined": False,
+        "end_delta": 3.0,
+        "end_confidence": 0.92,
+        "end_refined": 157.0,
+    }]
+
+    def fake_refine(_vp, _ff, center, target, *, cancel_check=None):
+        assert target == "combat"
+        return 98.5
+
+    monkeypatch.setattr(mod, "_refine_boundary_ts", fake_refine)
+    out = mod.refine_valorant_round_boundaries(
+        rounds, "v.mp4", "ffmpeg", cancel_check=None, source_profile="broadcast",
+    )
+    assert out[0]["start_delta"] == 1.5
+    assert out[0]["boundary_refined"] is True
+
+
+def test_post_settle_recovers_on_fresh_clock_without_gap(monkeypatch, tmp_path):
+    """结算后即使没有 HUD 空档，新回合满钟（1:40）出现也应正常闭合旧回合（不吞回合）。
+
+    2026-09-12 契约变更：原实现在此依赖「距结算 ≥6s 且读到 ≤45s 准备倒计时」解除
+    post_settle_hold；该依据已删除（回合尾段同样 ≤45s）。现在由满钟（≥85s）承担
+    同一个职责，且出点为降级 `next_combat`（不再冒充 next_prep）。
+    """
     import numpy as np
 
     import lsc.analyzer.valorant_ocr_rounds as mod
@@ -1101,17 +1288,17 @@ def test_post_settle_recovers_prep_without_gap_after_settle_period(monkeypatch, 
     video = tmp_path / "video.mp4"
     video.write_bytes(b"dummy")
 
-    # combat 0-10 -> settle 11 -> settle 内倒计时 5s (12-16) -> 无 gap 直接进入 30s 买枪准备 (17+)
+    # combat 0-10 → settle 11 → 结算残余倒计时 5→1 (12-15) → 新回合满钟 100+ (16-19)
     readings = []
-    for ts in range(0, 30):
+    for ts in range(0, 20):
         if ts <= 10:
             readings.append((90.0 - ts, None, None))
         elif ts == 11:
             readings.append((None, None, None))
-        elif ts <= 16:
-            readings.append((5.0 - (ts - 12), None, None))  # 结算倒计时
+        elif ts <= 15:
+            readings.append((5.0 - (ts - 12), None, None))
         else:
-            readings.append((30.0 - (ts - 17), None, None))  # 买枪倒计时（无 gap 直切）
+            readings.append((100.0 - (ts - 16), None, None))
 
     it = iter(readings)
     ci = [0]
@@ -1121,27 +1308,26 @@ def test_post_settle_recovers_prep_without_gap_after_settle_period(monkeypatch, 
 
     def fake_center(img):
         ci[0] += 1
-        # ts=11 出现结算横幅，之后无准备横幅
+        # 仅结算横幅；全程无准备横幅（证明不依赖 ≤45s 倒计时）
         return (False, True) if ci[0] == 12 else (False, False)
 
     monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: [
-        (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 30)
+        (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 20)
     ])
     monkeypatch.setattr(mod, "_read_top_anchors", fake_top)
     monkeypatch.setattr(mod, "_read_center_banner", fake_center)
 
     rounds = mod.detect_valorant_rounds_ocr(
         str(video),
-        time_range=(0.0, 30.0),
+        time_range=(0.0, 20.0),
         runtime_state={},
         finalize=False,
         refine_boundaries=False,
     )
     assert len(rounds) == 1
-    assert rounds[0]["confirm_status"] == "vision_confirmed"
-    assert rounds[0]["end_by"] == "next_prep"
-    # 出点应在买枪阶段两帧确认处（ts=18 确认两帧）
-    assert rounds[0]["end"] <= 20.0
+    assert rounds[0]["start"] == 0.0
+    assert rounds[0]["end_by"] == "next_combat"
+    assert rounds[0]["end"] >= 16.0
 
 
 def test_refine_boundary_ts_combat_skips_center_banner_and_early_stops(monkeypatch):
@@ -1175,6 +1361,7 @@ def test_refine_boundary_ts_combat_skips_center_banner_and_early_stops(monkeypat
     assert ts == 100.4  # 第 3 帧的时间戳 100.0 + 2*0.2 = 100.4
     assert center_called[0] == 0  # combat 密扫完全跳过 center banner OCR
     assert top_called[0] == 4  # 提前退出：仅运行了 4 帧 OCR，而非全部 30 帧
+
 
 
 # ── A6（2026-09-10）：关键词表剔除高光叠加字样 + 回放水印否决 ──────────────
@@ -1372,3 +1559,80 @@ def test_apply_replay_end_exclusion_accepts_broadcast_audit_passed() -> None:
          "replay_segments": [[196.0, 205.0]]}
     assert mod.apply_replay_end_exclusion(r) == 4.0
     assert r["end"] == 196.0
+
+def test_buy_phase_onset_requires_upward_reset() -> None:
+    """买枪阶段判据 = ≤45s **且**相对上一原始读数上跳 ≥20s（区分交战尾段的连续下降）。
+
+    现场依据（2026-09-12 抽帧）：买枪/装备界面顶中显示 `ROUND 5 0:03`（30s 倒计时）
+    紧跟在上一回合结束（读数趋 0）之后；而真实交战尾段 395-403s 是 46→45→44 连续下降。
+    """
+    from lsc.analyzer.valorant_ocr_rounds import _is_buy_phase_onset
+
+    # 买枪阶段开始：0 → 30 / 3 → 28
+    assert _is_buy_phase_onset(0.0, 30.0)
+    assert _is_buy_phase_onset(3.0, 28.0)
+    assert _is_buy_phase_onset(0.0, 45.0)          # 边界：45s 仍在买枪区间
+    # 交战尾段连续下降：46 → 45 → 44（旧实现会在此判 prep）
+    assert not _is_buy_phase_onset(46.0, 45.0)
+    assert not _is_buy_phase_onset(45.0, 44.0)
+    assert not _is_buy_phase_onset(40.0, 30.0)     # 下降更陡也不行
+    # 无前序读数 / 越界 / 读数为 0
+    assert not _is_buy_phase_onset(None, 30.0)
+    assert not _is_buy_phase_onset(3.0, None)
+    assert not _is_buy_phase_onset(3.0, 0.0)
+    assert not _is_buy_phase_onset(46.0, 50.0)     # >45 属交战钟，不是买枪
+
+
+def test_round_closes_at_buy_onset_not_at_live_tail(monkeypatch, tmp_path):
+    """核心回归：出点落在「买枪阶段首帧」，不再落在「交战尾段穿越 45s」处。
+
+    复刻 2026-09-12 现场机制：回合中段顶部计时器 OCR 失效（stale >35s ⇒ 锚点解除），
+    随后读数已是尾段的 ≤45s 且**连续下降**；旧实现把这 45 秒判成 prep → 4 帧游程后
+    以 next_prep 收尾（现场 403.125，真实 449.875）。新契约只在「≤45s 且上跳 ≥20s」
+    （新买枪阶段首帧）时判 prep，因此出点必须落在买枪阶段，而不是尾段。
+
+    - 0-39  交战钟 100→61（建立并刷新锚点）
+    - 40-74 计时器 OCR 失效（无读数 ⇒ 锚点 stale 解除）
+    - 75-99 尾段读数 45→21（连续下降，无上跳）
+    - 100   回合结束（读数趋 0）
+    - 101+  买枪倒计时 30→…（上跳 ≥20 ⇒ 真出点）
+    """
+    import numpy as np
+
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"dummy")
+
+    readings = []
+    for ts in range(0, 130):
+        if ts <= 39:
+            readings.append((100.0 - ts, None, None))
+        elif ts <= 74:
+            readings.append((None, None, None))          # OCR 失效（锚点随后 stale 解除）
+        elif ts <= 99:
+            readings.append((45.0 - (ts - 75), None, None))   # 尾段：连续下降的 ≤45s
+        elif ts == 100:
+            readings.append((0.5, None, None))           # 回合结束
+        else:
+            readings.append((30.0 - (ts - 101), None, None))  # 买枪倒计时（上跳）
+    it = iter(readings)
+
+    def fake_top(img):
+        return next(it, (None, None, None))
+
+    monkeypatch.setattr(mod, "extract_frames_cancellable", lambda *a, **k: [
+        (float(ts), np.zeros((360, 640, 3), dtype=np.uint8)) for ts in range(0, 130)
+    ])
+    monkeypatch.setattr(mod, "_read_top_anchors", fake_top)
+    monkeypatch.setattr(mod, "_read_center_banner", lambda img: (False, False))
+
+    rounds = mod.detect_valorant_rounds_ocr(
+        str(video), time_range=(0.0, 130.0), runtime_state={}, finalize=False,
+        refine_boundaries=False,
+    )
+    closed = [r for r in rounds if r.get("end_by") == "next_prep"]
+    # 必须恰好一条：出点落在买枪阶段（≈101+），而不是尾段 45s 穿越处（≈75-79）
+    assert len(closed) == 1, rounds
+    assert closed[0]["start"] == 0.0
+    assert closed[0]["end"] >= 100.0, closed[0]

@@ -104,6 +104,12 @@ def test_broadcast_refine_yields_to_coarse_coverage_during_catchup() -> None:
     assert room_handler._should_run_broadcast_refine(
         30.0, pending_count=1, refine_elapsed_sec=120.0
     ) is False
+    # Ready candidates whose full rear-window is already recorded must not be
+    # starved by catch-up: they can finalize one bounded candidate without
+    # blocking coarse coverage.
+    assert room_handler._should_run_broadcast_refine(
+        240.0, pending_count=1, ready_count=1
+    ) is True
 
 
 def test_broadcast_refine_gate_uses_live_duration_after_slow_scan() -> None:
@@ -113,6 +119,15 @@ def test_broadcast_refine_gate_uses_live_duration_after_slow_scan() -> None:
     assert "_live_current_dur = max(" in source
     assert "task_state.get('recorded_duration')" in source
     assert "_live_current_dur - float(completed_dur)" in source
+
+
+def test_micro_step_continuation_is_immediately_ready() -> None:
+    pending = [{
+        "start": 100.0,
+        "end": 180.0,
+        "_audit_continue_ready": True,
+    }]
+    assert room_handler._count_broadcast_ready_candidates(pending, 180.0) == 1
 
 
 def test_refine_running_within_budget_is_not_unconditionally_aborted() -> None:
@@ -186,9 +201,18 @@ def test_background_refine_has_hard_time_budget() -> None:
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
         encoding="utf-8"
     )
-    assert "timeout=_BCAST_REFINE_KEEP_MAX_SEC" in source
+    assert "_BCAST_REFINE_STEP_MAX_SEC = 20.0" in source
+    assert "_BCAST_REFINE_STEP_MEDIA_SEC = 18.0" in source
+    assert "timeout=_BCAST_REFINE_STEP_MAX_SEC" in source
+    assert "_BCAST_REFINE_STEP_MAX_SEC" in source
+    assert "max_audit_quota = 1" in source
+    assert "max_media_step_sec=_BCAST_REFINE_STEP_MEDIA_SEC" in source
     assert "timeout_state['refine_abort'] = True" in source
     assert "边界审计超过预算" in source
+    # 一个后台任务只能发起一个不可强制中断的 executor
+    # 微步骤；禁止在 deadline 剩余时间内紧接着开下一步。
+    refine_block = source[source.find("refined = []") : source.find("finally:", source.find("refined = []"))]
+    assert "while True:" not in refine_block
 
 
 def test_refine_partial_results_survive_abort_and_preempt() -> None:
@@ -239,8 +263,7 @@ def test_stop_tail_scan_targeted_window_and_audit_quota() -> None:
     """2026-09-08 调优：
     1. 停止补扫窗口定向瞄准 stop_tail_target（单窗 _STOP_TAIL_WINDOW_CAP_SEC），
        不再套用 90s 自适应追赶预算，缩短停止收尾时长；
-    2. 审计批配额收紧为 2，避免单批撑满 120s 总预算被中止（实测 4+ 候选批
-       让单窗滞后 +107s）。"""
+    2. 后台审计收紧为每次一个候选微步骤，避免批次撑满总预算被中止。"""
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
         encoding="utf-8"
     )
@@ -248,7 +271,7 @@ def test_stop_tail_scan_targeted_window_and_audit_quota() -> None:
     assert "state.get('stop_tail_scan')" in source
     assert "_stop_end_win = min(" in source
     assert "_stop_target_win" in source
-    assert "max_audit_quota = 2" in source
+    assert "max_audit_quota = 1" in source
     assert "max_audit_quota = 4" not in source
 
 
@@ -1269,16 +1292,20 @@ def test_frontend_continuous_start_checks_send_and_pending() -> None:
     after_modal_close = one_shot.split("setContinuousModalOpen(false)", 1)[1]
     assert "setContinuousSubmitting(false)" not in after_modal_close
 
-def test_finalize_continues_from_cursor_not_full_rescan() -> None:
-    """停录收尾从游标继续，不默认全文件重扫。"""
+def test_finalize_continues_from_gaps_in_chunks_not_full_rescan() -> None:
+    """停录收尾按 coverage 账本缺口逐片续扫，不默认全文件重扫。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     loop = src.split("async def _continuous_analysis_loop", 1)[1].split(
         "async def _export_and_broadcast", 1
     )[0]
-    assert "停录收尾：从游标继续处理尾部" in loop
-    finalize_block = loop.split("停录收尾：从游标继续处理尾部", 1)[1].split("else:", 1)[0]
-    assert "last_analyzed" in finalize_block
+    assert "coverage ledger 的真实缺口" in loop
+    finalize_block = loop.split("coverage ledger 的真实缺口", 1)[1].split(
+        "use_ocr_this_tick = True", 1
+    )[0]
+    assert "uncovered_ranges_for_state" in finalize_block
     assert "full_rescan = False" in finalize_block or "full_rescan=False" in finalize_block
+    assert "_FINALIZATION_CHUNK_SEC" in finalize_block
+    assert "scan_range = (_fin_start, _fin_end)" in finalize_block
     assert "(0.0, float(current_dur))" not in finalize_block
 
 
@@ -1713,7 +1740,7 @@ def test_top_hud_sampling_keeps_1fps() -> None:
     中央横幅降本走独立哨兵间隔，二者采样决策必须解耦。"""
     src = (ROOT / "lsc/analyzer/valorant_ocr_rounds.py").read_text(encoding="utf-8")
     # 顶部读取逐帧执行，不经过任何 sample_center 节流
-    top_call = src.find("_read_top_anchors_for_profile(img, source_profile)")
+    top_call = src.find("raw_timer, left, right = _read_top_anchors_for_profile(")
     center_gate = src.find("sample_center = (")
     assert top_call > 0
     assert center_gate > 0
@@ -1725,6 +1752,17 @@ def test_top_hud_sampling_keeps_1fps() -> None:
     assert "sample_fps = max(0.25, 1.0 / max(float(ocr_sample_interval), 0.1))" in src
 
 
+def test_broadcast_disables_realtime_fast_mode_deferral() -> None:
+    """官方解说分支不得因 backlog 进入 realtime_fast_mode（推迟候选审计）。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    marker = "state['realtime_fast_mode'] = bool("
+    idx = src.find(marker)
+    assert idx > 0
+    block = src[idx : idx + 500]
+    assert "state.get('valorant_profile') != 'broadcast'" in block
+    assert "center_sentinel_sec'] = 4.0" in src
+
+
 def test_top_roi_cache_reuses_unchanged_frames() -> None:
     """P0c: 顶部条 ROI 画面未变化时复用上一帧 OCR 读数，跳过重复推理。"""
     src = (ROOT / "lsc/analyzer/valorant_ocr_rounds.py").read_text(encoding="utf-8")
@@ -1733,3 +1771,33 @@ def test_top_roi_cache_reuses_unchanged_frames() -> None:
     assert "_ROI_DIFF_THRESHOLD" in src
     assert "raw_timer, left, right = prev_top_result" in src  # 复用分支
     assert "_top_changed" in src                               # 变化判定驱动 OCR/复用
+    assert "next_broadcast_wide_ts" in src                     # 赛事宽 ROI 周期容错
+
+
+def test_finalize_audit_does_not_return_pending_lookahead() -> None:
+    """2026-09-10 回归：收尾（finalize）阶段不得再返回 pending_lookahead。
+
+    录制文件定格后，后视窗口结构性不足（scan_end 超出可用末尾）的候选若仍返回
+    pending，会被写回待审计队列且 `_last_audit_dur` 被钉到文件时长，此后
+    ready/probe 判定（`_dur >= c_end+needed` / `_dur >= last_dur+12`）永不满足
+    → 候选永久滞留 → 收尾 `pending_audit` 恒真 → 无限补扫 / 界面卡死。
+    """
+    src = (ROOT / "lsc/analyzer/valorant_broadcast.py").read_text(encoding="utf-8")
+    assert "if lookahead_incomplete and not finalize:" in src
+    assert 'reason="lookahead_incomplete"' in src
+
+
+def test_finalize_forces_audit_of_past_end_candidates() -> None:
+    """收尾时对「候选终点已到/超出文件末尾」的候选强制尝试一次终态审计。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_finalize_now" in src
+    assert "elif _finalize_now and _dur <= c_end:" in src
+    assert "finalize=_finalize_now," in src
+
+
+def test_finalize_has_bounded_stall_fallback() -> None:
+    """收尾补扫必须有界兜底：结构性无法定稿的候选不得让收尾无限补扫 / 卡死。"""
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_FINALIZE_TAIL_STALL_MAX_ROUNDS" in src
+    assert "finalize_tail_stall_rounds" in src
+    assert "rejected_finalize_stalled" in src

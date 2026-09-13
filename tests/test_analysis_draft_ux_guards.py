@@ -45,7 +45,7 @@ def test_continuous_auto_draft_does_not_preset_autofired() -> None:
     marker = "持续分析终态"
     idx = text.find(marker)
     assert idx >= 0, "missing continuous draft effect marker"
-    window = text[idx : idx + 2000]
+    window = text[idx : idx + 3200]
     assert "runAnalysisDraftIfNeeded('auto')" in window or 'runAnalysisDraftIfNeeded("auto")' in window
     # 在调用前不得出现 s.autoFired = true
     call_at = window.find("runAnalysisDraftIfNeeded")

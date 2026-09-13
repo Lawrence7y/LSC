@@ -141,3 +141,52 @@ def test_stop_sets_stopping_until_resources_exit(tmp_path, monkeypatch) -> None:
         assert stopping_msgs, "stop 应广播 stopping 状态"
     finally:
         room_handler._continuous_tasks.clear()
+def test_stop_immediate_cancels_without_tail_scan(tmp_path, monkeypatch) -> None:
+    """immediate=True 的仅停止分析须立刻中止在途扫描，不触发尾部补扫。"""
+    main = _room(tmp_path, "main")
+    main.is_recording = True
+    manager = _FakeManager([main])
+    server = _FakeServer()
+    bridge = _FakeBridge(manager)
+    created_tasks: list[_FakeTask] = []
+
+    def fake_create_task(coro):
+        task = _FakeTask(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", fake_create_task)
+
+    async def scenario():
+        room_handler.register_room_handlers(server, bridge)
+        await server.handlers["start_continuous_analysis"]({
+            "main_room_id": "main",
+            "target_room_ids": ["main"],
+            "mode": "valorant_round",
+        })
+        stop = await server.handlers["stop_continuous_analysis"]({
+            "room_id": "main",
+            "immediate": True,
+        })
+        state = room_handler._continuous_tasks.get("main", {})
+        return stop, state, bridge.broadcasts
+
+    try:
+        stop_result, state, broadcasts = asyncio.run(scenario())
+
+        assert stop_result["success"] is True
+        assert stop_result.get("status") == "stopping"
+        assert state.get("stop_tail_scan") is False
+        assert state.get("cancelled") is True
+        assert state.get("scan_abort") is True
+        assert state.get("refine_abort") is True
+        assert state.get("stop_requested") is not True
+        assert state.get("status") == "stopping"
+        stopping_msgs = [
+            m for m in broadcasts
+            if m.get("type") == "continuous_analysis_status"
+            and m.get("data", {}).get("status") == "stopping"
+        ]
+        assert stopping_msgs, "immediate stop 应广播 stopping 状态"
+    finally:
+        room_handler._continuous_tasks.clear()

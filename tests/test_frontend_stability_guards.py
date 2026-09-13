@@ -1325,11 +1325,19 @@ def test_recording_review_timeline_guards() -> None:
         "const handleTimelineSeek", 1
     )[0]
     assert "targetsIncludeNoDvrMode" in enter_live
+    # 方案 A（§3.3）：回看房间由前端本地状态退出回看（exitReview），再回直播沿（goLive），
+    # 不再请求后端起流/建会话。
+    assert "exitReview" in enter_live
+    assert "goLive()" in enter_live
+    assert "start_recording_review" not in enter_live
 
     go_live = workbench.split("const handleGoLive = useCallback", 1)[1].split(
         "// Phase 3: 音频对齐", 1
     )[0]
-    assert "targetsIncludeNoDvrMode" in go_live
+    # 方案 A（§3.3）：handleGoLive 删除 targetsIncludeNoDvrMode 早退，
+    # 统一收口到 enterTimelineLive（内部对回看房间 exitReview + goLive）。
+    assert "targetsIncludeNoDvrMode" not in go_live
+    assert "enterTimelineLive" in go_live
 
     assert "回看" in room_card
     assert "recording_review" in room_card
@@ -1342,18 +1350,27 @@ def test_recording_review_timeline_guards() -> None:
     assert "isNoDvrPreviewMode" in coords
 
 
-def test_recording_review_seek_restarts_and_debounces_inflight() -> None:
-    """缓冲外点击：已在回看时重启 FFmpeg；启动中禁止连发第二次 start_recording_review。"""
+def test_recording_review_seek_uses_local_file_playback() -> None:
+    """缓冲外点击：改走前端本地文件回看（enterReview），不再请求后端起流/建会话。
+
+    方案 A（§3.3）新契约：删除 start_recording_review 发送与 8s 防抖 ref；
+    回看 = 本地文件读取（录制中优先 .dvr.mp4 镜像，否则录制文件本身），
+    因此不存在「启动中连发第二次」这类后端流竞态。
+    """
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
     handler = workbench.split("const mseSeek = useCallback", 1)[1].split(
         "const mseTogglePlayPause = useCallback", 1
     )[0]
-    assert "recordingReviewInFlightRef" in workbench
-    assert "recordingReviewInFlightRef" in handler
-    assert "mode !== 'degraded'" in handler
-    # 回看模式缓冲外必须允许再次 start_recording_review（换 -ss），不能永远 clamp 到 8s。
-    assert "mode !== 'recording_review' && mode !== 'degraded'" not in handler
-    assert "start_recording_review" in handler
+    # 旧通道彻底不再被调用
+    assert "start_recording_review" not in workbench
+    assert "close_recording_review" not in workbench
+    assert "recordingReviewInFlightRef" not in workbench
+    # 回看改为本地文件读取
+    assert "enterReview" in handler
+    # 已在回看且目标位置未变时不得重复进入（避免反复重建读流）
+    assert "preview_channel === 'review'" in handler
+    # 不可回看时仍要平滑回退到连续缓冲内，而不是把画面拽回 live edge
+    assert "fallback" in handler
 
 
 def test_timeline_content_span_uses_recording_when_preview_off() -> None:
@@ -1711,3 +1728,48 @@ def test_timeline_1x_zero_and_dvr_lookback_contract() -> None:
     control = (ROOT / "lsc-electron/src/pages/Workbench/components/ControlBar.tsx").read_text(encoding="utf-8")
     assert "retainClockLoop" in control
     assert "readLiveEdgeDisplay" in control
+
+
+def test_dvr_purple_line_uses_configured_replay_window() -> None:
+    """2026-09-10 回归：DVR 紫线左界须按用户配置的回放时长展示。
+
+    旧实现对紫线取 `Math.max(buf.start, liveEdge − replaySeconds)`：当 MSE 连续
+    缓存深度小于配置值（常见）时，紫线被钳到 buf.start，用户看到的可回放时长
+    「明显少于设置值」。超出缓冲的点击/拖动由 mseSeek 自动切换录制文件回看，
+    因此按配置时长展示是安全的。
+    """
+    source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "computeDvrLeftEdge(buf.end, timelineReplaySeconds)" in source
+    assert "Math.max(buf.start, computeDvrLeftEdge(" not in source
+
+
+def test_timeline_playhead_clamps_to_dvr_left_edge() -> None:
+    """2026-09-10：点击/拖动到 DVR 紫线以左时，播放头紧贴紫线。
+
+    紫线以左的媒体不在 MSE 连续缓冲内，松手落点超出缓冲时由 mseSeek 自动切到
+    录制文件回看承接，因此钳到紫线是安全的；旧实现放开钳制会让预览光标落到
+    紫线左侧、不贴回放光标。紫线归零（不足配置时长）时不设下界。
+    """
+    source = (ROOT / "lsc-electron/src/components/Timeline/index.tsx").read_text(encoding="utf-8")
+    assert "dvrStartRef.current - absWs" in source
+    assert "Math.max(lowerBound, relTime)" in source
+    assert "lowerBound = dvrRel !== null && dvrRel > 0 ? dvrRel : 0" in source
+
+
+def test_dvr_left_edge_never_negative() -> None:
+    """(b) 录制/回放时长不足配置值时光标停在最左边（左界不为负）。"""
+    source = (ROOT / "lsc-electron/src/utils/timelineWindow.ts").read_text(encoding="utf-8")
+    assert "Math.max(0, liveEdgeSec - lookback)" in source
+
+
+def test_preview_clock_recalibrates_periodically() -> None:
+    """2026-09-10：预览时钟须周期性重标定，不能只在首播标定一次。
+
+    `recording_to_preview_delta = preview_time − recording_elapsed` 隐含了预览
+    链路的传输/播放延迟；网络抖动改变缓冲深度后，一次性标定会失效，使
+    `previewToRecordingLocal` 与画面逐渐错位（时间线显示的录制秒 ≠ 后端真实
+    时刻）。首播成功后转为低频周期重采样即可跟踪漂移。
+    """
+    source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
+    assert "PREVIEW_CLOCK_REFRESH_MS" in source
+    assert "setInterval(report, PREVIEW_CLOCK_REFRESH_MS)" in source

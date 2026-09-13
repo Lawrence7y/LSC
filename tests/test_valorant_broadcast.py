@@ -317,10 +317,12 @@ def test_broadcast_audit_reuses_cached_pending_tail(monkeypatch) -> None:
     )
 
     assert first[0]["broadcast_audit"] == "pending_lookahead"
-    assert second[0]["broadcast_audit"] == "passed"
+    assert second[0]["broadcast_audit"] == "pending_no_exclusion"
+    assert second[0]["broadcast_next_prep_invalidated"] is True
     # 在线入点门禁只单独扫头部 [0,10]；尾部审计仍从候选尾窗开始 [0,20]，
-    # 重试时从缓存末尾 [19,55]。next_prep 强出点缩短 lookahead 到 45s。
-    assert calls == [(0.0, 10.0), (0.0, 20.0), (19.0, 55.0)]
+    # 首轮已否决 next_prep，重试必须从缓存末尾扩展到完整 90s 后视窗，
+    # 不再停在原“强出点”的 45s 窗。
+    assert calls == [(0.0, 10.0), (0.0, 20.0), (19.0, 100.0)]
 
 
 def test_broadcast_audit_without_exclusion_keeps_pending(monkeypatch) -> None:
@@ -456,8 +458,8 @@ def test_broadcast_audit_with_replay_promotes_to_exclusion(monkeypatch) -> None:
 
 
 
-def test_broadcast_audit_pass_keeps_next_prep_end_by(monkeypatch) -> None:
-    """OCR 已给 next_prep（vision_confirmed）时，审计通过不得把 end_by 改坏。"""
+def test_broadcast_audit_vetoes_false_next_prep_when_combat_continues(monkeypatch) -> None:
+    """next_prep 后立即持续 combat 证明 OCR 出点为假，不得盖章 passed。"""
     class FakeClassifier:
         thresholds = {"stable_prob": 0.55}
         model_version = "test"
@@ -495,14 +497,129 @@ def test_broadcast_audit_pass_keeps_next_prep_end_by(monkeypatch) -> None:
         available_end=100.0,
     )
 
+    assert result[0]["broadcast_audit"] == "pending_lookahead"
+    assert result[0]["broadcast_next_prep_invalidated"] is True
+    assert result[0]["_audit_continue_ready"] is True
+
+
+def test_broadcast_backward_cut_keeps_short_result_presentation_tail(monkeypatch) -> None:
+    """常规赛事审计向前截回粗出点时，保留结算横幅的展示尾巴。"""
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def load(self) -> None:
+            return None
+
+        def predict_batch(self, images):
+            rows = []
+            for image in images:
+                ts = float(image[0, 0, 0]) / 10.0
+                row = [0.01] * 5
+                row[2 if ts < 20.0 else 4] = 0.96
+                rows.append(row)
+            return np.asarray(rows, dtype=np.float32)
+
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        return [
+            (float(ts), np.full((8, 8, 3), float(ts) * 10.0, dtype=np.float32))
+            for ts in np.arange(start, end + 0.01, 1.0)
+        ]
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+
+    result = audit_broadcast_rounds(
+        [{
+            "start": 0.0,
+            "end": 40.0,
+            "end_coarse": 40.0,
+            "start_by": "ocr_combat",
+            "end_by": "next_combat",
+            "source_profile": "broadcast",
+            "start_delta": 0.2,
+            "start_confidence": 0.95,
+        }],
+        "unused.mp4",
+        classifier=FakeClassifier(),
+        available_end=100.0,
+    )
+
     assert result[0]["broadcast_audit"] == "passed"
-    assert result[0]["end_by"] == "next_prep"
-    assert result[0]["confirm_status"] == "vision_confirmed"
+    assert result[0]["broadcast_result_tail_sec"] == 2.5
+    assert 21.5 <= result[0]["end"] <= 23.0
+    assert result[0]["end_quality"] == "precise"
+    assert result[0]["end_review_required"] is False
+
+
+def test_false_next_prep_extends_to_real_replay_boundary(monkeypatch) -> None:
+    """粗出点后仍交战时，应延长到真实 replay，而不是保留过早 next_prep。"""
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def load(self) -> None:
+            return None
+
+        def predict_batch(self, images):
+            rows = []
+            for image in images:
+                ts = float(image[0, 0, 0]) / 10.0
+                label = 2 if ts < 31.0 else 4
+                row = [0.01] * 5
+                row[label] = 0.96
+                rows.append(row)
+            return np.asarray(rows, dtype=np.float32)
+
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        return [
+            (
+                float(ts),
+                np.full((8, 8, 3), float(ts) * 10.0, dtype=np.float32),
+            )
+            for ts in np.arange(start, end + 0.01, 1.0)
+        ]
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+
+    result = audit_broadcast_rounds(
+        [{
+            "start": 0.0,
+            "end": 10.0,
+            "phase": "combat",
+            "boundary_source": "valorant_ocr_v1",
+            "source_profile": "broadcast",
+            "start_by": "ocr_combat",
+            "end_by": "next_prep",
+            "confirm_status": "vision_confirmed",
+            "start_delta": 0.1,
+            "start_confidence": 0.95,
+        }],
+        "unused.mp4",
+        classifier=FakeClassifier(),
+        available_end=100.0,
+    )
+
+    assert result[0]["broadcast_audit"] == "passed"
+    assert result[0]["end_by"] == "broadcast_exclusion"
+    assert result[0]["broadcast_next_prep_invalidated"] is True
+    assert 29.0 <= result[0]["end"] <= 31.0
 
 
 def test_broadcast_fallback_rescans_only_unscanned_head(monkeypatch) -> None:
-    """提速回归：尾窗无 combat 触发兜底全扫时，只补抽未扫描的头部
-    [start, extract_start]，不重抽已在 samples 的尾窗（避免重复抽帧+推理）。"""
+    """尾窗无 combat 触发兜底全扫时，只补抽未扫描的头部，不重抽已在 samples 的尾窗。
+
+    注：回看窗口已从 30s 放宽到 60s（见 BROADCAST_AUDIT_TAIL_LOOKBACK_SEC 注释，
+    现场 round-000071 因窗口太短丢回合）。短候选因此一次就覆盖到头部，
+    长候选仍必须只补抽头部。
+    """
     calls: list[tuple[float, float]] = []
 
     class FakeClassifier:
@@ -521,32 +638,48 @@ def test_broadcast_fallback_rescans_only_unscanned_head(monkeypatch) -> None:
             )
 
     def fake_extract(*args, **kwargs):
-        start = float(kwargs["start_sec"])
-        end = float(kwargs["end_sec"])
-        calls.append((start, end))
+        start_ts = float(kwargs["start_sec"])
+        end_ts = float(kwargs["end_sec"])
+        calls.append((start_ts, end_ts))
         return [
             (float(ts), np.full((8, 8, 3), int(ts * 10) % 255, dtype=np.uint8))
-            for ts in np.arange(start, end + 0.01, 1.0)
+            for ts in np.arange(start_ts, end_ts + 0.01, 1.0)
         ]
 
     monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
     monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
 
+    lookback = broadcast.BROADCAST_AUDIT_TAIL_LOOKBACK_SEC
+
+    # ① 短候选（短于回看窗）：一次抽帧就覆盖头部，不得再重复补抽头部
     audit_broadcast_rounds(
         [{
             "start": 0.0, "end": 50.0,
-            # 已具备精修入点，跳过在线入点门禁，聚焦验证尾部兜底全扫
             "start_delta": 0.2, "start_confidence": 0.95, "start_refined": 0.0,
         }],
         "unused.mp4",
         classifier=FakeClassifier(),
         available_end=200.0,
     )
+    assert calls, "至少要有一次抽帧"
+    assert calls[0][0] == 0.0, f"回看窗 {lookback}s 应已覆盖头部：{calls}"
+    assert len(calls) == 1, f"头部已在窗内，不应重复补抽：{calls}"
 
-    # 主抽帧尾窗 [20, 140]；兜底只补抽头部 [0, 20]，而非重抽整段 [0, 140]
-    assert (20.0, 140.0) in calls
-    assert (0.0, 20.0) in calls
-    assert (0.0, 140.0) not in calls
+    # ② 长候选（远长于回看窗）：兜底只补抽未扫描的头部 [start, extract_start]
+    calls.clear()
+    audit_broadcast_rounds(
+        [{
+            "start": 0.0, "end": 400.0,
+            "start_delta": 0.2, "start_confidence": 0.95, "start_refined": 0.0,
+        }],
+        "unused.mp4",
+        classifier=FakeClassifier(),
+        available_end=600.0,
+    )
+    heads = [c for c in calls if c[0] == 0.0]
+    assert heads, f"长候选必须补抽头部：{calls}"
+    assert heads[0][1] <= 400.0 - lookback + 1.0, f"补抽范围应止于尾窗起点：{calls}"
+    assert len(calls) >= 2
 
 
 def test_broadcast_timer_ocr_skips_unknown_and_replay_frames(monkeypatch) -> None:
@@ -614,6 +747,26 @@ def test_broadcast_timer_ocr_skips_unknown_and_replay_frames(monkeypatch) -> Non
     # unknown(2,9) 与 replay(3,10) 绝不触发 OCR；非 stride 的 combat(1,11) 也不触发
     assert not (called & {1, 2, 3, 9, 10, 11})
 
+    # 持续分析的有界微步骤不再对 combat 帧周期跑通用
+    # OCR；只保留首个排除帧读数用于否决“交战钟仍在走”。
+    # 这保证 DirectML 上一个 18s 视觉步骤不会叠加 4–9 次
+    # 耗时数十秒的计时器 OCR。
+    ocr_called_idx.clear()
+    audit_broadcast_rounds(
+        [{
+            "start": 0.0,
+            "end": 2.0,
+            "start_delta": 0.1,
+            "start_confidence": 0.95,
+            "start_refined": 0.0,
+        }],
+        "unused.mp4",
+        classifier=FakeClassifier(),
+        available_end=200.0,
+        max_media_step_sec=18.0,
+    )
+    assert len(ocr_called_idx) <= 1
+
 
 def test_realtime_fast_mode_defers_broadcast_audit(monkeypatch, tmp_path) -> None:
     """实时追赶时先保存候选，不能让 90s broadcast lookahead 阻塞 OCR。"""
@@ -673,6 +826,9 @@ def test_pending_broadcast_round_is_reaudited_without_new_ocr_round(monkeypatch,
         thresholds = {"stable_prob": 0.55}
         model_version = "test"
         provider = "cpu"
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
 
         def load(self) -> None:
             return None
@@ -824,6 +980,12 @@ def test_decide_backlog_policy_tiers() -> None:
     assert p4["ocr_sample_interval"] == 1.0
     assert p4["center_sentinel_sec"] == 8.0
 
+    # 官方解说 / broadcast：即使落后 >180s 也保持高质量采样与审计配额
+    m5, p5 = decide_backlog_policy(240.0, 0.8, source_profile="broadcast")
+    assert m5 == "degraded-catchup"
+    assert p5["audit_quota"] == 2
+    assert p5["center_sentinel_sec"] == 4.0
+
 
 def test_scan_window_decouples_and_throttles_audit_quota(monkeypatch, tmp_path) -> None:
     """A-03: 粗扫与审计解耦，单次 kick 最多消费 quota 个候选，其余保留在 pending 队列。"""
@@ -846,6 +1008,10 @@ def test_scan_window_decouples_and_throttles_audit_quota(monkeypatch, tmp_path) 
         thresholds = {"stable_prob": 0.55}
         model_version = "test"
         provider = "cpu"
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
         def load(self): return None
 
     audited_count = 0
@@ -870,9 +1036,9 @@ def test_scan_window_decouples_and_throttles_audit_quota(monkeypatch, tmp_path) 
         ScanWindow(start_sec=0.0, end_sec=70.0, timeout_sec=120.0, use_ocr=True),
         state,
     )
-    assert audited_count == 1
-    assert len(res) == 1
-    assert len(state["runtime_state"]["broadcast_pending_rounds"]) == 2
+    assert audited_count == 2
+    assert len(res) == 2
+    assert len(state["runtime_state"]["broadcast_pending_rounds"]) == 1
 
 
 
@@ -1201,10 +1367,33 @@ def test_phase2_audit_broadcast_rounds_with_score_cutoff(monkeypatch) -> None:
     assert res[0]["end"] == 18.75
 
 
-def test_start_gate_moves_non_combat_start_to_stable_combat_on_finalize(monkeypatch) -> None:
-    """收尾审计时，候选前 3s 是 replay/result 等非交战画面时，入点必须后移。"""
+def test_hard_veto_decreasing_combat_after_cutoff() -> None:
+    """截断点之后交战计时器仍连续递减时，不得定稿 broadcast_exclusion。"""
+    assert broadcast._has_decreasing_combat_after(
+        10.0,
+        [
+            (9.0, 90.0, "combat"),
+            (10.5, 80.0, "combat"),
+            (11.5, 70.0, "combat"),
+            (12.5, "replay", "replay"),
+        ],
+    ) is True
+    # 截断后是 replay/非 combat：没有持续递减的交战计时器，允许正常截断。
+    assert broadcast._has_decreasing_combat_after(
+        10.0,
+        [
+            (9.0, 90.0, "combat"),
+            (10.5, 90.0, "combat"),
+            (11.5, 90.0, "combat"),
+            (12.5, None, "replay"),
+        ],
+    ) is False
+
+
+def test_start_gate_rejects_replay_headed_ordinary_candidate_on_finalize(monkeypatch) -> None:
+    """收尾审计时，普通候选前 3s 是 replay 画面、随后才进入 combat，应直接拒绝。
+    回放开头属于上一回合尾段；只有 split_from_oversize 固定块才允许块内后移。"""
     _LABELS = ("non_game", "buy", "combat", "result", "replay")
-    calls = []
 
     class FakeClassifier:
         thresholds = {"stable_prob": 0.55}
@@ -1229,32 +1418,28 @@ def test_start_gate_moves_non_combat_start_to_stable_combat_on_finalize(monkeypa
     def fake_extract(*args, **kwargs):
         start = float(kwargs["start_sec"])
         end = float(kwargs["end_sec"])
-        calls.append((start, end))
-        frames = []
-        for ts in np.arange(start, end + 0.01, 1.0):
-            label = label_at(float(ts))
-            img = np.full((8, 8, 3), int(float(ts) * 10) % 255, dtype=np.uint8)
-            img[..., 0] = _LABELS.index(label)
-            frames.append((float(ts), img))
-        return frames
+        return [
+            (
+                float(ts),
+                np.full((8, 8, 3), _LABELS.index(label_at(float(ts))), dtype=np.uint8),
+            )
+            for ts in np.arange(start, end + 0.01, 1.0)
+        ]
 
     monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
     monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
 
-    res = audit_broadcast_rounds(
+    outcomes = broadcast.audit_broadcast_rounds_with_outcomes(
         [{"start": 0.0, "end": 20.0}],
         "unused.mp4",
         classifier=FakeClassifier(),
         finalize=True,
     )
 
-    assert len(res) == 1
-    assert res[0]["start"] == 3.0
-    assert res[0]["start_refined"] == 3.0
-    assert res[0]["broadcast_start_gate"] == "moved_from_non_combat"
-    # 1fps 视觉门禁只负责后移，不伪造精修 delta，仍应要求人工复核
-    assert res[0]["start_delta"] is None
-    assert res[0]["broadcast_review_required"] is True
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "rejected"
+    assert outcomes[0].reason == "no_stable_combat_start"
+    assert outcomes[0].candidate["broadcast_start_gate"] == "no_stable_combat"
 
 
 def test_start_gate_rejects_candidate_whose_whole_head_is_non_combat(monkeypatch) -> None:
@@ -1416,9 +1601,9 @@ def test_start_gate_split_chunk_must_find_real_combat_onset(monkeypatch) -> None
     assert outcomes[0].reason == "no_stable_combat_start"
 
 
-def test_online_start_gate_moves_replay_head_to_combat(monkeypatch) -> None:
-    """Step 1：在线审计（available_end 已存在、finalize=False）也必须执行入点
-    门禁——回放开头候选后移到首个稳定 combat，强停时不再放行回放入点切片。"""
+def test_online_start_gate_rejects_replay_headed_ordinary_candidate(monkeypatch) -> None:
+    """Step 1+：在线审计也必须执行入点门禁；普通候选回放开头直接拒绝（删除），
+    不再后移成“下一条真回合”，避免强停/收尾产出回放入点切片。"""
     _LABELS = ("non_game", "buy", "combat", "result", "replay")
 
     class FakeClassifier:
@@ -1452,17 +1637,17 @@ def test_online_start_gate_moves_replay_head_to_combat(monkeypatch) -> None:
     monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
     monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
 
-    result = audit_broadcast_rounds(
+    outcomes = broadcast.audit_broadcast_rounds_with_outcomes(
         [{"start": 0.0, "end": 20.0}],
         "unused.mp4",
         classifier=FakeClassifier(),
         available_end=100.0,
     )
 
-    assert len(result) == 1
-    assert result[0]["start"] == 3.0
-    assert result[0]["broadcast_start_gate"] == "moved_from_non_combat"
-    assert result[0]["start_delta"] is None
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "rejected"
+    assert outcomes[0].reason == "no_stable_combat_start"
+    assert outcomes[0].candidate["broadcast_start_gate"] == "no_stable_combat"
 
 
 def test_online_start_gate_split_chunk_scans_past_standard_prefix(monkeypatch) -> None:
@@ -1576,6 +1761,252 @@ def test_online_start_gate_rejects_no_combat_head(monkeypatch) -> None:
     assert outcomes[0].candidate["broadcast_start_gate"] == "no_stable_combat"
 
 
+def test_start_gate_rejects_replay_headed_long_ordinary_candidate_without_extension(monkeypatch) -> None:
+    """回放占满普通 15s 门禁时，普通长候选也必须直接拒绝，不再扩展 35s 后移。
+
+    这样既删除“回放开头伪回合”，又减少解说流多出的 20s 抽帧/推理，缓解滞后。
+    """
+    _LABELS = ("non_game", "buy", "combat", "result", "replay")
+    extract_ranges: list[tuple[float, float]] = []
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def load(self) -> None:
+            return None
+
+        def predict_batch(self, images):
+            rows = []
+            for image in images:
+                label = _LABELS[int(image[0, 0, 0])]
+                row = np.full(len(_LABELS), 0.01, dtype=np.float32)
+                row[_LABELS.index(label)] = 0.97
+                rows.append(row)
+            return np.array(rows, dtype=np.float32)
+
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        extract_ranges.append((start, end))
+        frames = []
+        for ts in np.arange(start, end + 0.01, 1.0):
+            label = "replay" if float(ts) < 20.0 else "combat"
+            img = np.full((8, 8, 3), int(float(ts) * 10) % 255, dtype=np.uint8)
+            img[..., 0] = _LABELS.index(label)
+            frames.append((float(ts), img))
+        return frames
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+
+    outcomes = broadcast.audit_broadcast_rounds_with_outcomes(
+        [{
+            "start": 0.0,
+            "end": 40.0,
+            "end_by": "next_prep",
+            "confirm_status": "vision_confirmed",
+        }],
+        "unused.mp4",
+        classifier=FakeClassifier(),
+        finalize=True,
+    )
+
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "rejected"
+    assert outcomes[0].reason == "no_stable_combat_start"
+    # 普通候选不做 15→35s 扩展：只扫描 0-15s 门禁窗后立即拒绝
+    assert extract_ranges and all(end <= broadcast.START_GATE_SCAN_LIMIT_SEC + 1.0 for _, end in extract_ranges)
+    assert not any(end > broadcast.START_GATE_SCAN_LIMIT_SEC for _, end in extract_ranges)
+
+
+def test_audit_micro_steps_resume_from_cache_without_large_extract(monkeypatch) -> None:
+    """后台审计按媒体时间分步，并能从 audit_cache 继续直到终态。"""
+    extract_ranges: list[tuple[float, float, float]] = []
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def load(self) -> None:
+            return None
+
+        def predict_batch(self, images):
+            rows = []
+            for image in images:
+                ts = float(image[0, 0, 0]) / 10.0
+                row = [0.01] * 5
+                row[2 if ts < 50.0 else 4] = 0.96
+                rows.append(row)
+            return np.asarray(rows, dtype=np.float32)
+
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        fps = float(kwargs["fps"])
+        extract_ranges.append((start, end, fps))
+        return [
+            (
+                float(ts),
+                np.full((8, 8, 3), float(ts) * 10.0, dtype=np.float32),
+            )
+            for ts in np.arange(start, end + 0.01, 1.0 / fps)
+        ]
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda _image: (None, None, None))
+
+    candidate = {
+        "start": 0.0,
+        "end": 20.0,
+        "end_by": "next_prep",
+        "confirm_status": "vision_confirmed",
+        "start_delta": 0.0,
+        "start_confidence": 0.95,
+    }
+    cache: dict = {}
+    statuses: list[str] = []
+    for _ in range(10):
+        outcomes = broadcast.audit_broadcast_rounds_with_outcomes(
+            [candidate],
+            "unused.mp4",
+            classifier=FakeClassifier(),
+            available_end=120.0,
+            audit_cache=cache,
+            max_media_step_sec=18.0,
+        )
+        assert len(outcomes) == 1
+        statuses.append(outcomes[0].status)
+        candidate = outcomes[0].candidate
+        if outcomes[0].status == "accepted":
+            break
+
+    assert statuses[0] == "pending"
+    assert statuses[-1] == "accepted"
+    assert len(statuses) > 1
+    # Subsequent steps intentionally re-read one second at the seam for stable
+    # phase runs, so physical extraction is at most budget + 1s overlap.
+    assert all(end - start <= 19.001 for start, end, _fps in extract_ranges)
+
+
+def test_audit_fallback_full_scan_respects_micro_step_budget(monkeypatch) -> None:
+    """尾窗无 combat 时的头部回补也必须遵守媒体微步骤预算。
+
+    旧逻辑只限制了尾窗，却一次性抽取 [start, tail_start]，
+    真实官方解说候选会因此单次持锁 90s+。
+    """
+    extract_ranges: list[tuple[float, float, float]] = []
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def load(self) -> None:
+            return None
+
+        def predict_batch(self, images):
+            rows = np.full((len(images), 5), 0.01, dtype=np.float32)
+            rows[:, 4] = 0.96  # replay：尾窗不存在 combat，触发头部回补
+            return rows
+
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        fps = float(kwargs["fps"])
+        extract_ranges.append((start, end, fps))
+        return [
+            (float(ts), np.zeros((8, 8, 3), dtype=np.uint8))
+            for ts in np.arange(start, end + 0.01, 1.0 / fps)
+        ]
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda _image: (None, None, None))
+
+    outcomes = broadcast.audit_broadcast_rounds_with_outcomes(
+        [{
+            "start": 0.0,
+            "end": 100.0,
+            "end_by": "next_prep",
+            "start_delta": 0.1,
+            "start_confidence": 0.95,
+        }],
+        "unused.mp4",
+        classifier=FakeClassifier(),
+        available_end=200.0,
+        audit_cache={},
+        max_media_step_sec=18.0,
+    )
+
+    assert outcomes and outcomes[0].status == "pending"
+    assert len(extract_ranges) == 2  # 有界尾窗 + 有界头部回补
+    assert all(end - start <= 18.001 for start, end, _fps in extract_ranges)
+    # 回补从尾窗向前搜索，而非从候选 0s 开始慢慢追。
+    assert extract_ranges[1][1] == extract_ranges[0][0]
+
+
+def test_batch_audit_prefetches_overlapping_candidates_once(monkeypatch) -> None:
+    """重叠候选的 1fps gate/tail 范围应合并成一次 FFmpeg 抽帧。"""
+    from lsc.analyzer.frame_provider import FrameProvider
+
+    extract_ranges: list[tuple[float, float, float]] = []
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def load(self) -> None:
+            return None
+
+        def predict_batch(self, images):
+            rows = np.full((len(images), 5), 0.01, dtype=np.float32)
+            rows[:, 2] = 0.96
+            return rows
+
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        fps = float(kwargs["fps"])
+        extract_ranges.append((start, end, fps))
+        return [
+            (
+                float(ts),
+                np.full((8, 8, 3), int(float(ts) * 10) % 255, dtype=np.uint8),
+            )
+            for ts in np.arange(start, end + 0.01, 1.0 / fps)
+        ]
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda _image: (None, None, None))
+    candidates = [
+        {
+            "start": 0.0, "end": 40.0, "end_by": "next_prep",
+            "confirm_status": "vision_confirmed", "start_delta": 0.0,
+            "start_confidence": 0.95,
+        },
+        {
+            "start": 20.0, "end": 60.0, "end_by": "next_prep",
+            "confirm_status": "vision_confirmed", "start_delta": 0.0,
+            "start_confidence": 0.95,
+        },
+    ]
+
+    result = broadcast.audit_broadcast_rounds(
+        candidates,
+        "unused.mp4",
+        classifier=FakeClassifier(),
+        available_end=120.0,
+        frame_provider=FrameProvider(max_frames=500),
+    )
+
+    assert len(result) == 2
+    one_fps_calls = [row for row in extract_ranges if row[2] == 1.0]
+    assert one_fps_calls == [(0.0, 105.0, 1.0)]
+
+
 def test_online_start_gate_defers_when_head_not_fully_written(monkeypatch) -> None:
     """Step 1 安全边界：在线阶段若头部 15s 尚未被当前录制覆盖，不能拿截断头部
     下结论，应跳过入点门禁并返回 pending_lookahead 等待重试，避免误拒。"""
@@ -1628,9 +2059,8 @@ def test_online_start_gate_defers_when_head_not_fully_written(monkeypatch) -> No
     assert cache["0.0"].get("start_gate_rejected") is not True
 
 
-def test_online_start_gate_persists_moved_start_across_pending_retry(monkeypatch) -> None:
-    """Step 1：在线首轮后移入点后返回 pending_lookahead，重试时必须复用后移
-    后的起点，不能退回原始错误起点。"""
+def test_online_start_gate_rejects_replay_headed_ordinary_and_persists_rejection(monkeypatch) -> None:
+    """在线首轮判定普通回放开头候选应拒绝后，重试必须保持拒绝结论，不复活。"""
     _LABELS = ("non_game", "buy", "combat", "result", "replay")
 
     class FakeClassifier:
@@ -1665,30 +2095,30 @@ def test_online_start_gate_persists_moved_start_across_pending_retry(monkeypatch
     monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
 
     cache: dict[str, object] = {}
-    candidate = {"start": 0.0, "end": 20.0}
-    first = audit_broadcast_rounds(
+    candidate = {"start": 0.0, "end": 20.0, "round_key": "round-stable"}
+    first = broadcast.audit_broadcast_rounds_with_outcomes(
         [candidate],
         "unused.mp4",
         classifier=FakeClassifier(),
-        available_end=30.0,  # 头部已覆盖、尾部未写满 → pending_lookahead
+        available_end=30.0,  # 头部已覆盖，门禁可判定
         audit_cache=cache,
     )
     assert len(first) == 1
-    assert first[0]["broadcast_audit"] == "pending_lookahead"
-    assert first[0]["start"] == 3.0
-    assert first[0]["broadcast_start_gate"] == "moved_from_non_combat"
+    assert first[0].status == "rejected"
+    assert first[0].reason == "no_stable_combat_start"
+    assert cache["round-stable"].get("start_gate_rejected") is True
 
-    second = audit_broadcast_rounds(
-        [candidate],
+    second = broadcast.audit_broadcast_rounds_with_outcomes(
+        [dict(first[0].candidate)],
         "unused.mp4",
         classifier=FakeClassifier(),
         available_end=200.0,
         audit_cache=cache,
     )
     assert len(second) == 1
-    # 重试必须复用后移后的入点，而不是退回 0.0
-    assert second[0]["start"] == 3.0
-    assert second[0]["broadcast_start_gate"] == "moved_from_non_combat"
+    # 重试必须保持拒绝结论，不允许复活
+    assert second[0].status == "rejected"
+    assert second[0].reason == "no_stable_combat_start"
 
 
 # ── A4（2026-09-10）：start_confidence 由二值代理改为实测视觉一致性 ──────────
@@ -1797,3 +2227,455 @@ def test_replay_at_start_is_marked_without_changing_rejection_path() -> None:
     # 既有字段与 outcome reason 保持不变
     assert 'item["broadcast_start_gate"] = gate_reason' in block
     assert 'reason="no_stable_combat_start"' in src
+
+
+def test_veto_ignores_decreasing_clock_of_next_round() -> None:
+    """截断点之后出现「满钟」= 新回合：不得据此否决（回合化取证）。
+
+    形态复刻 2026-09-11 现场 round-000135：真实出点 1423.2 之后是回放/非游戏，
+    紧接着下一回合满钟并继续递减；旧逻辑（普通候选 fresh_clock_min=None）据此
+    否决 → 出点退回 next_prep/coarse（导出被判「出点未定稿」）。
+    """
+    timer_samples = [
+        (1352.0, 100.0, "combat"),
+        (1400.0, 52.0, "combat"),
+        (1420.0, 32.0, "combat"),
+        (1424.0, None, "non_game"),  # 回放/非游戏
+        (1450.0, 100.0, "combat"),  # 下一回合满钟
+        (1460.0, 90.0, "combat"),
+        (1470.0, 80.0, "combat"),
+    ]
+    # 旧语义：跨回合钟表递减 → 误否决（锁住"改之前是坏的"）
+    assert broadcast._has_decreasing_combat_after(1423.2, timer_samples) is True
+    # 回合化：识别到满钟=新回合 → 不否决
+    assert (
+        broadcast._has_decreasing_combat_after(
+            1423.2,
+            timer_samples,
+            fresh_clock_min=broadcast.FRESH_ROUND_CLOCK_MIN,
+        )
+        is False
+    )
+
+
+def test_veto_fresh_clock_is_round_scoped_for_all_candidates() -> None:
+    """源码守卫：硬否决的 fresh-clock 逃逸不得再按 split_from_oversize 分叉。
+
+    现场教训：跨回合的钟表证据会误否决正确截断（135 的 1423.2；宽窗口下 045 的
+    514.0 会被下一回合的钟表误否决）。若有人把条件改回「仅分裂块」，本用例必须红。
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "lsc/analyzer/valorant_broadcast.py"
+    ).read_text(encoding="utf-8")
+    anchor = "and _has_decreasing_combat_after("
+    window = src[src.index(anchor) : src.index(anchor) + 700]
+    assert "fresh_clock_min=FRESH_ROUND_CLOCK_MIN," in window
+    assert "split_from_oversize" not in window, (
+        "硬否决的回合化逃逸不得再按 split_from_oversize 分叉（跨回合钟表会误否决正确截断）"
+    )
+
+
+def test_interior_round_boundary_detected_for_cross_round_candidate() -> None:
+    """L1：区间内部含「回合结束后重新开战」= 跨回合候选。
+
+    形态复刻 2026-09-11 现场 round-000123：`[1232, 1420.75]` 内含回合 A 的结束
+    （1315→1349：result/non_game/replay + buy），随后回合 B 重开战（1350），
+    出点却是回合 B 的结束 ⇒ 与 round-000135 认领同一条回合。
+    """
+    samples = [
+        *[(float(t), "combat", 0.95) for t in range(0, 10)],
+        (10.0, "result", 0.95),
+        *[(float(t), "non_game", 0.95) for t in range(11, 15)],
+        *[(float(t), "replay", 0.95) for t in range(15, 18)],
+        *[(float(t), "buy", 0.95) for t in range(18, 20)],
+        *[(float(t), "combat", 0.95) for t in range(20, 39)],
+    ]
+    assert broadcast._interior_round_boundary(samples, start=0.0, end=38.0) == 20.0
+
+
+def test_interior_round_boundary_ignores_tail_exclusion_and_next_round() -> None:
+    """L1 不得误伤：出点就是排除点、且下一回合在区间**之后**（round-000135 形态）。
+
+    `[0, 33.5]` 内只有末尾的 result/non_game/replay（没有再次开战），
+    区间之后的 combat（>= end）不参与判定 ⇒ 必须返回 None。
+    """
+    samples = [
+        *[(float(t), "combat", 0.95) for t in range(0, 29)],
+        (29.0, "result", 0.95),
+        *[(float(t), "non_game", 0.95) for t in range(30, 33)],
+        (33.0, "replay", 0.95),
+        *[(float(t), "combat", 0.95) for t in range(34, 41)],  # 下一回合：在 end 之后
+    ]
+    assert broadcast._interior_round_boundary(samples, start=0.0, end=33.5) is None
+
+
+def test_interior_boundary_verdict_policy() -> None:
+    """裁决：小幅前缀裁剪 vs 大面积错位拒绝（避免"为凑切片而编造起点"）。"""
+    # 现场 123：总长 188.75s、前缀 118s、剩余 70.75s ⇒ 拒绝
+    assert broadcast._interior_boundary_verdict(
+        start=1232.0, end=1420.75, resume=1350.0
+    ) == ("reject", 118.0, 70.75)
+    # 小前缀（15s ≤ INTERIOR_TRIM_MAX_SEC）⇒ 裁剪
+    assert broadcast._interior_boundary_verdict(start=0.0, end=120.0, resume=15.0)[0] == "trim"
+    # 前缀既超过 20s 又超过总时长一半 ⇒ 拒绝
+    assert broadcast._interior_boundary_verdict(start=0.0, end=60.0, resume=40.0)[0] == "reject"
+    # 裁剪后剩余不足 MIN_ACTIVE_SEC ⇒ 拒绝
+    assert broadcast._interior_boundary_verdict(start=0.0, end=12.0, resume=5.0)[0] == "reject"
+
+
+def test_interior_boundary_check_is_wired_into_audit_emit() -> None:
+    """源码守卫：区间内边界自检必须挂在「盖章之后、写缓存之前」的产出路径上。"""
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "lsc/analyzer/valorant_broadcast.py"
+    ).read_text(encoding="utf-8")
+    anchor = "_stamp_broadcast_decision(item, clf, cutoff=cutoff, reason=reason)"
+    window = src[src.index(anchor) : src.index(anchor) + 3000]
+    assert "_interior_round_boundary(" in window
+    assert "rejected_interior_boundary" in window
+
+
+def test_interior_round_boundary_detects_when_window_starts_at_terminal_run() -> None:
+    """尾部窗口回归：区间内可能**没有**前缀 combat（现场 123 的样本从回合 A 的终态游程开始）。
+
+    首版实现要求「先见到 combat」，于是 1350 的重开战没被记上、L1 不触发
+    （真实样本：SPAN=[1232,1420.8] 从 1316:result 起）。本用例锁住该形态。
+    """
+    samples = [
+        *[(float(t), "result", 0.95) for t in range(0, 5)],
+        *[(float(t), "non_game", 0.95) for t in range(5, 16)],
+        *[(float(t), "replay", 0.95) for t in range(16, 28)],
+        (28.0, "unknown", 0.95),
+        *[(float(t), "buy", 0.95) for t in range(29, 34)],
+        *[(float(t), "combat", 0.95) for t in range(34, 55)],
+    ]
+    assert broadcast._interior_round_boundary(samples, start=-84.0, end=104.5) == 34.0
+
+
+def test_interior_boundary_trim_invalidates_old_start_evidence() -> None:
+    """L1 裁剪必须作废原起点的密扫证据（否则下游会误判"起点证据强"）。"""
+    item = {
+        "start": 100.0,
+        "end": 200.0,
+        "start_delta": 0.4,
+        "start_confidence": 0.95,
+        "start_quality": "precise",
+        "boundary_refined": True,
+        "broadcast_review_required": False,
+    }
+    broadcast._apply_interior_boundary_trim(item, resume=150.0, trimmed=50.0)
+    assert item["start"] == 150.0
+    assert item["start_refined"] == 150.0
+    assert item["start_by"] == "interior_boundary_trim"
+    assert item["interior_boundary_trim_sec"] == 50.0
+    assert item["start_quality"] == "coarse"
+    assert item["start_review_required"] is True
+    assert item["start_delta"] is None
+    assert item["start_confidence"] == 0.70
+    assert item["boundary_refined"] is False
+    assert item["broadcast_review_required"] is True
+
+
+def test_interior_boundary_rejection_is_not_cached_completed() -> None:
+    """L1 拒绝路径不得写 cache completed：缓存命中分支会绕过自检重新盖章成 accepted。
+
+    事故形态：拒绝后若标记 completed，下一轮审计命中缓存分支
+    （`item.update(stamped_decision)` 或重新 `_stamp_broadcast_decision()` 后直接
+    append 到 output）就会把"跨回合拒绝"悄悄翻成接受。既有拒绝路径
+    （no_stable_combat_start / long_or_invalid）都不写 completed，保持一致。
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "lsc/analyzer/valorant_broadcast.py"
+    ).read_text(encoding="utf-8")
+    index = src.index('item["broadcast_audit"] = "rejected_interior_boundary"')
+    branch = src[index: src.index("continue", index)]
+    assert 'cache_item["completed"]' not in branch, (
+        "拒绝路径写 cache completed 会让下一轮缓存命中把拒绝翻成接受"
+    )
+    assert "interior_round_boundary" in branch
+
+
+def test_start_gate_tolerates_one_sample_onset_jitter() -> None:
+    """入点容差：候选起点那一帧的低置信抖动不得否决整条真实回合。
+
+    2026-09-12 11:32 现场：start=230.187 首帧 unknown(0.3565)、其后 14 帧全 combat
+    （视觉抽帧确认该回合真实存在：233s 计时钟 1:36、292s SPIKE PLANTED），旧实现要求
+    onset 偏差 ≤1e-6s → rejected_no_stable_combat_start → 切片被删。同内容 start=230.200
+    即通过。容差 2.5s 吸收抖动，同时不放行"先回放、后交战"的伪候选。
+    """
+    samples = [(230.187, "unknown", 0.3565)] + [
+        (231.187 + i, "combat", 0.85) for i in range(14)
+    ]
+    assert broadcast._start_gate_decision(
+        samples, start=230.187, split_from_oversize=False,
+    ) == (230.187, None)
+
+    # 纯 replay / 非游戏窗口：没有 combat 游程 → 仍拒绝（15% 案例属此类，不受影响）
+    assert broadcast._start_gate_decision(
+        [(100.0 + i, "replay", 1.0) for i in range(15)],
+        start=100.0,
+        split_from_oversize=False,
+    ) == (None, "no_stable_combat")
+
+    # 窗口内先回放、约 10s 后才交战：偏差远超容差 → 仍拒绝
+    late_combat = [
+        (100.0 + i, "replay", 1.0) for i in range(9)
+    ] + [(109.0 + i, "combat", 0.9) for i in range(6)]
+    assert broadcast._start_gate_decision(
+        late_combat, start=100.0, split_from_oversize=False,
+    ) == (None, "no_stable_combat")
+
+
+def test_effective_lookahead_keeps_full_budget_when_ocr_end_vetoed() -> None:
+    """视觉否决 OCR 出点后，即使收尾/离线也不得把后视窗口钉死在 +45s。
+
+    否则 scan_end 恒 == end+45，而"否决后继续扩展"的判定条件恒成立 → 候选无限
+    pending（实测 351.312 的假出点 403.125 连跑 8 轮停在 448.125，真出点 449.875
+    在窗外）。给足 90s 后一次即定稿 broadcast_exclusion / precise。
+    """
+    resolve = broadcast._effective_lookahead_sec
+
+    # 旧行为：收尾/离线一律 45s（无论是否被否决）
+    assert resolve(
+        finalize=True, available_end=None, has_strong_ocr_end=False,
+        next_prep_invalidated=False,
+    ) == 45.0
+    # 新行为：被否决 → 给足 90s（收尾/离线同样适用）
+    assert resolve(
+        finalize=True, available_end=None, has_strong_ocr_end=False,
+        next_prep_invalidated=True,
+    ) == 90.0
+    assert resolve(
+        finalize=True, available_end=1000.0, has_strong_ocr_end=False,
+        next_prep_invalidated=True,
+    ) == 90.0
+    assert resolve(
+        finalize=False, available_end=None, has_strong_ocr_end=False,
+        next_prep_invalidated=True,
+    ) == 90.0
+    # OCR 强证据出点仍走 45s 窄窗；显式 lookahead_sec 仍被尊重
+    assert resolve(
+        finalize=False, available_end=1000.0, has_strong_ocr_end=True,
+        next_prep_invalidated=False,
+    ) == 45.0
+    assert resolve(
+        finalize=False, available_end=1000.0, has_strong_ocr_end=False,
+        next_prep_invalidated=True, lookahead_sec=120.0,
+    ) == 120.0
+
+
+def test_finalize_can_still_extend_after_next_prep_veto() -> None:
+    """接线守门：调用点必须把 next_prep_invalidated 传给后视预算解析函数。
+
+    只测纯函数不够——调用点漏传该标志时，收尾会退回"钉死 45s"的无限 pending。
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "lsc/analyzer/valorant_broadcast.py"
+    ).read_text(encoding="utf-8")
+    index = src.index("effective_lookahead = _effective_lookahead_sec(")
+    call = src[index: src.index(")", src.index("next_prep_invalidated=", index))]
+    assert "next_prep_invalidated=next_prep_invalidated" in call
+    assert "finalize=finalize" in call
+    assert "available_end=available_end" in call
+
+
+def test_interior_round_boundary_ignores_low_confidence_blip_after_result() -> None:
+    """L1 不得把「回合结束后转场里的 2 帧低置信 combat」当成重新开战。
+
+    2026-09-12 现场 round-000099（真实回合 990-1078）：审计样本为
+    `result 1081-1083 → combat 1084(0.554)/1085(0.648) → non_game/replay 1086+`，
+    随后整段回放。旧实现只要终态游程后出现**单帧** combat 就算跨回合 → 整条真实
+    回合被 `rejected_interior_boundary` 丢掉。重新开战必须是稳定游程（≥4 帧）。
+    """
+    samples = [
+        *[(float(t), "combat", 0.80) for t in range(0, 90)],      # 回合主体
+        (90.0, "unknown", 0.374),
+        (91.0, "non_game", 0.732),
+        (92.0, "unknown", 0.383),
+        *[(float(t), "result", 0.70) for t in range(93, 96)],      # 结算
+        (96.0, "combat", 0.554),                                   # 转场抖动（低置信）
+        (97.0, "combat", 0.648),
+        (98.0, "non_game", 0.942),
+        *[(float(t), "replay", 1.0) for t in range(99, 118)],       # 整段回放
+        (118.0, "non_game", 0.922),
+        *[(float(t), "buy", 0.76) for t in range(120, 123)],
+    ]
+    assert broadcast._interior_round_boundary(samples, start=0.0, end=99.75) is None
+
+    # 反例：真实重开战（稳定 combat 游程）仍必须被识别
+    with_real_resume = [
+        *samples,
+        *[(float(t), "combat", 0.80) for t in range(124, 160)],
+    ]
+    assert broadcast._interior_round_boundary(
+        with_real_resume, start=0.0, end=150.0,
+    ) == 124.0
+
+
+def test_interior_round_boundary_requires_stable_resume_run() -> None:
+    """阈值语义：重开战游程不足 ``min_resume_frames`` 帧时不算跨回合（可调）。"""
+    samples = [
+        *[(float(t), "result", 0.9) for t in range(0, 6)],
+        (6.0, "combat", 0.9),          # 只有 2 帧
+        (7.0, "combat", 0.9),
+        (8.0, "non_game", 0.9),
+    ]
+    assert broadcast._interior_round_boundary(samples, start=-5.0, end=20.0) is None
+    assert broadcast._interior_round_boundary(
+        samples, start=-5.0, end=20.0, min_resume_frames=2,
+    ) == 6.0
+
+
+def _fake_frame_extract(label_of):
+    """按 ts 决定像素值（十位=标签下标、个位随 ts 变化）的假抽帧器。
+
+    每帧内容按 ts 奇偶摆动 +5（保持 value // 10 == label 不变）：避免"帧差分 ≈0"
+    被冻结检测当成技术暂停（真实画面不会零差分）。
+    """
+    _LABELS = ("non_game", "buy", "combat", "result", "replay")
+
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        out = []
+        ts = start
+        while ts <= end + 0.01:
+            label = label_of(round(ts, 2))
+            value = _LABELS.index(label) * 10 + (5 if int(round(ts)) % 2 else 0)
+            out.append((ts, np.full((8, 8, 3), value, dtype=np.uint8)))
+            ts += 1.0
+        return out
+
+    return fake_extract
+
+
+def _fake_classifier():
+    _LABELS = ("non_game", "buy", "combat", "result", "replay")
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def load(self) -> None:
+            return None
+
+        def predict_batch(self, images):
+            rows = []
+            for image in images:
+                label = _LABELS[int(image[0, 0, 0]) // 10]
+                row = np.full(len(_LABELS), 0.01, dtype=np.float32)
+                row[_LABELS.index(label)] = 0.97
+                rows.append(row)
+            return np.array(rows, dtype=np.float32)
+
+    return FakeClassifier()
+
+
+def test_a5_window_cap_only_uses_inner_replay_blocks() -> None:
+    """A5 缩窗：只认候选区间内的回放块起点，+8s 余量。"""
+    from lsc.analyzer.valorant_broadcast import A5_WINDOW_CAP_MARGIN_SEC, _a5_window_cap
+
+    item = {"replay_segments": [[20.0, 30.0], [200.0, 220.0]]}
+    # 起点前的回放（属于上一回合尾段）忽略；区间内的取最小起点
+    assert _a5_window_cap(item, start=100.0, end=400.0) == 200.0 + A5_WINDOW_CAP_MARGIN_SEC
+    assert _a5_window_cap(item, start=250.0, end=400.0) is None      # 区间外
+    assert _a5_window_cap({"replay_segments": []}, start=0.0, end=10.0) is None
+    assert _a5_window_cap({}, start=0.0, end=10.0) is None
+
+
+def test_a5_cap_shrinks_scan_and_finds_same_cutoff(monkeypatch) -> None:
+    """缩窗路径：回放块为真时，审计仍能给出同一处截断（结论不变、成本更低）。"""
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable",
+                        _fake_frame_extract(lambda ts: "replay" if ts >= 215.0 else "combat"))
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+    cand = {"round_key": "round-cap-1", "start": 100.0, "end": 240.0,
+            "start_by": "ocr_combat", "end_by": "next_combat",
+            "replay_segments": [[215.0, 235.0]]}
+    outs = broadcast.audit_broadcast_rounds_with_outcomes(
+        [dict(cand)], "unused.mp4", classifier=_fake_classifier(), finalize=True,
+    )
+    assert len(outs) == 1
+    assert outs[0].status == "accepted", (outs[0].status, outs[0].reason)
+    end = float(outs[0].candidate["end"])
+    assert 210.0 <= end <= 218.0, outs[0].candidate
+    # 扫描窗口被压到「回放起点 + 余量」以内（未压窗时应为 end+45=285）
+    assert float(outs[0].candidate["broadcast_audit_scan_end"]) <= 224.0
+
+
+def test_a5_cap_failure_retries_with_full_window(monkeypatch) -> None:
+    """缩窗失败必须回退完整窗口（否则缩窗会把真出点挡在窗口外）。"""
+    # A5 块是假的（该处仍是 combat）；真出点在 235 之后
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable",
+                        _fake_frame_extract(lambda ts: "replay" if ts >= 235.0 else "combat"))
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+    cand = {"round_key": "round-cap-2", "start": 100.0, "end": 240.0,
+            "start_by": "ocr_combat", "end_by": "next_combat",
+            "replay_segments": [[215.0, 235.0]]}
+    cache: dict = {}
+    first = broadcast.audit_broadcast_rounds_with_outcomes(
+        [dict(cand)], "unused.mp4", classifier=_fake_classifier(), finalize=True,
+        audit_cache=cache,
+    )
+    assert len(first) == 1
+    assert first[0].status == "pending", first[0]
+    assert first[0].reason == "a5_cap_retry", first[0]
+
+    # 第二轮（同 cache）不得再缩窗，必须拿到真出点
+    second = broadcast.audit_broadcast_rounds_with_outcomes(
+        [dict(first[0].candidate)], "unused.mp4", classifier=_fake_classifier(),
+        finalize=True, audit_cache=cache,
+    )
+    assert len(second) == 1
+    assert second[0].status == "accepted", (second[0].status, second[0].reason)
+    end = float(second[0].candidate["end"])
+    # 真出点 235（回放起点）+ 审计既定 2.5s 结算尾巴 ⇒ 约 237.25
+    assert 236.5 <= end <= 238.0, second[0].candidate
+    assert second[0].candidate["end_by"] == "broadcast_exclusion"
+    assert second[0].candidate["end_quality"] == "precise"
+    assert "broadcast_audit_window_cap" not in second[0].candidate
+
+
+def test_tail_lookback_covers_round_end_before_late_ocr_anchor(monkeypatch) -> None:
+    """回看窗口必须够长：OCR 粗出点落在"下回合买枪首帧"时，真实出点常早 30–60s。
+
+    2026-09-12 19:14 现场 round-000071（真实 combat 712–798，粗出点 835）：
+    回看 30s → 窗口从 805 开始（回合已结束）⇒ `_first_stable_exclusion` 认不出
+    "combat → 终态"边界 ⇒ no_exclusion_evidence ⇒ 整条回合进不了草稿；
+    回看 45/60s → accepted / broadcast_exclusion / precise。
+    """
+    def label_at(ts: float) -> str:
+        if 100.0 <= ts <= 195.0:
+            return "combat"
+        if 196.0 <= ts <= 205.0:
+            return "result"
+        if 206.0 <= ts <= 232.0:
+            return "replay"
+        if 233.0 <= ts <= 255.0:
+            return "buy"
+        return "combat" if ts >= 256.0 else "non_game"
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", _fake_frame_extract(label_at))
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+    cand = {"round_key": "round-late-anchor", "start": 100.0, "end": 240.0,
+            "start_by": "ocr_combat", "end_by": "next_combat"}
+
+    assert broadcast.BROADCAST_AUDIT_TAIL_LOOKBACK_SEC >= 45.0, (
+        "回看过短会把回合自身的 combat 挡在窗口外（现场 round-000071）"
+    )
+    outs = broadcast.audit_broadcast_rounds_with_outcomes(
+        [dict(cand)], "unused.mp4", classifier=_fake_classifier(), finalize=True,
+    )
+    assert len(outs) == 1
+    assert outs[0].status == "accepted", (outs[0].status, outs[0].reason)
+    assert outs[0].candidate["end_by"] == "broadcast_exclusion"
+    assert outs[0].candidate["end_quality"] == "precise"
+    # 出点必须落在终态游程内（≈195-205），不得停在粗出点 240
+    assert 193.0 <= float(outs[0].candidate["end"]) <= 210.0, outs[0].candidate

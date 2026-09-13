@@ -27,6 +27,10 @@ def _broadcast_candidate(**overrides) -> dict:
         "confirm_status": "vision_confirmed",
         "broadcast_audit": "passed",
         "broadcast_review_required": False,
+        "start_quality": "precise",
+        "end_quality": "precise",
+        "start_review_required": False,
+        "end_review_required": False,
         "duration_anomaly": False,
     }
     base.update(overrides)
@@ -41,6 +45,8 @@ def test_hybrid_clip_metadata_carries_broadcast_audit_fields() -> None:
     assert meta["broadcast_audit"] == "passed"
     assert meta["end_by"] == "next_prep"
     assert "broadcast_review_required" in meta
+    assert meta["start_quality"] == "precise"
+    assert meta["end_quality"] == "precise"
     assert "duration_anomaly" in meta
 
 
@@ -100,6 +106,48 @@ def test_clip_allowed_for_draft_broadcast_fail_closed() -> None:
     assert clip_allowed_for_draft(pending, include_pending=True) is True
     assert clip_allowed_for_draft(pending, include_pending=False) is False
 
+    # 出点已经视觉审计定稿时，允许入点 coarse 的赛事切片
+    # 进入自动草稿；导出仍可保持更严格门禁。
+    precise_end = _broadcast_candidate(
+        confirm_status="pending",
+        end_by="broadcast_exclusion",
+        broadcast_review_required=True,
+        start_quality="coarse",
+        end_quality="precise",
+        start_review_required=True,
+        end_review_required=False,
+    )
+    precise_end["mark_precision"] = "exact"
+    assert clip_allowed_for_draft(precise_end, include_pending=False) is True
+
+    # 已拒绝/纯回放候选即使 include_pending 也永不进入草稿
+    rejected = _broadcast_candidate(
+        confirm_status="pending",
+        broadcast_audit="rejected_no_stable_combat_start",
+        end_by="open_tail",
+    )
+    rejected["mark_precision"] = "exact"
+    assert clip_allowed_for_draft(rejected, include_pending=True) is False
+
+    # 异常时长/无效坐标即使 include_pending 也永不进入
+    long_pending = _broadcast_candidate(
+        confirm_status="pending",
+        broadcast_audit="pending_lookahead",
+        start=0.0,
+        end=200.0,
+    )
+    long_pending["mark_precision"] = "exact"
+    assert clip_allowed_for_draft(long_pending, include_pending=True) is False
+
+    invalid_coords = _broadcast_candidate(
+        confirm_status="pending",
+        broadcast_audit="pending_lookahead",
+        start=200.0,
+        end=100.0,
+    )
+    invalid_coords["mark_precision"] = "exact"
+    assert clip_allowed_for_draft(invalid_coords, include_pending=True) is False
+
 
 def test_auto_draft_uses_include_pending_false() -> None:
     text = WORKBENCH.read_text(encoding="utf-8")
@@ -116,6 +164,7 @@ def test_auto_draft_waits_for_finalization_gate() -> None:
     assert "coverage_complete === true" in window
     assert "audit_delivery_gap" in window
     assert "pending_queue_depth" in window
+    assert "recordingStillActive" in text
 
 
 def test_coverage_gate_requires_full_scan() -> None:

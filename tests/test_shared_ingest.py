@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 
@@ -1083,3 +1084,100 @@ def test_recording_start_prefers_stdin_write_timeout_error(monkeypatch):
 
     assert result.ok is False
     assert "stdin write timed out" in result.error
+
+
+def test_nvenc_lock_failure_detection():
+    assert SharedRoomIngest._is_nvenc_lock_failure(
+        "[h264_nvenc] Failed locking bitstream buffer: invalid param (8)"
+    )
+    assert SharedRoomIngest._is_nvenc_lock_failure(
+        "[hevc_nvenc] error: invalid param"
+    )
+    assert not SharedRoomIngest._is_nvenc_lock_failure(
+        "[libx264] Error while opening encoder"
+    )
+
+
+def test_nvenc_recording_failure_hot_failovers_to_libx264(tmp_path, monkeypatch):
+    original = tmp_path / "recording.mp4"
+    original.write_bytes(b"nvenc-segment")
+    ingest = SharedRoomIngest("room-hot-failover", "https://example/live.flv")
+    ingest._recording_process = _FakeProcess(pid=31001)
+    ingest.recording_active = True
+    ingest._recording_path = str(original)
+    ingest._recording_original_path = str(original)
+    ingest._recording_profile = ExportProfile(codec="h264_nvenc", crf=27, preset="medium")
+    ingest._recording_stderr_buffer.append(
+        "[h264_nvenc @ 1] Failed locking bitstream buffer: invalid param (8)"
+    )
+
+    fallback_commands: list[list[str]] = []
+    fallback_process = _FakeProcess(pid=31002)
+
+    def launch(command):
+        fallback_commands.append(list(command))
+        assert "libx264" in command
+        assert "h264_nvenc" not in command
+        return fallback_process
+
+    def startup_ready(path):
+        Path(path).write_bytes(b"libx264-segment")
+        return True
+
+    monkeypatch.setattr(ingest, "_launch_process", launch)
+    monkeypatch.setattr(ingest, "_ensure_upstream_started", lambda: "")
+    monkeypatch.setattr(ingest, "_wait_for_startup_data", startup_ready)
+
+    ingest._handle_recording_process_exit(
+        ingest._recording_process,
+        "recording ffmpeg input failed: [Errno 32] Broken pipe",
+    )
+
+    assert ingest.recording_active is True
+    assert ingest.recording_error == ""
+    assert ingest.recording_failover_count == 1
+    assert ingest.recording_failover_in_progress is False
+    assert ingest._recording_failover_source_paths == [str(original)]
+    assert ingest._recording_path != str(original)
+    assert ".libx264-fallback-" in ingest._recording_path
+    assert len(fallback_commands) == 1
+    monkeypatch.setattr(
+        ingest,
+        "_merge_hot_failover_recording",
+        lambda **_kwargs: str(original),
+    )
+    ingest.stop_recording_sink(reason="test cleanup")
+
+
+def test_hot_failover_merge_joins_segments_and_restores_original(tmp_path, monkeypatch):
+    import lsc.core.services.shared_ingest as shared_ingest_mod
+
+    original = tmp_path / "recording.mp4"
+    fallback = tmp_path / "recording.libx264-fallback-test.mp4"
+    original.write_bytes(b"nvenc")
+    fallback.write_bytes(b"libx264")
+    ingest = SharedRoomIngest("room-merge", "https://example/live.flv")
+    ingest._recording_original_path = str(original)
+    ingest._recording_path = str(fallback)
+    ingest._recording_failover_attempted = True
+    ingest._recording_failover_source_paths = [str(original)]
+
+    captured: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        captured.append(list(command))
+        output = Path(command[-1])
+        output.write_bytes(b"merged")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(shared_ingest_mod.subprocess, "run", fake_run)
+
+    result = ingest._merge_hot_failover_recording()
+
+    assert result == str(original)
+    assert original.read_bytes() == b"merged"
+    assert not fallback.exists()
+    assert ingest._recording_path == str(original)
+    assert ingest._recording_failover_source_paths == []
+    assert captured and captured[0][captured[0].index("-f") + 1] == "concat"
+    assert "concat" in captured[0]

@@ -22,14 +22,15 @@ def _handle_export_many_body(source: str) -> str:
 
 
 def test_can_export_for_shortcut_rejects_pending_and_refining() -> None:
-    """Ctrl+E 与 canExportClip 一致：pending/refining 不可导出。"""
+    """Ctrl+E 必须委托唯一导出策略，不能维护一份会漂移的状态白名单。"""
     body = _can_export_for_shortcut_body(_workbench_source())
 
     assert "confirm_status === 'pending'" not in body
     assert "confirm_status === 'refining'" not in body
-    assert "user_confirmed" in body
-    assert "ocr_confirmed" in body
-    assert "vision_confirmed" in body
+    assert "return canExportClipPolicy(c)" in body
+    assert "user_confirmed" not in body
+    assert "ocr_confirmed" not in body
+    assert "vision_confirmed" not in body
 
 
 def test_handle_export_many_does_not_auto_confirm_pending_with_bounds_only() -> None:
