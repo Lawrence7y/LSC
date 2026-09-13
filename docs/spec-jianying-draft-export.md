@@ -77,6 +77,41 @@ source = trange(cs - recording_to_common_delta[rid], ce - cs)
 2. 否则 `clip.mark_in_wallclock` + `recording_start_mono`（exact）→ `common = wallclock - min(media_start_mono)` 推算
 3. 都没有（approximate，如拖拽标记）→ 该切片不进草稿，进 warnings 列表（与导出"近似定位"警告口径一致）
 
+### 当前录制 epoch 权威校验（2026-09-10 新增，三重门禁）
+
+在既有 pending/approximate/broadcast 审计门禁**之前**，对每个带 `round_key` 的切片做：
+
+1. **recording_id 校验**：`clip.recording_id`（clip_queued 载荷自 v1.0.12 起携带）与房间
+   当前 `room.recording_id` 不一致 → 旧录制会话切片，跳过
+2. **拒绝终态校验**：任务 `rejected_round_keys` tombstone 或收尾 sidecar
+   `rejected_candidates` 命中 `round_key` → 已被审计拒绝，跳过（即使 include_pending 也不复活）
+3. **sidecar 终态权威**：收尾 sidecar `accepted_candidates` 命中 → 边界与审计字段
+   （start/end/broadcast_audit/end_by/confirm_status 等）**以 sidecar 为准**，覆盖旧 listed 版本
+4. **权威集合归属**：存在权威来源（活跃/收尾任务、sidecar、分析结果 JSON）但
+   `round_key` 不在其中 → 旧分析会话遗留切片，跳过并 warning「非当前录制权威切片」。
+   **不得按 `recording_id` 兜底放行**：新入列切片在 `clip_queued` 时即已登记
+   `listed_clips`（校验步骤 3 可命中），未命中即判定不属于当前会话。
+5. 无 `round_key` 的手动切片不走本校验（沿用既有门禁）；无任何权威来源时保持兼容放行
+6. **权威集合补全**：前端列表可能遗漏当前录制 epoch 的已入列回合（断连重载、
+   `clip_queued` 事件丢失）。当请求为「会话级全集」时（`fill_authoritative` 默认 true），
+   后端按任务 `listed_clips` 补建切片源，避免漏写已入列回合；补入项同样过全部门禁，
+   rejected/pending 不会被复活。前端可传 `fill_authoritative=false` 关闭补全（未来的
+   单条/子集导出场景）。
+
+数据源取值优先级：收尾 sidecar `accepted`（**终态权威**）覆盖任务 `listed_clips`
+（实时快照）的同 `round_key` 边界；两者均无时回退分析结果 JSON（停录快照）。
+同 `round_key` 边界不一致时一律采信**终态权威来源**（accepted）。
+
+配套修复：持续分析启动按 `recording_id` 判定新 epoch，清理上一会话的
+`listed_clips`/键位登记/精修冻结（`_continuous_epoch_changed` + `_reset_epoch_scoped_clip_state`）；
+broadcast 审计拒绝终态同步从权威快照移除并广播 `clip_confirm_status=rejected`（前端删除切片）。
+
+### included_clip_count 口径
+
+`included_clip_count` = **实际写入切片轨的段数**（`JianyingDraftResult.placed_clip_count`）。
+gate 通过但被同轨重叠/越界丢弃的切片计入 `skipped_clip_count` 并进 warnings；
+「requested 8 / included 8 / 实际写入 7」的不一致不允许出现。
+
 ### 越界裁剪
 
 - `source.start < 0`（副房开播晚，早期回合不在其录制内）→ **跳过该房此段**，记 warning「房间 X 无此时段素材」
@@ -269,7 +304,7 @@ footer 上方加 `Radio.Group`（受控 state `exportTarget: 'mp4' | 'draft' | '
 | H3 | 房间对齐置信度 <0.3 不在 context 中 | 该房不进草稿，warning 列出 |
 | H4 | 房间无 record_output_path（未录制/文件被删） | 跳过该房（其切片轨也不生成），warning；全部缺失 → `no_rooms` 错误 |
 | H5 | 录制进行中生成 | 允许；duration 以 VideoMaterial 实测为准，越界段 clamp（§越界裁剪），warning 提示"基于当前进度，可停录后重新生成" |
-| H6 | 切片 confirm_status=pending/refining | 不进草稿（与导出口径一致）；UI 提示先确认 |
+| H6 | 切片 confirm_status=pending/refining | 默认不进草稿（与导出口径一致）。仅当请求显式 `include_pending=true`（手工生成），或 `source_profile=broadcast` 且 `broadcast_audit=passed` + `end_quality=precise`（出点已由视觉审计定稿）时，才允许以暂定入点进入。自动草稿固定 `include_pending=false`；`rejected` 永不进入 |
 | H7 | 同名草稿已存在 | 生成前删除旧草稿文件夹再创建（草稿=最新快照语义）；warning 提示"已覆盖同名草稿，若剪映中已打开请先关闭" |
 | H8 | approximate 精度切片（拖拽标记、无墙钟快照） | 不进草稿，warning（近似定位可能偏差数秒） |
 | H9 | 副房开播晚，早期回合 source.start<0 | 跳过该房该段，warning |

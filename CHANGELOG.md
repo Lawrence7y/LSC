@@ -1,7 +1,215 @@
 # LSC 直播切片系统 — 更新说明
 
+## v1.0.16 (2026-09-13)
+
+### 修复（全功能真机验收抓出的四处缺陷）
+
+2026-09-13 上午 computer-use 全链路真机验收（EDG夺冠回顾 huya 29701502 broadcast 分支 +
+Gus douyin 6096197105 LEGACY 分支），四个真实缺陷夹具先行修复：
+
+- **设置缓存毒化（P0，连接全挂）**：`handle_save_settings` 在 `save_settings()`（内部已刷新
+  `_settings_cache + _settings_cache_mtime`）之后又 `_settings_cache = None` 且不清 mtime ⇒
+  下次 `load_settings()` 命中「mtime 相等」捷径**永久返回 None** ⇒ 之后 connect_room 等一切
+  读设置的请求全部 `'NoneType' object has no attribute 'get'` 崩溃且不自愈（前端任何一次
+  设置保存即触发）。修复：捷径加非空守卫 + 失效处同时清 mtime。
+  夹具 `tests/test_settings_cache_poisoning.py`（改前 2 红）。
+- **回看远目标定位判死**：本地文件回看的有界定位按头部码率外推，码率前低后高时大幅欠冲，
+  顺序扫描追赶期间固定 8s 首帧死线把整个会话判死（`回看定位超时`），播放头钉死只能手动重试。
+  修复：死线改为**停滞看门狗**——读盘/建索引/入队任一进展即顺延，真停滞才按原诊断口径报错；
+  出画前读取块放大 4× 加速追赶。`localFileMseSource.test.ts` 新增双码率文件
+  +节流读盘回归（改前红），原"读不到数据必须报错"用例保持绿（真停滞语义不变）。
+- **草稿重叠去重未对账**（`skipped_unaccounted=4` ≠ 0）：收尾补扫合成出与既有切片重叠的
+  重复候选，placement 阶段被 SegmentOverlap 拦下后只写 warnings 不进 `excluded_clips` ⇒
+  响应残差字段违约。修复：该分支逐条进 `excluded_clips`（新 `reason_code=OVERLAP_DEDUP`，
+  带 start/end），响应 `skipped` 明细与 `skipped_unaccounted` 恢复恒等 0。
+  内容此前即无损失（草稿 6 段与审计精确出点逐一吻合、不变量审计 passed）。
+  夹具 `tests/test_broadcast_draft_overlap_accounting.py`（改前红；红线：不放宽
+  `clip_source_usable`/`_broadcast_gate_passed`）。
+- **切片标签撞号（两层根因）**：其一，upsert（边界精修）重新入列时不记忆首发标签；
+  其二（第二场真机复验才暴露的根因），`format_ai_round_clip_label` 的序号用的是分析器
+  `round_index`（跨扫描批次会重复）而 per-room 单调计数器被 `_ = index` 丢弃 ⇒ 不同回合
+  也撞号（现场两场各出现两条 R02）。修复：标签序号改用 per-room 单调计数器
+  （`_resolve_ai_clip_label` 按 listed_key 记忆首发标签，upsert 复用；epoch 清理同步裁剪；
+  无记忆 upsert 退回当前计数器；index<=0 兼容回退 round_idx）。副作用改善：导出文件名
+  （`{主播}_R{NN}.mp4`）不再互相覆盖。夹具 `tests/test_ai_clip_label_upsert.py`。
+- **平台抓取统一默认直连**：`build_opener` 默认 ProxyHandler 与
+  `douyin_record._SSRF_SAFE_OPENER` 的 `ProxyHandler(getproxies())` 会隐式采用
+  env/注册表系统代理——本机注册表代理指向已死端口（127.0.0.1:8780）时虎牙/抖音解析
+  集体报 [WinError 10061]（文案"网络错误"，极易误判为房间问题）。修复：两处默认 opener
+  显式空 ProxyHandler 强制直连，**显式 scoped proxy（network_context）路径不变且加测试钉住**。
+  夹具 `tests/test_platform_fetch_direct_default.py`（哨兵代理 + reload，机器无关红绿）。
+  行为变化：系统代理不再被平台解析隐式采用；需要代理的用户走设置内的显式代理配置。
+
+
+## v1.0.15 (2026-09-11)
+
+### 修复（赛事草稿「已定稿切片被静默丢弃」）
+
+现场：20:45:21 导出草稿，请求 8 条只写入 3 条；`round-000105` 在 20:43:26 已由赛事审计定稿
+（`audit=passed` / `end_by=broadcast_exclusion` / `end_quality=precise`）仍被跳过，且 5 条跳过
+共用一句「未确认/近似定位/未通过赛事审计」。完整清单与回归夹具见
+`docs/reports/broadcast-draft-silent-drop-plan-20260911.md` 与
+`tests/fixtures/broadcast_export_case_20260911_2045/`。
+
+- **终态权威快照跨会话保留**（`_last_authority_snapshots`）：收尾任务态被 pop 前把
+  `listed_clips + rejected_round_keys + recording_id` 留下，导出侧在活跃任务之后回落读取。
+  此前 pop 与导出相隔 1 秒，权威回落到 20:37 的旧分析 sidecar，把已定稿切片改回
+  `pending_lookahead` 后按「未确认」跳过。新录制 epoch / 删房时清除。
+- **扫描通路终态补投影**（`_project_scan_audit_terminals`）：扫描路径的审计结论此前只进
+  `listed_clips`，`accepted/rejected` 账本与收尾 sidecar 都看不到（现场 8 条结论只有 4 条落盘）。
+  现按与精修通路同一映射补齐、按 `round_key` 幂等，扫描结果已入列故同时计 `delivered`。
+- **权威注册表接线**（实测发现）：`register_jianying_handlers` 的调用点从未注入
+  `_continuous_tasks/_analysis_jobs`，两者在生产里一直是空 dict ⇒ `listed_clips` 权威补全
+  与审计字段合并全是死路径。现注入三个注册表并加守卫。
+- **跳过原因可辨**：新增结构化 `reason_code`（`END_NOT_FINAL` / `NEVER_AUDITED` /
+  `NO_EXCLUSION_EVIDENCE` / `NOT_IN_AUTHORITY` / `REJECTED`），响应新增
+  `skipped:[{round_key,label,start,end,reason_code,reason}]`，草稿结果弹窗逐条展示
+  （请求/写入/跳过计数 + 明细）。
+- **归档改名后落盘路径同步**（`_sync_analysis_save_path`）：改名后循环仍持旧路径，
+  20:39:27 那次落盘写回 `…_录制中.analysis.json`，「至_」文件的分析快照被冻在 20:37
+  （缺 `round-000135`），导出时它被判「不在权威集合」。现落盘前以房间当前录像为准。
+- **收尾完成判定收紧**（C6）：`pending_audit` = 「待审计队列非空 **或** 仍有已入列切片
+  无终态归属」；有界兜底对后者落 `manual_review` 终态（不删除、不放宽门禁），
+  避免「队列空 + listed 无归属」让收尾无限重跑（现场 20:45:20 判定瞬间 135 刚出结论）。
+- **回归夹具与不变量**：`tests/fixtures/broadcast_export_case_20260911_2045/`（真实 sidecar +
+  请求原文 + 权威快照 + provenance）+ `tests/test_broadcast_export_authority_lifetime.py`（11 条，
+  改前 included=3 / 改后 4）；`scripts/audit_continuous_analysis.py` 新增 no-silent-drop
+  三条不变量（结论↔终态、listed 归属、草稿口径与跳过可辨），失败返回非零。
+- **离线复算工具**（只读）：`scripts/valorant_vision/reaudit_broadcast_candidates.py`，
+  报告 `docs/reports/reaudit-2045-20260911.json` 给出结论——135 即便给足 254s 后视素材，
+  审计仍只能给 `next_prep/coarse` 出点（**不可定稿**，人工确认是正确出口）；
+  076 实为无效候选（离线判 `rejected_no_stable_combat_start`）。
+- **L3 真实环境验收（2026-09-12 08:44–09:01）**：16 分钟录制 + broadcast 持续分析，
+  收尾正常收敛；夹具 C 三条不变量全部转绿（`docs/reports/live-verify-0901-20260912.json`），
+  日志可见「扫描通路终态已补投影」「终态权威快照已保留」「未定稿切片落 manual_review」；
+  两次草稿（程序自动 + 驱动）都带逐条跳过原因码；归档后不再产生旧名 `_录制中` sidecar。
+  当轮修掉两个小问题：权威校验阶段的拒绝被判成 `NEVER_AUDITED`（切片 dict 仍带陈旧
+  `pending_lookahead`）→ 判据补文案分支；墓碑原因取到入点门禁的 `"ok"` 导致「已拒绝(ok)」
+  → `_rejection_reason()` 优先取审计结论。
+- **草稿静默丢弃清零（2026-09-12 09:01 现场，round-000065 门）**：三层缺陷
+  ①权威 `clip_id` 随边界派生，定稿后与请求里的旧 id 不一致 ⇒ stock `honor_clip_ids`
+  把"刚精修好"的切片静默丢弃（现同时接受合并前的原始 id，真不在清单里也补逐条留痕）；
+  ②`resolve_common_range` 优先读 `recording_start/end_sec`，而 reconcile 只改 `start/end`
+  ⇒ 权威精修出点被前端旧值顶掉、草稿带进 12s 赛后内容（现按同一轴回填别名）；
+  ③导出器 `clip_source_usable` 过滤只留本地计数 ⇒ 差额无法逐条对账（现逐条进
+  `excluded_clips` + 逐条 warning，响应新增 `skipped_unaccounted` 残差字段，恒等 0 才算干净）。
+  夹具 `tests/fixtures/broadcast_export_case_20260912_0901/` + 回归
+  `tests/test_broadcast_draft_silent_drop.py`（修复前 kept=3/残差 1 → 修复后 kept=4/残差 0）。
+- **同名草稿不再互相覆盖（2026-09-12）**：自动命名只精确到分钟，同一分钟内的两次导出会撞名
+  （09:01:48 的 4 段自动草稿被 09:01:54 的 3 段手动导出顶掉）。现自动命名避让为 `_2`/`_3`…
+  并给出「本次写入 … 以免覆盖上一份」告警；**显式命名仍覆盖**（前端"重试生成草稿"的既定语义）。
+- **列表逐条标注「为什么没进草稿」（2026-09-12）**：持续分析切片在列表里显示
+  `可导出 / 待审计 / 需确认 / 已排除 / 不可导出` 状态标签（含 tooltip 说明），
+  色轨也同步区分（此前待审计的切片同样亮"可导出"青色，用户到导出才发现少了几条）。
+  实测背景：审计吞吐 ≈2 分钟/条 > 收尾可用时间（91s），047/063 这类只能落 manual_review；
+  离线复算证明拉长收尾救不回（135 给足 254s 后视素材仍只能拿到 `next_prep/coarse`）。
+  状态码与后端 `_skip_reason_code` 同族并有 parity 守卫。
+- **红线**：不放宽 `_broadcast_gate_passed`。出点未定稿 / 无排除证据 / 被拒的切片继续被拒，
+  只是原因从一句聚合告警变成可定位的分类。
+
+## v1.0.14 (2026-09-11)
+
+### 修复（赛事切片导出被「必须人工确认」卡住）
+
+现场：持续分析跑完，切片列表里的回合出点已由视觉审计定稿（`broadcast_exclusion` /
+`end_quality=precise` / `audit=passed`），但点「导出」「导出全部」都被拦；必须先在列表里
+点开该条、再点「确认」把状态改成 `user_confirmed` 才能导出，否则弹「该赛事切片边界仍在
+审计/复核中」。根因是前端 `canExportClip` 只看聚合复核标记：持续分析的赛事切片入点仍是
+coarse 的 OCR 战斗锚点，`broadcast_review_required`（判据含入点密扫证据）与
+`boundary_review_required` 必然为 true，于是整条切片被锁死；而后端草稿门禁
+（`_broadcast_gate_passed`）早已按「出点定稿即可入草稿」放行——两条门禁判据不一致。
+
+- **前端导出门禁对齐后端**：`clipExportPolicy.canExportClip` 新增
+  `hasAuthoritativeBroadcastEnd`（`audit=passed` + `end_quality=precise` +
+  `end_review_required≠true` + 无时长异常 + `end_by ∈ {next_prep, broadcast_exclusion}`），
+  命中即视为可直接导出/入草稿；出点定稿后后台只可能再改入点，导出文件最多「起得略早」。
+  覆盖 `pending` / `refining` / `vision_confirmed` 三种会话态——`refining` 是用户点开切片
+  进入精修（`begin_refine_clip` 广播）的会话态，不是「边界不可信」，导出用的仍是该条已入列
+  的边界（预览弹窗显示的入出点即写入文件的范围）。被拒终态（`rejected_*`）依旧不复活，
+  未定稿出点（`open_tail` / `next_combat` / `end_review_required` / 时长异常）仍需人工确认
+- **两端判据钉在一起**：新增 `tests/test_broadcast_export_gate_parity.py`，
+  前端 `BROADCAST_VALID_END_BY` 必须等于后端 `jianying_draft` 与 `room_handler` 的同名集合，
+  并用真实运行样本（R01 出点定稿 / R04 未定稿）在两侧断言同一结论；前端
+  `src/utils/clipExportPolicy.test.ts` 同步补真实样本用例
+
+## v1.0.13 (2026-09-11)
+
+### 修复（官方解说分支持续分析：审计存活性与结论交付）
+
+现场：32 分钟真实会话里 `audit_terminal_total = 0`，`边界审计超过预算` 12 次、每次交付 0 条，
+切片列表长期停留未审计的粗边界（纯回放片段、跨回合 9 分钟片段、半路截断）。实测单步
+41.8s（冷）/21.4s（热）> 20s 墙钟预算，其中超长候选的门禁预取一次性解码 ≈514 帧 ≈23s。
+
+- **取消路径结论不丢**：`audit_broadcast_rounds_with_outcomes` 新增 `outcome_sink`；审计被
+  `cancel_check` 中断时，已定稿的拒绝结论照常交付（剪除已入列脏切片），未判定候选补发
+  `pending` 保持批次完整（否则消费端会把残缺批次当整批终态、静默丢弃未审计子候选）
+- **取消路径不交付半成品 accepted**：`accepted/manual_review` 在预算耗尽时降级留队，
+  下一轮由审计缓存复现后走完整路径（保持「accepted 必带入点密扫」不变量）
+- **在线微步骤一轮只推进一个分裂子块**：超长候选（>150s）分裂出的 4 块一轮跑完实测
+  ≈40s 远超预算；其余子块以 `pending` 交回队列续扫。实测同一 551.8s 候选 4 轮收敛
+  （9.2s / 8.4s / 8.3s / 6.0s），全部终态、计数不虚增
+- **在线预取受媒体预算约束**：分裂块门禁预取窗口由 150s 截到 `max_media_step_sec`（18s），
+  预取只是批量加速，判定窗口与语义不变
+- **分裂块整段起扫（画面质量）**：超长候选切成的固定块只扫尾部 30s，块中部的回放/回合
+  边界看不到 → 实测出现「切片跨两个回合 + 含 22s 回放」仍被判 passed。现改为分裂块从块头
+  整段起扫（单次仍按 18s 微步骤），并补两道门：块内「回放后接下一回合满钟」不再被
+  `_has_decreasing_combat_after` 硬否决；块头静态画面不得触发逐帧冻结兜底（避免整块被
+  `no_active_span` 拒绝）。真实录像离线复现：同一 203s 候选 s0 由 `310.4-460.4/next_prep/coarse`
+  变为 `310.4-414.25/broadcast_exclusion/precise`（截在回放起点 + 2.5s 结算尾巴）
+- **审计任务卡死可观测**：新增「边界审计任务 N 秒未推进（疑似卡死）」节流告警（现场 21 分钟
+  0 帧推理 0 交付时无任何日志，py-spy 抓到粗扫线程卡死在 rapidocr/onnxruntime 推理内、
+  持有的共享 ONNX 信号量把审计一起锁死——属 onnxruntime 原生问题，本次只补可观测性）
 
 ## v1.0.12 (2026-09-10)
+
+### 修复（持续分析 → 剪映草稿链路）
+
+- **新录制 epoch 隔离**：持续分析启动按 `recording_id` 判定新 epoch，自动清理上一会话的
+  `listed_clips` / 键位登记 / 精修冻结，旧切片不再混入新录制的权威快照
+- **审计拒绝同步清理**：broadcast 审计拒绝终态立即从权威切片快照移除并广播
+  `clip_confirm_status=rejected`（前端同步删除）；此前被拒回合残留为 pending_lookahead
+  并混入剪映草稿（拒绝切片被收录、精修通过切片反被重叠跳过的根因）
+- **剪映草稿权威校验**：`generate_jianying_draft` 对每个切片做
+  `recording_id + round_key + 当前 sidecar` 三重校验；sidecar accepted 终态的
+  边界/审计字段以 sidecar 为准，旧会话遗留/被拒切片直接跳过并给出原因告警
+- **included_clip_count 口径修正**：按实际写入切片轨的段数统计（`placed_clip_count`），
+  同轨重叠被丢弃的切片计入 skipped，不再出现「请求 8 / 包含 8 / 实际写入 7」
+- **收尾覆盖账本同步**：收尾判定与 sidecar 落盘前从任务状态权威 payload 重建
+  FinalizationJob；修复本地旧对象把 coverage 账本清空导致的
+  `coverage_complete=true` 却反复「继续补扫」死循环
+- **WS 1000 (OK) 降级为 DEBUG**：客户端正常关闭不再被记录为后端 ERROR
+- **权威校验收紧**：删除「recording_id 一致即兜底放行」分支——`round_key` 必须命中
+  `listed_clips` / sidecar `accepted` / `rejected` / `pending` / 分析结果之一才进入草稿，
+  防止 `recording_id` 恰好一致的旧会话/脏切片混入
+- **权威集合补全**：前端列表可能遗漏当前 epoch 已入列回合（断连重载、`clip_queued` 丢失），
+  后端按任务 `listed_clips` 补建切片源并给出告警；补入项同样过全部门禁
+  （rejected/pending 不复活），可传 `fill_authoritative=false` 关闭
+
+### 修复（收尾卡死 / 导出门禁 / DVR 显示）
+
+- **收尾无限补扫 / 卡死修复**：录制文件定格后，后视窗口结构性不足
+  （`scan_end` 超出可用末尾）的候选不再无限滞留待审计队列——审计
+  `finalize` 阶段直接按无帧判定终态（不再返回 `pending_lookahead`）；
+  收尾时对「候选终点已到/超出文件末尾」的候选强制尝试一次终态审计；新增
+  收尾补扫有界兜底 `_FINALIZE_TAIL_STALL_MAX_ROUNDS`，结构性无法定稿的候选
+  强制定稿并广播，收尾必定收敛（此前会无限「继续补扫」，界面表现为卡死、
+  无法停止，且不产出可验收切片）
+- **DVR 紫线按配置时长展示**：主时间线紫线左界不再钳制到 MSE 连续缓存起点
+  `buf.start`，改按用户设置的回放时长展示（超出缓冲的点击/拖动由 `mseSeek`
+  自动切录制文件回看），修复「可回放时长明显少于设置值」
+- **导出拦截提示优化**：赛事切片未完成审计/复核时，提示明确指引点击
+  【确认导出】完成人工复核后导出
+- **DVR 交互：播放头紧贴回放光标**：点击/拖动到 DVR 左界（紫线）以左时，播放头
+  钳到紫线（不再落到紫线左侧）；紫线以左的媒体由录制文件回看（recording_review）
+  承接，因此不会重演「画面卡死」；紫线右侧仍可实时查看缓存内容。紫线归零
+  （录制/回放时长不足配置值）时不设下界，整段可用
+- **预览时钟周期性重标定**：`recording_to_preview_delta` 由「首播标定一次」改为
+  低频周期重采样（60s，`PREVIEW_CLOCK_REFRESH_MS`），跟踪网络抖动引起的缓冲深度
+  变化，避免预览时钟长期漂移导致时间线显示的录制秒与后端真实时刻错位
+  （重采样失败不改变已接受 delta，安全）
+- **预览低延迟编码**：CPU 回退路径（libx264）补 `-tune zerolatency`——此前只有
+  NVENC 路径有 `-tune ll`，软编预览因此明显落后直播；muxer 增加
+  `-flush_packets 1`，分片生成后立即写出管道，不再做内部缓冲
 
 ### 清理（删除 PySide6 遗留死代码）
 

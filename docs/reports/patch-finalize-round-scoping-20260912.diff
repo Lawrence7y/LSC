@@ -1,0 +1,29 @@
+--- a/lsc/analyzer/valorant_broadcast.py
++++ b/lsc/analyzer/valorant_broadcast.py
+@@ -1868,19 +1868,19 @@
+         if (
+             cutoff is not None
+             and reason
+             and _has_decreasing_combat_after(
+                 cutoff,
+                 timer_samples,
+-                # 分裂块的出点是固定切块边界，块内"回放后再接下一回合满钟"是
+-                # 结构性正常形态，不能据此否决截断（普通候选保持原语义）。
+-                fresh_clock_min=(
+-                    FRESH_ROUND_CLOCK_MIN
+-                    if item.get("split_from_oversize")
+-                    else None
+-                ),
++                # 回合化（2026-09-12）：所有候选都允许「满钟=新回合」逃逸。
++                # 该规则本就为「回放后接下一回合满钟」设计（原仅用于固定切块），
++                # 普通候选遇到的正是同一形态——跨回合的钟表递减会误否决正确截断：
++                # 实测 round-000135 的真实出点 1423.2 被误否决（→next_prep/coarse），
++                # 且窗口放宽后 045 的正确截断 514.0 也会被下一回合的钟表误否决
++                # （→重搜接受 672.485，跨回合粘连 +158s）。
++                fresh_clock_min=FRESH_ROUND_CLOCK_MIN,
+             )
+         ):
+             _log.info(
+                 "赛事回合终点硬否决（截断后交战计时器仍递减）: %.1f-%.1f, cutoff=%.1f",
+                 start,
+                 end,

@@ -565,6 +565,21 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
         不得随 executor 线程丢弃（实测：120s 预算中止整批 `vision_confirmed` 丢失，列表
         永久停在 `pending_lookahead`）；`refine_abort` 只中止未完成部分。发布时 
         `current_dur` 以 `max(_dur, recorded_duration)` 兜底，防止主循环游标回退重扫。
+    *   **在线审计存活性（2026-09-11）**：超长候选（>150s）分裂后**一轮只推进一个子块**
+        （`max_media_step_sec` 非空时其余子块以 `pending` 交回队列）；分裂块门禁预取窗口
+        同样受 `max_media_step_sec` 约束（旧实现一次预取 150s 门禁窗 ≈514 帧 ≈23s，
+        叠加块内判定后单步 21–42s，每轮都在 20s 墙钟预算处被腰斩）；
+        `audit_broadcast_rounds_with_outcomes(outcome_sink=…)` 暴露 outcome 列表：被
+        `cancel_check` 中断时**已定稿的拒绝结论照常交付**、未判定候选补发 `pending`
+        保持批次完整；`accepted/manual_review` 在预算耗尽时降级留队（下一轮带密扫）。
+        实测同一 551.8s 候选 4 轮收敛（9.2/8.4/8.3/6.0s），此前 32 分钟内 12 次超预算、
+        0 条交付。守卫：`tests/test_broadcast_audit_liveness.py`。
+    *   **分裂块整段起扫（2026-09-11）**：`split_from_oversize` 固定切块没有真实 OCR 出点，
+        尾部 30s 扫描看不到块中部的回合边界（实测：块内 22s 回放未被发现，切片跨两个回合）。
+        现从块头整段起扫（单次仍受 18s 微步骤预算）；块内「回放后再接下一回合满钟」不再触发
+        `_has_decreasing_combat_after` 硬否决（`FRESH_ROUND_CLOCK_MIN=85`），块头静态画面也不得
+        触发逐帧冻结兜底。⚠️ 已知遗留：A5「回放终点排除」的 `replay_segments` 是启发式产物，
+        仍可能把审计已确认的精确出点覆盖成更早的值（实测 196.25 → 185.92，裁掉 10s 真实交战）。
     *   **停止补扫尾部（2026-09-08）**：录制中停止持续分析不再立即 `cancelled`，先进入
         `stop_tail_scan`（target 冻结在停止时刻，最多 `_STOP_TAIL_MAX_WINDOWS` 窗）补扫未覆盖
         尾部后自行退出；补扫期间审计中止（refine_abort）且不再启动新审计。
@@ -575,6 +590,48 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
         密扫+lookahead 审计 30–55s，4+ 候选必然撑满 `_BCAST_REFINE_KEEP_MAX_SEC=120s`
         预算被中止（实测 5 候选批让单窗滞后 +107s）；收紧后批次在预算内完整结束，
         未定稿候选在后续扫描间隙续扫。
+    *   **审计微步骤硬边界（2026-09-10）**：在线后台任务一次只允许执行一个
+        `18s` 媒体微步骤，不得在 `20s` 墙钟 deadline 内连续启动下一个不可强制中断的
+        FFmpeg/OCR 步骤。尾窗无 combat 时的头部回补也必须受同一预算约束，并从尾窗
+        向前倒序分块搜索最近 combat；每帧完成后持久化 cache 游标，取消/超时后不得
+        重扫已完成证据。在线计时器 OCR 每微步骤最多 1 个排除帧，收尾/离线审计才保留
+        完整计时器序列。
+    *   **官方 HUD 宽 ROI 哨兵（2026-09-10）**：赛事粗扫逐帧仅跑紧顶部 ROI，
+        宽 ROI 作为包装/黑边偏移容错每 `4s` 探测一次；禁止因紧 ROI 未同时读全
+        计时器+双比分而在每帧重复执行宽 ROI OCR。收尾仍可逐帧使用宽 ROI 保证证据完整。
+    *   **赛事假 next_prep 出点否决（2026-09-10）**：OCR 粗出点标记为 `next_prep`
+        后，视觉审计必须检查紧随其后的画面；若出点后 `8s` 内存在连续至少 `3` 帧
+        `combat`，证明 OCR 把交战中的计时器/包装误读为准备阶段，必须将该出点作废并把
+        后视范围从强证据的 `45s` 扩展到 `90s`/回合上限，直到找到真实
+        Replay、result 或 non-game 转场。禁止对仍持续交战的 `next_prep` 无条件盖章
+        `broadcast_audit=passed`。
+    *   **导出/草稿门禁同源（2026-09-11）**：赛事切片「出点已定稿」的判据
+        （`broadcast_audit=passed` + `end_quality=precise` + `end_review_required≠true`
+        + 无 `duration_anomaly` + `end_by ∈ {next_prep, broadcast_exclusion}`）在后端
+        `jianying_draft._broadcast_gate_passed` 与前端 `utils/clipExportPolicy.canExportClip`
+        必须一致；出点定稿即可直接导出/入草稿（`pending` / `refining` / `vision_confirmed`
+        三种会话态同等对待，`refining` 只是用户点开切片进入精修、不代表边界不可信），
+        禁止因入点仍是 coarse 而必然为 true 的聚合标记
+        （`broadcast_review_required` / `boundary_review_required`）把整条切片锁成
+        「必须逐条人工确认才能导出」。被拒终态人工确认也不复活；未定稿出点仍需确认。
+        守卫：`tests/test_broadcast_export_gate_parity.py`（两端 `_BROADCAST_VALID_END_BY` 集合相等）。
+    *   **导出权威的寿命与可辨性（2026-09-11，现场 20:45 事故）**：任务态 pop 与用户导出
+        相隔 1 秒时，权威会回落到可能更旧的分析 sidecar，把已定稿切片改回 `pending_lookahead`
+        后按「未确认」跳过。三条硬约束：① 收尾任务态 pop 前必须 `_preserve_authority_snapshot()`
+        留下 `listed_clips + rejected_round_keys + recording_id`（新 epoch / 删房清除）；
+        ② 扫描通路的审计终态必须经 `_project_scan_audit_terminals()` 补进 durable 账本
+        （否则 `accepted/rejected` 与收尾 sidecar 缺条目）；③ 跳过必须带结构化 `reason_code`
+        （`END_NOT_FINAL` / `NEVER_AUDITED` / `NO_EXCLUSION_EVIDENCE` / `NOT_IN_AUTHORITY` / `REJECTED`），
+        响应给逐条 `skipped` 明细。⚠️ `register_jianying_handlers` 必须注入三个注册表
+        （`continuous_tasks` / `analysis_jobs` / `authority_snapshots`）——不注入时它们是各模块的
+        空 dict，权威补全静默失效（历史上一直如此）。夹具与改前/改后对照：
+        `tests/fixtures/broadcast_export_case_20260911_2045/`、`tests/test_broadcast_export_authority_lifetime.py`、
+        `docs/reports/broadcast-draft-silent-drop-plan-20260911.md`。
+    *   **结算横幅保留（2026-09-10）**：常规赛事候选的视觉审计若将出点从 OCR 粗边界
+        向前截回至 Replay/non-game 转场首帧，须保留 `2.5s` 的 ROUND WIN/THRIFTY
+        结算展示尾巴。只有“假 `next_prep` 被否决后向后延长”的候选不加此尾巴，
+        避免带入真实选手席或 Replay。候选必须分别输出 `start_quality/end_quality`
+        与 `start_review_required/end_review_required`，禁止只用一个聚合布尔值删除整条切片。
     *   **精修结果可靠交付（2026-09-08）**：`accepted` / `manual_review` 终态必须先
         写入 `refine_result_queue`（以 `room_id + recording_id + round_key` 幂等），再从
         `broadcast_pending_rounds` 删除；收尾 sidecar 同步持久化该队列。主循环消费并合并
@@ -599,29 +656,77 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 
 *   `ControlBar` / `timelineView` 计算 `windowStart`、`displayCurrent`、进度条位置时，`elapsed` **只**允许使用与播放头同一轴的时间（common 或 preview）。
 *   **禁止**用 `record_started_at` 墙钟差或 `recorded_duration` 直接参与 `windowStart`（会导致录制已久、预览较晚时播放头被钳到 0%）。
-*   高频播放头同步也必须遵守同一轴契约：`preview_local` 写入时间线前，单房录制轴须先经 `previewToRecordingLocal` 转换；`recording_review` 则直接使用录制文件轴，禁止把原始 MSE `currentTime` 覆盖回显示轴。
+*   高频播放头同步也必须遵守同一轴契约：`preview_local` 写入时间线前，单房录制轴须先经 `previewToRecordingLocal` 转换；`recording_review`（本地文件回看）则使用"文件原始 PTS + 带符号轴偏移"（`review_offset_sec`，通常为负）换算到录制轴，禁止把原始 MSE `currentTime` 覆盖回显示轴（详见 §8.8）。
+*   **单房 AI 切片轴一致性（2026-09-10）**：没有 `TimelineContext` 时，只要房间正在录制或已有
+    录制文件，控制栏统一显示 `recording_local`。AI 切片 `start/end`、时间线块和导出参数均保持
+    录制轴；点击、拖动和播放器 seek 必须分别通过 `recordingToPreviewLocal` /
+    `previewToRecordingLocal` 往返转换，禁止将录制秒直接写入 MSE `currentTime`。赛事 provisional
+    候选在后台仍可能 upsert，未完成视觉审计或仍要求复核时不得直接导出；导出确认必须按
+    `room_id + round_key` 重新读取最新边界，禁止提交弹窗打开时冻结的旧版本。
+*   **剪映草稿终态门禁（2026-09-10）**：草稿必须等所有目标房间停止录制并取得
+    最终 `output_path` 后才可生成；房间仍在录制或路径含 `_录制中` / `_in_progress`
+    时返回 `recording_not_finalized`，禁止生成随后素材离线的草稿。请求 `include_clips=true`
+    且实际可用切片为 0 时必须返回 `no_usable_clips`，不得将仅有整段录像轨的
+    草稿伪报为切片草稿成功。已具备 `end_quality=precise` 且通过赛事视觉审计的
+    候选可携带 coarse 入点进入自动草稿，但不因此放宽 MP4 自动导出门禁。
 
-### 8.8 Live/Review 双通道播放与回放契约（2026-09-06）
+### 8.8 本地文件回看与回到直播契约（方案 A，2026-09-11 取代 2026-09-06 双通道方案）
 
-为彻底解决文件回看重启直播流、公共轴击穿失效、播放器反复重置问题，系统采用 Live/Review 双通道隔离架构：
+> 旧实现（后端 `_review_streamers` + `review_session_id` + 按需 FFmpeg 转码 + 全局 2 路名额）已整体删除。
+> 它用「直播流的机制」承载「本地文件回看」（`-re` 读到 EOF、每次点击新起进程、状态三方共管无单一收口），
+> 直接导致「点回看卡一次、之后回不去直播」。现方案见 `docs/plans/scheme-a-local-file-review-20260911.md`。
 
-1.  **后端分频道管理**：
-    *   直播预览句柄与文件回看句柄物理隔离：`_preview_stream_registry` 管理直播流，`_review_streamers` 管理文件回看流（全局并发限制 ≤ 2）。
-    *   启动文件回看绝不停止正在录制与推流的 live preview sink。
-2.  **Epoch 严格拆分**：
-    *   `preview_epoch_id` 只代表直播预览流版本；文件回看拥有独立的 `review_session_id`。
-    *   进入或离开文件回看**严禁**调用 `_set_preview_epoch` 或 `TimelineService.on_preview_epoch_change`，公共轴与用户标记（`commonMarkIn`/`commonMarkOut`）全程受保护不失效。
-3.  **MSE 二进制帧双通道协议**：
-    *   v1 帧（`b'MSE'`）：默认直播流媒体分片。
-    *   v2 帧（`b'MS2'`）：携带 `channel`（`0=live`, `1=review`）与 `stream_id`（epoch 或 session_id）。前端精准路由，旧 session 迟到分片自动丢弃。
-4.  **前端双播放器叠放**：
-    *   `VideoPreview` 同时维护 `livePlayer` 与按需创建的 `reviewPlayer` 两个实例。
-    *   切入回看仅切换激活通道（可见性与静音控制），不调用 `disposePlayerFully`，后台 `livePlayer` 持续收流更新缓冲。
-    *   Web Audio 对齐仅采样 `liveVideo`，保证录制同步不受文件回看音频干扰。
-5.  **真实回放起点与回直播收敛**：
-    *   时间线“即时回放起点”严格取 LivePlayer 真实连续 `buffered.start` 映射到显示轴（右侧可即时无缝回看；更早录制区域为需加载文件回看）。
-    *   回放起点标签在进入回看时保持稳定，不跳变到 0s 基座。
-    *   “回到直播”单一收口于 `enterTimelineLive`，健康 live sink 下零 `enable_preview` 请求，直接切回直播沿。
+1.  **回看 = 本地文件播放，不经后端流**：
+    *   渲染进程按字节读取录制文件（`local-media:info/read` IPC + 主进程白名单/扩展名校验），
+      用 `Fmp4BoxSplitter` 切成 init/media 段后直喂 `MsePlayer`。**不启动任何 FFmpeg**，
+      无 review 会话/epoch/窗口/并发名额 ⇒ 不存在驱逐、EOF 常驻进程与"回不去"的残留状态。
+    *   数据源：`dvr_output_path`（`.dvr.mp4` 镜像）优先，缺失时回退 `record_output_path`。
+      **⚠️ 实测现状（2026-09-11）**：镜像只在 legacy `lsc/recorder/capture.py` 路径实现，
+      当前 V2 录制走 `lsc/core/services/shared_ingest.py`（无镜像输出）⇒ `dvr_output_path` 恒为空串，
+      回看源实际**永远是 `record_output_path`**。这仍然可用：V2 主录制本身就是
+      `frag_keyframe+empty_moov+default_base_moof`（moov 一次写定、边录边可解析），
+      与镜像格式一致。改 V2 主输出的 `-movflags` 前必须重新评估回看与 OCR 抽帧。
+    *   白名单：主进程启动读 `settings.json.output_dir`；全新环境无该文件时，前端用**后端下发的
+      房间录制路径所在目录**调 `local-media:allow-root` 自举（`ensureLocalMediaRoot`）。
+2.  **通道状态单一权威（前端 store）**：`uiState[roomId]` 持有
+    `preview_channel / review_path / review_seek_sec / review_offset_sec / review_feeding / review_error`；
+    `rooms_updated` 整表替换**禁止覆盖**，本地回看激活期间 `setRooms` 强制
+    `preview_mode='recording_review'` + `preview_review_start_sec=review_offset_sec`。
+    后端**不得**再引入任何 review 会话字段（`RoomSession` 已删 `active_preview_channel /
+    review_session_id / review_start_sec / review_window_end_sec / preview_review_start_sec`）。
+3.  **轴语义（关键）**：回看播放器喂入**文件原始 PTS**（无 `-start_at_zero` 归一化），故
+    `review_offset_sec` 通常为**负值**（流基座很大）：
+    `recordingAxis = reviewPlayer.currentTime + review_offset_sec`，**禁止 `Math.max(0, …)`**。
+    消费方：`ControlBar/RoomCard.reviewStartSec`、`usePlayheadSampling`、`timelineViewModel`、
+    `resolveReviewSeekEdge`，以及 `handleTimelineSeek/ScrubEnd/SeekByDelta/拖拽标记`
+    （统一走 `reviewPlayerTimeFor(rid, 录制轴秒)` 换算）。
+    **播放头 scrubOverride 也必须同轴**：`mseSeek` 进回看时写的是**录制轴**目标
+    （不是调用方给的预览轴值），`usePlayheadSampling` 比较前把播放器时间换算到录制轴
+    （`t + preview_review_start_sec`）。两处不同轴会让 `|t - override| < 0.35s` 的释放条件
+    永不满足，播放头被钉死在进入位置（实测 9 分钟不动、画面却在前进而时间线不动）。
+    对齐（`commonMode`）下的回看还要走 `recordingToCommon`，不得直接 `previewToCommon`。
+4.  **预热切换**：`reviewVisible = isReviewActive && (review_feeding || 播放/暂停态)`；
+    首帧到达前 live 画面保持可见，仅显示「正在准备回看…」轻提示 ⇒ 消除点击回看的黑屏空窗。
+    `window.__msePlayers[roomId]` 的 `player` 指向**当前通道**播放器、`live` 恒为直播播放器；
+    WebSocket 分片只投 `live`，回看数据由本地读取器直喂。
+5.  **回到直播单一收口**：`enterTimelineLive` —— 回看房间执行 `exitReview`（纯前端复位）后对
+    `registry[roomId].live` 调 `goLive()`；live sink 在回看期间保持运行，故**零 `enable_preview`** 回直播沿。
+    `handleGoLive` 不得对回看房间提前 return；`ControlBar.goLiveDisabled` 仅
+    `preview_mode==='degraded' && !is_recording` 时为真。关闭预览/删除/断开/刷新预览都必须显式 `exitReview`。
+6.  **离线退化（degraded）**：主播下线或录制文件无效时只做「停直播 sink + `preview_mode='degraded'` + 广播」，
+    **不启动任何文件流**；前端凭 `degraded` + 本地录制路径改走本地回看。
+7.  **回看失败出口与 EOF 语义（2026-09-11 补）**：
+    *   回看失败用底部「回看不可用 + 原因 + 回到直播」条，**不得**复用直播的全屏错误遮罩
+      （遮罩取的是直播侧错误槽，实测显示无信息量的「预览不可用」并盖住仍在正常播放的直播画面）；
+      播放器与回看源的错误都必须写进 `uiState[roomId].review_error`（只写组件本地 state 会不可见）。
+    *   回看通道必须在生命周期点留日志（启动/首帧/播放器错误/源错误/读到末尾）：此前
+      `debug:false` 的 `MsePlayer` 与回看源几乎不输出，故障现场无法还原。
+    *   文件源读到末尾时调 `MsePlayer.markEndOfStream()`：之后缓冲不再增长属**正常结束**，
+      停在末尾等待用户操作，禁止判成「直播流连接中断」或强制 seek 回缓冲起点重播
+      （`_bufferStallTimeoutMs` 的 8s 饥饿判定只对直播流成立）。
+8.  **禁止项**：不得恢复 `_review_streamers`/`start_recording_review` 语义（这两个 WS 消息保留为返回
+    `deprecated: use local file playback` 的声明式桩）；不得让 `registry.player` 承担通道切换以外的语义；
+    不得在前端为回看再引入任何需要后端复位的状态。
 
 ---
 
