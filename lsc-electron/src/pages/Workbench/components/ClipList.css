@@ -268,3 +268,20 @@ html:not(.dark) .clip-list-v2 .seg-mini button.on {
   color: var(--brand-400, #4dc4bf);
   flex-shrink: 0;
 }
+
+/* 导出状态标签：待审计(蓝) / 需确认(琥珀) / 已排除(红) / 不可导出(灰红) */
+.clip-row-v2__tag--pending {
+  color: #3f83f8;
+  background: rgba(63, 131, 248, 0.14);
+}
+
+.clip-row-v2__tag--confirm {
+  color: var(--state-warning-on-surface, #ff9f0a);
+  background: rgba(255, 159, 10, 0.14);
+}
+
+.clip-row-v2__tag--rejected,
+.clip-row-v2__tag--blocked {
+  color: var(--state-error-on-surface, #ff453a);
+  background: rgba(255, 69, 58, 0.14);
+}

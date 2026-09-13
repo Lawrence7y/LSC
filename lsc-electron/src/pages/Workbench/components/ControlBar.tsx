@@ -15,7 +15,7 @@ import {
 } from '@ant-design/icons'
 import { RoomSession, ClipSegment, TimelineHighlightBand, ContinuousAnalysisStatus, TimelineProgressSummary } from '@/types'
 import type { TimelineAlignStatus } from '@/utils/timelineCoords'
-import { computeRecordedDurationHint, isNoDvrPreviewMode, isRecordingReviewMode, previewToRecordingLocal, resolveLiveContentSpan, resolveRecordingReviewSpan, summarizeTimelineProgress } from '@/utils/timelineCoords'
+import { computeRecordedDurationHint, isRecordingReviewMode, previewToRecordingLocal, resolveLiveContentSpan, resolveRecordingReviewSpan, summarizeTimelineProgress } from '@/utils/timelineCoords'
 import { computeTimelineWindow } from '@/utils/timelineWindow'
 import { Timeline, type TimelineBufferedRange } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
@@ -223,7 +223,8 @@ export const ControlBar = memo(function ControlBar({
 }: ControlBarProps) {
   const { t } = useI18n()
   const isRecordingReview = isRecordingReviewMode(room?.preview_mode)
-  const goLiveDisabled = isNoDvrPreviewMode(room?.preview_mode) && !room?.is_recording
+  // 本地回看态可以随时回到直播；只有主播离线退化（degraded）才没有实时沿可跳
+  const goLiveDisabled = room?.preview_mode === 'degraded' && !room?.is_recording
   const [isEditingTime, setIsEditingTime] = useState(false)
   // 录制中时每秒刷新一次时间显示，非录制时不触发
   const [tick, setTick] = useState(0)
@@ -236,8 +237,9 @@ export const ControlBar = memo(function ControlBar({
   // 单房间录制态时间线以 recording_local 为显示轴；MSE currentTime 仍是
   // preview_local，因此播放头和标记需要转换后再交给 Timeline 渲染。
   const localRecordingAxis = !timelineView && (axis === 'recording' || axis === 'recording_review')
+  // 回看轴偏移带符号（本地文件原始 PTS 基座）+ 播放头 → 录制轴
   const reviewStartSec = isRecordingReview
-    ? Math.max(0, Number(room?.preview_review_start_sec) || 0)
+    ? (Number(room?.preview_review_start_sec) || 0)
     : 0
   const localPlayhead = localRecordingAxis
     ? isRecordingReview

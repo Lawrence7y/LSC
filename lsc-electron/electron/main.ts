@@ -5,6 +5,7 @@ import https from 'https'
 import { createHash, randomBytes } from 'crypto'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { extractBackendWsUrl } from './backendUrl'
+import { MAX_READ_LENGTH, normalizeRoot, parseReadRequest, resolveAllowedMediaPath } from './localMedia'
 
 // ===== EPIPE 防护：stdout/stderr 管道断裂时不崩溃 =====
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
@@ -1172,6 +1173,161 @@ function _isSafePath(p: string): boolean {
   return true
 }
 
+
+// ===== 本地媒体文件读取 IPC（方案 A §3.1：回看直接读本地录制文件，不经后端流）=====
+
+/** 允许渲染进程按字节读取的媒体根目录白名单（模块级，启动时从 settings.json 加载 + allow-root 追加）。 */
+const localMediaRoots = new Set<string>()
+
+/** settings.json 的候选位置（与 _readJianyingDraftDirFromSettings 用同一套项目根解析口径）。 */
+function getProjectSettingsCandidates(): string[] {
+  const backendDir = getBackendDir()
+  return [
+    path.join(process.cwd(), 'settings.json'),
+    path.join(app.getPath('userData'), 'settings.json'),
+    path.join(backendDir, 'settings.json'),
+    path.join(backendDir, '..', 'settings.json'),
+  ]
+}
+
+/** 展开 ~ 家目录前缀（settings.json 的 output_dir 允许写 ~/LSC/output）。 */
+function expandHomePath(p: string): string {
+  const trimmed = p.trim()
+  if (!trimmed.startsWith('~')) return trimmed
+  try {
+    // path.join 会吞掉后续片段的前导分隔符，故 ~/LSC/output 与 ~\LSC\output 都能正确拼接
+    return path.join(app.getPath('home'), trimmed.slice(1))
+  } catch {
+    return trimmed
+  }
+}
+
+/**
+ * 启动时把项目根 settings.json 的 output_dir 加入本地媒体白名单。
+ * 找不到 settings.json 或没有 output_dir 一律静默忽略，绝不阻塞启动。
+ */
+function loadLocalMediaRootsFromSettings(): void {
+  let found = false
+  try {
+    for (const settingsPath of getProjectSettingsCandidates()) {
+      if (!fs.existsSync(settingsPath)) continue
+      let parsed: any
+      try {
+        parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+      } catch (err) {
+        appLog('WARN', 'LocalMedia', 'settings.json 解析失败（已跳过）: ' + settingsPath + ' ' + err)
+        continue
+      }
+      const outputDir = typeof parsed?.output_dir === 'string' ? parsed.output_dir.trim() : ''
+      if (!outputDir) continue
+      // 相对值按「settings.json 自身所在目录（= 项目根）」解析，绝不依赖进程 cwd
+      const root = normalizeRoot(path.resolve(path.dirname(settingsPath), expandHomePath(outputDir)))
+      if (!root) continue
+      localMediaRoots.add(root)
+      found = true
+      appLog('INFO', 'LocalMedia', '本地媒体白名单已加入 output_dir: ' + root)
+    }
+  } catch (err) {
+    appLog('WARN', 'LocalMedia', '读取 output_dir 失败（已忽略）: ' + err)
+  }
+  if (!found) {
+    appLog('INFO', 'LocalMedia', '未从 settings.json 解析到 output_dir，本地媒体白名单为空（等待 allow-root 追加）')
+  }
+}
+
+function localMediaRootsList(): string[] {
+  return Array.from(localMediaRoots)
+}
+
+// 注册本地媒体读取 IPC（只在 whenReady 中调用一次）。四个通道全部返回对象，
+// 任何失败都以 { ok: false, error } 收口，绝不向渲染进程抛异常。
+function registerLocalMediaIpc(): void {
+  ipcMain.handle('local-media:roots', () => {
+    return { ok: true, roots: localMediaRootsList() }
+  })
+
+  ipcMain.handle('local-media:allow-root', (_event, args: { root?: unknown } | undefined) => {
+    try {
+      const raw = typeof args?.root === 'string' ? args.root.trim() : ''
+      if (!raw || !path.isAbsolute(raw)) {
+        return { ok: false, error: 'root 必须是非空绝对路径', roots: localMediaRootsList() }
+      }
+      const root = normalizeRoot(raw)
+      if (!root) {
+        return { ok: false, error: 'root 无法规范化', roots: localMediaRootsList() }
+      }
+      localMediaRoots.add(root)
+      appLog('INFO', 'LocalMedia', '本地媒体白名单追加根目录: ' + root)
+      return { ok: true, roots: localMediaRootsList() }
+    } catch (err) {
+      appLog('WARN', 'LocalMedia', '追加白名单根失败: ' + err)
+      return { ok: false, error: err instanceof Error ? err.message : String(err), roots: localMediaRootsList() }
+    }
+  })
+
+  ipcMain.handle('local-media:info', (_event, args: { path?: unknown } | undefined) => {
+    try {
+      const result = resolveAllowedMediaPath(typeof args?.path === 'string' ? args.path : '', localMediaRootsList())
+      if (!result.ok) {
+        appLog('WARN', 'LocalMedia', 'info 被拒绝: ' + result.error)
+        return { ok: false, size: 0, mtimeMs: 0, error: result.error }
+      }
+      const stat = fs.statSync(result.path)
+      return { ok: true, size: stat.size, mtimeMs: stat.mtimeMs }
+    } catch (err) {
+      appLog('WARN', 'LocalMedia', 'info 失败: ' + err)
+      return { ok: false, size: 0, mtimeMs: 0, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle(
+    'local-media:read',
+    async (_event, args: { path?: unknown; offset?: unknown; length?: unknown } | undefined) => {
+      let handle: Awaited<ReturnType<typeof fs.promises.open>> | null = null
+      try {
+        const request = parseReadRequest(args, MAX_READ_LENGTH)
+        if (!request.ok) {
+          return { ok: false, bytesRead: 0, size: 0, eof: true, error: request.error }
+        }
+        const result = resolveAllowedMediaPath(typeof args?.path === 'string' ? args.path : '', localMediaRootsList())
+        if (!result.ok) {
+          appLog('WARN', 'LocalMedia', 'read 被拒绝: ' + result.error)
+          return { ok: false, bytesRead: 0, size: 0, eof: true, error: result.error }
+        }
+        handle = await fs.promises.open(result.path, 'r')
+        const stat = await handle.stat()
+        const size = stat.size
+        // 只读「当前已知大小」之内的字节，避免在 EOF 附近为无数据区域分配大缓冲
+        const toRead = Math.min(request.length, Math.max(0, size - request.offset))
+        const tile = Buffer.allocUnsafe(toRead)
+        const { bytesRead } = await handle.read(tile, 0, toRead, request.offset)
+        // 拷贝出精确长度的独立 Uint8Array：Buffer 可能来自 node 内存池，
+        // 直接外传视图会把底层 ArrayBuffer 的额外字节一并交给渲染进程
+        const data = new Uint8Array(bytesRead)
+        if (bytesRead > 0) data.set(tile.subarray(0, bytesRead))
+        return {
+          ok: true,
+          bytesRead,
+          size,
+          eof: request.offset + bytesRead >= size,
+          data,
+        }
+      } catch (err) {
+        appLog('WARN', 'LocalMedia', 'read 失败: ' + err)
+        return { ok: false, bytesRead: 0, size: 0, eof: true, error: err instanceof Error ? err.message : String(err) }
+      } finally {
+        if (handle) {
+          try {
+            await handle.close()
+          } catch {
+            // 句柄已失效，忽略
+          }
+        }
+      }
+    },
+  )
+}
+
 // 注册窗口相关 IPC（只在 whenReady 中调用一次，避免 macOS activate 二次注册触发
 // "Attempted to register a second handler" 错误）
 function registerWindowIpc(): void {
@@ -1949,6 +2105,10 @@ async function finishGracefulAppQuit(reason: string): Promise<void> {
 
     // 注册窗口 IPC（只注册一次）
     registerWindowIpc()
+
+    // 本地媒体读取 IPC + 启动时把 settings.json 的 output_dir 加入白名单（方案 A §3.1）
+    registerLocalMediaIpc()
+    loadLocalMediaRootsFromSettings()
 
     // 注册依赖安装相关 IPC
     registerDependencyIpc()

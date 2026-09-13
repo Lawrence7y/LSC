@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   _cacheMseInit,
   _cacheMseSegment,
   clearMseRoomCache,
-  drainPendingMseReviewSegments,
   drainPendingMseSegments,
   getMseInitCache,
-  getMseReviewInitCache,
 } from './useWebSocket'
 
 function bufferOf(mb: number): ArrayBuffer {
@@ -58,9 +58,9 @@ describe('MSE cache bounds', () => {
     expect(kept).toBeLessThanOrEqual(20)
   })
 
-  it('drains review channel init and segments with session isolation', () => {
-    const roomId = 'room-review-test'
-    expect(getMseReviewInitCache(roomId)).toBeNull()
-    expect(drainPendingMseReviewSegments(roomId)).toEqual([])
+  it('方案 A：回看不再经 WebSocket 缓存（review 通道缓存已移除）', () => {
+    const source = readFileSync(join(process.cwd(), 'src/hooks/useWebSocket.ts'), 'utf-8')
+    expect(source).not.toContain('_mseReviewInitCache')
+    expect(source).not.toContain('_mseReviewSegmentCache')
   })
 })

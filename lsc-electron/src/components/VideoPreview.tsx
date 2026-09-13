@@ -3,12 +3,11 @@ import { LoadingOutlined, PlayCircleOutlined, PauseCircleOutlined } from '@ant-d
 import { MsePlayer, MsePlayerState } from '@/services/mediaSourcePlayer'
 import {
   clearMseRoomCache,
-  drainPendingMseReviewSegments,
   drainPendingMseSegments,
   getMseInitCache,
-  getMseReviewInitCache,
   wsClient,
 } from '@/hooks/useWebSocket'
+import { LocalFileMseSource } from '@/services/localFileMseSource'
 import { useAppStore } from '@/store/appStore'
 import { getAligner } from '@/utils/previewAudioAligner'
 import { isMuteSyncSuppressed, withMuteSyncSuppressed } from '@/utils/muteSyncGuard'
@@ -17,6 +16,15 @@ import {
   DEFAULT_TIMELINE_REPLAY_SECONDS,
   normalizeReplayBufferSeconds,
 } from '@/utils/replaySettings'
+
+/**
+ * 预览时钟重标定间隔（ms）。
+ *
+ * MSE 起播时对齐直播沿，但网络抖动会让播放头相对录制沿的偏移发生变化——
+ * delta 只在首播标定一次会长期漂移，使时间线显示与后端真实时刻错位。
+ * 60s 一次的低频重采样足以跟踪漂移，又不会造成可见的显示跳变。
+ */
+const PREVIEW_CLOCK_REFRESH_MS = 60_000
 
 interface VideoPreviewProps {
   /** Room ID for the video stream */
@@ -57,7 +65,6 @@ export function VideoPreview({
   const [state, setState] = useState<MsePlayerState>('idle')
   const [error, setError] = useState<string | null>(null)
   const [reviewState, setReviewState] = useState<MsePlayerState>('idle')
-  const [reviewError, setReviewError] = useState<string | null>(null)
   // 后端自动重连状态（从 uiState 读取，避免 rooms_updated 冲掉）
   const mseReconnecting = useAppStore(
     (s) => s.uiState[roomId]?.mse_reconnecting
@@ -84,13 +91,23 @@ export function VideoPreview({
       return r?.recording_media_start_mono ?? (r?.recording_start_mono ? Number(r.recording_start_mono) : undefined)
     },
   )
-  const activePreviewChannel = useAppStore(
-    (s) => s.rooms.find((r) => r.room_id === roomId)?.active_preview_channel,
-  )
-  const reviewSessionId = useAppStore(
-    (s) => s.rooms.find((r) => r.room_id === roomId)?.review_session_id,
-  )
-  const isReviewActive = (activePreviewChannel === 'review' || previewMode === 'recording_review') && Boolean(reviewSessionId)
+  // ── 本地文件回看通道（方案 A）：状态完全由前端 store 持有 ──
+  const reviewChannel = useAppStore((s) => s.uiState[roomId]?.preview_channel)
+  const reviewPath = useAppStore((s) => s.uiState[roomId]?.review_path)
+  const reviewSeekSec = useAppStore((s) => s.uiState[roomId]?.review_seek_sec)
+  const reviewFeeding = useAppStore((s) => s.uiState[roomId]?.review_feeding)
+  const reviewChannelError = useAppStore((s) => s.uiState[roomId]?.review_error)
+  const roomIsRecording = useAppStore((s) => s.rooms.find((r) => r.room_id === roomId)?.is_recording)
+  const roomReviewFallback = useAppStore((s) => {
+    const r = s.rooms.find((item) => item.room_id === roomId)
+    return r?.dvr_output_path || r?.record_output_path || ''
+  })
+  const enterReviewStore = useAppStore((s) => s.enterReview)
+  const setReviewFeedingStore = useAppStore((s) => s.setReviewFeeding)
+  const setReviewErrorStore = useAppStore((s) => s.setReviewError)
+  const setReviewOffsetStore = useAppStore((s) => s.setReviewOffset)
+  const exitReviewStore = useAppStore((s) => s.exitReview)
+  const isReviewActive = reviewChannel === 'review' && Boolean(reviewPath)
   const previewClockAcceptedRef = useRef<string | null>(null)
   const previewClockSampleEpochRef = useRef<number | null>(null)
   // 预览源切换（live ↔ recording_review / epoch 轮换）时递增，强制重建 MsePlayer
@@ -127,7 +144,7 @@ export function VideoPreview({
   // 直播 MSE 首次稳定播放后采集一次预览时钟样本。样本绑定 recording/preview
   // 两个 epoch；录制首帧校正或预览重建时依赖变化会自动重新采样。
   useEffect(() => {
-    if (!active || state !== 'playing' || (previewMode ?? 'live_mse') !== 'live_mse' || !recordingId) return
+    if (!active || state !== 'playing' || !recordingId) return
     const sampleKey = [
       previewEpochId || '',
       recordingId || '',
@@ -137,9 +154,11 @@ export function VideoPreview({
 
     let stopped = false
     let retryTimer: number | null = null
+    let refreshTimer: number | null = null
     const stop = () => {
       stopped = true
       if (retryTimer !== null) window.clearInterval(retryTimer)
+      if (refreshTimer !== null) window.clearInterval(refreshTimer)
       window.clearTimeout(initialTimer)
       window.clearTimeout(expiryTimer)
       unsubscribe()
@@ -166,7 +185,18 @@ export function VideoPreview({
         && (!data.preview_clock_epoch_id || !previewEpochId || data.preview_clock_epoch_id === previewEpochId)
       ) {
         previewClockAcceptedRef.current = sampleKey
-        stop()
+        // 首播标定成功后转入低频周期性重标定：预览缓冲深度会随网络抖动变化，
+        // 一次性标定得到的 delta 若长期不更新，`previewToRecordingLocal` 会与
+        // 画面逐渐错位（时间线显示的录制秒 ≠ 后端真实内容时刻）。
+        // 重标定失败不会改变后端已接受的 delta，因此是安全的。
+        if (retryTimer !== null) {
+          window.clearInterval(retryTimer)
+          retryTimer = null
+        }
+        if (refreshTimer === null) {
+          refreshTimer = window.setInterval(report, PREVIEW_CLOCK_REFRESH_MS)
+        }
+        window.clearTimeout(expiryTimer)
       }
     })
     const initialTimer = window.setTimeout(() => {
@@ -232,25 +262,16 @@ export function VideoPreview({
     }, 3000)
   }, [retrying, cleanupPlayer, roomId])
 
-  // Feed init segment to player (双通道路由)
+  // WebSocket 分片只属于直播通道：回看由本地文件读取器直接喂入，不再经 WS 路由。
   const feedInit = useCallback((data: ArrayBuffer) => {
     hasReceivedDataRef.current = true
-    if (isReviewActive && reviewPlayerRef.current) {
-      reviewPlayerRef.current.feedInit(data)
-    } else {
-      playerRef.current?.feedInit(data)
-    }
-  }, [isReviewActive])
+    playerRef.current?.feedInit(data)
+  }, [])
 
-  // Feed media segment to player (双通道路由)
   const feedMedia = useCallback((data: ArrayBuffer) => {
     hasReceivedDataRef.current = true
-    if (isReviewActive && reviewPlayerRef.current) {
-      reviewPlayerRef.current.feedMedia(data)
-    } else {
-      playerRef.current?.feedMedia(data)
-    }
-  }, [isReviewActive])
+    playerRef.current?.feedMedia(data)
+  }, [])
 
   // 预览源切换：直播 preview_epoch_id 真正变化时重建 LivePlayer；
   // recording_review 由独立的 reviewPlayer 处理，切换 mode 不会销毁 LivePlayer。
@@ -326,7 +347,8 @@ export function VideoPreview({
       replayBufferSeconds: normalizeReplayBufferSeconds(
         replayBufferSeconds ?? DEFAULT_TIMELINE_REPLAY_SECONDS,
       ),
-      isFile: previewMode === 'recording_review',
+      // 直播播放器始终按直播流处理：文件回看由独立 ReviewPlayer 承载
+      isFile: false,
       debug: false,
       onStateChange: (newState) => {
         setState(newState)
@@ -574,76 +596,109 @@ export function VideoPreview({
     return () => video.removeEventListener('volumechange', handleVolumeChange)
   }, [active, roomId])
 
-  // 录制文件回看独立播放器管理（C-01/C-03）
+  // 本地文件回看通道（方案 A）：读取本地录制文件 → fMP4 切分 → MSE。
+  // 无后端流进程、无会话/epoch；切换或再次 seek 时整体重建播放器与读取器，
+  // 保证 MSE 时间轴从目标位置起单调连续。
   useEffect(() => {
-    if (!active || !isReviewActive || !reviewVideoRef.current || !reviewSessionId) {
-      if (reviewPlayerRef.current) {
-        reviewPlayerRef.current.stop()
-        reviewPlayerRef.current = null
-      }
+    const revVideo = reviewVideoRef.current
+    const clearRegistry = () => {
       const registry = window.__msePlayers || {}
       if (registry[roomId]) {
         registry[roomId].review = null
         registry[roomId].player = playerRef.current
       }
-      setReviewState('idle')
-      setReviewError(null)
-      return
     }
-
-    if (!reviewPlayerRef.current || reviewPlayerRef.current.sessionId !== reviewSessionId) {
+    if (!active || !isReviewActive || !revVideo || !reviewPath) {
       if (reviewPlayerRef.current) {
         reviewPlayerRef.current.stop()
         reviewPlayerRef.current = null
       }
-      const revPlayer = new MsePlayer({
-        videoElement: reviewVideoRef.current,
-        channel: 'review',
-        sessionId: reviewSessionId,
-        isFile: true,
-        replayBufferSeconds: 60,
-        debug: false,
-        onStateChange: (s) => setReviewState(s),
-        onError: (err) => setReviewError(err),
-      })
-      revPlayer.start('')
-      reviewPlayerRef.current = revPlayer
+      clearRegistry()
+      setReviewState('idle')
+      setReviewErrorStore(roomId, undefined)
+      return
+    }
 
-      // 1. 立即更新全局注册表，确保后续 WS 帧能命中 review player
-      const registry = window.__msePlayers || {}
-      registry[roomId] = {
-        ...(registry[roomId] || {}),
-        player: revPlayer,
-        review: revPlayer,
-        live: playerRef.current,
-        feedInit,
-        feedMedia,
-      }
-      window.__msePlayers = registry
+    setReviewFeedingStore(roomId, false)
+    setReviewErrorStore(roomId, undefined)
 
-      // 2. 补喂已缓存的 review init 段，消除早到竞态
-      const cachedRevInit = getMseReviewInitCache(roomId, reviewSessionId)
-      if (cachedRevInit) {
-        revPlayer.feedInit(cachedRevInit)
-      } else {
-        sendRef.current('request_mse_init', { room_id: roomId, channel: 'review' })
-      }
+    // 回看通道此前除"目标越界"外没有任何日志，故障时只能看到 UI 上一个
+    // 无信息量的「预览不可用」。这四个生命周期点足够把现场还原出来。
+    console.info(
+      `[VideoPreview] 回看启动: room=${roomId} target=${(reviewSeekSec ?? 0).toFixed(1)}s `
+      + `follow=${Boolean(roomIsRecording)} path=${reviewPath}`,
+    )
 
-      // 3. 回放已排队的 review media 段
-      const pendingRevSegments = drainPendingMseReviewSegments(roomId, reviewSessionId)
-      if (pendingRevSegments.length > 0) {
-        setTimeout(() => {
-          pendingRevSegments.forEach((buf) => {
-            try {
-              revPlayer.feedMedia(buf)
-            } catch (e) {
-              console.warn(`[VideoPreview] drain pending review segment failed for ${roomId}:`, e)
-            }
-          })
-        }, 0)
+    const revPlayer = new MsePlayer({
+      videoElement: revVideo,
+      channel: 'review',
+      isFile: true,
+      replayBufferSeconds: 60,
+      debug: false,
+      onStateChange: (s) => setReviewState(s),
+      onError: (err) => {
+        // 播放器错误同样要写进 store：底部「回看不可用 + 原因」条只认 store，
+        // 回看模式不再复用直播的全屏错误遮罩，只写本地 state 会让错误不可见。
+        console.warn(`[VideoPreview] 回看播放器错误: room=${roomId} ${err}`)
+        setReviewErrorStore(roomId, err)
+      },
+    })
+    revPlayer.start('')
+    reviewPlayerRef.current = revPlayer
+
+    // 注册表：review 通道激活期间 player 指向回看播放器，live 始终单独保留
+    const registry = window.__msePlayers || {}
+    registry[roomId] = {
+      ...(registry[roomId] || {}),
+      player: revPlayer,
+      review: revPlayer,
+      live: playerRef.current,
+      feedInit,
+      feedMedia,
+    }
+    window.__msePlayers = registry
+
+    const previousOffset = useAppStore.getState().uiState[roomId]?.review_offset_sec
+    const source = new LocalFileMseSource({
+      path: reviewPath,
+      player: revPlayer,
+      startAxisSec: reviewSeekSec ?? 0,
+      // 同一录制文件上次测得的轴偏移可跳过头部扫描；读取器会自行校验提示值
+      axisOffsetHintSec: previousOffset ?? undefined,
+      // 录制中文件持续增长：追增；录制已停止则读到末尾收尾
+      follow: Boolean(roomIsRecording),
+      onFirstMedia: () => {
+        console.info(`[VideoPreview] 回看首帧已喂入: room=${roomId}`)
+        setReviewFeedingStore(roomId, true)
+      },
+      onIndex: ({ axisOffsetSec, targetClamped }) => {
+        setReviewOffsetStore(roomId, axisOffsetSec)
+        if (targetClamped) {
+          console.warn(`[VideoPreview] ${roomId} 回看目标超出已录制范围，已从最新可读位置起播`)
+        }
+      },
+      onError: (msg) => {
+        console.warn(`[VideoPreview] 回看源错误: room=${roomId} ${msg}`)
+        setReviewErrorStore(roomId, msg)
+        // 录制归档/改名后旧路径失效：按房间最新路径重进回看
+        if (roomReviewFallback && roomReviewFallback !== reviewPath) {
+          enterReviewStore(roomId, { path: roomReviewFallback, seekSec: reviewSeekSec ?? 0 })
+        }
+      },
+    })
+    source.start()
+
+    return () => {
+      source.dispose()
+      revPlayer.stop()
+      if (reviewPlayerRef.current === revPlayer) reviewPlayerRef.current = null
+      const current = window.__msePlayers || {}
+      if (current[roomId]?.review === revPlayer) {
+        current[roomId].review = null
+        current[roomId].player = playerRef.current
       }
     }
-  }, [active, isReviewActive, reviewSessionId, roomId, feedInit, feedMedia])
+  }, [active, isReviewActive, reviewPath, reviewSeekSec, roomId, roomIsRecording])
 
   // 回看视频元素静音同步
   useEffect(() => {
@@ -663,16 +718,31 @@ export function VideoPreview({
     return () => v.removeEventListener('volumechange', onVol)
   }, [active, isReviewActive])
 
-  const showError = (isReviewActive ? (reviewState === 'error' || reviewError) : (state === 'error' || error))
+  /**
+   * 预热切换：回看通道**首帧到达前保持直播画面可见**，
+   * 因此点击回看不再出现"黑屏卡一次"；只有回看真正出画后才隐藏 live。
+   */
+  const reviewVisible = isReviewActive && (Boolean(reviewFeeding) || reviewState === 'playing' || reviewState === 'paused')
+  /** 回看正在定位/启动（此时仍显示直播画面） */
+  const reviewPreparing = isReviewActive && !reviewVisible && !reviewChannelError
+  /**
+   * 回看通道有独立失败出口（底部「回看不可用 + 原因 + 回到直播」条），
+   * 不复用直播的全屏错误遮罩：否则回看失败会把仍在正常播放的直播画面
+   * 整屏盖住，且遮罩文案取的是直播侧错误槽（实测显示无信息量的「预览不可用」）。
+   */
+  const showError = isReviewActive
+    ? false
+    : (state === 'error' || Boolean(error))
   const showIdle = state === 'idle'
   // 暂停态是用户主动操作，不算"未出画"：不得显示"正在拉流/转码…"
   const isPaused = state === 'paused'
-  // 预览已启用但尚未出画（拉流/转码中）
+  // 预览已启用但尚未出画（拉流/转码中）——回看可见时不显示直播的启动遮罩
   const showStarting =
     active &&
     !mseReconnecting &&
     !showError &&
     !isPaused &&
+    !reviewVisible &&
     state !== 'playing'
 
   // 阶段进度文案：首次刷新流地址可能需要等待上游解析完成
@@ -711,7 +781,7 @@ export function VideoPreview({
         style={{
           width: '100%',
           height: '100%',
-          display: isReviewActive ? 'none' : (state === 'idle' ? 'none' : 'block'),
+          display: reviewVisible ? 'none' : (state === 'idle' ? 'none' : 'block'),
           objectFit: 'contain',
           background: '#000',
           willChange: 'transform',
@@ -728,7 +798,7 @@ export function VideoPreview({
         style={{
           width: '100%',
           height: '100%',
-          display: isReviewActive ? (reviewState === 'idle' ? 'none' : 'block') : 'none',
+          display: reviewVisible ? 'block' : 'none',
           objectFit: 'contain',
           background: '#000',
           willChange: 'transform',
@@ -781,6 +851,67 @@ export function VideoPreview({
         >
           <PauseCircleOutlined style={{ fontSize: 13, color: 'var(--text-secondary)' }} />
           <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{t('已暂停')}</span>
+        </div>
+      )}
+
+      {/* 回看定位中：直播画面保持可见，仅顶部轻提示（预热切换，不再黑屏） */}
+      {reviewPreparing && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 8,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            background: 'rgba(0, 0, 0, 0.55)',
+            backdropFilter: 'blur(6px)',
+            borderRadius: 999,
+            padding: '3px 10px',
+            zIndex: 3,
+            pointerEvents: 'none',
+          }}
+        >
+          <LoadingOutlined style={{ fontSize: 13, color: 'var(--brand-500)' }} />
+          <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{t('正在准备回看…')}</span>
+        </div>
+      )}
+
+      {/* 回看通道不可用（文件缺失/改名中）：提示并允许一键回到直播 */}
+      {isReviewActive && !reviewVisible && reviewChannelError && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 8,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            background: 'rgba(0, 0, 0, 0.72)',
+            backdropFilter: 'blur(6px)',
+            borderRadius: 999,
+            padding: '4px 10px',
+            zIndex: 4,
+          }}
+        >
+          <span style={{ fontSize: 11, color: 'var(--state-warning)' }}>{t('回看不可用')}</span>
+          <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{reviewChannelError}</span>
+          <button
+            onClick={() => exitReviewStore(roomId)}
+            style={{
+              fontSize: 11,
+              padding: '1px 8px',
+              borderRadius: 999,
+              border: 'none',
+              cursor: 'pointer',
+              background: 'var(--brand-500)',
+              color: 'var(--overlay-text, #f5f5f7)',
+            }}
+          >
+            {t('回到直播')}
+          </button>
         </div>
       )}
 

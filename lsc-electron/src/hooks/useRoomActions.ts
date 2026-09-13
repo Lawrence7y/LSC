@@ -112,6 +112,10 @@ export function useRoomActions(opts: {
   }, [modal, handleStopRecord])
 
   const handleTogglePreview = useCallback((roomId: string, enabled: boolean) => {
+    if (!enabled) {
+      // 本地回看通道由前端持有：关闭预览时必须一并退出，避免残留一个无源的"回看中"卡片
+      useAppStore.getState().exitReview(roomId)
+    }
     if (enabled) {
       const activePreviews = useAppStore.getState().rooms
         .filter(r => r.preview_enabled && r.room_id !== roomId).length
@@ -151,6 +155,7 @@ export function useRoomActions(opts: {
       if (isRecording) {
         send('stop_recording', { room_id: roomId })
       }
+      useAppStore.getState().exitReview(roomId)
       if (room?.preview_enabled) {
         send('enable_preview', { room_id: roomId, enabled: false, mode: 'mse' })
       }
@@ -186,6 +191,7 @@ export function useRoomActions(opts: {
       if (room?.is_recording) {
         send('stop_recording', { room_id: roomId })
       }
+      useAppStore.getState().exitReview(roomId)
       if (room?.preview_enabled) {
         send('enable_preview', { room_id: roomId, enabled: false, mode: 'mse' })
       }

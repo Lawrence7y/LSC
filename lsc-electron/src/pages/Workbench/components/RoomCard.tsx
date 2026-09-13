@@ -341,8 +341,9 @@ export const RoomCard = memo(function RoomCard({
   const configuredReplaySeconds = useAppStore((state) => state.settings.timeline_replay_seconds)
   const replayBufferSeconds = normalizeReplayBufferSeconds(configuredReplaySeconds)
   const isLivePreview = !isNoDvrPreviewMode(room.preview_mode)
+  // 回看轴偏移带符号（本地文件原始 PTS 基座）+ 播放头，换算回录制轴
   const reviewStartSec = isRecordingReview
-    ? Math.max(0, Number(room.preview_review_start_sec) || 0)
+    ? (Number(room.preview_review_start_sec) || 0)
     : 0
   const supportsLiveDvr = isLivePreview && replayBufferSeconds > 0
   const expandedWindow = expandedWindowFromVideo({
@@ -556,22 +557,10 @@ export const RoomCard = memo(function RoomCard({
     <Card
       hoverable
       onClick={(e) => onSelect(room.room_id, e)}
-      className={`room-card${isExpanded ? ' room-card--expanded' : ''}${room.is_recording ? ' room-card--recording' : ''}`}
+      className={`room-card${isExpanded ? ' room-card--expanded' : ''}${room.is_recording ? ' room-card--recording' : ''}${selected ? ' room-card--selected' : ''}${multiSelected ? ' room-card--multiselected' : ''}${isLive ? ' room-card--live' : ''}`}
       style={{
         background: selected ? 'var(--surface-2)' : 'var(--surface-1)',
-        borderRadius: 'var(--radius-sm, 8px)',
-        border: multiSelected
-          ? '1px solid var(--brand-400)'
-          : selected
-            ? '1px solid var(--brand-500)'
-            : '1px solid var(--border-hairline)',
-        boxShadow: multiSelected
-          ? '0 0 0 1px var(--brand-400), 0 2px 10px rgba(49, 179, 174, 0.18)'
-          : selected
-          ? '0 0 0 1px var(--brand-500), 0 2px 14px rgba(49, 179, 174, 0.22)'
-          : 'var(--shadow-sm)',
         cursor: 'pointer',
-        overflow: 'hidden',
       }}
       styles={{ body: { padding: '10px 12px 12px' } }}
     >
@@ -857,9 +846,9 @@ export const RoomCard = memo(function RoomCard({
                 {hasLiveDvrRange && (
                   <div
                     className="room-card__expanded-replay-info"
-                    title={t('左侧时间是绝对时间点；设置回看是时长，当前可用时长受实际 MSE 缓冲限制')}
+                    title={t('左侧时间是绝对时间点；设置回看是时长；早于 MSE 缓冲的部分会切换到录制文件回看')}
                   >
-                    {t('回看设置 {configured} · 当前可用 {available}', {
+                    {t('回看设置 {configured} · 时间线范围 {available}', {
                       configured: formatTime(expandedWindow.configuredReplaySeconds),
                       available: formatTime(expandedWindow.availableReplaySeconds),
                     })}
@@ -1069,7 +1058,7 @@ export const RoomCard = memo(function RoomCard({
           </div>
         )}
       
-        {/* 录制中指示条（脉冲动画提示录制进行中） */}
+        {/* 录制中指示条 */}
         {room.is_recording && (
           <div
             className="room-card-recording-bar"
@@ -1080,7 +1069,7 @@ export const RoomCard = memo(function RoomCard({
               right: 0,
               height: 2,
               width: '100%',
-              background: 'var(--brand-500)',
+              background: 'var(--state-error, #ff453a)',
               zIndex: 4,
             }}
           />

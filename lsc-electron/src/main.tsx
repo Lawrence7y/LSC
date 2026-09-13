@@ -3,7 +3,11 @@ import ReactDOM from 'react-dom/client'
 import App from './App'
 import { getLocale, setLocale } from './i18n'
 import { useAppStore } from './store/appStore'
+import { installIslandMessageBridge } from './services/notificationBridge'
 import './styles/global.css'
+
+// 全局安装灵动岛消息桥接：接管 antd message 提示并流向顶栏灵动岛
+installIslandMessageBridge()
 
 if (typeof window !== 'undefined') {
   ;(window as any).__appStore__ = useAppStore

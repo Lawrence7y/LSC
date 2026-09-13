@@ -205,6 +205,8 @@ export const enPartWorkbench: Record<string, string> = {
   '草稿名：{name}': 'Draft name: {name}',
   '轨道：{tracks}': 'Tracks: {tracks}',
   '片段：{segments}': 'Segments: {segments}',
+  '请求 {req} · 写入 {inc} · 跳过 {skip}': 'Requested {req} · placed {inc} · skipped {skip}',
+  '跳过明细': 'Skipped details',
   '剪映中需重启或进出一次草稿以刷新列表': 'You may need to restart Jianying or enter/exit the draft once to refresh the list',
   '重试生成草稿': 'Retry Generating Draft',
 
@@ -237,8 +239,8 @@ export const enPartWorkbench: Record<string, string> = {
   '停止录制并收尾（推荐）': 'Stop recording & finalize (recommended)',
   '先停录（{count} 间房），后端自动补扫尾部回合后完成': 'Stop recording first ({count} rooms), backend auto-scans trailing rounds then completes',
   '后端自动补扫尾部回合后完成': 'Backend auto-scans trailing rounds then completes',
-  '仅停止分析': 'Stop Analysis Only',
-  '立刻取消当前扫描，尾部回合不会补入列表': 'Immediately cancels the current scan; trailing rounds will not be added to the list',
+  '仅停止分析（立即停止）': 'Stop Analysis Only (Immediate)',
+  '立即停止分析，不补扫尾部；最后几分钟的回合可能不会补入列表': 'Stops analysis immediately without a tail scan; rounds from the last minutes may not be added',
   '停止中…': 'Stopping…',
   '分析导出': 'Analyze & Export',
   '去对齐': 'Go to Align',
@@ -311,6 +313,7 @@ export const enPartWorkbench: Record<string, string> = {
   '后端权威切片快照数量校验失败': 'Authoritative backend clip snapshot count validation failed',
   '无法读取后端权威切片列表': 'Unable to read the authoritative backend clip list',
   '切片列表尚未完整同步（{actual}/{expected}），暂不生成草稿': 'Clip list is not fully synced ({actual}/{expected}); draft generation is paused',
+  '该赛事切片边界仍在审计/复核中：请稍候，或点击【确认导出】完成人工复核后再导出': 'This tournament clip is still being audited: wait a moment, or click "Confirm Export" to review it manually and export.',
 
   // ── 工具栏禁用原因（变灰必须说清楚为什么）──
   '还没有房间，先粘贴链接添加': 'No rooms yet — paste a link to add one',

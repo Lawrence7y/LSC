@@ -23,6 +23,21 @@ interface RoomUIState {
   mse_error?: string
   mse_reconnecting?: { attempt: number; maxAttempts: number }
   preview_frame_data?: string
+  /**
+   * 回看通道（方案 A）：**前端本地权威**，后端不感知、无会话/epoch。
+   * 'review' 表示预览画面来自本地录制文件（LocalFileMseSource → MSE）。
+   */
+  preview_channel?: 'live' | 'review'
+  /** 回看来源文件绝对路径（录制中优先 .dvr.mp4 镜像，否则录制文件本身） */
+  review_path?: string
+  /** 回看目标位置（录制轴秒） */
+  review_seek_sec?: number
+  /** 回看源首帧在录制轴上的偏移（秒，可为负）：recordingAxis = playerTime + offset */
+  review_offset_sec?: number
+  /** 回看通道首帧是否已到达（预热切换：未到达前不隐藏 live 画面） */
+  review_feeding?: boolean
+  /** 回看通道错误文案 */
+  review_error?: string
 }
 
 interface AppState {
@@ -71,6 +86,16 @@ interface AppActions {
   setSettingsDrawerOpen: (open: boolean) => void
   setPreviewDegradationBanner: (info: PreviewDegradationInfo | null) => void
   dismissPreviewDegradationBanner: () => void
+  /** 进入本地文件回看通道（方案 A）。path = 回看来源文件。 */
+  enterReview: (roomId: string, payload: { path: string; seekSec: number; offsetSec?: number }) => void
+  /** 退出回看通道，回到直播。 */
+  exitReview: (roomId: string) => void
+  /** 回看通道首帧到达状态 */
+  setReviewFeeding: (roomId: string, feeding: boolean) => void
+  /** 回看通道错误 */
+  setReviewError: (roomId: string, error?: string) => void
+  /** 回看源首帧偏移（读取器索引建立后回填） */
+  setReviewOffset: (roomId: string, offsetSec: number) => void
 }
 
 const defaultSettings: RecordSettings = {
@@ -176,8 +201,15 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
         && incoming.preview_epoch_id === prev.preview_clock_epoch_id
         && incoming.recording_to_preview_delta == null,
       )
+      const localReview = ui?.preview_channel === 'review'
       return {
         ...incoming,
+        // 回看通道为前端本地状态：后端快照（live_mse/degraded）不得覆盖它，
+        // 否则一次 rooms_updated 就会把回看画面"改回"直播通道（旧实现的状态残留根因）。
+        preview_mode: localReview ? 'recording_review' : incoming.preview_mode,
+        preview_review_start_sec: localReview
+          ? (ui?.review_offset_sec ?? prev?.preview_review_start_sec ?? 0)
+          : (incoming.preview_review_start_sec ?? prev?.preview_review_start_sec),
         preview_phase: incoming.preview_phase ?? ui?.preview_phase ?? prev?.preview_phase,
         mse_error: incoming.mse_error ?? ui?.mse_error ?? prev?.mse_error,
         mse_reconnecting: incoming.mse_reconnecting ?? ui?.mse_reconnecting ?? prev?.mse_reconnecting,
@@ -256,6 +288,80 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
       newRooms[idx] = { ...newRooms[idx], ...roomData }
       return { rooms: newRooms }
     }),
+
+  // ── 回看通道（方案 A：本地文件回看，前端本地权威） ──
+  enterReview: (roomId, payload) =>
+    set((state) => ({
+      rooms: state.rooms.map((r) =>
+        r.room_id === roomId
+          ? {
+              ...r,
+              preview_mode: 'recording_review' as const,
+              preview_review_start_sec: payload.offsetSec ?? r.preview_review_start_sec ?? 0,
+            }
+          : r,
+      ),
+      uiState: {
+        ...state.uiState,
+        [roomId]: {
+          ...state.uiState[roomId],
+          preview_channel: 'review',
+          review_path: payload.path,
+          review_seek_sec: payload.seekSec,
+          review_offset_sec: payload.offsetSec ?? state.uiState[roomId]?.review_offset_sec ?? 0,
+          review_feeding: false,
+          review_error: undefined,
+        },
+      },
+    })),
+
+  exitReview: (roomId) =>
+    set((state) => ({
+      rooms: state.rooms.map((r) =>
+        r.room_id === roomId
+          ? { ...r, preview_mode: 'live_mse' as const, preview_review_start_sec: 0 }
+          : r,
+      ),
+      uiState: {
+        ...state.uiState,
+        [roomId]: {
+          ...state.uiState[roomId],
+          preview_channel: 'live',
+          review_path: '',
+          review_seek_sec: 0,
+          review_offset_sec: 0,
+          review_feeding: false,
+          review_error: undefined,
+        },
+      },
+    })),
+
+  setReviewFeeding: (roomId, feeding) =>
+    set((state) => ({
+      uiState: {
+        ...state.uiState,
+        [roomId]: { ...state.uiState[roomId], review_feeding: feeding },
+      },
+    })),
+
+  setReviewError: (roomId, error) =>
+    set((state) => ({
+      uiState: {
+        ...state.uiState,
+        [roomId]: { ...state.uiState[roomId], review_error: error },
+      },
+    })),
+
+  setReviewOffset: (roomId, offsetSec) =>
+    set((state) => ({
+      rooms: state.rooms.map((r) =>
+        r.room_id === roomId ? { ...r, preview_review_start_sec: offsetSec } : r,
+      ),
+      uiState: {
+        ...state.uiState,
+        [roomId]: { ...state.uiState[roomId], review_offset_sec: offsetSec },
+      },
+    })),
 
   setSelectedRoomId: (roomId) => set({ selectedRoomId: roomId }),
 

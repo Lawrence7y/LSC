@@ -1,102 +1,119 @@
-/* ===== 顶栏状态胶囊灵动气泡通知（Dynamic Pill Notification） ===== */
+/* ===== 顶栏状态胶囊灵动岛通知（Dynamic Island Pill Notification） ===== */
 
 .pill-notification-wrapper {
   position: absolute;
   top: calc(100% + 5px);
   left: 50%;
   transform: translateX(-50%);
-  z-index: 9999;
+  z-index: 10000;
   pointer-events: none;
   white-space: nowrap;
   perspective: 600px;
 }
 
-/* 入场过渡 */
+/* 入场过渡：自母体胶囊底部以物理阻尼向下弹性展开 */
 .pill-notification-wrapper--entering {
   opacity: 0;
-  transform: translateX(-50%) translateY(-10px) scale(0.88);
-  transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  transform: translateX(-50%) translateY(-10px) scale(0.86);
+  filter: blur(3px);
+  transition: all 0.32s cubic-bezier(0.175, 0.885, 0.32, 1.15);
 }
 
 /* 活跃态（正常展示） */
 .pill-notification-wrapper--active {
   opacity: 1;
   transform: translateX(-50%) translateY(0) scale(1);
-  transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  filter: blur(0px);
+  transition: all 0.32s cubic-bezier(0.175, 0.885, 0.32, 1.15);
 }
 
-/* 离场过渡（向上收回状态胶囊） */
+/* 离场过渡：向上无缝收回状态胶囊内部 */
 .pill-notification-wrapper--exiting {
   opacity: 0;
-  transform: translateX(-50%) translateY(-8px) scale(0.92);
+  transform: translateX(-50%) translateY(-8px) scale(0.9);
+  filter: blur(2px);
   transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* 气泡本体 */
+/* 灵动岛气泡本体 */
 .pill-notification-body {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  height: 28px;
-  padding: 0 12px 0 10px;
-  border-radius: 999px;
+  min-height: 28px;
+  max-height: 36px;
+  padding: 2px 13px 2px 10px;
+  border-radius: 9999px;
   font-size: 11px;
   font-weight: 500;
   color: var(--text-primary, #f5f5f7);
-  background: rgba(22, 26, 34, 0.92);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  background: rgba(20, 24, 30, 0.92);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
   border: 1px solid var(--border-hairline, rgba(255, 255, 255, 0.12));
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.35),
-    0 1px 4px rgba(0, 0, 0, 0.2);
+    0 6px 20px rgba(0, 0, 0, 0.45),
+    0 1px 4px rgba(0, 0, 0, 0.25);
+  pointer-events: auto;
   user-select: none;
+  max-width: 560px;
+  transition:
+    width 0.24s cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 0.25s ease,
+    box-shadow 0.25s ease;
 }
 
 /* 浅色主题适配 */
 :root:not(.dark) .pill-notification-body {
-  background: rgba(255, 255, 255, 0.94);
+  background: rgba(255, 255, 255, 0.95);
   color: var(--text-primary, #1d1d1f);
-  border: 1px solid rgba(0, 0, 0, 0.1);
+  border: 1px solid rgba(0, 0, 0, 0.08);
   box-shadow:
-    0 4px 18px rgba(0, 0, 0, 0.1),
-    0 1px 3px rgba(0, 0, 0, 0.06);
+    0 6px 20px rgba(0, 0, 0, 0.1),
+    0 1px 3px rgba(0, 0, 0, 0.05);
 }
 
-/* 语义色调发光 */
+/* 语义色发光微边框与环境光 */
 .pill-notification-body--record {
-  border-color: rgba(255, 69, 58, 0.35);
+  border-color: rgba(255, 69, 58, 0.4);
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 6px 20px rgba(0, 0, 0, 0.45),
     0 0 12px rgba(255, 69, 58, 0.25);
 }
 
 .pill-notification-body--align {
-  border-color: rgba(77, 196, 191, 0.4);
+  border-color: rgba(77, 196, 191, 0.45);
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.4),
+    0 6px 20px rgba(0, 0, 0, 0.45),
+    0 0 12px rgba(49, 179, 174, 0.25);
+}
+
+.pill-notification-body--loading {
+  border-color: rgba(77, 196, 191, 0.45);
+  box-shadow:
+    0 6px 20px rgba(0, 0, 0, 0.45),
     0 0 12px rgba(49, 179, 174, 0.25);
 }
 
 .pill-notification-body--success {
-  border-color: rgba(52, 199, 89, 0.35);
+  border-color: rgba(52, 199, 89, 0.4);
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.4),
-    0 0 10px rgba(52, 199, 89, 0.2);
+    0 6px 20px rgba(0, 0, 0, 0.45),
+    0 0 10px rgba(52, 199, 89, 0.22);
 }
 
 .pill-notification-body--warning {
-  border-color: rgba(255, 159, 10, 0.35);
+  border-color: rgba(255, 159, 10, 0.4);
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.4),
-    0 0 10px rgba(255, 159, 10, 0.2);
+    0 6px 20px rgba(0, 0, 0, 0.45),
+    0 0 10px rgba(255, 159, 10, 0.22);
 }
 
 .pill-notification-body--error {
-  border-color: rgba(255, 69, 58, 0.4);
+  border-color: rgba(255, 69, 58, 0.45);
   box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.4),
-    0 0 12px rgba(255, 69, 58, 0.25);
+    0 6px 20px rgba(0, 0, 0, 0.45),
+    0 0 14px rgba(255, 69, 58, 0.28);
 }
 
 /* 图标容器 */
@@ -105,6 +122,83 @@
   align-items: center;
   justify-content: center;
   line-height: 1;
+  flex-shrink: 0;
+}
+
+/* 文本内容与交互按钮 */
+.pill-notification-text {
+  letter-spacing: 0.01em;
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 460px;
+}
+
+/* 文本内的交互链接（如「撤销」） */
+.pill-notification-text a {
+  color: var(--brand-400, #4DC4BF);
+  cursor: pointer;
+  text-decoration: none;
+  font-weight: 600;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: rgba(77, 196, 191, 0.16);
+  transition: all 0.15s ease;
+}
+
+.pill-notification-text a:hover {
+  background: rgba(77, 196, 191, 0.32);
+  text-decoration: underline;
+}
+
+/* 合并计数徽章 */
+.pill-notification-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 16px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text-secondary);
+  margin-left: 2px;
+  flex-shrink: 0;
+}
+
+:root:not(.dark) .pill-notification-count {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+/* 常驻项关闭按钮 */
+.pill-notification-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  margin-left: 4px;
+  padding: 0;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.pill-notification-close:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: var(--text-primary);
+}
+
+:root:not(.dark) .pill-notification-close:hover {
+  background: rgba(0, 0, 0, 0.08);
 }
 
 /* 录制红点呼吸动画 */
@@ -129,8 +223,4 @@
     opacity: 1;
     box-shadow: 0 0 10px #ff453a;
   }
-}
-
-.pill-notification-text {
-  letter-spacing: 0.01em;
 }

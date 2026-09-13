@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 
 // ─── Mock 重依赖 hooks / 服务 ────────────────────────────────────────
 
@@ -127,6 +127,7 @@ vi.mock('@/components/RecordingSpecSelector', () => ({
 
 import Workbench, { reconcileContinuousListedClips } from './index'
 import { useAppStore } from '@/store/appStore'
+import { sendRequest } from '@/utils/wsRequest'
 import type { RoomSession, ClipSegment } from '@/types'
 
 describe('持续分析切片快照', () => {
@@ -201,6 +202,11 @@ function makeClip(overrides: Partial<ClipSegment> = {}): ClipSegment {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  try {
+    localStorage.removeItem('lsc.wantAnalysisDraft')
+  } catch {
+    /* ignore */
+  }
   useAppStore.setState({
     rooms: [],
     clips: [],
@@ -261,5 +267,42 @@ describe('Workbench 渲染', () => {
     render(<Workbench />)
     // 防抖 2 秒内不应出现断连提示
     expect(screen.queryByText(/WebSocket 连接断开/)).toBeNull()
+  })
+it('仅停止分析（immediate idle）后自动触发剪映草稿', async () => {
+    localStorage.setItem('lsc.wantAnalysisDraft', '1')
+    useAppStore.setState({
+      rooms: [makeRoom({ room_id: 'room-1' })],
+      clips: [makeClip({
+        room_id: 'room-1',
+        clip_id: 'clip-001',
+        round_key: 'round-1',
+        confirm_status: 'user_confirmed',
+      })],
+      continuousAnalysisStatus: {
+        running: false,
+        phase: 'idle',
+        status: 'idle',
+        room_id: 'room-1',
+        target_room_ids: ['room-1'],
+        finalization_state: 'idle',
+        coverage_complete: false,
+        audit_delivery_gap: 0,
+        pending_queue_depth: 0,
+      },
+    })
+    render(<Workbench />)
+
+    await waitFor(() => {
+      expect(sendRequest).toHaveBeenCalledWith(
+        expect.anything(),
+        'generate_jianying_draft',
+        expect.objectContaining({
+          clips: expect.arrayContaining([
+            expect.objectContaining({ clip_id: 'clip-001' }),
+          ]),
+        }),
+        120000,
+      )
+    })
   })
 })

@@ -1,41 +1,40 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import {
   CheckCircleFilled,
   InfoCircleFilled,
   WarningFilled,
   CloseCircleFilled,
   ThunderboltFilled,
+  LoadingOutlined,
+  CloseOutlined,
 } from '@ant-design/icons'
+import {
+  islandManager,
+  islandMessageApi,
+  type IslandToastItem,
+  type IslandToastType,
+} from '@/services/notificationBridge'
 import './PillNotification.css'
 
-export type PillToastType = 'success' | 'info' | 'warning' | 'error' | 'record' | 'align'
+export type PillToastType = IslandToastType
 
 export interface PillToastPayload {
   id?: string
   type?: PillToastType
-  message: string
-  /** 停留时长（毫秒，默认 2600ms） */
+  message?: React.ReactNode
+  content?: React.ReactNode
   duration?: number
 }
 
-type ToastItem = PillToastPayload & {
-  id: string
-  phase: 'entering' | 'active' | 'exiting'
-}
-
-type Listener = (payload: PillToastPayload) => void
-const listeners = new Set<Listener>()
-
 /**
- * 全局派发灵动通知气泡（从顶栏连接与资源占用胶囊下缘冒出）
+ * 全局派发灵动通知气泡（向后兼容旧调用）
  */
 export function emitPillToast(payload: PillToastPayload): void {
-  listeners.forEach((fn) => {
-    try {
-      fn(payload)
-    } catch (e) {
-      console.warn('[PillNotification] emit error:', e)
-    }
+  islandMessageApi.open({
+    id: payload.id,
+    type: payload.type,
+    content: payload.content ?? payload.message ?? '',
+    duration: payload.duration,
   })
 }
 
@@ -43,68 +42,28 @@ export function emitPillToast(payload: PillToastPayload): void {
  * 状态胶囊下挂载的灵动通知组件
  */
 export function PillNotification() {
-  const [currentToast, setCurrentToast] = useState<ToastItem | null>(null)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const exitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const clearAllTimers = useCallback(() => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current)
-      timerRef.current = null
-    }
-    if (exitTimerRef.current) {
-      clearTimeout(exitTimerRef.current)
-      exitTimerRef.current = null
-    }
-  }, [])
-
-  const startDismiss = useCallback(() => {
-    clearAllTimers()
-    setCurrentToast((prev) => (prev ? { ...prev, phase: 'exiting' } : null))
-    exitTimerRef.current = setTimeout(() => {
-      setCurrentToast(null)
-    }, 240) // 与 CSS 退出动画时长匹配
-  }, [clearAllTimers])
+  const [toast, setToast] = useState<IslandToastItem | null>(null)
 
   useEffect(() => {
-    const handler: Listener = (payload) => {
-      clearAllTimers()
-      const id = payload.id || `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-      const duration = payload.duration ?? 2600
+    return islandManager.subscribe((item) => {
+      setToast(item)
+    })
+  }, [])
 
-      // 入场阶段
-      setCurrentToast({
-        ...payload,
-        id,
-        phase: 'entering',
-      })
+  if (!toast) return null
 
-      // 80ms 后切换到 active
-      setTimeout(() => {
-        setCurrentToast((prev) => (prev && prev.id === id ? { ...prev, phase: 'active' } : prev))
-      }, 60)
+  const type = toast.type || 'info'
 
-      // 定时启动退出动画
-      timerRef.current = setTimeout(() => {
-        startDismiss()
-      }, duration)
-    }
+  const getIcon = () => {
+    if (toast.icon) return toast.icon
 
-    listeners.add(handler)
-    return () => {
-      listeners.delete(handler)
-      clearAllTimers()
-    }
-  }, [clearAllTimers, startDismiss])
-
-  if (!currentToast) return null
-
-  const getIcon = (type: PillToastType = 'info') => {
     switch (type) {
       case 'record':
         return <span className="pill-dot pill-dot--record" />
       case 'align':
         return <ThunderboltFilled style={{ color: 'var(--brand-400, #4DC4BF)', fontSize: 13 }} />
+      case 'loading':
+        return <LoadingOutlined style={{ color: 'var(--brand-400, #4DC4BF)', fontSize: 13 }} />
       case 'success':
         return <CheckCircleFilled style={{ color: 'var(--state-success, #34c759)', fontSize: 13 }} />
       case 'warning':
@@ -117,16 +76,33 @@ export function PillNotification() {
     }
   }
 
-  const type = currentToast.type || 'info'
+  const isSticky = toast.duration === 0
 
   return (
     <div
-      className={`pill-notification-wrapper pill-notification-wrapper--${currentToast.phase}`}
+      className={`pill-notification-wrapper pill-notification-wrapper--${toast.phase}`}
       aria-live="polite"
     >
-      <div className={`pill-notification-body pill-notification-body--${type}`}>
-        <span className="pill-notification-icon">{getIcon(type)}</span>
-        <span className="pill-notification-text">{currentToast.message}</span>
+      <div
+        className={`pill-notification-body pill-notification-body--${type}`}
+        onMouseEnter={() => islandManager.pause()}
+        onMouseLeave={() => islandManager.resume()}
+      >
+        <span className="pill-notification-icon">{getIcon()}</span>
+        <div className="pill-notification-text">{toast.content}</div>
+        {toast.count > 1 && (
+          <span className="pill-notification-count">×{toast.count}</span>
+        )}
+        {isSticky && (
+          <button
+            type="button"
+            className="pill-notification-close"
+            onClick={() => islandManager.dismiss()}
+            title="关闭"
+          >
+            <CloseOutlined style={{ fontSize: 9 }} />
+          </button>
+        )}
       </div>
     </div>
   )

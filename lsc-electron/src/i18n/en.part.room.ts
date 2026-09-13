@@ -58,7 +58,12 @@ export const enPartRoom: Record<string, string> = {
   '首次刷新可能需要 10–30 秒': 'First refresh may take 10–30 seconds',
   '已暂停': 'Paused',
   '预览不可用': 'Preview unavailable',
+  // ── 本地文件回看通道（方案 A：回看走本地文件，不再起后端流）──
+  '正在准备回看…': 'Preparing review…',
+  '回看不可用': 'Review unavailable',
+  '回到直播': 'Back to live',
   '重试中...': 'Retrying...',
+
   '重试': 'Retry',
   '正在恢复预览 ({attempt}/{max})...': 'Restoring preview ({attempt}/{max})...',
   '点击启用预览': 'Click to enable preview',
@@ -66,8 +71,8 @@ export const enPartRoom: Record<string, string> = {
   // ── 放大态预览时间线 DVR 边界（与主时间线同一语义的卡片内描述）──
   'DVR 回看窗口左边界 {time}：左侧已超出当前缓冲区不可回放，右侧可回放': 'DVR review window starts at {time}: the left side is outside the current buffer and cannot be replayed, while the right side can',
   'DVR 回看窗口左边界 {time}：早于直播缓冲的区域将切换录制文件，边界按安全边距起播，右侧可直接回看': 'DVR review window starts at {time}: earlier positions switch to the recording file, the boundary starts with a safe margin, and the right side can be reviewed directly',
-  '左侧时间是绝对时间点；设置回看是时长，当前可用时长受实际 MSE 缓冲限制': 'The left time is an absolute position; replay setting is a duration, and availability is limited by the actual MSE buffer',
-  '回看设置 {configured} · 当前可用 {available}': 'Replay setting {configured} · currently available {available}',
+  '左侧时间是绝对时间点；设置回看是时长；早于 MSE 缓冲的部分会切换到录制文件回看': 'The left time is an absolute position; replay setting is a duration; parts before the MSE buffer switch to recording-file review',
+  '回看设置 {configured} · 时间线范围 {available}': 'Replay setting {configured} · timeline range {available}',
   '该直播间已在列表中，无需重复添加': 'This live stream is already in the list',
   '该直播间': 'This room',
   '确认停止录制并删除房间？': 'Stop recording and delete room?',

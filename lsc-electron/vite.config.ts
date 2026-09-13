@@ -50,9 +50,9 @@ export default defineConfig(({ mode }) => {
       },
     },
     server: {
-      // 5173 落在本机 Windows 排除端口 5150-5249，会导致 EACCES
+      // 使用 5300，避开本机 Windows 排除端口 5192-5291
       host: '127.0.0.1',
-      port: 5250,
+      port: 5300,
       strictPort: true,
     },
     build: {

@@ -122,7 +122,7 @@ describe('computeExpandedPreviewWindow', () => {
       bufferedStart: 490,
       bufferedEnd: 620,
     })
-    expect(r.start).toBe(490)
+    expect(r.start).toBe(320)
     expect(r.end).toBe(620)
     expect(r.playheadPct).toBe(100)
     expect(r.fillWidthPct).toBe(100)
@@ -147,13 +147,13 @@ describe('computeExpandedPreviewWindow', () => {
       bufferedEnd: 620,
       recordedHint: 3600,
     })
-    expect(r.start).toBe(490)
+    expect(r.start).toBe(320)
     expect(r.end).toBe(620)
-    expect(r.purple).toBe(490)
+    expect(r.purple).toBe(320)
     expect(r.liveEdge).toBe(620)
-    expect(r.playheadPct).toBeCloseTo((610 - 490) / 130 * 100, 5)
+    expect(r.playheadPct).toBeCloseTo((610 - 320) / 300 * 100, 5)
     expect(r.configuredReplaySeconds).toBe(300)
-    expect(r.availableReplaySeconds).toBe(130)
+    expect(r.availableReplaySeconds).toBe(300)
   })
 
   it('live under 120s starts at 0 even if recording is long', () => {

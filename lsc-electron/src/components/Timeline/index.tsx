@@ -375,10 +375,19 @@ export function Timeline({
   recordedEndRef.current = recordedEnd
   triggerSnapFlashRef.current = triggerSnapFlash
 
-  const clampToDvrStart = useCallback((relTime: number, _absWs: number): number => {
-    // 允许用户点击/回看早于当前 MSE 内存缓冲的内容（通过录制文件回看模式承接），
-    // 仅保证 relTime 不小于 0，不再强制锁死吸附在 dvrStart 上导致画面卡死。
-    return Math.max(0, relTime)
+  const clampToDvrStart = useCallback((relTime: number, absWs: number): number => {
+    // 点击/拖动到 DVR 左界（紫线）以左时，播放头紧贴紫线：该区间的媒体不在
+    // MSE 连续缓冲内，松手落点若超出缓冲会由 mseSeek 自动切换到录制文件回看
+    // 承接，因此钳到紫线不会再重演「画面卡死」（旧实现缺少文件回看兜底，才不
+    // 得不放开此钳制）。
+    //
+    // 紫线归零（录制/回放时长不足配置值，(b) 情形）时不设下界，整段都可用；
+    // 紫线右侧（缓存区内）不受影响，仍可实时查看缓存内容。
+    const dvrRel = dvrStartRef.current !== null
+      ? dvrStartRef.current - absWs
+      : null
+    const lowerBound = dvrRel !== null && dvrRel > 0 ? dvrRel : 0
+    return Math.max(lowerBound, relTime)
   }, [])
 
   const applyPointerTime = useCallback((clientX: number, seekPlayhead: boolean, altKey = false) => {

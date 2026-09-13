@@ -10,6 +10,7 @@ import {
   computeRecordedDurationHint,
   isRecordingReviewMode,
   previewToCommon,
+  recordingToCommon,
   resolveLiveContentSpan,
   resolveRecordingReviewSpan,
 } from '@/utils/timelineCoords'
@@ -31,6 +32,8 @@ export type TimelineViewInput = {
     mark_out?: number | null
     record_started_at?: string | null
     is_recording?: boolean
+    /** 本地回看轴偏移（带符号）：recordingAxis = 回看播放器 currentTime + 本值 */
+    preview_review_start_sec?: number
   }>
   previewPositions: Record<string, number>
   commonMarkIn: number | null
@@ -128,13 +131,26 @@ export function computeTimelineViewModel(input: TimelineViewInput): TimelineView
 
   const refRoom = rooms.find(r => r.room_id === referenceRoomId)
   const previewT = previewPositions[referenceRoomId] ?? 0
-  const curCommon = previewToCommon(timelineContext, referenceRoomId, previewT)
   const isRecordingReview = isRecordingReviewMode(refRoom?.preview_mode)
+  // 回看播放器的 currentTime 是**本地文件原始 PTS**：先叠加带符号轴偏移得到
+  // 录制轴秒，再套 recording→common。直接把文件 PTS 当 preview 轴会让 curCommon
+  // 与 contentEnd 被撑到 PTS 基座量级（多房对齐时才可见，单房无影响）。
+  const reviewAxisPos = previewT + (Number(refRoom?.preview_review_start_sec) || 0)
+  let curCommon: number
+  if (isRecordingReview) {
+    try {
+      curCommon = recordingToCommon(timelineContext, referenceRoomId, reviewAxisPos)
+    } catch {
+      curCommon = reviewAxisPos
+    }
+  } else {
+    curCommon = previewToCommon(timelineContext, referenceRoomId, previewT)
+  }
   let axisProgress = Math.max(commonMarkOut ?? 0, commonMarkIn ?? 0, curCommon)
   if (isRecordingReview) {
     const recordedHint = computeRecordedDurationHint(refRoom, recordedDurationHint)
     const reviewSpan = resolveRecordingReviewSpan(
-      previewT,
+      reviewAxisPos,
       recordedHint,
       mediaDuration,
       commonMarkIn,

@@ -100,6 +100,11 @@ export interface RoomSession {
   recording_queue_position?: number
   is_reconnecting?: boolean
   record_output_path: string
+  /**
+   * 录制镜像文件（fMP4，empty_moov）：录制中回看的数据源。
+   * 与录制文件同生命周期、随归档重命名同步改名；录制结束前后均可读。
+   */
+  dvr_output_path?: string
   record_manifest_path?: string
   record_started_at: string | null
   record_size_mb: number
@@ -139,15 +144,11 @@ export interface RoomSession {
   preview_phase?: 'idle' | 'refreshing_url' | 'probing' | 'streaming' | 'error'
   /** 预览来源：live_mse=直播 MSE，recording_review=录制文件回看，degraded=降级；缺省视为 live_mse */
   preview_mode?: PreviewMode
-  /** 当前激活的预览通道：live=直播，review=录制文件回看 */
-  active_preview_channel?: 'live' | 'review'
-  /** 录制文件回看会话 ID（与直播 preview_epoch_id 严格隔离） */
-  review_session_id?: string
-  /** 录制回看窗口起点（秒） */
-  review_start_sec?: number
-  /** 录制回看预载窗口终点（秒） */
-  review_window_end_sec?: number
-  /** 文件回看流的 MSE 0 秒对应录制轴的秒数。 */
+  /**
+   * 回看轴偏移（秒，可为负）：recordingAxis = 回看播放器 currentTime + 本值。
+   * 方案 A 起由**前端本地状态**维护（本地录制文件原始 PTS 基座通常很大，
+   * 故该值常为负），后端不再下发 review 会话/窗口字段。
+   */
   preview_review_start_sec?: number
   /** 预览源世代 ID；切换 live/recording_review 或重建 MSE 时递增，供前端强制重建播放器 */
   preview_epoch_id?: string
@@ -163,7 +164,15 @@ export interface RoomSession {
 }
 
 // 切片确认状态（与导出状态正交：确认管可信度，export 管导出队列）
-export type ClipConfirmStatus = 'pending' | 'refining' | 'user_confirmed' | 'ocr_confirmed' | 'vision_confirmed' | 'audio_pending'
+export type ClipConfirmStatus =
+  | 'pending'
+  | 'refining'
+  | 'user_confirmed'
+  | 'ocr_confirmed'
+  | 'vision_confirmed'
+  | 'audio_pending'
+  // 赛事审计拒绝终态：后端 `_prune_rejected_listed_clips` 会广播并从前端列表移除
+  | 'rejected'
 
 // 切片相关
 export interface ClipSegment {
@@ -204,6 +213,11 @@ export interface ClipSegment {
   boundary_quality?: 'precise' | 'coarse' | 'pending' | 'invalid' | string
   boundary_quality_reason_code?: string
   boundary_review_required?: boolean
+  start_quality?: 'precise' | 'coarse' | 'invalid' | string
+  end_quality?: 'precise' | 'coarse' | 'invalid' | string
+  start_review_required?: boolean
+  end_review_required?: boolean
+  broadcast_result_tail_sec?: number
   /** 稳定回合键（与持续分析 _valorant_round_key 一致），用于多房同步 */
   round_key?: string
   /** 入队时快照的墙钟入点（time.monotonic），导出时优先于房间当前 mark */
@@ -495,12 +509,32 @@ export interface JianyingDraftOptions {
   non_main_volume_zero?: boolean
 }
 
+/** 草稿跳过的单条切片（后端 `_skip_reason_code` 的分类；文案可改、码不可改） */
+export interface JianyingSkippedClip {
+  round_key?: string
+  label?: string
+  start?: number | null
+  end?: number | null
+  confirm_status?: string | null
+  broadcast_audit?: string | null
+  end_by?: string | null
+  end_quality?: string | null
+  /** END_NOT_FINAL / NEVER_AUDITED / NO_EXCLUSION_EVIDENCE / NOT_IN_AUTHORITY / REJECTED … */
+  reason_code?: string
+  reason?: string
+}
+
 export interface JianyingDraftResult {
   success: boolean
   draft_name?: string
   draft_dir?: string
   tracks?: number
   segments?: number
+  requested_clip_count?: number
+  included_clip_count?: number
+  skipped_clip_count?: number
+  /** 逐条跳过明细：只有聚合告警时无法分辨是哪道门禁拦的（2026-09-11 现场） */
+  skipped?: JianyingSkippedClip[]
   warnings?: string[]
   error?: string
   error_code?: string

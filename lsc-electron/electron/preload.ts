@@ -45,6 +45,30 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openPath: (path: string) => ipcRenderer.invoke('open-path', path),
   showItemInFolder: (path: string) => ipcRenderer.invoke('show-item-in-folder', path),
 
+  // 本地媒体读取（方案 A §3.1：回看直接按字节读本地录制文件，不经后端流）
+  localMedia: {
+    info: (payload: { path: string }) =>
+      ipcRenderer.invoke('local-media:info', payload) as Promise<{
+        ok: boolean
+        size: number
+        mtimeMs: number
+        error?: string
+      }>,
+    read: (payload: { path: string; offset: number; length: number }) =>
+      ipcRenderer.invoke('local-media:read', payload) as Promise<{
+        ok: boolean
+        bytesRead: number
+        size: number
+        eof: boolean
+        data?: Uint8Array
+        error?: string
+      }>,
+    allowRoot: (payload: { root: string }) =>
+      ipcRenderer.invoke('local-media:allow-root', payload) as Promise<{ ok: boolean; roots: string[]; error?: string }>,
+    roots: () =>
+      ipcRenderer.invoke('local-media:roots') as Promise<{ ok: boolean; roots: string[] }>,
+  },
+
   // 自动更新
   checkForUpdate: () => ipcRenderer.invoke('check-for-update'),
   downloadUpdate: () => ipcRenderer.invoke('download-update'),

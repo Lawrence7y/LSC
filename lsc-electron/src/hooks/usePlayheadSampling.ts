@@ -6,6 +6,7 @@ import {
   pickReferenceRoomId,
   previewToCommon,
   previewToRecordingLocal,
+  recordingToCommon,
 } from '@/utils/timelineCoords'
 import { writeDisplayPlayhead, writePlayhead } from '@/utils/playheadStore'
 
@@ -65,6 +66,7 @@ export function usePlayheadSampling(opts: {
 
       // scrub 中跳过：光标走 Timeline 本地 dragTime，避免父级轮询重渲染抢帧
       if (timelineScrubbingRef.current) return
+      const store = useAppStore.getState()
       const next: Record<string, number> = { ...lastPreviewPositionsRef.current }
       let changed = false
       for (const rid of Object.keys(registry)) {
@@ -73,7 +75,14 @@ export function usePlayheadSampling(opts: {
         if (typeof t !== 'number' || t < 0) continue
         const scrub = scrubOverrideRef.current[rid]
         if (scrub != null) {
-          if (Math.abs(t - scrub) < 0.35) {
+          // 回看通道里播放器时间是**文件原始 PTS**，override 记的是**录制轴**：
+          // 必须换算到同一轴再比较。否则 |t - scrub| 恒大于容差，播放头会被
+          // 钉死在进入回看时的位置（实测 9 分钟不动，画面却在前进）。
+          const room = store.rooms.find((item) => item.room_id === rid)
+          const axisT = isRecordingReviewMode(room?.preview_mode)
+            ? t + (Number(room?.preview_review_start_sec) || 0)
+            : t
+          if (Math.abs(axisT - scrub) < 0.35) {
             delete scrubOverrideRef.current[rid]
             next[rid] = t
             changed = true
@@ -106,7 +115,6 @@ export function usePlayheadSampling(opts: {
       }
 
       // 显示轴绝对播放头（与 timelineView.currentTime 同轴）→ Timeline rAF 直写
-      const store = useAppStore.getState()
       const ctx = store.timelineContext
       const status = getAlignStatus(ctx, store.timelineInvalidated)
       const refId =
@@ -116,26 +124,35 @@ export function usePlayheadSampling(opts: {
       if (refId) {
         const t = next[refId] ?? lastPreviewPositionsRef.current[refId] ?? 0
         let displayTime = t
+        const refRoom = store.rooms.find((item) => item.room_id === refId)
+        const refIsReview = isRecordingReviewMode(refRoom?.preview_mode)
         if (status === 'ready' && ctx?.room_snapshots[refId]) {
           try {
-            displayTime = previewToCommon(ctx, refId, t)
+            // 回看通道的播放器时间是文件原始 PTS，先叠加轴偏移得到录制轴，
+            // 再套 recording→common；直接把文件 PTS 当 preview 轴会得到错位
+            // 的绝对时间（对齐模式才可见）。
+            displayTime = refIsReview
+              ? recordingToCommon(ctx, refId, t + (Number(refRoom?.preview_review_start_sec) || 0))
+              : previewToCommon(ctx, refId, t)
           } catch (err) {
-            // preview→common 轴换算失败（对齐快照瞬时不可用）：降级为 preview 轴，
+            // 轴换算失败（对齐快照瞬时不可用）：降级为当前轴，
             // 两轴数值含义不同会导致播放头瞬时跳变，节流记录日志便于排查
             if (now - _lastAxisFallbackWarnAt > 5000) {
               _lastAxisFallbackWarnAt = now
-              console.warn('[usePlayheadSampling] previewToCommon failed, fallback to preview axis:', err)
+              console.warn('[usePlayheadSampling] 轴换算失败, fallback:', err)
             }
+            if (refIsReview) displayTime = t + (Number(refRoom?.preview_review_start_sec) || 0)
           }
         } else {
           // 单房录制时间线显示 recording_local，而 MSE currentTime 是
           // preview_local。这里必须和 ControlBar 的 localPlayhead 使用同一转换，
           // 否则每帧都会把正确的 recording 轴播放头覆盖回左侧 delta 秒。
-          const room = store.rooms.find((item) => item.room_id === refId)
-          const isReview = isRecordingReviewMode(room?.preview_mode)
+          const room = refRoom
+          const isReview = refIsReview
           if (isReview) {
-            // 文件回看 MSE 以本次 -ss 后的 0 为起点，恢复到录制显示轴。
-            displayTime = t + Math.max(0, Number(room?.preview_review_start_sec) || 0)
+            // 本地文件回看的 MSE 时间轴是文件原始 PTS，偏移通常为负（大基座），
+            // 必须带符号相加；钳到 0 会让播放头显示错误。
+            displayTime = t + (Number(room?.preview_review_start_sec) || 0)
           } else {
             const usesRecordingAxis = Boolean(
               room

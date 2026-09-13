@@ -268,26 +268,6 @@ export function getMseInitCache(roomId: string): ArrayBuffer | null {
   return _mseInitCache[roomId] ?? null
 }
 
-const _mseReviewInitCache: Record<string, { buffer: ArrayBuffer; sessionId?: string }> = {}
-const _mseReviewSegmentCache: Record<string, { buffer: ArrayBuffer; sessionId?: string }[]> = {}
-
-/** 获取某房间缓存的 review init 段 */
-export function getMseReviewInitCache(roomId: string, sessionId?: string): ArrayBuffer | null {
-  const item = _mseReviewInitCache[roomId]
-  if (!item) return null
-  if (sessionId && item.sessionId && item.sessionId !== sessionId) return null
-  return item.buffer
-}
-
-/** 取出并清空某房间已排队的 review media 段 */
-export function drainPendingMseReviewSegments(roomId: string, sessionId?: string): ArrayBuffer[] {
-  const arr = _mseReviewSegmentCache[roomId]
-  if (!arr || arr.length === 0) return []
-  delete _mseReviewSegmentCache[roomId]
-  const valid = arr.filter((item) => !sessionId || !item.sessionId || item.sessionId === sessionId)
-  return valid.map((item) => item.buffer)
-}
-
 function _decodeBase64Segment(b64Data: string): ArrayBuffer {
   // ponytail: fast path, loop is hot for every MSE segment; Worker if still bottleneck
   return Uint8Array.from(atob(b64Data), (c) => c.charCodeAt(0)).buffer
@@ -300,55 +280,29 @@ function _coerceMsePayload(data: ArrayBuffer | string): ArrayBuffer {
   return data
 }
 
+/**
+ * 直播 MSE 分片投递。方案 A 起回看不再经 WebSocket 通道（元数据/会话/频道字段全部移除），
+ * 因此这里只处理直播流：命中 registry.live，未注册时缓存以消除竞态。
+ */
 function _feedMseSegment(
   roomId: string,
   data: ArrayBuffer | string,
   type: 'init' | 'segment',
-  channel: 'live' | 'review' = 'live',
-  streamId?: string,
 ): void {
   try {
     const buffer = _coerceMsePayload(data)
-    if (channel === 'live') {
-      if (type === 'init') {
-        _cacheMseInit(roomId, buffer)
-      }
-    } else {
-      if (type === 'init') {
-        _mseReviewInitCache[roomId] = { buffer, sessionId: streamId }
-      }
+    if (type === 'init') {
+      _cacheMseInit(roomId, buffer)
     }
 
     const registry = window.__msePlayers as Record<string, any> | undefined
     const entry = registry?.[roomId]
-    // 支持 entry 为单一 player（旧结构兼容）或 { live, review, player }
-    let targetPlayer: any = undefined
-    if (entry) {
-      if (channel === 'review') {
-        targetPlayer = entry.review
-      } else {
-        targetPlayer = entry.live ?? entry.player
-      }
-    }
+    // 回看期间 registry.player 指向 review 播放器，直播分片必须固定投给 live
+    const targetPlayer: any = entry ? (entry.live ?? entry.player) : undefined
 
     if (!targetPlayer) {
       // player 未注册时缓存 media 段，避免初始几秒丢帧
-      if (type === 'segment') {
-        if (channel === 'live') {
-          _cacheMseSegment(roomId, buffer)
-        } else {
-          if (!_mseReviewSegmentCache[roomId]) _mseReviewSegmentCache[roomId] = []
-          _mseReviewSegmentCache[roomId].push({ buffer, sessionId: streamId })
-          if (_mseReviewSegmentCache[roomId].length > 30) {
-            _mseReviewSegmentCache[roomId].shift()
-          }
-        }
-      }
-      return
-    }
-
-    // 若带有 streamId，且目标播放器绑定了特定 session，失配时丢弃过期帧
-    if (streamId && targetPlayer.sessionId && targetPlayer.sessionId !== streamId) {
+      if (type === 'segment') _cacheMseSegment(roomId, buffer)
       return
     }
 
@@ -358,7 +312,7 @@ function _feedMseSegment(
       targetPlayer.feedMedia(buffer)
     }
   } catch (e) {
-    console.warn(`MSE ${type} (${channel}) decode failed for ${roomId}:`, e)
+    console.warn(`MSE ${type} decode failed for ${roomId}:`, e)
   }
 }
 
@@ -604,26 +558,20 @@ function _attachSharedWebSocketHandlers(): () => void {
   const unsubMseInit = wsClient.on('mse_init', (data: {
     room_id: string
     data: ArrayBuffer | string
-    channel?: 'live' | 'review'
-    stream_id?: string
   }) => {
     if (data?.room_id && data?.data) {
-      _feedMseSegment(data.room_id, data.data, 'init', data.channel || 'live', data.stream_id)
+      _feedMseSegment(data.room_id, data.data, 'init')
     }
   })
 
   const unsubMseSegment = wsClient.on('mse_segment', (data: {
     room_id: string
     data: ArrayBuffer | string
-    channel?: 'live' | 'review'
-    stream_id?: string
   }) => {
     if (data?.room_id && data?.data) {
-      if ((data.channel || 'live') === 'live') {
-        _lastMseSegmentTimePerRoom.set(data.room_id, Date.now())
-        _mseWatchdogFailCount[data.room_id] = 0
-      }
-      _feedMseSegment(data.room_id, data.data, 'segment', data.channel || 'live', data.stream_id)
+      _lastMseSegmentTimePerRoom.set(data.room_id, Date.now())
+      _mseWatchdogFailCount[data.room_id] = 0
+      _feedMseSegment(data.room_id, data.data, 'segment')
     }
   })
 
@@ -723,7 +671,10 @@ function _attachSharedWebSocketHandlers(): () => void {
       if (cachedInit) {
         try {
           const registry = window.__msePlayers as Record<string, any> | undefined
-          const player = registry?.[roomId]
+          // registry[roomId] 是 { player, live, review, feedInit, feedMedia }：
+          // 直播分片固定投 live（回看期间 player 指向 review 播放器）。
+          const entry = registry?.[roomId]
+          const player: any = entry?.live ?? entry?.player
           if (player) {
             player.feedInit(cachedInit)
             console.log(`MSE init delivered from frontend cache for ${roomId}`)

@@ -177,3 +177,62 @@ describe('ClipList 导出交互', () => {
     expect(screen.getByText('45%')).toBeTruthy()
   })
 })
+
+describe('切片导出状态标注（列表里就说清为什么没进草稿）', () => {
+  it('待审计的赛事切片显示「待审计」，色轨同步为 pending', () => {
+    render(
+      <ClipList
+        {...defaultProps}
+        clips={[makeClip({
+          source_profile: 'broadcast', is_ai_highlight: true, round_key: 'round-000001',
+          confirm_status: 'pending', broadcast_audit: 'pending_lookahead',
+        })]}
+      />,
+    )
+    expect(screen.getByText('待审计')).toBeTruthy()
+    // 色轨必须与标签一致（此前待审计切片照样亮"可导出"青色）
+    expect(document.querySelector('.rail-pending')).toBeTruthy()
+    expect(document.querySelector('.rail-ready')).toBeNull()
+  })
+
+  it('出点未定稿显示「需确认」，被拒显示「已排除」', () => {
+    const { unmount } = render(
+      <ClipList
+        {...defaultProps}
+        clips={[makeClip({
+          source_profile: 'broadcast', is_ai_highlight: true, round_key: 'round-000002',
+          confirm_status: 'pending', broadcast_audit: 'passed', end_by: 'next_prep',
+          end_quality: 'coarse', end_review_required: true, broadcast_review_required: true,
+        })]}
+      />,
+    )
+    expect(screen.getByText('需确认')).toBeTruthy()
+    unmount()
+    render(
+      <ClipList
+        {...defaultProps}
+        clips={[makeClip({
+          source_profile: 'broadcast', is_ai_highlight: true, round_key: 'round-000003',
+          confirm_status: 'pending', broadcast_audit: 'rejected_no_stable_combat_start',
+        })]}
+      />,
+    )
+    expect(screen.getByText('已排除')).toBeTruthy()
+  })
+
+  it('已定稿的切片不显示状态标签（列表保持干净）', () => {
+    render(
+      <ClipList
+        {...defaultProps}
+        clips={[makeClip({
+          source_profile: 'broadcast', is_ai_highlight: true, round_key: 'round-000004',
+          confirm_status: 'pending', broadcast_audit: 'passed', end_by: 'broadcast_exclusion',
+          end_quality: 'precise', end_review_required: false,
+        })]}
+      />,
+    )
+    expect(screen.queryByText('待审计')).toBeNull()
+    expect(screen.queryByText('需确认')).toBeNull()
+    expect(document.querySelector('.rail-ready')).toBeTruthy()
+  })
+})

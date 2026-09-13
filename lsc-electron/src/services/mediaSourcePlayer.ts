@@ -134,6 +134,12 @@ export class MsePlayer {
   // 强制 seek 恢复的次数：仅 currentTime 前进时重置（不受 buffer 增长重置），
   // 防止"buffer 持续增长掩盖 media clock 冻结"时无限 seek 死循环。
   private _forcedSeekRecoveryCount = 0
+  /**
+   * 文件回看源已读到文件末尾（由 LocalFileMseSource 在 EOF 时置位）。
+   * 置位后缓冲不再增长是**正常结束**：不得判成"直播流连接中断"，也不得
+   * 强制 seek 回缓冲起点重播。
+   */
+  private _eofReached = false
   private _currentBlobUrl: string | null = null
   // 记录最近一次主动 seek 的时间戳，用于卡顿恢复保护期
   private _lastSeekTime = 0
@@ -199,6 +205,7 @@ export class MsePlayer {
     this._forcedSeekRecoveryCount = 0
     this._lastSeekTime = 0
     this._backpressurePaused = false
+    this._eofReached = false
     this._setState('loading')
     this._initMediaSource()
     this._startStallDetection()
@@ -414,6 +421,16 @@ export class MsePlayer {
   /** 标记发生过主动 seek，激活 3 秒卡顿保护窗口（防止卡顿自恢复误跳直播沿） */
   markSeeked(): void {
     this._lastSeekTime = Date.now()
+  }
+
+  /**
+   * 文件回看源读到文件末尾时调用（见 LocalFileMseSource EOF 收尾）。
+   *
+   * 之后缓冲不再增长属于正常结束：卡顿检测应停在末尾而不是报"直播流中断"
+   * 或回跳重播；再次 seek 会重新喂入数据，需由 start()/seek 路径复位。
+   */
+  markEndOfStream(): void {
+    this._eofReached = true
   }
 
   /** Toggle mute. */
@@ -1116,6 +1133,19 @@ export class MsePlayer {
       if (!video || video.buffered.length === 0) {
         this._log('Stall recovery: buffer empty, waiting for data')
         return
+      }
+
+      // 文件回看已到 EOF：播放头停在缓冲末端是正常结束（不是流中断），
+      // 也不能回跳重播——直接停在末尾，等用户 seek 或回到直播。
+      if (this._eofReached) {
+        const eofBufEnd = this._video?.buffered.length
+          ? this._video.buffered.end(this._video.buffered.length - 1)
+          : 0
+        if (ct >= eofBufEnd - 1.0) {
+          this._log('EOF: playback reached end of loaded file, pausing (no error)')
+          this.pause()
+          return
+        }
       }
 
       // 数据饥饿防线：buffer 超过 8s 未增长，停止自动恢复并报错

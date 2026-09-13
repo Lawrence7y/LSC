@@ -153,46 +153,70 @@
   overflow-wrap: anywhere;
 }
 
-/* ===== 房间卡片微动效与深度阴影 ===== */
+/* ===== 房间卡片状态边框（无散光/纯净高精质感） ===== */
 .room-card {
-  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.22s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s ease !important;
+  position: relative !important;
+  border-radius: var(--radius-sm, 8px) !important;
+  border: 1px solid var(--border-hairline) !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2) !important;
+  transition:
+    transform 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 0.2s ease,
+    box-shadow 0.2s ease,
+    background-color 0.2s ease !important;
+  overflow: hidden;
 }
 
+/* 悬停态：微浮动 */
 .room-card:not(.room-card--expanded):hover {
   transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.2) !important;
+}
+
+/* 选中聚焦态：品牌青色外边框（纯净线框，无发散光晕） */
+.room-card--selected {
+  border-color: var(--brand-500, #31B3AE) !important;
+  box-shadow: 0 0 0 1px var(--brand-500, #31B3AE) !important;
+}
+
+/* 多选群组态：青色细线 */
+.room-card--multiselected {
+  border-color: var(--brand-400, #4DC4BF) !important;
+  box-shadow: 0 0 0 1px var(--brand-400, #4DC4BF) !important;
 }
 
 /* 放大展开态卡片 */
 .room-card--expanded {
   transform: none !important;
-  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--brand-500, #31b3ae) !important;
+  border-color: var(--brand-500, #31B3AE) !important;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5) !important;
   z-index: 10;
 }
 
-/* 录制中卡片：边框红光微呼吸与顶部极光能量条 */
+/* 录制中卡片：清晰红色细边框，无发散光效 */
 .room-card--recording {
-  border-color: rgba(255, 69, 58, 0.42) !important;
-  box-shadow: 0 0 0 1px rgba(255, 69, 58, 0.3), 0 4px 18px rgba(255, 69, 58, 0.16) !important;
-  position: relative;
+  border-color: var(--state-error, #ff453a) !important;
+  box-shadow: 0 0 0 1px rgba(255, 69, 58, 0.6) !important;
 }
 
-.room-card--recording::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2.5px;
-  background: linear-gradient(90deg, transparent 0%, #ff453a 30%, #ff9f0a 50%, #ff453a 70%, transparent 100%);
-  background-size: 200% 100%;
-  animation: auroraFlow 2.6s linear infinite;
-  z-index: 6;
-  pointer-events: none;
+/* 录制中 + 选中并存态 */
+.room-card--recording.room-card--selected {
+  border-color: var(--brand-500, #31B3AE) !important;
+  box-shadow: 0 0 0 1px var(--brand-500, #31B3AE) !important;
 }
 
-@keyframes auroraFlow {
-  0% { background-position: 100% 0; }
-  100% { background-position: -100% 0; }
+.room-card--recording.room-card--multiselected {
+  border-color: var(--brand-400, #4DC4BF) !important;
+  box-shadow: 0 0 0 1px var(--brand-400, #4DC4BF) !important;
+}
+
+/* 浅色模式适配 */
+:root:not(.dark) .room-card {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06) !important;
+}
+
+:root:not(.dark) .room-card:not(.room-card--expanded):hover {
+  border-color: rgba(0, 0, 0, 0.2) !important;
 }
 
 /* 放大预览底部时间线滑入 */

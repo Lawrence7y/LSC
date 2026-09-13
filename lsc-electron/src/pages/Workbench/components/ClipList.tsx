@@ -14,7 +14,13 @@ import {
 import { ClipSegment } from '@/types'
 import { formatTime } from '@/utils/time'
 import { formatClipHoverTitle } from '@/utils/clipNaming'
-import { canExportOrConfirmExport } from '@/utils/clipExportPolicy'
+import {
+  canExportOrConfirmExport,
+  clipExportState,
+  CLIP_EXPORT_STATE_HINT,
+  CLIP_EXPORT_STATE_LABEL,
+  type ClipExportStateCode,
+} from '@/utils/clipExportPolicy'
 import { useI18n } from '@/i18n'
 import './ClipList.css'
 
@@ -96,12 +102,16 @@ function getActualRecordingRange(clip: ClipSegment): { start: number; end: numbe
 }
 
 /**
- * 状态 → 色轨修饰类：可导出(青) / 导出中(青蓝) / 已导出(绿) / 失败(红)
+ * 状态 → 色轨修饰类：可导出(青) / 导出中(青蓝) / 已导出(绿) / 失败(红) / 尚不可导出(琥珀)
+ *
+ * 「尚不可导出」必须与「可导出」区分：此前待审计/需确认的切片也亮青色 rails-ready，
+ * 用户到导出时才发现少了几条（2026-09-12 09:01 现场）。
  */
 function railClass(clip: ClipSegment, _isRefining: boolean, isExporting: boolean): string {
   if (isExporting || clip.export_status === 'queued') return 'rail-busy'
   if (clip.export_status === 'failed') return 'rail-failed'
   if (clip.exported) return 'rail-exported'
+  if (clipExportState(clip) !== 'EXPORTABLE') return 'rail-pending'
   return 'rail-ready'
 }
 
@@ -111,6 +121,16 @@ export const RAIL_LEGEND: Record<string, string> = {
   'rail-busy': '正在导出',
   'rail-exported': '已导出完成',
   'rail-failed': '导出失败 · 可重试',
+  'rail-pending': '尚不可导出（待审计/需确认/已排除，见行内标签）',
+}
+
+/** 状态标签的配色修饰类（与 policy 的 ClipExportStateCode 一一对应） */
+const STATE_TAG_CLASS: Record<ClipExportStateCode, string> = {
+  EXPORTABLE: '',
+  PENDING_AUDIT: 'clip-row-v2__tag--pending',
+  NEEDS_CONFIRM: 'clip-row-v2__tag--confirm',
+  REJECTED: 'clip-row-v2__tag--rejected',
+  BLOCKED: 'clip-row-v2__tag--blocked',
 }
 
 export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, onOpenFolder, onCancelExport, exportProgress, onSelectClip, onConfirmClip, onConfirmAndExport: _onConfirmAndExport, refiningClipId, selectedClipIds: externalSelected, onSelectedClipIdsChange, onConfirmAll: _onConfirmAll, onDeleteMany, onClearExported }: ClipListProps) {
@@ -187,6 +207,7 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
       + (clip.export_status === 'failed' && clip.export_error ? `\n${clip.export_error}` : '')
 
     const rail = railClass(clip, isRefining, isExporting)
+    const exportState = clipExportState(clip)
 
     return (
       <div
@@ -225,6 +246,14 @@ export function ClipList({ clips, onDelete, onExport, onExportMany, onOpenFile, 
               <span className="clip-row-v2__tag clip-row-v2__tag--ai">{t('持续分析')}</span>
             ) : (
               <span className="clip-row-v2__tag clip-row-v2__tag--manual">{t('手动切片')}</span>
+            )}
+            {/* 非「可导出」状态逐条标出：用户不该等到导出才发现某条没进草稿 */}
+            {exportState !== 'EXPORTABLE' && (
+              <Tooltip title={t(CLIP_EXPORT_STATE_HINT[exportState])} placement="top">
+                <span className={`clip-row-v2__tag ${STATE_TAG_CLASS[exportState]}`}>
+                  {t(CLIP_EXPORT_STATE_LABEL[exportState])}
+                </span>
+              </Tooltip>
             )}
           </div>
           <div className="clip-row-v2__bottom" onClick={e => e.stopPropagation()}>

@@ -34,16 +34,18 @@ import {
   isRecordingReviewMode,
   pickReferenceRoomId,
   previewToCommon,
+  previewToRecordingLocal,
   recordingToCommon,
+  recordingToPreviewLocal,
   resolveRecordingReviewSpan,
 } from '@/utils/timelineCoords'
 import { computeDvrLeftEdge } from '@/utils/timelineWindow'
 import { useTimelineViewModel } from '@/hooks/useTimelineViewModel'
+import { canExportClip as canExportClipPolicy } from '@/utils/clipExportPolicy'
 
 /** 贴右此容差内视为回到 Live（秒） */
 const LIVE_EDGE_TOLERANCE_SEC = 1.0
 /** 越过紫标左沿此容差内视为回到 Live（秒） */
-const DVR_LEFT_TOLERANCE_SEC = 0.25
 const MAX_ROOM_URLS_PER_ADD = 12
 const BROADCAST_PROFILE_HINTS = [
   '官方赛事', '官方解说', '赛事直播', '赛事转播', '赛事解说',
@@ -188,12 +190,22 @@ type CaptureFailure = {
 }
 
 function canExportForShortcut(c: ClipSegment): boolean {
-  if (c.export_status === 'queued' || c.export_status === 'exporting') return false
-  // 与 canExportClip 一致：pending/refining/audio_pending 不可直接导出，须先确认
-  return !c.confirm_status ||
-    c.confirm_status === 'user_confirmed' ||
-    c.confirm_status === 'ocr_confirmed' ||
-    c.confirm_status === 'vision_confirmed'
+  return canExportClipPolicy(c)
+}
+
+function usesLocalRecordingAxis(room: {
+  is_recording?: boolean
+  record_output_path?: string
+  preview_mode?: string
+} | null | undefined): boolean {
+  return Boolean(
+    room
+    && (
+      room.is_recording
+      || room.record_output_path
+      || isRecordingReviewMode(room.preview_mode)
+    )
+  )
 }
 
 type ContinuousListedClip = ClipSegment & { export_deferred?: boolean }
@@ -433,7 +445,6 @@ export default function Workbench() {
   const exportProgressStatusPendingRef = useRef<Set<string>>(new Set())
   const aligningRoomIdsRef = useRef<Set<string>>(new Set())
   const alignmentInFlightRef = useRef(false)
-  const recordingReviewInFlightRef = useRef<Set<string>>(new Set())
   const alignmentBackgroundRef = useRef(false)
   const alignmentWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const alignButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -719,8 +730,13 @@ export default function Workbench() {
     }
     const buf = getRoomBufferedRange(rid)
     if (!buf) return null
-    // 真实 MSE 缓冲起播安全线：不能落后于播放器真实连续缓存起始 buf.start。
-    const dvrPreview = Math.max(buf.start, computeDvrLeftEdge(buf.end, timelineReplaySeconds))
+    // DVR 紫线左边界 = liveEdge − 用户配置的回放时长（与放大预览条 /
+    // computeExpandedPreviewWindow 的设计一致）。**不要**再钳到真实连续缓存
+    // 起点 buf.start：MSE 连续缓存深度取决于预览流已推时长与配额，往往远小于
+    // 用户配置（例如缓冲只有 ~120s 时，钳制会让紫线距直播只有 2 分钟，用户
+    // 看到「可回放时长明显少于设置的 5 分钟」）。超出缓冲的点击/拖动由 mseSeek
+    // 自动切换到录制文件回看（recording_review），因此按配置时长展示是安全的。
+    const dvrPreview = computeDvrLeftEdge(buf.end, timelineReplaySeconds)
     if (commonMode && timelineContext?.room_snapshots[rid]) {
       try {
         return previewToCommon(timelineContext, rid, dvrPreview)
@@ -1229,6 +1245,17 @@ export default function Workbench() {
     return 0
   }, [])
 
+  /**
+   * 目标房间处于本地回看通道时，把**录制轴**秒换算为回看播放器时间轴秒。
+   * 返回 null 表示该房间不在回看通道（调用方按直播轴处理）。
+   */
+  const reviewPlayerTimeFor = useCallback((rid: string, recordingAxisSec: number): number | null => {
+    const ui = useAppStore.getState().uiState[rid]
+    if (ui?.preview_channel !== 'review') return null
+    // 回看播放器的 currentTime 是本地文件原始 PTS，轴偏移为负值
+    return Math.max(0, recordingAxisSec - (ui.review_offset_sec ?? 0))
+  }, [])
+
   const resolveReviewSeekEdge = useCallback((targets: Set<string>): number => {
     const refId = referenceRoomId || selectedRoomId || [...targets][0]
     if (!refId) return Math.max(lastContentEndRef.current, 1)
@@ -1237,8 +1264,11 @@ export default function Workbench() {
       return Math.max(lastContentEndRef.current, 1)
     }
     const hint = computeRecordedDurationHint(refRoom, continuousAnalysisStatus?.recorded_duration)
+    // 回看播放器时间轴是本地文件原始 PTS：先叠加带符号轴偏移得到录制轴秒，
+    // 否则右沿会被撑到 PTS 基座量级（时间线整段失真）。
+    const reviewAxisPos = getPreviewCurrentTime(refId) + (Number(refRoom?.preview_review_start_sec) || 0)
     return resolveRecordingReviewSpan(
-      getPreviewCurrentTime(refId),
+      reviewAxisPos,
       hint,
       getRoomMediaDuration(refId),
       refRoom?.mark_in,
@@ -1250,7 +1280,15 @@ export default function Workbench() {
   ])
 
   // 直接控制 MSE player 的 video 元素（Electron 模式下后端无法控制 MSE video）
-  const mseSeek = useCallback((roomId: string, time: number, opts?: { quiet?: boolean }) => {
+  /**
+   * 直接控制 MSE player 的 video 元素。
+   *
+   * `opts.axisSec`：本次跳转在**显示轴**上的目标秒（时间线刻度值）。
+   * 回看入口必须用它换算录制轴——不能用 `t` 反推：`t` 是播放器轴，
+   * 一旦 `recording_to_preview_delta` 缺失/过期，反推会得到越界目标，
+   * 表现为"轴切到回看但画面迟迟不出"。
+   */
+  const mseSeek = useCallback((roomId: string, time: number, opts?: { quiet?: boolean; axisSec?: number }) => {
     const t = Math.max(0, time)
     const quiet = opts?.quiet === true || timelineScrubbingRef.current
     if (!quiet) {
@@ -1273,57 +1311,89 @@ export default function Workbench() {
           writeDisplayPlayhead(t)
         }
       } else {
-        writeDisplayPlayhead(t)
+        const roomState = useAppStore.getState().rooms.find(r => r.room_id === roomId)
+        writeDisplayPlayhead(
+          usesLocalRecordingAxis(roomState)
+            ? (previewToRecordingLocal(roomState, t) ?? t)
+            : t,
+        )
       }
     }
 
     const registry = window.__msePlayers
     const video = registry?.[roomId]?.player?.videoElement as HTMLVideoElement | undefined
     const player = registry?.[roomId]?.player
-    if (video && video.buffered.length > 0) {
-      const bufStart = video.buffered.start(0)
-      const bufEnd = video.buffered.end(video.buffered.length - 1)
-      if (t >= bufStart && t <= bufEnd) {
-        try {
-          player?.markSeeked?.()
-          video.currentTime = t
-        } catch { /* seek 可能被浏览器拒绝 */ }
-      } else if (!quiet) {
+    const hasBuffer = Boolean(video && video.buffered.length > 0)
+    const bufStart = hasBuffer ? video!.buffered.start(0) : null
+    const bufEnd = hasBuffer ? video!.buffered.end(video!.buffered.length - 1) : null
+    if (video && bufStart != null && bufEnd != null && t >= bufStart && t <= bufEnd) {
+      try {
         player?.markSeeked?.()
-        // 非拖动回放（点击切片/标记/跳转）缓冲外：如果存在录制文件，切换到
-        // 录制文件回看（recording_review）并按目标秒数起播，而不是只回退到
-        // MSE 直播缓冲边缘（通常只有数秒到数十秒）。
-        const st = useAppStore.getState()
-        const roomState = st.rooms.find(r => r.room_id === roomId)
-        const mode = roomState?.preview_mode
-        if (recordingReviewInFlightRef.current.has(roomId) && mode !== 'recording_review') {
-          console.info(`[Workbench] recording review already starting for ${roomId}, skip duplicate`)
-          return
-        }
-        // recording_review 缓冲外也要重启文件 FFmpeg（换 -ss），不能永远 clamp 到几秒缓冲。
-        const canReview = Boolean(roomState?.record_output_path) && mode !== 'degraded'
-        if (canReview) {
-          let recTime = t
-          const ctx = st.timelineContext
-          const status = getAlignStatus(ctx, st.timelineInvalidated)
+        video.currentTime = t
+      } catch { /* seek 可能被浏览器拒绝 */ }
+    } else if (!quiet) {
+      player?.markSeeked?.()
+      // 非拖动回放（点击切片/标记/跳转）缓冲外：如果存在录制文件，切换到
+      // 录制文件回看（recording_review）并按目标秒数起播，而不是只回退到
+      // MSE 直播缓冲边缘（通常只有数秒到数十秒）。
+      // **无直播缓冲**（预览尚未出画/已停/出错）时同样允许进回看：此前整个
+      // 分支被 `buffered.length > 0` 挡住，表现为"点回看没反应"。
+      const st = useAppStore.getState()
+      const roomState = st.rooms.find(r => r.room_id === roomId)
+
+      // 回看来源：录制中的镜像文件优先（moov 一次写定的 fMP4），否则用录制文件本身
+      const canReview = Boolean(roomState?.dvr_output_path || roomState?.record_output_path)
+      if (canReview) {
+        let recTime = t
+        const ctx = st.timelineContext
+        const status = getAlignStatus(ctx, st.timelineInvalidated)
+        if (opts?.axisSec != null && Number.isFinite(opts.axisSec)) {
+          // 首选：调用方给了显示轴刻度（时间线点击/拖拽/标记都是这个值）
           if (status === 'ready' && ctx?.room_snapshots[roomId]) {
             try {
-              const common = previewToCommon(ctx, roomId, t)
-              recTime = commonToRecording(ctx, roomId, common)
-            } catch { /* 保持 t */ }
+              recTime = commonToRecording(ctx, roomId, opts.axisSec)
+            } catch {
+              recTime = opts.axisSec
+            }
           } else {
-            recTime = Math.max(0, t - (roomState?.content_offset ?? 0))
+            recTime = opts.axisSec
           }
-          console.info(
-            `[Workbench] seek ${t.toFixed(1)}s 超出直播缓冲 [${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}]，切换到录制文件回看 @${recTime.toFixed(1)}s`,
+        } else if (status === 'ready' && ctx?.room_snapshots[roomId]) {
+          try {
+            const common = previewToCommon(ctx, roomId, t)
+            recTime = commonToRecording(ctx, roomId, common)
+          } catch { /* 保持 t */ }
+        } else {
+          recTime = Math.max(
+            0,
+            previewToRecordingLocal(roomState, t)
+              ?? (t - (roomState?.content_offset ?? 0)),
           )
-          recordingReviewInFlightRef.current.add(roomId)
-          window.setTimeout(() => {
-            recordingReviewInFlightRef.current.delete(roomId)
-          }, 8000)
-          send('start_recording_review', { room_id: roomId, time: recTime })
+        }
+        const reviewSource = roomState?.dvr_output_path || roomState?.record_output_path || ''
+        // 已在回看且目标位置未变：忽略重复点击（换位置由 store 的 seekSec 变化驱动重建）
+        const reviewUi = st.uiState[roomId]
+        if (reviewUi?.preview_channel === 'review' && reviewUi.review_path === reviewSource
+          && Math.abs((reviewUi.review_seek_sec ?? -1) - recTime) < 0.05) {
           return
         }
+        console.info(
+          `[Workbench] seek ${t.toFixed(1)}s 超出直播缓冲 `
+          + `[${bufStart != null && bufEnd != null ? `${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}` : '无缓冲'}]，`
+          + `切换到本地文件回看 @${recTime.toFixed(1)}s`,
+        )
+        // 播放头兜底值必须记在**录制轴**（回看播放器轴会按 preview_review_start_sec
+        // 换算回录制轴再比较）。写成显示轴/预览轴的值时，usePlayheadSampling 的
+        // 0.35s 释放条件永不满足，播放头会被钉死在进入位置（实测 9 分钟不动）。
+        scrubOverrideRef.current[roomId] = Math.max(0, recTime)
+        // 方案 A：回看 = 本地文件读取，不再请求后端起流/建会话
+        useAppStore.getState().enterReview(roomId, {
+          path: reviewSource,
+          seekSec: Math.max(0, recTime),
+        })
+        return
+      }
+      if (video && bufStart != null && bufEnd != null) {
         // 没有可回看文件时：clamp 到当前连续有效缓冲起点，保证平滑回放且不暂停。
         const fallback = Math.max(bufStart + 0.3, Math.min(bufEnd - 0.5, t))
         try {
@@ -1335,7 +1405,7 @@ export default function Workbench() {
           `[Workbench] seek ${t.toFixed(1)}s 超出缓冲 [${bufStart.toFixed(1)}, ${bufEnd.toFixed(1)}]，平滑回退到 ${fallback.toFixed(1)}s`,
         )
       }
-      // quiet（scrub 拖动中）缓冲外：只动时间线 UI，不把 video 拽回 live edge
+      // 无缓冲且无录制文件：仅保留播放头/时间线 UI 的写入（下方 send('seek') 仍照发）
     }
     // scrub 中不刷 WebSocket seek，松手后再同步
     if (!quiet) {
@@ -1387,17 +1457,15 @@ export default function Workbench() {
     const skippedNoDvr: string[] = []
     const dvrIds: string[] = []
     const restoreLiveIds: string[] = []
+    const ui = useAppStore.getState().uiState
     ids.forEach(rid => {
       const room = roomList.find(r => r.room_id === rid)
-      const mode = room?.preview_mode
-      if (isNoDvrPreviewMode(mode)) {
-        // 手动从录制文件回看切回直播：如果录制仍在进行，说明这不是离线回看，
-        // 应该重新 enable_preview 恢复 live_mse，而不是简单跳过。
-        if (mode === 'recording_review' && room?.is_recording) {
-          restoreLiveIds.push(rid)
-        } else {
-          skippedNoDvr.push(rid)
-        }
+      if (ui[rid]?.preview_channel === 'review') {
+        // 本地文件回看（方案 A）：退出回看通道即可回到直播，无需后端复位
+        restoreLiveIds.push(rid)
+      } else if (isNoDvrPreviewMode(room?.preview_mode)) {
+        // degraded（主播离线且无预览）：没有实时沿可跳
+        skippedNoDvr.push(rid)
       } else {
         dvrIds.push(rid)
       }
@@ -1411,14 +1479,16 @@ export default function Workbench() {
     setTimelineFollowLive(true)
     timelineScrubbingRef.current = false
     setTimelineScrubbing(false)
-    // 手动回看且仍在录制：切回直播预览（live_mse）。
+    // 退出本地回看：通道状态完全由前端 store 持有，不存在后端残留导致"回不去"
     restoreLiveIds.forEach(rid => {
-      send('enable_preview', { room_id: rid, enabled: true, mode: 'mse' })
+      useAppStore.getState().exitReview(rid)
+      // live preview sink 在回看期间保持运行，无需重新 enable_preview
     })
     const registry = window.__msePlayers
-    dvrIds.forEach(rid => {
+    ;[...dvrIds, ...restoreLiveIds].forEach(rid => {
       const entry = registry?.[rid]
-      const player = entry?.player
+      // 必须取 live 播放器：回看期间 registry.player 指向 review 播放器
+      const player = entry?.live ?? entry?.player
       const video = player?.videoElement as HTMLVideoElement | undefined
       const bufferedLength = video?.buffered?.length ?? 0
       const bufferedStart = bufferedLength > 0 ? video!.buffered.start(0) : null
@@ -1452,10 +1522,8 @@ export default function Workbench() {
     const edge = noDvr ? resolveReviewSeekEdge(targets) : Math.max(lastContentEndRef.current, 1)
     // 不可拖过直播沿；贴右容差内视为回 Live（recording_review 无 Live 沿）
     const clamped = Math.max(0, Math.min(time, edge))
-    if (!scrubbing && !noDvr && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
-      enterTimelineLive(targets)
-      return
-    }
+    // 早于当前 MSE 缓冲的位置交给 mseSeek() 切换到录制文件回看，
+    // 不能在这里直接拉回直播沿。
     if (!scrubbing && !noDvr && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
@@ -1467,13 +1535,21 @@ export default function Workbench() {
     // scrub 中只预览一路 video，多路正式落点在松手时同步
     const seekIds = scrubbing ? [[...targets][0]].filter(Boolean) : [...targets]
     seekIds.forEach(rid => {
+      const reviewTime = reviewPlayerTimeFor(rid, clamped)
+      if (reviewTime != null) {
+        mseSeek(rid, reviewTime, { quiet: scrubbing, axisSec: clamped })
+        return
+      }
       if (status === 'ready' && ctx?.room_snapshots[rid]) {
-        mseSeek(rid, Math.max(0, commonToPreview(ctx, rid, clamped)), { quiet: scrubbing })
+        mseSeek(rid, Math.max(0, commonToPreview(ctx, rid, clamped)), { quiet: scrubbing, axisSec: clamped })
         return
       }
       const room = roomList.find(r => r.room_id === rid)
       const offset = room?.content_offset ?? 0
-      mseSeek(rid, Math.max(0, clamped - offset), { quiet: scrubbing })
+      const previewTime = targets.size === 1 && usesLocalRecordingAxis(room)
+        ? (recordingToPreviewLocal(room, clamped) ?? clamped)
+        : clamped - offset
+      mseSeek(rid, Math.max(0, previewTime), { quiet: scrubbing, axisSec: clamped })
     })
   }, [resolveSeekTargets, enterTimelineLive, mseSeek, dvrStart, resolveReviewSeekEdge])
 
@@ -1519,10 +1595,7 @@ export default function Workbench() {
     }
 
     const clamped = Math.max(0, Math.min(playhead, edge))
-    if (!noDvr && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
-      enterTimelineLive(targets)
-      return
-    }
+    // 早于 DVR 左边界的位置保留给录制文件回看，不应回弹直播沿。
     if (!noDvr && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
@@ -1530,13 +1603,21 @@ export default function Workbench() {
     setTimelineFollowLive(false)
     // 正式落点：写 UI + WS（拖拽过程不 seek，仅松手一次）
     targets.forEach(targetRid => {
+      const reviewTime = reviewPlayerTimeFor(targetRid, clamped)
+      if (reviewTime != null) {
+        mseSeek(targetRid, reviewTime, { axisSec: clamped })
+        return
+      }
       if (status === 'ready' && ctx?.room_snapshots[targetRid]) {
-        mseSeek(targetRid, Math.max(0, commonToPreview(ctx, targetRid, clamped)))
+        mseSeek(targetRid, Math.max(0, commonToPreview(ctx, targetRid, clamped)), { axisSec: clamped })
         return
       }
       const room = roomList.find(r => r.room_id === targetRid)
       const offset = room?.content_offset ?? 0
-      mseSeek(targetRid, Math.max(0, clamped - offset))
+      const previewTime = targets.size === 1 && usesLocalRecordingAxis(room)
+        ? (recordingToPreviewLocal(room, clamped) ?? clamped)
+        : clamped - offset
+      mseSeek(targetRid, Math.max(0, previewTime), { axisSec: clamped })
     })
   }, [referenceRoomId, selectedRoomId, selectedRoomIds, enterTimelineLive, resolveSeekTargets, mseSeek, dvrStart, resolveReviewSeekEdge])
 
@@ -1602,10 +1683,6 @@ export default function Workbench() {
       if (!refId) return
       const commonT = previewToCommon(ctx, refId, getPreviewCurrentTime(refId)) + delta
       const clamped = Math.max(0, Math.min(commonT, edge))
-      if (!noDvr && dvrStart != null && clamped < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
-        enterTimelineLive(targets)
-        return
-      }
       if (!noDvr && edge - clamped <= LIVE_EDGE_TOLERANCE_SEC) {
         enterTimelineLive(targets)
         return
@@ -1618,11 +1695,18 @@ export default function Workbench() {
       return
     }
     const anyId = [...targets][0]
-    const next = Math.max(0, Math.min(getPreviewCurrentTime(anyId) + delta, edge))
-    if (!noDvr && dvrStart != null && next < dvrStart - DVR_LEFT_TOLERANCE_SEC) {
-      enterTimelineLive(targets)
+    // 本地回看通道：当前时刻先换算到录制轴，步进后再换算回回看播放器时间轴
+    if (useAppStore.getState().uiState[anyId]?.preview_channel === 'review') {
+      setTimelineFollowLive(false)
+      targets.forEach(rid => {
+        const offsetSec = useAppStore.getState().uiState[rid]?.review_offset_sec ?? 0
+        const curAxis = getPreviewCurrentTime(rid) + offsetSec
+        const nextAxis = Math.max(0, Math.min(curAxis + delta, edge))
+        mseSeek(rid, Math.max(0, nextAxis - offsetSec))
+      })
       return
     }
+    const next = Math.max(0, Math.min(getPreviewCurrentTime(anyId) + delta, edge))
     if (!noDvr && edge - next <= LIVE_EDGE_TOLERANCE_SEC) {
       enterTimelineLive(targets)
       return
@@ -1840,20 +1924,20 @@ export default function Workbench() {
 
   const handleGoLive = useCallback(() => {
     const targets = resolveSeekTargets()
-    if (targetsIncludeNoDvrMode(targets, rooms)) {
-      message.info(t('回看模式房间不支持跳转直播沿'))
-      return
-    }
     if (targets.size === 0) return
+    // 统一收口：本地回看房间由 enterTimelineLive 退出回看并回直播沿，
+    // degraded（离线）房间在其内部提示"无实时沿"。
     enterTimelineLive(targets)
-  }, [rooms, resolveSeekTargets, enterTimelineLive])
+  }, [resolveSeekTargets, enterTimelineLive])
 
   const handleExpandedPreviewSeek = useCallback((roomId: string, requestedTime: number) => {
     const room = useAppStore.getState().rooms.find(item => item.room_id === roomId)
     const range = getRoomBufferedRange(roomId)
     let target = Math.max(0, requestedTime)
     if (range && !isNoDvrPreviewMode(room?.preview_mode)) {
-      target = Math.max(range.start, Math.min(range.end, target))
+      // 只限制不能越过当前直播沿/缓冲右端；早于缓冲左端的位置保留给
+      // mseSeek() 自动切到录制文件回看。
+      target = Math.min(range.end, target)
       if (range.end - target <= LIVE_EDGE_TOLERANCE_SEC) {
         enterTimelineLive(new Set([roomId]))
         return
@@ -1865,7 +1949,7 @@ export default function Workbench() {
     const next = { ...lastPreviewPositionsRef.current, [roomId]: target }
     lastPreviewPositionsRef.current = next
     setPreviewPositions(next)
-    mseSeek(roomId, target)
+    mseSeek(roomId, target, { axisSec: Math.max(0, requestedTime) })
   }, [enterTimelineLive, mseSeek])
 
   // Phase 3: 音频对齐结果监听器
@@ -2357,14 +2441,25 @@ export default function Workbench() {
       return
     }
     selectedRoomIds.forEach(rid => {
+      const room = useAppStore.getState().rooms.find(r => r.room_id === rid)
+      const previewTime = reviewPlayerTimeFor(rid, time)
+        ?? (selectedRoomIds.size === 1 && usesLocalRecordingAxis(room)
+          ? (recordingToPreviewLocal(room, time) ?? time)
+          : time)
       if (type === 'in') {
-        send('set_mark_in', { room_id: rid, time, live: false })
+        send('set_mark_in', { room_id: rid, time: previewTime, live: false })
       } else {
-        send('set_mark_out', { room_id: rid, time, live: false })
+        send('set_mark_out', { room_id: rid, time: previewTime, live: false })
       }
     })
     if (selectedRoomIds.size > 0) {
-      mseSeek([...selectedRoomIds][0], time)
+      const rid = [...selectedRoomIds][0]
+      const room = useAppStore.getState().rooms.find(r => r.room_id === rid)
+      const previewTime = reviewPlayerTimeFor(rid, time)
+        ?? (selectedRoomIds.size === 1 && usesLocalRecordingAxis(room)
+          ? (recordingToPreviewLocal(room, time) ?? time)
+          : time)
+      mseSeek(rid, previewTime, { axisSec: time })
     }
     message.info(t('近似定位：拖拽标记可能偏差数秒，精确导出请用 I / O 键'), 3)
   }, [selectedRoomIds, send, mseSeek, selectedRoomId])
@@ -2445,9 +2540,10 @@ export default function Workbench() {
     const ctx = useAppStore.getState().timelineContext
     const status = getAlignStatus(ctx, useAppStore.getState().timelineInvalidated)
 
+    const clipRoom = useAppStore.getState().rooms.find(r => r.room_id === roomId)
     const toPreview = (rec: number): number => {
       const snap = ctx?.room_snapshots[roomId!]
-      if (!snap) return rec
+      if (!snap) return recordingToPreviewLocal(clipRoom, rec) ?? rec
       return rec + snap.recording_to_common_delta - snap.preview_to_common_delta
     }
 
@@ -2511,8 +2607,12 @@ export default function Workbench() {
     }
 
     if (room?.mark_in != null && room?.mark_out != null) {
-      let start = room.mark_in
-      let end = room.mark_out
+      let start = usesLocalRecordingAxis(room)
+        ? (previewToRecordingLocal(room, room.mark_in) ?? room.mark_in)
+        : room.mark_in
+      let end = usesLocalRecordingAxis(room)
+        ? (previewToRecordingLocal(room, room.mark_out) ?? room.mark_out)
+        : room.mark_out
       if (localDragMark) {
         if (localDragMark.type === 'in') start = localDragMark.time
         else end = localDragMark.time
@@ -2569,7 +2669,7 @@ export default function Workbench() {
     const rid = clip.room_id
     const toRecording = (pv: number): number => {
       const snap = ctx?.room_snapshots[rid ?? '']
-      if (!snap) return pv
+      if (!snap) return previewToRecordingLocal(room, pv) ?? pv
       return pv - snap.recording_to_common_delta + snap.preview_to_common_delta
     }
 
@@ -2716,6 +2816,10 @@ export default function Workbench() {
           broadcast_audit_reason: c.broadcast_audit_reason,
           broadcast_excluded_reason: c.broadcast_excluded_reason,
           broadcast_review_required: c.broadcast_review_required,
+          start_quality: c.start_quality,
+          end_quality: c.end_quality,
+          start_review_required: c.start_review_required,
+          end_review_required: c.end_review_required,
           duration_anomaly: c.duration_anomaly,
           end_by: c.end_by,
         })),
@@ -2980,9 +3084,19 @@ export default function Workbench() {
   const handleConfirmExport = () => {
     if (!ensureNotAligning()) return
     if (!previewClip) return
+    const latestClip = previewClip.round_key
+      ? useAppStore.getState().clips.find(
+          c => c.room_id === previewClip.room_id && c.round_key === previewClip.round_key,
+        ) ?? previewClip
+      : previewClip
+    if (!canExportClipPolicy(latestClip)) {
+      message.warning(t('该赛事切片边界仍在审计/复核中：请稍候，或点击【确认导出】完成人工复核后再导出'))
+      setPreviewClip(null)
+      return
+    }
     // 确认导出
 
-    const room = rooms.find(r => r.room_id === previewClip.room_id)
+    const room = rooms.find(r => r.room_id === latestClip.room_id)
     if (!room) {
       message.error(t('房间不存在'))
       return
@@ -2995,42 +3109,43 @@ export default function Workbench() {
     const submitMp4Export = () => {
       _operationCounter++
       const operationId = `op-${Date.now()}-${_operationCounter}`
-      const jobId = previewClip.clip_snapshot_id
-        ? clipSnapshotJobId(previewClip.clip_snapshot_id)
+      const jobId = latestClip.clip_snapshot_id
+        ? clipSnapshotJobId(latestClip.clip_snapshot_id)
         : operationId
 
-      if (previewClip.clip_snapshot_id) {
+      if (latestClip.clip_snapshot_id) {
         send('export_clip_by_id', {
-          clip_id: previewClip.clip_snapshot_id,
-          label: previewClip.label,
+          clip_id: latestClip.clip_snapshot_id,
+          label: latestClip.label,
           preset_id: exportPresetId,
-          source: previewClip.is_ai_highlight ? 'ai_highlight' : 'manual',
+          source: latestClip.is_ai_highlight ? 'ai_highlight' : 'manual',
           operation_id: operationId,
         })
       } else {
         send('export_clip', {
-          room_id: previewClip.room_id,
-          start: previewClip.start,
-          end: previewClip.end,
-          label: previewClip.label,
+          room_id: latestClip.room_id,
+          start: latestClip.start,
+          end: latestClip.end,
+          label: latestClip.label,
           preset_id: exportPresetId,
           job_id: jobId,
           operation_id: operationId,
-          source: previewClip.is_ai_highlight ? 'ai_highlight' : 'manual',
-          mark_in_wallclock: previewClip.mark_in_wallclock,
-          mark_out_wallclock: previewClip.mark_out_wallclock,
-          recording_start_mono: previewClip.recording_start_mono,
-          recording_media_start_mono: previewClip.recording_media_start_mono,
-          content_offset: previewClip.content_offset,
+          source: latestClip.is_ai_highlight ? 'ai_highlight' : 'manual',
+          round_key: latestClip.round_key,
+          mark_in_wallclock: latestClip.mark_in_wallclock,
+          mark_out_wallclock: latestClip.mark_out_wallclock,
+          recording_start_mono: latestClip.recording_start_mono,
+          recording_media_start_mono: latestClip.recording_media_start_mono,
+          content_offset: latestClip.content_offset,
           use_room_marks: false,
         })
       }
       pendingExportJobIdsRef.current.add(jobId)
       const store = useAppStore.getState()
       store.setClips(store.clips.map(c =>
-        c.clip_id === previewClip.clip_id ||
-          getClipStableId(c) === getClipStableId(previewClip) ||
-          (c.start === previewClip.start && c.end === previewClip.end && c.room_id === previewClip.room_id)
+        c.clip_id === latestClip.clip_id ||
+          getClipStableId(c) === getClipStableId(latestClip) ||
+          (c.start === latestClip.start && c.end === latestClip.end && c.room_id === latestClip.room_id)
           ? { ...c, job_id: jobId, exported: false, export_status: 'queued', export_error: undefined }
           : c
       ))
@@ -3038,7 +3153,7 @@ export default function Workbench() {
       message.info(t('导出任务已提交'))
     }
 
-    if (isApproximateClip(previewClip)) {
+    if (isApproximateClip(latestClip)) {
       message.warning(t('该切片为近似定位，导出时间可能偏差数秒；精确导出请用 I / O 键标记'))
       modal.confirm({
         title: t('近似定位切片'),
@@ -3598,6 +3713,11 @@ export default function Workbench() {
                 boundary_quality: data.boundary_quality ?? c.boundary_quality,
                 boundary_quality_reason_code: data.boundary_quality_reason_code ?? c.boundary_quality_reason_code,
                 boundary_review_required: data.boundary_review_required ?? c.boundary_review_required,
+                start_quality: data.start_quality ?? c.start_quality,
+                end_quality: data.end_quality ?? c.end_quality,
+                start_review_required: data.start_review_required ?? c.start_review_required,
+                end_review_required: data.end_review_required ?? c.end_review_required,
+                broadcast_result_tail_sec: data.broadcast_result_tail_sec ?? c.broadcast_result_tail_sec,
                 source_profile: data.source_profile ?? c.source_profile,
                 broadcast_audit: data.broadcast_audit ?? c.broadcast_audit,
                 broadcast_audit_reason: data.broadcast_audit_reason ?? c.broadcast_audit_reason,
@@ -3648,6 +3768,11 @@ export default function Workbench() {
           boundary_quality: data.boundary_quality,
           boundary_quality_reason_code: data.boundary_quality_reason_code,
           boundary_review_required: data.boundary_review_required,
+          start_quality: data.start_quality,
+          end_quality: data.end_quality,
+          start_review_required: data.start_review_required,
+          end_review_required: data.end_review_required,
+          broadcast_result_tail_sec: data.broadcast_result_tail_sec,
           source_profile: data.source_profile,
           broadcast_audit: data.broadcast_audit,
           broadcast_audit_reason: data.broadcast_audit_reason,
@@ -3686,6 +3811,11 @@ export default function Workbench() {
         boundary_quality: data.boundary_quality,
         boundary_quality_reason_code: data.boundary_quality_reason_code,
         boundary_review_required: data.boundary_review_required,
+        start_quality: data.start_quality,
+        end_quality: data.end_quality,
+        start_review_required: data.start_review_required,
+        end_review_required: data.end_review_required,
+        broadcast_result_tail_sec: data.broadcast_result_tail_sec,
         source_profile: data.source_profile,
         broadcast_audit: data.broadcast_audit,
         broadcast_audit_reason: data.broadcast_audit_reason,
@@ -3718,6 +3848,13 @@ export default function Workbench() {
     unsubs.push(on('clip_confirm_status', (data: any) => {
       if (!data?.room_id || !data?.round_key) return
       const st = useAppStore.getState()
+      // 审计拒绝终态：从切片列表移除（权威快照已同步清理，残留会混入剪映草稿）
+      if (data.confirm_status === 'rejected') {
+        st.setClips(st.clips.filter(
+          c => !(c.room_id === data.room_id && c.round_key === data.round_key)
+        ))
+        return
+      }
       const existing = st.clips.find(
         c => c.room_id === data.room_id && c.round_key === data.round_key
       )
@@ -3825,11 +3962,25 @@ export default function Workbench() {
       && status.coverage_complete === true
       && (status.audit_delivery_gap ?? 0) === 0
       && (status.pending_queue_depth ?? 0) === 0
-    if (!finalizedOk) return
+    // “仅停止分析（立即停止）”不进入正常收尾，后端会直接取消在途扫描并以
+    // idle 结束。此时当前已确认/已入列的切片就是可生成草稿的权威集合，
+    // 不能因为 finalization_state 不是 completed 而永远不触发草稿。
+    const immediateStopOk =
+      phase === 'idle'
+      && status.finalization_recoverable !== true
+      && (status.finalization_state === 'idle' || status.finalization_state == null)
+    if (!finalizedOk && !immediateStopOk) return
+    // 草稿素材必须引用停录后的最终文件名。仅停止分析时
+    // 录制可能仍在继续；等 rooms_updated 把 is_recording 切为 false
+    // 后 effect 自动重跑，禁止生成指向随后被改名的 _录制中.mp4。
+    const recordingStillActive = rooms.some(
+      room => s.targetRoomIds.includes(room.room_id) && room.is_recording,
+    )
+    if (recordingStillActive) return
 
     // autoFired 仅由 runAnalysisDraftIfNeeded 置位；此处预置会导致函数内立即 return
     void runAnalysisDraftIfNeeded('auto')
-  }, [continuousAnalysisStatus, runAnalysisDraftIfNeeded, wantAnalysisDraft, armDraftSession])
+  }, [continuousAnalysisStatus, runAnalysisDraftIfNeeded, wantAnalysisDraft, armDraftSession, rooms])
 
   // ── 导出文件操作 ──
   const handleOpenExportFolder = (outputPath: string) => {
@@ -3853,7 +4004,9 @@ export default function Workbench() {
   // 本地模式也维护直播沿（只增不减）
   {
     const previewT = previewPositions[selectedRoom?.room_id ?? ''] ?? 0
-    let localEnd = previewT
+    let localEnd = usesLocalRecordingAxis(selectedRoom)
+      ? (previewToRecordingLocal(selectedRoom, previewT) ?? previewT)
+      : previewT
     if (selectedRoom?.mark_out != null && selectedRoom.mark_out > localEnd) localEnd = selectedRoom.mark_out
     if (selectedRoom?.mark_in != null && selectedRoom.mark_in > localEnd) localEnd = selectedRoom.mark_in
     const end = Math.max(timelineView?.duration ?? 0, localEnd, 1)
@@ -3869,15 +4022,33 @@ export default function Workbench() {
   const activeRefineRange = useMemo(() => {
     if (!refiningClipId) return null
     const ctx = timelineContext
-    const toDisplay = (localStart: number, localEnd: number, roomId?: string | null) => {
+    const toDisplay = (
+      localStart: number,
+      localEnd: number,
+      roomId?: string | null,
+      sourceAxis: 'preview' | 'recording' = 'preview',
+    ) => {
       if (commonMode && ctx && roomId && ctx.room_snapshots[roomId]) {
         try {
           return {
-            start: previewToCommon(ctx, roomId, localStart),
-            end: previewToCommon(ctx, roomId, localEnd),
+            start: sourceAxis === 'recording'
+              ? recordingToCommon(ctx, roomId, localStart)
+              : previewToCommon(ctx, roomId, localStart),
+            end: sourceAxis === 'recording'
+              ? recordingToCommon(ctx, roomId, localEnd)
+              : previewToCommon(ctx, roomId, localEnd),
           }
         } catch {
           /* fallthrough */
+        }
+      }
+      if (sourceAxis === 'preview' && roomId) {
+        const room = rooms.find(r => r.room_id === roomId)
+        if (usesLocalRecordingAxis(room)) {
+          return {
+            start: previewToRecordingLocal(room, localStart) ?? localStart,
+            end: previewToRecordingLocal(room, localEnd) ?? localEnd,
+          }
         }
       }
       return { start: localStart, end: localEnd }
@@ -3910,12 +4081,12 @@ export default function Workbench() {
       if (clip.common_start != null && clip.common_end != null) {
         return { start: clip.common_start, end: clip.common_end }
       }
-      return toDisplay(clip.start, clip.end, clip.room_id)
+      return toDisplay(clip.start, clip.end, clip.room_id, 'recording')
     }
     return null
   }, [
     refiningClipId, localDragMark, commonMarkIn, commonMarkOut, selectedRoom, clips,
-    commonMode, timelineContext,
+    commonMode, timelineContext, rooms,
   ])
 
   const recordedDurationHint = useMemo(() => {
@@ -4184,6 +4355,8 @@ export default function Workbench() {
       send('refresh_room_status', {})
       const currentRooms = useAppStore.getState().rooms
       currentRooms.forEach(r => {
+        // 刷新即回到直播通道：回看状态在前端，必须显式退出
+        useAppStore.getState().exitReview(r.room_id)
         if (r.preview_enabled && r.is_connected) {
           send('enable_preview', { room_id: r.room_id, enabled: false, mode: 'mse' })
           setTimeout(() => {
@@ -4432,8 +4605,8 @@ export default function Workbench() {
                                   </span>
                                 </Radio>
                                 <Radio value="stop_only">
-                                  {t('仅停止分析')}<br />
-                                  <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{t('立刻取消当前扫描，尾部回合不会补入列表')}</span>
+                                  {t('仅停止分析（立即停止）')}<br />
+                                  <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{t('立即停止分析，不补扫尾部；最后几分钟的回合可能不会补入列表')}</span>
                                 </Radio>
                               </Space>
                             </Radio.Group>
@@ -4445,6 +4618,8 @@ export default function Workbench() {
                         onOk: () => {
                           if (stopModeRef.current === 'stop_with_finalize' && recordingRooms.length > 0) {
                             recordingRooms.forEach(r => send('stop_recording', { room_id: r.room_id }))
+                          } else if (stopModeRef.current === 'stop_only') {
+                            send('stop_continuous_analysis', { main_room_id: activeRoomId, immediate: true })
                           } else {
                             send('stop_continuous_analysis', { main_room_id: activeRoomId })
                           }
@@ -4698,7 +4873,15 @@ export default function Workbench() {
             frozenWindowStart={frozenWindowStart}
             alignStatus={alignStatus}
             timelineView={timelineView}
-            axis={isRecordingReviewMode(selectedRoom?.preview_mode) ? 'recording_review' : timelineView ? 'common' : 'preview'}
+            axis={
+              isRecordingReviewMode(selectedRoom?.preview_mode)
+                ? 'recording_review'
+                : timelineView
+                  ? 'common'
+                  : usesLocalRecordingAxis(selectedRoom)
+                    ? 'recording'
+                    : 'preview'
+            }
             continuousStatus={continuousAnalysisStatus}
             analysisProgress={(() => {
               const rec = continuousAnalysisStatus?.recorded_duration ?? 0
@@ -4838,6 +5021,29 @@ export default function Workbench() {
           <>
             <p>{t('草稿名：{name}', { name: jianyingResult.draft_name ?? '' })}</p>
             <p>{t('轨道：{tracks}', { tracks: jianyingResult.tracks ?? 0 })}　{t('片段：{segments}', { segments: jianyingResult.segments ?? 0 })}</p>
+            <p>
+              {t('请求 {req} · 写入 {inc} · 跳过 {skip}', {
+                req: jianyingResult.requested_clip_count ?? 0,
+                inc: jianyingResult.included_clip_count ?? 0,
+                skip: jianyingResult.skipped_clip_count ?? 0,
+              })}
+            </p>
+            {/* 逐条跳过明细：聚合告警分辨不出是哪道门禁拦的（现场 5 条共用一句话） */}
+            {(jianyingResult.skipped || []).length > 0 && (
+              <div style={{ marginTop: 6 }}>
+                <div style={{ fontWeight: 600, fontSize: 12 }}>{t('跳过明细')}</div>
+                <ul style={{ margin: '4px 0 0', paddingLeft: 18, fontSize: 12 }}>
+                  {(jianyingResult.skipped || []).map((s, i) => (
+                    <li key={i}>
+                      {`${s.label || s.round_key || t('切片')}　${s.reason_code || ''}`}
+                      {s.start != null && s.end != null
+                        ? `　${formatTime(Number(s.start))}→${formatTime(Number(s.end))}`
+                        : ''}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {(jianyingResult.warnings || []).length > 0 && (
               <ul>{jianyingResult.warnings!.map((w, i) => <li key={i}>{w}</li>)}</ul>
             )}

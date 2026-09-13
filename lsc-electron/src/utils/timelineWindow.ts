@@ -135,8 +135,9 @@ export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput):
     }
   }
   const desiredStart = computeDvrLeftEdge(liveEdge, replaySeconds)
-  // 浏览器可能因自身配额提前驱逐旧数据，实际 buffered.start 才是可信下界。
-  const start = hasBuffer ? Math.max(desiredStart, bufStart as number) : desiredStart
+  // 时间线按用户配置的回放时长展示，即使浏览器 MSE 缓冲因配额还没有覆盖到
+  // 那么早；点击缓冲左侧时由 mseSeek 自动切到录制文件回看。
+  const start = desiredStart
   const purple = start
   const end = Math.max(liveEdge, start)
   const span = Math.max(end - start, 1e-6)

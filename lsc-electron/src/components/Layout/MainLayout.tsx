@@ -13,6 +13,7 @@ import { useI18n } from '@/i18n'
 import type { ConnectionStatus } from '@/store/appStore'
 import SystemMonitor from './SystemMonitor'
 import { PillNotification } from './PillNotification'
+import { islandManager, type IslandToastItem } from '@/services/notificationBridge'
 import Settings from '@/pages/Settings'
 
 const { Content } = Layout
@@ -35,6 +36,14 @@ export default function MainLayout() {
   const settingsDrawerOpen = useAppStore((state) => state.settingsDrawerOpen)
   const setSettingsDrawerOpen = useAppStore((state) => state.setSettingsDrawerOpen)
   const [connectionVisible, setConnectionVisible] = useState(false)
+  const [activeToast, setActiveToast] = useState<IslandToastItem | null>(null)
+
+  // 监听灵动岛通知，与顶栏母体胶囊产生光晕联动
+  useEffect(() => {
+    return islandManager.subscribe((item) => {
+      setActiveToast(item && item.phase !== 'exiting' ? item : null)
+    })
+  }, [])
   const themeTransitionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const connectionLabels: Record<ConnectionStatus, string> = {
@@ -172,7 +181,25 @@ export default function MainLayout() {
                 padding: '2px 10px',
                 borderRadius: 'var(--radius-xs)',
                 background: 'var(--surface-2)',
-                border: '1px solid var(--border-hairline)',
+                border: activeToast
+                  ? activeToast.type === 'error' || activeToast.type === 'record'
+                    ? '1px solid rgba(255, 69, 58, 0.45)'
+                    : activeToast.type === 'warning'
+                      ? '1px solid rgba(255, 159, 10, 0.45)'
+                      : activeToast.type === 'success'
+                        ? '1px solid rgba(52, 199, 89, 0.45)'
+                        : '1px solid rgba(77, 196, 191, 0.45)'
+                  : '1px solid var(--border-hairline)',
+                boxShadow: activeToast
+                  ? activeToast.type === 'error' || activeToast.type === 'record'
+                    ? '0 0 8px rgba(255, 69, 58, 0.2)'
+                    : activeToast.type === 'warning'
+                      ? '0 0 8px rgba(255, 159, 10, 0.2)'
+                      : activeToast.type === 'success'
+                        ? '0 0 8px rgba(52, 199, 89, 0.2)'
+                        : '0 0 8px rgba(77, 196, 191, 0.2)'
+                  : 'none',
+                transition: 'border-color 0.25s ease, box-shadow 0.25s ease',
                 fontSize: 11,
                 height: 26,
                 whiteSpace: 'nowrap',
