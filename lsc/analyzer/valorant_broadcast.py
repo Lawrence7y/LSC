@@ -1233,9 +1233,7 @@ def _split_merge_geometry_ok(head: dict[str, Any], tail: dict[str, Any]) -> bool
     if merged_duration < MIN_ACTIVE_SEC or merged_duration > MAX_BROADCAST_ROUND_SEC:
         return False
     # 头碎片的起点必须是 OCR 交战锚点（不是门禁后移前的位置推算）
-    if str(head.get("start_by") or "").strip().lower() not in ("ocr_combat", "refined_combat"):
-        return False
-    return True
+    return str(head.get("start_by") or "").strip().lower() in ("ocr_combat", "refined_combat")
 
 
 def _can_absorb_split_head(head: dict[str, Any], tail: dict[str, Any]) -> bool:
@@ -1452,7 +1450,7 @@ def _merge_split_family_fragments(
 
     merged = 0
     touched: list[dict[str, Any]] = []
-    for base, by_index in families.items():
+    for by_index in families.values():
         for index in sorted(by_index):
             head = by_index.get(index)
             tail = by_index.get(index + 1)
