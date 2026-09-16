@@ -21,7 +21,13 @@ _backend_dir = os.path.join(os.path.dirname(__file__), '..', 'python-backend')
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-from server import LSCWebSocketServer, _json_dumps, _redact_public_payload, _truncate_for_log
+from server import (
+    LSCWebSocketServer,
+    _json_dumps,
+    _redact_public_payload,
+    _status_summary_for_log,
+    _truncate_for_log,
+)
 from ws_auth import is_origin_allowed
 
 
@@ -48,12 +54,29 @@ class TestTruncateForLog:
         result = _truncate_for_log(data)
         assert result["items"] == [1, 2, 3]
 
-    def test_nested_dict_not_recursively_truncated(self):
-        """truncate only processes top-level keys, not nested dicts."""
+    def test_nested_dict_is_recursively_truncated(self):
+        """嵌套 dict 也必须截断（旧实现只处理顶层，导致状态响应整段入库）。"""
         data = {"inner": {"key": "y" * 300}}
         result = _truncate_for_log(data, str_limit=50)
-        # Top-level "inner" is a dict (not str/list), so it's kept as-is
-        assert result["inner"] == {"key": "y" * 300}
+        assert result["inner"] == {"key": "<str of length 300>"}
+
+    def test_nested_list_of_dicts_is_recursively_truncated(self):
+        """现场回归：listed_clips 这类「list 内套 dict」必须逐条截断。"""
+        clip = {"clip_id": "a" * 300, "label": "R1", "start": 6.0}
+        data = {"listed_clips": [dict(clip) for _ in range(3)], "running": True}
+        result = _truncate_for_log(data, str_limit=50)
+        assert isinstance(result["listed_clips"], list)
+        assert len(result["listed_clips"]) == 3
+        assert result["listed_clips"][0]["clip_id"] == "<str of length 300>"
+        assert result["listed_clips"][0]["start"] == 6.0
+        assert result["running"] is True
+
+    def test_depth_limit_guards_runaway_nesting(self):
+        deep: dict = {"k": "v"}
+        for _ in range(40):
+            deep = {"n": deep}
+        result = _truncate_for_log(deep)
+        assert "<max depth>" in str(result)
 
     def test_non_dict_returned_as_is(self):
         assert _truncate_for_log(42) == 42
@@ -62,6 +85,49 @@ class TestTruncateForLog:
     def test_long_string_truncated(self):
         result = _truncate_for_log("x" * 500, str_limit=200)
         assert result == "<str of length 500>"
+
+
+class TestStatusSummaryForLog:
+    """状态轮询响应的日志摘要：保留诊断字段，压掉切片明细。"""
+
+    def _payload(self):
+        return {
+            'running': True,
+            'phase': 'finalizing',
+            'analysis_stage': '收尾中（补齐未覆盖区间）',
+            'progress': 100.0,
+            'analysis_lag_sec': 0.0,
+            'analysis_backlog_sec': 58.2,
+            'listed_clip_count': 8,
+            'pending_review_count': 8,
+            'finalizing': True,
+            'listed_clips': [
+                {'clip_id': 'x' * 400, 'boundary_review_reason': 'y' * 400}
+                for _ in range(8)
+            ],
+        }
+
+    def test_keeps_diagnostic_fields(self):
+        summary = _status_summary_for_log(self._payload())
+        assert summary['phase'] == 'finalizing'
+        assert summary['progress'] == 100.0
+        assert summary['analysis_backlog_sec'] == 58.2
+        assert summary['listed_clip_count'] == 8
+        assert summary['finalizing'] is True
+
+    def test_collapses_listed_clips_to_count(self):
+        summary = _status_summary_for_log(self._payload())
+        assert summary['listed_clips'] == '<8 clips>'
+        # 明细不得残留（旧实现会把整条 dict 原样打进日志）
+        assert 'clip_id' not in str(summary)
+
+    def test_summary_is_small(self):
+        payload = self._payload()
+        assert len(str(_status_summary_for_log(payload))) < 1000
+        assert len(str(_truncate_for_log(payload))) < 1000
+
+    def test_non_dict_passthrough(self):
+        assert _status_summary_for_log("x" * 500) == "<str of length 500>"
 
 
 class TestNumpyJSONEncoder:

@@ -17,7 +17,7 @@ import { RoomSession, ClipSegment, TimelineHighlightBand, ContinuousAnalysisStat
 import type { TimelineAlignStatus } from '@/utils/timelineCoords'
 import { computeRecordedDurationHint, isRecordingReviewMode, previewToRecordingLocal, resolveLiveContentSpan, resolveRecordingReviewSpan, summarizeTimelineProgress } from '@/utils/timelineCoords'
 import { computeTimelineWindow } from '@/utils/timelineWindow'
-import { Timeline, type TimelineBufferedRange } from '@/components/Timeline'
+import { Timeline, type TimelineBufferedRange, type DvrReplayWindow } from '@/components/Timeline'
 import { formatTime } from '@/utils/time'
 import { useI18n } from '@/i18n'
 import { PLAYBACK_RATE_STEPS, type PlaybackRate } from '@/hooks/useKeyboardShortcuts'
@@ -83,6 +83,8 @@ interface ControlBarProps {
   recordedDurationHint?: number
   /** DVR 可回看窗口左边界（绝对秒）；Task 3 接入 bufStart */
   dvrStart?: number | null
+  /** DVR 窗口如实口径（真实缓冲起点 / 设置边界 / 实际可回放时长 / 配额缩容） */
+  dvrReplay?: DvrReplayWindow | null
   /** 当前房间 buffered ranges，使用与 timelineView 相同的显示轴。 */
   bufferedRanges?: TimelineBufferedRange[]
   /** 当前控制栏所处轴（用于三轴标注展示） */
@@ -133,6 +135,7 @@ function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): 
   if (prev.activeRefine !== next.activeRefine) return false
   if (prev.recordedDurationHint !== next.recordedDurationHint) return false
   if (prev.dvrStart !== next.dvrStart) return false
+  if (prev.dvrReplay !== next.dvrReplay) return false
   if (prev.bufferedRanges !== next.bufferedRanges) return false
   if (prev.axis !== next.axis) return false
   if (prev.continuousStatus !== next.continuousStatus) return false
@@ -215,6 +218,7 @@ export const ControlBar = memo(function ControlBar({
   activeRefine = null,
   recordedDurationHint = 0,
   dvrStart = null,
+  dvrReplay = null,
   bufferedRanges = [],
   axis = 'preview',
   continuousStatus = null,
@@ -585,6 +589,7 @@ export const ControlBar = memo(function ControlBar({
         onDeleteMarker={onDeleteMarker}
         activeRefine={activeRefine}
         dvrStart={dvrStart ?? null}
+        dvrReplay={dvrReplay ?? null}
         bufferedRanges={bufferedRanges}
         followLive={followLive}
         isScrubbing={isScrubbing}

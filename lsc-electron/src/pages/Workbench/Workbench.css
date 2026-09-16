@@ -219,39 +219,113 @@
   border-color: rgba(0, 0, 0, 0.2) !important;
 }
 
-/* 放大预览底部时间线滑入 */
+/**
+ * 放大预览底部控制区：时间线 + 按键 = **同一块玻璃面板**，默认向下隐藏，
+ * 鼠标经过 / 键盘聚焦 / 拖动 / 下拉打开时滑出展示。
+ *
+ * 隐藏态同时用 translateY(100%)（滑出卡片，卡片 overflow:hidden 会裁掉）、
+ * opacity 0 与 pointer-events:none 三重收口：不可见、不可点、也不挡画面。
+ */
 .room-card__expanded-controls {
-  animation: roomCardControlsSlideUp 0.26s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 9;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 12px 8px;
+  background: linear-gradient(to top, rgba(10, 11, 13, 0.92) 0%, rgba(10, 11, 13, 0.74) 62%, rgba(10, 11, 13, 0.32) 100%);
+  backdrop-filter: blur(14px) saturate(1.05);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(100%);
+  transition:
+    transform 0.24s cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 0.18s ease;
+  will-change: transform, opacity;
 }
 
-@keyframes roomCardControlsSlideUp {
-  from {
-    opacity: 0;
-    transform: translateY(14px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
+.room-card__expanded-controls--shown,
+.room-card__expanded-controls:hover,
+.room-card__expanded-controls:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .room-card__expanded-controls {
+    transition: none;
   }
 }
 
 /* 放大预览时间线：加大命中区域，显示首尾时间并支持点击/键盘定位。 */
-.room-card__expanded-replay-info {
-  padding: 3px 14px 0;
-  color: rgba(255, 255, 255, 0.68);
-  font-family: var(--font-mono, 'JetBrains Mono', monospace);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  text-align: center;
-  white-space: nowrap;
-}
-
 .room-card__expanded-timeline {
   display: grid;
   grid-template-columns: minmax(54px, auto) 1fr minmax(54px, auto);
   align-items: center;
   gap: 10px;
-  padding: 14px 14px 8px;
+  padding: 2px 2px 0;
+}
+
+/**
+ * 「缩小为窗口播放」（原生画中画）。
+ *
+ * 与其它覆盖层玻璃按钮同一设计语言（同 small 尺寸、同圆角令牌、同毛玻璃），
+ * 差异刻意做成“一眼可辨”：品牌青描边 + 淡青底 + 文字标签 + 画中画图标；
+ * 激活（已在悬浮小窗里）时整块转品牌色实底，与灰底箭头图标按钮形成对比。
+ */
+.room-card__pip-btn {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 8px !important;
+  border-radius: var(--radius-md, 10px) !important;
+  color: var(--brand-400, #4dc4bf) !important;
+  background: rgba(77, 196, 191, 0.16) !important;
+  border: 1px solid rgba(77, 196, 191, 0.55) !important;
+  backdrop-filter: blur(8px);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.room-card__pip-btn:hover:not(:disabled) {
+  color: var(--brand-400, #4dc4bf) !important;
+  background: rgba(77, 196, 191, 0.3) !important;
+  border-color: var(--brand-400, #4dc4bf) !important;
+}
+
+.room-card__pip-btn--active,
+.room-card__pip-btn--active:hover:not(:disabled) {
+  color: #04110f !important;
+  background: var(--brand-500, #31b3ae) !important;
+  border-color: var(--brand-500, #31b3ae) !important;
+}
+
+.room-card__pip-btn:disabled {
+  opacity: 0.45;
+}
+
+.room-card__pip-glyph {
+  width: 13px;
+  height: 13px;
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* 走带按键行：与时间线同一块面板，自身不再有底色/外边距。 */
+.room-card__expanded-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px;
 }
 
 .room-card__expanded-time {
@@ -364,25 +438,6 @@
 .room-card__expanded-track:focus-visible {
   box-shadow: 0 0 0 2px rgba(77, 196, 191, 0.7);
   border-radius: 9px;
-}
-
-.room-card__expanded-unavailable {
-  position: absolute;
-  top: 7px;
-  bottom: 7px;
-  left: 0;
-  border-radius: 999px 0 0 999px;
-  background:
-    repeating-linear-gradient(
-      135deg,
-      rgba(255, 255, 255, 0.13) 0,
-      rgba(255, 255, 255, 0.13) 4px,
-      rgba(0, 0, 0, 0.22) 4px,
-      rgba(0, 0, 0, 0.22) 8px
-    ),
-    rgba(70, 70, 74, 0.84);
-  pointer-events: none;
-  z-index: 1;
 }
 
 .room-card__expanded-replay-boundary {

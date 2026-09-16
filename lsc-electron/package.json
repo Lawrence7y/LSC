@@ -1,6 +1,6 @@
 {
   "name": "lsc-electron",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "description": "LSC 直播切片系统 - Electron 版本",
   "author": "Lawrence7y",
   "repository": {
@@ -67,15 +67,39 @@
     "extraResources": [
       {
         "from": "../python-backend",
-        "to": "python-backend"
+        "to": "python-backend",
+        "filter": [
+          "**/*",
+          "!settings.json",
+          "!recording_history.json",
+          "!logs/**",
+          "!NVIDIA Corporation/**",
+          "!__pycache__/**",
+          "!**/__pycache__/**",
+          "!*.pyc"
+        ]
       },
       {
         "from": "../lsc",
-        "to": "lsc"
+        "to": "lsc",
+        "filter": [
+          "**/*",
+          "!__pycache__/**",
+          "!**/__pycache__/**",
+          "!*.pyc"
+        ]
       },
       {
         "from": "../scripts",
-        "to": "scripts"
+        "to": "scripts",
+        "filter": [
+          "**/*",
+          "!__pycache__/**",
+          "!**/__pycache__/**",
+          "!*.pyc",
+          "!recover_and_backfill_broadcast.py",
+          "!verify_live_session.py"
+        ]
       },
       {
         "from": "../requirements.txt",

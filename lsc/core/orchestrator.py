@@ -1053,15 +1053,11 @@ class RoomOrchestrator:
     def _serialize_room(self, room: RoomSession) -> dict[str, Any]:
         """把单个房间序列化为可持久化的 dict。
 
-        仅保存用户偏好与选区(跨重启稳定的纯数据),不保存瞬时连接/录制状态、
-        controller/preview_widget 等运行时句柄。mark_in/mark_out 仍需对应房间
-        重新连接后才有意义的时长,但保留下来可避免用户白标选区。
+        仅保存用户偏好与配置（跨重启稳定的纯数据），不保存瞬时连接/录制状态、
+        controller/preview_widget 等运行时句柄。
+        选区 mark_in/mark_out 与当前推流会话强绑定，不得跨会话持久化。
         """
         entry: dict[str, Any] = {"url": room.room_url}
-        if room.mark_in is not None:
-            entry["mark_in"] = float(room.mark_in)
-        if room.mark_out is not None:
-            entry["mark_out"] = float(room.mark_out)
         # include_in_cut / preview_muted 与默认值不同时才存,减少噪声
         # (RoomSession 的默认值见 session.py 字段定义)
         if room.include_in_cut is not True:
@@ -1222,17 +1218,8 @@ class RoomOrchestrator:
             if room is None:
                 continue
             loaded += 1
-            # 恢复用户偏好与选区(向后兼容:缺失字段保持 RoomSession 默认值)
-            if "mark_in" in item and item["mark_in"] is not None:
-                try:
-                    room.mark_in = float(item["mark_in"])
-                except (TypeError, ValueError):
-                    pass
-            if "mark_out" in item and item["mark_out"] is not None:
-                try:
-                    room.mark_out = float(item["mark_out"])
-                except (TypeError, ValueError):
-                    pass
+            # 恢复用户偏好配置(向后兼容:缺失字段保持 RoomSession 默认值)
+            # 选区 mark_in/mark_out 为会话级瞬时状态，即使历史配置中存在也予以忽略
             if "include_in_cut" in item:
                 room.include_in_cut = bool(item["include_in_cut"])
             if "preview_muted" in item:
@@ -1274,6 +1261,11 @@ class RoomOrchestrator:
         room = self.get_room(room_id)
         if room is None:
             return False
+        # 新连接开始时清空上一会话遗留的选区与墙钟戳
+        room.mark_in = None
+        room.mark_out = None
+        room.mark_in_wallclock = None
+        room.mark_out_wallclock = None
 
         if async_mode:
             return self._connect_room_async(room, quality_preset=quality_preset)
@@ -1480,6 +1472,11 @@ class RoomOrchestrator:
         room.reconnect_next_attempt_at = 0.0
         room.preview_error = ""
         room.last_error = ""
+        # 断开连接时清空时间线选区与单调时钟戳
+        room.mark_in = None
+        room.mark_out = None
+        room.mark_in_wallclock = None
+        room.mark_out_wallclock = None
         return True
 
     # ── Preview ──────────────────────────────────────────────

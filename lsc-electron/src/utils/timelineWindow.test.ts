@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  clampSeekToRange,
   computeDvrLeftEdge,
   computeExpandedPreviewWindow,
   computeTimelineWindow,
   DVR_LOOKBACK_SEC,
+  isWithinSeekRange,
 } from './timelineWindow'
 
 describe('computeTimelineWindow', () => {
@@ -122,7 +124,8 @@ describe('computeExpandedPreviewWindow', () => {
       bufferedStart: 490,
       bufferedEnd: 620,
     })
-    expect(r.start).toBe(320)
+    // 设置 300s 只在缓冲更深时才是边界；此处真实缓冲只有 130s ⇒ 左端 = buf.start。
+    expect(r.start).toBe(490)
     expect(r.end).toBe(620)
     expect(r.playheadPct).toBe(100)
     expect(r.fillWidthPct).toBe(100)
@@ -147,13 +150,41 @@ describe('computeExpandedPreviewWindow', () => {
       bufferedEnd: 620,
       recordedHint: 3600,
     })
-    expect(r.start).toBe(320)
+    expect(r.start).toBe(490)
     expect(r.end).toBe(620)
-    expect(r.purple).toBe(320)
+    expect(r.purple).toBe(490)
     expect(r.liveEdge).toBe(620)
-    expect(r.playheadPct).toBeCloseTo((610 - 320) / 300 * 100, 5)
-    expect(r.configuredReplaySeconds).toBe(300)
-    expect(r.availableReplaySeconds).toBe(300)
+    expect(r.playheadPct).toBeCloseTo((610 - 490) / 130 * 100, 5)
+  })
+
+  it('缓冲比设置浅时，可点范围回到真实缓冲起点（能点 == 能立即回放）', () => {
+    // 2026-09-15 真机：设置 300s、真实缓冲只有 157.2s。旧实现把
+    // [liveEdge − 300, liveEdge] 整段画成可点区域，点在缓冲左侧会被 mseSeek
+    // 判成缓冲外并切到本地文件回看通道（预览区显示「正在准备回看…」）。
+    const r = computeExpandedPreviewWindow({
+      liveDvr: true,
+      previewPos: 516,
+      bufferedStart: 358.9,
+      bufferedEnd: 516.1,
+      replaySeconds: 300,
+    })
+    expect(r.start).toBeCloseTo(358.9, 1)
+    expect(r.end).toBeCloseTo(516.1, 1)
+    expect(r.purple).toBeCloseTo(358.9, 1)
+    expect(r.end - r.start).toBeCloseTo(157.2, 1)
+  })
+
+  it('缓冲比设置深时，设置值作为上限：左端 = liveEdge − 设置时长', () => {
+    const r = computeExpandedPreviewWindow({
+      liveDvr: true,
+      previewPos: 1000,
+      bufferedStart: 400,
+      bufferedEnd: 1000,
+      replaySeconds: 300,
+    })
+    expect(r.start).toBe(700)
+    expect(r.end).toBe(1000)
+    expect(r.end - r.start).toBe(300)
   })
 
   it('live under 120s starts at 0 even if recording is long', () => {
@@ -211,7 +242,29 @@ describe('computeExpandedPreviewWindow', () => {
     expect(r.purple).toBe(0)
     expect(r.hasLiveDvr).toBe(false)
     expect(r.playheadPct).toBeCloseTo(30 / 180 * 100, 5)
-    expect(r.configuredReplaySeconds).toBe(0)
-    expect(r.availableReplaySeconds).toBe(180)
+  })
+})
+
+describe('可点范围 = 可立即回放范围（seek 落点收口）', () => {
+  it('isWithinSeekRange 含边界容差：贴边一两秒不算缓冲外', () => {
+    // 分片边界 + 浮点误差常让“刚好点在左沿/右沿”越界零点几秒；旧实现因此把
+    // 普通点击推进重量级的本地文件回看通道。
+    expect(isWithinSeekRange(308.1, 308.1, 465.2)).toBe(true)
+    expect(isWithinSeekRange(306.5, 308.1, 465.2)).toBe(true)
+    expect(isWithinSeekRange(466.4, 308.1, 465.2)).toBe(true)
+    // 超出容差仍然按缓冲外处理（更早的内容走文件回看，语义不变）
+    expect(isWithinSeekRange(305.5, 308.1, 465.2)).toBe(false)
+    expect(isWithinSeekRange(468, 308.1, 465.2)).toBe(false)
+    expect(isWithinSeekRange(Number.NaN, 308.1, 465.2)).toBe(false)
+  })
+
+  it('clampSeekToRange 把落点收进缓冲内侧（左右各留安全边距）', () => {
+    expect(clampSeekToRange(283.1, 308.1, 465.2)).toBeCloseTo(308.4, 5)
+    expect(clampSeekToRange(465.2, 308.1, 465.2)).toBeCloseTo(464.9, 5)
+    expect(clampSeekToRange(400, 308.1, 465.2)).toBe(400)
+    // 退化区间（缓冲短于两个安全边距）：返回下沿，不产生 NaN/负值
+    const tiny = clampSeekToRange(10, 10, 10.2)
+    expect(Number.isFinite(tiny)).toBe(true)
+    expect(tiny).toBeGreaterThanOrEqual(10)
   })
 })

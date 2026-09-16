@@ -168,6 +168,44 @@ export function findFragmentBoundary(buffer: Uint8Array, baseOffset: number): nu
   return null
 }
 
+/**
+ * 读满一个定位窗口（跨多次 IPC 读）。
+ *
+ * 主进程对单次读有硬上限（`electron/localMedia.ts` 的 `MAX_READ_LENGTH`＝8MB，
+ * `parseReadRequest` 超限时**静默截断、不报错**），所以一次性请求 16MB 只能拿回
+ * 8MB；而边界自洽链需要约一个 fragment 的前看量（真机实测 moof+mdat ≈6.4MB），
+ * 半截窗口 ⇒ `findFragmentBoundary` 返回 null ⇒ 游标落到 mdat 中间的任意字节 ⇒
+ * 切分器无法重同步、一路扫到文件尾 0 段入队，最后被停滞看门狗判死
+ * （2026-09-15 真机：目标 396.8s，文件时间范围停在 0.0~8.4s，队列=0）。
+ * 故按**实际返回长度**分多次读，拼满窗口或读到文件尾为止。
+ */
+async function readSeekWindow(
+  path: string,
+  offset: number,
+  length: number,
+): Promise<Uint8Array | null> {
+  const parts: Uint8Array[] = []
+  let filled = 0
+  while (filled < length) {
+    const chunk = await localMediaRead(path, offset + filled, length - filled)
+    if (!chunk.ok) break
+    const bytes = chunk.data
+    if (!bytes || bytes.byteLength === 0) break
+    parts.push(bytes)
+    filled += bytes.byteLength
+    if (chunk.eof) break
+  }
+  if (parts.length === 0) return null
+  if (parts.length === 1) return parts[0]
+  const out = new Uint8Array(filled)
+  let cursor = 0
+  for (const part of parts) {
+    out.set(part, cursor)
+    cursor += part.byteLength
+  }
+  return out
+}
+
 /** 校验 pos 起是一条自洽的 box 链（尺寸合法 + 出现 moof） */
 function isValidFragmentChain(buffer: Uint8Array, pos: number): boolean {
   let at = pos
@@ -604,9 +642,9 @@ export class LocalFileMseSource {
       const windowLen = Math.max(0, windowEnd - windowStart)
       let start = windowStart
       if (windowLen > 0) {
-        const win = await localMediaRead(this._path, windowStart, windowLen)
-        if (this._alive && win.ok && win.data) {
-          const boundary = findFragmentBoundary(win.data, windowStart)
+        const win = await readSeekWindow(this._path, windowStart, windowLen)
+        if (this._alive && win) {
+          const boundary = findFragmentBoundary(win, windowStart)
           if (boundary != null) start = boundary
         }
       }

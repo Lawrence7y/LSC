@@ -15,23 +15,110 @@ from lsc.platforms.redaction import redact_mapping, redact_text
 _log = logging.getLogger('lsc.server')
 
 
-def _truncate_for_log(data: Any, str_limit: int = 200, list_limit: int = 10) -> Any:
-    """截断超大日志字段，避免日志文件暴增。"""
+_LOG_MAX_DEPTH = 6  # 递归截断的深度上限：防超深/自引用结构把日志路径本身拖慢
+_LOG_MAX_CHARS = 2000  # 单条 payload 的字符上限（结构截断兜底，见 _cap_log_size）
+
+
+def _truncate_for_log(
+    data: Any,
+    str_limit: int = 200,
+    list_limit: int = 10,
+) -> Any:
+    """截断超大日志字段，避免日志文件暴增（递归结构截断 + 体积兜底）。"""
+    return _cap_log_size(_truncate_struct(data, str_limit, list_limit, 0))
+
+
+def _truncate_struct(
+    data: Any,
+    str_limit: int,
+    list_limit: int,
+    depth: int,
+) -> Any:
+    """递归结构截断。
+
+    现场（2026-09-14 10:31–10:37）：旧实现只处理顶层 key，嵌套 dict 原样返回，
+    于是状态响应里的 ``listed_clips``（每条切片一个完整 dict，含 boundary_*/audit_*
+    十几个字段）被整段打进 INFO——5 秒一次轮询，单行 >10KB，backend.log 迅速轮转，
+    真实故障线索（扫描超时、收尾补扫）被淹没。
+
+    统一语义：超长字符串→``<str of length N>``；超长列表→``<list of length N>``；
+    嵌套 dict/list 逐层套用同一规则；深度超限→``<max depth>``。
+    """
+    if depth > _LOG_MAX_DEPTH:
+        return "<max depth>"
     if isinstance(data, dict):
         data = redact_mapping(data)
-    if isinstance(data, dict):
-        result = {}
-        for k, v in data.items():
-            if isinstance(v, str) and len(v) > str_limit:
-                result[k] = f"<str of length {len(v)}>"
-            elif isinstance(v, list) and len(v) > list_limit:
-                result[k] = f"<list of length {len(v)}>"
-            else:
-                result[k] = v
-        return result
+        return {
+            k: _truncate_struct(v, str_limit, list_limit, depth + 1)
+            for k, v in data.items()
+        }
+    if isinstance(data, list):
+        if len(data) > list_limit:
+            return f"<list of length {len(data)}>"
+        return [_truncate_struct(v, str_limit, list_limit, depth + 1) for v in data]
     if isinstance(data, str) and len(data) > str_limit:
         return f"<str of length {len(data)}>"
     return data
+
+
+def _cap_log_size(data: Any, max_chars: int = _LOG_MAX_CHARS) -> Any:
+    """体积兜底：结构截断挡不住「字段多、值都短」的 payload。
+
+    实测（2026-09-14 现场状态响应）：结构截断后仍是 11743 字符——listed_clips 只有
+    8 条（未超 list_limit）、每条内部字符串都不超 200，但 8×20+ 个字段照样堆出 10KB。
+    故按渲染长度兜底：超限时降级为「顶层字段名 + 各自体积」，既压掉体积又保留
+    「哪个字段变大了」这条线索。
+    """
+    if not isinstance(data, (dict, list)):
+        return data
+    try:
+        text = str(data)
+    except Exception:  # pragma: no cover - 防御：异常 repr 不得打断日志路径
+        return "<unrenderable payload>"
+    if len(text) <= max_chars:
+        return data
+    if isinstance(data, dict):
+        sizes = {}
+        for k, v in data.items():
+            try:
+                sizes[k] = len(str(v))
+            except Exception:  # pragma: no cover
+                sizes[k] = -1
+        return f"<payload: {len(text)} chars, {len(data)} keys, sizes={sizes}>"
+    return f"<payload: {len(text)} chars, list of {len(data)}>"
+
+
+# 状态轮询响应的日志摘要字段：把「排查时真正要看的那几个数」从大 JSON 里挑出来。
+# 完整 payload 仍照旧发给前端，只是不再整段进日志。
+_STATUS_SUMMARY_FIELDS = (
+    'phase', 'analysis_stage', 'progress', 'analysis_lag_phase',
+    'analyzed_duration', 'recorded_duration',
+    'analysis_lag_sec', 'analysis_backlog_sec', 'backlog_mode',
+    'scan_reason', 'scan_throughput', 'scan_cycle_sec', 'scan_wall_sec',
+    'confirmed_rounds', 'pending_rounds', 'listed_clip_count',
+    'pending_review_count', 'audit_queue_depth', 'audit_delivered_total',
+    'audit_terminal_total', 'finalizing', 'completed',
+    'degraded_mode', 'consecutive_scan_timeouts', 'last_scan_error',
+)
+
+
+def _status_summary_for_log(data: Any) -> Any:
+    """状态轮询响应的压缩日志形态（保留诊断关键字段 + 切片数）。"""
+    if not isinstance(data, dict):
+        return _truncate_for_log(data)
+    summary = {key: data[key] for key in _STATUS_SUMMARY_FIELDS if key in data}
+    listed = data.get('listed_clips')
+    if isinstance(listed, list):
+        summary['listed_clips'] = f"<{len(listed)} clips>"
+    # 摘要白名单之外的字段只报数量，便于发现"哪天又多了个大字段"。
+    extra = [
+        k for k in data
+        if k not in _STATUS_SUMMARY_FIELDS and k != 'listed_clips'
+    ]
+    if extra:
+        summary['_other_keys'] = f"<{len(extra)} keys>"
+    # 摘要是从原始 payload 里挑出来的，仍须过一遍脱敏 + 长度截断。
+    return _truncate_for_log(summary)
 
 
 def _redact_public_payload(data: Any) -> Any:
@@ -235,7 +322,16 @@ class LSCWebSocketServer:
                 if request_id is not None and isinstance(result, dict):
                     result['request_id'] = request_id
                 if msg_type not in high_freq_types:
-                    _log.info("Sending WS response: type=%s_response, data=%s", msg_type, _truncate_for_log(result))
+                    if msg_type == 'get_continuous_analysis_status':
+                        # 状态轮询是 5s 级高频，且 payload 里含完整 listed_clips：
+                        # 只记诊断摘要，避免单行 >10KB 把故障线索淹掉。
+                        _log.info(
+                            "Sending WS response: type=%s_response, data=%s",
+                            msg_type,
+                            _status_summary_for_log(result),
+                        )
+                    else:
+                        _log.info("Sending WS response: type=%s_response, data=%s", msg_type, _truncate_for_log(result))
                 await websocket.send(_json_dumps({
                     'type': f'{msg_type}_response',
                     'data': _redact_public_payload(result),

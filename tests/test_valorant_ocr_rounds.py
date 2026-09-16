@@ -1560,6 +1560,39 @@ def test_apply_replay_end_exclusion_accepts_broadcast_audit_passed() -> None:
     assert mod.apply_replay_end_exclusion(r) == 4.0
     assert r["end"] == 196.0
 
+
+def test_apply_replay_end_exclusion_keeps_finalized_audit_end() -> None:
+    """审计已 passed 的 next_prep 出点（end_refined 已定稿）不得被启发式回放段裁早。
+
+    2026-09-15 扩展：旧判据只认 end_by==broadcast_exclusion，于是「审计 passed +
+    密扫已定稿」的 next_prep 回合仍会被 replay_segments（「计时器不可读」的间接
+    推断，实测有 ~17s 时间戳偏差与成片误标）裁掉最多 30s 真实内容。
+    """
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 100.0, "end": 196.25, "end_refined": 196.25,
+         "end_by": "next_prep", "broadcast_audit": "passed",
+         "confirm_status": "vision_confirmed", "result_ts": 180.0,
+         "replay_segments": [[185.922, 196.0]]}
+    assert mod.apply_replay_end_exclusion(r) is None
+    assert r["end"] == 196.25, "已定稿出点不得被启发式窗口覆盖"
+    assert r["replay_end_exclusion_skipped"] == "visual_end_authoritative"
+    assert r["replay_end_exclusion_candidate_sec"] == 10.328
+    assert r["boundary_review_required"] is True
+    assert "end_before_replay_exclusion" not in r
+
+
+def test_apply_replay_end_exclusion_still_trims_unfinalized_next_prep_end() -> None:
+    """边界不变式：**未定稿**的 next_prep 出点（无 end_refined / 审计未 passed）
+    仍按原语义裁剪 —— 那正是 A5 要兜的「模型漏掉的实战镜头回放」。"""
+    import lsc.analyzer.valorant_ocr_rounds as mod
+
+    r = {"start": 100.0, "end": 200.0, "end_by": "next_prep",
+         "confirm_status": "vision_confirmed", "result_ts": 190.0,
+         "replay_segments": [[195.0, 205.0]]}
+    assert mod.apply_replay_end_exclusion(r) == 5.0
+    assert r["end"] == 195.0
+
 def test_buy_phase_onset_requires_upward_reset() -> None:
     """买枪阶段判据 = ≤45s **且**相对上一原始读数上跳 ≥20s（区分交战尾段的连续下降）。
 

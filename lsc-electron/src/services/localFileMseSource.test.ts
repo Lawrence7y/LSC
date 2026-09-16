@@ -34,7 +34,7 @@ const TIMESCALE = 90000
 const BASE_SEC = 1000
 const MDAT_BYTES = 1000
 
-function buildFile(fragmentCount: number): Uint8Array {
+function buildFile(fragmentCount: number, mdatBytes: number = MDAT_BYTES): Uint8Array {
   const ftyp = box('ftyp', new Uint8Array([0x69, 0x73, 0x6f, 0x6d, 0, 0, 2, 0]))
   const tkhd = box('tkhd', concat(new Uint8Array([0, 0, 0, 0]), u32(0), u32(0), u32(1), u32(0), u32(0), u32(0), u32(0), u32(0)))
   const mdhd = box('mdhd', concat(new Uint8Array([0, 0, 0, 0]), u32(0), u32(0), u32(TIMESCALE), u32(0), new Uint8Array([0x55, 0xc4, 0, 0])))
@@ -46,7 +46,43 @@ function buildFile(fragmentCount: number): Uint8Array {
     const tfhd = box('tfhd', concat(new Uint8Array([0, 0, 0, 0]), u32(1)))
     const tfdt = box('tfdt', concat(new Uint8Array([1, 0, 0, 0]), u64(ticks)))
     parts.push(box('moof', box('traf', concat(tfhd, tfdt))))
-    parts.push(box('mdat', new Uint8Array(MDAT_BYTES)))
+    parts.push(box('mdat', new Uint8Array(mdatBytes)))
+  }
+  return concat(...parts)
+}
+
+/**
+ * 与 {@link buildFile} 同构，但 mdat 填**非零**伪随机字节。
+ *
+ * 真实录像的 mdat 是压缩码流；零填充会让"落在 mdat 中间"被解析成一个
+ * size=0 的盒子吞掉整块缓冲，随后**偶然**与新读入的 fragment 对齐而自愈，
+ * 于是测不出真机的"卡在等待更多数据"（2026-09-15 现场即此形态）。
+ * 字节恒非零 ⇒ 任意 4 字节窗口的 box size 都远大于缓冲，解析必然停在
+ * 「不完整，等待更多数据」，不会自愈。
+ */
+function buildFilledFile(fragmentCount: number, mdatBytes: number): Uint8Array {
+  const ftyp = box('ftyp', new Uint8Array([0x69, 0x73, 0x6f, 0x6d, 0, 0, 2, 0]))
+  const tkhd = box('tkhd', concat(new Uint8Array([0, 0, 0, 0]), u32(0), u32(0), u32(1), u32(0), u32(0), u32(0), u32(0), u32(0)))
+  const mdhd = box('mdhd', concat(new Uint8Array([0, 0, 0, 0]), u32(0), u32(0), u32(TIMESCALE), u32(0), new Uint8Array([0x55, 0xc4, 0, 0])))
+  const hdlr = box('hdlr', concat(new Uint8Array([0, 0, 0, 0]), u32(0), new Uint8Array([0x76, 0x69, 0x64, 0x65]), new Uint8Array(12)))
+  const moov = box('moov', box('trak', concat(tkhd, box('mdia', concat(mdhd, hdlr)))))
+  const template = new Uint8Array(4096)
+  let seed = 0x2545f491
+  for (let i = 0; i < template.length; i += 1) {
+    seed = (seed * 1664525 + 1013904223) >>> 0
+    template[i] = (seed >>> 24) || 0x5a
+  }
+  const parts: Uint8Array[] = [ftyp, moov]
+  for (let n = 0; n < fragmentCount; n += 1) {
+    const ticks = (BASE_SEC + n) * TIMESCALE
+    const tfhd = box('tfhd', concat(new Uint8Array([0, 0, 0, 0]), u32(1)))
+    const tfdt = box('tfdt', concat(new Uint8Array([1, 0, 0, 0]), u64(ticks)))
+    parts.push(box('moof', box('traf', concat(tfhd, tfdt))))
+    const payload = new Uint8Array(mdatBytes)
+    for (let at = 0; at < payload.length; at += template.length) {
+      payload.set(template.subarray(0, Math.min(template.length, payload.length - at)), at)
+    }
+    parts.push(box('mdat', payload))
   }
   return concat(...parts)
 }
@@ -573,5 +609,56 @@ describe('LocalFileMseSource 回归：会话缓存与越界目标', () => {
     expect(entryGetter as number).toBeGreaterThanOrEqual(2)
     // 定位必须落在目标附近而不是字节 0（文件时间 1300s = 轴 300s）
     expect(medias[0]).toBeGreaterThanOrEqual(BASE_SEC + 298)
+  })
+
+  it('定位窗口被 IPC 读上限截断时仍必须落到目标 fragment（2026-09-15 真机事故）', async () => {
+    // 现场：SEEK_BACK_WINDOW_BYTES(16MB) 的边界搜索窗口被主进程
+    // MAX_READ_LENGTH(8MB) **静默截断**（localMedia.ts 的 parseReadRequest 不报错），
+    // 而自洽 box 链需要约一个 fragment 的前看量（实测 moof+mdat ≈ 6.4MB）——
+    // findFragmentBoundary 只看得到窗口头部，返回 null 后回退到 windowStart：
+    // 那是 mdat 中间的任意字节，切分器无法重同步，一路扫描到文件尾 0 段入队，
+    // 2m39s 后被停滞看门狗判死（`目标=396.8s，文件时间范围=0.0~8.4s，队列=0`）。
+    // 正确行为：窗口按实际返回长度分多次读完，边界搜索必须看到整窗。
+    const CAP = 256 * 1024
+    const bytes = buildFilledFile(48, 512 * 1024)
+    const file: FakeFile = { bytes, size: bytes.length }
+    const api = {
+      localMedia: {
+        info: async () => ({ ok: true, size: file.size, mtimeMs: 1 }),
+        // 复刻主进程语义：length 超上限时截断到上限，其余照常返回
+        read: async ({ offset, length }: { path: string; offset: number; length: number }) => {
+          const end = Math.min(file.size, offset + Math.min(length, CAP))
+          const slice = file.bytes.subarray(offset, end).slice()
+          return { ok: true, data: slice, bytesRead: slice.length, size: file.size, eof: end >= file.size }
+        },
+        allowRoot: async () => ({ ok: true, roots: [] }),
+        roots: async () => ({ roots: [] }),
+      },
+    }
+    ;(window as unknown as { electronAPI: unknown }).electronAPI = api
+    const { player, medias } = createFakePlayer()
+    let error = ''
+    const source = new LocalFileMseSource({
+      path: 'D:/rec/capped.mp4',
+      player,
+      // 轴 40s ⇒ 文件时间 1040s（文件覆盖 1000~1047s）。
+      // 头部外推 ≈20.5MB > 16MB ⇒ windowStart≈3.7MB 落在 mdat 中间（非边界）。
+      startAxisSec: 40,
+      lookaheadSec: 4,
+      pollIntervalMs: 10,
+      follow: false,
+      firstFrameTimeoutMs: 3000,
+      onError: (e) => (error = e),
+    })
+    source.start()
+    await wait(2000)
+    source.dispose()
+
+    // 改前：边界搜索在 256KB 截断缓冲里找不到自洽链 ⇒ 跳 windowStart ⇒ medias 为空
+    expect(error).toBe('')
+    expect(medias.length).toBeGreaterThan(0)
+    // 起播必须落在目标所在 fragment（±2 个 fragment），而不是文件头或窗口起点
+    expect(medias[0]).toBeGreaterThanOrEqual(BASE_SEC + 38)
+    expect(medias[0]).toBeLessThanOrEqual(BASE_SEC + 41)
   })
 })

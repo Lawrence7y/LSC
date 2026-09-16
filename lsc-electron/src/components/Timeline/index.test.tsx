@@ -324,3 +324,139 @@ describe('Timeline 点击语义：只有 scrub，没有隐藏修饰键', () => {
     unmount()
   })
 })
+
+// ─── 回放标签如实口径（2026-09-15 真机排查：标签必须说实话） ─────────
+
+describe('即时回放起点标签', () => {
+  const dvrProps = (over?: Record<string, unknown>) => ({
+    ...baseProps,
+    duration: 300,
+    windowStart: 0,
+    ...over,
+  })
+
+  it('标签显示真实起点与实际可回放时长（按可见跨度取小），紫标落在真实缓冲起点', () => {
+    const { container } = render(
+      <Timeline
+        {...dvrProps({
+          dvrStart: 200,
+          dvrReplay: {
+            start: 200,
+            configuredStart: 100,
+            availableSeconds: 130,
+            configuredSeconds: 300,
+            effectiveSeconds: 300,
+            degraded: false,
+          },
+        })}
+      />,
+    )
+    const marker = container.querySelector('.lsc-timeline__record-end') as HTMLElement
+    expect(marker).toBeTruthy()
+    // 300s 轴上 200s → 66.67%
+    expect(parseFloat(marker.style.left)).toBeCloseTo(200 / 300 * 100, 3)
+    const label = container.querySelector('.lsc-timeline__record-end-label') as HTMLElement
+    // 缓冲 130s 但右沿只到 300s ⇒ 可见可回放 = 100s；数字必须与眼睛量到的一致
+    expect(label.textContent).toContain('可回放')
+    expect(label.textContent).toContain('00:01:40')
+  })
+
+  it('缓冲完全落在可见窗口内时如实报出缓冲深度', () => {
+    const { container } = render(
+      <Timeline
+        {...dvrProps({
+          duration: 600,
+          dvrStart: 200,
+          dvrReplay: {
+            start: 200,
+            configuredStart: 100,
+            availableSeconds: 130,
+            configuredSeconds: 300,
+            effectiveSeconds: 300,
+            degraded: false,
+          },
+        })}
+      />,
+    )
+    const label = container.querySelector('.lsc-timeline__record-end-label') as HTMLElement
+    expect(label.textContent).toContain('00:02:10')
+  })
+
+  it('设置窗口与真实起点差 > 5s 时画出参考虚线，差得少则不画', () => {
+    const far = render(
+      <Timeline
+        {...dvrProps({
+          dvrStart: 200,
+          dvrReplay: {
+            start: 200,
+            configuredStart: 100,
+            availableSeconds: 130,
+            configuredSeconds: 300,
+            effectiveSeconds: 300,
+            degraded: false,
+          },
+        })}
+      />,
+    )
+    expect(far.container.querySelector('.lsc-timeline__replay-configured')).toBeTruthy()
+    far.unmount()
+
+    const close = render(
+      <Timeline
+        {...dvrProps({
+          dvrStart: 200,
+          dvrReplay: {
+            start: 200,
+            configuredStart: 197,
+            availableSeconds: 300,
+            configuredSeconds: 300,
+            effectiveSeconds: 300,
+            degraded: false,
+          },
+        })}
+      />,
+    )
+    expect(close.container.querySelector('.lsc-timeline__replay-configured')).toBeNull()
+    close.unmount()
+  })
+
+  it('标记靠近右沿时标签向左展开（防文字被轨道裁切）', () => {
+    const { container } = render(
+      <Timeline
+        {...dvrProps({
+          dvrStart: 240, // 80% > 70% 阈值
+          dvrReplay: {
+            start: 240,
+            configuredStart: null,
+            availableSeconds: 60,
+            configuredSeconds: 0,
+            effectiveSeconds: 30,
+            degraded: false,
+          },
+        })}
+      />,
+    )
+    expect(container.querySelector('.lsc-timeline__record-end-label--flip')).toBeTruthy()
+  })
+
+  it('配额缩容时标签点明原因（内存压力）', () => {
+    const { container } = render(
+      <Timeline
+        {...dvrProps({
+          dvrStart: 150,
+          dvrReplay: {
+            start: 150,
+            configuredStart: 100,
+            availableSeconds: 108,
+            configuredSeconds: 300,
+            effectiveSeconds: 180,
+            degraded: true,
+          },
+        })}
+      />,
+    )
+    const label = container.querySelector('.lsc-timeline__record-end-label') as HTMLElement
+    expect(label.textContent).toContain('内存压力')
+    expect(label.textContent).toContain('00:03:00')
+  })
+})

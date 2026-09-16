@@ -942,14 +942,27 @@ def apply_replay_end_exclusion(round_data: dict[str, Any]) -> float | None:
         _skip("boundary_not_confirmed", candidate_trim)
         return None
 
-    # 视觉审计已给出"精确出点"（逐帧证据截断）时，不得再用启发式窗口覆盖它：两条
-    # 信号在描述同一处转场，而 replay_segments 只是"计时器不可读"的间接推断。实测
-    # （2026-09-11）：end_refined=196.25（该区间逐帧 p_combat 0.59–0.82，是真实交战
-    # 结束）被本函数裁到 185.922，白丢 10.3s 画面。只记录"本该裁多少、为什么没裁"。
-    if (
-        str(round_data.get("end_by") or "") == "broadcast_exclusion"
-        and round_data.get("end_refined") is not None
-    ):
+    # 视觉审计已给出"精确出点"（逐帧证据截断 / 赛事审计 passed）时，不得再用启发式
+    # 窗口覆盖它：两条信号在描述同一处转场，而 replay_segments 只是"计时器不可读"的
+    # 间接推断。实测（2026-09-11）：end_refined=196.25（该区间逐帧 p_combat 0.59–0.82，
+    # 是真实交战结束）被本函数裁到 185.922，白丢 10.3s 画面。
+    #
+    # 2026-09-15 扩展：旧判据只认 end_by=='broadcast_exclusion'，但「审计 passed 的
+    # next_prep 出点」同样是**已定稿**出点（end_refined 由 5-10fps 密扫给出、且经
+    # _has_immediate_combat_after 复核），与 broadcast_exclusion 同级，不许被启发式
+    # 回放段裁早——实测该启发式本身就有 ~17s 时间戳偏差与成片误标的历史（见上）。
+    # 未定稿路径（无 end_refined / 审计未 passed）语义不变：那正是 A5 要兜的
+    # "模型漏掉的实战镜头回放"。只记录"本该裁多少、为什么没裁"。
+    _end_by_norm = str(round_data.get("end_by") or "")
+    _audit_end_finalized = bool(
+        round_data.get("end_refined") is not None
+        and (
+            _end_by_norm == "broadcast_exclusion"
+            or str(round_data.get("broadcast_audit") or "") in _REPLAY_END_CONFIRMED_AUDIT
+            or str(round_data.get("confirm_status") or "") in _REPLAY_END_CONFIRMED_STATUS
+        )
+    )
+    if _audit_end_finalized:
         _skip("visual_end_authoritative", candidate_trim)
         round_data["boundary_review_required"] = True
         return None

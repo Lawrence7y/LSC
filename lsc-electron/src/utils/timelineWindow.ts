@@ -33,6 +33,43 @@ export type TimelineWindowResult = {
   visibleSpan: number
 }
 
+/**
+ * 缓冲边界容差（秒）。
+ *
+ * seek 目标落在可回放范围之外、但相差不超过该容差时按“范围之内”处理：分片边界与
+ * 浮点误差经常让“刚好点在左沿/右沿”算出零点几到一两秒的越界，旧实现会因此把一次
+ * 普通点击推进重量级的本地文件回看通道（表现为预览区一直显示「正在准备回看…」）。
+ */
+export const DVR_BUFFER_EDGE_TOLERANCE_SEC = 2
+
+/** 落点与可回放范围边界之间保留的安全边距（秒）：贴着边界 seek 容易被判出缓冲。 */
+export const DVR_SEEK_EDGE_MARGIN_SEC = 0.3
+
+/** 目标是否落在可立即回放的缓冲范围内（含边界容差）。 */
+export function isWithinSeekRange(
+  target: number,
+  rangeStart: number,
+  rangeEnd: number,
+  toleranceSec: number = DVR_BUFFER_EDGE_TOLERANCE_SEC,
+): boolean {
+  if (!Number.isFinite(target) || !Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd)) {
+    return false
+  }
+  return target >= rangeStart - toleranceSec && target <= rangeEnd + toleranceSec
+}
+
+/**
+ * 把 seek 落点收进 [rangeStart + margin, rangeEnd − margin]。
+ *
+ * 「能点的范围」必须等于「真能回放的范围」：调用方拿到任何落点都应先过这一层，
+ * 否则左沿/右沿那点误差就会触发文件回看重通道或让播放头落在缓冲外。
+ */
+export function clampSeekToRange(target: number, rangeStart: number, rangeEnd: number): number {
+  const lo = rangeStart + DVR_SEEK_EDGE_MARGIN_SEC
+  const hi = Math.max(lo, rangeEnd - DVR_SEEK_EDGE_MARGIN_SEC)
+  return Math.min(hi, Math.max(lo, target))
+}
+
 /** 预览/common 轴上的 DVR 左边界（紫线）。 */
 export function computeDvrLeftEdge(
   liveEdgeSec: number,
@@ -61,17 +98,17 @@ export type ExpandedPreviewWindowInput = {
 }
 
 export type ExpandedPreviewWindow = {
+  /** 可立即回放范围左端：真实 MSE 连续缓冲起点（用户设置只作为上限）。 */
   start: number
+  /** 可立即回放范围右端：直播沿（真实缓冲末端；无缓冲时退化为播放位置）。 */
   end: number
+  /** 左界标记位置（= start），供预览条画“从此处起可回放”的标记。 */
   purple: number
   liveEdge: number
   hasLiveDvr: boolean
   playheadPct: number
   fillLeftPct: number
   fillWidthPct: number
-  /** 用户设置的回看时长与当前真实可用时长，供 UI 区分两者。 */
-  configuredReplaySeconds: number
-  availableReplaySeconds: number
 }
 
 function finiteNonNeg(n: number | null | undefined): number {
@@ -79,7 +116,10 @@ function finiteNonNeg(n: number | null | undefined): number {
 }
 
 /**
- * 放大预览条窗口：Live 左端 = 紫线 = liveEdge − 用户配置的回放时长。
+ * 放大预览条窗口（**能点的范围 = 真能回放的范围**）：
+ *   · 左端 start = max(真实连续缓冲起点 buf.start, liveEdge − 用户设置时长)，
+ *     用户设置只作为上限，绝不把未缓冲的历史画成可点区域；
+ *   · 右端 end = liveEdge（真实缓冲末端），无缓冲时退化为播放位置。
  * liveEdge 优先 buffered.end，无效时用 previewPos；禁止录制墙钟。
  */
 export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput): ExpandedPreviewWindow {
@@ -106,8 +146,6 @@ export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput):
       playheadPct,
       fillLeftPct: 0,
       fillWidthPct: playheadPct,
-      configuredReplaySeconds: 0,
-      availableReplaySeconds: end,
     }
   }
 
@@ -130,14 +168,14 @@ export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput):
       playheadPct: 100,
       fillLeftPct: 0,
       fillWidthPct: 100,
-      configuredReplaySeconds: 0,
-      availableReplaySeconds: 0,
     }
   }
-  const desiredStart = computeDvrLeftEdge(liveEdge, replaySeconds)
-  // 时间线按用户配置的回放时长展示，即使浏览器 MSE 缓冲因配额还没有覆盖到
-  // 那么早；点击缓冲左侧时由 mseSeek 自动切到录制文件回看。
-  const start = desiredStart
+  // 用户设置只是**上限**：缓冲比设置浅（预览刚起、配额缩容、播放头落后被 trim）
+  // 时，左端必须回到真实连续缓冲起点 buf.start —— 能点/能拖的范围就是能立即回放
+  // 的范围。旧实现把「设置窗口」整段画成可点区域，点在缓冲左侧会触发重量级的
+  // 本地文件回看通道（预览区显示「正在准备回看…」），实测一次点击白等数秒。
+  const settingStart = computeDvrLeftEdge(liveEdge, replaySeconds)
+  const start = hasBuffer ? Math.max(bufStart as number, settingStart) : settingStart
   const purple = start
   const end = Math.max(liveEdge, start)
   const span = Math.max(end - start, 1e-6)
@@ -154,8 +192,6 @@ export function computeExpandedPreviewWindow(input: ExpandedPreviewWindowInput):
     playheadPct,
     fillLeftPct: 0,
     fillWidthPct: playheadPct,
-    configuredReplaySeconds: replaySeconds,
-    availableReplaySeconds: Math.max(0, end - start),
   }
 }
 

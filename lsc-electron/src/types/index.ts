@@ -687,6 +687,12 @@ export interface MsePlayerRegistryEntry {
     getBufferedRange: () => { start: number; end: number } | null
     getBufferedRanges?: () => Array<{ start: number; end: number }>
     setReplayBufferSeconds?: (seconds: number) => void
+    /** 设置值 vs 实际保留量（配额压力下会被缩容），供 UI 如实展示可回放时长 */
+    getReplayBufferStatus?: () => {
+      configuredSeconds: number
+      effectiveSeconds: number
+      degraded: boolean
+    }
     state: string
     videoElement?: HTMLVideoElement
     resumePlayback?: (silent?: boolean) => void

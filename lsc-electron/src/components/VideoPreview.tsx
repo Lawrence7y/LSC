@@ -349,7 +349,9 @@ export function VideoPreview({
       ),
       // 直播播放器始终按直播流处理：文件回看由独立 ReviewPlayer 承载
       isFile: false,
-      debug: false,
+      // 诊断开关：生产默认静默；需要现场排查时在 devtools 里执行
+      // localStorage.setItem('lsc.mseDebug','1') 再重开预览即可拿到完整播放器追踪。
+      debug: typeof localStorage !== 'undefined' && localStorage.getItem('lsc.mseDebug') === '1',
       onStateChange: (newState) => {
         setState(newState)
         if (newState === 'playing') {
@@ -634,7 +636,9 @@ export function VideoPreview({
       channel: 'review',
       isFile: true,
       replayBufferSeconds: 60,
-      debug: false,
+      // 诊断开关：生产默认静默；需要现场排查时在 devtools 里执行
+      // localStorage.setItem('lsc.mseDebug','1') 再重开预览即可拿到完整播放器追踪。
+      debug: typeof localStorage !== 'undefined' && localStorage.getItem('lsc.mseDebug') === '1',
       onStateChange: (s) => setReviewState(s),
       onError: (err) => {
         // 播放器错误同样要写进 store：底部「回看不可用 + 原因」条只认 store，

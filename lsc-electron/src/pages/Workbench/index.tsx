@@ -39,7 +39,9 @@ import {
   recordingToPreviewLocal,
   resolveRecordingReviewSpan,
 } from '@/utils/timelineCoords'
-import { computeDvrLeftEdge } from '@/utils/timelineWindow'
+import { clampSeekToRange, computeDvrLeftEdge, isWithinSeekRange } from '@/utils/timelineWindow'
+import { normalizeReplayBufferSeconds } from '@/utils/replaySettings'
+import type { DvrReplayWindow } from '@/components/Timeline'
 import { useTimelineViewModel } from '@/hooks/useTimelineViewModel'
 import { canExportClip as canExportClipPolicy } from '@/utils/clipExportPolicy'
 
@@ -116,6 +118,22 @@ function getRoomBufferedRange(roomId: string): { start: number; end: number } | 
   const registry = window.__msePlayers
   const entry = registry?.[roomId]
   return entry?.player?.getBufferedRange?.() ?? null
+}
+
+/**
+ * 播放器侧的回放缓冲现状（设置值 / 实际保留量 / 是否被配额缩容）。
+ *
+ * 时间线标签必须能如实回答"为什么设置 5 分钟却只有 2 分钟可回放"：
+ * 前者是用户设置，后者受 MSE 连续缓冲深度与 QuotaExceeded 缩容共同影响。
+ */
+function getRoomReplayBufferStatus(roomId: string): {
+  configuredSeconds: number
+  effectiveSeconds: number
+  degraded: boolean
+} | null {
+  const registry = window.__msePlayers
+  const entry = registry?.[roomId]
+  return entry?.player?.getReplayBufferStatus?.() ?? null
 }
 
 /** 优先参考房，否则选中列表里第一个有缓冲的预览房 */
@@ -712,8 +730,17 @@ export default function Workbench() {
     }
   }, [timelineView?.contentEnd, timelineView?.windowStart])
 
-  // 紫标 = liveEdge − 120s（与预览条左端契约一致）；recording_review / degraded 无紫标
-  const dvrStart = useMemo((): number | null => {
+  // DVR 回放窗口（时间线紫标 + 如实口径）。recording_review / degraded 无此窗口。
+  //
+  // 口径修正（2026-09-15 真机排查）：紫标过去画在「liveEdge − 用户配置时长」上，
+  // 但用户量的是「标签到右沿的距离」——两者在缓冲深度不足或配额缩容时能差出
+  // 一个数量级（实测设置 300s、真实缓冲 157s、标签到右沿 190s），而 tooltip 却
+  // 承诺"右侧可立即回放"。现在改为：
+  //   · `start`（紫标/标签）= 真实连续缓冲起点 buf.start —— 「此处起可立即回放」为真；
+  //   · `configuredStart` = liveEdge − 用户配置时长 —— 设置承诺窗口，另画一条淡虚线；
+  //   · `availableSeconds` = 真实缓冲深度；`configuredSeconds`/`effectiveSeconds`
+  //     来自播放器（含配额缩容），供 UI 说清"设置 5 分钟为什么只有 2 分钟"。
+  const dvrReplay = useMemo((): DvrReplayWindow | null => {
     const rid = resolveDvrSourceRoomId(
       referenceRoomId,
       selectedRoomId,
@@ -730,23 +757,41 @@ export default function Workbench() {
     }
     const buf = getRoomBufferedRange(rid)
     if (!buf) return null
-    // DVR 紫线左边界 = liveEdge − 用户配置的回放时长（与放大预览条 /
-    // computeExpandedPreviewWindow 的设计一致）。**不要**再钳到真实连续缓存
-    // 起点 buf.start：MSE 连续缓存深度取决于预览流已推时长与配额，往往远小于
-    // 用户配置（例如缓冲只有 ~120s 时，钳制会让紫线距直播只有 2 分钟，用户
-    // 看到「可回放时长明显少于设置的 5 分钟」）。超出缓冲的点击/拖动由 mseSeek
-    // 自动切换到录制文件回看（recording_review），因此按配置时长展示是安全的。
-    const dvrPreview = computeDvrLeftEdge(buf.end, timelineReplaySeconds)
+    const configuredSeconds = normalizeReplayBufferSeconds(timelineReplaySeconds)
+    const status = getRoomReplayBufferStatus(rid)
+    const effectiveSeconds = status?.effectiveSeconds ?? configuredSeconds
+    const degraded = status?.degraded ?? false
+    const availableSeconds = Math.max(0, buf.end - buf.start)
+    // 关闭回放档位：不画"设置窗口"参考线（没有承诺可参照），只如实显示当前缓冲
+    const configuredStart = configuredSeconds > 0
+      ? computeDvrLeftEdge(buf.end, configuredSeconds)
+      : null
+    const window = {
+      start: Math.max(0, buf.start),
+      configuredStart,
+      availableSeconds,
+      configuredSeconds,
+      effectiveSeconds,
+      degraded,
+    }
     if (commonMode && timelineContext?.room_snapshots[rid]) {
       try {
-        return previewToCommon(timelineContext, rid, dvrPreview)
+        return {
+          ...window,
+          start: previewToCommon(timelineContext, rid, window.start),
+          configuredStart: configuredStart == null
+            ? null
+            : previewToCommon(timelineContext, rid, configuredStart),
+        }
       } catch {
         // 对齐快照瞬时不可用时回退 preview 轴，避免紫标整段消失
-        return dvrPreview
+        return window
       }
     }
-    return dvrPreview
+    return window
   }, [referenceRoomId, selectedRoomId, selectedRoomIds, rooms, commonMode, timelineContext, previewPositions, timelineTick, timelineReplaySeconds])
+
+  const dvrStart = dvrReplay?.start ?? null
 
   // recording_review / degraded：强制退出 followLive
   useEffect(() => {
@@ -1326,10 +1371,14 @@ export default function Workbench() {
     const hasBuffer = Boolean(video && video.buffered.length > 0)
     const bufStart = hasBuffer ? video!.buffered.start(0) : null
     const bufEnd = hasBuffer ? video!.buffered.end(video!.buffered.length - 1) : null
-    if (video && bufStart != null && bufEnd != null && t >= bufStart && t <= bufEnd) {
+    // 「能点的范围 = 真能回放的范围」：边界容差内的落点一律按缓冲内处理并收进缓冲
+    // 内侧——分片边界/浮点误差常让“刚好点在左沿或右沿”越界零点几秒，旧实现会把它
+    // 判成缓冲外，白跑一趟重量级的本地文件回看（预览区显示「正在准备回看…」）。
+    if (video && bufStart != null && bufEnd != null && isWithinSeekRange(t, bufStart, bufEnd)) {
+      const safe = clampSeekToRange(t, bufStart, bufEnd)
       try {
         player?.markSeeked?.()
-        video.currentTime = t
+        video.currentTime = safe
       } catch { /* seek 可能被浏览器拒绝 */ }
     } else if (!quiet) {
       player?.markSeeked?.()
@@ -1395,7 +1444,7 @@ export default function Workbench() {
       }
       if (video && bufStart != null && bufEnd != null) {
         // 没有可回看文件时：clamp 到当前连续有效缓冲起点，保证平滑回放且不暂停。
-        const fallback = Math.max(bufStart + 0.3, Math.min(bufEnd - 0.5, t))
+        const fallback = clampSeekToRange(t, bufStart, bufEnd)
         try {
           video.currentTime = fallback
           player?.markSeeked?.()
@@ -4911,6 +4960,7 @@ export default function Workbench() {
             activeRefine={activeRefineRange}
             recordedDurationHint={recordedDurationHint}
             dvrStart={dvrStart}
+            dvrReplay={dvrReplay}
             onHighlightClick={handleHighlightClick}
           />
         </div>

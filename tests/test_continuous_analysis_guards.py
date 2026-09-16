@@ -198,19 +198,32 @@ def test_precise_broadcast_round_with_refined_combat_start_is_listable() -> None
 
 
 def test_background_refine_has_hard_time_budget() -> None:
+    """后台审计批次必须有硬边界（2026-09-15 P1-6 起口径：有界批次，而非单步）。
+
+    历史：旧口径「每批次一个候选一个微步骤」是为了避免一次审计撑满预算被中止
+    （2026-09-08）。但实测容量只有需求的 1/5-1/8（吞吐 = 1 步 x 18s x 1，而一条
+    弱出点候选窗口 150s = 9 步，每个扫描周期只推进一步），列表长期停在待审计。
+    放宽为批次后，有界性必须由**四条**同时保证：单步墙钟上限、单步媒体上限、
+    步数硬上限、批次墙钟死线 + 实测步耗时 EMA（慢机自动退回单步）。
+    """
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
         encoding="utf-8"
     )
+    # 单步预算契约不变（既有的硬预算护栏不得被放宽）
     assert "_BCAST_REFINE_STEP_MAX_SEC = 20.0" in source
     assert "_BCAST_REFINE_STEP_MEDIA_SEC = 18.0" in source
-    assert "timeout=_BCAST_REFINE_STEP_MAX_SEC" in source
     assert "_BCAST_REFINE_STEP_MAX_SEC" in source
-    assert "max_audit_quota = 1" in source
-    assert "max_media_step_sec=_BCAST_REFINE_STEP_MEDIA_SEC" in source
+    # 批次吞吐的新边界：步数硬上限 + 批次墙钟死线 + 自适应步长/配额
+    assert "_BCAST_REFINE_BATCH_MAX_SEC = 40.0" in source
+    assert "_BCAST_REFINE_MAX_STEPS = 3" in source
+    assert "max_audit_quota = _audit_batch_quota(" in source
+    assert "max_media_step_sec=_audit_media_step," in source
+    assert "step_est_sec=_audit_step_estimate(task_state)," in source
+    assert "+ _BCAST_REFINE_STEP_MAX_SEC" in source
     assert "timeout_state['refine_abort'] = True" in source
-    assert "边界审计超过预算" in source
-    # 一个后台任务只能发起一个不可强制中断的 executor
-    # 微步骤；禁止在 deadline 剩余时间内紧接着开下一步。
+    assert "边界审计批次超过预算" in source
+    # 一个后台任务只能发起不可强制中断的 executor 微步骤；
+    # 禁止在 deadline 剩余时间内无界地紧接着开下一步。
     refine_block = source[source.find("refined = []") : source.find("finally:", source.find("refined = []"))]
     assert "while True:" not in refine_block
 
@@ -263,7 +276,10 @@ def test_stop_tail_scan_targeted_window_and_audit_quota() -> None:
     """2026-09-08 调优：
     1. 停止补扫窗口定向瞄准 stop_tail_target（单窗 _STOP_TAIL_WINDOW_CAP_SEC），
        不再套用 90s 自适应追赶预算，缩短停止收尾时长；
-    2. 后台审计收紧为每次一个候选微步骤，避免批次撑满总预算被中止。"""
+    2. 后台审计配额（2026-09-15 P1-6 起）：由「每批一个候选一个微步骤」改为
+       「按滞后分层的 1/2/3 条 + 有界批次」。原先的 loosening 风险（批次撑满
+       总预算被中止）改由 _BCAST_REFINE_MAX_STEPS 与 _BCAST_REFINE_BATCH_MAX_SEC
+       两个硬边界兜住，配额本身不再承担有界性。"""
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(
         encoding="utf-8"
     )
@@ -271,7 +287,8 @@ def test_stop_tail_scan_targeted_window_and_audit_quota() -> None:
     assert "state.get('stop_tail_scan')" in source
     assert "_stop_end_win = min(" in source
     assert "_stop_target_win" in source
-    assert "max_audit_quota = 1" in source
+    assert "max_audit_quota = _audit_batch_quota(" in source
+    assert "_BCAST_REFINE_MAX_QUOTA = 3" in source
     assert "max_audit_quota = 4" not in source
 
 
@@ -1801,3 +1818,71 @@ def test_finalize_has_bounded_stall_fallback() -> None:
     assert "_FINALIZE_TAIL_STALL_MAX_ROUNDS" in src
     assert "finalize_tail_stall_rounds" in src
     assert "rejected_finalize_stalled" in src
+
+
+def test_finalize_stall_also_trips_on_no_progress() -> None:
+    """2026-09-14 回归：收尾补扫只数轮次会把「结构性卡死」拖到 5 轮才收敛。
+
+    现场：10:36:12–10:36:39 连跑 5 轮，每轮 OCR 都是「0 回合, 7 帧」，
+    候选/终态/账本/coverage 全不变，约 50s 纯空转。终止条件必须同时看
+    「进展指纹是否变化」。
+    """
+    src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
+    assert "_FINALIZE_TAIL_STALL_NO_PROGRESS_ROUNDS" in src
+    assert "finalize_tail_no_progress_rounds" in src
+    assert "_finalize_progress_signature" in src
+    assert "_stalled_by_no_progress" in src
+
+
+def test_finalize_progress_signature_tracks_every_bucket() -> None:
+    """指纹必须覆盖候选队列 / listed 终态 / 账本 / coverage 四个维度。
+
+    任一维度变化都要算「有进展」——否则会把"审计刚出结论但还没入列"的
+    健康推进误判成卡死、提前强制定稿。
+    """
+    base = {
+        "ocr_runtime_state": {"broadcast_pending_rounds": [{"start": 1.0, "end": 2.0}]},
+        "listed_clips": {
+            "room:round-000001": {
+                "round_key": "round-000001",
+                "broadcast_audit": "pending_lookahead",
+                "confirm_status": "pending",
+            }
+        },
+        "audit_accepted_count": 5,
+        "audit_rejected_count": 0,
+        "audit_manual_review_count": 0,
+        "audit_delivered_total": 5,
+        "coverage_ranges": [[0.0, 100.0]],
+    }
+    sig0 = room_handler._finalize_progress_signature(base)
+
+    # 1) 待审计队列变化
+    pending_changed = {**base, "ocr_runtime_state": {"broadcast_pending_rounds": []}}
+    assert room_handler._finalize_progress_signature(pending_changed) != sig0
+
+    # 2) listed 终态变化（审计出结论）
+    listed_changed = {
+        **base,
+        "listed_clips": {
+            "room:round-000001": {
+                "round_key": "round-000001",
+                "broadcast_audit": "passed",
+                "confirm_status": "vision_confirmed",
+            }
+        },
+    }
+    assert room_handler._finalize_progress_signature(listed_changed) != sig0
+
+    # 3) 审计账本变化
+    assert room_handler._finalize_progress_signature(
+        {**base, "audit_accepted_count": 6}
+    ) != sig0
+
+    # 4) coverage 变化
+    assert room_handler._finalize_progress_signature(
+        {**base, "coverage_ranges": [[0.0, 120.0]]}
+    ) != sig0
+
+    # 完全不变 ⇒ 指纹相同（这正是"空转"的判据）
+    assert room_handler._finalize_progress_signature(dict(base)) == sig0

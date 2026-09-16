@@ -494,18 +494,52 @@ _RECORDING_MAPPING_BOUNDS_EPS = 1.0
 # 买枪+交战+结算(+赛事回放) 常见 90–130s；>150s 才视为异常合并/漏切
 _VALORANT_MAX_ROUND_DURATION_SEC = 150.0
 _MAX_SKIP_SLEEP_TICKS = 5  # 主循环连续跳过 sleep 的防御上限：超过强制 0.5s 节流，防忙循环广播风暴
+# MSE 预览 backpressure：单次暂停的最长保留时间（前端正常排空只要 1-2 秒；20s 足以区分
+# 「渲染慢但在推进」与「管线卡死」，超时后由推送侧自动恢复，见 _push_mse_segment）。
+_MSE_PUSH_PAUSE_MAX_SEC = 20.0
 _SCAN_ERROR_BACKOFF_SEC = 30.0  # 持续分析 worker 失败后的重试退避（非收尾）
 _REFINE_PREEMPT_BACKLOG_SEC = 60.0  # 审计运行中 backlog 超过该值即允许粗扫抢占审计，防止 coverage 长期停滞
 _BCAST_REFINE_KEEP_LAG_SEC = 90.0  # backlog 未超过该值时保留健康的后台审计
 _BCAST_REFINE_KEEP_MAX_SEC = 120.0  # 后台审计最长保留时间，防止粗扫无限等待
-_BCAST_REFINE_STEP_MAX_SEC = 20.0  # 单个后台审计微步骤的墙钟预算
-_BCAST_REFINE_STEP_MEDIA_SEC = 18.0  # 单步最多新增审计的媒体时间
+_BCAST_REFINE_STEP_MAX_SEC = 20.0  # 单个后台审计微步骤的墙钟预算（单步硬上限，不变）
+_BCAST_REFINE_STEP_MEDIA_SEC = 18.0  # 单步最多新增审计的媒体时间（滞后时保守步长）
+# ------------------------------------------------------------------ 审计吞吐
+# 后台审计的吞吐 = (每个扫描周期能做几个微步骤) x (每步覆盖多少媒体) x (每周期可定稿几条)。
+# 旧口径三项全是 1 / 18s / 1：一条弱出点候选的窗口 ≈ 60s 回看 + 90s 后视 = 150s，
+# 需要 9 个微步骤，而每个扫描周期（赛事档单窗 ~90s 媒体 ≈ 100s+ 墙钟）只推进一步
+# => 单条候选要 10-19 分钟才定稿，而回合约 2 分钟出一个：审计容量只有需求的 1/5-1/8，
+# 现场表现为切片列表长期停在「待审计/待确认」。
+# 下面四项只放宽「一个批次内部」的推进量，**不放宽单步墙钟上限**、不放宽任何判据：
+#   * 批次总预算 40s（含单步 20s 硬上限 + 步数硬上限 3）=> 快机上 2-3 步/周期；
+#     慢机上实测步耗时 EMA 会让批次自动退化回「1 步」，等于旧行为；
+#   * 滞后 <=15s 时步长放大到 30s（窗口步数 9 -> 5），滞后大时仍用保守 18s；
+#   * 低滞后窗口允许一个批次多定稿几条（quota 1 -> 2/3），避免「定稿一条就收工」空转。
+# 粗扫的保护阀原样保留：backlog > _REFINE_PREEMPT_BACKLOG_SEC(60s) 时仍在步与步之间
+# 立即释放槽位（每步开头都会查 refine_abort / cancel_check）。
+_BCAST_REFINE_BATCH_MAX_SEC = 40.0  # 单次后台审计批次的墙钟总预算
+_BCAST_REFINE_MAX_STEPS = 3  # 单批次微步骤硬上限（防慢机上一批吞掉一个周期）
+_BCAST_REFINE_STEP_MEDIA_RELAXED_SEC = 30.0  # 低滞后时的放大步长
+_BCAST_REFINE_RELAXED_MEDIA_BACKLOG_SEC = 15.0  # 滞后不超过该值才放大步长
+_BCAST_REFINE_MULTI_QUOTA_BACKLOG_SEC = 30.0  # 滞后不超过该值才允许 quota > 1
+_BCAST_REFINE_MAX_QUOTA = 3  # 单批次最多定稿条数
+_BCAST_REFINE_STEP_EST_SEED_SEC = 12.0  # 尚无实测步耗时的保守估计（只用于决定是否再放一步）
+_BCAST_REFINE_STEP_EST_ALPHA = 0.3  # 步耗时 EMA 权重（越大越跟手）
 _REFINE_FAIRNESS_COARSE_WINDOWS = 5  # 追赶时每 N 个粗扫窗口至少让一个审计候选运行
+# ------------------------------------------------------------------ 直播沿优先（P1-5）
+# 总开关：默认开。置 LSC_VALORANT_LIVE_FIRST=0/false/off/no 可退回「只按游标回填」的
+# 旧行为（现场 A/B 用；改该 env 需重启后端）。
+# 阈值本身在 lsc/analyzer/valorant_plugin.py:LIVE_FIRST_MAX_TAIL_LAG_SEC（240s）。
+_LIVE_FIRST_ENV = "LSC_VALORANT_LIVE_FIRST"
 _STOP_TAIL_MAX_WINDOWS = 3  # 停止持续分析时的尾部补扫窗口上限（有界停止，避免追直播沿无休止）
 # 收尾补扫的有界兜底：coverage/delivery 均已完成、仅剩待审计队列非空时，若连续
 # 这么多轮仍无法定稿，说明存在结构性无法收敛的候选（典型：录制文件尾后视窗口
 # 不足的 pending_lookahead）。此时强制定稿剩余候选，避免收尾无限补扫 / 界面卡死。
 _FINALIZE_TAIL_STALL_MAX_ROUNDS = 5
+# 零进展提前收敛：只数轮次无法区分「还在缓慢推进」与「结构性卡死」。指纹
+# （待审计队列 / listed 终态 / 账本 / coverage）连续这么多轮完全不变即判定卡死，
+# 立刻强制定稿，不必再等满 _FINALIZE_TAIL_STALL_MAX_ROUNDS。
+# 现场（2026-09-14 10:36:12–10:36:39）：连跑 5 轮「OCR 0 回合, 7 帧」，约 50s 纯空转。
+_FINALIZE_TAIL_STALL_NO_PROGRESS_ROUNDS = 2
 _STOP_TAIL_WINDOW_CAP_SEC = 120.0  # 尾部补扫单窗媒体上限（与全局单窗保护一致）；定向瞄准
                                   # 停止时刻 target，不再套用 90s 自适应追赶预算，提速停止收尾
 _SCAN_MIN_RETRY_WINDOW_SEC = 5.0  # 超时拆分重试的最小窗口；不得跳过未覆盖内容
@@ -974,10 +1008,43 @@ def _probe_stream_offline(mgr: RoomOrchestrator, room_id: str) -> tuple[bool, st
     if _is_stream_info_offline(info):
         return True, _mse_offline_error_message(info.error or '')
     return False, ''
+def _mse_pause_should_auto_resume(
+    now: float,
+    paused_at: float | None,
+    *,
+    max_pause_sec: float = _MSE_PUSH_PAUSE_MAX_SEC,
+) -> bool:
+    """暂停是否已超时、必须由推送侧自动恢复（前端的 resume 可能永远不来）。
+
+    纯函数便于单测：读不出暂停时刻（旧状态/被清过）时返回 False，
+    由调用方按「没有时刻就是刚暂停」处理。
+    """
+    if paused_at is None:
+        return False
+    try:
+        elapsed = float(now) - float(paused_at)
+        limit = max(0.0, float(max_pause_sec))
+    except (TypeError, ValueError):
+        return False
+    return elapsed >= limit
+
+
+def _mse_pause_snapshot(room_id: str) -> tuple[bool, float | None, int]:
+    """(是否暂停, 暂停时刻, 暂停期间被丢弃的分段数)。"""
+    with _mse_push_paused_lock:
+        return (
+            room_id in _mse_push_paused,
+            _mse_push_paused_at.get(room_id),
+            int(_mse_push_dropped.get(room_id) or 0),
+        )
+
+
 def _clear_mse_push_paused(room_id: str) -> None:
-    """预览停止时清除 backpressure 暂停标记，避免残留导致重开后丢帧。"""
+    """清除 backpressure 暂停标记（预览停止 / 自动恢复时调用）。"""
     with _mse_push_paused_lock:
         _mse_push_paused.discard(room_id)
+        _mse_push_paused_at.pop(room_id, None)
+        _mse_push_dropped.pop(room_id, None)
 def _stop_live_preview_streamer(room_id: str) -> None:
     """停止房间的直播 CDN / 共享进样预览 sink（下播后降级为本地文件回看时调用）。"""
     old = _preview_stream_registry().pop(room_id)
@@ -1530,6 +1597,13 @@ def _hybrid_clip_metadata(round_data: dict[str, Any]) -> dict[str, Any]:
         "broadcast_next_prep_invalidated",
         "broadcast_next_prep_invalidated_reason",
         "broadcast_ocr_end_invalidated",
+        # 超长分裂族合并来源（2026-09-14）：切片起止被"头碎片起点 + 尾碎片出点"
+        # 合成过，前端与导出侧都要能解释这条切片为什么比 OCR 原始区间更长；
+        # superseded_by_round_key 同时是跳过原因码 SUPERSEDED_BY_SPLIT_MERGE 的判据。
+        "split_merged",
+        "split_merged_from",
+        "split_merged_original_start",
+        "superseded_by_round_key",
     )
     return {key: round_data[key] for key in keys if key in round_data}
 def _min_highlight_duration_for_queue(*, list_only: bool) -> float:
@@ -1840,6 +1914,41 @@ def _terminal_round_keys(task_state: dict[str, Any]) -> set[str]:
             known.add(_valorant_round_key(entry["candidate"]))
     known.discard("")
     return known
+
+
+def _finalize_progress_signature(task_state: dict[str, Any]) -> tuple[Any, ...]:
+    """收尾补扫的进展指纹：任何一项变化都算"有进展"。
+
+    现场（2026-09-14 10:36）：收尾补扫连跑 5 轮，每轮 OCR 都是「0 回合, 7 帧」
+    （range=1373.8-1381.8）——候选数、审计终态、coverage、账本全不变，纯空转烧掉
+    约 50s，直到撞满 ``_FINALIZE_TAIL_STALL_MAX_ROUNDS`` 才落 manual_review。
+    只数轮次无法区分「还在缓慢推进」与「结构性卡死」；指纹连续不变即结构性卡死，
+    可立刻收敛；指纹仍在变则即便轮次更多也应继续补扫。
+    """
+    ocr_state = task_state.get("ocr_runtime_state") or {}
+    pending = ocr_state.get("broadcast_pending_rounds") or []
+    listed = task_state.get("listed_clips") or {}
+    listed_states: list[tuple[str, str, str]] = []
+    if isinstance(listed, dict):
+        for key, item in listed.items():
+            if not isinstance(item, dict):
+                continue
+            listed_states.append((
+                str(item.get("round_key") or key),
+                str(item.get("broadcast_audit") or ""),
+                str(item.get("confirm_status") or ""),
+            ))
+    listed_states.sort()
+    return (
+        len(pending),
+        tuple(listed_states),
+        len(_listed_items_without_terminal(task_state)),
+        int(task_state.get("audit_accepted_count") or 0),
+        int(task_state.get("audit_rejected_count") or 0),
+        int(task_state.get("audit_manual_review_count") or 0),
+        int(task_state.get("audit_delivered_total") or 0),
+        tuple(tuple(item) for item in _continuous_coverage_snapshot(task_state)),
+    )
 
 
 def _listed_items_without_terminal(task_state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3402,6 +3511,170 @@ def _should_run_broadcast_refine(
     return bool(float(backlog_sec) <= _BCAST_REFINE_KEEP_LAG_SEC)
 
 
+def _live_first_enabled() -> bool:
+    """直播沿优先（P1-5）总开关：默认开，env 显式关闭即退回旧口径。"""
+    return os.environ.get(_LIVE_FIRST_ENV, "").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
+def _continuous_tail_lag_sec(
+    state: dict[str, Any] | None,
+    current_dur: float,
+) -> float | None:
+    """文件尾 - 「已覆盖到的最右端」；读不出覆盖账本时返回 None（= 不插队）。
+
+    用覆盖账本（而不是主游标）算滞后：游标只表示「从 0 连续回填到哪里」。
+    直播沿插队后游标故意不推进，两者从此不同（见 P1-5 设计注释）。
+    """
+    if not isinstance(state, dict):
+        return None
+    try:
+        target = max(0.0, float(current_dur or 0.0))
+    except (TypeError, ValueError):
+        return None
+    if target <= 0.0:
+        return None
+    covered_end = 0.0
+    for item in _continuous_coverage_snapshot(state):
+        try:
+            covered_end = max(covered_end, float(item[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return max(0.0, target - covered_end)
+
+
+def _reset_ocr_runtime_for_noncontiguous_window(
+    state: dict[str, Any] | None,
+    scan_start: float,
+) -> bool:
+    """窗口不连续时重置 OCR 跨窗状态（FSM / 锚点 / 计时器外推 / last_processed_ts）。
+
+    两个理由（沿用收尾短尾续扫的既有做法）：
+      1. last_processed_ts 只增不减：从直播沿跳回中间缺口时，回填窗的帧会被全部
+         当成「已处理过」过滤掉 —— 扫描「成功但零回合」，缺口被误标已覆盖；
+      2. 相位连续性跨越大段未扫区时无效：残留的开回合会把缺口两头的画面拼成
+         一条几千秒的假回合。
+    返回是否实际重置。
+    """
+    runtime_state = (state or {}).get("ocr_runtime_state")
+    if not isinstance(runtime_state, dict):
+        return False
+    try:
+        runtime_state["last_processed_ts"] = float(scan_start)
+    except (TypeError, ValueError):
+        return False
+    runtime_state.pop("ocr_fsm", None)
+    runtime_state.pop("combat_anchor", None)
+    runtime_state.pop("combat_cand_ts", None)
+    runtime_state.pop("last_timer", None)
+    runtime_state.pop("last_timer_ts", None)
+    runtime_state.pop("last_raw_timer", None)
+    runtime_state.pop("last_raw_ts", None)
+    state["ocr_runtime_reset_at"] = round(float(scan_start), 3)
+    return True
+
+
+def _audit_step_media_sec(backlog_sec: float | None) -> float:
+    """单微步骤的媒体预算：低滞后时放大步长（少步数），滞后大时退回保守步长。
+
+    步长只影响「一个批次能推进多少媒体」，不影响任何判据：审计内部按窗口累计
+    样本，步与步之间由 audit_cache / FrameProvider 续跑（已实现的语义）。
+    """
+    if backlog_sec is None:
+        # 读不出滞后 = 不知道粗扫紧不紧 => 保守步长
+        return float(_BCAST_REFINE_STEP_MEDIA_SEC)
+    try:
+        backlog = max(0.0, float(backlog_sec))
+    except (TypeError, ValueError):
+        # 脏值同上：宁可多几步，也不要在粗扫吃紧时放大单步开销
+        return float(_BCAST_REFINE_STEP_MEDIA_SEC)
+    if backlog <= _BCAST_REFINE_RELAXED_MEDIA_BACKLOG_SEC:
+        return float(_BCAST_REFINE_STEP_MEDIA_RELAXED_SEC)
+    return float(_BCAST_REFINE_STEP_MEDIA_SEC)
+
+
+def _audit_batch_quota(
+    backlog_sec: float | None,
+    *,
+    pending_count: int = 0,
+    ready_count: int = 0,
+) -> int:
+    """单批次允许定稿几条候选：滞后越小给得越多（滞后大时优先保 coverage）。"""
+    if int(ready_count or 0) <= 0 or int(pending_count or 0) <= 0:
+        return 1
+    if backlog_sec is None:
+        # 读不出滞后时只给最小配额（放量必须有明确的「粗扫不紧」证据）
+        return 1
+    try:
+        backlog = max(0.0, float(backlog_sec))
+    except (TypeError, ValueError):
+        return 1
+    if backlog > _REFINE_PREEMPT_BACKLOG_SEC:
+        return 1
+    if backlog > _BCAST_REFINE_MULTI_QUOTA_BACKLOG_SEC:
+        return 2
+    return max(1, min(int(_BCAST_REFINE_MAX_QUOTA), int(ready_count)))
+
+
+def _audit_step_estimate(task_state: dict[str, Any] | None) -> float:
+    """实测步耗时估计（EMA）：没有实测值时用保守种子。"""
+    if not isinstance(task_state, dict):
+        return float(_BCAST_REFINE_STEP_EST_SEED_SEC)
+    try:
+        value = float(task_state.get('audit_step_elapsed_ema') or 0.0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value <= 0.0:
+        return float(_BCAST_REFINE_STEP_EST_SEED_SEC)
+    return value
+
+
+def _audit_step_estimate_update(task_state: dict[str, Any] | None, elapsed_sec: float) -> float:
+    """把一次微步骤的实测墙钟写进 EMA（批次是否再放一步据此决定）。"""
+    try:
+        elapsed = max(0.0, float(elapsed_sec or 0.0))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if not isinstance(task_state, dict) or elapsed <= 0.0:
+        return elapsed
+    try:
+        previous = float(task_state.get('audit_step_elapsed_ema') or 0.0)
+    except (TypeError, ValueError):
+        previous = 0.0
+    if previous <= 0.0:
+        ema = elapsed
+    else:
+        alpha = float(_BCAST_REFINE_STEP_EST_ALPHA)
+        ema = previous * (1.0 - alpha) + elapsed * alpha
+    task_state['audit_step_elapsed_ema'] = round(ema, 3)
+    return ema
+
+
+def _audit_batch_has_budget(
+    *,
+    elapsed_sec: float,
+    steps_done: int,
+    step_est_sec: float,
+    batch_max_sec: float | None = None,
+    max_steps: int | None = None,
+) -> bool:
+    """本批次是否还放得下一个微步骤（步数硬上限 + 实测步耗时预估，双保险）。"""
+    limit_steps = int(_BCAST_REFINE_MAX_STEPS if max_steps is None else max_steps)
+    if int(steps_done or 0) >= limit_steps:
+        return False
+    if int(steps_done or 0) <= 0:
+        return True
+    budget = float(_BCAST_REFINE_BATCH_MAX_SEC if batch_max_sec is None else batch_max_sec)
+    try:
+        elapsed = max(0.0, float(elapsed_sec or 0.0))
+        estimate = max(1.0, float(step_est_sec or 0.0))
+    except (TypeError, ValueError):
+        return False
+    # 留 1.25 倍余量：宁可少放一步，也不要让一步跨过批次的硬墙钟边界
+    return elapsed + estimate * 1.25 <= budget
+
+
 def _select_scan_window(
     analyzer: Any,
     plan_state: dict[str, Any],
@@ -3988,8 +4261,18 @@ def get_disk_usage_info():
     except Exception:
         return {'total': 0, 'used': 0, 'free': 0}
     return {'total': total, 'used': used, 'free': free}
+# MSE 预览 backpressure：前端 pending 队列过高时要求后端暂停推送 media 段。
+#
+# ⚠️ 必须带超时自愈（2026-09-15 现场事故）：前端的 resume 只在它自己的队列排空时才发，
+# 一旦解码/追加管线卡住（队列永远排不空），后端就会一直把该房的分段全丢掉 —— 直播预览
+# 变成「有 init、永远没有 media」的永久断流，前端任何自动恢复都拿不到数据，用户只能
+# 「请手动重新开启预览」（现场日志：12:03:42 pause 之后再无 resume，直到 12:06:19 手动重开）。
+# 因此暂停必须记录时刻，超过 _MSE_PUSH_PAUSE_MAX_SEC 由推送侧自动恢复。
 _mse_push_paused: set[str] = set()
+_mse_push_paused_at: dict[str, float] = {}
+_mse_push_dropped: dict[str, int] = {}
 _mse_push_paused_lock = threading.Lock()
+# （阈值 _MSE_PUSH_PAUSE_MAX_SEC 定义在文件顶部常量区：helper 的默认参数在 def 时求值）
 def _push_mse_segment(
     ws_server: Any,
     loop: asyncio.AbstractEventLoop,
@@ -4007,8 +4290,27 @@ def _push_mse_segment(
         "mse_segment": "segment",
         "media": "segment",
     }.get(kind, kind)
-    if normalized_kind == "segment" and room_id in _mse_push_paused:
-        return
+    if normalized_kind == "segment":
+        paused, paused_at, dropped = _mse_pause_snapshot(room_id)
+        if paused:
+            if _mse_pause_should_auto_resume(time.monotonic(), paused_at):
+                # 前端 resume 丢失 / 管线卡死：绝不把该房永久停在「只发 init 不发 media」。
+                # 自动恢复后前端若仍然拥塞，会按自己的 pending 重新发 pause（自带节流）。
+                _log.warning(
+                    "MSE 预览 backpressure 暂停超时，自动恢复推送: room=%s, 暂停=%.1fs, 期间丢弃分段=%d",
+                    room_id,
+                    (
+                        time.monotonic() - float(paused_at)
+                        if paused_at is not None
+                        else -1.0
+                    ),
+                    dropped,
+                )
+                _clear_mse_push_paused(room_id)
+            else:
+                with _mse_push_paused_lock:
+                    _mse_push_dropped[room_id] = dropped + 1
+                return
     asyncio.run_coroutine_threadsafe(
         ws_server.broadcast_mse(normalized_kind, room_id, seg),
         loop,
@@ -4102,10 +4404,14 @@ def _persist_current_rooms(manager: RoomOrchestrator) -> bool:
     # so restart/reconnect can work.  Public HTTP/WebSocket snapshots use the
     # redacted default above.
     rooms = _rooms_list(manager, redact_sensitive=False)
-    # 预览时钟映射只在当前录制/预览 epoch 内有效，不能跨重启复用。
+    # 预览时钟映射和时间线选区只在当前推流会话内有效，不能跨重启复用。
     for room in rooms:
         room.pop('recording_to_preview_delta', None)
         room.pop('preview_clock_epoch_id', None)
+        room['mark_in'] = None
+        room['mark_out'] = None
+        room['mark_in_wallclock'] = None
+        room['mark_out_wallclock'] = None
     schedule_save_rooms(rooms)
     return True
 def restore_persisted_rooms(manager: RoomOrchestrator) -> int:
@@ -4136,7 +4442,7 @@ def restore_persisted_rooms(manager: RoomOrchestrator) -> int:
                 continue
             existing_urls.add(normalized_url)
             restored += 1
-            for field in ("mark_in", "mark_out", "content_offset"):
+            for field in ("content_offset",):
                 value = item.get(field)
                 if value is None:
                     continue
@@ -6933,8 +7239,13 @@ def register_room_handlers(server, bridge):
         with _mse_push_paused_lock:
             if state == 'pause':
                 _mse_push_paused.add(room_id)
+                # 记录暂停时刻：推送侧据此超时自愈（前端 resume 可能永远不来）
+                _mse_push_paused_at[room_id] = time.monotonic()
+                _mse_push_dropped.setdefault(room_id, 0)
             else:
                 _mse_push_paused.discard(room_id)
+                _mse_push_paused_at.pop(room_id, None)
+                _mse_push_dropped.pop(room_id, None)
             paused = room_id in _mse_push_paused
         _log.debug(
             "mse_backpressure: room=%s state=%s pending=%s paused=%s",
@@ -7607,6 +7918,11 @@ def register_room_handlers(server, bridge):
                             float(scan_range[0]), float(scan_range[1])
                         )
                         scan_result_container['completed_at'] = time.time()
+                        # 直播沿优先（P1-5）：本窗是否插队到文件尾（主循环据此不推进
+                        # 主游标 —— 否则中间缺口会被误认为已覆盖）。
+                        scan_result_container['live_first'] = bool(
+                            str(task_state.get('scan_reason') or '') == 'live_first'
+                        )
                         scan_result_container['degraded_mode'] = None
                         scan_result_container['boundary_refine_pass'] = False
                         done_ev = task_state.get('scan_done_event')
@@ -7761,14 +8077,55 @@ def register_room_handlers(server, bridge):
                                         if not _pending:
                                             return []
                                         _pending.sort(key=lambda x: float(x.get('start', 0.0)))
-                                        # 每个后台任务只处理一个候选的一个微步骤。
-                                        # start gate / tail lookahead 按 18s 媒体区间续扫，
-                                        # wall-clock 20s 后归还槽位；下一次从 audit_cache 和
-                                        # FrameProvider 续跑，避免 120s 黑盒审计阻塞粗扫。
+                                        # 一个批次推进**多个有界微步骤**：吞吐 = 步数 x 步长 x quota。
+                                        # 旧口径三项全是 1 / 18s / 1，而一条弱出点候选的窗口
+                                        # ≈ 60s 回看 + 90s 后视 = 150s（9 步），每个扫描周期只推
+                                        # 进一步 => 单条候选要 10-19 分钟才定稿，回合约 2 分钟一个，
+                                        # 容量只有需求 1/5-1/8（现场表现：列表长期停在待审计）。
+                                        # 放宽的只有「批次内推进量」：单步媒体仍 18/30s、步数硬上限 3、
+                                        # 批次墙钟 40s，慢机上实测步耗时 EMA 会自动退回 1 步（= 旧行为）。
                                         produced_audited: list[dict[str, Any]] = []
-                                        max_audit_quota = 1
+                                        _batch_live_dur = max(
+                                            float(_dur or 0.0),
+                                            float(task_state.get('current_dur') or 0.0),
+                                            float(task_state.get('recorded_duration') or 0.0),
+                                        )
+                                        # 滞后未知（连录制时长都读不到）时传 None：吞吐放量必须有明确证据
+                                        _batch_backlog = (
+                                            max(0.0, _batch_live_dur - float(_dur or 0.0))
+                                            if _batch_live_dur > 0.0
+                                            else None
+                                        )
+                                        _audit_media_step = _audit_step_media_sec(_batch_backlog)
+                                        max_audit_quota = _audit_batch_quota(
+                                            _batch_backlog,
+                                            pending_count=len(_pending),
+                                            ready_count=_count_broadcast_ready_candidates(
+                                                _pending, _batch_live_dur,
+                                            ),
+                                        )
+                                        _batch_quota_configured = int(max_audit_quota)
+                                        _batch_started_mono = time.monotonic()
+                                        _batch_deadline = _batch_started_mono + float(_BCAST_REFINE_BATCH_MAX_SEC)
+                                        _batch_steps = 0
+                                        _batch_finalized = 0
+                                        _batch_stop_reason = ''
 
                                         while max_audit_quota > 0 and _pending:
+                                            # 批次内不再放下一步的两道闸：墙钟死线 + 实测步耗时预估。
+                                            # 放在循环开头（选候选之前），避免白做一轮 ready/probe 扫描。
+                                            if _batch_steps > 0:
+                                                _batch_elapsed = time.monotonic() - _batch_started_mono
+                                                if time.monotonic() >= _batch_deadline:
+                                                    _batch_stop_reason = 'deadline'
+                                                    break
+                                                if not _audit_batch_has_budget(
+                                                    elapsed_sec=_batch_elapsed,
+                                                    steps_done=_batch_steps,
+                                                    step_est_sec=_audit_step_estimate(task_state),
+                                                ):
+                                                    _batch_stop_reason = 'budget'
+                                                    break
                                             _cand = None
                                             _cand_idx = -1
                                             ready_indices: list[int] = []
@@ -7805,6 +8162,7 @@ def register_room_handlers(server, bridge):
                                                 _rs_state['broadcast_classifier'] = clf
                                             audit_cache = _rs_state.setdefault('broadcast_audit_cache', {})
                                             _audit_outcome_sink: list[Any] = []
+                                            _step_t0 = time.monotonic()
                                             try:
                                                 audit_outcomes = _run_with_onnx_resource(
                                                     audit_broadcast_rounds_with_outcomes,
@@ -7818,7 +8176,9 @@ def register_room_handlers(server, bridge):
                                                     finalize=_finalize_now,
                                                     lookahead_sec=45.0,
                                                     frame_provider=_frame_provider,
-                                                    max_media_step_sec=_BCAST_REFINE_STEP_MEDIA_SEC,
+                                                    # 步长随滞后自适应（低滞后 30s / 滞后 18s）；
+                                                    # 审计内部把样本按窗口累计，判据不变。
+                                                    max_media_step_sec=_audit_media_step,
                                                     outcome_sink=_audit_outcome_sink,
                                                 )
                                             except FFmpegCancelled:
@@ -7839,6 +8199,14 @@ def register_room_handlers(server, bridge):
                                                 _rs_state['broadcast_pending_rounds'] = _pending
                                                 task_state['audit_queue_depth'] = len(_pending)
                                                 return produced_audited
+                                            finally:
+                                                # 实测步耗时进 EMA：本批次是否还放得下一步据此决定
+                                                # （慢机上一批自动退回 1 步，不会久占 ONNX/DirectML）。
+                                                _audit_step_estimate_update(
+                                                    task_state,
+                                                    time.monotonic() - _step_t0,
+                                                )
+                                            _batch_steps += 1
                                             # 2. 终态后执行物理密扫：只有 start gate 已经落在真实
                                             #    粗入点后，10fps 入点密扫产生的 start_delta/confidence
                                             #    才与最终 start 一致，不再出现“先密扫旧起点、门禁再移动、
@@ -7883,14 +8251,60 @@ def register_room_handlers(server, bridge):
                                                 broadcast=bridge.queue_broadcast,
                                             ):
                                                 max_audit_quota -= 1
+                                                _batch_finalized += 1
                                                 continue
                                             if not audit_outcomes:
                                                 _cand['_last_audit_dur'] = _dur
-                                            # 若本候选仍有非终态子候选等待后视窗口，本周期
-                                            # 暂挂起（已写回 pending），避免死循环。
-                                            break
+                                            # 非终态（pending_lookahead 续扫 / 后视窗口未写满 / 刚提交
+                                            # 一次回扫申请）：只要批次还有预算，就在**本批次内**继续
+                                            # 推进同一条候选，不再立刻 break —— 旧口径让一条 150s
+                                            # 窗口的候选每个扫描周期只走一步（9 个周期 = 10-19 分钟），
+                                            # 正是审计容量不足的主因。终止性由步数硬上限
+                                            # (_BCAST_REFINE_MAX_STEPS) + 墙钟死线双保险保证。
+                                            continue
+                                        if not _pending:
+                                            _batch_stop_reason = _batch_stop_reason or 'queue_empty'
+                                        elif max_audit_quota <= 0:
+                                            _batch_stop_reason = _batch_stop_reason or 'quota'
+                                        elif _batch_steps == 0:
+                                            _batch_stop_reason = _batch_stop_reason or 'no_ready'
                                         _rs_state['broadcast_pending_rounds'] = _pending
                                         task_state['audit_queue_depth'] = len(_pending)
+                                        task_state['audit_batch_steps'] = int(_batch_steps)
+                                        task_state['audit_batch_finalized'] = int(_batch_finalized)
+                                        task_state['audit_batch_quota'] = int(_batch_quota_configured)
+                                        task_state['audit_batch_elapsed_sec'] = round(
+                                            time.monotonic() - _batch_started_mono, 3,
+                                        )
+                                        task_state['audit_media_step_sec'] = float(_audit_media_step)
+                                        # 只在「有值得观察的东西」时打点（多步/有定稿/被预算或死线截断），
+                                        # 否则每个扫描周期一条 INFO 会把日志刷爆；计数仍写进 task_state。
+                                        _batch_notable = (
+                                            _batch_steps > 1
+                                            or _batch_finalized > 0
+                                            or _batch_stop_reason in {'budget', 'deadline'}
+                                        )
+                                        if _batch_notable:
+                                            _log.info(
+                                                "后台审计批次: room_id=%s, steps=%d, finalized=%d, "
+                                                "quota=%d, step_media=%.0fs, elapsed=%.1fs, "
+                                                "stop=%s, backlog=%.1fs, queue=%d, step_ema=%.1fs",
+                                                room_id,
+                                                _batch_steps,
+                                                _batch_finalized,
+                                                _batch_quota_configured,
+                                                float(_audit_media_step),
+                                                task_state['audit_batch_elapsed_sec'],
+                                                _batch_stop_reason,
+                                                # 滞后未知（None）时打 -1：日志格式化不得抛异常
+                                                (
+                                                    float(_batch_backlog)
+                                                    if _batch_backlog is not None
+                                                    else -1.0
+                                                ),
+                                                len(_pending),
+                                                _audit_step_estimate(task_state),
+                                            )
                                         return produced_audited
                                     from lsc.analyzer.valorant_ocr_rounds import (
                                         refine_valorant_round_boundaries,
@@ -7934,11 +8348,12 @@ def register_room_handlers(server, bridge):
                                             st['refine_started_at'] = time.time()
                                             st['refine_abort'] = False
                                         try:
-                                            # 一个后台任务只执行一个媒体微步骤。
-                                            # 旧实现会在 20s deadline 前立即启动下一步，
-                                            # 而内部 FFmpeg/OCR 不能被 asyncio 硬中断，导致
-                                            # 已剩不足 1s 时仍可持锁数分钟。未完成的
-                                            # _audit_continue_ready 候选由下一个粗扫间隙续跑。
+                                            # 一个后台任务执行一个有界批次（多个微步骤）：单步媒体
+                                            # 18/30s、步数硬上限 3、批次墙钟 40s，且只有在上一步实测
+                                            # 耗时 EMA 表明「还放得下」时才继续下一步 —— 慢机上自动退化
+                                            # 回「1 步」，不会出现旧实现那种「20s 死线前抢跑下一步、
+                                            # 内部 FFmpeg/OCR 又不可硬中断 ⇒ 持锁数分钟」的形态。
+                                            # 未完成的 _audit_continue_ready 候选由下个粗扫间隙续跑。
                                             refined = []
 
                                             def _run_refine_guarded():
@@ -7950,7 +8365,12 @@ def register_room_handlers(server, bridge):
                                             try:
                                                 _step_refined = await asyncio.wait_for(
                                                     asyncio.shield(_refine_fut),
-                                                    timeout=_BCAST_REFINE_STEP_MAX_SEC,
+                                                    # 批次预算 + 一步的余量：批次自身的边界由步数上限与
+                                                    # 步耗时 EMA 控制，这里只是「整批彻底卡住」的兜底死线。
+                                                    timeout=(
+                                                        _BCAST_REFINE_BATCH_MAX_SEC
+                                                        + _BCAST_REFINE_STEP_MAX_SEC
+                                                    ),
                                                 )
                                             except TimeoutError:
                                                 with _analysis_jobs_lock:
@@ -7958,9 +8378,9 @@ def register_room_handlers(server, bridge):
                                                     if timeout_state is not None:
                                                         timeout_state['refine_abort'] = True
                                                 _log.warning(
-                                                    "边界审计超过预算，中止并归还分析槽: room_id=%s, timeout=%.0fs",
+                                                    "边界审计批次超过预算，中止并归还分析槽: room_id=%s, timeout=%.0fs",
                                                     room_id,
-                                                    _BCAST_REFINE_STEP_MAX_SEC,
+                                                    _BCAST_REFINE_BATCH_MAX_SEC + _BCAST_REFINE_STEP_MAX_SEC,
                                                 )
                                                 try:
                                                     await asyncio.wait_for(
@@ -9151,17 +9571,39 @@ def register_room_handlers(server, bridge):
                     await _flush_deferred_exports(force=_finalize_started)
                     if _refine_delivery_keys:
                         _ack_refine_results(state, _refine_delivery_keys)
-                    # 仅非旧分段切换结果才推进主分析游标，防止旧文件时长覆盖新文件的 0 起步游标
+                    # 仅非旧分段切换结果才推进主分析游标，防止旧文件时长覆盖新文件的 0 起步游标。
+                    # 直播沿优先窗（live_first）同样不得推进游标：那一窗与游标不相连，推进等于
+                    # 宣称「中间缺口已分析」——进度会跳到 100%，收尾也不会再去补那段。
+                    _scan_was_live_first = bool(
+                        isinstance(scan_result, dict) and scan_result.get('live_first')
+                    )
                     if not _stale_scan_result and not _refine_only_delivery:
-                        last_analyzed = worker_dur
                         with _analysis_jobs_lock:
                             if room_id in _continuous_tasks:
-                                _continuous_tasks[room_id]['last_analyzed'] = last_analyzed
+                                if not _scan_was_live_first:
+                                    last_analyzed = worker_dur
+                                    _continuous_tasks[room_id]['last_analyzed'] = last_analyzed
                                 _continuous_tasks[room_id]['recorded_duration'] = max(recorded_duration, worker_dur)
                                 if _finalize_started and _continuous_tasks[room_id].get(
                                     'finalization_full_rescan'
                                 ):
                                     _continuous_tasks[room_id]['finalization_scan_cursor'] = worker_dur
+                    if _scan_was_live_first:
+                        # 遥测：插队次数与当前滞后（现场判断策略是否按预期工作）
+                        _lf_lag = _continuous_tail_lag_sec(state, current_dur)
+                        with _analysis_jobs_lock:
+                            if room_id in _continuous_tasks:
+                                _continuous_tasks[room_id]['live_first_scans'] = int(
+                                    _continuous_tasks[room_id].get('live_first_scans') or 0
+                                ) + 1
+                                _continuous_tasks[room_id]['tail_lag_sec'] = _lf_lag
+                        _log.info(
+                            "持续分析直播沿优先窗完成: room_id=%s, 回填游标保持 %.1fs, 覆盖尾 %.1fs, 剩余滞后 %s",
+                            room_id,
+                            float(last_analyzed),
+                            float(worker_dur),
+                            f"{float(_lf_lag):.1f}s" if _lf_lag is not None else "unknown",
+                        )
                     with _analysis_jobs_lock:
                         if room_id in _continuous_tasks:
                             # 分开跟踪含 lookback 的粗扫吞吐和真实新增
@@ -9311,14 +9753,33 @@ def register_room_handlers(server, bridge):
                                 _stall_rounds = int(
                                     state.get('finalize_tail_stall_rounds') or 0
                                 ) + 1
+                                # 零进展指纹：轮次只说明"试了几次"，指纹不变才说明
+                                # "再试也不会有新东西"（现场：5 轮 OCR 全 0 回合空转）。
+                                _progress_sig = _finalize_progress_signature(state)
+                                if _progress_sig == state.get('finalize_tail_progress_signature'):
+                                    _no_progress_rounds = int(
+                                        state.get('finalize_tail_no_progress_rounds') or 0
+                                    ) + 1
+                                else:
+                                    _no_progress_rounds = 0
+                                state['finalize_tail_progress_signature'] = _progress_sig
                             else:
                                 _stall_rounds = 0
+                                _no_progress_rounds = 0
                             state['finalize_tail_stall_rounds'] = _stall_rounds
+                            state['finalize_tail_no_progress_rounds'] = _no_progress_rounds
                             _still_recording = bool(
                                 getattr(manager.get_room(room_id), 'is_recording', False)
                             )
-                            if (
+                            _stalled_by_rounds = (
                                 _stall_rounds >= _FINALIZE_TAIL_STALL_MAX_ROUNDS
+                            )
+                            _stalled_by_no_progress = (
+                                _no_progress_rounds
+                                >= _FINALIZE_TAIL_STALL_NO_PROGRESS_ROUNDS
+                            )
+                            if (
+                                (_stalled_by_rounds or _stalled_by_no_progress)
                                 and pending_audit
                                 and not _still_recording
                             ):
@@ -9371,21 +9832,31 @@ def register_room_handlers(server, bridge):
                                     )
                                 _persist_refine_result_queue(state)
                                 _log.warning(
-                                    "收尾补扫达到上限，强制终止 %d 个无法定稿的候选（另 %d 条已入列切片落 manual_review）: room_id=%s",
+                                    "收尾补扫收敛（%s），强制终止 %d 个无法定稿的候选（另 %d 条已入列切片落 manual_review）: room_id=%s, stall_rounds=%d, no_progress_rounds=%d",
+                                    (
+                                        '零进展'
+                                        if _stalled_by_no_progress
+                                        else '达到轮次上限'
+                                    ),
                                     len(_stalled), len(_stalled_listed), room_id,
+                                    _stall_rounds, _no_progress_rounds,
                                 )
                                 state['finalize_tail_stall_rounds'] = 0
+                                state['finalize_tail_no_progress_rounds'] = 0
+                                state.pop('finalize_tail_progress_signature', None)
                             with _analysis_jobs_lock:
                                 if room_id in _continuous_tasks:
                                     _continuous_tasks[room_id]['finalizing'] = False
                                     _continuous_tasks[room_id]['analysis_stage'] = '收尾中（补齐未覆盖区间）'
                             _log.warning(
-                                "持续分析收尾终点已到但 coverage/审计交付不完整，继续补扫: room_id=%s, target=%.1fs, ranges=%s, pending=%s, delivery_complete=%s",
+                                "持续分析收尾终点已到但 coverage/审计交付不完整，继续补扫: room_id=%s, target=%.1fs, ranges=%s, pending=%s, delivery_complete=%s, stall_rounds=%d, no_progress_rounds=%d",
                                 room_id,
                                 _finalize_target,
                                 _continuous_coverage_snapshot(state),
                                 pending_audit,
                                 delivery_complete,
+                                _stall_rounds,
+                                _no_progress_rounds,
                             )
                         else:
                             _finalize_pending = False
@@ -9611,9 +10082,23 @@ def register_room_handlers(server, bridge):
                             or int(state.get('consecutive_scan_timeouts') or 0) > 0
                             or _file_switch_cooldown > 0
                         )
+                        # 直播沿优先（P1-5）：只有在「直播增量期」才把 tail_lag 交给插件；
+                        # 收尾 / 停止补扫路径保持既有语义（它们有各自的定向窗口与重置）。
+                        _live_first_ok = bool(
+                            _live_first_enabled()
+                            and _valorant_incremental_rounds
+                            and not (_finalize_pending or _finalize_started)
+                            and not state.get('stop_tail_scan')
+                        )
+                        _tail_lag_for_plan = (
+                            _continuous_tail_lag_sec(state, current_dur)
+                            if _live_first_ok
+                            else None
+                        )
                         _plan_state = {
                             'mode': mode,
                             'last_analyzed': last_analyzed,
+                            'tail_lag_sec': _tail_lag_for_plan,
                             'tick_count': _scan_counter,
                             'incremental_lookback': (
                                 _VALORANT_INCREMENTAL_LOOKBACK_SEC
@@ -9644,6 +10129,12 @@ def register_room_handlers(server, bridge):
                             _retry_range,
                             finalize=bool(_finalize_started or _finalize_pending),
                         )
+                        # 直播沿优先（P1-5）：插件把本窗标成 live_first 时改写 reason，
+                        # 供 worker 回传、主循环据此「不推进主游标」并重置 OCR 跨窗状态。
+                        if bool(_plan_state.get('live_first')) and not (
+                            _finalize_started or _finalize_pending
+                        ):
+                            _scan_reason = 'live_first'
                         if not (_finalize_started or _finalize_pending) and not full_rescan:
                             # 实时录制增量追赶单窗上限保护（<=120s）：防止窗口滚雪球导致单次扫描耗时几分钟卡死
                             if scan_range[1] - scan_range[0] > 120.0:
@@ -9888,6 +10379,20 @@ def register_room_handlers(server, bridge):
                                 max(1.0, float(scan_range[1]) - float(scan_range[0])),
                                 use_ocr=_ocr_anchor_active,
                             )
+                            # 窗口不连续（直播沿插队 / 插队后回到游标回填）时必须重置
+                            # OCR 跨窗状态：last_processed_ts 只增不减会把回填窗整段过滤
+                            # 掉（「成功但零回合」+ 缺口被误标已覆盖），残留的开回合也会
+                            # 把缺口两头拼成几千秒的假回合。
+                            if _scan_reason == 'live_first':
+                                _reset_ocr_runtime_for_noncontiguous_window(
+                                    state, scan_range[0],
+                                )
+                                state['_ocr_state_noncontiguous'] = True
+                            elif state.get('_ocr_state_noncontiguous'):
+                                state['_ocr_state_noncontiguous'] = False
+                                _reset_ocr_runtime_for_noncontiguous_window(
+                                    state, scan_range[0],
+                                )
                         if _should_skip_continuous_scan_kick(
                             state,
                             scan_range,
@@ -9994,6 +10499,12 @@ def register_room_handlers(server, bridge):
                                 'scan_phase': 'full' if full_rescan else 'incremental',
                                 'scan_reason': _scan_reason,
                                 'planner': _planner_name,
+                                'live_first': bool(_scan_reason == 'live_first'),
+                                'tail_lag_sec': (
+                                    round(float(_tail_lag_for_plan), 1)
+                                    if _tail_lag_for_plan is not None
+                                    else None
+                                ),
                                 'backlog_sec': round(_backlog_before, 1),
                                 'planned_new_media_sec': round(_planned_new_media, 1),
                                 'effective_interval': effective_interval,

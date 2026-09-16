@@ -1,5 +1,66 @@
 # LSC 直播切片系统 — 更新说明
 
+## v1.0.17 (2026-09-16)
+
+### 变更（回放交互口径：能点的范围 = 真能回放的范围）
+
+2026-09-15 真机日志（20:22:08 `[Workbench] seek 283.1s 超出直播缓冲 [308.1, 465.2] → 切换到本地文件回看`）
+暴露的叠加问题：设置 `timeline_replay_seconds=300` 时真实 MSE 连续缓冲只有 157s，而放大预览条把
+「设置窗口」（`liveEdge − 设置时长`）整段画成可点区域 ⇒ 点在画出来的窗口内、真实缓冲外的位置会被
+`mseSeek` 判成缓冲外并切到本地文件回看通道，预览区一直显示「正在准备回看…」（一次普通点击白等数秒）；
+条上还同时印着「回看设置 X · 实际可回放 Y」两个时长，与实际能点的范围并不一致。
+
+- **放大预览条可点/可拖范围 = 真实可回放范围**：`computeExpandedPreviewWindow` 左端改为
+  `max(真实缓冲起点 buf.start, liveEdge − 设置时长)` —— 用户设置**只作上限**，绝不把未缓冲的历史
+  画成可点区域；指针拖动与方向键两处落点统一过 `clampSeekToRange` 收进缓冲内侧。
+- **`mseSeek` 边界容差**：新增 `isWithinSeekRange`（`DVR_BUFFER_EDGE_TOLERANCE_SEC = 2s`），容差内的
+  落点按缓冲内处理并 `clampSeekToRange` 收进缓冲内侧；分片边界/浮点误差不再把一次普通点击推给
+  重量级的回看通道。更早的内容仍走本地文件回看（主时间线 hover 照旧提示「缓冲外·将从录制文件回看」）。
+- **删除放大预览区的两个时长文案**：「回看设置 {configured} · 实际可回放 {available}」及其内存降级后缀
+  一并移除（连同 `room-card__expanded-replay-info` / `expanded-unavailable` 死样式）；
+  窗口计算不再返回 `configuredReplaySeconds` / `availableReplaySeconds`。主时间线紫标/文案不变
+  （起点 = 真实缓冲起点、时长 = 真实可回放量，设置承诺窗口另画淡虚线）。
+- **守卫**：`tests/test_frontend_stability_guards.py::test_preview_bar_seekable_range_equals_replayable_range`；
+  夹具 `lsc-electron/src/utils/timelineWindow.test.ts`（两种窗口口径 + `isWithinSeekRange`/`clampSeekToRange`）。
+  同时修正三条已失效的旧守卫（`const dvrStart = useMemo` → `dvrReplay` 重构名、`bufEnd - 0.5` 字面量、
+  主时间线「紫标无文案」旧约定）。
+
+### 新增（放大预览：缩小为窗口播放 = 原生画中画）
+
+- **放大态控制条新增「窗口播放」按钮**，紧挨「缩小回网格」之后（顺序：静音 → 缩小回网格 →
+  窗口播放 → 全屏 → 停止预览），与其它覆盖层玻璃按钮**同一设计语言**（同 small 尺寸、同圆角
+  令牌、同毛玻璃），差异化为：画中画图标（外框 + 右下角实心小窗，刻意不用向内收拢的
+  `ShrinkOutlined`／向外发散的 `FullscreenOutlined` 箭头语汇）+ 文字标签「窗口播放」+ 品牌青描边
+  淡青底，激活后整块转品牌色。原「缩小」tooltip 由「缩小（窗口播放）」改为「缩小（回到网格，
+  不改变播放）」，消除两个按钮的语义撞车。
+- **功能走播放器原生能力**（`requestPictureInPicture`，Electron/Chromium 原生小窗可跨应用常驻，
+  不需要把 MSE 分片再喂一份）：状态机在 `src/hooks/usePictureInPicture.ts`——画中画是 document
+  级单例，故按 `document.pictureInPictureElement === 本房 video` 判定并监听 document 的
+  `enter/leavepictureinpicture`（绑在 video 上会在播放器重建后失效）；取**当前通道**的 video
+  （回看时跟随回看播放器）；卡片卸载时若本房仍在小窗里则 `exitPictureInPicture()` 收口；
+  `requestPictureInPicture()` 需要用户手势且视频须已有画面，失败给出提示而不是静默。
+- **一次点击 = 缩小 + 窗口播放**：进入小窗成功后顺带收起区域放大（同一路画面不该在卡片与小窗
+  里各播一份）；退出小窗只退小窗，不重新放大。按钮位于自动隐藏控制条内，跟随向下隐藏行为。
+- **守卫**：`tests/test_frontend_stability_guards.py::test_window_playback_button_uses_native_pip`；
+  夹具 `lsc-electron/src/hooks/usePictureInPicture.test.ts`（支持性探测 / 进出切换 / 单例语义 /
+  失败回报 / 卸载收口，共 7 条）。
+
+### 变更（放大预览底部控制条：一体化 + 自动隐藏）
+
+- **时间线 + 走带按键合成一块面板**：原先时间线一行、按键一行各自留白与底色，读起来是两段；
+  现在合并为同一块玻璃面板（统一样式见 `Workbench.css` 的 `room-card__expanded-controls` 与
+  `room-card__expanded-actions`）。
+- **默认向下隐藏，鼠标经过/移动滑出，静止 2.5s 自动收起**：显隐状态机统一走新增的
+  `src/hooks/useAutoHideControls.ts`；拖动时间线、画质下拉打开期间 `pinned` 钉住，键盘焦点在条内
+  由 CSS `:focus-within` 兜底。隐藏态用 `translateY(100%)` + `opacity:0` + `pointer-events:none`
+  三重收口（不可见、不可点、不挡画面；卡片 `overflow:hidden` 裁掉滑出部分）。旧「挂载即滑入且
+  常驻」动画 `roomCardControlsSlideUp` 删除，并补 `prefers-reduced-motion` 关闭过渡。
+- **显隐信号挂在 `<Card>`**（预览画面 + 控制条的公共祖先）：挂预览容器上时，指针从画面移向控制条
+  会先触发 `pointerleave`，把条在用户伸手去点的那一刻藏掉。
+- **守卫**：`tests/test_frontend_stability_guards.py::test_expanded_preview_controls_autohide_as_one_panel`；
+  夹具 `lsc-electron/src/hooks/useAutoHideControls.test.ts`（默认隐藏 / 空闲收起 / 移动重置 /
+  `pinned` 钉住 / 退出放大复位 / 卸载清定时器，共 6 条）。
+
 ## v1.0.16 (2026-09-13)
 
 ### 修复（全功能真机验收抓出的四处缺陷）

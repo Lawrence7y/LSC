@@ -29,7 +29,13 @@ export const enPartRoom: Record<string, string> = {
   '播放': 'Play',
   '后退 10 秒（与总体时间线一致）': 'Back 10 seconds (aligned with main timeline)',
   '前进 10 秒（与总体时间线一致）': 'Forward 10 seconds (aligned with main timeline)',
-  '缩小（窗口播放）': 'Collapse (windowed playback)',
+  '缩小（回到网格，不改变播放）': 'Collapse to the grid (playback unchanged)',
+  // 「缩小为窗口播放」= 原生画中画（PiP）：与“回到网格”刻意区分语汇
+  '窗口播放': 'Pop-out',
+  '缩小为窗口播放（画中画）：在悬浮小窗里继续看，腾出工作台': 'Shrink to window playback (Picture-in-Picture): keep watching in a floating window and free up the workbench',
+  '退出窗口播放，回到卡片预览': 'Exit window playback and return to the card preview',
+  '当前环境不支持窗口播放（画中画）': 'This environment does not support window playback (Picture-in-Picture)',
+  '无法进入窗口播放，请确认预览已出画后重试': 'Could not start window playback. Make sure the preview has a picture, then retry.',
   '退出全屏': 'Exit fullscreen',
   '全屏放大': 'Fullscreen',
   '放大': 'Enlarge',
@@ -68,11 +74,8 @@ export const enPartRoom: Record<string, string> = {
   '正在恢复预览 ({attempt}/{max})...': 'Restoring preview ({attempt}/{max})...',
   '点击启用预览': 'Click to enable preview',
 
-  // ── 放大态预览时间线 DVR 边界（与主时间线同一语义的卡片内描述）──
-  'DVR 回看窗口左边界 {time}：左侧已超出当前缓冲区不可回放，右侧可回放': 'DVR review window starts at {time}: the left side is outside the current buffer and cannot be replayed, while the right side can',
-  'DVR 回看窗口左边界 {time}：早于直播缓冲的区域将切换录制文件，边界按安全边距起播，右侧可直接回看': 'DVR review window starts at {time}: earlier positions switch to the recording file, the boundary starts with a safe margin, and the right side can be reviewed directly',
-  '左侧时间是绝对时间点；设置回看是时长；早于 MSE 缓冲的部分会切换到录制文件回看': 'The left time is an absolute position; replay setting is a duration; parts before the MSE buffer switch to recording-file review',
-  '回看设置 {configured} · 时间线范围 {available}': 'Replay setting {configured} · timeline range {available}',
+  // ── 放大态预览时间线：可点范围 = 真实 MSE 缓冲范围（不再画“设置窗口”）──
+  '可立即回放起点 {time}：这里是 MSE 缓冲最早的位置，右侧可直接回放': 'Instant replay start {time}: the earliest position in the MSE buffer; everything to the right can be replayed directly',
   '该直播间已在列表中，无需重复添加': 'This live stream is already in the list',
   '该直播间': 'This room',
   '确认停止录制并删除房间？': 'Stop recording and delete room?',

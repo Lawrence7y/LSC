@@ -54,7 +54,8 @@ def test_push_mse_segment_broadcasts_streaming_on_first_init():
     """_push_mse_segment 在首个 init 段时广播 preview_phase=streaming（仅一次）。"""
     idx = ROOM_HANDLER.find("def _push_mse_segment")
     assert idx > 0
-    window = ROOM_HANDLER[idx : idx + 900]
+    # 取整个函数体（到下一个顶层 def 为止），不写死字符窗 —— 注释增删不该让守卫失败
+    window = ROOM_HANDLER[idx:].split("\ndef ", 1)[0]
     assert "_mse_live_phase" in window
     assert "if normalized_kind == \"init\" and room_id not in _mse_live_phase:" in window
     assert "'phase': 'streaming'" in window

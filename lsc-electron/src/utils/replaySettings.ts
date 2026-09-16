@@ -8,7 +8,14 @@ export const REPLAY_BUFFER_OPTIONS = [0, 120, 300, 600] as const
 export type ReplayBufferSeconds = typeof REPLAY_BUFFER_OPTIONS[number]
 
 export const DEFAULT_TIMELINE_REPLAY_SECONDS = 300
-export const MIN_PLAYBACK_BUFFER_SECONDS = 15
+/**
+ * 播放缓冲硬下限（秒）。
+ *
+ * 同时是「关闭回放」档的安全缓冲与 MSE trim 的最低保留量——两处必须同源：
+ * 旧实现前者 15s、后者 `Math.max(30, …)`，于是"关闭回放"实际保留 30s 而
+ * 常量写着 15s（2026-09-15 排查发现的口径不一致）。
+ */
+export const MIN_PLAYBACK_BUFFER_SECONDS = 30
 export const REPLAY_TRIM_HEADROOM_SECONDS = 20
 
 export function normalizeReplayBufferSeconds(value: unknown): ReplayBufferSeconds {

@@ -8,6 +8,8 @@ import lsc.analyzer.valorant_broadcast as broadcast
 import lsc.analyzer.valorant_ocr_rounds as ocr_rounds
 from lsc.analyzer.base import ScanWindow
 from lsc.analyzer.valorant_broadcast import (
+    BroadcastAuditOutcome,
+    _merge_split_family_fragments,
     audit_broadcast_phase_sequence,
     audit_broadcast_rounds,
 )
@@ -865,6 +867,118 @@ def test_pending_broadcast_round_is_reaudited_without_new_ocr_round(monkeypatch,
     )
     assert second and second[0]["broadcast_audit"] == "passed"
     assert state["runtime_state"]["broadcast_pending_rounds"] == []
+
+
+def _cancel_audit_plugin(monkeypatch, tmp_path, exc_factory, *, emit_windows: int = 1):
+    """搭一个「OCR 出候选 → 审计抛异常」的 scan_window 现场。
+
+    ``emit_windows``：OCR 只在最初这么多轮窗口里产出该回合（真实语义——同一回合
+    不会在每个增量窗口里反复出现；后续窗口只扫新媒体）。
+    """
+    import lsc.analyzer.valorant_frame_classifier as classifier_module
+
+    video_path = tmp_path / "recording.mp4"
+    video_path.write_bytes(b"test")
+    emissions = {"left": emit_windows}
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+    def fake_detect(*_args, **_kwargs):
+        if emissions["left"] <= 0:
+            return []
+        emissions["left"] -= 1
+        return [
+            {
+                "start": 969.6,
+                "end": 1078.6,
+                "round_key": "round-000097",
+                "end_by": "next_combat",
+            }
+        ]
+
+    monkeypatch.setattr(ocr_rounds, "detect_valorant_rounds_ocr", fake_detect)
+    monkeypatch.setattr(classifier_module, "ValorantFrameClassifier", FakeClassifier)
+    monkeypatch.setattr(
+        broadcast,
+        "audit_broadcast_rounds",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(exc_factory()),
+    )
+    state = {
+        "valorant_profile": "broadcast",
+        "runtime_state": {},
+        "current_dur": 1381.8,
+        "finalize": False,
+        "ffmpeg_path": "ffmpeg",
+    }
+    return ValorantAnalyzerPlugin(), state, video_path
+
+
+def test_cancelled_broadcast_audit_requeues_candidate(monkeypatch, tmp_path) -> None:
+    """2026-09-14 现场回归：审计被「取消」不得把候选静默丢出待审队列。
+
+    现场：10:34:43 收尾尾部扫描 360s 超时 → 正在跑的 broadcast 审计被取消 →
+    插件异常分支把整批盖成 ``broadcast_audit="skipped"``，而回写队列的条件只认
+    ``pending_lookahead`` ⇒ 候选既无终态、又不在队列（``pending_queue_depth=0``），
+    收尾补扫 5 轮全空转，round-000097 落 manual_review、导出侧报 NEVER_AUDITED。
+
+    取消 ≠ 结构性无解：文件还在，下一轮理应接着审。故必须重新排队。
+    """
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    plugin, state, video_path = _cancel_audit_plugin(
+        monkeypatch, tmp_path, lambda: FFmpegCancelled("cancelled during broadcast audit")
+    )
+    plugin.scan_window(
+        str(video_path),
+        ScanWindow(start_sec=1315.6, end_sec=1381.8, timeout_sec=360.0, use_ocr=True),
+        state,
+    )
+
+    pending = state["runtime_state"]["broadcast_pending_rounds"]
+    assert pending, "被取消的候选必须留在待审队列里续审"
+    assert pending[0]["round_key"] == "round-000097"
+    # 重新排队不等于"已审"：列表侧仍须显示未审计
+    assert pending[0]["broadcast_audit"] == "skipped"
+    assert pending[0]["broadcast_review_required"] is True
+
+
+def test_cancelled_audit_requeue_is_bounded(monkeypatch, tmp_path) -> None:
+    """有界重试：真·无解不能无限占用审计槽位（超过上限即不再排队）。"""
+    from lsc.analyzer.valorant_plugin import _BROADCAST_AUDIT_CANCEL_RETRY_MAX
+    from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+
+    plugin, state, video_path = _cancel_audit_plugin(
+        monkeypatch, tmp_path, lambda: FFmpegCancelled("cancelled")
+    )
+    window = ScanWindow(start_sec=1315.6, end_sec=1381.8, timeout_sec=360.0, use_ocr=True)
+    for _ in range(_BROADCAST_AUDIT_CANCEL_RETRY_MAX + 2):
+        plugin.scan_window(str(video_path), window, state)
+
+    pending = state["runtime_state"]["broadcast_pending_rounds"]
+    assert pending == [], "超过重试上限后不得再排队"
+
+
+def test_unavailable_broadcast_audit_does_not_requeue(monkeypatch, tmp_path) -> None:
+    """审计「不可用」（非取消，如模型缺失）不重排：重试无意义，避免空转。"""
+    plugin, state, video_path = _cancel_audit_plugin(
+        monkeypatch, tmp_path, lambda: RuntimeError("model unavailable")
+    )
+    plugin.scan_window(
+        str(video_path),
+        ScanWindow(start_sec=1315.6, end_sec=1381.8, timeout_sec=360.0, use_ocr=True),
+        state,
+    )
+    assert state["runtime_state"]["broadcast_pending_rounds"] == []
+
 
 
 def test_frozen_combat_timer_is_pause_boundary() -> None:
@@ -2679,3 +2793,966 @@ def test_tail_lookback_covers_round_end_before_late_ocr_anchor(monkeypatch) -> N
     assert outs[0].candidate["end_quality"] == "precise"
     # 出点必须落在终态游程内（≈195-205），不得停在粗出点 240
     assert 193.0 <= float(outs[0].candidate["end"]) <= 210.0, outs[0].candidate
+
+
+# ---------------------------------------------------------------------------
+# 同父分裂碎片头尾合并（2026-09-14 现场回归）
+#
+# 真实数据取自 `2026-09-14_09-59-12_至_2026-09-14_10-22-08.finalization.json`：
+#   round-000070 父候选 695.609-963.609（268s）> MAX_BROADCAST_ROUND_SEC=150
+#   ⇒ 切成 s0(695.6-845.6) / s1(845.6-963.6) 独立审计。
+#   头碎片 s0：入点门禁后移 695.609→791.609，头内找不到出点证据 → pending_no_exclusion
+#   尾碎片 s1：审计出真出点 930.75（result_ts=928.609 + 2.5s 结算尾）→ passed
+#   实际回合 = 791.609-930.75（139s），但导出的是后半段 845.609-930.75（85s）。
+# ---------------------------------------------------------------------------
+
+def _split_head_070() -> dict:
+    return {
+        "round_key": "round-000070-s0",
+        "split_from_oversize": True,
+        "split_index": 0,
+        "start": 791.609,
+        "start_coarse": 695.609,
+        "start_refined": 791.609,
+        "start_delta": None,
+        "start_confidence": 1.0,
+        "start_confidence_source": "visual_combat_ratio",
+        "start_by": "ocr_combat",
+        "start_quality": "coarse",
+        "start_review_required": True,
+        "broadcast_start_gate": "moved_from_non_combat",
+        "broadcast_start_gate_from": 695.609,
+        "broadcast_start_gate_to": 791.609,
+        "end": 845.609,
+        "end_coarse": 845.609,
+        "end_by": "next_combat",
+        "end_confidence": 0.5,
+        "end_quality": "coarse",
+        "end_review_required": True,
+        "broadcast_audit": "pending_no_exclusion",
+        "broadcast_audit_reason": "none",
+        "confirm_status": "pending",
+        "result_ts": 928.609,
+        "source_profile": "broadcast",
+    }
+
+
+def _split_tail_070() -> dict:
+    return {
+        "round_key": "round-000070-s1",
+        "split_from_oversize": True,
+        "split_index": 1,
+        "start": 845.609,
+        "start_coarse": 845.609,
+        "start_refined": 845.609,
+        "start_delta": None,
+        "start_confidence": 1.0,
+        "start_by": "ocr_combat",
+        "start_quality": "coarse",
+        "start_review_required": True,
+        "broadcast_start_gate": "ok",
+        "broadcast_start_gate_from": 845.609,
+        "end": 930.75,
+        "end_refined": 930.75,
+        "end_coarse": 963.609,
+        "end_delta": 32.859,
+        "end_confidence": 0.92,
+        "end_by": "broadcast_exclusion",
+        "end_quality": "precise",
+        "end_review_required": False,
+        "broadcast_audit": "passed",
+        "broadcast_audit_reason": "broadcast_replay_or_non_game",
+        "broadcast_excluded_reason": "broadcast_replay_or_non_game",
+        "broadcast_result_tail_sec": 2.5,
+        "confirm_status": "vision_confirmed",
+        "result_ts": 928.609,
+        "source_profile": "broadcast",
+    }
+
+
+def test_split_family_merge_recovers_head_of_real_round() -> None:
+    """头碎片（无出点证据）+ 尾碎片（有权威出点）⇒ 合并成完整回合。"""
+    head, tail = _split_head_070(), _split_tail_070()
+    items = [head, tail]
+
+    assert _merge_split_family_fragments(items) == 1
+
+    # 起点并回头的起点（已过入点门禁的 791.609），出点保持尾碎片的审计结论
+    assert tail["start"] == 791.609
+    assert tail["start_coarse"] == 695.609
+    assert tail["end"] == 930.75
+    assert tail["end_by"] == "broadcast_exclusion"
+    assert tail["end_quality"] == "precise"
+    assert tail["split_merged"] is True
+    assert tail["split_merged_from"] == ["round-000070-s0"]
+    assert tail["split_merged_original_start"] == 845.609
+    assert tail["split_merged_gap_sec"] == 0.0
+    # 起点属性随起点一起搬运，不得留下 start < start_coarse 之类自相矛盾
+    assert tail["broadcast_start_gate"] == "moved_from_non_combat"
+    assert tail["start_quality"] == "coarse"
+    # 合并后是 139.1s 的完整回合，而不是 85s 的半截
+    assert round(tail["end"] - tail["start"], 1) == 139.1
+
+    # 头碎片仍留在列表（保留"入列但不导出"的可观测性），只标被接管；
+    # broadcast_audit 不得篡改成 passed——失败关闭语义必须原样保留
+    assert head["broadcast_audit"] == "pending_no_exclusion"
+    assert head["superseded_by_round_key"] == "round-000070-s1"
+    assert head["broadcast_audit_reason"] == "superseded_by_split_merge"
+
+
+def test_split_family_merge_makes_clip_pass_export_gate() -> None:
+    """合并的**目的**是让完整回合能进草稿，且不靠放宽门禁实现。"""
+    from lsc.exporter.jianying_draft import _broadcast_gate_passed
+
+    def gate(clip: dict, include_pending: bool) -> bool:
+        return _broadcast_gate_passed(
+            confirm_status=clip.get("confirm_status"),
+            source_profile=clip.get("source_profile"),
+            broadcast_audit=clip.get("broadcast_audit"),
+            broadcast_review_required=bool(clip.get("broadcast_review_required", True)),
+            start_quality=clip.get("start_quality"),
+            end_quality=clip.get("end_quality"),
+            start_review_required=bool(clip.get("start_review_required", False)),
+            end_review_required=bool(clip.get("end_review_required", False)),
+            duration_anomaly=False,
+            end_by=clip.get("end_by"),
+            include_pending=include_pending,
+        )
+
+    tail = _split_tail_070()
+    # 未合并时：尾碎片本身也过门禁（出点权威），但它只是半截回合
+    assert gate(tail, include_pending=False) is True
+    # 头碎片单独看：过不了门禁（本就该被丢弃）
+    assert gate(_split_head_070(), include_pending=False) is False
+    # 合并后：仍过门禁，且跨度是完整回合
+    _merge_split_family_fragments([_split_head_070(), _split_tail_070()])
+    merged = _split_tail_070()
+    _merge_split_family_fragments([_split_head_070(), merged])
+    assert gate(merged, include_pending=False) is True
+    assert merged["start"] == 791.609
+
+
+def test_split_family_merge_tolerates_result_ts_outside_head_span() -> None:
+    """现场头碎片的 result_ts(928.609) 落在自己区间之外——不影响判定。
+
+    这正是"用 result_ts 升格 next_combat"方案不可行的原因：头碎片区间
+    (791.6-845.6) 内没有结算证据，只有尾碎片才有。
+    """
+    head, tail = _split_head_070(), _split_tail_070()
+    assert not (head["start"] <= head["result_ts"] <= head["end"])
+    assert _merge_split_family_fragments([head, tail]) == 1
+    assert tail["start"] == 791.609
+
+
+def test_split_family_merge_skips_authoritative_head() -> None:
+    """044 现场几何：权威出点在**头**碎片上（s0 440.5-557.25 passed，
+    s1 590.5-604.95 是真实回合之后的残余）⇒ 不得反向合并。"""
+    head = {
+        "round_key": "round-000044-s0",
+        "split_from_oversize": True,
+        "split_index": 0,
+        "start": 440.515,
+        "end": 557.25,
+        "end_by": "broadcast_exclusion",
+        "end_quality": "precise",
+        "end_review_required": False,
+        "broadcast_audit": "passed",
+        "confirm_status": "vision_confirmed",
+        "result_ts": 590.953,
+    }
+    tail = {
+        "round_key": "round-000044-s1",
+        "split_from_oversize": True,
+        "split_index": 1,
+        "start": 590.515,
+        "end": 604.953,
+        "end_by": "next_combat",
+        "end_quality": "coarse",
+        "broadcast_audit": "pending_no_exclusion",
+        "result_ts": 590.953,
+    }
+
+    assert _merge_split_family_fragments([head, tail]) == 0
+    assert tail["start"] == 590.515
+    assert "split_merged" not in tail
+    assert "superseded_by_round_key" not in head
+
+
+def test_split_family_merge_requires_contiguity() -> None:
+    """头尾之间隔着内容（gap > 容差）不得拼接成假回合。"""
+    head, tail = _split_head_070(), _split_tail_070()
+    head["end"] = 700.0  # 与尾碎片起点 845.609 不再相接
+    assert _merge_split_family_fragments([head, tail]) == 0
+    assert tail["start"] == 845.609
+
+
+def test_split_family_merge_respects_max_round_duration() -> None:
+    """合并后越过"超长回合"红线（>150s）时不做合并——那是另一个异常形态。"""
+    head, tail = _split_head_070(), _split_tail_070()
+    head["start"] = 600.0  # 合并后 = 930.75-600.0 = 330.75s > 150
+    head["end"] = 845.609
+    assert _merge_split_family_fragments([head, tail]) == 0
+    assert tail["start"] == 845.609
+
+
+def test_split_family_merge_requires_inconclusive_head() -> None:
+    """被拒的头碎片（入点/区间有问题）不得把它的起点并进别人的回合。"""
+    head, tail = _split_head_070(), _split_tail_070()
+    head["broadcast_audit"] = "rejected_interior_boundary"
+    assert _merge_split_family_fragments([head, tail]) == 0
+    assert tail["start"] == 845.609
+
+
+def test_split_family_merge_syncs_outcome_sink() -> None:
+    """outcome 记录时做了浅拷贝 ⇒ 合并必须同步回写，否则调用方拿到旧边界。"""
+    head, tail = _split_head_070(), _split_tail_070()
+    sink = [
+        BroadcastAuditOutcome(
+            status="manual_review", candidate=dict(head), reason="no_exclusion_evidence"
+        ),
+        BroadcastAuditOutcome(
+            status="accepted", candidate=dict(tail), reason="broadcast_replay_or_non_game"
+        ),
+    ]
+
+    assert _merge_split_family_fragments([head, tail], sink) == 1
+    assert sink[1].candidate["start"] == 791.609
+    assert sink[1].candidate["split_merged"] is True
+    assert sink[0].candidate["superseded_by_round_key"] == "round-000070-s1"
+
+
+def test_audit_wires_split_family_merge_before_return() -> None:
+    """接线守卫：两个审计入口共用 audit_broadcast_rounds，合并必须在其出口。
+
+    且必须在定稿循环**之后**——只有那时本批结论才都定稿。
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "lsc/analyzer/valorant_broadcast.py"
+    ).read_text(encoding="utf-8")
+    assert "_reconcile_split_family_fragments(output, audit_cache, _outcome_sink)" in src
+    merge_idx = src.find("_reconcile_split_family_fragments(output, audit_cache")
+    assert merge_idx > src.find('"赛事回合审计完成:')
+
+
+def test_split_family_merge_across_batches_via_ledger() -> None:
+    """**主路径**回归：正常运行期 deferred_audit=True，审计一次只推进一个子块，
+    头尾碎片不在同一批 ⇒ 必须靠 audit_cache 台账跨批补回前半段。
+
+    现场（2026-09-14）：s0 在 10:27:54 定稿（未定论）、s1 在 10:28:39 定稿
+    （passed），两次不同的审计调用；只在同批里合并等于在主路径上不生效。
+    """
+    cache: dict = {}
+
+    # 第一批：只有头碎片（未定论）——只入台账，不改边界
+    head = _split_head_070()
+    assert broadcast._reconcile_split_family_fragments([head], cache) == 0
+    assert head["start"] == 791.609
+    assert "split_merged" not in head
+    ledger = cache[broadcast._SPLIT_FAMILY_CACHE_KEY]["round-000070"]
+    assert ledger[0]["round_key"] == "round-000070-s0"
+
+    # 第二批：只有尾碎片（定稿）——从台账补回前半段
+    tail = _split_tail_070()
+    assert broadcast._reconcile_split_family_fragments([tail], cache) == 1
+    assert tail["start"] == 791.609
+    assert tail["end"] == 930.75
+    assert tail["split_merged"] is True
+    assert tail["split_merged_from"] == ["round-000070-s0"]
+    assert tail["split_merged_original_start"] == 845.609
+    assert round(tail["end"] - tail["start"], 1) == 139.1
+
+
+def test_split_family_merge_across_batches_needs_inconclusive_head_in_ledger() -> None:
+    """台账里的头碎片若已被拒（入点/区间有问题），跨批也不得合并。"""
+    cache: dict = {}
+    head = _split_head_070()
+    head["broadcast_audit"] = "rejected_interior_boundary"
+    broadcast._reconcile_split_family_fragments([head], cache)
+
+    tail = _split_tail_070()
+    assert broadcast._reconcile_split_family_fragments([tail], cache) == 0
+    assert tail["start"] == 845.609
+
+
+def test_split_family_merge_chains_three_fragments() -> None:
+    """3 块以上的族：台账记录的是**合并后**的起点，故可逐级传递。"""
+    cache: dict = {}
+    head0 = _split_head_070()
+    head1 = {
+        **_split_head_070(),
+        "round_key": "round-000070-s1",
+        "split_index": 1,
+        "start": 845.609,
+        "end": 890.0,
+    }
+    # 两块都未定论，先入台账
+    assert broadcast._reconcile_split_family_fragments([head0, head1], cache) == 0
+    ledger = cache[broadcast._SPLIT_FAMILY_CACHE_KEY]["round-000070"]
+    assert ledger[0]["start_fields"]["start"] == 791.609
+    # 中段碎片自己虽然未定论，台账里记的是**有效起点**（承接 s0）
+    assert ledger[1]["start_fields"]["start"] == 791.609
+    assert ledger[1]["chained_from"] == ["round-000070-s0"]
+
+    tail = {
+        **_split_tail_070(),
+        "round_key": "round-000070-s2",
+        "split_index": 2,
+        "start": 890.0,
+    }
+    assert broadcast._reconcile_split_family_fragments([tail], cache) == 1
+    # 链式传递：s2 直接借到的是 s1 台账里的"有效起点"，而 s1 的起点已被 s0 承接
+    # ⇒ 一次补回整族最前面的真实起点 791.609
+    assert tail["start"] == 791.609
+    assert tail["split_merged_from"] == ["round-000070-s1", "round-000070-s0"]
+    assert round(tail["end"] - tail["start"], 1) == 139.1
+
+
+def test_split_family_reconcile_is_idempotent() -> None:
+    """重复 reconcil 不得二次吸收（否则 split_merged_original_start 会失真）。"""
+    cache: dict = {}
+    head, tail = _split_head_070(), _split_tail_070()
+    items = [head, tail]
+    assert broadcast._reconcile_split_family_fragments(items, cache) == 1
+    assert broadcast._reconcile_split_family_fragments(items, cache) == 0
+    assert tail["split_merged_original_start"] == 845.609
+    assert tail["start"] == 791.609
+
+
+
+
+def test_split_merge_provenance_is_forwarded_to_clip_metadata() -> None:
+    """合并来源必须透传到 clip_queued 与草稿侧白名单，否则前端/导出看不到解释。"""
+    from pathlib import Path
+
+    room_src = (
+        Path(__file__).resolve().parents[1] / "python-backend/handlers/room_handler.py"
+    ).read_text(encoding="utf-8")
+    draft_src = (
+        Path(__file__).resolve().parents[1]
+        / "python-backend/handlers/jianying_handlers.py"
+    ).read_text(encoding="utf-8")
+    for field in ("split_merged", "split_merged_from", "superseded_by_round_key"):
+        assert f'"{field}"' in room_src, field
+        assert f'"{field}"' in draft_src, field
+
+
+def test_inline_broadcast_audit_is_step_bounded(monkeypatch, tmp_path) -> None:
+    """收尾同步审计必须限步（D 修复）：不限步时审计与被超时包裹的扫描争抢
+    ONNX/DirectML 锁，把整窗拖到扫描超时。
+
+    现场实测（2026-09-14）：同窗口无争抢仅需 51.8s（66.2s 媒体），
+    现场却烧满 360s 超时并取消了正在跑的审计（round-000097 因此丢失）。
+    """
+    import lsc.analyzer.valorant_frame_classifier as classifier_module
+    from lsc.analyzer.valorant_plugin import _BROADCAST_INLINE_AUDIT_STEP_MEDIA_SEC
+
+    video = tmp_path / "broadcast.mp4"
+    video.write_bytes(b"placeholder")
+    seen: dict = {}
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        ocr_rounds,
+        "detect_valorant_rounds_ocr",
+        lambda *_a, **_k: [{"start": 10.0, "end": 80.0, "round_key": "round-000001"}],
+    )
+    monkeypatch.setattr(classifier_module, "ValorantFrameClassifier", FakeClassifier)
+
+    def fake_audit(rounds, video_path, **kwargs):
+        seen.update(kwargs)
+        return [{**r, "broadcast_audit": "passed"} for r in rounds]
+
+    monkeypatch.setattr(broadcast, "audit_broadcast_rounds", fake_audit)
+
+    result = ValorantAnalyzerPlugin().scan_window(
+        str(video),
+        ScanWindow(start_sec=0.0, end_sec=90.0, timeout_sec=120.0, use_ocr=True),
+        {
+            "valorant_profile": "broadcast",
+            "runtime_state": {},
+            "current_dur": 90.0,
+            "finalize": True,
+            "ffmpeg_path": "ffmpeg",
+        },
+    )
+    assert result and result[0]["broadcast_audit"] == "passed"
+    assert seen.get("max_media_step_sec") == _BROADCAST_INLINE_AUDIT_STEP_MEDIA_SEC
+    assert seen.get("finalize") is True
+
+
+def test_slow_scan_logs_stage_breakdown(monkeypatch, tmp_path, caplog) -> None:
+    """分段耗时打点：扫描逼近超时预算时必须打出 OCR/审计两段墙钟，
+    否则下次现场仍只能看到"扫描超时"这一句，无法定位慢在哪一段。"""
+    import logging as _logging
+    import time as _time
+
+    video = tmp_path / "broadcast.mp4"
+    video.write_bytes(b"placeholder")
+
+    def slow_ocr(*_a, **_k):
+        # 必须真的耗时：Windows 上 monotonic 粒度约 15ms，瞬时返回会让
+        # elapsed 恰好为 0，打点阈值永远不满足（测试会假绿/假红）。
+        _time.sleep(0.05)
+        return []
+
+    monkeypatch.setattr(ocr_rounds, "detect_valorant_rounds_ocr", slow_ocr)
+
+    with caplog.at_level(_logging.WARNING, logger="lsc.analyzer.valorant_plugin"):
+        ValorantAnalyzerPlugin().scan_window(
+            str(video),
+            # 小超时预算（阈值 0.6*0.01=6ms）⇒ 必然跨过打点阈值
+            ScanWindow(start_sec=0.0, end_sec=10.0, timeout_sec=0.01, use_ocr=True),
+            {"valorant_profile": "pov", "runtime_state": {}, "current_dur": 10.0},
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("扫描耗时逼近超时预算" in m for m in messages), messages
+    breakdown = next(m for m in messages if "扫描耗时逼近超时预算" in m)
+    assert "ocr=" in breakdown and "audit=" in breakdown and "timeout=" in breakdown
+
+
+# ---------------------------------------------------------------------------
+# 收尾缺口补扫口径（2026-09-14 真实会话回归）
+#   真实事实：round-000015-s0(154.1-246.7) 11:43:43 定稿、round-000071-s0
+#   (712.2-802.2) 11:52:37 定稿；11:54:33 补扫仍把 153.0-257.0 / 711.0-813.0
+#   判为「无候选」并合成新候选，最终以父键定稿 ⇒ 同回合两条重叠条目
+#   （导出侧 R12/R13 靠 OVERLAP_DEDUP 兜住）。且 gap_sweep_done 写在了每轮
+#   新建的局部 state 上，收尾 4 轮各补扫一次。
+# ---------------------------------------------------------------------------
+
+def _finalize_scan_state(runtime_state):
+    return {
+        "valorant_profile": "broadcast",
+        "runtime_state": runtime_state,
+        "current_dur": 1147.0,
+        "finalize": True,
+        "ffmpeg_path": "ffmpeg",
+    }
+
+
+def _sweep_harness(monkeypatch, tmp_path, *, ocr_rounds_per_call, sweep_calls):
+    """搭一个收尾扫描现场：OCR 出候选、审计按脚本给结论、补扫被记录。"""
+    import lsc.analyzer.valorant_frame_classifier as classifier_module
+
+    video = tmp_path / "recording.mp4"
+    video.write_bytes(b"placeholder")
+    pending_ocr = list(ocr_rounds_per_call)
+
+    class FakeClassifier:
+        thresholds = {"stable_prob": 0.55}
+        model_version = "test"
+        provider = "cpu"
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        ocr_rounds,
+        "detect_valorant_rounds_ocr",
+        lambda *_a, **_k: [dict(c) for c in (pending_ocr.pop(0) if pending_ocr else [])],
+    )
+    monkeypatch.setattr(classifier_module, "ValorantFrameClassifier", FakeClassifier)
+    monkeypatch.setattr(
+        broadcast,
+        "audit_broadcast_rounds",
+        lambda rounds, *_a, **_k: [
+            {**r, "broadcast_audit": "passed", "end_by": "broadcast_exclusion",
+             "end_quality": "precise", "confirm_status": "vision_confirmed"}
+            for r in rounds
+        ],
+    )
+
+    def fake_sweep(video_path, candidates, **_kwargs):
+        sweep_calls.append([dict(c) for c in candidates])
+        return []
+
+    monkeypatch.setattr(broadcast, "sweep_gap_rounds", fake_sweep)
+    return video
+
+
+def test_gap_sweep_runs_once_per_finalize_task(monkeypatch, tmp_path) -> None:
+    """补扫标记必须跨调用存活：state 是每轮新建的局部 dict，写它等于没写。
+
+    现场：收尾 4 轮各补扫一次（4×全片巡检），把 20s 审计微步预算挤爆。
+    """
+    sweep_calls: list = []
+    video = _sweep_harness(
+        monkeypatch, tmp_path,
+        ocr_rounds_per_call=[[{"start": 10.0, "end": 80.0, "round_key": "round-000001"}]] * 3,
+        sweep_calls=sweep_calls,
+    )
+    runtime_state: dict = {}
+    plugin = ValorantAnalyzerPlugin()
+    window = ScanWindow(start_sec=0.0, end_sec=90.0, timeout_sec=120.0, use_ocr=True)
+
+    for _ in range(3):
+        # 每轮都传**新建**的外层 state（复刻 room_handler 的 _scan_state），
+        # 只有 runtime_state 是跨轮共享的同一个 dict
+        plugin.scan_window(str(video), window, _finalize_scan_state(runtime_state))
+
+    assert runtime_state.get("gap_sweep_done") is True, "标记必须落到 runtime_state"
+    assert len(sweep_calls) == 1, f"收尾多轮只应补扫一次，实际 {len(sweep_calls)} 次"
+
+
+def test_gap_sweep_excludes_finalized_spans(monkeypatch, tmp_path) -> None:
+    """已定稿真实回合覆盖过的区间不得再被当作"无候选区间"。"""
+    sweep_calls: list = []
+    video = _sweep_harness(
+        monkeypatch, tmp_path,
+        ocr_rounds_per_call=[
+            [{"start": 900.0, "end": 1000.0, "round_key": "round-000090"}]
+        ],
+        sweep_calls=sweep_calls,
+    )
+    runtime_state: dict = {
+        # 已定稿跨度台账在共享 audit_cache 里（两条审计路径同一份）
+        "broadcast_audit_cache": {
+            broadcast._FINALIZED_SPANS_CACHE_KEY: [[154.053, 246.703], [712.153, 802.203]]
+        }
+    }
+    ValorantAnalyzerPlugin().scan_window(
+        str(video),
+        ScanWindow(start_sec=0.0, end_sec=90.0, timeout_sec=120.0, use_ocr=True),
+        _finalize_scan_state(runtime_state),
+    )
+
+    assert sweep_calls, "补扫应被调用（候选列表非空才进缺口计算）"
+    passed = sweep_calls[0]
+    spans = sorted((float(c["start"]), float(c["end"])) for c in passed)
+    assert (154.053, 246.703) in spans
+    assert (712.153, 802.203) in spans
+
+
+def test_finalized_span_ledger_only_records_passed() -> None:
+    """台账只记 passed（确有回合），被拒区间保持可补扫——缺口补扫是安全网。"""
+    cache: dict = {}
+    broadcast._remember_finalized_spans(cache, [
+        {"start": 10.0, "end": 80.0, "broadcast_audit": "passed"},
+        {"start": 90.0, "end": 150.0, "broadcast_audit": "rejected_no_stable_combat"},
+        {"start": 160.0, "end": 220.0, "broadcast_audit": "pending_lookahead"},
+        {"start": 230.0, "end": 290.0, "broadcast_audit": "skipped"},
+        {"start": 300.0, "end": 300.0, "broadcast_audit": "passed"},  # 零长不计
+    ])
+    assert broadcast.finalized_spans(cache) == [[10.0, 80.0]]
+
+    # 幂等：重复记同一跨度不膨胀
+    broadcast._remember_finalized_spans(cache, [
+        {"start": 10.0, "end": 80.0, "broadcast_audit": "passed"}
+    ])
+    assert broadcast.finalized_spans(cache) == [[10.0, 80.0]]
+
+    # 有界
+    many = [
+        {"start": float(i * 10), "end": float(i * 10 + 5), "broadcast_audit": "passed"}
+        for i in range(broadcast._FINALIZED_SPANS_MAX + 10)
+    ]
+    broadcast._remember_finalized_spans(cache, many)
+    assert len(broadcast.finalized_spans(cache)) == broadcast._FINALIZED_SPANS_MAX
+
+
+def test_audit_records_finalized_spans_into_shared_cache(monkeypatch) -> None:
+    """写入点必须在审计出口：两条审计路径（插件同步 / 后台微步）共用同一个
+    audit_cache，只有写在那里，收尾补扫才看得见**另一条路径**定稿的回合。
+
+    现场正是如此：s0 由后台路径在正常阶段定稿，收尾期的插件补扫看不见它。
+    """
+    def label_at(ts: float) -> str:
+        if 100.0 <= ts <= 195.0:
+            return "combat"
+        if 196.0 <= ts <= 205.0:
+            return "result"
+        if 206.0 <= ts <= 232.0:
+            return "replay"
+        if 233.0 <= ts <= 255.0:
+            return "buy"
+        return "combat" if ts >= 256.0 else "non_game"
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", _fake_frame_extract(label_at))
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+
+    cache: dict = {}
+    out = audit_broadcast_rounds(
+        [{"round_key": "round-late-anchor", "start": 100.0, "end": 240.0,
+          "start_by": "ocr_combat", "end_by": "next_combat"}],
+        "unused.mp4",
+        classifier=_fake_classifier(),
+        audit_cache=cache,
+        finalize=True,
+    )
+    assert out and out[0]["broadcast_audit"] == "passed", out
+    spans = broadcast.finalized_spans(cache)
+    assert spans, "审计出口必须把已定稿跨度写进共享 audit_cache"
+    assert spans[0][0] >= 100.0
+
+
+def test_plugin_sweep_reads_finalized_spans_from_audit_cache() -> None:
+    """插件读的必须是共享 audit_cache 台账（不是自己那份 runtime_state 副本）。"""
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "lsc/analyzer/valorant_plugin.py"
+    ).read_text(encoding="utf-8")
+    assert "_finalized_span_items(audit_cache)" in src
+    assert "finalized_spans(audit_cache)" in src
+    # 旧的 runtime_state 版台账必须彻底移除，避免两份台账各记一半
+    assert "_BROADCAST_FINALIZED_SPANS_KEY" not in src
+
+
+def test_gap_sweep_runs_even_with_empty_queue_and_no_new_rounds(monkeypatch, tmp_path) -> None:
+    """收尾期「无新候选 + 队列已排空」也必须补扫。
+
+    2026-09-14 12:40 会话现场：收尾各轮 OCR 恒为 0 回合、待审队列空 ⇒ 整个
+    broadcast 分支被跳过，补扫一次没跑，最后 650.2-736.1（85.9s）无人巡检。
+    补扫要抓的恰恰是这种"画面静止导致全程无候选"的漏检，故收尾期无条件进入。
+    """
+    sweep_calls: list = []
+    video = _sweep_harness(
+        monkeypatch, tmp_path,
+        ocr_rounds_per_call=[[]],  # 本轮没有任何新 OCR 回合
+        sweep_calls=sweep_calls,
+    )
+    runtime_state: dict = {
+        # 队列已排空：只剩已定稿真实回合的跨度（这正是补扫需要的覆盖证据）
+        "broadcast_pending_rounds": [],
+        "broadcast_audit_cache": {
+            broadcast._FINALIZED_SPANS_CACHE_KEY: [[0.2, 51.25], [585.03, 650.25]]
+        },
+    }
+    ValorantAnalyzerPlugin().scan_window(
+        str(video),
+        ScanWindow(start_sec=728.1, end_sec=736.1, timeout_sec=120.0, use_ocr=True),
+        _finalize_scan_state(runtime_state),
+    )
+
+    assert sweep_calls, "收尾期队列空、无新回合时补扫也必须运行"
+    spans = sorted((float(c["start"]), float(c["end"])) for c in sweep_calls[0])
+    assert (585.03, 650.25) in spans, "已定稿跨度必须作为覆盖证据传进去"
+    # 650.25-1147.0 是真实缺口 ⇒ 补扫必须看到它（而不是被当成"全片已覆盖"）
+    assert span_gap_visible(sweep_calls[0])
+
+
+def span_gap_visible(candidates: list) -> bool:
+    """候选覆盖集必须留出真实缺口（此处 duration=1147.0，缺口 650.25-1147.0）。"""
+    from lsc.analyzer.valorant_broadcast import GAP_SWEEP_MIN_GAP_SEC, _merged_span_gaps
+
+    spans = [(float(c["start"]), float(c["end"])) for c in candidates]
+    gaps = _merged_span_gaps(spans, duration=1147.0, min_gap_sec=GAP_SWEEP_MIN_GAP_SEC)
+    return any(a <= 650.3 <= b for a, b in gaps)
+
+
+# ---------------------------------------------------------------------------
+# 弱出点候选的「向前回扫」取证（2026-09-15）
+#
+# 现场形态：OCR 以 next_combat 闭合（漏检下一回合准备横幅，出点落在下一回合满钟
+# 首帧，比真出点晚 30-80s）。旧实现只看 [end-60, end+90]：真出点所在的
+# combat -> replay/result/non_game 转场若早于 end-60 就完全在窗外，
+# _first_stable_exclusion 因为「样本里先有 replay、没有 combat 前缀」而认不出边界
+# => reason=none => pending_no_exclusion，把过晚的粗出点冻结成终态（切片尾部带
+# 整段回放与买枪，且此后无人再审）。修复：定稿前必须先做一次有界向前回扫取证。
+# ---------------------------------------------------------------------------
+
+_BROADCAST_LABELS = ("non_game", "buy", "combat", "result", "replay")
+# 伪标签「unknown」的编码：分类器输出平坦概率（最高置信度 0.2 < stable_prob=0.55），
+# 由 _stable_visual_label 归一成 unknown —— 与真实模型"看不清"的形态一致。
+_UNKNOWN_LABEL_INDEX = len(_BROADCAST_LABELS)
+
+
+class _LabelClassifier:
+    """8x8 假帧：像素首字节编码标签索引（沿用 liveness 测试的假分类器风格）。"""
+
+    thresholds = {"stable_prob": 0.55}
+    model_version = "test"
+    provider = "cpu"
+
+    def load(self) -> None:
+        return None
+
+    def predict_batch(self, images):
+        rows = []
+        for image in images:
+            index = int(image[0, 0, 0])
+            if index == _UNKNOWN_LABEL_INDEX:
+                rows.append(np.full(len(_BROADCAST_LABELS), 0.2, dtype=np.float32))
+                continue
+            row = np.full(len(_BROADCAST_LABELS), 0.01, dtype=np.float32)
+            row[index] = 0.97
+            rows.append(row)
+        return np.array(rows, dtype=np.float32)
+
+
+def _label_frame(ts: float, label: str) -> np.ndarray:
+    """假帧：首像素编码标签，其余像素随 ts 变化。
+
+    必须随 ts 变化：_first_frozen_frames 会把「连续两帧几乎一样」的 combat 判成
+    技术暂停（真实交战帧不会一样），常量帧会让用例走成 broadcast_pause 而不是
+    回放转场，掩盖被测的边界语义。
+    """
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    frame[:, :, 1] = ((int(ts) * 37) % 200) + 20
+    frame[0, 0, 0] = (
+        _UNKNOWN_LABEL_INDEX
+        if label == "unknown"
+        else _BROADCAST_LABELS.index(label)
+    )
+    return frame
+
+
+def _install_label_ocr(monkeypatch, label_at, calls: list | None = None) -> None:
+    def fake_extract(*args, **kwargs):
+        start = float(kwargs["start_sec"])
+        end = float(kwargs["end_sec"])
+        if calls is not None:
+            calls.append((round(start, 3), round(end, 3)))
+        return [
+            (float(ts), _label_frame(float(ts), label_at(float(ts))))
+            for ts in np.arange(start, end + 0.01, 1.0)
+        ]
+
+    monkeypatch.setattr(ocr_rounds, "extract_frames_cancellable", fake_extract)
+    monkeypatch.setattr(ocr_rounds, "_read_top_anchors", lambda image: (None, None, None))
+
+
+def _drive_audit_to_terminal(
+    candidate: dict,
+    cache: dict,
+    *,
+    available_end: float,
+    limit: int = 30,
+    sink: list | None = None,
+) -> tuple[dict, int]:
+    """按 room_handler 的微步骤调度反复调用审计，直到候选拿到终态。
+
+    ``sink`` 传入时收集每轮的 outcome（交付态断言用）。
+    """
+    for round_index in range(1, limit + 1):
+        out = audit_broadcast_rounds(
+            [dict(candidate)],
+            "unused.mp4",
+            classifier=_LabelClassifier(),
+            available_end=available_end,
+            audit_cache=cache,
+            max_media_step_sec=18.0,
+            _outcome_sink=sink,
+        )
+        if not out:
+            # 拒绝终态只进 outcome sink、不写 output（既有契约）：据此终止。
+            if sink:
+                rejected = sink[-1]
+                if str(getattr(rejected, "status", "")) == "rejected":
+                    return dict(getattr(rejected, "candidate", None) or candidate), round_index
+            raise AssertionError("审计吞掉了候选：output 与 outcome sink 都为空")
+        item = out[0]
+        if str(item.get("broadcast_audit") or "") != "pending_lookahead":
+            return item, round_index
+    raise AssertionError(f"候选未在 {limit} 轮内定稿（回扫不收敛）")
+
+
+def _weak_end_candidate(round_key: str) -> dict:
+    return {
+        "round_key": round_key,
+        "start": 0.0,
+        "end": 120.0,
+        "start_by": "ocr_combat",
+        "end_by": "next_combat",
+        "confirm_status": "pending",
+        "source_profile": "broadcast",
+        "boundary_source": "valorant_ocr_v1",
+    }
+
+
+def test_weak_end_candidate_backward_sweeps_to_real_end(monkeypatch) -> None:
+    """弱出点 + 尾窗无排除证据 => 向前回扫后截到真实出点（而不是冻结过晚粗出点）。"""
+
+    def label_at(ts: float) -> str:
+        if ts < 60.0:
+            return "combat"      # 真实回合的交战尾段
+        if ts < 70.0:
+            return "replay"      # 赛后回放（真实出点在 60 附近）
+        return "combat"          # 下一回合满钟（OCR 误判成新回合闭合点）
+
+    calls: list = []
+    _install_label_ocr(monkeypatch, label_at, calls)
+    cache: dict = {}
+
+    item, rounds = _drive_audit_to_terminal(
+        _weak_end_candidate("round-000012"), cache, available_end=320.0,
+    )
+
+    assert item["end_by"] == "broadcast_exclusion"
+    assert item["broadcast_audit"] == "passed"
+    assert item["confirm_status"] == "vision_confirmed"
+    assert item["end_quality"] == "precise"
+    # 真实出点 60 + 结算展示尾巴(2.5s) - 边界微调(0.25s)
+    assert 58.0 <= float(item["end"]) <= 65.0, item["end"]
+    # 回扫必须真的走到尾窗左界之前，而不是停在尾窗内
+    assert float(item["broadcast_backward_swept_to"]) < 60.0
+    assert any(start < 60.0 for start, _end in calls), "必须发生尾窗之前的向前回扫"
+    assert rounds <= 20, f"回扫应在有限微步骤内收敛（实际 {rounds} 轮）"
+
+
+def test_weak_end_backward_sweep_terminates_without_exclusion(monkeypatch) -> None:
+    """回扫必须有界：整段没有排除证据时仍收敛到 pending_no_exclusion，不得无限 pending。"""
+    calls: list = []
+    _install_label_ocr(monkeypatch, lambda _ts: "combat", calls)
+    cache: dict = {}
+    candidate = _weak_end_candidate("round-000013")
+
+    item, rounds = _drive_audit_to_terminal(candidate, cache, available_end=320.0)
+
+    assert item["broadcast_audit"] == "pending_no_exclusion"
+    assert item["confirm_status"] == "pending"
+    assert item["end_by"] == "next_combat"
+    # 回扫扫到候选起点就停（有界），并把「已扫完」写进缓存，不再来一轮
+    assert cache["round-000013"]["fallback_full_scanned"] is True
+    assert float(cache["round-000013"]["backward_sweep_scanned_to"]) == 0.0
+    assert rounds <= 20, f"回扫不得无限滞留（实际 {rounds} 轮）"
+    # 定稿后必须命中缓存：重复调用不得再抽帧（否则审计预算被同一条候选吃光）
+    before = len(calls)
+    repeat = audit_broadcast_rounds(
+        [dict(candidate)],
+        "unused.mp4",
+        classifier=_LabelClassifier(),
+        available_end=320.0,
+        audit_cache=cache,
+        max_media_step_sec=18.0,
+    )
+    assert repeat[0]["broadcast_audit"] == "pending_no_exclusion"
+    assert len(calls) == before, "已定稿结论必须命中缓存，不得重新抽帧"
+
+
+# ---------------------------------------------------------------------------
+# 入点门禁：区分「有证据的否定」与「模型不确定」（P1-4，2026-09-15）
+#
+# 旧实现把两者一起判成 rejected_no_stable_combat_start（终态、人工确认也不复活），
+# 于是「交战在起点之后 15-35s 才开始」「前段画面模型读不准」的真实回合被永久丢弃。
+# 现在：窗口里有连续 >=2 帧 replay/non_game/result 才算证据（拒绝）；只有
+# unknown/buy 这类非终态标签时先把门禁窗 15s 扩到 35s 复判，仍无结论则保留候选
+# 交人工确认，绝不静默删除。
+# ---------------------------------------------------------------------------
+
+
+def test_start_gate_uncertain_head_keeps_round_for_manual_review(monkeypatch) -> None:
+    """前 30s 模型读不准（unknown）+ 出点在 60s 的真实回合：不得被门禁判死。"""
+
+    def label_at(ts: float) -> str:
+        if ts < 30.0:
+            return "unknown"     # 模型看不清（不代表不是交战）
+        if ts < 60.0:
+            return "combat"
+        if ts < 75.0:
+            return "replay"      # 赛后回放（真出点在 60 附近）
+        return "combat"
+
+    calls: list = []
+    _install_label_ocr(monkeypatch, label_at, calls)
+    cache: dict = {}
+    sink: list = []
+
+    item, rounds = _drive_audit_to_terminal(
+        _weak_end_candidate("round-000014"),
+        cache,
+        available_end=320.0,
+        sink=sink,
+    )
+
+    # 入点：不确定 = 保留 + 待复核，而不是终态拒绝
+    assert item["broadcast_start_gate"] == "inconclusive"
+    assert item["start_quality"] == "coarse"
+    assert item["start_review_required"] is True
+    assert item["confirm_status"] == "pending", "入点不确定不得自动导出"
+    # 出点仍然定稿：整条回合不因入点不确定而丢失
+    assert item["end_by"] == "broadcast_exclusion"
+    assert item["broadcast_audit"] == "passed"
+    assert item["end_quality"] == "precise"
+    assert 58.0 <= float(item["end"]) <= 65.0, item["end"]
+    # 交付态是人工复核（不是被拒绝/删除）
+    assert sink and sink[-1].status == "manual_review"
+    assert sink[-1].reason == "start_gate_inconclusive"
+    # 不确定时先扩窗复判一次：门禁窗必须真的扫到 35s
+    assert (15.0, 35.0) in calls, calls
+    assert rounds <= 25, f"门禁扩窗 + 回扫应在有限轮次内收敛（实际 {rounds} 轮）"
+
+
+def test_start_gate_extends_window_then_rejects_on_replay_evidence(monkeypatch) -> None:
+    """扩窗后拿到结构性否定证据（回放游程）时仍必须拒绝——证据与不确定分开。"""
+
+    def label_at(ts: float) -> str:
+        if ts < 20.0:
+            return "unknown"     # 前 15s 窗口只有 unknown ⇒ 先扩窗
+        if ts < 45.0:
+            return "replay"      # 扩到 35s 后看到回放游程 ⇒ 有证据的否定
+        return "combat"
+
+    calls: list = []
+    _install_label_ocr(monkeypatch, label_at, calls)
+    cache: dict = {}
+    sink: list = []
+
+    item, rounds = _drive_audit_to_terminal(
+        _weak_end_candidate("round-000015"),
+        cache,
+        available_end=320.0,
+        sink=sink,
+    )
+
+    assert item["broadcast_audit"] == "rejected_no_stable_combat_start"
+    assert item["broadcast_start_gate"] == "no_stable_combat"
+    assert item["broadcast_start_gate_detail"] == "non_combat_in_gate_window"
+    assert item.get("start_review_required") is not True or item.get("start_quality") != "precise"
+    assert sink and sink[-1].status == "rejected"
+    assert sink[-1].reason == "no_stable_combat_start"
+    assert cache["round-000015"].get("start_gate_rejected") is True
+    assert cache["round-000015"].get("start_gate_inconclusive") is not True
+    assert (15.0, 35.0) in calls, calls
+    assert rounds <= 6, f"扩窗后应立刻定稿（实际 {rounds} 轮）"
+
+
+def test_finalize_scan_without_candidates_must_not_fail(monkeypatch, tmp_path, caplog) -> None:
+    """收尾扫描窗 0 候选时不得把整窗判失败（2026-09-15 真机事故）。
+
+    现场：收尾最后一个窗口 1970.1-1978.1 的 OCR 本就 0 回合（直播沿已被前瞻
+    窗扫过），`_audit_t0` 只在 `if audit_batch:` 内赋值，却在外层无条件参与
+    耗时打点 ⇒ UnboundLocalError 被兜底 except 吞成 "scan_window failed"、
+    scan_succeeded 置 False ⇒ 上层按 `_ScanWindowRetryError` 重试 3 次后放弃
+    收尾（phase=error，17 段停在待确认），「完成后生成剪映草稿」永不触发。
+
+    空候选窗是常态（每轮扫描都可能没有新回合），必须判成功。
+    """
+    import logging as _logging
+
+    sweep_calls: list = []
+    video = _sweep_harness(
+        monkeypatch, tmp_path,
+        ocr_rounds_per_call=[[]],
+        sweep_calls=sweep_calls,
+    )
+    state = _finalize_scan_state({})
+    state["current_dur"] = 1978.1
+
+    with caplog.at_level(_logging.WARNING, logger="lsc.analyzer.valorant_plugin"):
+        result = ValorantAnalyzerPlugin().scan_window(
+            str(video),
+            ScanWindow(start_sec=1970.1, end_sec=1978.1, timeout_sec=360.0, use_ocr=True),
+            state,
+        )
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("scan_window failed" in m for m in messages), messages
+    assert state["scan_succeeded"] is True, "空候选窗也是成功扫描，不得判失败"
+    assert state["last_analyzed"] == 1978.1
+    assert result == []

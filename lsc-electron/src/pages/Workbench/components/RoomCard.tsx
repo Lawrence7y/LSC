@@ -19,7 +19,9 @@ import {
 import { RoomSession } from '@/types'
 import { VideoPreview } from '@/components/VideoPreview'
 import { formatTime } from '@/utils/time'
-import { computeExpandedPreviewWindow } from '@/utils/timelineWindow'
+import { clampSeekToRange, computeExpandedPreviewWindow } from '@/utils/timelineWindow'
+import { useAutoHideControls } from '@/hooks/useAutoHideControls'
+import { usePictureInPicture } from '@/hooks/usePictureInPicture'
 import { normalizeReplayBufferSeconds } from '@/utils/replaySettings'
 import { isNoDvrPreviewMode } from '@/utils/timelineCoords'
 import { readPlayhead, retainClockLoop, subscribeClock } from '@/utils/playheadStore'
@@ -55,6 +57,28 @@ function readMseBuffered(video: HTMLVideoElement | undefined | null): { start: n
   }
   return { start: 0, end: 0 }
 }
+
+/**
+ * 「窗口播放」图标：外框 + 右下角实心小窗（业界通用的画中画语汇）。
+ *
+ * 刻意不用 ShrinkOutlined（向内收拢的箭头，已被「缩小回网格」占用），也不用
+ * FullscreenOutlined（向外发散的箭头）：那两者都在讲“画面占多大”，而这里讲的是
+ * “画面被放进一个小窗口继续播”——用户第一眼就该看出区别。
+ */
+function PiPWindowGlyph() {
+  return (
+    <svg className="room-card__pip-glyph" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <rect x="1.1" y="2.5" width="13.8" height="11" rx="2.4" fill="none" stroke="currentColor" strokeWidth="1.4" />
+      <rect x="7.2" y="8.2" width="6.4" height="4.3" rx="1.1" fill="currentColor" />
+    </svg>
+  )
+}
+
+/**
+ * 放大态控制条（时间线 + 按键一体化）的空闲自动隐藏时长（ms）。
+ * 鼠标在预览区静止这么久后，控制条向下滑出画面；再次移动/经过即滑出展示。
+ */
+const EXPANDED_CONTROLS_IDLE_MS = 2500
 
 function expandedWindowFromVideo(opts: {
   liveDvr: boolean
@@ -243,8 +267,8 @@ export const RoomCard = memo(function RoomCard({
 }: RoomCardProps) {
   const tick = recordingTick
   const { t } = useI18n()
-  // context 版 modal：静态 Modal.confirm 在 antd v5 下不跟随 ConfigProvider 主题
-  const { modal } = App.useApp()
+  // context 版 modal/message：静态调用在 antd v5 下不跟随 ConfigProvider 主题
+  const { modal, message } = App.useApp()
   const [disconnecting, setDisconnecting] = useState(false)
   const [localMuted, setLocalMuted] = useState(room.preview_muted)
   const [localVolume, setLocalVolume] = useState(1.0)
@@ -252,6 +276,9 @@ export const RoomCard = memo(function RoomCard({
   const [isBrowserFullscreen, setIsBrowserFullscreen] = useState(false)
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isExpanded = expandedRoomId === room.room_id
+  // 放大态控制条（时间线 + 按键）交互标志：拖动中 / 画质下拉打开时钉住，不被空闲计时收起
+  const [expandedControlsDragging, setExpandedControlsDragging] = useState(false)
+  const [qualityOpen, setQualityOpen] = useState(false)
 
   // 同步后端广播的实际静音状态（覆盖乐观更新）
   useEffect(() => {
@@ -360,7 +387,6 @@ export const RoomCard = memo(function RoomCard({
   const expTimelineEnd = expandedWindow.end
   const expTimelineSpan = Math.max(1e-6, expTimelineEnd - expTimelineStart)
   const replayBoundary = expandedWindow.purple
-  const replayBoundaryPct = 0
   const expProgressPct = expandedWindow.playheadPct
   const progressFillLeftPct = expandedWindow.fillLeftPct
   const progressFillWidthPct = expandedWindow.fillWidthPct
@@ -401,6 +427,48 @@ export const RoomCard = memo(function RoomCard({
     }
   }, [isExpanded, room.room_id, isLivePreview, isRecordingReview, reviewStartSec, supportsLiveDvr, replayBufferSeconds, previewDuration, room.mark_in, room.mark_out, followLive])
 
+  /**
+   * 放大态控制条（时间线 + 按键一体化）显隐：鼠标在预览区经过/移动 → 滑出展示；
+   * 静止 `EXPANDED_CONTROLS_IDLE_MS` → 自动向下隐藏（放大后默认隐藏，画面不被压住）。
+   * 拖动时间线与画质下拉打开期间钉住；键盘焦点在条内时由 CSS `:focus-within` 兜底。
+   */
+  const {
+    visible: expandedControlsVisible,
+    reveal: revealExpandedControls,
+    hide: hideExpandedControls,
+  } = useAutoHideControls({
+    enabled: isExpanded,
+    idleMs: EXPANDED_CONTROLS_IDLE_MS,
+    pinned: expandedControlsDragging || (qualityOpen && isExpanded),
+  })
+
+  /**
+   * 「缩小为窗口播放」= 原生画中画（见 usePictureInPicture）。
+   * 取的是**当前通道**的 video：回看模式下 registry.player 指向回看播放器，
+   * 小窗自然跟随用户正在看的那一路，而不是永远抓直播流。
+   */
+  const {
+    supported: pipSupported,
+    active: pipActive,
+    toggle: togglePip,
+  } = usePictureInPicture(
+    () => window.__msePlayers?.[room.room_id]?.player?.videoElement ?? null,
+  )
+
+  /**
+   * 切换窗口播放：进入成功后**顺带收起区域放大**——同一路画面不该在卡片与小窗里各播一份，
+   * 这正是「缩小为窗口播放」的完整语义（一次点击 = 缩小 + 窗口播放）；退出小窗只退小窗。
+   */
+  const handleTogglePip = async () => {
+    const wasActive = pipActive
+    const ok = await togglePip()
+    if (!ok) {
+      message.warning(t('无法进入窗口播放，请确认预览已出画后重试'))
+      return
+    }
+    if (!wasActive) onCollapse?.(room.room_id)
+  }
+
   const seekExpandedTimeline = (
     clientX: number,
     track: HTMLElement,
@@ -431,7 +499,9 @@ export const RoomCard = memo(function RoomCard({
         target = win.purple
       }
     }
-    onSeekTo(room.room_id, target)
+    // 落点必须收进可立即回放的范围（含边界安全边距）：贴边 seek 会被 mseSeek
+    // 判成“缓冲外”，从而切到重量级的本地文件回看通道。
+    onSeekTo(room.room_id, clampSeekToRange(target, win.start, win.end))
   }
   const overlayBtnStyle: React.CSSProperties = {
     color: 'var(--overlay-text, #f5f5f7)',
@@ -450,6 +520,11 @@ export const RoomCard = memo(function RoomCard({
       }}
       onClick={(e) => e.stopPropagation()}
       getPopupContainer={() => document.body}
+      // 下拉挂在 body 上，指针离开卡片会触发控制条自动隐藏：打开期间钉住，关闭后重新展示
+      onOpenChange={(open) => {
+        setQualityOpen(open)
+        if (!open) revealExpandedControls()
+      }}
       style={{ width: 88, fontSize: 11 }}
       options={[
         { value: '原画', label: t('原画') },
@@ -552,11 +627,49 @@ export const RoomCard = memo(function RoomCard({
       />
     </Tooltip>
   )
+  /**
+   * 「缩小为窗口播放」（原生画中画）。
+   *
+   * 与「缩小回网格」同为“离开放大态”的出口，但结果不同：这个把画面放进悬浮小窗继续看。
+   * 设计语言与其他玻璃按钮一致（同为 small / 圆角 / 毛玻璃），差异靠三处一眼可辨：
+   * ① 图标是“外框 + 右下角实心小窗”的画中画语汇；② 带文字标签「窗口播放」；
+   * ③ 品牌青描边 + 淡青底，激活后整块变品牌色（与灰色玻璃图标按钮形成对比）。
+   */
+  const pipBtn = (
+    <Tooltip
+      title={
+        !pipSupported
+          ? t('当前环境不支持窗口播放（画中画）')
+          : pipActive
+            ? t('退出窗口播放，回到卡片预览')
+            : t('缩小为窗口播放（画中画）：在悬浮小窗里继续看，腾出工作台')
+      }
+    >
+      <Button
+        type="text"
+        size="small"
+        disabled={!pipSupported}
+        className={`room-card__pip-btn${pipActive ? ' room-card__pip-btn--active' : ''}`}
+        onClick={(e) => {
+          e.stopPropagation()
+          void handleTogglePip()
+        }}
+      >
+        <PiPWindowGlyph />
+        <span>{t('窗口播放')}</span>
+      </Button>
+    </Tooltip>
+  )
 
   return (
     <Card
       hoverable
       onClick={(e) => onSelect(room.room_id, e)}
+      // 控制条显隐的信号源必须覆盖「预览画面 + 控制条」两者（挂在公共祖先上）：
+      // 挂在预览容器上时，指针从画面移向控制条会先触发 pointerleave 而把条藏掉。
+      onPointerEnter={revealExpandedControls}
+      onPointerMove={revealExpandedControls}
+      onPointerLeave={hideExpandedControls}
       className={`room-card${isExpanded ? ' room-card--expanded' : ''}${room.is_recording ? ' room-card--recording' : ''}${selected ? ' room-card--selected' : ''}${multiSelected ? ' room-card--multiselected' : ''}${isLive ? ' room-card--live' : ''}`}
       style={{
         background: selected ? 'var(--surface-2)' : 'var(--surface-1)',
@@ -840,20 +953,11 @@ export const RoomCard = memo(function RoomCard({
             {/* 底部控制区：普通态单行；放大态 = 动态进度条 + 播放控制行（原有按键全部保留、不被遮挡） */}
             {isExpanded ? (
               <div
-                className="room-card__expanded-controls"
-                style={{ position: 'absolute', bottom: 0, left: 0, right: 0, display: 'flex', flexDirection: 'column', background: 'linear-gradient(transparent, rgba(0,0,0,0.78))', zIndex: 9 }}
+                className={
+                  'room-card__expanded-controls'
+                  + (expandedControlsVisible ? ' room-card__expanded-controls--shown' : '')
+                }
               >
-                {hasLiveDvrRange && (
-                  <div
-                    className="room-card__expanded-replay-info"
-                    title={t('左侧时间是绝对时间点；设置回看是时长；早于 MSE 缓冲的部分会切换到录制文件回看')}
-                  >
-                    {t('回看设置 {configured} · 时间线范围 {available}', {
-                      configured: formatTime(expandedWindow.configuredReplaySeconds),
-                      available: formatTime(expandedWindow.availableReplaySeconds),
-                    })}
-                  </div>
-                )}
                 <div className="room-card__expanded-timeline">
                   <span ref={expStartLabelRef} className="room-card__expanded-time">{formatTime(expTimelineStart)}</span>
                   <div
@@ -866,6 +970,8 @@ export const RoomCard = memo(function RoomCard({
                     className="room-card__expanded-track"
                     onPointerDown={(e) => {
                       e.stopPropagation()
+                      // 拖动期间钉住控制条：指针被捕获后可能滑出卡片，不能让条在拖动中消失
+                      setExpandedControlsDragging(true)
                       e.currentTarget.setPointerCapture(e.pointerId)
                       const video = window.__msePlayers?.[room.room_id]?.player?.videoElement
                       const pos = video && Number.isFinite(video.currentTime)
@@ -892,12 +998,14 @@ export const RoomCard = memo(function RoomCard({
                       e.stopPropagation()
                       seekExpandedTimeline(e.clientX, e.currentTarget, expandedDragWindowRef.current)
                       expandedDragWindowRef.current = null
+                      setExpandedControlsDragging(false)
                       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
                         e.currentTarget.releasePointerCapture(e.pointerId)
                       }
                     }}
                     onPointerCancel={(e) => {
                       expandedDragWindowRef.current = null
+                      setExpandedControlsDragging(false)
                       if (e.currentTarget.hasPointerCapture(e.pointerId)) {
                         e.currentTarget.releasePointerCapture(e.pointerId)
                       }
@@ -907,25 +1015,19 @@ export const RoomCard = memo(function RoomCard({
                       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
                         e.preventDefault()
                         e.stopPropagation()
-                        onSeekTo(room.room_id, Math.max(replayBoundary, Math.min(
-                          expTimelineEnd,
+                        onSeekTo(room.room_id, clampSeekToRange(
                           previewPos + (e.key === 'ArrowLeft' ? -10 : 10),
-                        )))
+                          expTimelineStart,
+                          expTimelineEnd,
+                        ))
                       }
                     }}
                   >
                     {hasLiveDvrRange && (
-                      <>
-                        <span
-                          className="room-card__expanded-unavailable"
-                          style={{ width: `${replayBoundaryPct}%` }}
-                        />
-                        <span
-                          className="room-card__expanded-replay-boundary"
-                          style={{ left: `${replayBoundaryPct}%` }}
-                          title={t('DVR 回看窗口左边界 {time}：早于直播缓冲的区域将切换录制文件，边界按安全边距起播，右侧可直接回看', { time: formatTime(replayBoundary) })}
-                        />
-                      </>
+                      <span
+                        className="room-card__expanded-replay-boundary"
+                        title={t('可立即回放起点 {time}：这里是 MSE 缓冲最早的位置，右侧可直接回放', { time: formatTime(replayBoundary) })}
+                      />
                     )}
                     {/* 主时间线位置指示器（P3: 预览时间线与主时间线同步滚动） */}
                     {isCommonMode && mainWindowStart != null && (() => {
@@ -975,7 +1077,7 @@ export const RoomCard = memo(function RoomCard({
                     {formatTime(expTimelineEnd)}
                   </span>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 8px 6px' }}>
+                <div className="room-card__expanded-actions">
                   <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
                     <Tooltip title={isPreviewPlaying ? t('暂停') : t('播放')}>
                       <Button type="text" size="small" icon={isPreviewPlaying ? <PauseCircleOutlined /> : <PlayCircleOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onPlayPause?.() }} />
@@ -990,9 +1092,12 @@ export const RoomCard = memo(function RoomCard({
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                     {muteBtn}
-                    <Tooltip title={t('缩小（窗口播放）')}>
+                    {/* 缩小回网格 → 缩小为窗口播放 → 全屏：三个“画面在哪看”的出口紧挨着，
+                        窗口播放用画中画图标 + 文字标签 + 品牌青描边，一眼与其它两个箭头图标区分。 */}
+                    <Tooltip title={t('缩小（回到网格，不改变播放）')}>
                       <Button type="text" size="small" icon={<ShrinkOutlined />} style={overlayBtnStyle} onClick={(e) => { e.stopPropagation(); onCollapse?.(room.room_id) }} />
                     </Tooltip>
+                    {pipBtn}
                     <Tooltip title={isBrowserFullscreen ? t('退出全屏') : t('全屏放大')}>
                       <Button
                         type="text"

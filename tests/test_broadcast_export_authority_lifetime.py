@@ -135,6 +135,131 @@ def test_no_exclusion_evidence_reason_code():
     ) == "NO_EXCLUSION_EVIDENCE"
 
 
+def test_superseded_split_fragment_has_its_own_reason_code():
+    """2026-09-14 现场：超长分裂碎片被并入兄弟后，原因必须是"已被接管"，
+    而不是"出点证据不足"——后者会让人去修一个不存在的 bug。
+
+    不传 sibling_lookup 也成立（合并标记随切片透传），保持纯函数语义。
+    """
+    clip = {
+        "round_key": "round-000070-s0",
+        "confirm_status": "pending",
+        "broadcast_audit": "pending_no_exclusion",
+        "end_by": "next_combat",
+        "superseded_by_round_key": "round-000070-s1",
+    }
+    assert jianying_handlers._skip_reason_code(clip, "blocked_by_gate") == (
+        "SUPERSEDED_BY_SPLIT_MERGE"
+    )
+
+
+def test_sibling_owns_round_reason_code():
+    """同族兄弟已用权威出点定稿 ⇒ 本碎片是回合外的残余，原因可辨（仍不导出）。"""
+    tail = {"round_key": "round-000044-s0", "broadcast_audit": "passed",
+            "end_by": "broadcast_exclusion", "end_quality": "precise"}
+
+    def lookup(key):
+        return tail if key == "round-000044-s0" else None
+
+    clip = {
+        "round_key": "round-000044-s1",
+        "confirm_status": "pending",
+        "broadcast_audit": "pending_no_exclusion",
+        "end_by": "next_combat",
+    }
+    assert jianying_handlers._skip_reason_code(
+        clip, "blocked_by_gate", sibling_lookup=lookup
+    ) == "SIBLING_OWNS_ROUND"
+    # 不传 lookup ⇒ 保持原判据（不引入新的放行/归类副作用）
+    assert jianying_handlers._skip_reason_code(clip, "blocked_by_gate") == (
+        "NO_EXCLUSION_EVIDENCE"
+    )
+
+
+def test_sibling_owns_round_needs_authoritative_sibling():
+    """兄弟没定稿 / 出点非法 / 查不到 ⇒ 不得套用 SIBLING_OWNS_ROUND（防误判）。"""
+    clip = {
+        "round_key": "round-000044-s1",
+        "confirm_status": "pending",
+        "broadcast_audit": "pending_no_exclusion",
+    }
+    for sibling in (
+        None,
+        {"broadcast_audit": "pending_no_exclusion", "end_by": "broadcast_exclusion"},
+        {"broadcast_audit": "passed", "end_by": "next_combat"},
+        {"broadcast_audit": "passed"},
+    ):
+        assert jianying_handlers._skip_reason_code(
+            clip, "blocked_by_gate", sibling_lookup=lambda _k, s=sibling: s
+        ) == "NO_EXCLUSION_EVIDENCE"
+
+    def boom(_key):
+        raise RuntimeError("authority unavailable")
+
+    assert jianying_handlers._skip_reason_code(
+        clip, "blocked_by_gate", sibling_lookup=boom
+    ) == "NO_EXCLUSION_EVIDENCE"
+    # 非分裂切片不参与家族解释
+    assert jianying_handlers._skip_reason_code(
+        {**clip, "round_key": "round-000044"}, "blocked_by_gate",
+        sibling_lookup=lambda _k: {"broadcast_audit": "passed", "end_by": "broadcast_exclusion"},
+    ) == "NO_EXCLUSION_EVIDENCE"
+
+
+def test_sibling_lookup_falls_back_to_parent_key():
+    """2026-09-14 真实会话回归：真实回合是用**父键**定稿的（round-000071
+    711.0-802.2 vision_confirmed），分裂碎片 s0 只是它的早期投影；残余碎片
+    round-000071-s1(862.0-874.3) 必须报"兄弟已覆盖回合"，而不是 NEVER_AUDITED。"""
+    parent = {"round_key": "round-000071", "broadcast_audit": "passed",
+              "end_by": "broadcast_exclusion", "end_quality": "precise"}
+    lookup = lambda key: parent if key == "round-000071" else None
+    clip = {"round_key": "round-000071-s1", "confirm_status": "pending",
+            "broadcast_audit": "pending_lookahead", "end_by": "next_prep"}
+    assert jianying_handlers._skip_reason_code(
+        clip, "blocked_by_gate", sibling_lookup=lookup
+    ) == "SIBLING_OWNS_ROUND"
+    # 不带 lookup 时仍是原码（纯函数语义不变）
+    assert jianying_handlers._skip_reason_code(clip, "blocked_by_gate") == "NEVER_AUDITED"
+
+    # -s0 碎片同理（父键已定稿 ⇒ 该碎片是同回合的早期投影）
+    s0 = {"round_key": "round-000071-s0", "confirm_status": "pending",
+          "broadcast_audit": "pending_no_exclusion"}
+    assert jianying_handlers._skip_reason_code(
+        s0, "blocked_by_gate", sibling_lookup=lookup
+    ) == "SIBLING_OWNS_ROUND"
+
+
+def test_sibling_does_not_override_rejection():
+    """被拒就是被拒：不得被"兄弟已覆盖"文案盖掉。"""
+    clip = {
+        "round_key": "round-000044-s1",
+        "confirm_status": "rejected",
+        "broadcast_audit": "rejected_no_stable_combat",
+    }
+    assert jianying_handlers._skip_reason_code(
+        clip, "blocked_by_gate",
+        sibling_lookup=lambda _k: {"broadcast_audit": "passed", "end_by": "broadcast_exclusion"},
+    ) == "REJECTED"
+
+
+def test_split_family_key_parsing_matches_analyzer():
+    """解析规则必须与分析器同源（合并侧与解释侧不能各写一套）。"""
+    from lsc.analyzer.valorant_broadcast import _split_family_base_key as analyzer_base
+
+    for key, expected in (
+        ("round-000070-s1", "round-000070"),
+        ("round-000070-s0", "round-000070"),
+        ("round-000070-s12", "round-000070"),
+        ("round-000070", ""),
+        ("", ""),
+        ("round-000070-sx", ""),
+    ):
+        assert jianying_handlers._split_family_base_key(key) == expected
+        assert jianying_handlers._split_family_base_key(key) == analyzer_base(key)
+    assert jianying_handlers._split_fragment_index("round-000070-s12") == 12
+    assert jianying_handlers._split_fragment_index("round-000070") is None
+
+
 def test_rejected_round_stays_rejected():
     assert jianying_handlers._skip_reason_code(
         {"confirm_status": "pending", "broadcast_audit": "rejected_no_stable_combat_start"},

@@ -139,9 +139,16 @@ def test_gap_sweep_is_wired_into_finalize_scan() -> None:
     assert "is_final_scan" in window
     after = src[sweep_at: audit_at]
     assert "merged_candidates" in after and "sorted_candidates" in after
-    # 每个收尾任务只补扫一次（否则每轮重扫全片，挤爆审计预算）
-    assert 'state.get("gap_sweep_done")' in src
-    assert 'state["gap_sweep_done"] = True' in src
+    # 每个收尾任务只补扫一次（否则每轮重扫全片，挤爆审计预算）。
+    # 2026-09-14 修正：标记必须写 runtime_state 才跨调用存活——外层 state 是
+    # room_handler 每轮 `_do_scan` 新建的局部 dict，写它等于没写
+    # （本轮真实会话收尾 4 轮各补扫一次，正是这句老断言把 bug 钉成了契约）。
+    assert "_GAP_SWEEP_DONE_KEY" in src
+    assert "runtime_state.get(_GAP_SWEEP_DONE_KEY)" in src
+    assert "runtime_state[_GAP_SWEEP_DONE_KEY] = True" in src
+    # 已定稿真实回合的跨度必须参与「已覆盖」判定，否则同一回合被重复合成。
+    # 台账读自**共享 audit_cache**（两条审计路径同一份），插件侧只读不写。
+    assert "_finalized_span_items(audit_cache)" in src
 
 
 def test_sweep_candidates_are_listable_and_still_gated() -> None:

@@ -15,6 +15,7 @@ from lsc.core.services.timeline_service import get_timeline_service
 from lsc.exporter.jianying_draft import (
     ClipDraftSource,
     RoomDraftSource,
+    _BROADCAST_VALID_END_BY,
     build_session_draft,
     clip_allowed_for_draft,
     detect_jianying_draft_dir,
@@ -225,14 +226,88 @@ SKIP_REASON_INTERIOR_BOUNDARY = "INTERIOR_BOUNDARY"
 SKIP_REASON_DUPLICATE_ROUND = "DUPLICATE_ROUND"
 SKIP_REASON_MAPPING_FAILED = "MAPPING_FAILED"
 SKIP_REASON_NO_RECORDING = "NO_RECORDING"
+# 超长分裂碎片的两条专用码。现场（2026-09-14）：044-s1 / 070-s0 被报成
+# NO_EXCLUSION_EVIDENCE，读起来像"审计没找到出点=逻辑缺口"，实际是同族的真实回合
+# 已由兄弟碎片导出（044-s0 出点 557.25 / 070-s1 出点 930.75）。诊断文案盖掉真相，
+# 会让人去修一个不存在的 bug（本次排查就差点如此），故单列。
+SKIP_REASON_SIBLING_OWNS_ROUND = "SIBLING_OWNS_ROUND"
+SKIP_REASON_SUPERSEDED_BY_SPLIT_MERGE = "SUPERSEDED_BY_SPLIT_MERGE"
 
 
-def _skip_reason_code(clip: dict[str, Any], reason: str = "") -> str:
+def _split_family_base_key(round_key: object) -> str:
+    """``round-000070-s1`` → ``round-000070``；非分裂子块返回空串。
+
+    与 `lsc.analyzer.valorant_broadcast._split_family_base_key` 用**同一实现**
+    （那边负责合并，这边只用于解释跳过原因），避免两处解析规则漂移。
+    """
+    try:
+        from lsc.analyzer.valorant_broadcast import (
+            _split_family_base_key as _analyzer_split_base_key,
+        )
+    except Exception:  # pragma: no cover - 分析器不可用时退化为不做家族解释
+        return ""
+    return _analyzer_split_base_key(round_key)
+
+
+def _split_fragment_index(round_key: object) -> int | None:
+    """``round-000070-s1`` → 1；非分裂子块返回 None。"""
+    key = str(round_key or "").strip()
+    base, sep, suffix = key.rpartition("-s")
+    if not sep or not suffix.isdigit() or not base:
+        return None
+    return int(suffix)
+
+
+def _sibling_owns_round(
+    clip: dict[str, Any],
+    lookup: Callable[[str], dict[str, Any] | None] | None,
+) -> dict[str, Any] | None:
+    """本碎片是否为「同族真实回合已由兄弟碎片覆盖」的残余（返回那个兄弟）。
+
+    只用于**解释**跳过原因，不参与任何放行判据：仍然跳过，只是原因可辨。
+    """
+    if lookup is None:
+        return None
+    index = _split_fragment_index(clip.get("round_key"))
+    base = _split_family_base_key(clip.get("round_key"))
+    if index is None or not base:
+        return None
+    # 邻居含**父键本身**：2026-09-14 真实会话实测，同族的真实回合常常是用父键
+    # （`round-000071`，711.0-802.2 vision_confirmed）定稿的，分裂碎片 s0 只是它的
+    # 早期投影；只看 `-s{N±1}` 会漏掉父键，把残余碎片报成 NEVER_AUDITED。
+    neighbour_keys = [f"{base}-s{index + 1}", base]
+    if index > 0:
+        neighbour_keys.insert(0, f"{base}-s{index - 1}")
+    for neighbour_key in neighbour_keys:
+        try:
+            sibling = lookup(neighbour_key)
+        except Exception:  # pragma: no cover - 解释性查询不得影响门禁
+            return None
+        if not isinstance(sibling, dict):
+            continue
+        if str(sibling.get("broadcast_audit") or "").strip().lower() != "passed":
+            continue
+        if str(sibling.get("end_by") or "").strip().lower() not in _BROADCAST_VALID_END_BY:
+            continue
+        return sibling
+    return None
+
+
+def _skip_reason_code(
+    clip: dict[str, Any],
+    reason: str = "",
+    *,
+    sibling_lookup: Callable[[str], dict[str, Any] | None] | None = None,
+) -> str:
     """把「被跳过」归一成结构化原因码。
 
     现场（2026-09-11 20:45）：5 条跳过共用一句「未确认/近似定位/未通过赛事审计」，
     无法分辨是"从未审计""审计跑完但无排除证据""审计过了但出点没定稿"还是"不在权威集合"。
     判定顺序与 `_broadcast_gate_passed` 一致，最后一项兜底为出点未定稿。
+
+    ``sibling_lookup``：可选的后端权威查询（round_key → listed 条目）。传了才能识别
+    「同族兄弟已覆盖该回合」这一类（见 SKIP_REASON_SIBLING_OWNS_ROUND）；不传则本
+    函数保持纯函数语义，既有调用方与测试不受影响。
     """
     audit = str(clip.get("broadcast_audit") or "").strip().lower()
     status = str(clip.get("confirm_status") or "").strip().lower()
@@ -255,6 +330,12 @@ def _skip_reason_code(clip: dict[str, Any], reason: str = "") -> str:
         return SKIP_REASON_MAPPING_FAILED
     if "录制文件" in text:
         return SKIP_REASON_NO_RECORDING
+    # 分裂族解释：本碎片已把起点/内容并入兄弟（合并标记），或兄弟已拥有该回合的权威
+    # 出点。两者都比"出点证据不足"更贴近真相，故排在 NO_EXCLUSION_EVIDENCE 之前。
+    if str(clip.get("superseded_by_round_key") or ""):
+        return SKIP_REASON_SUPERSEDED_BY_SPLIT_MERGE
+    if _sibling_owns_round(clip, sibling_lookup) is not None:
+        return SKIP_REASON_SIBLING_OWNS_ROUND
     if audit == "pending_no_exclusion":
         return SKIP_REASON_NO_EXCLUSION_EVIDENCE
     if audit == "pending_lookahead" or not audit:
@@ -318,6 +399,11 @@ _AUTHORITATIVE_AUDIT_FIELDS = (
     "broadcast_model_version",
     "broadcast_model_provider",
     "model_version",
+    # 分裂族合并来源：由后端权威给出（前端不得伪造），导出侧据此解释跨度与原因码。
+    "split_merged",
+    "split_merged_from",
+    "split_merged_original_start",
+    "superseded_by_round_key",
 )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -21,11 +22,131 @@ STEADY_LOOKBACK_SEC = 8.0
 MAX_CATCHUP_SEC = 90.0
 # 自适应追赶下限：45s ≈ lookback+一回合量级
 MIN_CATCHUP_SEC = 45.0
+# ------------------------------------------------------------------ 直播沿优先（P1-5）
+# 为什么需要：中途开分析时游标从 0 起爬（首窗强制 [0, MIN_CATCHUP]），而增量窗上限
+# 只有 MAX_CATCHUP_SEC=90s/窗、单窗墙钟常 > 窗口媒体（实测 OCR 0.78x 实时）⇒ 净推进
+# 可能为负，backlog 单调增长。结果是最新回合要等整段历史爬完才出现（一小时录像要等
+# 一小时以上），用户视角就是「现在的回合一直不来」。
+# 策略：只要「已覆盖到的最右端」落后文件尾超过 LIVE_FIRST_MAX_TAIL_LAG_SEC，就把这一窗
+# 让给直播沿窗口 [dur - catchup_cap, dur]（记进 coverage 账本），否则继续按游标回填。
+# 两个方向都有界，且不牺牲完整性：
+#   * 直播沿滞后 <= 阈值 + 一个窗；
+#   * 中间缺口不属于「已覆盖」，收尾由 uncovered_ranges_for_state 逐片补扫（既有机制），
+#     运行期也会在直播沿已新鲜的周期继续回填。
+# 首窗（last<=0）不插队：先给一段文件头基线，再由本策略接管（既有首窗守卫测试固化）。
+# 切换窗口时 room_handler 必须重置 OCR 跨窗状态（FSM/锚点/last_processed_ts），
+# 非连续窗口的相位连续性是无效的，且 last_processed_ts 只增不减会把回填窗整段过滤掉。
+LIVE_FIRST_MAX_TAIL_LAG_SEC = 240.0
 
 
 # 赛事审计缓存每房间上限：被拒回合不清采样列表（跨窗口复用语义），
 # 长播按回合累积；此上限只限制内存占用，不改变单回合判定结果
 _BROADCAST_AUDIT_CACHE_MAX = 64
+
+# 审计被「取消」时的候选重试上限。取消（扫描超时 / 录制 epoch 切换 / 停止抢占）
+# 不是结构性无解：审计根本没跑完，文件还在，下一轮理应能接着跑。旧实现在异常分支
+# 把整批候选盖成 ``broadcast_audit="skipped"``，而回写待审队列的条件只认
+# ``pending_lookahead`` ⇒ 候选被**静默丢出队列**，此后既不会再审、也没有终态，
+# 收尾只剩"listed 无终态"空转，最终落 manual_review / 导出侧报 NEVER_AUDITED。
+# 现场：2026-09-14 10:34:44（360s 扫描超时取消）→ round-000097 永久滞留。
+# 有界重试：真·无解（例如模型不可用）也不能无限重排，超过上限即按"跳过"落终态，
+# 交给收尾兜底与导出门禁判据，而不是无限占用审计槽位。
+_BROADCAST_AUDIT_CANCEL_RETRY_MAX = 3
+_BROADCAST_AUDIT_CANCEL_RETRY_FIELD = "broadcast_audit_cancel_retries"
+
+# 扫描窗口内**同步** broadcast 审计的单步媒体预算（与 room_handler 后台步
+# `_BCAST_REFINE_STEP_MEDIA_SEC=18` 同量级）。
+#
+# 为什么必须限步（2026-09-14 现场实测）：收尾阶段 `deferred_audit=not finalizing`
+# 为 False ⇒ scan_window 会在**同一个被超时包裹的调用里**先 OCR、再同步跑完
+# broadcast 审计。实测（真实录像、无争抢）该窗口 OCR 只需要 51.8s（66.2s 媒体，
+# 0.78x 实时），但现场同窗口烧满了 360s 扫描超时被中止——预算是需求的 7 倍，
+# 说明问题不是"预算太小"，而是审计与扫描共用 ONNX/DirectML 锁互相饿死。
+# 限步后单轮审计工作量有界，扫描超时留有充足余量，不再出现"窗口超时 →
+# 正在跑的审计被取消 → 候选滞留"这条链（round-000097 就是这么丢的）。
+_BROADCAST_INLINE_AUDIT_STEP_MEDIA_SEC = 18.0
+# 分段耗时打点阈值：扫描耗时超过窗口超时预算的这个比例就打一条 WARNING，
+# 把 [OCR / 审计] 两段墙钟拆开，避免下次只能靠猜（本次排查就缺这个数据）。
+_SCAN_SLOW_LOG_RATIO = 0.6
+
+# ---------------------------------------------------------------- 缺口补扫口径
+# 收尾缺口补扫（sweep_gap_rounds）的输入只该包含「未定稿候选 + 已定稿真实回合覆盖
+# 的区间」，否则会把已有人管的区间当成"无候选区间"再合成一次。现场（2026-09-14）：
+#   * round-000015-s0（154.1-246.7）11:43 定稿、round-000071-s0（712.2-802.2）11:52
+#     定稿（**后台审计路径**，正常阶段 deferred_audit=True 时插件不审计）；
+#   * 11:54:33 补扫仍把 153.0-257.0 / 711.0-813.0 判为无候选并合成新候选，最终以
+#     **父键** round-000015 / round-000071 定稿 ⇒ 同一真实回合两条重叠条目。
+#   导出侧靠重叠去重兜住（R12/R13 → OVERLAP_DEDUP），但 requested 计数虚高、白跑
+#   两次完整审计，且让收尾每轮都有"新进展"从而必然撞满补扫轮次上限。
+# 已定稿跨度台账放在 **audit_cache**——两条审计路径共享同一份
+# （`_rs_state['broadcast_audit_cache']`），只有写在那里补扫才看得见另一条路径的结论；
+# 写入点在 `valorant_broadcast.audit_broadcast_rounds` 出口，插件只负责读。
+#
+# 收尾补扫只跑一次的标记必须放 runtime_state（跨调用存活）：旧实现写在每次
+# `_do_scan` 新建的局部 state 上 ⇒ 标记每次都丢，收尾每轮重扫全片（本轮实测 4 次）。
+_GAP_SWEEP_DONE_KEY = "gap_sweep_done"
+
+
+def _finalized_span_items(audit_cache: Any) -> list[dict[str, Any]]:
+    """已定稿真实回合的跨度，转成 sweep 能吃的 {start,end} 形式（只读这两个字段）。"""
+    try:
+        from lsc.analyzer.valorant_broadcast import finalized_spans
+    except Exception:  # pragma: no cover - 分析器不可用时退化为旧行为（不排除）
+        return []
+    return [{"start": span[0], "end": span[1]} for span in finalized_spans(audit_cache)]
+
+
+def _is_audit_cancellation(error: object) -> bool:
+    """审计异常是否为「取消/中止」（可重试）而非「审计不可用」（重试无意义）。"""
+    name = type(error).__name__.lower()
+    if "cancel" in name:
+        return True
+    text = str(error or "").lower()
+    return any(
+        token in text
+        for token in ("cancelled", "canceled", "取消", "中断", "中止", "timeout", "超时")
+    )
+
+
+def _preserve_audit_retry_state(previous: Any, current: dict[str, Any]) -> None:
+    """同 key 候选合并时保留「审计取消重试计数」。
+
+    合并语义是"后写入者胜"（``merged_candidates[key] = c``，rounds 覆盖 pending）。
+    OCR 若在后续窗口重新产出同一回合（lookback 重叠 / 重连重扫），新候选会盖掉
+    待审队列里的旧条目；丢掉计数就等于取消重试没有上界，可以无限空转占审计槽位。
+    """
+    if not isinstance(previous, dict):
+        return
+    used = previous.get(_BROADCAST_AUDIT_CANCEL_RETRY_FIELD)
+    if used is None or current.get(_BROADCAST_AUDIT_CANCEL_RETRY_FIELD) is not None:
+        return
+    current[_BROADCAST_AUDIT_CANCEL_RETRY_FIELD] = used
+
+
+def _cancel_retry_candidates(
+    marked: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """从"审计被取消"的批次里挑出应下一轮续审的候选（返回 (重试项, 超限数)）。
+
+    幂等：只递增自身计数器，不改动 ``broadcast_audit``——列表里仍显示"未审计"，
+    与真实的 pending 语义一致（前端不该看到"已审计"）。
+    """
+    retry: list[dict[str, Any]] = []
+    exhausted = 0
+    for item in marked:
+        if not isinstance(item, dict):
+            continue
+        try:
+            used = int(item.get(_BROADCAST_AUDIT_CANCEL_RETRY_FIELD) or 0)
+        except (TypeError, ValueError):
+            used = 0
+        if used >= _BROADCAST_AUDIT_CANCEL_RETRY_MAX:
+            exhausted += 1
+            continue
+        candidate = dict(item)
+        candidate[_BROADCAST_AUDIT_CANCEL_RETRY_FIELD] = used + 1
+        retry.append(candidate)
+    return retry, exhausted
 
 
 def _cap_broadcast_audit_cache(audit_cache: dict[str, Any]) -> None:
@@ -179,6 +300,47 @@ def decide_backlog_policy(
     return mode, policy
 
 
+def live_first_scan_window(
+    *,
+    last_analyzed: float,
+    current_dur: float,
+    tail_lag_sec: float | None,
+    catchup_cap: float,
+    lookback_sec: float,
+) -> tuple[float, float] | None:
+    """直播沿优先窗口：返回 None 表示走常规增量（沿游标回填缺口）。
+
+    ``tail_lag_sec`` = 文件尾 - 「已覆盖到的最右端」（由 coverage 账本算出）。
+    返回的窗口必须与常规增量窗**不重叠**，否则没必要插队（常规窗本来就扫到）。
+    """
+    if tail_lag_sec is None:
+        return None
+    try:
+        lag = float(tail_lag_sec)
+        last = float(last_analyzed)
+        dur = float(current_dur)
+        cap = max(1.0, float(catchup_cap))
+        lookback = max(0.0, float(lookback_sec))
+    except (TypeError, ValueError):
+        return None
+    if dur <= 0.0 or lag <= LIVE_FIRST_MAX_TAIL_LAG_SEC:
+        return None
+    if last <= 0.0:
+        # 首窗不插队：先扫文件头基线（既有首窗语义，有守卫测试固化）。
+        return None
+    if last + cap >= dur - 1.0:
+        # 常规追赶窗已经够到文件尾：它本身就是「直播沿窗」，不需要插队。
+        return None
+    scan_end = dur
+    scan_start = max(0.0, dur - cap)
+    if scan_start <= last + lookback + 1.0:
+        # 直播沿窗会与游标窗重叠：没有可插队的空间。
+        return None
+    if scan_end <= scan_start + 1.0:
+        return None
+    return (round(scan_start, 3), round(float(scan_end), 3))
+
+
 def compute_valorant_scan_budget(
     mode: str,
     last_analyzed: float,
@@ -189,6 +351,7 @@ def compute_valorant_scan_budget(
     kick_interval: float = 60.0,
     scan_cycle_sec: float | None = None,
     lookback_sec: float | None = None,
+    tail_lag_sec: float | None = None,
 ) -> tuple[tuple[float, float], bool, int, bool]:
     """增量扫描预算：从已分析点回看 lookback 再向前追赶，绝不跳窗漏扫。
 
@@ -197,6 +360,7 @@ def compute_valorant_scan_budget(
     kick_interval：旧版兼容的名义间隔；新调用必须优先传 scan_cycle_sec。
     scan_cycle_sec：实际两次扫描启动之间的墙钟周期（秒）。
     lookback_sec：回看秒数；不传/非法时用稳态 8s，失败重试由上层传 30s。
+    tail_lag_sec：文件尾 - 已覆盖最右端；超过阈值时本窗让给直播沿（P1-5）。
     """
     del pressure
     last = float(last_analyzed)
@@ -210,6 +374,21 @@ def compute_valorant_scan_budget(
         kick_interval,
         scan_cycle_sec=scan_cycle_sec,
     )
+    live_first_range = live_first_scan_window(
+        last_analyzed=last,
+        current_dur=dur,
+        tail_lag_sec=tail_lag_sec,
+        catchup_cap=catchup_cap,
+        lookback_sec=lookback,
+    )
+    if live_first_range is not None:
+        scan_duration = max(1.0, live_first_range[1] - live_first_range[0])
+        return (
+            live_first_range,
+            True,
+            window_scan_timeout(scan_duration, use_ocr=True),
+            False,
+        )
     if last <= 0.0:
         scan_start = 0.0
         scan_end = min(dur, catchup_cap)
@@ -315,8 +494,17 @@ class ValorantAnalyzerPlugin:
                 else None
             ),
             lookback_sec=state.get("incremental_lookback"),
+            tail_lag_sec=state.get("tail_lag_sec"),
         )
         state["full_rescan"] = full_rescan
+        # 直播沿优先（P1-5）：本窗是否插队到文件尾（room_handler 据此定 scan_reason、
+        # 决定是否推进主游标、以及是否重置 OCR 跨窗状态）。
+        state["live_first"] = bool(
+            not full_rescan
+            and float(scan_range[1]) >= float(current_dur) - 1.0
+            and float(scan_range[0]) > float(state.get("last_analyzed", 0.0) or 0.0) + 1.0
+            and float(state.get("tail_lag_sec") or 0.0) > LIVE_FIRST_MAX_TAIL_LAG_SEC
+        )
         start, end = scan_range
         return ScanWindow(
             start_sec=float(start),
@@ -354,6 +542,10 @@ class ValorantAnalyzerPlugin:
         from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
 
         ocr_candidates: list[dict[str, Any]] = []
+        _stage_t0 = time.monotonic()
+        _ocr_elapsed = 0.0
+        _audit_elapsed = 0.0
+        _audit_batch_n = 0
         try:
             # 增量：粗扫先返回入列；收尾/全量仍同步密扫保证终态精度
             _finalize = bool(state.get("finalize", False))
@@ -370,6 +562,7 @@ class ValorantAnalyzerPlugin:
                 refine_boundaries=_finalize,
                 fast_mode=bool(state.get("realtime_fast_mode", False)) and not _finalize,
             ) or []
+            _ocr_elapsed = time.monotonic() - _stage_t0
             if state.get("scan_succeeded") is False:
                 return []
             ocr_candidates = [dict(item) for item in rounds if isinstance(item, dict)]
@@ -378,8 +571,13 @@ class ValorantAnalyzerPlugin:
                 isinstance(_runtime_state, dict)
                 and bool(_runtime_state.get("broadcast_pending_rounds"))
             )
+            # 收尾缺口补扫**不依赖"本轮有新候选"**：它要抓的恰恰是"画面静止导致
+            # OCR 全程没产出候选"的漏检。现场（2026-09-14 12:40 会话）：收尾各轮
+            # OCR 恒为 0 回合、待审队列已排空 ⇒ 整个 broadcast 分支被跳过，补扫
+            # 一次没跑，最后 650.2-736.1（85.9s）无人巡检（离线复跑该区间 5.6s、
+            # 确认没漏回合，但机制上必须补上）。故收尾期无条件进入该分支。
             if state.get("valorant_profile") == "broadcast" and (
-                rounds or _has_broadcast_pending
+                rounds or _has_broadcast_pending or bool(state.get("finalize"))
             ):
                 from lsc.analyzer.valorant_broadcast import audit_broadcast_rounds
                 from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
@@ -464,6 +662,9 @@ class ValorantAnalyzerPlugin:
                         continue
                     c = dict(candidate)
                     c.setdefault("round_key", candidate_key)
+                    _preserve_audit_retry_state(
+                        merged_candidates.get(candidate_key), c
+                    )
                     merged_candidates[candidate_key] = c
 
                 is_final_scan = bool(state.get("finalize"))
@@ -484,26 +685,42 @@ class ValorantAnalyzerPlugin:
                     # 2026-09-12：1530-1632 / 1740-1802 两段真实交战无候选），
                     # 收尾时对无候选区间做低频视觉巡检并合成候选，与 OCR 候选走
                     # 同一套审计/门禁（只补候选，不放宽判据）。
-                    # 每个收尾任务只补扫一次：候选列表只含"待审计"项，已定稿的会被移出，
-                    # 不看这个标记就会每个收尾循环都重扫全片（现场实测 4 次 × 16 条，
-                    # 把 20s 审计微步预算挤爆）。重复候选由既有的重叠合并兜底。
-                    _sweep_done = bool(state.get("gap_sweep_done"))
+                    # 只补扫一次：标记存 runtime_state（跨调用存活）。旧实现写在本轮
+                    # 局部 state 上，每次都丢 ⇒ 收尾每轮重扫全片（本轮实测 4 次）。
+                    _sweep_done = bool(
+                        state.get(_GAP_SWEEP_DONE_KEY)
+                        or runtime_state.get(_GAP_SWEEP_DONE_KEY)
+                    )
+                    _sweep_ok = False
                     try:
                         from lsc.analyzer.valorant_broadcast import sweep_gap_rounds
 
+                        # 已定稿切片覆盖过的区间也算"已覆盖"，否则同一真实回合会被
+                        # 再合成一次（本轮 153.0-257.0 / 711.0-813.0 就是已定稿的
+                        # s0 区间，重复候选最终以父键定稿 → 同回合两条重叠条目）。
+                        _sweep_input = [
+                            *sorted_candidates,
+                            *_finalized_span_items(audit_cache),
+                        ]
                         _swept = [] if _sweep_done else sweep_gap_rounds(
                             video_path,
-                            sorted_candidates,
+                            _sweep_input,
                             duration=float(state.get("current_dur", 0.0) or 0.0),
                             classifier=classifier,
                             ffmpeg_path=state.get("ffmpeg_path") or "ffmpeg",
                             cancel_check=cancel_check,
                         )
+                        _sweep_ok = True
                     except Exception as exc:  # noqa: BLE001 - 补扫失败不得影响收尾
                         _log.warning("收尾缺口补扫失败（忽略）: %s", redact_text(exc))
                         _swept = []
-                    if _swept:
-                        state["gap_sweep_done"] = True
+                    if _sweep_ok:
+                        # 「跑过一遍」就算完成，不管有没有合成出候选：巡检出"确实没有
+                        # 漏掉的交战"同样是结论，不能下一轮再把同一批缺口重扫一遍。
+                        # 标记必须落 runtime_state 才跨调用存活（state 是每轮新建的）。
+                        # 失败时**不打**标记，留给后续轮次重试。
+                        state[_GAP_SWEEP_DONE_KEY] = True
+                        runtime_state[_GAP_SWEEP_DONE_KEY] = True
                     for _item in _swept:
                         _key = str(_item.get("start", 0.0))
                         merged_candidates.setdefault(f"gap-{_key}", _item)
@@ -533,6 +750,13 @@ class ValorantAnalyzerPlugin:
                         remaining_pending.append(c_copy)
 
                 audited_rounds: list[dict[str, Any]] = []
+                # 计时与计数必须**无条件**初始化：空候选窗是常态（收尾尾部窗 OCR
+                # 本就 0 回合），只在 `if audit_batch:` 内赋值会让下面的耗时打点抛
+                # UnboundLocalError，被兜底 except 吞成 "scan_window failed"、把整窗
+                # 判失败 ⇒ 上层按扫描重试耗尽后放弃收尾（2026-09-15 真机：phase=error、
+                # 17 段停在待确认、草稿永不生成）。
+                _audit_batch_n = len(audit_batch)
+                _audit_t0 = time.monotonic()
                 if audit_batch:
                     try:
                         audited_rounds = audit_broadcast_rounds(
@@ -548,8 +772,13 @@ class ValorantAnalyzerPlugin:
                             ),
                             audit_cache=audit_cache,
                             finalize=is_final_scan,
+                            # 限步：单个候选的审计一次只推进 18s 媒体（见常量注释）。
+                            # 不限步时审计会与被超时包裹的扫描争抢 ONNX/DirectML 锁，
+                            # 把整窗拖到扫描超时（现场实测该窗口无争抢只需 51.8s）。
+                            max_media_step_sec=_BROADCAST_INLINE_AUDIT_STEP_MEDIA_SEC,
                         )
                     except Exception as exc:
+                        _audit_cancelled = _is_audit_cancellation(exc)
                         _log.warning(
                             "Valorant broadcast audit skipped; retaining OCR candidates: %s",
                             redact_text(exc),
@@ -558,16 +787,34 @@ class ValorantAnalyzerPlugin:
                             [dict(item) for item in audit_batch],
                             exc,
                         )
+                        if _audit_cancelled:
+                            # 取消 ≠ 结构性无解：审计没跑完，必须把候选留在待审队列里续审。
+                            # 否则候选既无终态、又不在队列（现场 pending_queue_depth=0），
+                            # 收尾只剩空转，最终被兜底判 manual_review。
+                            _retry_items, _exhausted = _cancel_retry_candidates(
+                                audited_rounds
+                            )
+                            for _retry_item in _retry_items:
+                                remaining_pending.append(_retry_item)
+                            if _retry_items or _exhausted:
+                                _log.warning(
+                                    "赛事审计被取消，候选重新排队续审: retry=%d, 超限落终态=%d",
+                                    len(_retry_items),
+                                    _exhausted,
+                                )
 
                 for item in audited_rounds:
                     if item.get("broadcast_audit") == "pending_lookahead":
                         remaining_pending.append(dict(item))
 
+                # 已定稿跨度由分析器在审计出口写进共享 audit_cache
+                # （两条审计路径共用一份，插件侧不再自己维护，避免各记一半）。
                 runtime_state["broadcast_pending_rounds"] = remaining_pending
                 rounds = [
                     item for item in audited_rounds
                     if item.get("broadcast_audit") != "pending_lookahead"
                 ]
+                _audit_elapsed = time.monotonic() - _audit_t0
         except Exception as exc:
             _log.warning(
                 "Valorant %s scan_window failed: %s",
@@ -586,4 +833,27 @@ class ValorantAnalyzerPlugin:
             return []
         state["scan_succeeded"] = True
         state["last_analyzed"] = window.end_sec
+        _total_elapsed = time.monotonic() - _stage_t0
+        if (
+            window.timeout_sec > 0
+            and _total_elapsed >= _SCAN_SLOW_LOG_RATIO * float(window.timeout_sec)
+        ):
+            # 分段耗时打点：下次现场可据此判断慢在哪一段（OCR 抽帧/识别 vs 同步审计），
+            # 而不是只能看到"扫描超时"。本次排查正是缺这条数据，
+            # 只能靠离线复跑才测出"该窗口无争抢仅需 51.8s，预算 360s 被烧满是争抢"。
+            _log.warning(
+                "扫描耗时逼近超时预算: profile=%s, range=%.1f-%.1f (%.1fs 媒体), "
+                "total=%.1fs, ocr=%.1fs, audit=%.1fs, timeout=%.0fs, "
+                "audit_candidates=%d, pending_queue=%d",
+                state.get("valorant_profile", "pov"),
+                float(window.start_sec),
+                float(window.end_sec),
+                float(window.end_sec) - float(window.start_sec),
+                _total_elapsed,
+                _ocr_elapsed,
+                _audit_elapsed,
+                float(window.timeout_sec),
+                _audit_batch_n,
+                len((state.get("runtime_state") or {}).get("broadcast_pending_rounds") or []),
+            )
         return rounds or []

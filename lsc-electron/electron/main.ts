@@ -1083,9 +1083,11 @@ function createTray(): void {
 
 // ===== 窗口 =====
 
-function shouldSkipRendererConsole(message: string): boolean {
+function shouldSkipRendererConsole(message: string, level?: number): boolean {
   if (!message) return true
-  if (message.includes('[MsePlayer]')) return true
+  // 播放器的 INFO 级追踪仍然过滤（量大）；WARN/ERROR 必须放行 ——
+  // 现场「预览恢复失败」这类事故只有这条通道能留下证据（debug:false 时 _log 是空操作）。
+  if (message.includes('[MsePlayer]')) return (level ?? 0) < 2
   if (message.includes('[Workbench] 直播按钮诊断')) return true
   const noisy = [
     'heartbeat',
@@ -1798,7 +1800,7 @@ function createWindow() {
   // 始终注册渲染进程日志转发和生命周期日志
   mainWindow.webContents.on('console-message', (_event, level, message) => {
     if (message.includes('Electron Security Warning')) return
-    if (shouldSkipRendererConsole(message)) return
+    if (shouldSkipRendererConsole(message, level)) return
     const levelMap: Record<number, 'INFO' | 'WARN' | 'ERROR'> = {
       0: 'INFO',
       1: 'INFO',

@@ -1,6 +1,7 @@
 import {
   DEFAULT_TIMELINE_REPLAY_SECONDS,
   effectivePlaybackBufferSeconds,
+  MIN_PLAYBACK_BUFFER_SECONDS,
   REPLAY_TRIM_HEADROOM_SECONDS,
 } from '@/utils/replaySettings'
 
@@ -145,8 +146,18 @@ export class MsePlayer {
   private _lastSeekTime = 0
   // 配额超出连续恢复计数，成功写入后归零
   private _quotaRetryCount = 0
+  // 硬重建（重建 MediaSource）恢复预算：解码器/MediaSource 卡死时 seek 与 play() 都救不回来，
+  // 只有重建能救。旧实现在 stall/强制 seek 预算耗尽时直接终态报错，用户只能手动重开预览。
+  private _hardResetCount = 0
+  private readonly _hardResetLimit = 2
+  private _lastHardResetAt = 0
+  private readonly _hardResetCooldownMs = 5 * 60 * 1000
   // 当前 MSE 实际保留时长。0（关闭 DVR）映射为短安全缓存，而不是完全无缓存。
+  // 配额压力下会被自适应缩减（见 _handleQuotaExceeded），故与"用户设置值"分开记。
   private _replayBufferSeconds: number
+  // 用户在设置里选的保留时长（经 effectivePlaybackBufferSeconds 归一），
+  // 用于让 UI 说清"设置 5 分钟 vs 实际 2 分钟"的差额来源。
+  private _configuredReplaySeconds: number
   // 文件回看首个 media 到达时，从文件缓冲起点启动；直播才跳到 live edge。
   private readonly _isFile: boolean
   public readonly channel: 'live' | 'review'
@@ -162,9 +173,10 @@ export class MsePlayer {
     this._isFile = options.isFile === true
     this.channel = options.channel ?? (this._isFile ? 'review' : 'live')
     this.sessionId = options.sessionId
-    this._replayBufferSeconds = effectivePlaybackBufferSeconds(
+    this._configuredReplaySeconds = effectivePlaybackBufferSeconds(
       options.replayBufferSeconds ?? DEFAULT_TIMELINE_REPLAY_SECONDS,
     )
+    this._replayBufferSeconds = this._configuredReplaySeconds
   }
 
   get state(): MsePlayerState {
@@ -177,8 +189,30 @@ export class MsePlayer {
 
   /** 动态更新 MSE 缓冲保留时长；已被 remove 的历史分片不会重新出现。 */
   setReplayBufferSeconds(seconds: number): void {
-    this._replayBufferSeconds = effectivePlaybackBufferSeconds(seconds)
+    this._configuredReplaySeconds = effectivePlaybackBufferSeconds(seconds)
+    // 改档即复位配额降级：否则一旦缩过容，之后升档也回不到用户设的时长。
+    this._replayBufferSeconds = this._configuredReplaySeconds
+    this._quotaRetryCount = 0
     this._flushPending()
+  }
+
+  /**
+   * 回放缓冲现状（供时间线/房间卡如实展示"实际可立即回放多少"）。
+   *
+   * `degraded=true` 表示 QuotaExceededError 自适应缩容已生效——真实保留量
+   * 小于设置值。UI 必须能说出这个原因，而不是让用户对着"设置 5 分钟、实际
+   * 只有 2 分钟"自行猜测（2026-09-15 真机排查结论）。
+   */
+  getReplayBufferStatus(): {
+    configuredSeconds: number
+    effectiveSeconds: number
+    degraded: boolean
+  } {
+    return {
+      configuredSeconds: this._configuredReplaySeconds,
+      effectiveSeconds: this._replayBufferSeconds,
+      degraded: this._replayBufferSeconds < this._configuredReplaySeconds,
+    }
   }
 
   /** Start receiving init + media segments.
@@ -246,13 +280,9 @@ export class MsePlayer {
     // 收到新的不同 init 段（推流源切换如录制回看/直播切换）或从错误中恢复
     if (this._initReceived && (isDifferent || isError)) {
       this._log(`New init segment received (different=${isDifferent}, recovering=${isError}), resetting stream pipeline`)
-      this._setState('loading')
-      this._initReceived = true
       this._initSegment = newBytes
-      this._initAppended = false
-      this._liveEdgeAligned = false
-      this._pendingSegments = []
-      this._initMediaSource()
+      // 源切换/错误恢复不计入「卡死恢复预算」（那是给 stall/append 失败用的）
+      this._resetStreamPipeline('new init segment', false)
       return
     }
 
@@ -558,6 +588,9 @@ export class MsePlayer {
     }
     this._setState('idle')
     this._userPaused = false
+    // 播放器停用（组件卸载/切换到回看）也必须收口：后端暂停标记只在预览「停止」时清，
+    // 若此处不发 resume，下次复用该房预览会拿不到任何 media 段。
+    this._emitBackpressureResume('player stop')
     this._backpressurePaused = false
     // S5: abort SourceBuffer 防止 pending 的 append 阻塞 _cleanup
     if (this._sourceBuffer) {
@@ -691,7 +724,7 @@ export class MsePlayer {
         const bufStart = buffered.start(0)
         const bufEnd = buffered.end(buffered.length - 1)
         const bufDuration = bufEnd - bufStart
-        const targetReplaySeconds = Math.max(30, this._replayBufferSeconds)
+        const targetReplaySeconds = Math.max(MIN_PLAYBACK_BUFFER_SECONDS, this._replayBufferSeconds)
         const trimThreshold = targetReplaySeconds + REPLAY_TRIM_HEADROOM_SECONDS
         if (bufDuration > trimThreshold) {
           let removeEnd = bufEnd - targetReplaySeconds
@@ -992,6 +1025,12 @@ export class MsePlayer {
 
   private _handleAppendError(e: unknown, seg: Uint8Array, context: string): void {
     if (!this._isQuotaExceededError(e)) {
+      // 解码/时间戳类失败（源切换后 PTS 跳变等）重建管线就能恢复；
+      // 旧实现直接终态报错，用户只能手动重开预览。
+      if (this._tryHardResetRecovery(`${context} append error`)) {
+        this._pendingSegments.unshift(seg)
+        return
+      }
       this._handleError(`${context} failed: ${e}`)
       return
     }
@@ -1006,8 +1045,13 @@ export class MsePlayer {
     // 将当前未写入的 segment 重新推入待处理队列前端
     this._pendingSegments.unshift(seg)
 
-    // 自适应缩减保留时长：配额紧张时逐步减半，最低保留 30 秒
-    this._replayBufferSeconds = Math.max(30, Math.floor(this._replayBufferSeconds * 0.6))
+    // 自适应缩减保留时长：配额紧张时逐步减半，最低保留 MIN_PLAYBACK_BUFFER_SECONDS。
+    // 该缩容会通过 getReplayBufferStatus().degraded 暴露给 UI（否则用户只会看到
+    // "设置 5 分钟、实际 2 分钟"却查不到原因）。
+    this._replayBufferSeconds = Math.max(
+      MIN_PLAYBACK_BUFFER_SECONDS,
+      Math.floor(this._replayBufferSeconds * 0.6),
+    )
     this._log(`QuotaExceededError handled: buffer target reduced to ${this._replayBufferSeconds}s, triggering emergency eviction`)
 
     // 立即执行紧急驱逐腾出空间
@@ -1053,8 +1097,113 @@ export class MsePlayer {
     return false
   }
 
+  /**
+   * 硬重建流管线：丢弃待播队列、重建 MediaSource、重新 append 缓存的 init 段。
+   *
+   * 与 feedInit 的「新 init 段」分支同一套动作（那里用于源切换/从错误恢复）。
+   * `recovery=true` 时计入卡死恢复预算（5 分钟冷却窗口内最多 _hardResetLimit 次），
+   * 防止卡死循环里无限重建。
+   *
+   * @returns 是否真的发起了重建（无缓存的 init 段时返回 false）
+   */
+  private _resetStreamPipeline(reason: string, recovery = false): boolean {
+    if (!this._initSegment) {
+      this._log(`Hard pipeline reset skipped (${reason}): no init segment cached yet`)
+      return false
+    }
+    if (recovery) {
+      this._hardResetCount++
+      this._lastHardResetAt = Date.now()
+    }
+    this._log(
+      `Hard pipeline reset (${reason}, recovery=${recovery}, count=${this._hardResetCount}/${this._hardResetLimit})`,
+    )
+    this._setState('loading')
+    this._initReceived = true
+    this._initAppended = false
+    this._liveEdgeAligned = false
+    this._pendingSegments = []
+    this._stallRecoveryCount = 0
+    this._forcedSeekRecoveryCount = 0
+    this._playExhausted = false
+    this._quotaRetryCount = 0
+    this._initMediaSource()
+    return true
+  }
+
+  /**
+   * 恢复预算耗尽时的最后一层自愈：有界硬重建。
+   * @returns true = 已发起重建（调用方不要再报错）；false = 预算用尽，应报错
+   */
+  private _tryHardResetRecovery(reason: string): boolean {
+    const now = Date.now()
+    if (this._hardResetCount > 0 && now - this._lastHardResetAt > this._hardResetCooldownMs) {
+      // 距上次重建已过冷却窗口：视为新一轮故障，恢复预算
+      this._hardResetCount = 0
+    }
+    if (this._hardResetCount >= this._hardResetLimit) {
+      this._log(`Hard reset budget exhausted (${this._hardResetCount}/${this._hardResetLimit})`)
+      return false
+    }
+    return this._resetStreamPipeline(reason, true)
+  }
+
+  /**
+   * 离开 backpressure 暂停态时**必须**通知后端恢复推送。
+   *
+   * 否则后端会一直丢弃该房所有 media 段（room_handler._mse_push_paused），前端永远拿不到
+   * 数据、任何自动恢复都不可能成功 —— 现场（2026-09-15）表现为「预览恢复失败，请手动
+   * 重新开启预览」，且只有重开预览（清暂停标记）才能救回来。
+   */
+  private _emitBackpressureResume(reason: string): void {
+    if (!this._backpressurePaused) return
+    this._backpressurePaused = false
+    try {
+      this._onBackpressure?.('resume', this._pendingSegments.length)
+    } catch (e) {
+      this._log(`backpressure resume callback failed: ${e}`)
+    }
+    this._log(`backpressure resume emitted (${reason})`)
+  }
+
+  /** 错误时的健康快照：现场 debug:false 时 _log 全被吞掉，错误必须自带上下文。 */
+  private _healthSnapshot(): string {
+    const video = this._video
+    let ranges = ''
+    try {
+      const buffered = video?.buffered
+      if (buffered) {
+        const parts: string[] = []
+        for (let i = 0; i < buffered.length; i += 1) {
+          parts.push(`${buffered.start(i).toFixed(1)}-${buffered.end(i).toFixed(1)}`)
+        }
+        ranges = parts.join(',')
+      }
+    } catch {}
+    return [
+      `state=${this._state}`,
+      `ct=${video ? video.currentTime.toFixed(2) : '-'}`,
+      `readyState=${video ? video.readyState : '-'}`,
+      `pending=${this._pendingSegments.length}`,
+      `buffered=[${ranges}]`,
+      `stall=${this._stallRecoveryCount}/${this._stallRecoveryLimit}`,
+      `forced=${this._forcedSeekRecoveryCount}`,
+      `hardReset=${this._hardResetCount}/${this._hardResetLimit}`,
+      `quota=${this._quotaRetryCount}`,
+      `bpPaused=${this._backpressurePaused}`,
+      `initAppended=${this._initAppended}`,
+      `userPaused=${this._userPaused}`,
+    ].join(' ')
+  }
+
   private _handleError(msg: string): void {
-    this._log(`ERROR: ${msg}`)
+    // 错误必须无条件可见：_log 受 debug 开关控制（生产 debug:false），
+    // 现场只有这条 console.error 能进 debug.log（main.ts 放行 [MsePlayer] 的 WARN/ERROR）。
+    try {
+      console.error(`[MsePlayer] ERROR: ${msg} | ${this._healthSnapshot()}`)
+    } catch {}
+    // backpressure 收口：不能让后端停在「暂停推送」（见 _emitBackpressureResume 注释）
+    this._emitBackpressureResume('player error')
     this._setState('error')
     this._stopStallDetection()
     this._onError?.(msg)
@@ -1161,7 +1310,9 @@ export class MsePlayer {
       // 连续恢复次数上限：超过 3 次停止自动恢复，避免无限循环占满主线程
       this._stallRecoveryCount++
       if (this._stallRecoveryCount > this._stallRecoveryLimit) {
-        this._log(`Stall recovery limit reached (${this._stallRecoveryCount}/${this._stallRecoveryLimit}), stopping auto-recovery`)
+        this._log(`Stall recovery limit reached (${this._stallRecoveryCount}/${this._stallRecoveryLimit})`)
+        // 最后一层自愈：重建 MediaSource。seek/play() 救不了卡死的解码器，重建可以。
+        if (this._tryHardResetRecovery('stall recovery exhausted')) return
         this._handleError('预览恢复失败，请手动重新开启预览')
         return
       }
@@ -1184,7 +1335,8 @@ export class MsePlayer {
         // 强制 seek 独立限流：不受 buffer 增长重置（否则"buffer 持续增长 + media clock 冻结"会无限循环）
         this._forcedSeekRecoveryCount++
         if (this._forcedSeekRecoveryCount > this._stallRecoveryLimit) {
-          this._log(`Forced seek recovery limit reached (${this._forcedSeekRecoveryCount}/${this._stallRecoveryLimit}), stopping auto-recovery`)
+          this._log(`Forced seek recovery limit reached (${this._forcedSeekRecoveryCount}/${this._stallRecoveryLimit})`)
+          if (this._tryHardResetRecovery('forced seek recovery exhausted')) return
           this._handleError('预览恢复失败，请手动重新开启预览')
           return
         }

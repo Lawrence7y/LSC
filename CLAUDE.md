@@ -325,6 +325,42 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
     *   如果缓冲无法解析出完整 box 且累积超过解析缓冲上限（`_MAX_SEGMENT_BYTES` = 512KB 的 2 倍 = 1MB），解析器会**从最近的 `ftyp`/`moof` 标记处丢弃积压数据**（截断丢弃，不是"切分出合法分片"）；正常参数下每段约 300KB，该路径实战几乎不触发。
 4.  **前端消费机制**：前端通过 `mediaSourcePlayer.ts` 接收 WebSocket 消息。首帧写入 `SourceBuffer.appendBuffer(initSegment)`，后续高频追加 `mediaSegment`，当缓冲区超出时间阈值时，自动执行清理以保证预览低延迟。
 
+#### 7.2.2 预览自愈与 backpressure 收口（2026-09-15 现场事故）
+
+现场（2026-09-15 11:52-12:06，长预览后报「预览恢复失败，请手动重新开启预览」）：
+
+*   **现象**：预览跑了 ~8 分钟后画面冻结（`set_preview_clock` 在 11:52:34 后停发；期间后端无任何错误，
+    连续分析仍在正常推进）；用户手动关/开预览后 12:06:24 恢复。
+*   **不可恢复的成因（双端）**：
+    1. 前端播放器在 `pending >= _backpressurePauseAt(10)` 时向后端发 `mse_backpressure pause`，而它的
+       `resume` 只在队列排空到 `<= _backpressureResumeAt(3)` 时才发（`_maybeEmitBackpressure`）；管线一旦卡死，
+       队列永远排不空 ⇒ **永远不发 resume**；
+    2. 后端 `_mse_push_paused` 因此永久保留该房，`_push_mse_segment` 把该房后续**所有 media 段全部丢弃**
+       （只放行 init）⇒ 前端重建播放器、重放 init 都拿不到 media，只有「重开预览」能清标记（现场 12:03:42
+       pause 之后再无 resume，12:06:19 手动重开才恢复）。
+*   **修复（三条硬约束）**：
+    1. **后端暂停必须能自愈**：`mse_backpressure pause` 记录 `_mse_push_paused_at`，推送侧（`_push_mse_segment`，
+       在分段流经时惰性检查）发现暂停超过 `_MSE_PUSH_PAUSE_MAX_SEC=20s` 即 `_clear_mse_push_paused` + WARNING
+       日志（含暂停时长与被丢弃分段数）。前端若仍拥塞会按自己的 pending 重新 pause，因此最坏是周期抖动，
+       绝不会再出现「永久只发 init」。**禁止**把「前端 resume 会来」当作不变量。
+    2. **前端离开暂停态必须收口**：`_emitBackpressureResume()` 由 `stop()` 与 `_handleError()` 调用
+       （旧实现只在正常排空与 `_setUserPaused(false)` 时发 resume）；错误态不得把后端留在暂停。
+    3. **前端恢复阶梯**（不再直接终态报错）：stall 恢复预算（3 次）/ 强制 seek 预算（3 次）耗尽、或非配额类
+       `appendBuffer` 失败（解码/时间戳跳变）时，先 `_tryHardResetRecovery()` → `_resetStreamPipeline()`
+       （重建 MediaSource + 重新 append 缓存的 init + 清 pending，5 分钟冷却窗口内最多 2 次），只有重建预算也用尽
+       才 `_handleError('预览恢复失败，请手动重新开启预览')`。
+*   **诊断可见性**：`_handleError` 无条件 `console.error('[MsePlayer] ERROR: ... | <健康快照>')`
+    （快照含 state/ct/readyState/pending/buffered/stall/forced/hardReset/quota/bpPaused/initAppended），
+    且 `electron/main.ts` 的 `shouldSkipRendererConsole(message, level)` 对 `[MsePlayer]` 只过滤 INFO、放行
+    WARN/ERROR 进 `debug.log`（旧实现把整个 `[MsePlayer]` 前缀过滤掉，而生产 `debug:false` 下 `_log` 本就是空操作
+    ⇒ 这类事故现场零证据）。需要完整追踪时在 devtools 执行 `localStorage.setItem('lsc.mseDebug','1')` 后重开预览。
+*   🔻 **已知遗留**：`enable_preview` 在已推流时只回 `already streaming, init replayed`（不重建 sink），
+    所以前端目前无法强制重启后端预览 sink；若要「播放器自救失败后自动重开后端 sink」，需给 `enable_preview`
+    加 `restart: true`（带退避与次数上限）。另一个未定论项：渲染端媒体时钟为何在长预览后冻结（现场预览滞后从
+    -113s 涨到 -158s/3min，疑似 GPU/CPU 与持续分析争抢导致的追赶失败）—— 新的错误快照与 `[MsePlayer]` 追踪
+    是下一次定位的依据。
+*   守卫：`tests/test_preview_backpressure_watchdog.py`、`lsc-electron/src/services/mediaSourcePlayer.test.ts`。
+
 ### 7.3 预览流与录制流架构模式
 
 系统支持两种预览/录制架构模式，通过 `LscConfig.shared_ingest_enabled` 配置开关控制：
@@ -578,24 +614,80 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
         尾部 30s 扫描看不到块中部的回合边界（实测：块内 22s 回放未被发现，切片跨两个回合）。
         现从块头整段起扫（单次仍受 18s 微步骤预算）；块内「回放后再接下一回合满钟」不再触发
         `_has_decreasing_combat_after` 硬否决（`FRESH_ROUND_CLOCK_MIN=85`），块头静态画面也不得
-        触发逐帧冻结兜底。⚠️ 已知遗留：A5「回放终点排除」的 `replay_segments` 是启发式产物，
-        仍可能把审计已确认的精确出点覆盖成更早的值（实测 196.25 → 185.92，裁掉 10s 真实交战）。
+        触发逐帧冻结兜底。**A5 回放终点排除（2026-09-15 收口）**：`replay_segments` 是启发式
+        产物（「计时器不可读」≠ 回放，实测有成片误标与 ~17s 时间戳偏差），凡**已定稿**出点
+        （`end_refined` 已存在，且 `end_by ∈ {broadcast_exclusion, next_prep}` 或
+        `broadcast_audit=passed` 或 `confirm_status=vision_confirmed`）一律不得被它裁早：只写
+        `replay_end_exclusion_skipped=visual_end_authoritative` 留痕，不改终点。旧判据只认
+        `broadcast_exclusion`，于是审计 passed 的 `next_prep` 出点仍被裁早（实测 196.25 → 185.92
+        白丢 10.3s 真实交战）。未定稿路径（无 `end_refined` / 审计未 passed）语义不变 —— 那正是
+        A5 要兜的「模型漏掉的实战镜头回放」。守卫：`tests/test_valorant_ocr_rounds.py`。
     *   **停止补扫尾部（2026-09-08）**：录制中停止持续分析不再立即 `cancelled`，先进入
         `stop_tail_scan`（target 冻结在停止时刻，最多 `_STOP_TAIL_MAX_WINDOWS` 窗）补扫未覆盖
         尾部后自行退出；补扫期间审计中止（refine_abort）且不再启动新审计。
         补扫窗口定向瞄准 target（单窗 `_STOP_TAIL_WINDOW_CAP_SEC=120s`），不套用 90s
         自适应预算，缩短停止收尾时长；停止路径与“停止录制并收尾”互斥：补扫仅在无收尾
         任务时生效。
-    *   **审计批配额（2026-09-08）**：后台审计单批配额 `max_audit_quota=2`。单候选
-        密扫+lookahead 审计 30–55s，4+ 候选必然撑满 `_BCAST_REFINE_KEEP_MAX_SEC=120s`
-        预算被中止（实测 5 候选批让单窗滞后 +107s）；收紧后批次在预算内完整结束，
-        未定稿候选在后续扫描间隙续扫。
-    *   **审计微步骤硬边界（2026-09-10）**：在线后台任务一次只允许执行一个
-        `18s` 媒体微步骤，不得在 `20s` 墙钟 deadline 内连续启动下一个不可强制中断的
-        FFmpeg/OCR 步骤。尾窗无 combat 时的头部回补也必须受同一预算约束，并从尾窗
-        向前倒序分块搜索最近 combat；每帧完成后持久化 cache 游标，取消/超时后不得
-        重扫已完成证据。在线计时器 OCR 每微步骤最多 1 个排除帧，收尾/离线审计才保留
-        完整计时器序列。
+    *   **弱出点候选的向前回扫取证（2026-09-15，P0）**：OCR 以 `next_combat`/`open_tail` 闭合时
+        出点常比真出点晚 30–80s（赛后回放 + 买枪都很长）。尾窗只从 `end-60` 开始，真出点那次
+        `combat→replay/result/non_game` 转场若早于该点就完全落在窗外，`_first_stable_exclusion`
+        因「样本里先有 replay、没有 combat 前缀」认不出边界 ⇒ `reason=none` ⇒ 过晚的粗出点被
+        `pending_no_exclusion` 盖成终态（切片尾部带整段回放与买枪，且此后无人再审）。现在
+        **定稿前必须先做一次有界向前回扫**：`BROADCAST_AUDIT_BACKWARD_SWEEP_MAX_SEC=150s`、
+        `broadcast_audit_step="backward_sweep"`，复用 `fallback_full_*` 游标、单步仍受
+        `max_media_step_sec` 约束，扫到候选起点才允许盖章。回扫锚点必须取**尾窗左界**
+        （`backward_sweep_anchor`）：微步骤下 `extract_start` 会漂到 `scanned_end` 附近，用它
+        当起点会把已扫尾部重扫一遍（实测多花 9 个微步骤）。只对缺强证据的出点触发 ——
+        `result_ts` 存在时尾窗已按 `result_ts-10` 锚定，`next_prep`/`buy_phase` 走 90s 扩窗路径，
+        都不回扫。守卫：`tests/test_valorant_broadcast.py::test_weak_end_candidate_backward_sweeps_to_real_end`。
+    *   **后台审计批次吞吐（2026-09-15，P1-6）**：吞吐 = 步数 × 步长 × 配额，旧口径三项全是
+        `1 × 18s × 1` ⇒ 一条 150s 窗口的候选要 9 个扫描周期（10–19 分钟）才定稿，而回合约
+        2 分钟一个，容量只有需求 1/5–1/8（现场表现：切片列表长期停在「待审计/待确认」）。
+        现改为**有界批次**：`_BCAST_REFINE_BATCH_MAX_SEC=40s`、`_BCAST_REFINE_MAX_STEPS=3`；
+        步长随滞后自适应（滞后 ≤15s 用 30s，否则 18s），配额按滞后分层（>60s→1，30–60s→2，
+        ≤30s→3，且必须有「就绪候选」才放量）；是否再放一步由**实测步耗时 EMA**
+        （`audit_step_elapsed_ema`，种子 12s）判断 ⇒ 慢机自动退回 1 步（= 旧行为），
+        不会回到「20s 死线前抢跑下一步、内部 FFmpeg/OCR 又不可硬中断 ⇒ 持锁数分钟」的老形态。
+        单步墙钟上限 `_BCAST_REFINE_STEP_MAX_SEC=20s`、抢占阈值 `_REFINE_PREEMPT_BACKLOG_SEC=60s`、
+        取消交付契约（`_deliver_audit_outcomes_on_cancel`）均不变；批次兜底死线 = 批次预算 + 一步余量。
+        2026-09-10 的两条硬边界也不变：在线计时器 OCR 每微步骤最多 1 个排除帧；每帧完成后持久化
+        cache 游标，取消/超时后不得重扫已完成证据。守卫：
+        `tests/test_broadcast_audit_batch_throughput.py`、`tests/test_continuous_analysis_guards.py`。
+    *   **审计批配额历史（2026-09-08 → 2026-09-15 取代）**：早期为「每批一个候选一个微步骤」
+        （`max_audit_quota=1`）以避免批次撑满 `_BCAST_REFINE_KEEP_MAX_SEC=120s` 预算被中止
+        （实测 5 候选批让单窗滞后 +107s）；有界性现由步数上限 + 批次墙钟 + 步耗时 EMA 承担，
+        配额只决定「一批可定稿几条」。
+    *   **入点门禁：区分「有证据的否定」与「模型不确定」（2026-09-15，P1-4）**：
+        门禁窗（`START_GATE_SCAN_LIMIT_SEC=15s`）里找不到稳定 combat 锚点时有**两种**成因，
+        旧实现一律 `rejected_no_stable_combat_start`（终态、人工确认也不复活）⇒ 真实回合被永久
+        丢弃。现按证据分流：① 窗内有连续 ≥2 帧 `replay`/`non_game`/`result`（`_start_window_evidence`，
+        `_TERMINAL_LABELS`）⇒ 起点确实在回放/结算里，立即拒绝（不做扩展，省掉解说流 20s 额外抽帧）；
+        ② 只有 `unknown`/`buy` 这类非终态标签 ⇒ 先把门禁窗 15s→`START_GATE_EXTENDED_SCAN_LIMIT_SEC(35s)`
+        复判一次（在线=独立微步骤 `broadcast_audit_step="start_gate_extend"`；离线/收尾单发调用=`while`
+        循环内就地扩窗，样本续存 `start_gate_samples`）；③ 扩窗后仍无 combat 锚点、也无结构性证据
+        ⇒ 标 `broadcast_start_gate="inconclusive"`（`cache_item["start_gate_inconclusive"]`），**保留候选**：
+        出点审计照常定稿（`end_by`/`end_quality` 保留审计结论），但强制 `confirm_status=pending` +
+        `start_quality=coarse` + `start_review_required=True`，交付态 `manual_review` —— 自动导出路径要求
+        `confirm_status==vision_confirmed`，故被挡住；人工确认后可导出（与「入点 coarse 只是起得略早」
+        的既有产品规则一致）。**禁止**把「模型不确定」写成拒绝终态。守卫：
+        `tests/test_valorant_broadcast.py::test_start_gate_uncertain_head_keeps_round_for_manual_review`、
+        `::test_start_gate_extends_window_then_rejects_on_replay_evidence`。
+    *   **直播沿优先（2026-09-15，P1-5）**：中途开分析时游标从 0 起爬（首窗强制
+        `[0, MIN_CATCHUP_SEC]`），而增量窗上限只有 `MAX_CATCHUP_SEC=90s/窗`、单窗墙钟常大于
+        窗口媒体（实测 OCR 0.78x 实时）⇒ 净推进可能为负、backlog 单调增长：最新回合要等整段
+        历史爬完才出现。现策略：只要「已覆盖到的最右端」（coverage 账本 `max(end)`，
+        `_continuous_tail_lag_sec`）落后文件尾超过 `LIVE_FIRST_MAX_TAIL_LAG_SEC=240s`，本窗就让给
+        直播沿窗口 `[dur - catchup_cap, dur]`（`live_first_scan_window`），否则继续按游标回填。
+        三条硬约束：① **插队窗不推进主游标**（`scan_result_container['live_first']` →
+        `if not _scan_was_live_first:`）——推进等于宣称中间缺口已分析（进度假跳 100%、收尾不再补）；
+        ② 窗口不连续时必须重置 OCR 跨窗状态（`_reset_ocr_runtime_for_noncontiguous_window`：
+        `last_processed_ts` 只增不减会把回填窗整段过滤成「成功但零回合」，残留开回合还会把缺口
+        两头拼成几千秒假回合），插队窗与插队后的第一个回填窗都要重置；③ 只对**是否已连续分析**无
+        影响的路径启用：收尾 / 停止补扫（`stop_tail_scan`）传 `tail_lag_sec=None`，它们各有定向窗口
+        与自己的重置（`_rs['last_processed_ts'] = _fin_start`）。完整性的兜底是既有的收尾缺口补扫
+        （`uncovered_ranges_for_state` 逐片扫）——中间缺口不算「已覆盖」。首窗语义不变（先给文件头
+        基线）。总开关 `LSC_VALORANT_LIVE_FIRST=0/false/off/no` 可退回旧口径。
+        守卫：`tests/test_continuous_live_first_priority.py`。
     *   **官方 HUD 宽 ROI 哨兵（2026-09-10）**：赛事粗扫逐帧仅跑紧顶部 ROI，
         宽 ROI 作为包装/黑边偏移容错每 `4s` 探测一次；禁止因紧 ROI 未同时读全
         计时器+双比分而在每帧重复执行宽 ROI OCR。收尾仍可逐帧使用宽 ROI 保证证据完整。
@@ -727,6 +819,48 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 8.  **禁止项**：不得恢复 `_review_streamers`/`start_recording_review` 语义（这两个 WS 消息保留为返回
     `deprecated: use local file playback` 的声明式桩）；不得让 `registry.player` 承担通道切换以外的语义；
     不得在前端为回看再引入任何需要后端复位的状态。
+
+### 8.9 回放窗口口径：能点的范围 = 真能回放的范围（2026-09-15）
+
+真机日志（`[Workbench] seek 283.1s 超出直播缓冲 [308.1, 465.2] → 切换到本地文件回看`）暴露的
+叠加问题：设置 `timeline_replay_seconds=300` 时真实 MSE 连续缓冲只有 157s，而放大预览条把
+「设置窗口」（`liveEdge − 设置时长`）整段画成可点区域 ⇒ 点在画出来的窗口内、真实缓冲外的位置被
+`mseSeek` 判成缓冲外、切到本地文件回看通道，预览区一直显示「正在准备回看…」（一次普通点击白等数秒）；
+条上还同时印着「回看设置 X · 实际可回放 Y」两个时长，与实际能点的范围并不一致。
+
+1.  **放大预览条**（`computeExpandedPreviewWindow`）：左端 = `max(真实缓冲起点 buf.start,
+    liveEdge − 用户设置时长)` —— 用户设置**只作上限**，绝不把未缓冲的历史画成可点区域；右端 =
+    `liveEdge`（无缓冲时退化为播放位置）。指针拖动与方向键两处落点统一过 `clampSeekToRange`
+    收进缓冲内侧。
+2.  **`mseSeek` 边界容差**：`isWithinSeekRange`（`DVR_BUFFER_EDGE_TOLERANCE_SEC = 2s`）内的落点按
+    缓冲内处理并 `clampSeekToRange` 收进缓冲内侧；分片边界/浮点误差不得再把一次普通点击推给重量级的
+    回看通道。更早内容仍走本地文件回看（主时间线 hover 照旧提示「缓冲外·将从录制文件回看，可能需要加载」）。
+3.  **放大预览区不再显示回放时长文案**：删掉「回看设置 {configured} · 实际可回放 {available}」及其降级
+    后缀（含 `room-card__expanded-replay-info` / `expanded-unavailable` 死样式）；窗口计算不再返回
+    `configuredReplaySeconds` / `availableReplaySeconds`。**主时间线**紫标/文案不变：起点 = 真实缓冲
+    起点、时长 = 真实可回放量，设置承诺窗口另画一条淡虚线（`configuredStart`）。
+4.  **守卫**：`tests/test_frontend_stability_guards.py::test_preview_bar_seekable_range_equals_replayable_range`、
+    `lsc-electron/src/utils/timelineWindow.test.ts`（窗口口径 + `isWithinSeekRange`/`clampSeekToRange`）。
+5.  **放大预览底部控制条（时间线 + 走带按键）= 同一块面板，默认向下隐藏**：合并为一块玻璃面板
+    （时间线行与按键行不再各自留白/底色），默认 `translateY(100%)` + `opacity:0` +
+    `pointer-events:none` 三重收口（不可见/不可点/不挡画面，卡片 `overflow:hidden` 裁掉滑出部分）；
+    鼠标经过或移动滑出，静止 `EXPANDED_CONTROLS_IDLE_MS(2500ms)` 自动收起，显隐状态机统一走
+    `src/hooks/useAutoHideControls.ts`（拖动时间线、画质下拉打开期间 `pinned` 钉住；键盘焦点在条内
+    由 CSS `:focus-within` 兜底）。**显隐信号必须挂在 `<Card>`**（预览画面 + 控制条的公共祖先）上：
+    挂在预览容器上时，指针从画面移向控制条会先触发 `pointerleave`，把条在用户伸手去点的那一刻藏掉。
+6.  **「缩小为窗口播放」= 原生画中画（PiP）**：放大态控制条内，紧挨「缩小回网格」之后（顺序 =
+    静音 → 缩小回网格 → 窗口播放 → 全屏 → 停止预览），与其它覆盖层玻璃按钮**同一设计语言**
+    （同为 small / 圆角令牌 / 毛玻璃），差异化为：画中画图标（外框 + 右下角实心小窗，
+    刻意不用 `ShrinkOutlined`/`FullscreenOutlined` 的箭头语汇）+ 文字标签「窗口播放」+ 品牌青描边
+    淡青底，激活后整块转品牌色。状态机在 `src/hooks/usePictureInPicture.ts`：
+    **画中画是 document 级单例**，故状态按 `document.pictureInPictureElement === 本房 video` 判定、
+    监听 document 的 `enter/leavepictureinpicture`（绑在 video 上会在播放器重建后失效），
+    取的是**当前通道**的 `registry.player.videoElement`（回看时跟随回看播放器）；
+    卡片卸载时若本房仍在小窗里必须 `exitPictureInPicture()` 收口。进入成功后**顺带收起区域放大**
+    （一次点击 = 缩小 + 窗口播放，避免同一路画面在卡片与小窗里各播一份）；`requestPictureInPicture()`
+    需要用户手势且视频须已有画面，失败必须提示用户而不是静默。守卫：
+    `tests/test_frontend_stability_guards.py::test_window_playback_button_uses_native_pip`、
+    夹具 `lsc-electron/src/hooks/usePictureInPicture.test.ts`。
 
 ---
 

@@ -18,6 +18,24 @@ export interface TimelineBufferedRange {
   end: number
 }
 
+/**
+ * DVR 回放窗口的如实口径（显示轴绝对秒）。
+ *
+ * - `start`：**真实**连续缓冲起点——此处向右可立即回放，由 `video.buffered` 决定；
+ * - `configuredStart`：设置里选的时长对应的边界（liveEdge − 配置值），仅作参考；
+ * - `availableSeconds`：当前真实可立即回放的时长；
+ * - `configuredSeconds` / `effectiveSeconds`：设置值与播放器实际保留量
+ *   （配额压力下后者会被缩容，`degraded` 为 true 时 UI 需点明原因）。
+ */
+export interface DvrReplayWindow {
+  start: number
+  configuredStart: number | null
+  availableSeconds: number
+  configuredSeconds: number
+  effectiveSeconds: number
+  degraded: boolean
+}
+
 interface TimelineProps {
   duration: number
   currentTime: number
@@ -53,6 +71,8 @@ interface TimelineProps {
   activeRefine?: { start: number; end: number } | null
   /** DVR 可回看窗口左边界（绝对秒），紫标位置 */
   dvrStart?: number | null
+  /** DVR 窗口如实口径（真实缓冲起点 / 设置边界 / 实际可回放时长 / 配额缩容） */
+  dvrReplay?: DvrReplayWindow | null
   /** @deprecated 保留兼容；紫标已改用 dvrStart */
   recordedEnd?: number | null
   /** 跟随直播沿：播放头钉右；与 ControlBar displayCurrent 一致 */
@@ -213,6 +233,7 @@ export function Timeline({
   windowStart = 0,
   activeRefine,
   dvrStart = null,
+  dvrReplay = null,
   recordedEnd = null,
   followLive = false,
   isScrubbing = false,
@@ -628,7 +649,57 @@ export function Timeline({
   const markerInPct = markIn !== null ? clamp((markIn / effectiveDuration) * 100, 0, 100) : null
   const markerOutPct = markOut !== null ? clamp((markOut / effectiveDuration) * 100, 0, 100) : null
   const hoverPct = hoverTime !== null ? clamp((hoverTime / effectiveDuration) * 100, 0, 100) : null
+  // 如实口径（可为空：由父级传入真实缓冲起点/设置边界/实际可回放时长）
+  const dvrReplayInfo = dvrReplay
+  const configuredMarkerPct = dvrReplayInfo?.configuredStart != null
+    ? clamp(((dvrReplayInfo.configuredStart - ws) / effectiveDuration) * 100, 0, 100)
+    : null
+  // 参考线只在"设置窗口"与"真实可回放起点"明显不同时才画，否则纯噪声
+  const showConfiguredMarker = (
+    configuredMarkerPct != null
+    && dvrReplayInfo != null
+    && Math.abs(dvrReplayInfo.configuredStart! - dvrReplayInfo.start) > 5
+  )
   const dvrStartPct = dvrStart != null ? clamp(((dvrStart - ws) / effectiveDuration) * 100, 0, 100) : null
+  // 「可回放」= 从这个标记到**时间线右沿**的距离（用户能点到、能核对的那一段）。
+  // 直接照搬播放器缓冲深度会大于可见跨度（播放头落后缓冲末端），标签上的数字
+  // 与眼睛量出来的距离对不上，又变成另一种口径不一致。
+  const contentEndAbs = ws + effectiveDuration
+  const availableSec = dvrReplayInfo
+    ? Math.max(0, Math.min(
+      dvrReplayInfo.start + dvrReplayInfo.availableSeconds,
+      contentEndAbs,
+    ) - dvrReplayInfo.start)
+    : null
+  const configuredSec = dvrReplayInfo?.configuredSeconds ?? null
+  // 标签默认以标记为中心；靠近右沿时改为向左展开，避免文字被轨道裁掉
+  const dvrLabelFlip = dvrStartPct != null && dvrStartPct > 70
+  const dvrLabelText = (() => {
+    if (dvrStart == null) return ''
+    const base = availableSec != null && availableSec > 0
+      ? t('即时回放起点 {time} · 可回放 {available}', {
+        time: formatTime(dvrStart),
+        available: formatTime(availableSec),
+      })
+      : t('即时回放起点 {time}', { time: formatTime(dvrStart) })
+    return dvrReplayInfo?.degraded
+      ? `${base}${t('（内存压力已缩减至 {effective}）', { effective: formatTime(dvrReplayInfo.effectiveSeconds) })}`
+      : base
+  })()
+  const dvrLabelTitle = dvrStart == null
+    ? undefined
+    : [
+      t('即时回放起点 {time}：右侧可立即回放；更早录制内容需要加载文件回看', { time: formatTime(dvrStart) }),
+      availableSec != null && availableSec > 0
+        ? t('当前可立即回放 {available}', { available: formatTime(availableSec) })
+        : null,
+      configuredSec != null && configuredSec > 0
+        ? t('设置里的回放时长为 {configured}', { configured: formatTime(configuredSec) })
+        : t('已关闭直播回放，仅保留播放安全缓冲'),
+      dvrReplayInfo?.degraded
+        ? t('内存压力已把缓冲目标缩减到 {effective}', { effective: formatTime(dvrReplayInfo.effectiveSeconds) })
+        : null,
+    ].filter(Boolean).join('；')
 
   const tickStep = Math.max(1, Math.round(tickInterval))
   const quantizedWs = Math.floor(ws / tickStep) * tickStep
@@ -870,10 +941,29 @@ export function Timeline({
                 }`}
                 style={{ left: `${dvrStartPct}%` }}
                 aria-label={t('即时回放起点')}
-                title={t('即时回放起点 {time}：右侧可立即回放；更早录制内容需要加载文件回看', { time: formatTime(dvrStart!) })}
+                title={dvrLabelTitle}
               >
-                <span className="lsc-timeline__record-end-label">{t('即时回放起点')} {formatTime(dvrStart!)}</span>
+                <span
+                  className={`lsc-timeline__record-end-label${
+                    dvrLabelFlip ? ' lsc-timeline__record-end-label--flip' : ''
+                  }`}
+                >
+                  {dvrLabelText}
+                </span>
               </div>
+            )}
+
+            {/* 设置承诺窗口的参考虚线：与真实可回放起点明显不同才画，
+                让"设置 5 分钟、实际 2 分钟"的差额可见（此前只有一条会骗人的紫标） */}
+            {showConfiguredMarker && configuredMarkerPct !== null && (
+              <div
+                className="lsc-timeline__replay-configured"
+                style={{ left: `${configuredMarkerPct}%` }}
+                aria-hidden="true"
+                title={t('设置里的回放时长（{configured}）对应的边界', {
+                  configured: formatTime(configuredSec ?? 0),
+                })}
+              />
             )}
 
             {markerInPct !== null && (

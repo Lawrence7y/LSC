@@ -1003,7 +1003,7 @@ def test_preview_phase_broadcast_and_ui() -> None:
     assert "preview_phase: incoming.preview_phase ?? ui?.preview_phase ?? prev?.preview_phase" in store
 
     workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    dvr_block = workbench.split("const dvrStart = useMemo", 1)[1].split("}, [", 1)[0]
+    dvr_block = workbench.split("const dvrReplay = useMemo", 1)[1].split("}, [", 1)[0]
     assert "preview_phase !== 'streaming'" not in dvr_block
     assert "getRoomBufferedRange" in dvr_block
 
@@ -1215,8 +1215,10 @@ def test_timeline_scrub_can_leave_live_edge() -> None:
 
     seek_body = workbench.split("const mseSeek = useCallback", 1)[1].split("const mseTogglePlayPause", 1)[0]
     # 非拖动回放（点击切片/标记）缓冲外 clamp 到最近可回放位置，保证回放有响应；
-    # quiet（scrub 拖动中）禁止强制 seek 视频，防止拖拽时被拽回 live edge
-    assert "bufEnd - 0.5" in seek_body
+    # quiet（scrub 拖动中）禁止强制 seek 视频，防止拖拽时被拽回 live edge。
+    # 2026-09-15：两个 clamp 出口统一走 clampSeekToRange（含边界容差），
+    # 「能点的范围 = 真能回放的范围」，贴边落点不再误判缓冲外。
+    assert "clampSeekToRange(t, bufStart, bufEnd)" in seek_body
     assert "else if (!quiet)" in seek_body
     assert "scrubOverrideRef.current[roomId]" in seek_body
 
@@ -1277,11 +1279,11 @@ def test_timeline_dvr_start_prop() -> None:
     css = (ROOT / "lsc-electron/src/components/Timeline/Timeline.css").read_text(encoding="utf-8")
     assert "dvrStart" in timeline
     assert "dvrStart=" in control or "dvrStart={" in control
-    # 紫标应对齐 dvrStart（竖线本身，无文案标签）
+    # 紫标应对齐 dvrStart（真实缓冲起点），并如实标注“此处起可立即回放”
     assert "dvrStartPct" in timeline or ("dvrStart" in timeline and "lsc-timeline__record-end" in timeline)
     assert "lsc-timeline__record-end" in css
+    assert "即时回放起点 {time} · 可回放 {available}" in timeline
     assert "不可回放" not in timeline
-    assert "可回放" not in timeline
 
 
 def test_preview_mode_type_exists() -> None:
@@ -1308,14 +1310,14 @@ def test_recording_review_timeline_guards() -> None:
 
     assert "isNoDvrPreviewMode" in workbench
     assert "isRecordingReviewMode" in workbench
-    dvr_block = workbench.split("const dvrStart = useMemo", 1)[1].split("}, [referenceRoomId", 1)[0]
+    dvr_block = workbench.split("const dvrReplay = useMemo", 1)[1].split("}, [referenceRoomId", 1)[0]
     assert "isNoDvrPreviewMode" in dvr_block
 
     assert "setTimelineFollowLive(false)" in workbench
     follow_block = workbench.split("// recording_review / degraded：强制退出 followLive", 1)[1].split("}, [rooms", 1)[0]
     assert "isNoDvrPreviewMode" in follow_block
 
-    timeline_view = workbench.split("const timelineView = useTimelineViewModel", 1)[1].split("const dvrStart = useMemo", 1)[0]
+    timeline_view = workbench.split("const timelineView = useTimelineViewModel", 1)[1].split("const dvrReplay = useMemo", 1)[0]
     assert "recordedDurationHint" in timeline_view or "continuousAnalysisStatus" in timeline_view
     view_model = (ROOT / "lsc-electron/src/utils/timelineViewModel.ts").read_text(encoding="utf-8")
     assert "isRecordingReview" in view_model
@@ -1436,10 +1438,20 @@ def test_websocket_deep_copy_logging_is_dev_only() -> None:
 
 
 def test_mse_preview_debug_is_off_by_default() -> None:
-    """开发模式也不默认打开每分片 MsePlayer 日志，避免主进程磁盘被打满。"""
+    """MsePlayer 每分片日志默认必须关闭（避免主进程磁盘被打满）。
+
+    2026-09-15：改为显式 opt-in 形式（devtools 里 localStorage.setItem('lsc.mseDebug','1')）。
+    默认仍是关；现场排查「预览恢复失败」这类事故时可在不改代码的前提下拿到完整追踪。
+    """
     source = (ROOT / "lsc-electron/src/components/VideoPreview.tsx").read_text(encoding="utf-8")
     ctor = source.split("new MsePlayer({", 1)[1].split("onStateChange", 1)[0]
-    assert "debug: false" in ctor or "debug:false" in ctor.replace(" ", "")
+    default_off = (
+        "debug: false" in ctor
+        or "debug:false" in ctor.replace(" ", "")
+        or "localStorage.getItem('lsc.mseDebug') === '1'" in ctor
+    )
+    assert default_off, "播放器追踪必须默认关闭（只允许显式 opt-in）"
+    assert "debug: true" not in ctor, "禁止无条件打开每分片日志"
 
 
 def test_workbench_preview_position_poll_is_500ms() -> None:
@@ -1730,17 +1742,146 @@ def test_timeline_1x_zero_and_dvr_lookback_contract() -> None:
     assert "readLiveEdgeDisplay" in control
 
 
-def test_dvr_purple_line_uses_configured_replay_window() -> None:
-    """2026-09-10 回归：DVR 紫线左界须按用户配置的回放时长展示。
+def test_dvr_purple_line_reports_real_buffer_start() -> None:
+    """2026-09-15 口径收敛：主时间线紫标 = **真实缓冲起点**，设置窗口只作参考虚线。
 
-    旧实现对紫线取 `Math.max(buf.start, liveEdge − replaySeconds)`：当 MSE 连续
-    缓存深度小于配置值（常见）时，紫线被钳到 buf.start，用户看到的可回放时长
-    「明显少于设置值」。超出缓冲的点击/拖动由 mseSeek 自动切换录制文件回看，
-    因此按配置时长展示是安全的。
+    2026-09-10 的实现把紫标画在 `liveEdge − 用户设置时长` 上，并在 tooltip 里承诺
+    “右侧可立即回放”；实测设置 300s、真实缓冲 157s 时标签到右沿 190s，承诺为假，
+    用户量出来的距离与标签数字对不上。现在：紫标/文案 = buf.start（此处起可立即
+    回放为真），设置承诺窗口另画一条淡虚线（configuredStart）。
     """
     source = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
-    assert "computeDvrLeftEdge(buf.end, timelineReplaySeconds)" in source
-    assert "Math.max(buf.start, computeDvrLeftEdge(" not in source
+    assert "start: Math.max(0, buf.start)" in source
+    assert "const configuredStart = configuredSeconds > 0" in source
+    assert "computeDvrLeftEdge(buf.end, configuredSeconds)" in source
+
+
+def test_window_playback_button_uses_native_pip() -> None:
+    """放大预览新增「缩小为窗口播放」= 原生画中画，且与「缩小回网格」一眼可辨。
+
+    产品诉求：放大后需要一个“把画面放进悬浮小窗继续看”的出口（原生 PiP 支持跨应用常驻，
+    自绘悬浮窗做不到，也不该把 MSE 分片再喂一份）；按键必须紧挨现有按键、跟随控制条的
+    向下隐藏行为，并与「缩小回网格」做差异化，让用户第一眼就看出两者的区别。
+    """
+    room = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    hook = (ROOT / "lsc-electron/src/hooks/usePictureInPicture.ts").read_text(encoding="utf-8")
+
+    # 原生能力：requestPictureInPicture / document 级单例判定 / 卸载收口
+    assert "video.requestPictureInPicture()" in hook
+    assert "document.pictureInPictureElement === video" in hook
+    assert "document.exitPictureInPicture?.()" in hook
+    assert "usePictureInPicture(" in room
+
+    # 按键定义：同一套玻璃按钮语汇 + 差异化的画中画图标/文字/品牌青描边
+    assert "room-card__pip-btn" in room
+    assert "PiPWindowGlyph" in room
+    assert "t('窗口播放')" in room
+    # 与「缩小回网格」差异化：不得复用向内收拢的 ShrinkOutlined，也不是向外发散的 Fullscreen
+    pip_block = room.split("const pipBtn = (", 1)[1].split("  return (", 1)[0]
+    assert "ShrinkOutlined" not in pip_block
+    assert "FullscreenOutlined" not in pip_block
+    assert "<svg" in room and "viewBox=\"0 0 16 16\"" in room
+    # 「缩小」旧 tooltip 里的“窗口播放”必须改掉，否则两个按钮语义撞车
+    assert "t('缩小（窗口播放）')" not in room
+    assert "t('缩小（回到网格，不改变播放）')" in room
+
+    # 位置：在放大态控制条内、紧跟缩小按钮之后（`{pipBtn}` 在缩小与全屏之间）
+    actions = room.split("room-card__expanded-actions", 1)[1]
+    assert "{pipBtn}" in actions
+    shrink_idx = actions.index("onCollapse?.(room.room_id)")
+    pip_idx = actions.index("{pipBtn}")
+    full_idx = actions.index("onBrowserFullscreen?.(room.room_id)")
+    assert shrink_idx < pip_idx < full_idx
+
+    # 行为：进入小窗后顺带收起区域放大（一次点击 = 缩小 + 窗口播放），退出只退小窗
+    handler = room.split("const handleTogglePip = async () => {", 1)[1].split("\n  }", 1)[0]
+    assert "await togglePip()" in handler
+    assert "if (!wasActive) onCollapse?.(room.room_id)" in handler
+    assert "message.warning(" in handler
+
+    # 跟随自动隐藏：按钮在控制条内（同一块面板），显隐由 --shown/hover 统一控制
+    controls_css = (ROOT / "lsc-electron/src/pages/Workbench/Workbench.css").read_text(encoding="utf-8")
+    assert ".room-card__pip-btn {" in controls_css
+    assert ".room-card__pip-btn--active," in controls_css
+    assert ".room-card__pip-glyph {" in controls_css
+
+
+def test_expanded_preview_controls_autohide_as_one_panel() -> None:
+    """放大预览的「时间线 + 走带按键」是一整块控制条：默认向下隐藏，鼠标经过滑出。
+
+    现场诉求：放大后的底部时间线 + 按键常驻压住画面；且两者视觉上是两段（时间线一行、
+    按键一行各自留白），不像一个整体。现在合成一块玻璃面板，默认 translateY(100%) 滑出
+    卡片（卡片 overflow:hidden 裁掉 + opacity 0 + pointer-events:none），鼠标经过/移动
+    时滑出，静止 2.5s 自动收起；拖动时间线、画质下拉打开期间钉住，键盘焦点在条内由
+    `:focus-within` 兜底。
+    """
+    room = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    assert "EXPANDED_CONTROLS_IDLE_MS" in room
+    assert "useAutoHideControls({" in room
+    assert "room-card__expanded-controls--shown" in room
+    # 显隐信号必须挂在「预览画面 + 控制条」的公共祖先（Card）上：挂在预览容器上时，
+    # 指针从画面移向控制条会先触发 pointerleave，把条在用户伸手去点的那一刻藏掉。
+    # 取 <Card ...> 开标签本身（不能用 split(">")：属性里的箭头函数 => 会提前截断）
+    card_block = room.split("<Card", 1)[1].split("className={", 1)[0]
+    assert "onPointerEnter={revealExpandedControls}" in card_block
+    assert "onPointerMove={revealExpandedControls}" in card_block
+    assert "onPointerLeave={hideExpandedControls}" in card_block
+    # 交互期间钉住
+    assert "setExpandedControlsDragging(true)" in room
+    assert "setExpandedControlsDragging(false)" in room
+    assert "pinned: expandedControlsDragging || (qualityOpen && isExpanded)" in room
+    assert "onOpenChange={(open) => {" in room
+    # 时间线与按键行必须在同一块面板内，按键行不再自带 padding/底色
+    controls_block = room.split("room-card__expanded-controls", 1)[1]
+    assert "room-card__expanded-timeline" in controls_block
+    assert "room-card__expanded-actions" in controls_block
+    assert "justifyContent: 'space-between', padding: '4px 8px 6px'" not in room
+
+    css = (ROOT / "lsc-electron/src/pages/Workbench/Workbench.css").read_text(encoding="utf-8")
+    controls_css = css.split(".room-card__expanded-controls {", 1)[1].split("}", 1)[0]
+    assert "transform: translateY(100%);" in controls_css
+    assert "opacity: 0;" in controls_css
+    assert "pointer-events: none;" in controls_css
+    reveal_css = css.split(".room-card__expanded-controls--shown,", 1)[1].split("}", 1)[0]
+    assert ".room-card__expanded-controls:hover," in reveal_css
+    assert ".room-card__expanded-controls:focus-within" in reveal_css
+    assert "transform: translateY(0);" in reveal_css
+    # 旧的“挂载即滑入且常驻”动画必须彻底移除
+    assert "roomCardControlsSlideUp" not in css
+
+    hook = (ROOT / "lsc-electron/src/hooks/useAutoHideControls.ts").read_text(encoding="utf-8")
+    assert "clearTimeout(timerRef.current)" in hook
+    assert "}, [enabled, hide])" in hook
+
+
+def test_preview_bar_seekable_range_equals_replayable_range() -> None:
+    """2026-09-15 现场回归：放大预览条「能点的范围」必须等于「真能回放的范围」。
+
+    现场（20:22:08 日志）：设置 300s、真实缓冲只有 [308.1, 465.2]（157s），用户点
+    283.1s —— 落在画出来的“设置窗口”内、真实缓冲外，mseSeek 于是切到本地文件回看
+    通道，预览区一直显示「正在准备回看…」，一次普通点击白等数秒。修法：
+      · 窗口左端 = max(真实缓冲起点, liveEdge − 设置时长)，设置值只作上限；
+      · 预览条所有 seek 落点收进可回放范围（clampSeekToRange）；
+      · mseSeek 对贴边落点给容差（isWithinSeekRange），不再误判缓冲外；
+      · 删掉放大预览区的「回看设置 X · 实际可回放 Y」两个时长文案。
+    """
+    window = (ROOT / "lsc-electron/src/utils/timelineWindow.ts").read_text(encoding="utf-8")
+    assert "const start = hasBuffer ? Math.max(bufStart as number, settingStart) : settingStart" in window
+    assert "configuredReplaySeconds" not in window
+    assert "availableReplaySeconds" not in window
+    assert "export function isWithinSeekRange(" in window
+    assert "export function clampSeekToRange(" in window
+
+    room = (ROOT / "lsc-electron/src/pages/Workbench/components/RoomCard.tsx").read_text(encoding="utf-8")
+    assert "回看设置" not in room
+    assert "实际可回放" not in room
+    assert "room-card__expanded-replay-info" not in room
+    # 指针拖动/键盘两处落点都必须过收口函数
+    assert room.count("clampSeekToRange(") >= 2
+
+    workbench = (ROOT / "lsc-electron/src/pages/Workbench/index.tsx").read_text(encoding="utf-8")
+    assert "isWithinSeekRange(t, bufStart, bufEnd)" in workbench
+    assert "clampSeekToRange(t, bufStart, bufEnd)" in workbench
 
 
 def test_timeline_playhead_clamps_to_dvr_left_edge() -> None:

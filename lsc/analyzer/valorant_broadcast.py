@@ -45,6 +45,19 @@ BROADCAST_BOUNDARY_REFINE_SEC = 6.0
 #   lookback=45 → accepted, end=803.25, broadcast_exclusion, precise
 #   lookback=60 → 同上
 BROADCAST_AUDIT_TAIL_LOOKBACK_SEC = 60.0
+# 弱出点候选的「向前回扫」取证预算（秒）。
+#
+# 为什么需要：OCR 以 next_combat / open_tail 闭合时，出点常比真出点晚 30-80s
+# （赛后回放 + 买枪都很长）。尾窗只从 end-60 开始，真出点之前的转场
+# （combat -> replay/result/non_game/buy）若早于该点就完全落在窗外：
+# _first_stable_exclusion 认不出边界 -> reason=none -> 过晚的粗出点被
+# pending_no_exclusion 当成终态保留（切片尾部把整段回放和买枪一起切进去，
+# 用户侧表现为「边界不准 + 永远待确认」）。
+# 把回看从 30s 放宽到 60s 只救回「差一点」的候选；本常量把这类取证升级为
+# **有界向前回扫**：复用既有的 fallback_full_* 游标机制，每步仍受
+# max_media_step_sec 约束，定稿前必须把该候选自己的区间扫完，否则不得盖章
+# pending_no_exclusion。上限只是安全阀（非分裂候选跨度 <= 150s，回扫空间天然 <= 90s）。
+BROADCAST_AUDIT_BACKWARD_SWEEP_MAX_SEC = 150.0
 AUDIT_MICRO_STEP_SEC = 18.0
 NEXT_PREP_COMBAT_VETO_WINDOW_SEC = 8.0
 # 分裂块专用：截断点之后重新出现的满钟阈值（与 OCR FSM _NEW_ROUND_CLOCK_MIN 同值）。
@@ -888,6 +901,53 @@ def _start_window_replay_evidence(
     return False
 
 
+# 入点门禁窗口内的「结构性否定」证据阈值：标签属于终态（回放/非游戏/结算）且连续
+# 出现至少这么多帧，才认定「起点确实落在非交战内容里」（有证据的拒绝）。
+_START_GATE_TERMINAL_EVIDENCE_FRAMES = 2
+
+
+def _start_window_evidence(
+    samples: list[tuple[float, str, float]] | None,
+    *,
+    start: float,
+    window: float,
+) -> str | None:
+    """门禁窗口内是否存在**结构性否定**证据（回放 / 非游戏 / 结算）。
+
+    存在的意义（2026-09-15，P1-4）：``no_stable_combat``（窗口里找不到稳定 combat
+    锚点）有两种完全不同的成因，必须分开处置 ——
+
+    - **有证据的否定**：窗口里出现连续 >=2 帧 ``replay``/``non_game``/``result``
+      ⇒ 起点确实落在上一回合的回放尾段/结算画面里，这是既有拒绝路径的目标形态
+      （旧实现整条 ``rejected_no_stable_combat_start`` 拒绝是正确的）；
+    - **模型不确定**：窗口里只有 ``unknown``（或 ``buy`` 这类非终态标签）⇒
+      模型看不清，不等于候选是假的。旧实现把两者一起拒绝，而拒绝是终态、
+      人工确认也不复活，于是「交战在起点之后 15-35s 才开始」「前段画面模型读不准」
+      的真实回合被永久丢弃（现场：漏回合投诉的主要成因之一）。
+
+    返回拒绝理由字符串；无结构性证据返回 ``None``（= 不确定）。
+    """
+    if not samples:
+        return None
+    try:
+        lower = float(start) - 0.5
+        upper = float(start) + max(0.0, float(window)) + 0.5
+    except (TypeError, ValueError):
+        return None
+    run = 0
+    for ts, label, _confidence in samples:
+        point = float(ts)
+        if point < lower or point > upper:
+            continue
+        if str(label) in _TERMINAL_LABELS:
+            run += 1
+            if run >= _START_GATE_TERMINAL_EVIDENCE_FRAMES:
+                return "replay_at_start"
+            continue
+        run = 0
+    return None
+
+
 def _apply_start_visual_confidence(
     item: dict[str, Any],
     samples: list[tuple[float, str, float]] | None,
@@ -938,6 +998,20 @@ def _a5_window_cap(item: dict[str, Any], *, start: float, end: float) -> float |
     if not starts:
         return None
     return min(starts) + A5_WINDOW_CAP_MARGIN_SEC
+
+
+def _weak_ocr_end(item: dict[str, Any]) -> bool:
+    """OCR 出点是否缺少强证据（可能晚到下一回合满钟/文件尾，需要向前回扫取证）。
+
+    - next_prep / buy_phase：真出点就在其附近，或已由 next_prep_invalidated 走
+      90s 扩窗路径 -> 不需要向前回扫；
+    - result_ts 存在：尾窗左界已按 result_ts-10 锚定（转场必在窗内）-> 同样不需要；
+    - next_combat / open_tail：只说明后面还有内容，不能证明切点没落在回放/买枪里
+      —— 这正是「真出点在尾窗之前 60s 以外」的形态。
+    """
+    if item.get("result_ts") is not None:
+        return False
+    return str(item.get("end_by") or "").strip().lower() not in {"next_prep", "buy_phase"}
 
 
 def _effective_lookahead_sec(
@@ -1071,6 +1145,442 @@ def _expand_oversize_candidates(
         expanded.append(last_chunk)
     return expanded
 
+
+# 同父分裂碎片「头尾合并」：只补偿丢失的回合前半段，不放宽任何出点判据。
+#
+# 现场（2026-09-14，round-000070）：真实回合 791.6-930.8（139s），被
+# MAX_BROADCAST_ROUND_SEC=150 切成两半**独立审计**：
+#   * 头碎片 791.6-845.6 → 头内找不到出点证据（845.6 只是块边界，不是回合结束）
+#     → pending_no_exclusion → 导出门禁丢弃；
+#   * 尾碎片 845.6-963.6 → 审计出真出点 930.75（result_ts 928.609 + 2.5s 结算尾）
+#     → passed / broadcast_exclusion。
+# 最终导出的是"同一真实回合的后半段"（845.6-930.75，85s），**前半段 54s 丢失**，
+# 切片从回合中间开始。这里把头碎片的（已过入点门禁的）起点并回尾碎片，
+# 出点仍取尾碎片的审计结论——起点证据取自头、出点证据取自尾，不伪造任一边界。
+_SPLIT_MERGE_GAP_SEC = 2.0  # 头尾相接容差（块边界同点，实测 gap=0）
+_SPLIT_MERGE_MIN_EXTEND_SEC = 5.0  # 至少能往前扩这么多才有意义
+# 允许被合并的"头碎片"必须是**未定论**（没拿到自己的出点证据）：它既没被拒
+# （被拒说明入点/区间有问题，不能把它的起点并进别人的回合），也没 accepted
+# （accepted 说明它自己就是一个真实回合，那就该各成一片，不许粘连）。
+_SPLIT_HEAD_INCONCLUSIVE_AUDITS = frozenset({
+    "pending_no_exclusion",
+    "pending_lookahead",
+    "skipped",
+})
+# 合并后从"头碎片"继承的起点字段：合并起点 == 头碎片起点，故这些字段必须一起搬，
+# 否则 start/start_coarse/start_refined 互相矛盾（例如 start 早于 start_coarse）。
+_SPLIT_MERGE_START_FIELDS = (
+    "start",
+    "start_coarse",
+    "start_refined",
+    "start_delta",
+    "start_confidence",
+    "start_confidence_source",
+    "start_by",
+    "start_quality",
+    "start_review_required",
+    "broadcast_start_gate",
+    "broadcast_start_gate_from",
+    "broadcast_start_gate_to",
+    "broadcast_start_gate_scan_end",
+    "broadcast_start_gate_detail",
+)
+
+
+def _split_family_base_key(round_key: object) -> str:
+    """``round-000070-s1`` → ``round-000070``；非分裂子块返回空串。"""
+    key = str(round_key or "").strip()
+    if not key:
+        return ""
+    base, sep, suffix = key.rpartition("-s")
+    if not sep or not suffix.isdigit() or not base:
+        return ""
+    return base
+
+
+def _split_fragment_index(item: dict[str, Any]) -> int | None:
+    if not item.get("split_from_oversize"):
+        return None
+    try:
+        return int(item.get("split_index"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _numeric(item: dict[str, Any], key: str) -> float | None:
+    try:
+        value = item.get(key)
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_merge_geometry_ok(head: dict[str, Any], tail: dict[str, Any]) -> bool:
+    """合并的几何判据（不含任何结论判据）——台账链式传递也复用它。"""
+    head_end = _numeric(head, "end")
+    tail_start = _numeric(tail, "start")
+    head_start = _numeric(head, "start")
+    tail_end = _numeric(tail, "end")
+    if None in (head_end, tail_start, head_start, tail_end):
+        return False
+    # 头尾相接（块边界同点）——不接纳中间隔着内容的碎片，避免把两段拼成假回合
+    if abs(head_end - tail_start) > _SPLIT_MERGE_GAP_SEC:
+        return False
+    # 扩展量有意义，且合并后不越过"超长回合"红线（>150s 本身就是异常形态）
+    if tail_start - head_start < _SPLIT_MERGE_MIN_EXTEND_SEC:
+        return False
+    merged_duration = tail_end - head_start
+    if merged_duration < MIN_ACTIVE_SEC or merged_duration > MAX_BROADCAST_ROUND_SEC:
+        return False
+    # 头碎片的起点必须是 OCR 交战锚点（不是门禁后移前的位置推算）
+    if str(head.get("start_by") or "").strip().lower() not in ("ocr_combat", "refined_combat"):
+        return False
+    return True
+
+
+def _can_absorb_split_head(head: dict[str, Any], tail: dict[str, Any]) -> bool:
+    """头碎片能否并入尾碎片（结论判据 + 几何判据，任一不满足即保持现状）。"""
+    if tail.get("split_merged"):
+        return False  # 幂等：已合并过的尾碎片不再重复吸收
+    if str(tail.get("broadcast_audit") or "").lower() != "passed":
+        return False
+    if str(tail.get("end_by") or "").lower() != "broadcast_exclusion":
+        return False
+    if str(tail.get("end_quality") or "").lower() != "precise":
+        return False
+    if tail.get("end_review_required"):
+        return False
+    if str(head.get("broadcast_audit") or "").lower() not in _SPLIT_HEAD_INCONCLUSIVE_AUDITS:
+        return False
+    return _split_merge_geometry_ok(head, tail)
+
+
+def _absorb_split_head(tail: dict[str, Any], head: dict[str, Any]) -> None:
+    """把尾碎片的起点并回头的起点，并留下可追溯的合并来源。"""
+    original_start = _numeric(tail, "start")
+    for field in _SPLIT_MERGE_START_FIELDS:
+        if field in head:
+            tail[field] = head[field]
+    tail["split_merged"] = True
+    absorbed = [str(head.get("round_key") or "")]
+    chained = head.get("chained_from")
+    if isinstance(chained, list):
+        # 链式：起点其实来自更早的碎片（如 s2 借的是 s1 记录的 s0 起点），
+        # 来源必须把中间碎片一起列出来，否则无法从字段回溯真实起点出处。
+        absorbed.extend(str(key) for key in chained if str(key) not in absorbed)
+    tail["split_merged_from"] = absorbed
+    tail["split_merged_original_start"] = original_start
+    tail["split_merged_gap_sec"] = round(
+        abs(float(_numeric(head, "end") or 0.0) - float(original_start or 0.0)), 3
+    )
+    # 头碎片若在**本批**里（真实 item），标注被接管；若来自台账（跨批，头碎片
+    # 早已交付过），这里只改到临时还原的 dict，真实条目靠 tail 的合并来源字段回溯。
+    # 无论哪条路径都不改 broadcast_audit——门禁的失败关闭语义必须原样保留。
+    head["superseded_by_round_key"] = str(tail.get("round_key") or "")
+    head["broadcast_audit_reason"] = "superseded_by_split_merge"
+
+
+# 分裂族台账存进 audit_cache 的专用键（前缀限制在候选 key 命名空间之外）。
+# 必须跨调用存活：正常运行期 `deferred_audit=True`（room_handler:7520），审计由
+# 后台微步骤**一次只推进一个子块**（audit_targets = expanded_rounds[:1]），
+# 头尾碎片根本不在同一批里——同批合并覆盖不到主路径，故需要台账。
+_SPLIT_FAMILY_CACHE_KEY = "__split_family_ledger__"
+
+# 已定稿「真实回合」跨度台账（同样存 audit_cache）：收尾缺口补扫据此排除已覆盖区间。
+#
+# 为什么必须放 audit_cache（而不是某个调用方的 runtime_state）：正常运行期
+# `deferred_audit=True`，**插件不审计**，定稿由 room_handler 的后台微步完成；收尾期
+# 又是插件在同步审计。两条路径都调本函数，而 audit_cache 是两条路径共享的同一份
+# （`_rs_state['broadcast_audit_cache']`）⇒ 只有写在这里，补扫才看得见另一条路径的结论。
+# 现场（2026-09-14）：round-000015-s0(154.1-246.7)、round-000071-s0(712.2-802.2) 由
+# 后台路径在 11:43/11:52 定稿，11:54 收尾补扫仍把 153-257 / 711-813 判为"无候选"
+# 并合成新候选（最终以父键定稿）⇒ 同一回合两条重叠条目。
+_FINALIZED_SPANS_CACHE_KEY = "__finalized_round_spans__"
+_FINALIZED_SPANS_MAX = 128
+
+
+def _is_finalized_round(item: dict[str, Any]) -> bool:
+    """是否已定稿为**真实回合**（passed）。
+
+    只认 passed：只有"这段确实有回合"才足以把它从补扫缺口里去掉。被拒的区间
+    **保持可补扫**——那正是缺口补扫这张网的意义（宁可多扫一次，也不要因为一条
+    拒绝结论把后面真漏掉的回合永久遮住）。
+    """
+    return str(item.get("broadcast_audit") or "").strip().lower() == "passed"
+
+
+def _remember_finalized_spans(
+    audit_cache: dict[str, Any] | None,
+    items: Iterable[dict[str, Any]],
+) -> None:
+    """把已定稿真实回合的跨度记进 audit_cache（去重 + 有界）。"""
+    if not isinstance(audit_cache, dict):
+        return
+    spans = audit_cache.get(_FINALIZED_SPANS_CACHE_KEY)
+    if not isinstance(spans, list):
+        spans = []
+    changed = False
+    for item in items:
+        if not isinstance(item, dict) or not _is_finalized_round(item):
+            continue
+        try:
+            start = float(item.get("start"))
+            end = float(item.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        span = [round(start, 3), round(end, 3)]
+        if span not in spans:
+            spans.append(span)
+            changed = True
+    if changed:
+        audit_cache[_FINALIZED_SPANS_CACHE_KEY] = spans[-_FINALIZED_SPANS_MAX:]
+
+
+def finalized_spans(audit_cache: dict[str, Any] | None) -> list[list[float]]:
+    """已定稿真实回合的跨度（供收尾缺口补扫排除已覆盖区间）。"""
+    if not isinstance(audit_cache, dict):
+        return []
+    spans = audit_cache.get(_FINALIZED_SPANS_CACHE_KEY)
+    if not isinstance(spans, list):
+        return []
+    out: list[list[float]] = []
+    for span in spans:
+        if isinstance(span, (list, tuple)) and len(span) >= 2:
+            try:
+                out.append([float(span[0]), float(span[1])])
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _split_head_record(item: dict[str, Any]) -> dict[str, Any]:
+    """台账里保存的"头碎片事实"：足以让后续批次沿用它的起点。"""
+    return {
+        "round_key": str(item.get("round_key") or ""),
+        "end": _numeric(item, "end"),
+        "audit": str(item.get("broadcast_audit") or "").lower(),
+        "start_fields": {
+            field: item[field] for field in _SPLIT_MERGE_START_FIELDS if field in item
+        },
+    }
+
+
+def _split_head_from_record(record: Any) -> dict[str, Any] | None:
+    """把台账记录还原成"头碎片形状"的 dict，复用同一套判据与合并实现。"""
+    if not isinstance(record, dict):
+        return None
+    start_fields = record.get("start_fields")
+    if not isinstance(start_fields, dict):
+        return None
+    head = dict(start_fields)
+    head["round_key"] = record.get("round_key")
+    head["end"] = record.get("end")
+    head["broadcast_audit"] = record.get("audit")
+    chained = record.get("chained_from")
+    if isinstance(chained, list):
+        head["chained_from"] = list(chained)
+    return head
+
+
+def _split_family_ledger(audit_cache: dict[str, Any] | None) -> dict[str, Any]:
+    """取（必要时创建）分裂族台账。audit_cache 为 None 时返回空台账（不跨调用）。"""
+    if not isinstance(audit_cache, dict):
+        return {}
+    ledger = audit_cache.get(_SPLIT_FAMILY_CACHE_KEY)
+    if not isinstance(ledger, dict):
+        ledger = {}
+        audit_cache[_SPLIT_FAMILY_CACHE_KEY] = ledger
+    return ledger
+
+
+def _record_split_fragment(ledger: dict[str, Any], item: dict[str, Any]) -> None:
+    """把本碎片记进台账，并把"有效起点"沿族链传递。
+
+    链式传递是必要的：3 块以上的族里，中段碎片自己可能也**未定论**，但它仍
+    承接了更前面碎片的起点。台账记"有效起点"（而非碎片自身起点），最后的
+    定稿尾碎片才能一次借到整族最前面的真实起点；否则链断在中段、前半段依旧丢失。
+    结论判据不参与链式传递（它只决定"能否导出"，不决定"这一族的真实起点在哪"）。
+    """
+    if not isinstance(ledger, dict):
+        return
+    index = _split_fragment_index(item)
+    base = _split_family_base_key(item.get("round_key"))
+    if index is None or not base:
+        return
+    record = _split_head_record(item)
+    if index > 0:
+        prev_head = _split_head_from_record((ledger.get(base) or {}).get(index - 1))
+        current_flat = _split_head_from_record(record)
+        # 注意：判据吃的是**扁平** dict（start/end/start_by 在顶层），
+        # 台账记录是嵌套结构，必须先还原再判，否则 _numeric 全取到 None、链式静默失效。
+        if (
+            prev_head is not None
+            and current_flat is not None
+            and _split_merge_geometry_ok(prev_head, current_flat)
+        ):
+            record["start_fields"] = {
+                field: prev_head[field]
+                for field in _SPLIT_MERGE_START_FIELDS
+                if field in prev_head
+            }
+            record["chained_from"] = [
+                str(prev_head.get("round_key") or ""),
+                *(prev_head.get("chained_from") or []),
+            ]
+    ledger.setdefault(base, {})[index] = record
+
+
+def _merge_split_family_fragments(
+    items: list[dict[str, Any]],
+    sink: list[BroadcastAuditOutcome] | None = None,
+) -> int:
+    """同父分裂碎片合并（返回合并条数）。见本段顶部现场说明。"""
+    families: dict[str, dict[int, dict[str, Any]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        index = _split_fragment_index(item)
+        if index is None:
+            continue
+        base = _split_family_base_key(item.get("round_key"))
+        if not base:
+            continue
+        # 同族同 index 只保留一个（重复 key 不应出现；出现则先到者胜，保持确定性）
+        families.setdefault(base, {}).setdefault(index, item)
+
+    merged = 0
+    touched: list[dict[str, Any]] = []
+    for base, by_index in families.items():
+        for index in sorted(by_index):
+            head = by_index.get(index)
+            tail = by_index.get(index + 1)
+            if head is None or tail is None or head is tail:
+                continue
+            if not _can_absorb_split_head(head, tail):
+                continue
+            original_tail_start = _numeric(tail, "start")
+            _absorb_split_head(tail, head)
+            touched.extend((tail, head))
+            merged += 1
+            new_start = _numeric(tail, "start")
+            _log.warning(
+                "赛事分裂碎片头尾合并: %s + %s -> %.1f-%.1f (补回 %.1fs 前半段), "
+                "出点仍取尾碎片审计结论 end_by=%s",
+                head.get("round_key"),
+                tail.get("round_key"),
+                float(new_start or 0.0),
+                float(_numeric(tail, "end") or 0.0),
+                float(original_tail_start or 0.0) - float(new_start or 0.0),
+                tail.get("end_by"),
+            )
+
+    if merged and sink:
+        # outcome 在记录时做了浅拷贝（``dict(candidate)``），且 dataclass 是 frozen
+        # ⇒ 只能按 key 重建 outcome，否则调用方拿到的是合并前的旧边界
+        # （「审计结果永不丢失」的反面）。
+        by_key = {
+            str(item.get("round_key") or ""): item
+            for item in touched
+            if isinstance(item, dict)
+        }
+        for index, outcome in enumerate(sink):
+            candidate = getattr(outcome, "candidate", None)
+            if not isinstance(candidate, dict):
+                continue
+            current = by_key.get(str(candidate.get("round_key") or ""))
+            if current is None:
+                continue
+            sink[index] = BroadcastAuditOutcome(
+                status=outcome.status,
+                candidate=current,
+                reason=outcome.reason,
+                retry_after_duration=outcome.retry_after_duration,
+            )
+    return merged
+
+
+def _split_tail_is_authoritative(item: dict[str, Any]) -> bool:
+    return (
+        str(item.get("broadcast_audit") or "").lower() == "passed"
+        and str(item.get("end_by") or "").lower() == "broadcast_exclusion"
+        and str(item.get("end_quality") or "").lower() == "precise"
+        and not item.get("end_review_required")
+    )
+
+
+def _reconcile_split_family_fragments(
+    items: list[dict[str, Any]],
+    audit_cache: dict[str, Any] | None,
+    sink: list[BroadcastAuditOutcome] | None = None,
+) -> int:
+    """分裂族合并（返回合并条数）：同批成对 + 跨批台账。
+
+    为什么必须两路都做：正常运行期 `deferred_audit=True`，审计由后台微步骤
+    **一次推进一个子块**，头碎片与尾碎片天然不在同一批；只在同批里合并等于
+    在主路径上不生效。台账（存 audit_cache，按房间跨调用存活）保存头碎片的
+    "起点事实"，待尾碎片在后续批次定稿时再补回前半段。
+
+    只做一件事：把**头碎片的起点**接到尾碎片上。出点永远取尾碎片自己的审计
+    结论，任何一边都不伪造——头碎片仍以原来的未定论状态入列（不导出）。
+    """
+    merged = _merge_split_family_fragments(items, sink)
+    if not isinstance(audit_cache, dict):
+        # 没有 audit_cache（个别调用方不传）⇒ 无法跨批；同批合并已经做完
+        return merged
+    ledger = _split_family_ledger(audit_cache)
+
+    newly_merged: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        index = _split_fragment_index(item)
+        base = _split_family_base_key(item.get("round_key"))
+        if index is None or not base:
+            continue
+        # 尾碎片在后续批次定稿：用台账里 index-1 的起点事实补回前半段
+        if index > 0 and not item.get("split_merged") and _split_tail_is_authoritative(item):
+            record = (ledger.get(base) or {}).get(index - 1)
+            head = _split_head_from_record(record)
+            if head is not None and _can_absorb_split_head(head, item):
+                original_tail_start = _numeric(item, "start")
+                _absorb_split_head(item, head)
+                newly_merged.append(item)
+                merged += 1
+                new_start = _numeric(item, "start")
+                _log.warning(
+                    "赛事分裂碎片跨批合并: %s(台账) + %s -> %.1f-%.1f (补回 %.1fs 前半段), "
+                    "出点仍取尾碎片审计结论 end_by=%s",
+                    head.get("round_key"),
+                    item.get("round_key"),
+                    float(new_start or 0.0),
+                    float(_numeric(item, "end") or 0.0),
+                    float(original_tail_start or 0.0) - float(new_start or 0.0),
+                    item.get("end_by"),
+                )
+
+    for item in items:
+        _record_split_fragment(ledger, item)
+
+    if newly_merged and sink:
+        by_key = {
+            str(item.get("round_key") or ""): item for item in newly_merged
+        }
+        for index, outcome in enumerate(sink):
+            candidate = getattr(outcome, "candidate", None)
+            if not isinstance(candidate, dict):
+                continue
+            current = by_key.get(str(candidate.get("round_key") or ""))
+            if current is None:
+                continue
+            sink[index] = BroadcastAuditOutcome(
+                status=outcome.status,
+                candidate=current,
+                reason=outcome.reason,
+                retry_after_duration=outcome.retry_after_duration,
+            )
+    return merged
 
 
 def _fill_pending_for_undecided(
@@ -1366,6 +1876,16 @@ def audit_broadcast_rounds(
                     reason="no_stable_combat_start",
                 )
                 continue
+        if cache_item is not None and cache_item.get("start_gate_inconclusive"):
+            # 入点结论是「模型不确定」（见下方 inconclusive 分支）：门禁窗口在过去，
+            # 证据不会变，本轮不必重判，但标记必须每轮都带上 —— 否则尾部审计的
+            # pending 分支会让候选看起来像「入点已通过」，最终盖章时又会把
+            # confirm_status 改回 vision_confirmed（变成可自动导出）。
+            item["broadcast_start_gate"] = "inconclusive"
+            item["broadcast_start_gate_scan_end"] = cache_item.get("start_gate_scan_end")
+            item["start_quality"] = "coarse"
+            item["start_review_required"] = True
+            item["broadcast_review_required"] = True
         # 复用在之前在线轮次已完成的入点门禁结论：在线阶段常先返回
         # pending_lookahead，后移后的起点必须跨重试保留，否则重审会用回
         # 原始的（错误）起点。
@@ -1569,12 +2089,94 @@ def audit_broadcast_rounds(
                     start=start,
                     split_from_oversize=bool(item.get("split_from_oversize")),
                 )
-                # 普通候选不做 15s→35s 扩展：起点不是真实 combat 就当场拒绝，
+                # P1-4（2026-09-15）：起点缺少稳定 combat 锚点时先分清「有证据的
+                # 否定」与「模型不确定」——结构性否定证据（回放/非游戏/结算）在窗口
+                # 里出现才算证据；只有 unknown/buy 这类非终态标签时，模型看不清 ≠
+                # 候选是假的，不许直接判死。不确定时先把门禁窗 15s→35s 再判一次
+                # （样本续存 start_gate_samples，重判只多抽 ≤20s 媒体）。
+                _gate_terminal_evidence = _start_window_evidence(
+                    decision_samples,
+                    start=original_start,
+                    window=float(gate_scan_end) - original_start,
+                )
+                if (
+                    gate_reason == "no_stable_combat"
+                    and not bool(item.get("split_from_oversize"))
+                    and _gate_terminal_evidence is None
+                    and float(gate_limit) < float(START_GATE_EXTENDED_SCAN_LIMIT_SEC)
+                    # 候选自身必须还有可扩的头部（短候选的门禁窗本来就到 end，
+                    # 扩窗等于白跑一轮微步骤）。
+                    and float(end) > float(start) + float(gate_limit) + 0.5
+                    and (
+                        available_end is None
+                        or float(available_end) + 0.5
+                        >= float(start) + float(START_GATE_EXTENDED_SCAN_LIMIT_SEC)
+                    )
+                ):
+                    cache_item["start_gate_next_limit"] = float(
+                        START_GATE_EXTENDED_SCAN_LIMIT_SEC
+                    )
+                    if max_media_step_sec is not None:
+                        # 在线：扩窗单独算一个微步骤，本批不为此多烧预算；下一轮
+                        # 用更宽的门禁窗复判（start_gate_next_limit 已被读入）。
+                        item["broadcast_audit"] = "pending_lookahead"
+                        item["broadcast_audit_step"] = "start_gate_extend"
+                        item["_audit_continue_ready"] = True
+                        output.append(item)
+                        _record_audit_outcome(
+                            _outcome_sink,
+                            status="pending",
+                            candidate=item,
+                            reason="start_gate_extend",
+                            retry_after_duration=float(available_end or gate_scan_end),
+                        )
+                        _log.info(
+                            "赛事回合入点门禁不确定，扩窗至 %.0fs 复判（下一微步骤）: %.1f-%.1f",
+                            float(START_GATE_EXTENDED_SCAN_LIMIT_SEC),
+                            original_start,
+                            end,
+                        )
+                        _start_gate_pending_candidate = True
+                        break
+                    # 离线/收尾单发调用：无重试队列，直接在本函数内扩窗重判。
+                    gate_limit = float(START_GATE_EXTENDED_SCAN_LIMIT_SEC)
+                    _log.info(
+                        "赛事回合入点门禁不确定，就地扩窗至 %.0fs 复判: %.1f-%.1f",
+                        float(START_GATE_EXTENDED_SCAN_LIMIT_SEC),
+                        original_start,
+                        end,
+                    )
+                    continue
+                # 普通候选不做起点后移：起点不是真实 combat 就当场拒绝，
                 # 省掉额外抽帧/推理（缓解解说流滞后）；split_from_oversize 已经
                 # 一次扫到整块上限，无需扩展。
                 cache_item.pop("start_gate_next_limit", None)
                 cache_item["start_gate_done"] = True
                 if gate_reason == "no_stable_combat":
+                    if _gate_terminal_evidence is None:
+                        # 扩窗后仍无 combat 锚点、也无结构性否定证据 ⇒ 属于**模型
+                        # 不确定**，不是「有证据的拒绝」：保留候选（出点审计照常跑），
+                        # 入点按 coarse + 待复核交付，并强制 confirm_status=pending
+                        # 禁止自动导出（人工确认后可导出，与「入点 coarse 只是起得
+                        # 略早」的既有产品规则一致）。旧实现把它记成终态拒绝并在前端
+                        # 删除，人工确认也不复活 —— 真实回合就此永久丢失。
+                        item["broadcast_start_gate"] = "inconclusive"
+                        item["broadcast_start_gate_scan_end"] = round(gate_scan_end, 3)
+                        item["broadcast_start_gate_detail"] = "no_visual_evidence"
+                        item["start_quality"] = "coarse"
+                        item["start_review_required"] = True
+                        item["broadcast_review_required"] = True
+                        cache_item["start_gate_inconclusive"] = True
+                        cache_item["start_gate_reason"] = gate_reason
+                        cache_item["start_gate_scan_end"] = round(gate_scan_end, 3)
+                        _log.info(
+                            "赛事回合入点门禁不确定（无 combat 锚点、无回放/非游戏证据）: "
+                            "%.1f-%.1f (scan_end=%.1f) —— 保留候选待人工确认",
+                            original_start,
+                            end,
+                            gate_scan_end,
+                        )
+                        break
                     item["broadcast_start_gate"] = gate_reason
                     item["broadcast_start_gate_scan_end"] = round(gate_scan_end, 3)
                     item["broadcast_audit"] = "rejected_no_stable_combat_start"
@@ -1591,6 +2193,17 @@ def audit_broadcast_rounds(
                         _log.info(
                             "赛事回合入点回放否决(A2): start=%.1f 起点窗口含回放/非游戏帧",
                             original_start,
+                        )
+                    elif _gate_terminal_evidence is not None:
+                        # 结构性否定证据出现在窗口更远处（15-35s 扩展窗内）：同样是
+                        # 「起点落在非交战内容里」，只是不在前 2s。单独标注成因，
+                        # 与 A2 的前 2s 回放证据区分开，便于统计占比。
+                        item["broadcast_start_gate_detail"] = "non_combat_in_gate_window"
+                        cache_item["start_gate_detail"] = "non_combat_in_gate_window"
+                        _log.info(
+                            "赛事回合入点门禁拒绝(扩展窗内非交战): start=%.1f, scan_end=%.1f",
+                            original_start,
+                            gate_scan_end,
                         )
                     _log.info(
                         "赛事回合入点门禁拒绝: %.1f-%.1f (split=%s, scan_end=%.1f)",
@@ -1699,6 +2312,11 @@ def audit_broadcast_rounds(
             result_ts = item.get("result_ts")
             if isinstance(result_ts, (int, float)):
                 audit_start = min(audit_start, max(start, float(result_ts) - 10.0))
+            # 回扫锚点：**真正的尾窗左界**（只在首轮、decided 之前记录一次）。
+            # 微步骤模式下后续调用的 extract_start 会漂到 scanned_end 附近，
+            # 若用它当回扫起点，回扫会先把已扫过的尾部重扫一遍（实测要多花
+            # 9 个微步骤）——回扫必须从尾窗左界开始向前走。
+            cache_item["backward_sweep_anchor"] = round(float(audit_start), 3)
         extract_start = max(start, audit_start)
         if cached_samples and cached_scanned_end >= effective_scan_end - 0.5:
             extract_start = effective_scan_end
@@ -1863,13 +2481,24 @@ def audit_broadcast_rounds(
         # 尾部窗口若完全没有 combat，说明候选 end 可能落在长回放之后；
         # 扩展回候选起点做一次兜底，优先保证结束边界不被尾部窗口误放行。
         # 兜底全扫单回合至多做一次，避免跨增量窗口或收尾重试重复全区间抽帧。
-        if (
+        # 触发条件二：弱出点候选在尾窗内拿不到任何排除证据时，由下方
+        # broadcast_audit_step="backward_sweep" 分派显式申请一次向前回扫。
+        # 必须用**持久标志**而不是复判样本内容：回扫第一步就会把本回合的 combat
+        # 帧带进 samples，若仍用「无 combat」当条件，回扫会在第一步之后立刻停住，
+        # 永远走不到真出点那次转场（旧实现的一次性 fallback 正是这个形态）。
+        _need_backward_sweep = (
             not any(label == "combat" for _, label, _ in samples)
+            or bool(cache_item.get("backward_sweep_requested"))
+        )
+        if (
+            _need_backward_sweep
             and extract_start > start + 0.5
             and not cache_item.get("fallback_full_scanned")
         ):
             fallback_target_end = float(
-                cache_item.get("fallback_full_target_end") or extract_start
+                cache_item.get("fallback_full_target_end")
+                or cache_item.get("backward_sweep_anchor")
+                or extract_start
             )
             cache_item["fallback_full_target_end"] = fallback_target_end
             # 从尾窗向前搜索，优先找到紧邻 Replay/结算的
@@ -1889,6 +2518,17 @@ def audit_broadcast_rounds(
                     fallback_start,
                     fallback_end - max(1.0, float(max_media_step_sec)),
                 )
+            # 有界向前回扫的安全阀：不得越过「尾窗左界 - 回扫预算」。非分裂候选
+            # 跨度 <= MAX_BROADCAST_ROUND_SEC(150s) 时该项恒 <= start，仅兜住异常数据；
+            # clamp 到 fallback_end 保证 _extract 的 [start,end) 合法。
+            fallback_start = max(
+                fallback_start,
+                float(start),
+                float(end)
+                - BROADCAST_AUDIT_TAIL_LOOKBACK_SEC
+                - BROADCAST_AUDIT_BACKWARD_SWEEP_MAX_SEC,
+            )
+            fallback_start = min(fallback_start, fallback_end)
             _raise_if_cancelled("fallback extraction")
             # 只补抽尚未扫描的头部 [start, extract_start]：尾窗 [extract_start,
             # effective_scan_end] 的样本已在 samples 中，重抽整段会重复抽帧+重复
@@ -1934,6 +2574,8 @@ def audit_broadcast_rounds(
                 samples = [samples_by_ts[key] for key in sorted(samples_by_ts)]
                 cache_item["samples"] = samples
             cache_item["fallback_full_cursor"] = fallback_start
+            if cache_item.get("backward_sweep_requested"):
+                cache_item["backward_sweep_scanned_to"] = round(fallback_start, 3)
             if fallback_start > float(start) + 0.5:
                 # 原实现在此绕过 18s 媒体预算，一次回扫
                 # 90s+ 并长时间占住粗扫共用的 OCR/ONNX 锁。
@@ -2189,13 +2831,62 @@ def audit_broadcast_rounds(
                 scan_end,
             )
             continue
+        if (
+            cutoff is None
+            and _weak_ocr_end(item)
+            and not cache_item.get("fallback_full_scanned")
+            and not cache_item.get("backward_sweep_requested")
+            and extract_start > start + 0.5
+        ):
+            # 弱出点（next_combat / open_tail）+ 尾窗内没有任何排除证据：真出点很可能
+            # 落在尾窗之前（赛后回放 + 买枪比 60s 回看更长）。先安排一次有界向前回扫
+            # 取证，由下一个微步骤续跑；绝不在还没看过该区间时就盖章
+            # pending_no_exclusion —— 那会把「晚 30-80s 的粗出点」冻结成终态，切片尾部
+            # 一直带着回放/买枪，且此后无人再审。
+            cache_item["backward_sweep_requested"] = True
+            cache_item["backward_sweep_from"] = round(float(extract_start), 3)
+            item["broadcast_audit"] = "pending_lookahead"
+            item["broadcast_audit_step"] = "backward_sweep"
+            item["broadcast_audit_step_from"] = round(float(extract_start), 3)
+            item["_audit_continue_ready"] = True
+            output.append(item)
+            _record_audit_outcome(
+                _outcome_sink,
+                status="pending",
+                candidate=item,
+                reason="backward_sweep",
+                retry_after_duration=float(available_end or scan_end),
+            )
+            _log.info(
+                "赛事回合审计尾窗无排除证据，向前回扫取证: %.1f-%.1f, from=%.1f, end_by=%s",
+                start,
+                end,
+                float(extract_start),
+                item.get("end_by"),
+            )
+            continue
         item.pop("_audit_continue_ready", None)
         item.pop("broadcast_audit_step", None)
         item.pop("broadcast_audit_step_end", None)
         item["broadcast_audit_scan_end"] = round(scan_end, 3)
+        if cache_item.get("backward_sweep_requested"):
+            # 可观测性：本次定稿前做了向前回扫（回扫到的位置 + 当时尾窗左界），
+            # 供现场按 candidate 复查「是不是粗出点太晚才需要回扫」。
+            item["broadcast_backward_swept_to"] = cache_item.get("backward_sweep_scanned_to")
+            item["broadcast_backward_sweep_from"] = cache_item.get("backward_sweep_from")
         # 证据驱动盖章：仅当真实发现截断或 OCR next_prep 复核通过时才标 passed/confirmed，
         # reason=none 保持 pending，严禁伪造 broadcast_exclusion。
         _stamp_broadcast_decision(item, clf, cutoff=cutoff, reason=reason)
+        if cache_item.get("start_gate_inconclusive"):
+            # 入点是「模型不确定」：出点审计照常定稿（end_by/end_quality 保留审计结论），
+            # 但不允许自动导出 —— confirm_status 固定 pending，交人工确认。
+            # （人工确认后即可导出，与「入点 coarse 只是起得略早」的既有产品规则一致；
+            #   auto-export 路径要求 confirm_status == vision_confirmed，故自动导出被挡。）
+            item["confirm_status"] = "pending"
+            item["broadcast_start_gate"] = "inconclusive"
+            item["start_quality"] = "coarse"
+            item["start_review_required"] = True
+            item["broadcast_review_required"] = True
         # L1：区间内边界自检。出点定稿不等于区间干净——OCR 起点可能落在上一回合内部，
         # 区间里含一个完整回合边界，出点却属于后一回合（round-000123 ↔ round-000135）。
         _interior_resume = _interior_round_boundary(
@@ -2270,6 +2961,8 @@ def audit_broadcast_rounds(
             "broadcast_result_tail_sec": item.get("broadcast_result_tail_sec"),
             "broadcast_model_version": item.get("broadcast_model_version"),
             "broadcast_model_provider": item.get("broadcast_model_provider"),
+            "broadcast_backward_swept_to": item.get("broadcast_backward_swept_to"),
+            "broadcast_backward_sweep_from": item.get("broadcast_backward_sweep_from"),
         }
         # 定稿回合不再保留全部采样列表；相同 round_key 后续只需复用 final_end。
         cache_item["samples"] = []
@@ -2280,13 +2973,18 @@ def audit_broadcast_rounds(
             _outcome_sink,
             status=(
                 "manual_review"
-                if item.get("broadcast_audit") == "pending_no_exclusion"
+                if (
+                    item.get("broadcast_audit") == "pending_no_exclusion"
+                    or item.get("broadcast_start_gate") == "inconclusive"
+                )
                 else "accepted"
             ),
             candidate=item,
             reason=(
                 "no_exclusion_evidence"
                 if item.get("broadcast_audit") == "pending_no_exclusion"
+                else "start_gate_inconclusive"
+                if item.get("broadcast_start_gate") == "inconclusive"
                 else str(
                     item.get("broadcast_audit_reason")
                     or item.get("broadcast_audit")
@@ -2305,6 +3003,13 @@ def audit_broadcast_rounds(
             item.get("end_by"),
             reason or "none",
         )
+    # 超长分裂族：头碎片丢失的回合前半段在这里补回（放最后一步，此时本批结论
+    # 都已定稿）。同批成对合并之外还有跨批台账——正常运行期 deferred_audit 下
+    # 审计一次只推进一个子块，同批永远凑不齐头尾，台账才是主路径。
+    _reconcile_split_family_fragments(output, audit_cache, _outcome_sink)
+    # 已定稿真实回合的跨度进共享台账：收尾缺口补扫据此排除"已经有人管"的区间，
+    # 不再把同一回合合成第二遍（两条审计路径共用同一个 audit_cache）。
+    _remember_finalized_spans(audit_cache, output)
     return output
 
 
