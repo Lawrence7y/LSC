@@ -28,6 +28,12 @@ import { SettingsSection } from './SettingsSection'
 import { SettingsRow } from './SettingsRow'
 import { ToggleSwitch } from './ToggleSwitch'
 import { DepStatus } from './DepStatus'
+import { PlatformSelfCheck } from './PlatformSelfCheck'
+import {
+  CookieStatusLine,
+  cookieStatusFrom,
+  type CookieStatus,
+} from './CookieStatusLine'
 import {
   DEFAULT_TIMELINE_REPLAY_SECONDS,
   REPLAY_BUFFER_OPTIONS,
@@ -97,28 +103,18 @@ export default function Settings() {
     releaseNotes?: string
   } | null>(null)
   const [douyinCookieText, setDouyinCookieText] = useState('')
-  const [douyinCookieStatus, setDouyinCookieStatus] = useState<{
-    configured?: boolean
-    count?: number
-    keys?: string[]
-  } | null>(null)
+  const [douyinCookieStatus, setDouyinCookieStatus] = useState<CookieStatus | null>(null)
   const [savingDouyinCookie, setSavingDouyinCookie] = useState(false)
   const [bilibiliCookieText, setBilibiliCookieText] = useState('')
-  const [bilibiliCookieStatus, setBilibiliCookieStatus] = useState<{
-    configured?: boolean
-    count?: number
-    keys?: string[]
-  } | null>(null)
+  const [bilibiliCookieStatus, setBilibiliCookieStatus] = useState<CookieStatus | null>(null)
   const [savingBilibiliCookie, setSavingBilibiliCookie] = useState(false)
   const [huyaCookieText, setHuyaCookieText] = useState('')
-  const [huyaCookieStatus, setHuyaCookieStatus] = useState<{
-    configured?: boolean
-    count?: number
-    keys?: string[]
-  } | null>(null)
+  const [huyaCookieStatus, setHuyaCookieStatus] = useState<CookieStatus | null>(null)
   const [savingHuyaCookie, setSavingHuyaCookie] = useState(false)
   const [detectedJianyingDir, setDetectedJianyingDir] = useState('')
   const [activeSection, setActiveSection] = useState('general')
+  const [exportingDiag, setExportingDiag] = useState(false)
+  const [isStoreBuild] = useState(() => window.electronAPI?.isStoreBuild?.() ?? false)
 
   useEffect(() => {
     window.electronAPI?.getAppVersion().then((v: string) => setAppVersion(v)).catch((e: unknown) => console.error('[Settings] getAppVersion failed:', e))
@@ -144,114 +140,54 @@ export default function Settings() {
 
   useEffect(() => {
     const unsubs = [
-      on('get_douyin_cookie_status_response', (data: {
-        success?: boolean
-        configured?: boolean
-        count?: number
-        keys?: string[]
-        error?: string
-      }) => {
+      on('get_douyin_cookie_status_response', (data: CookieStatus & { success?: boolean; error?: string }) => {
         if (data?.success === false && data.error) {
           message.error(t('读取抖音 Cookie 状态失败：{error}', { error: data.error }))
           return
         }
-        setDouyinCookieStatus({
-          configured: !!data?.configured,
-          count: data?.count || 0,
-          keys: data?.keys || [],
-        })
+        setDouyinCookieStatus(cookieStatusFrom(data))
       }),
-      on('save_douyin_cookies_response', (data: {
-        success?: boolean
-        configured?: boolean
-        count?: number
-        keys?: string[]
-        error?: string
-      }) => {
+      on('save_douyin_cookies_response', (data: CookieStatus & { success?: boolean; error?: string }) => {
         setSavingDouyinCookie(false)
         if (!data?.success) {
           message.error(data?.error || t('保存抖音 Cookie 失败'))
           return
         }
-        setDouyinCookieStatus({
-          configured: !!data.configured,
-          count: data.count || 0,
-          keys: data.keys || [],
-        })
+        setDouyinCookieStatus(cookieStatusFrom(data))
         setDouyinCookieText('')
         message.success(t('抖音 Cookie 已保存（{count} 项），请重新连接直播间', { count: data.count || 0 }))
       }),
-      on('get_bilibili_cookie_status_response', (data: {
-        success?: boolean
-        configured?: boolean
-        count?: number
-        keys?: string[]
-        error?: string
-      }) => {
+      on('get_bilibili_cookie_status_response', (data: CookieStatus & { success?: boolean; error?: string }) => {
         if (data?.success === false && data.error) {
           message.error(t('读取 B站 Cookie 状态失败：{error}', { error: data.error }))
           return
         }
-        setBilibiliCookieStatus({
-          configured: !!data?.configured,
-          count: data?.count || 0,
-          keys: data?.keys || [],
-        })
+        setBilibiliCookieStatus(cookieStatusFrom(data))
       }),
-      on('save_bilibili_cookies_response', (data: {
-        success?: boolean
-        configured?: boolean
-        count?: number
-        keys?: string[]
-        error?: string
-      }) => {
+      on('save_bilibili_cookies_response', (data: CookieStatus & { success?: boolean; error?: string }) => {
         setSavingBilibiliCookie(false)
         if (!data?.success) {
           message.error(data?.error || t('保存 B站 Cookie 失败'))
           return
         }
-        setBilibiliCookieStatus({
-          configured: !!data.configured,
-          count: data.count || 0,
-          keys: data.keys || [],
-        })
+        setBilibiliCookieStatus(cookieStatusFrom(data))
         setBilibiliCookieText('')
         message.success(t('B站 Cookie 已保存（{count} 项），请重新连接直播间', { count: data.count || 0 }))
       }),
-      on('get_huya_cookie_status_response', (data: {
-        success?: boolean
-        configured?: boolean
-        count?: number
-        keys?: string[]
-        error?: string
-      }) => {
+      on('get_huya_cookie_status_response', (data: CookieStatus & { success?: boolean; error?: string }) => {
         if (data?.success === false && data.error) {
           message.error(t('读取虎牙 Cookie 状态失败：{error}', { error: data.error }))
           return
         }
-        setHuyaCookieStatus({
-          configured: !!data?.configured,
-          count: data?.count || 0,
-          keys: data?.keys || [],
-        })
+        setHuyaCookieStatus(cookieStatusFrom(data))
       }),
-      on('save_huya_cookies_response', (data: {
-        success?: boolean
-        configured?: boolean
-        count?: number
-        keys?: string[]
-        error?: string
-      }) => {
+      on('save_huya_cookies_response', (data: CookieStatus & { success?: boolean; error?: string }) => {
         setSavingHuyaCookie(false)
         if (!data?.success) {
           message.error(data?.error || t('保存虎牙 Cookie 失败'))
           return
         }
-        setHuyaCookieStatus({
-          configured: !!data.configured,
-          count: data.count || 0,
-          keys: data.keys || [],
-        })
+        setHuyaCookieStatus(cookieStatusFrom(data))
         setHuyaCookieText('')
         message.success(t('虎牙 Cookie 已保存（{count} 项），请重新连接直播间', { count: data.count || 0 }))
       }),
@@ -391,11 +327,35 @@ export default function Settings() {
   }
 
   const handleDownloadUpdate = async () => {
+    // Microsoft Store 版禁止 GitHub Setup 下载，统一走 Store 更新
+    if (isStoreBuild || window.electronAPI?.isStoreBuild?.()) {
+      message.info(t('请通过 Microsoft Store 更新'))
+      return
+    }
     const result = await window.electronAPI?.downloadUpdate()
     if (result && !result.success) {
       message.error(t('打开下载页失败: {error}', { error: result.error ?? '' }))
     } else {
       message.info(t('已在浏览器中打开 GitHub Release 下载页'))
+    }
+  }
+
+  const handleExportDiagnosticPack = async () => {
+    const api = window.electronAPI?.exportDiagnosticPack
+    if (!api) {
+      message.info(t('请在 Electron 桌面版中使用导出诊断包功能'))
+      return
+    }
+    setExportingDiag(true)
+    try {
+      const result = await api()
+      if (result?.success && result.path) {
+        message.success(t('诊断包已导出：{path}', { path: result.path }))
+      } else if (!result?.canceled) {
+        message.error(t('导出诊断包失败: {error}', { error: result?.error ?? '' }))
+      }
+    } finally {
+      setExportingDiag(false)
     }
   }
 
@@ -950,25 +910,7 @@ export default function Settings() {
               marginBottom: 16,
             }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>{t('抖音 Cookie')}</div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: douyinCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
-                {douyinCookieStatus?.configured
-                  ? <>
-                      <span>{t('已配置 {count} 项', { count: douyinCookieStatus.count || 0 })}</span>
-                      {(douyinCookieStatus.keys || []).length > 0 && (
-                        <Tooltip title={(douyinCookieStatus.keys || []).join(', ')}>
-                          <span style={{
-                            fontSize: 11,
-                            color: 'var(--text-tertiary)',
-                            textDecoration: 'underline dotted',
-                            cursor: 'help',
-                          }}>
-                            {t('查看键名')}
-                          </span>
-                        </Tooltip>
-                      )}
-                    </>
-                  : t('尚未配置有效 Cookie')}
-              </div>
+              <CookieStatusLine status={douyinCookieStatus} />
               <Input.TextArea
                 value={douyinCookieText}
                 onChange={(e) => setDouyinCookieText(e.target.value)}
@@ -996,25 +938,7 @@ export default function Settings() {
               marginBottom: 16,
             }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>{t('B站 Cookie')}</div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: bilibiliCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
-                {bilibiliCookieStatus?.configured
-                  ? <>
-                      <span>{t('已配置 {count} 项', { count: bilibiliCookieStatus.count || 0 })}</span>
-                      {(bilibiliCookieStatus.keys || []).length > 0 && (
-                        <Tooltip title={(bilibiliCookieStatus.keys || []).join(', ')}>
-                          <span style={{
-                            fontSize: 11,
-                            color: 'var(--text-tertiary)',
-                            textDecoration: 'underline dotted',
-                            cursor: 'help',
-                          }}>
-                            {t('查看键名')}
-                          </span>
-                        </Tooltip>
-                      )}
-                    </>
-                  : t('尚未配置有效 Cookie')}
-              </div>
+              <CookieStatusLine status={bilibiliCookieStatus} />
               <Input.TextArea
                 value={bilibiliCookieText}
                 onChange={(e) => setBilibiliCookieText(e.target.value)}
@@ -1041,25 +965,7 @@ export default function Settings() {
               padding: 16,
             }}>
               <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>{t('虎牙 Cookie')}</div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 10, color: huyaCookieStatus?.configured ? 'var(--state-success)' : 'var(--state-warning)' }}>
-                {huyaCookieStatus?.configured
-                  ? <>
-                      <span>{t('已配置 {count} 项', { count: huyaCookieStatus.count || 0 })}</span>
-                      {(huyaCookieStatus.keys || []).length > 0 && (
-                        <Tooltip title={(huyaCookieStatus.keys || []).join(', ')}>
-                          <span style={{
-                            fontSize: 11,
-                            color: 'var(--text-tertiary)',
-                            textDecoration: 'underline dotted',
-                            cursor: 'help',
-                          }}>
-                            {t('查看键名')}
-                          </span>
-                        </Tooltip>
-                      )}
-                    </>
-                  : t('尚未配置有效 Cookie')}
-              </div>
+              <CookieStatusLine status={huyaCookieStatus} />
               <Input.TextArea
                 value={huyaCookieText}
                 onChange={(e) => setHuyaCookieText(e.target.value)}
@@ -1077,6 +983,8 @@ export default function Settings() {
                 {t('保存虎牙 Cookie')}
               </Button>
             </div>
+
+            <PlatformSelfCheck />
           </SettingsSection>
 
           <SettingsSection
@@ -1109,50 +1017,75 @@ export default function Settings() {
             </SettingsRow>
             <SettingsRow label={t('在线更新')}>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
-                {updateStatus?.type === 'checking' && (
-                  <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{t('正在检查更新...')}</span>
-                )}
-                {updateStatus?.type === 'not-available' && (
-                  <span style={{ fontSize: 12, color: 'var(--state-success)' }}>
-                    {t('✓ 已是最新版本 v{version}', { version: updateStatus.version ?? '' })}
-                  </span>
-                )}
-                {updateStatus?.type === 'available' && (
+                {isStoreBuild ? (
                   <>
-                    <span style={{ fontSize: 12, color: 'var(--brand-400)', fontWeight: 500 }}>
-                      {t('发现新版本 v{version}', { version: updateStatus.version ?? '' })}
-                    </span>
-                    {updateStatus.releaseNotes && (
-                      <span style={{
-                        fontSize: 11,
-                        color: 'var(--text-tertiary)',
-                        maxWidth: 220,
-                        whiteSpace: 'pre-wrap',
-                        wordBreak: 'break-word',
-                        lineHeight: 1.5,
-                      }}>
-                        {String(updateStatus.releaseNotes).slice(0, 120)}{String(updateStatus.releaseNotes).length > 120 ? '...' : ''}
-                      </span>
-                    )}
+                    <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{t('请通过 Microsoft Store 更新')}</span>
                     <Button
-                      type="primary"
                       size="small"
-                      icon={<DownloadOutlined />}
-                      onClick={() => { void handleDownloadUpdate() }}
+                      disabled
+                      title={t('请通过 Microsoft Store 更新')}
                     >
                       {t('前往下载')}
                     </Button>
                   </>
+                ) : (
+                  <>
+                    {updateStatus?.type === 'checking' && (
+                      <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>{t('正在检查更新...')}</span>
+                    )}
+                    {updateStatus?.type === 'not-available' && (
+                      <span style={{ fontSize: 12, color: 'var(--state-success)' }}>
+                        {t('✓ 已是最新版本 v{version}', { version: updateStatus.version ?? '' })}
+                      </span>
+                    )}
+                    {updateStatus?.type === 'available' && (
+                      <>
+                        <span style={{ fontSize: 12, color: 'var(--brand-400)', fontWeight: 500 }}>
+                          {t('发现新版本 v{version}', { version: updateStatus.version ?? '' })}
+                        </span>
+                        {updateStatus.releaseNotes && (
+                          <span style={{
+                            fontSize: 11,
+                            color: 'var(--text-tertiary)',
+                            maxWidth: 220,
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            lineHeight: 1.5,
+                          }}>
+                            {String(updateStatus.releaseNotes).slice(0, 120)}{String(updateStatus.releaseNotes).length > 120 ? '...' : ''}
+                          </span>
+                        )}
+                        <Button
+                          type="primary"
+                          size="small"
+                          icon={<DownloadOutlined />}
+                          onClick={() => { void handleDownloadUpdate() }}
+                        >
+                          {t('前往下载')}
+                        </Button>
+                      </>
+                    )}
+                    {updateStatus?.type === 'error' && (
+                      <span style={{ fontSize: 12, color: 'var(--state-error)' }}>
+                        {updateStatus.message || t('更新失败')}
+                      </span>
+                    )}
+                    <Button onClick={() => { void handleCheckUpdate() }} loading={updateStatus?.type === 'checking'}>
+                      {t('检查更新')}
+                    </Button>
+                  </>
                 )}
-                {updateStatus?.type === 'error' && (
-                  <span style={{ fontSize: 12, color: 'var(--state-error)' }}>
-                    {updateStatus.message || t('更新失败')}
-                  </span>
-                )}
-                <Button onClick={() => { void handleCheckUpdate() }} loading={updateStatus?.type === 'checking'}>
-                  {t('检查更新')}
-                </Button>
               </div>
+            </SettingsRow>
+            <SettingsRow label={t('诊断包')} description={t('导出脱敏日志与设置快照（不含 Cookie/Token）')}>
+              <Button
+                size="small"
+                loading={exportingDiag}
+                aria-label={t('导出诊断包')}
+                onClick={() => { void handleExportDiagnosticPack() }}
+              >
+                {t('导出诊断包')}
+              </Button>
             </SettingsRow>
           </SettingsSection>
 

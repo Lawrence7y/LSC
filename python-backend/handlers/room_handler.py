@@ -3,12 +3,14 @@
 并通过广播将房间状态变更实时推送给前端。
 """
 from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+
 # 添加 lsc 到 Python 路径
 import sys
 import threading
@@ -16,10 +18,10 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
+
 _LSC_ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
 if _LSC_ROOT not in sys.path:
     sys.path.insert(0, _LSC_ROOT)
@@ -31,14 +33,15 @@ from continuous_finalization import (
     merge_ranges,
     uncovered_ranges,
 )
-from handlers.timeline_handlers import (
-    register_timeline_handlers,
-)
 from persistence import (
     archive_finalization_job,
     save_analysis_results,
     save_finalization_job,
     save_rooms,
+)
+
+from handlers.timeline_handlers import (
+    register_timeline_handlers,
 )
 from lsc.config import (
     ExportProfile,
@@ -49,6 +52,7 @@ from lsc.config import (
 from lsc.core.orchestrator import (
     RoomOrchestrator,
     _get_configured_max_previews,
+    _get_configured_max_rooms,
     _is_stream_offline_error,
 )
 from lsc.core.services.ingest_registry import PreviewStreamRegistry, get_shared_ingest_registry
@@ -57,14 +61,17 @@ from lsc.core.services.resource_monitor import collect_system_stats, get_resourc
 from lsc.core.services.timeline_service import (
     get_timeline_service,
 )
-from lsc.platforms.base import ERROR_OFFLINE
+from lsc.platforms.base import ERROR_OFFLINE, StreamInfo
+from lsc.platforms.diagnostics import degradation_snapshot, note_degradation
 from lsc.platforms.failure import FailureKind, classify_failure
 from lsc.platforms.recovery_policy import mark_failed_candidate, recovery_action
 from lsc.platforms.redaction import redact_text, redact_url
 from lsc.platforms.registry import detect_platform, get_display_name, parse_stream, select_quality
 from lsc.utils.cancellable_ffmpeg import FFmpegCancelled
+from lsc.utils.coerce import safe_float
 from lsc.utils.error_messages import humanize_error, humanize_error_with_suggestion
-from lsc.utils.process_launcher import run_hidden
+from lsc.utils.process_launcher import budget_snapshot, run_hidden
+
 _log = logging.getLogger('lsc.handlers')
 _MAX_ROOM_URL_LENGTH = 2048
 _MAX_ROOM_URLS_PER_ADD = 12
@@ -164,32 +171,46 @@ def _error_response(exc: Exception | str) -> dict[str, Any]:
     raw = redact_text(exc)
     info = humanize_error_with_suggestion(raw)
     return {'success': False, 'error': info['message'], 'suggestion': info.get('suggestion')}
-def _validate_room_url_candidate(raw_url: object) -> dict[str, Any]:
-    """校验 URL 格式并通过平台适配器实际解析直播间。
-    该函数会进行网络解析，必须在线程池中调用，不能阻塞 WebSocket 事件循环。
-    已识别平台返回 ``offline`` 时仍视为有效直播间：用户可以先添加未开播房间。
+def _room_url_shape(raw_url: object) -> tuple[str, str | None]:
+    """直播间 URL 的**纯结构**校验（不做任何网络解析）。
+
+    返回 `(规范化后的 url, 错误信息或 None)`。单条入口 `_validate_room_url_candidate`
+    与批量落盘入口 `save_rooms` 必须共用这份判据：此前两条写入口两套规则，
+    `save_rooms` 只查"是不是字符串"，任何超长/带控制字符/非 http(s) 的 URL 都能
+    绕过 `add_room` 的约束直接进 `rooms.json`（P0 持久化）。
     """
     if not isinstance(raw_url, str):
-        return _invalid_room_url_result("", "直播间链接必须是文本")
+        return "", "直播间链接必须是文本"
     url = raw_url.strip()
     if not url:
-        return _invalid_room_url_result(url, "请输入直播间链接")
+        return url, "请输入直播间链接"
     if len(url) > _MAX_ROOM_URL_LENGTH:
-        return _invalid_room_url_result(url, "直播间链接过长")
+        return url, "直播间链接过长"
     if any(ch.isspace() or ord(ch) < 32 for ch in url):
-        return _invalid_room_url_result(url, "链接中不能包含空格、换行或控制字符")
+        return url, "链接中不能包含空格、换行或控制字符"
     try:
         parsed = urlsplit(url)
         # 访问 port 属性可同时触发非法端口格式校验。
         _ = parsed.port
     except ValueError:
-        return _invalid_room_url_result(url, "链接格式无效，请检查地址是否完整")
+        return url, "链接格式无效，请检查地址是否完整"
     if parsed.scheme.lower() not in {"http", "https"}:
-        return _invalid_room_url_result(url, "仅支持 http:// 或 https:// 直播间链接")
+        return url, "仅支持 http:// 或 https:// 直播间链接"
     if not parsed.hostname:
-        return _invalid_room_url_result(url, "链接缺少有效的网站域名")
+        return url, "链接缺少有效的网站域名"
     if parsed.username is not None or parsed.password is not None:
-        return _invalid_room_url_result(url, "直播间链接不能包含用户名或密码")
+        return url, "直播间链接不能包含用户名或密码"
+    return url, None
+
+
+def _validate_room_url_candidate(raw_url: object) -> dict[str, Any]:
+    """校验 URL 格式并通过平台适配器实际解析直播间。
+    该函数会进行网络解析，必须在线程池中调用，不能阻塞 WebSocket 事件循环。
+    已识别平台返回 ``offline`` 时仍视为有效直播间：用户可以先添加未开播房间。
+    """
+    url, shape_error = _room_url_shape(raw_url)
+    if shape_error is not None:
+        return _invalid_room_url_result(url, shape_error)
     # URL validation is also a platform-facing parse entry point.  Once all
     # V2 components are enabled for this platform, keep it on the same
     # resolver bridge so the first room add cannot silently warm the legacy
@@ -218,7 +239,9 @@ def _validate_room_url_candidate(raw_url: object) -> dict[str, Any]:
         )
         resolved_platform = str(getattr(result, "platform", "") or platform_hint or "unknown")
         first_candidate = next(iter(getattr(result, "candidates", ()) or ()), None)
-        info = SimpleNamespace(
+        # 用真实 StreamInfo 而不是 SimpleNamespace 鸭子类型：两条分支必须交出
+        # 同一个形状，否则下游碰一下 `info.raw` / `quality_urls` 就 AttributeError。
+        info = StreamInfo(
             platform=resolved_platform,
             room_url=str(getattr(result, "room_url", "") or url),
             stream_url=str(getattr(first_candidate, "url", "") or ""),
@@ -328,6 +351,7 @@ def format_ai_round_clip_label(streamer: str, round_idx: int, index: int = 0) ->
     return f"{_sanitize_streamer_name(streamer)}_R{seq:02d}"
 # 每房间手动切片计数器（room_id -> 当前序号）
 _manual_clip_counters: dict[str, int] = {}
+_clip_label_lock = threading.RLock()
 # 每房间 AI 回合切片计数器（room_id -> 当前序号）
 _ai_clip_counters: dict[str, int] = {}
 # listed_key -> 首发分配的切片标签：upsert（边界精修重新入列）必须复用首发标签。
@@ -351,24 +375,18 @@ def _resolve_ai_clip_label(listed_key: str, rid: str, room_name: str, round_idx:
         # format 内部回退 round_idx（旧行为）。
         return format_ai_round_clip_label(room_name, round_idx, _ai_clip_counters.get(rid, 0))
     # 有界化与 _listed_clip_ids 同纪律（_CLIP_KEY_CACHE_MAX=20000，超限裁最旧一半）
-    if len(_listed_clip_labels) >= 20000:
-        for _old_key in list(_listed_clip_labels)[:10000]:
-            _listed_clip_labels.pop(_old_key, None)
-    _ai_clip_counters[rid] = _ai_clip_counters.get(rid, 0) + 1
-    label = format_ai_round_clip_label(room_name, round_idx, _ai_clip_counters[rid])
-    _listed_clip_labels[listed_key] = label
+    with _clip_label_lock:
+        if len(_listed_clip_labels) >= 20000:
+            for _old_key in list(_listed_clip_labels)[:10000]:
+                _listed_clip_labels.pop(_old_key, None)
+        _ai_clip_counters[rid] = _ai_clip_counters.get(rid, 0) + 1
+        label = format_ai_round_clip_label(room_name, round_idx, _ai_clip_counters[rid])
+        _listed_clip_labels[listed_key] = label
     return label
 # Analytics jobs in progress: {room_id: {"progress": 0.0, "highlights": [...], "completed_at": float}}
 _analysis_jobs: dict[str, dict[str, Any]] = {}
 _analysis_jobs_lock = threading.RLock()
 _ANALYSIS_JOB_TTL = 300.0  # 5 分钟后自动清理已完成的分析结果
-def _clear_analysis_job(room_id: str) -> None:
-    """移除房间的分析任务登记（失败/清理路径）。
-    登记提前到 handler 线程后，任何失败路径都必须清理登记，
-    否则前端会一直看到「分析中」卡住。
-    """
-    with _analysis_jobs_lock:
-        _analysis_jobs.pop(room_id, None)
 # 持续分析任务状态：room_id -> {task, last_analyzed, highlights, cancelled}
 # 边录边分析：后台 asyncio 任务定期对录制文件新增段做增量场景检测
 _continuous_tasks: dict[str, dict[str, Any]] = {}
@@ -416,12 +434,6 @@ def _preserve_authority_snapshot(
     )
 
 
-def _authority_snapshot_for(room_id: str) -> dict[str, Any] | None:
-    """读取房级终态权威快照（无则 None）。"""
-    if not room_id:
-        return None
-    with _analysis_jobs_lock:
-        return _last_authority_snapshots.get(room_id)
 
 
 def _sync_analysis_save_path(manager: Any, room_id: str, video_path: str | None) -> str:
@@ -590,33 +602,6 @@ export_jobs: dict[str, str] = {}
 _export_jobs_lock = threading.Lock()
 _export_job_states: dict[str, dict[str, Any]] = {}
 _MAX_EXPORT_JOB_STATES = 512
-def _set_export_job_state(job_id: str, status: str, **fields: Any) -> None:
-    """记录可查询的导出状态，补偿 WebSocket 单次终态广播丢失。"""
-    if not job_id:
-        return
-    with _export_jobs_lock:
-        current = dict(_export_job_states.get(job_id) or {})
-        current.update(fields)
-        current.update({
-            'job_id': job_id,
-            'status': status,
-            'updated_at': time.time(),
-        })
-        _export_job_states[job_id] = current
-        if len(_export_job_states) > _MAX_EXPORT_JOB_STATES:
-            stale = sorted(
-                _export_job_states,
-                key=lambda key: float(_export_job_states[key].get('updated_at', 0.0)),
-            )[:len(_export_job_states) - _MAX_EXPORT_JOB_STATES]
-            for key in stale:
-                _export_job_states.pop(key, None)
-def _get_export_job_states(job_ids: list[str]) -> list[dict[str, Any]]:
-    with _export_jobs_lock:
-        return [
-            dict(_export_job_states[job_id])
-            for job_id in job_ids
-            if job_id in _export_job_states
-        ]
 # 粗扫 asyncio 入口的并发上限；审计入口使用独立的 _refine_semaphore。
 # DirectML 的 ONNX 上下文仍通过线程资源串行化，但审计只在一个候选步骤内
 # 持有它，避免一整个 audit batch 长时间占用资源。
@@ -633,49 +618,14 @@ _analysis_thread_semaphore = threading.Semaphore(1)
 # serialized. The refine path acquires these only for one candidate step; it
 # never holds them for the entire audit queue.
 _ffmpeg_capture_semaphore = threading.Semaphore(1)
-# One ONNX/DirectML context remains serialized with one-shot analysis; the
-# audit-specific wrapper below releases it after each candidate step.
-_onnx_inference_semaphore = _analysis_thread_semaphore
-# 全局导出队列：所有导出任务（手动/自动/分析）统一入队，worker 池并行消费
-# 保护_export_in_flight 和连续分析状态的线程锁（防止 handler 异步与 bridge.sync 并发冲突）
-_export_stats_lock = threading.Lock()
-# ── P2-2: 批量导出进度显示 ─────────────────────────────────────────
-_export_total = 0  # 总导出任务数（一个 batch 内的总数）
-_export_completed = 0  # 已完成任务数
-_export_batch_id = ""  # 当前批次 ID
-def _notify_export_overall(bridge, success: bool = True) -> None:
-    """广播批量导出总体进度（P2-2: 批量导出进度显示）"""
-    global _export_completed
-    with _export_stats_lock:
-        _export_completed += 1
-        total = _export_total
-        completed = _export_completed
-    if total > 0:
-        bridge.queue_broadcast({
-            'type': 'export_overall_progress',
-            'data': {
-                'total': total,
-                'completed': completed,
-                'percent': (completed / total * 100),
-                'batch_id': _export_batch_id,
-            },
-        })
-def _reset_export_batch(total: int, batch_id: str) -> None:
-    """重置批量导出计数器"""
-    global _export_total, _export_completed, _export_batch_id
-    with _export_stats_lock:
-        _export_total = total
-        _export_completed = 0
-        _export_batch_id = batch_id
-def _get_export_max_concurrent() -> int:
-    """从 settings 读取 export_max_concurrent，默认 2，合法值仅 1 或 2。"""
-    try:
-        val = int(load_settings().get('export_max_concurrent', 2))
-        if val not in (1, 2):
-            return 2
-        return val
-    except (TypeError, ValueError):
-        return 2
+# One ONNX/DirectML context stays serialized across both paths: the audit wrapper
+# below deliberately reuses the single slot above rather than taking its own, so a
+# one-shot analysis can never infer alongside continuous analysis. Named distinctly
+# at the acquire site, never aliased — two names for one slot read as two budgets.
+# 全局导出队列的取消集合：与 export_handlers 共享同一个 set 对象（由 register 传入），
+# 排队中的任务也能被取消。批量进度计数器/状态表**不**在这里持有 ——
+# 它们 2026-09-18 已随导出簇搬家统一到 `export_handlers`（此前两个模块各一份，
+# 而活的那份丢了 `_export_batch_id` 的赋值，见债务报告 §11.18）。
 _export_cancelled_jobs: set[str] = set()  # 已取消的 job_id 集合（含排队中）
 # MSE streamer instances keyed by room_id
 _mse_streamers: dict[str, Any] = {}
@@ -698,6 +648,32 @@ def _ingest_diagnostics() -> dict[str, int]:
         }
     stats["legacy_mse_streamers"] = _preview_stream_registry().active_count()
     return stats
+def _system_stats_extra(bridge: Any = None) -> dict[str, Any]:
+    """§7.4 / P2-2 的统一诊断载荷：**唯一**构造点。
+
+    `low_tick` 周期广播和 `get_system_stats` 按需查询都要带同一组扩展字段。
+    两处各写一份 dict 的话，字段会分叉（历史上 `platform_degradation` 就只
+    进了按需那条，顶栏周期刷新里看不到），所以这里收成一个函数。
+    """
+    extra: dict[str, Any] = {
+        # 顶栏"系统负载"里可直接看到存活 FFmpeg 分类计数、在途派生数、被闸
+        # 拒绝/放行累计次数 —— 预览冻结事故复盘时这就是证据链。
+        **_ingest_diagnostics(),
+        'ffmpeg_budget': budget_snapshot(),
+        # 平台层降级聚合：parser_stale / 虎牙 SDK 回退 / Cookie 失效计数。
+        # 各类在适配器侧已单独打过日志，这里给"哪个平台哪一类一共几次"，
+        # 用于判断是偶发还是平台改版。
+        'platform_degradation': degradation_snapshot(),
+    }
+    # 广播通道自检：序列号水位、队列深度、主动丢弃计数、唤醒失败计数。
+    # 「前端说它没收到消息」时，这里是唯一能分辨"后端没发 / 队列丢了 / 没唤醒"的证据。
+    health = getattr(bridge, 'broadcast_health', None)
+    if callable(health):
+        try:
+            extra['broadcast'] = health()
+        except Exception as exc:  # noqa: BLE001 — 诊断字段不得影响 stats 主链路
+            _log.debug("broadcast_health unavailable: %s", exc)
+    return extra
 def _stop_idle_shared_ingest(room_id: str, reason: str) -> bool:
     if room_id in _recording_starting:
         return False
@@ -1201,6 +1177,10 @@ _ai_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ai')
 # FFprobe 探针专用线程池：-probesize 5M + -analyzeduration 2M 可阻塞 10s+，
 # 独立线程池避免阻塞 bridge 快操作（disconnect/mute/seek）和录制操作（#20）
 _probe_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='probe')
+# 录制文件修复专用线程池：repair_recording 内部是同步 subprocess 调用、超时上限 600s。
+# 放在 rec 池里时一次修复可占用 6 槽之一长达 10 分钟，多路修复叠加就能把录制启动饿死；
+# 独立 1 槽既保证串行（修复本身不该并发抢磁盘），又把故障域与录制启动彻底分开。
+_repair_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='repair')
 # 录制并发限流：最多同时启动 2 路录制，避免 6 路同时 HTTP 刷新 + FFmpeg 启动耗尽线程和 CPU
 _recording_semaphore = asyncio.Semaphore(2)
 # 正在提交录制启动的 room_id 集合，防止同一房间重复提交
@@ -1256,6 +1236,7 @@ def shutdown_room_handlers(timeout_sec: float = 10.0) -> dict[str, int]:
         ("bridge", _bridge_executor),
         ("ai", _ai_executor),
         ("probe", _probe_executor),
+        ("repair", _repair_executor),
     ):
         shutdown = getattr(executor, "shutdown", None)
         if callable(shutdown):
@@ -1423,14 +1404,6 @@ def _map_highlights_by_room(highlights, main_room, target_rooms) -> dict[str, li
             if float(mapped.get("start", 0) or 0) < float(mapped.get("end", 0) or 0):
                 mapped_by_room[room_id].append(mapped)
     return mapped_by_room
-def _detect_audio_energy_peaks(*args, **kwargs):
-    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
-    from lsc.analyzer.scene_analysis import detect_audio_energy_peaks
-    return detect_audio_energy_peaks(*args, **kwargs)
-def _detect_rounds_by_audio_rhythm(*args, **kwargs):
-    """兼容包装：音频回合检测已随纯 OCR 简化移除，恒返回空列表。"""
-    _log.warning("detect_rounds_by_audio_rhythm 已废弃（纯 OCR 路径），返回空结果")
-    return []
 def _new_rounds(
     prev: list[dict[str, Any]],
     current: list[dict[str, Any]],
@@ -1681,6 +1654,11 @@ def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
     """Return whether an OCR round is exportable (vision_confirmed + valid boundaries)."""
     if not _is_ocr_round(round_data):
         return False
+    # Jev live 门控（可选；默认 off 时该字段永不出现，行为与原来逐字节一致）：
+    # 判决不达标的回合**撤销自动导出资格**，降级为待人工确认。放在这里而不是只挪
+    # pending 列表，是为了让下游（收尾统计、待导出重试）看到同一个口径。
+    if round_data.get(_JEV_GATED_REASON_FIELD):
+        return False
     try:
         start = float(round_data.get("start", 0.0))
         end = float(round_data.get("end", 0.0))
@@ -1709,6 +1687,217 @@ def _is_auto_exportable_valorant_round(round_data: dict[str, Any]) -> bool:
         else (_OCR_VALID_END_BY | _BROADCAST_VALID_END_BY)
     )
     return start_by in _OCR_VALID_START_BY and end_by in valid_end_by
+# ── Jev 高光判决接线（可选；默认 off 完全跳过）───────────────────────────────
+# 设计、实测与成本见 docs/reports/jev-integration.md。三条边界：
+#  1) highlight_judge_mode 为 off/缺失/写错时，本块**不 import** lsc.analyzer.jev_judge，
+#     零启动开销、零行为变化（这是默认路径）；
+#  2) shadow 是 fire-and-forget：只写 data/jev_judge_shadow.jsonl + 不一致 WARNING，
+#     绝不触碰主流程的返回值、时序或异常语义；
+#  3) live 是可选开关：判决跑在 _ai_executor（不占用事件循环），在下发 vision_confirmed
+#     之前放行/降级——不达标只降级为 pending（仍入列待人工确认，绝不丢弃）。
+_JEV_TIMEOUT_SEC = 8.0
+_JEV_MAX_GATED_ROUNDS = 4
+_JEV_GATED_REASON_FIELD = 'jev_judge_gate_reason'
+_JEV_BACKGROUND_TASKS: set[Any] = set()
+_JEV_PASSTHROUGH_KEYS: tuple[str, ...] = (
+    # ⚠️ round_no 只能来自上游**真有**的字段，**严禁**从 round_key 里解析。
+    # round_key 是 10 秒时间桶（lsc/analyzer/valorant_ocr_rounds.py:708-710
+    # 的 _round_key = f"round-{round(start/10):06d}"），不是回合号：
+    # 夹具里的 round-000105 约是录像 17.5 分钟处，当成「第 105 回合」会喂给模型
+    # 一个**错误事实**（而 build_state_text 会把它当明文陈述，比 unknown 更糟）。
+    'round_no',
+    'phase', 'score_self', 'score_enemy', 'round_time_left_sec',
+    'kills_self', 'kills_enemy', 'deaths_self', 'alive_self', 'alive_enemy',
+    'spike_planted', 'spike_defused', 'ace', 'clutch_1vN',
+    'ocr_text', 'recent_events',
+)
+def _jev_mode_and_threshold() -> tuple[str, float] | None:
+    """返回 (mode, min_confidence)；mode 不是 shadow/live 时返回 None。
+
+    off 的判定先用原始 settings 值做**廉价短路**，避免为了知道「是否开启」而 import
+    判决模块——默认 off 时该模块永远不会被加载（零启动延迟）。
+    """
+    try:
+        settings = load_settings() or {}
+    except Exception as exc:
+        _log.debug("Jev 接线读取 settings 失败，按 off 处理: %s", exc)
+        return None
+    raw = settings.get('highlight_judge_mode')
+    if not isinstance(raw, str) or raw.strip().lower() not in ('shadow', 'live'):
+        return None
+    try:
+        from lsc.analyzer.jev_judge import judge_min_confidence, judge_mode
+    except Exception as exc:
+        _log.warning("Jev 判决模块加载失败，已按 off 处理: %s", exc)
+        return None
+    mode = judge_mode(settings)
+    if mode == 'off':
+        return None
+    return (mode, judge_min_confidence(settings))
+def _jev_round_state(
+    room_id: str,
+    room: Any,
+    round_data: dict[str, Any],
+    analysis_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """把 LSC 的一回合映射成 jev_judge 冻结的 state 键。
+
+    ⚠️ 诚实边界（详见报告「已知问题」）：当前分析管线**不产出**回合级游戏语义字段
+    （kills_self / spike_planted / ace / clutch_1vN / round_time_left_sec 等），
+    所以这里一律**不填、不猜**——jev_judge 会把它们明确列为 NOT AVAILABLE。
+    本层只做「有就透传」：上游一旦补上这些字段，接线无需改动即生效。
+
+    同理**不往 extra 里塞边界/审计元数据**：那是「切得准不准」的证据，与「值不值得切」
+    无关，塞进去只会稀释准确率（Jev 官方明确 state 越杂准确率越低）。
+    """
+    state: dict[str, Any] = {}
+    if room_id:
+        state['room_id'] = str(room_id)
+    platform = str(getattr(room, 'platform', '') or '')
+    if platform:
+        state['platform'] = platform
+    # 本分支只服务 Valorant 回合——这是这条路径的事实，不是猜测。
+    state['game'] = 'valorant'
+    state['mode'] = 'valorant_round'
+    for key in _JEV_PASSTHROUGH_KEYS:
+        value = round_data.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        state[key] = value
+    extra = round_data.get('jev_extra')
+    if isinstance(extra, dict) and extra:
+        state['extra'] = extra
+    return state
+async def _jev_judge_one(state_dict: dict[str, Any]) -> Any:
+    """在 _ai_executor 里跑一次判判决。
+
+    同步阻塞的 judge_round 必须离开事件循环；判决层自身已吞掉所有异常，
+    这里再兜一层是为了防线程池本身出问题。
+    """
+    from lsc.analyzer.jev_judge import judge_round
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _ai_executor, lambda: judge_round(state_dict, timeout=_JEV_TIMEOUT_SEC),
+    )
+def _jev_spawn(coro: Any) -> None:
+    """fire-and-forget：保留强引用防 GC，完成即摘除。"""
+    try:
+        task = asyncio.ensure_future(coro)
+    except RuntimeError as exc:
+        _log.debug("Jev 后台任务无法创建（无运行中的事件循环）: %s", exc)
+        return
+    _JEV_BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_JEV_BACKGROUND_TASKS.discard)
+async def _jev_shadow_worker(
+    room_id: str,
+    room: Any,
+    rounds: list[dict[str, Any]],
+    analysis_state: dict[str, Any] | None,
+) -> None:
+    """shadow 的异步体：只记录，不改主流程。"""
+    from lsc.analyzer.jev_judge import (
+        append_shadow_record,
+        disagrees_with_original,
+        reason_text,
+    )
+    for round_data in rounds:
+        try:
+            state_dict = _jev_round_state(room_id, room, round_data, analysis_state)
+            verdict = await _jev_judge_one(state_dict)
+            original_worth = _is_auto_exportable_valorant_round(round_data)
+            disagreed = disagrees_with_original(
+                verdict, original_worth_clipping=original_worth,
+            )
+            record = {
+                'kind': 'shadow',
+                'at': time.time(),
+                'room_id': str(room_id),
+                'round_key': _valorant_round_key(round_data),
+                'original_worth_clipping': original_worth,
+                'agree': not disagreed,
+                'reason_text': reason_text(verdict),
+                **verdict.as_log_record(),
+            }
+            path = append_shadow_record(record)
+            if disagreed:
+                _log.warning(
+                    "Jev shadow 与原决策不一致: room=%s round=%s 原=%s jev=%s "
+                    "p_clip=%.3f confidence=%.2f reason=%s log=%s",
+                    room_id, record['round_key'], original_worth,
+                    verdict.worth_clipping, verdict.p_clip, verdict.confidence,
+                    record['reason_text'], path,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.debug("Jev shadow 判决/记录异常（已忽略）: %s", exc)
+def _jev_spawn_shadow(
+    mode: str,
+    room_id: str,
+    room: Any,
+    rounds: list[dict[str, Any]],
+    analysis_state: dict[str, Any] | None,
+) -> None:
+    """把 shadow 判决投成后台任务（不 await，不阻塞分析循环）。"""
+    if mode != 'shadow' or not rounds:
+        return
+    _jev_spawn(_jev_shadow_worker(room_id, room, list(rounds), analysis_state))
+async def _jev_apply_live_gate(
+    mode: str,
+    min_confidence: float,
+    room_id: str,
+    room: Any,
+    rounds: list[dict[str, Any]],
+    analysis_state: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """live 门控：返回 (放行, 被降级)。
+
+    判决并发跑在 _ai_executor，并由 _JEV_TIMEOUT_SEC 与 _JEV_MAX_GATED_ROUNDS 双重封顶，
+    因此本函数对分析循环的最坏附加等待是**一次判决的 timeout**（不是 N 倍）。
+    判决不可用时按 jev_judge.LIVE_GATE_FAIL_OPEN 放行（交回原逻辑），
+    并把「判决不可用」写进原因串，不做静默降级。
+    """
+    if mode != 'live' or not rounds:
+        return (rounds, [])
+    from lsc.analyzer.jev_judge import gate_out_reason, reason_text
+    batch = rounds[:_JEV_MAX_GATED_ROUNDS]
+    overflow = rounds[_JEV_MAX_GATED_ROUNDS:]
+    states = [_jev_round_state(room_id, room, item, analysis_state) for item in batch]
+    verdicts = await asyncio.gather(
+        *(_jev_judge_one(state_dict) for state_dict in states),
+        return_exceptions=True,
+    )
+    kept: list[dict[str, Any]] = []
+    gated: list[dict[str, Any]] = []
+    # strict=False 是有意的：verdicts 由 gather 对同一批 states 生成，长度按构造必等；
+    # 但真出现不等时，宁可少门控一个回合，也不能让 ValueError 冲进分析循环。
+    for round_data, verdict in zip(batch, verdicts, strict=False):
+        if isinstance(verdict, BaseException):
+            _log.debug("Jev live 判决异常（按放行处理）: %s", verdict)
+            kept.append(round_data)
+            continue
+        reason = gate_out_reason(verdict, min_confidence)
+        if not reason:
+            kept.append(round_data)
+            continue
+        # 降级：只撤销「自动导出资格」，不丢弃——仍入列待人工确认。
+        round_data[_JEV_GATED_REASON_FIELD] = reason
+        round_data['jev_judge'] = verdict.as_log_record()
+        round_data['jev_judge_reason_text'] = reason_text(verdict)
+        gated.append(round_data)
+        _log.info(
+            "Jev live 门控降级为待人工确认: room=%s round=%s reason=%s "
+            "p_clip=%.3f confidence=%.2f",
+            room_id, _valorant_round_key(round_data), reason,
+            verdict.p_clip, verdict.confidence,
+        )
+    if overflow:
+        _log.info(
+            "Jev live 门控达单轮上限 %d，其余 %d 回合本轮按原逻辑放行",
+            _JEV_MAX_GATED_ROUNDS, len(overflow),
+        )
+        kept.extend(overflow)
+    return (kept, gated)
 def _valorant_round_key(round_data: dict[str, Any]) -> str:
     """Return a boundary-stable key for one Valorant round."""
     existing = str(round_data.get("round_key") or "").strip()
@@ -1808,7 +1997,9 @@ def _strip_room_scoped_keys(room_id: str, *registries: Any) -> int:
             for key in [k for k in reg if str(k).startswith(prefix)]:
                 reg.pop(key, None)
                 removed += 1
-        elif isinstance(reg, (set, frozenset)):
+        elif isinstance(reg, set):
+            # 刻意不收 frozenset：它压根不能改，写进判据只会让 `reg.discard`
+            # 在真收到 frozenset 时抛 AttributeError（一个谎报支持的分支）。
             for key in [k for k in reg if str(k).startswith(prefix)]:
                 reg.discard(key)
                 removed += 1
@@ -2062,9 +2253,13 @@ def _round_dedupe_key(item: dict[str, Any]) -> str:
 
 
 def _round_span_sec(item: dict[str, Any]) -> tuple[float, float] | None:
+    raw_start = item.get("start")
+    raw_end = item.get("end")
+    if raw_start is None or raw_end is None:
+        return None
     try:
-        start = float(item.get("start"))
-        end = float(item.get("end"))
+        start = float(raw_start)
+        end = float(raw_end)
     except (TypeError, ValueError):
         return None
     if end - start < _DEDUPE_MIN_SPAN_SEC:
@@ -2588,10 +2783,15 @@ def _continuous_listed_clip_snapshot(task: dict[str, Any]) -> list[dict[str, Any
     if isinstance(listed_clip_state, list):
         return [dict(item) for item in listed_clip_state if isinstance(item, dict)]
     return []
-def _continuous_coverage_snapshot(task: dict[str, Any]) -> list[list[float]]:
-    """Return the successful scan coverage without exposing mutable state."""
+def _continuous_coverage_snapshot(task: dict[str, Any]) -> list[tuple[float, float]]:
+    """Return the successful scan coverage without exposing mutable state.
+
+    账本内部一律 tuple —— 与 `ContinuousFinalizationJob.coverage_ranges` 同形，
+    也让 `merge_ranges` / `uncovered_ranges` 的类型声明真的成立。转成 list 是
+    JSON 载荷边界的事（见 `continuous_finalization.to_payload`）。
+    """
     ranges = task.get("coverage_ranges") or []
-    result: list[list[float]] = []
+    result: list[tuple[float, float]] = []
     if isinstance(ranges, (list, tuple)):
         for item in ranges:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -2601,8 +2801,8 @@ def _continuous_coverage_snapshot(task: dict[str, Any]) -> list[list[float]]:
                 except (TypeError, ValueError):
                     continue
                 if start >= 0.0 and end > start:
-                    result.append([start, end])
-    return [list(item) for item in merge_ranges((item[0], item[1]) for item in result)]
+                    result.append((start, end))
+    return merge_ranges(result)
 def _refresh_audit_queue_state(task_state: dict[str, Any]) -> None:
     """刷新审计队列深度与交付差额状态。"""
     ocr_state = task_state.get("ocr_runtime_state") or {}
@@ -2629,13 +2829,10 @@ def _record_continuous_scan_coverage(
         return
     if start < 0.0 or end <= start:
         return
-    state["coverage_ranges"] = [
-        list(item)
-        for item in merge_ranges([
-            *(_continuous_coverage_snapshot(state)),
-            (start, end),
-        ])
-    ]
+    state["coverage_ranges"] = merge_ranges([
+        *(_continuous_coverage_snapshot(state)),
+        (start, end),
+    ])
     if final_duration is not None:
         try:
             target = max(0.0, float(final_duration))
@@ -2966,15 +3163,6 @@ def _build_continuous_status_payload(
     if include_listed:
         payload["listed_clips"] = listed_clips
     return payload
-def _is_ocr_quality_round(round_data: dict[str, Any]) -> bool:
-    """OCR 边界回合（含未完全可导的 pending），合并时优先于纯音频。"""
-    if round_data.get("ocr_confirmed"):
-        return True
-    start_by = str(round_data.get("start_by", "") or "")
-    end_by = str(round_data.get("end_by", "") or "")
-    return start_by in {"ocr_buy_exit", "ocr_prev_end", "ocr"} or end_by in {
-        "ocr_result", "next_buy",
-    }
 def _merge_round_windows(
     existing: list[dict[str, Any]],
     window_rounds: list[dict[str, Any]],
@@ -3557,7 +3745,10 @@ def _reset_ocr_runtime_for_noncontiguous_window(
          一条几千秒的假回合。
     返回是否实际重置。
     """
-    runtime_state = (state or {}).get("ocr_runtime_state")
+    if not isinstance(state, dict):
+        # 本函数末尾要往 state 里写 `ocr_runtime_reset_at`，必须先确定它是 dict。
+        return False
+    runtime_state = state.get("ocr_runtime_state")
     if not isinstance(runtime_state, dict):
         return False
     try:
@@ -3802,18 +3993,6 @@ def _cleanup_segments(segments: list[dict[str, Any]], min_duration: float = 5.0)
                 cleaned.pop()
         cleaned.append(dict(seg))
     return cleaned
-def _scene_ocr_detection(*args, **kwargs):
-    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
-    from lsc.analyzer.scene_analysis import scene_ocr_detection
-    return scene_ocr_detection(*args, **kwargs)
-def _merge_scene_and_ocr(*args, **kwargs):
-    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
-    from lsc.analyzer.scene_analysis import merge_scene_and_ocr
-    return merge_scene_and_ocr(*args, **kwargs)
-def _run_scene_analysis(*args, **kwargs):
-    """兼容包装：逻辑已迁至 lsc.analyzer.scene_analysis。"""
-    from lsc.analyzer.scene_analysis import run_scene_analysis
-    return run_scene_analysis(*args, **kwargs)
 def _analyze_scene_or_rounds(
     video_path: str,
     game: str,
@@ -3980,7 +4159,11 @@ def _is_allowed_output_dir(path: str) -> bool:
         root_norm = os.path.normcase(os.path.realpath(root))
         if real == root_norm or real.startswith(root_norm + os.sep):
             return False
-    return True
+    # 禁止盘符根与 UNC 共享根（C:\ / D:/ / \\server\share），要求至少一层子目录
+    drive = os.path.splitdrive(real)[0]
+    if drive and real.rstrip("\\/") == drive.rstrip("\\/"):
+        return False
+    return not (real.startswith("\\\\") and real.count("\\") <= 3)
 def _parse_fps(framerate: str) -> float:
     """Parse framerate string to float. Returns 0.0 for 原画/auto."""
     if not framerate or framerate == '原画':
@@ -3989,12 +4172,6 @@ def _parse_fps(framerate: str) -> float:
         return float(framerate)
     except (ValueError, TypeError):
         return 0.0
-def _safe_float(value, default: float = 0.0) -> float:
-    """安全地将值转换为 float，转换失败时返回默认值。"""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 def _epoch_ms_to_mono(epoch_ms: float) -> float:
     """将前端 Date.now() 毫秒时间转换为后端 time.monotonic()。"""
     return time.monotonic() - (time.time() - float(epoch_ms) / 1000.0)
@@ -4111,7 +4288,17 @@ def load_settings():
             _settings_cache_time = now
             return _settings_cache
         except Exception as exc:
-            _log.warning("加载设置文件失败，使用默认值: %s", exc)
+            _log.warning("加载设置文件失败，尝试 .bak 恢复: %s", exc)
+            bak = SETTINGS_FILE.with_suffix(SETTINGS_FILE.suffix + '.bak')
+            try:
+                with open(bak, encoding='utf-8') as f:
+                    _settings_cache = json.load(f)
+                _settings_cache_mtime = None
+                _settings_cache_time = now
+                _log.info("已从 settings.json.bak 恢复设置")
+                return _settings_cache
+            except Exception as bak_exc:
+                _log.warning("settings.json.bak 也不可用，使用默认值: %s", bak_exc)
     _settings_cache = {
         'output_dir': os.path.join(os.path.expanduser('~'), 'LSC', 'output'),
         'theme': 'dark',
@@ -4130,6 +4317,10 @@ def load_settings():
         'default_export_preset': 'douyin_vertical',
         'export_max_concurrent': 2,
         'ocr_accel': 'dml',
+        # Jev 高光判决（可选）。默认 off = 不 import 判决模块、零行为变化；
+        # 'shadow' 只记录对照，'live' 用判决门控自动导出资格。
+        'highlight_judge_mode': 'off',
+        'highlight_judge_min_confidence': 0.6,
         'jianying_draft_dir': '',  # 空 = 自动探测 %LOCALAPPDATA%\JianyingPro\...
     }
     _settings_cache_time = now
@@ -4225,31 +4416,6 @@ def save_settings(settings: dict):
     except OSError as exc:
         _log.error("保存设置失败: %s", exc)
         raise
-def get_storage_info():
-    """获取输出目录存储信息（总大小、磁盘总量、切片数量）。"""
-    settings = load_settings()
-    output_dir = _expand_user_path(settings.get('output_dir', os.path.join(os.path.expanduser('~'), 'LSC', 'output')))
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-    total_size = 0
-    clip_count = 0
-    for dirpath, _dirnames, filenames in os.walk(output_dir):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if os.path.exists(fp):
-                total_size += os.path.getsize(fp)
-                if f.endswith(('.mp4', '.mkv', '.flv', '.mov', '.ts')):
-                    clip_count += 1
-    try:
-        disk_usage = shutil.disk_usage(output_dir)
-        total_disk = disk_usage.total / (1024 ** 3)
-    except Exception:
-        total_disk = 50
-    return {
-        'used': total_size / (1024 ** 3),
-        'total': total_disk,
-        'clip_count': clip_count,
-    }
 def get_disk_usage_info():
     """获取输出目录磁盘使用情况（总容量、已用、可用）。"""
     settings = load_settings()
@@ -4502,7 +4668,7 @@ class _RoomsThrottle:
         self._pending = True
         return False
     def mark_pending(self) -> None:
-        """标记有未发送的更新。"""
+        """标记有未发送的更新（供调用方在"已经自行处理过发送"之后复位/置位）。"""
         self._pending = True
     @property
     def has_pending(self) -> bool:
@@ -4669,10 +4835,10 @@ def register_room_handlers(server, bridge):
                 return False
             ingest = get_shared_ingest_registry().get(room_id)
             saw_first_ts = bool(getattr(ingest, "_upstream_has_produced_data", False))
-            rotating = bool(
-                callable(getattr(ingest, "is_lease_rotating", None))
-                and ingest.is_lease_rotating()
-            )
+            # 先取到局部变量再判 callable：`and` 不会替我py收窄 None，
+            # 直接写 `ingest.is_lease_rotating()` 会让静态检查报属性不存在。
+            rotate_probe = getattr(ingest, "is_lease_rotating", None)
+            rotating = bool(callable(rotate_probe) and rotate_probe())
             return _is_lease_rotation_error(
                 getattr(room, "stream_info", None),
                 err,
@@ -5206,7 +5372,10 @@ def register_room_handlers(server, bridge):
         try:
             settings = load_settings()
             output_dir = _expand_user_path(settings.get('output_dir', ''))
-            stats = collect_system_stats(output_dir, extra=_ingest_diagnostics())
+            stats = collect_system_stats(
+                output_dir,
+                extra=_system_stats_extra(bridge),
+            )
             bridge.queue_broadcast({'type': 'system_stats', 'data': stats})
         except Exception as exc:
             _log.debug("System stats broadcast failed: %s", exc)
@@ -5318,21 +5487,32 @@ def register_room_handlers(server, bridge):
         return {'success': True, 'refreshed': refreshed}
     @server.on('save_rooms')
     async def handle_save_rooms(data):
-        """保存前端传入的房间列表。"""
+        """保存前端传入的房间列表。
+
+        这是 rooms.json 的**第二条写入口**，判据必须与 `add_room` 同源：
+        过去它只查"是不是字符串"，既没有 URL 结构校验，也没有房间数上限 ——
+        一次批量保存就能绕过 `MAX_ROOMS` 写入任意多房间并把脏 URL 落盘。
+        """
         rooms = data.get('rooms', [])
         if not isinstance(rooms, list):
             _log.warning("save_rooms 校验失败: rooms 不是列表")
             return {'success': False, 'error': 'rooms 必须是列表'}
-        for room in rooms:
+        max_rooms = _get_configured_max_rooms()
+        if len(rooms) > max_rooms:
+            _log.warning("save_rooms 校验失败: %d 个房间超过上限 %d", len(rooms), max_rooms)
+            return {'success': False, 'error': f'房间数超过上限（最多 {max_rooms} 个）'}
+        for index, room in enumerate(rooms):
             if not isinstance(room, dict):
                 _log.warning("save_rooms 校验失败: 房间数据不是对象")
                 return {'success': False, 'error': '房间数据必须是对象'}
-            if not isinstance(room.get('room_id'), str):
-                _log.warning("save_rooms 校验失败: room_id 不是字符串")
-                return {'success': False, 'error': 'room_id 必须是字符串'}
-            if not isinstance(room.get('room_url'), str):
-                _log.warning("save_rooms 校验失败: room_url 不是字符串")
-                return {'success': False, 'error': 'room_url 必须是字符串'}
+            room_id = room.get('room_id')
+            if not isinstance(room_id, str) or not room_id.strip():
+                _log.warning("save_rooms 校验失败: room_id 不是非空字符串 (index=%s)", index)
+                return {'success': False, 'error': 'room_id 必须是非空字符串'}
+            url, shape_error = _room_url_shape(room.get('room_url'))
+            if shape_error is not None:
+                _log.warning("save_rooms 校验失败: 第 %s 个房间 URL 非法 (%s)", index, shape_error)
+                return {'success': False, 'error': f'第 {index + 1} 个房间链接非法：{shape_error}'}
         success = save_rooms(rooms)
         _log.info("save_rooms: 保存 %d 个房间, success=%s", len(rooms), success)
         return {'success': success}
@@ -5652,6 +5832,10 @@ def register_room_handlers(server, bridge):
         _log.info("移除房间: room_id=%s", room_id)
         # 房间被移除：终态权威快照一并清掉，避免房间重新加入后旧快照被当成权威集合。
         _clear_authority_snapshot(room_id)
+        # 同时注销该房间按 room:round_key / room_id 登记的切片账本与标签计数器。
+        # 缺这一步时，反复增删房间会让这些注册表只增不减（长挂机内存累积），
+        # 且重新加入同名房间会继承上一场的"已删除 tombstone / 已入列键"从而吞掉广播。
+        _forget_room_registries(room_id)
         stale_streamer = _preview_stream_registry().pop(room_id)
         if stale_streamer is not None:
             _log.info("清理移除房间的 MSE streamer: room_id=%s", room_id)
@@ -5716,7 +5900,7 @@ def register_room_handlers(server, bridge):
     async def handle_seek(data):
         """跳转到指定时间位置。"""
         room_id = data.get('room_id')
-        time_pos = _safe_float(data.get('time', 0))
+        time_pos = safe_float(data.get('time', 0))
         if not room_id:
             return {'error': 'room_id is required'}
         _log.debug("seek: room_id=%s, time=%.2f", room_id, time_pos)
@@ -5747,8 +5931,8 @@ def register_room_handlers(server, bridge):
         """
         room_id = str(data.get('room_id') or '').strip()
         preview_epoch_id = str(data.get('preview_epoch_id') or '').strip()
-        preview_time = _safe_float(data.get('preview_current_time'), -1.0)
-        sample_epoch_ms = _safe_float(data.get('sample_epoch_ms'), 0.0)
+        preview_time = safe_float(data.get('preview_current_time'), -1.0)
+        sample_epoch_ms = safe_float(data.get('sample_epoch_ms'), 0.0)
         if not room_id:
             return {'success': False, 'error': 'room_id is required'}
         if preview_time < 0.0 or sample_epoch_ms <= 0.0:
@@ -5865,6 +6049,7 @@ def register_room_handlers(server, bridge):
         _log.debug("设置入点: room_id=%s, time=%s, live=%s", room_id, time_value, live)
         # 支持显式传入精确计算的 wallclock（如回看或拖动微调）；未传入时 live=True 取当前 monotonic
         wallclock_val = data.get('wallclock')
+        captured_wallclock: float | None
         if wallclock_val is not None:
             captured_wallclock = float(wallclock_val)
         else:
@@ -5904,6 +6089,7 @@ def register_room_handlers(server, bridge):
         _log.debug("设置出点: room_id=%s, time=%s, live=%s", room_id, time_value, live)
         # 支持显式传入精确计算的 wallclock（如回看或拖动微调）；未传入时 live=True 取当前 monotonic
         wallclock_val = data.get('wallclock')
+        captured_wallclock: float | None
         if wallclock_val is not None:
             captured_wallclock = float(wallclock_val)
         else:
@@ -5965,7 +6151,7 @@ def register_room_handlers(server, bridge):
         _log.debug("获取系统资源快照")
         settings = load_settings()
         output_dir = _expand_user_path(settings.get('output_dir', ''))
-        stats = collect_system_stats(output_dir, extra=_ingest_diagnostics())
+        stats = collect_system_stats(output_dir, extra=_system_stats_extra(bridge))
         return {'type': 'system_stats', 'data': stats}
     @server.on('get_settings')
     async def handle_get_settings(data):
@@ -6020,175 +6206,8 @@ def register_room_handlers(server, bridge):
             data.get('timeline_replay_seconds'),
         )
         return {'success': True}
-    @server.on('get_douyin_cookie_status')
-    async def handle_get_douyin_cookie_status(data):
-        """查询抖音 Cookie 是否已配置。"""
-        from lsc.platforms.cookie_helper import get_douyin_cookie_status
-        try:
-            return {'success': True, **get_douyin_cookie_status()}
-        except Exception as exc:
-            _log.warning("get_douyin_cookie_status failed: %s", redact_text(exc))
-            return {'success': False, 'error': redact_text(exc), 'configured': False, 'count': 0}
-    @server.on('save_douyin_cookies')
-    async def handle_save_douyin_cookies(data):
-        """保存用户粘贴的抖音 Cookie（JSON / Cookie 头）。"""
-        from lsc.platforms.cookie_helper import save_douyin_cookies_from_text
-        raw = ''
-        if isinstance(data, dict):
-            raw = str(data.get('cookies') or data.get('text') or '')
-        if not raw.strip():
-            return {'success': False, 'error': '请粘贴 Cookie 内容'}
-        # 限制 Cookie 输入大小，防止超大 payload 导致 OOM（正常 Cookie < 16KB）
-        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
-        if len(raw) > _MAX_COOKIE_BYTES:
-            _log.warning("抖音 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
-            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
-        try:
-            status = save_douyin_cookies_from_text(raw)
-            _log.info("抖音 Cookie 已保存: count=%s", status.get('count'))
-            credential_status = ''
-            try:
-                from lsc.platforms.credentials import get_default_credential_provider
-                credential_status = get_default_credential_provider().refresh(
-                    'douyin'
-                ).status.value
-            except Exception as exc:
-                _log.warning(
-                    "refresh douyin credential state failed: %s",
-                    redact_text(exc),
-                )
-            return {
-                'success': True,
-                **status,
-                'credential_status': credential_status or 'INVALID',
-            }
-        except (ValueError, json.JSONDecodeError) as exc:
-            return {'success': False, 'error': redact_text(exc)}
-        except OSError as exc:
-            _log.error("保存抖音 Cookie 失败: %s", redact_text(exc))
-            return {'success': False, 'error': humanize_error(str(exc))}
-    @server.on('get_bilibili_cookie_status')
-    async def handle_get_bilibili_cookie_status(data):
-        """查询 B 站 Cookie 是否已配置。"""
-        from lsc.platforms.cookie_helper import get_bilibili_cookie_status
-        try:
-            return {'success': True, **get_bilibili_cookie_status()}
-        except Exception as exc:
-            _log.warning("get_bilibili_cookie_status failed: %s", redact_text(exc))
-            return {'success': False, 'error': redact_text(exc), 'configured': False, 'count': 0}
-    @server.on('get_platform_credential_status')
-    async def handle_get_platform_credential_status(data):
-        """Return redacted credential state for any registered platform."""
-        from lsc.platforms.capabilities import all_platform_capabilities
-        from lsc.platforms.credentials import get_default_credential_provider
-        platform = str(data.get('platform') or '').strip().lower() if isinstance(data, dict) else ''
-        account_ref = str(data.get('account_ref') or 'default').strip() if isinstance(data, dict) else 'default'
-        if platform not in all_platform_capabilities():
-            return {'success': False, 'error': '不支持的平台', 'status': 'NOT_CONFIGURED'}
-        if not account_ref or len(account_ref) > 128:
-            return {'success': False, 'error': 'account_ref 无效', 'status': 'INVALID'}
-        try:
-            provider = get_default_credential_provider()
-            status = provider.get_status(platform, account_ref)
-            capabilities = all_platform_capabilities()[platform]
-            return {
-                'success': True,
-                'platform': platform,
-                'account_ref': account_ref,
-                'status': status.value,
-                'available': status.value in {'AVAILABLE', 'EXPIRING'},
-                'support_level': capabilities.support_level,
-                'credential_kinds': list(capabilities.credential_kinds),
-            }
-        except Exception as exc:
-            _log.warning("platform credential status failed platform=%s: %s", platform, redact_text(exc))
-            return {'success': False, 'error': '读取凭据状态失败', 'status': 'INVALID'}
-    @server.on('save_bilibili_cookies')
-    async def handle_save_bilibili_cookies(data):
-        """保存用户粘贴的 B 站 Cookie（JSON / Cookie 头）。"""
-        from lsc.platforms.cookie_helper import save_bilibili_cookies_from_text
-        raw = ''
-        if isinstance(data, dict):
-            raw = str(data.get('cookies') or data.get('text') or '')
-        if not raw.strip():
-            return {'success': False, 'error': '请粘贴 Cookie 内容'}
-        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
-        if len(raw) > _MAX_COOKIE_BYTES:
-            _log.warning("B站 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
-            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
-        try:
-            status = save_bilibili_cookies_from_text(raw)
-            _log.info("B站 Cookie 已保存: count=%s", status.get('count'))
-            credential_status = ''
-            try:
-                from lsc.platforms.credentials import get_default_credential_provider
-                credential_status = get_default_credential_provider().refresh(
-                    'bilibili'
-                ).status.value
-            except Exception as exc:
-                _log.warning(
-                    "refresh bilibili credential state failed: %s",
-                    redact_text(exc),
-                )
-            return {
-                'success': True,
-                **status,
-                'credential_status': credential_status or 'INVALID',
-            }
-        except (ValueError, json.JSONDecodeError) as exc:
-            return {'success': False, 'error': redact_text(exc)}
-        except OSError as exc:
-            _log.error("保存 B站 Cookie 失败: %s", redact_text(exc))
-            return {'success': False, 'error': humanize_error(str(exc))}
-    @server.on('get_huya_cookie_status')
-    async def handle_get_huya_cookie_status(data):
-        """查询虎牙 Cookie 是否已配置。"""
-        from lsc.platforms.cookie_helper import get_huya_cookie_status
-        try:
-            return {'success': True, **get_huya_cookie_status()}
-        except Exception as exc:
-            _log.warning("get_huya_cookie_status failed: %s", redact_text(exc))
-            return {'success': False, 'error': redact_text(exc), 'configured': False, 'count': 0}
-    @server.on('save_huya_cookies')
-    async def handle_save_huya_cookies(data):
-        """保存用户粘贴的虎牙 Cookie（JSON / Cookie 头）。"""
-        from lsc.platforms.cookie_helper import save_huya_cookies_from_text
-        raw = ''
-        if isinstance(data, dict):
-            raw = str(data.get('cookies') or data.get('text') or '')
-        if not raw.strip():
-            return {'success': False, 'error': '请粘贴 Cookie 内容'}
-        _MAX_COOKIE_BYTES = 1 * 1024 * 1024  # 1 MB
-        if len(raw) > _MAX_COOKIE_BYTES:
-            _log.warning("虎牙 Cookie 输入过大: %d bytes (limit %d)", len(raw), _MAX_COOKIE_BYTES)
-            return {'success': False, 'error': f'Cookie 内容过大（{len(raw)} 字节），请检查输入'}
-        try:
-            status = save_huya_cookies_from_text(raw)
-            _log.info("虎牙 Cookie 已保存: count=%s", status.get('count'))
-            credential_status = ''
-            try:
-                from lsc.platforms.credentials import get_default_credential_provider
-                credential_status = get_default_credential_provider().refresh(
-                    'huya'
-                ).status.value
-            except Exception as exc:
-                _log.warning(
-                    "refresh huya credential state failed: %s",
-                    redact_text(exc),
-                )
-            return {
-                'success': True,
-                **status,
-                'credential_status': credential_status or 'INVALID',
-            }
-        except (ValueError, json.JSONDecodeError) as exc:
-            return {'success': False, 'error': redact_text(exc)}
-        except OSError as exc:
-            _log.error("保存虎牙 Cookie 失败: %s", redact_text(exc))
-            return {'success': False, 'error': humanize_error(str(exc))}
-    # ⚠️ 死代码：本 handler 与 align_preview_audio 已被 alignment_handlers.py 后注册覆盖。
-    # 改动此处无效，须改 alignment_handlers.py（register_room_handlers 按顺序注册，
-    # server.on 后注册覆写前者）。保留仅供比对，勿改。
+    # check_dependencies 的唯一实现在这里，不在 alignment_handlers.py。
+    # （server.on 对重复注册直接抛 ValueError，"按注册顺序后者优先/覆盖"的机制并不存在。）
     _DEPS_CHECK_CACHE_TTL = 30.0
     _deps_cache: dict[str, Any] = {'data': None, 'at': 0.0}
     @server.on('check_dependencies')
@@ -6273,6 +6292,7 @@ def register_room_handlers(server, bridge):
             return {'success': False, 'error': '该房间没有录制文件'}
         def _render() -> list[str | None]:
             import cv2
+
             from lsc.analyzer.valorant_ocr_rounds import extract_frames_cancellable
             cfg = load_config()
             ffmpeg_path = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
@@ -6310,7 +6330,16 @@ def register_room_handlers(server, bridge):
         _log.info("预览切换: room_id=%s, enabled=%s, mode=%s", room_id, enabled, mode)
         # MSE 模式：在 handler 层管理 MseStreamer（需要 WebSocket 推送）
         if mode == 'mse':
-            return await _handle_mse_preview(server, manager, room_id, enabled, data)
+            # restart=true：前端播放器自救阶梯耗尽后请求重建后端预览 sink。
+            # 旧实现只回一句「已在推流」而不重建 sink，前端没有任何手段强制重启
+            # 后端 sink ⇒ 现场（2026-09-15）只能让用户手动关/开预览（CLAUDE.md §7.2.2 遗留项）。
+            # 重建会换 preview_epoch_id，前端据此重建播放器并等新 init 段，不需要额外协议。
+            force_restart = bool(data.get('restart', False)) and enabled
+            if force_restart:
+                _log.info("按前端自愈请求强制重启预览 sink: room_id=%s", room_id)
+            return await _handle_mse_preview(
+                server, manager, room_id, enabled, data, force_restart=force_restart,
+            )
         def _preview():
             if enabled:
                 return manager.start_preview(room_id, mode=mode)  # type: ignore[call-arg]
@@ -6978,7 +7007,6 @@ def register_room_handlers(server, bridge):
                         ).probe_timeout_sec
                         # 11. 创建并启动新的 MseStreamer
                         def _restart():
-                            from lsc.core.services.mse_streamer import MseStreamer
                             try:
                                 streamer = MseStreamer(
                                     url=r_stream_url,
@@ -7066,7 +7094,6 @@ def register_room_handlers(server, bridge):
                     误导用户。
                     """
                     try:
-                        from lsc.core.services.mse_streamer import MseStreamer
                         streamer = MseStreamer(
                             url=stream_url,
                             width=width,
@@ -7288,6 +7315,22 @@ def register_room_handlers(server, bridge):
     _listed_clip_bounds: dict[str, tuple[float, float, str]] = {}  # listed_key -> (start, end, status)
     _deleted_clip_keys: dict[str, None] = {}  # 用户删除的 listed_key（tombstone，防止 OCR upsert 复活）
     _refined_round_keys: set[str] = set()  # 精修中或已确认的 round_key（OCR 不得改边界）
+
+    def _forget_room_registries(room_id: str) -> int:
+        """房间被移除（而非仅换 epoch）时注销它的全部按房间登记的账本。
+
+        委托既有的 `_reset_epoch_scoped_clip_state`（它已覆盖
+        _listed_clip_ids / bounds / _exported_clip_ids / _deleted_clip_keys /
+        _listed_clip_labels / _refined_round_keys），这里只补它管不到的
+        **按裸 room_id 增长**的两个标签计数器 —— 它们此前全仓无任何 pop/clear，
+        而删房路径此前一次都没调用过 epoch 清理，等于房间来回增删即永久累积。
+        """
+        if not room_id:
+            return 0
+        with _clip_label_lock:
+            _manual_clip_counters.pop(room_id, None)
+            _ai_clip_counters.pop(room_id, None)
+        return _reset_epoch_scoped_clip_state(room_id)
     # 保护 _refined_round_keys 的锁：asyncio handler 与分析 executor 线程
     # 均会并发读写（#102），无锁可导致重复导出或 OCR 误改冻结边界
     _refined_round_keys_lock = threading.Lock()
@@ -7797,11 +7840,22 @@ def register_room_handlers(server, bridge):
                             'rounds': _rounds or [],
                             'scan_succeeded': bool(_scan_state.get('scan_succeeded', True)),
                         }
-                    return _detect_rounds_by_audio_rhythm(
-                        _vp, duration=_dur, ffmpeg_path=_ffmpeg,
-                        time_range=_range,
-                        cancel_check=_cancel,
-                    )
+                    # 走到这里说明启动侧的能力闸被绕过（`analysis_handlers
+                    # .handle_start_continuous_analysis` 已把非 Valorant-回合 组合拦下）。
+                    # 音频节奏粗扫已随纯 OCR 简化移除，这里**没有**可跑的持续扫描实现；
+                    # 原先调 `_detect_rounds_by_audio_rhythm` 恒返回 []，于是"本轮扫描成功
+                    # 但 0 回合"，把未覆盖窗口误标成已覆盖（债务报告 §11.18-D）。
+                    # 现在如实报 scan_succeeded=False：窗口保持未覆盖，并由既有的
+                    # `_ScanWindowRetryError` 路径记一条简短 warning。
+                    if note_degradation(
+                        "analyzer", "continuous_scan_combo_unsupported",
+                        reason=f"{game}/{_mode}",
+                    ):
+                        _log.error(
+                            "持续分析收到不支持的组合 game=%s mode=%s：本轮按未覆盖处理",
+                            game, _mode,
+                        )
+                    return {'rounds': [], 'scan_succeeded': False}
                 task_state['scan_requested'] = False
                 task_state['scan_running'] = True
                 task_state['scan_abort'] = False
@@ -8044,9 +8098,9 @@ def register_room_handlers(server, bridge):
 
                                     def _run_with_onnx_resource(fn, *args, **kwargs):
                                         """Serialize one bounded refine step only."""
-                                        with _ffmpeg_capture_semaphore:
-                                            with _onnx_inference_semaphore:
-                                                return fn(*args, **kwargs)
+                                        with (_ffmpeg_capture_semaphore,
+                                              _analysis_thread_semaphore):
+                                            return fn(*args, **kwargs)
 
                                     # 收尾阶段判定：录制已停止 / 收尾进行中时文件不再增长，
                                     # 后视窗口结构性不足的候选必须走 finalize 审计（以文件尾
@@ -8059,6 +8113,7 @@ def register_room_handlers(server, bridge):
                                         == 'finalizing'
                                     )
                                     if _profile == 'broadcast':
+                                        from lsc.analyzer.frame_provider import FrameProvider
                                         from lsc.analyzer.valorant_broadcast import (
                                             audit_broadcast_rounds_with_outcomes,
                                         )
@@ -8068,7 +8123,6 @@ def register_room_handlers(server, bridge):
                                         from lsc.analyzer.valorant_ocr_rounds import (
                                             refine_valorant_round_boundaries,
                                         )
-                                        from lsc.analyzer.frame_provider import FrameProvider
                                         _frame_provider = _rs_state.get('broadcast_frame_provider')
                                         if not isinstance(_frame_provider, FrameProvider):
                                             _frame_provider = FrameProvider(max_frames=512)
@@ -8137,18 +8191,18 @@ def register_room_handlers(server, bridge):
                                                 last_dur = float(c.get('_last_audit_dur') or 0.0)
                                                 if c.get('_audit_continue_ready'):
                                                     ready_indices.append(idx)
-                                                elif _dur >= c_end + needed:
-                                                    ready_indices.append(idx)
-                                                elif _finalize_now and _dur <= c_end:
-                                                    # 收尾且候选终点已到/超出文件末尾：后视窗口
-                                                    # 结构性不足。必须强制尝试一次终态审计
+                                                elif (_dur >= c_end + needed
+                                                      or (_finalize_now and _dur <= c_end)):
+                                                    # 常规后视窗口已够；或收尾且候选终点已到/超出
+                                                    # 文件末尾 —— 后者必须强制尝试一次终态审计
                                                     # （finalize=True），否则该候选的
                                                     # `_last_audit_dur` 被钉到文件时长后
                                                     # ready/probe 判定永不再满足，永久滞留。
                                                     ready_indices.append(idx)
-                                                elif last_dur <= 0.0 and _dur >= c_end + 10.0:
-                                                    probe_indices.append(idx)
-                                                elif last_dur > 0.0 and _dur >= last_dur + 12.0:
+                                                elif ((last_dur <= 0.0
+                                                       and _dur >= c_end + 10.0)
+                                                      or (last_dur > 0.0
+                                                          and _dur >= last_dur + 12.0)):
                                                     probe_indices.append(idx)
                                             target_list = ready_indices if ready_indices else probe_indices
                                             if not target_list:
@@ -8212,7 +8266,10 @@ def register_room_handlers(server, bridge):
                                             #    才与最终 start 一致，不再出现“先密扫旧起点、门禁再移动、
                                             #    又把 start_delta 清空”的契约断裂。
                                             if audit_outcomes:
-                                                from lsc.analyzer.valorant_broadcast import BroadcastAuditOutcome
+                                                from lsc.analyzer.valorant_broadcast import (
+                                                    BroadcastAuditOutcome,
+                                                    BroadcastAuditStatus,  # noqa: F401  (cast 目标类型)
+                                                )
                                                 _refined_outcomes: list[Any] = []
                                                 for _outcome in audit_outcomes:
                                                     _status = str(getattr(_outcome, 'status', '') or '').lower()
@@ -8230,7 +8287,11 @@ def register_room_handlers(server, bridge):
                                                         if _refined_list:
                                                             _cand_out = _refined_list[0]
                                                         _refined_outcomes.append(BroadcastAuditOutcome(
-                                                            status=_status,
+                                                            # 外层 if 已判定 _status ∈ {accepted, manual_review}，
+                                                            # cast 只是把该不变量告诉类型系统。
+                                                            status=cast(
+                                                                "BroadcastAuditStatus", _status
+                                                            ),
                                                             candidate=_cand_out,
                                                             reason=str(getattr(_outcome, 'reason', '') or ''),
                                                             retry_after_duration=getattr(_outcome, 'retry_after_duration', None),
@@ -8309,7 +8370,7 @@ def register_room_handlers(server, bridge):
                                     from lsc.analyzer.valorant_ocr_rounds import (
                                         refine_valorant_round_boundaries,
                                     )
-                                    _pov_refined = []
+                                    _pov_refined: list[Any] = []
                                     for _candidate in _rounds:
                                         _pov_refined.extend(
                                             _run_with_onnx_resource(
@@ -9519,6 +9580,8 @@ def register_room_handlers(server, bridge):
                                 )
                         else:
                             listable_hl = list(new_hl)
+                        # Jev 接线配置：off（默认）时返回 None，且**不 import** 判决模块。
+                        _jev_cfg = _jev_mode_and_threshold()
                         if (
                             listable_hl
                             and ok
@@ -9535,6 +9598,14 @@ def register_room_handlers(server, bridge):
                                 h for h in listable_hl
                                 if not _is_auto_exportable_valorant_round(h)
                             ]
+                            # Jev live 门控（可选；默认 off 时 _jev_cfg 为 None 直接放行）：
+                            # 只把「自动导出资格」降级为待人工确认，绝不丢弃回合。
+                            if _jev_cfg and _jev_cfg[0] == 'live':
+                                confirmed_hl, _jev_gated_hl = await _jev_apply_live_gate(
+                                    _jev_cfg[0], _jev_cfg[1], room_id, main_room_for_map,
+                                    confirmed_hl, state,
+                                )
+                                pending_hl.extend(_jev_gated_hl)
                             # 只入列不导出：list_only=True 仅广播 clip_queued 入切片列表与时间线
                             if confirmed_hl:
                                 await _auto_export_highlights(
@@ -9557,6 +9628,14 @@ def register_room_handlers(server, bridge):
                             _log.info(
                                 "持续分析入列（仅列表）: room_id=%s, 确认 %d 段, pending %d 段 × %d 房间",
                                 room_id, len(confirmed_hl), len(pending_hl), len(target_rooms_for_map),
+                            )
+                        # Jev shadow（可选；默认 off 完全跳过）：fire-and-forget，
+                        # 只落 data/jev_judge_shadow.jsonl + 不一致 WARNING，
+                        # 不触碰主流程的返回值/时序/异常语义。
+                        if _jev_cfg and _jev_cfg[0] == 'shadow' and listable_hl:
+                            _jev_spawn_shadow(
+                                _jev_cfg[0], room_id, manager.get_room(main_room_id),
+                                listable_hl, state,
                             )
                         # 导出成功后，清除"最近检测边界"，避免状态栏持续显示已导出的回合。
                         # 状态栏应只展示"已分析但尚未导出"的入出点；导出完成后应等待下一轮扫描
@@ -9725,11 +9804,8 @@ def register_room_handlers(server, bridge):
                             if _runtime_coverage:
                                 _finalization_job.coverage_ranges = merge_ranges(
                                     [
-                                        list(item)
-                                        for item in (
-                                            list(_finalization_job.coverage_ranges)
-                                            + _runtime_coverage
-                                        )
+                                        *_finalization_job.coverage_ranges,
+                                        *_runtime_coverage,
                                     ]
                                 )
                             coverage_complete = coverage_complete and (
@@ -10872,6 +10948,16 @@ def register_room_handlers(server, bridge):
         _log.info("删除切片: room=%s, round_key=%s, removed=%s", room_id, round_key, removed)
         return {'success': True, 'removed': removed}
     # ── 职责域子模块注册（拆分自 room_handler，保持 WebSocket 路由不变）──
+    # 这里刻意用函数级 import：子模块与 room_handler 互相引用，提到模块级会成环。
+    # 与 CLAUDE.md §11.4 禁止的"每个处理器各自在函数体内 import"不是一回事。
+    from handlers.credential_handlers import register_credential_handlers
+    register_credential_handlers(server, log=_log)
+    from handlers.selfcheck_handlers import register_selfcheck_handlers
+    register_selfcheck_handlers(
+        server,
+        log=_log,
+        validate_url=_room_url_shape,
+    )
     from handlers.alignment_handlers import register_alignment_handlers
     register_alignment_handlers(
         server,
@@ -10889,6 +10975,7 @@ def register_room_handlers(server, bridge):
         broadcast_rooms=_broadcast_rooms,
         bridge_executor=_bridge_executor,
         recording_executor=_recording_executor,
+        repair_executor=_repair_executor,
         recording_semaphore=_recording_semaphore,
         recording_starting=_recording_starting,
         recording_wait_queue=_recording_wait_queue,
@@ -10927,7 +11014,7 @@ def register_room_handlers(server, bridge):
         ai_executor=_ai_executor,
         analysis_thread_semaphore=_analysis_thread_semaphore,
         load_settings=load_settings,
-        safe_float=_safe_float,
+        safe_float=safe_float,
         analyze_scene_or_rounds=_analyze_scene_or_rounds,
         validate_synced_analysis_targets=_validate_synced_analysis_targets,
         continuous_analysis_loop=_continuous_analysis_loop,

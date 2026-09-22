@@ -34,12 +34,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('backend-ready', wrapper)
     return () => ipcRenderer.removeListener('backend-ready', wrapper)
   },
-  
+
   // 窗口控制
   minimizeWindow: () => ipcRenderer.invoke('minimize-window'),
   maximizeWindow: () => ipcRenderer.invoke('maximize-window'),
   closeWindow: () => ipcRenderer.invoke('close-window'),
-  
+
   // 文件操作
   selectDirectory: () => ipcRenderer.invoke('select-directory'),
   openPath: (path: string) => ipcRenderer.invoke('open-path', path),
@@ -120,6 +120,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('read-log-file', opts),
   openLogFolder: () =>
     ipcRenderer.invoke('open-log-folder'),
+
+  // 诊断包（脱敏日志尾部 + settings 快照，禁 Cookie/Token）
+  exportDiagnosticPack: () =>
+    ipcRenderer.invoke('export-diagnostic-pack') as Promise<{
+      success: boolean
+      path?: string
+      error?: string
+      canceled?: boolean
+    }>,
 
   // 退出清理：主进程通知渲染进程清理所有房间
   onCleanupAllRooms: (callback: () => void) => {

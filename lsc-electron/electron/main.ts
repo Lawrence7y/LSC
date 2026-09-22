@@ -6,6 +6,13 @@ import { createHash, randomBytes } from 'crypto'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { extractBackendWsUrl } from './backendUrl'
 import { MAX_READ_LENGTH, normalizeRoot, parseReadRequest, resolveAllowedMediaPath } from './localMedia'
+import {
+  buildDiagnosticEntries,
+  buildManifest,
+  buildZipStore,
+  LOG_TAIL_LINES,
+  sanitizeSettings,
+} from './diagnosticPack'
 
 // ===== EPIPE 防护：stdout/stderr 管道断裂时不崩溃 =====
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
@@ -1241,6 +1248,41 @@ function localMediaRootsList(): string[] {
   return Array.from(localMediaRoots)
 }
 
+/**
+ * 受信媒体根：userData、~/LSC、剪映草稿目录、settings.output_dir。
+ * allow-root 只允许在这些根之下「确认子目录」，禁止渲染层把任意绝对路径塞进白名单。
+ */
+function builtInTrustedMediaRoots(): string[] {
+  const trusted: string[] = [
+    normalizeRoot(app.getPath('userData')) || '',
+    normalizeRoot(path.join(app.getPath('home'), 'LSC')) || '',
+  ]
+  const jy = _readJianyingDraftDirFromSettings()
+  if (jy) trusted.push(normalizeRoot(jy) || '')
+  for (const settingsPath of getProjectSettingsCandidates()) {
+    try {
+      if (!fs.existsSync(settingsPath)) continue
+      const parsed: any = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+      const outputDir = typeof parsed?.output_dir === 'string' ? parsed.output_dir.trim() : ''
+      if (!outputDir) continue
+      const root = normalizeRoot(path.resolve(path.dirname(settingsPath), expandHomePath(outputDir)))
+      if (root) trusted.push(root)
+    } catch {
+      // 忽略单个损坏的 settings 候选
+    }
+  }
+  return trusted.filter(Boolean)
+}
+
+function isUnderAnyRoot(target: string, roots: string[]): boolean {
+  const norm = (s: string) => (process.platform === 'win32' ? s.toLowerCase() : s)
+  const t = norm(target.endsWith(path.sep) ? target : target + path.sep)
+  return roots.some((root) => {
+    const r = norm(root.endsWith(path.sep) ? root : root + path.sep)
+    return t === r || t.startsWith(r) || norm(root) === norm(target)
+  })
+}
+
 // 注册本地媒体读取 IPC（只在 whenReady 中调用一次）。四个通道全部返回对象，
 // 任何失败都以 { ok: false, error } 收口，绝不向渲染进程抛异常。
 function registerLocalMediaIpc(): void {
@@ -1257,6 +1299,14 @@ function registerLocalMediaIpc(): void {
       const root = normalizeRoot(raw)
       if (!root) {
         return { ok: false, error: 'root 无法规范化', roots: localMediaRootsList() }
+      }
+      // 安全约束：只允许在受信根（output_dir / ~/LSC / userData / 剪映草稿）之下注册，
+      // 禁止渲染层用 allow-root 把任意目录（如整个用户文档）扩进读盘白名单。
+      const trusted = builtInTrustedMediaRoots()
+      const already = localMediaRootsList()
+      if (!isUnderAnyRoot(root, trusted) && !isUnderAnyRoot(root, already)) {
+        appLog('WARN', 'LocalMedia', '拒绝非受信根目录: ' + root)
+        return { ok: false, error: '不允许将该目录加入本地媒体白名单', roots: localMediaRootsList() }
       }
       localMediaRoots.add(root)
       appLog('INFO', 'LocalMedia', '本地媒体白名单追加根目录: ' + root)
@@ -1341,7 +1391,14 @@ function registerWindowIpc(): void {
     return backendWsUrl
   })
   ipcMain.handle('get-startup-dependency-state', () => startupDependencyState)
-  ipcMain.handle('get-backend-ws-token', () => backendWsToken)
+  ipcMain.handle('get-backend-ws-token', (event) => {
+    // Token 只发给主窗口，避免任意 webContents（弹窗/子页面）拿到本机后端凭证
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+      appLog('WARN', 'IPC', '拒绝非主窗口获取 backend WS token')
+      return null
+    }
+    return backendWsToken
+  })
 
   ipcMain.handle('minimize-window', () => {
     appLog('INFO', 'IPC', '最小化窗口')
@@ -1579,7 +1636,7 @@ function registerWindowIpc(): void {
   // 打开 GitHub Release 页面（浏览器下载）
   ipcMain.handle('download-update', async () => {
     if (isStoreBuild()) {
-      return { success: false, error: 'Microsoft Store 版本通过 Store 自动更新，无需手动下载。' }
+      return { success: false, error: '请通过 Microsoft Store 更新' }
     }
     appLog('INFO', 'Update', '用户点击下载更新，跳转到 GitHub Release 页面')
     // 使用缓存的 releaseUrl，否则直接跳转仓库 releases 页
@@ -1604,7 +1661,7 @@ function registerWindowIpc(): void {
   ipcMain.handle('install-update', () => {
     if (isStoreBuild()) {
       appLog('INFO', 'Update', 'Store 版本更新由 Microsoft Store 管理')
-      return { success: false, error: 'Microsoft Store 版本通过 Store 自动更新。' }
+      return { success: false, error: '请通过 Microsoft Store 更新' }
     }
     appLog('INFO', 'Update', 'install-update called（手动下载模式，跳转 GitHub）')
     shell.openExternal('https://github.com/Lawrence7y/LSC/releases/latest').catch(() => {})
@@ -1725,6 +1782,72 @@ function registerWindowIpc(): void {
       shell.openPath(logDir)
       return { success: true }
     } catch (err) {
+      return { success: false, error: String(err) }
+    }
+  })
+
+  // 导出诊断包：脱敏日志尾部 + 版本/platform/windowsStore + settings 脱敏快照（禁 Cookie/Token）
+  ipcMain.handle('export-diagnostic-pack', async () => {
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const saveOpts: Electron.SaveDialogOptions = {
+        title: isEnglishUI() ? 'Export diagnostic pack' : '导出诊断包',
+        defaultPath: `lsc-diagnostic-${stamp}.zip`,
+        filters: [{ name: 'ZIP', extensions: ['zip'] }],
+      }
+      const saveResult = mainWindow && !mainWindow.isDestroyed()
+        ? await dialog.showSaveDialog(mainWindow, saveOpts)
+        : await dialog.showSaveDialog(saveOpts)
+      if (saveResult.canceled || !saveResult.filePath) {
+        return { success: false, canceled: true }
+      }
+
+      const logDir = path.join(app.getPath('userData'), 'logs')
+      const logFiles = ['debug.log', 'backend.log', 'backend-stdout.log']
+      const logs: Array<{ name: string; content: string }> = []
+      for (const name of logFiles) {
+        const p = path.join(logDir, name)
+        try {
+          logs.push({
+            name,
+            content: fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : '(日志文件不存在)',
+          })
+        } catch (err) {
+          logs.push({ name, content: `(读取失败: ${String(err)})` })
+        }
+      }
+
+      // settings 脱敏快照：主进程 app-settings + 项目 settings.json 候选
+      const settingsSnapshot: Record<string, unknown> = {
+        appSettings: sanitizeSettings(settingsCache),
+      }
+      for (const settingsPath of getProjectSettingsCandidates()) {
+        try {
+          if (!fs.existsSync(settingsPath)) continue
+          const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+          settingsSnapshot[path.basename(path.dirname(settingsPath)) + '/' + path.basename(settingsPath)] =
+            sanitizeSettings(parsed)
+        } catch {
+          // 单个损坏的 settings 候选忽略
+        }
+      }
+
+      const entries = buildDiagnosticEntries({
+        manifest: buildManifest({
+          version: app.getVersion(),
+          platform: process.platform,
+          windowsStore: process.windowsStore === true,
+        }),
+        settingsSnapshot,
+        logs,
+        logTailLines: LOG_TAIL_LINES,
+      })
+      const zip = buildZipStore(entries)
+      fs.writeFileSync(saveResult.filePath, zip)
+      appLog('INFO', 'IPC', `诊断包已导出: ${saveResult.filePath}`)
+      return { success: true, path: saveResult.filePath }
+    } catch (err) {
+      appLog('ERROR', 'IPC', `导出诊断包失败: ${err}`)
       return { success: false, error: String(err) }
     }
   })
@@ -1914,6 +2037,25 @@ let shutdownCleanupInProgress = false
 let shutdownCleanupTimer: ReturnType<typeof setTimeout> | null = null
 const SHUTDOWN_CLEANUP_TIMEOUT_MS = 45_000
 
+// ===== 单实例锁 =====
+// 多开会起多份后端进程：抢同一个 WS 端口（9876 被占则退到 19877…），并各自持有房间
+// 账本，可能互相写坏 settings.json / rooms.json（FEATURE-INVENTORY §17 列为 P1 缺口）。
+// 第二个实例不初始化任何资源，直接退出并把已有窗口拉到前台。
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+app.on('second-instance', () => {
+  appLog('INFO', 'App', '检测到第二个实例启动，聚焦已有窗口')
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+})
+
+if (!hasSingleInstanceLock) {
+  appLog('WARN', 'App', '已有实例在运行，本次启动退出（单实例锁）')
+  app.quit()
+}
+
 function requestGracefulAppQuit(reason: string): void {
   if (isQuitting || shutdownCleanupInProgress) {
     return
@@ -2083,6 +2225,13 @@ async function finishGracefulAppQuit(reason: string): Promise<void> {
   }
 
   app.whenReady().then(() => {
+    // 未取得单实例锁（已有实例在跑）：不初始化窗口/托盘/后端，直接退出。
+    // 这里必须守在 ready 回调最前面——否则第二个实例仍会 spawnBackend 抢端口。
+    if (!hasSingleInstanceLock) {
+      app.quit()
+      return
+    }
+
     // 必须在 app.ready 之后才能访问 commandLine
     app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 
@@ -2153,4 +2302,3 @@ async function finishGracefulAppQuit(reason: string): Promise<void> {
       mainWindow.focus()
     }
   })
-

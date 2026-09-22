@@ -1,4 +1,4 @@
-﻿# LSC Live Stream Clipper - Bundle Resources Preparation
+# LSC Live Stream Clipper - Bundle Resources Preparation
 # Downloads embedded Python + uv dependency installer.
 # With -WithDeps, also bundles ALL Python dependencies and FFmpeg inside the
 # installer (required for Microsoft Store / MSIX builds, policy 10.2.5:
@@ -26,8 +26,7 @@ $PythonArch = "amd64"
 $UvUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 $PipIndexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple"
 $FfmpegUrls = @(
-    "https://ghfast.top/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip",
-    "https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip",
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip",
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
 )
 $VcRedistUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"

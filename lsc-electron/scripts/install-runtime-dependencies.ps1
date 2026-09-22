@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory = $true)]
     [string]$UvExe,
     [Parameter(Mandatory = $true)]
@@ -27,8 +27,7 @@ if (Test-Path (Join-Path $bundledPackagesDir 'numpy')) {
 $PipIndexUrl = 'https://pypi.tuna.tsinghua.edu.cn/simple'
 # FFmpeg 走 GitHub 加速代理回退链（按顺序尝试，全部失败才报错）
 $FfmpegUrls = @(
-    'https://ghfast.top/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip',
-    'https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip',
+    'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip',
     'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip'
 )
 

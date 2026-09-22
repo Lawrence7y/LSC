@@ -5,6 +5,9 @@ import { ExportPreset } from '@/types'
  *
  * 预设不包含房间/时间信息，仅包含编码参数。
  * 房间和时间信息在用户选择切片时自动绑定。
+ *
+ * 默认 codec 使用 CPU 软编（libx264/libx265）：无 N 卡机器上硬编预设会直接失败。
+ * 硬件编码走 resolveExportCodec() 由调用方按运行时能力切换。
  */
 export const EXPORT_PRESETS: ExportPreset[] = [
   {
@@ -13,7 +16,7 @@ export const EXPORT_PRESETS: ExportPreset[] = [
     description: '1080x1920 竖屏（原画居中+上下黑边）, 30fps, H.264, CRF 23',
     resolution: '1080:1920',
     framerate: '30',
-    codec: 'h264_nvenc',
+    codec: 'libx264',
     crf: 23,
     vertical_crop: true,
     audio_bitrate: '128k',
@@ -24,7 +27,7 @@ export const EXPORT_PRESETS: ExportPreset[] = [
     description: '1920x1080 横屏, 30fps, H.264, CRF 23',
     resolution: '1920:1080',
     framerate: '30',
-    codec: 'h264_nvenc',
+    codec: 'libx264',
     crf: 23,
     vertical_crop: false,
     audio_bitrate: '128k',
@@ -46,7 +49,7 @@ export const EXPORT_PRESETS: ExportPreset[] = [
     description: '原画分辨率, 60fps, H.264 CRF 18, AAC 256k',
     resolution: '',
     framerate: '60',
-    codec: 'h264_nvenc',
+    codec: 'libx264',
     crf: 18,
     vertical_crop: false,
     audio_bitrate: '256k',
@@ -57,12 +60,26 @@ export const EXPORT_PRESETS: ExportPreset[] = [
     description: '720p, 24fps, H.265, CRF 28, 适合快速分享',
     resolution: '1280:720',
     framerate: '24',
-    codec: 'hevc_nvenc',
+    codec: 'libx265',
     crf: 28,
     vertical_crop: false,
     audio_bitrate: '96k',
   },
 ]
+
+const _HW_CODEC_MAP: Record<string, string> = {
+  libx264: 'h264_nvenc',
+  libx265: 'hevc_nvenc',
+}
+
+/**
+ * 按运行时硬件能力解析最终编码器。
+ * 有 NVENC 且预设是软编 H.264/H.265 时升级为对应硬编；否则保持软编，避免无 N 卡失败。
+ */
+export function resolveExportCodec(codec: string, hasNvenc: boolean): string {
+  if (!hasNvenc) return codec
+  return _HW_CODEC_MAP[codec] ?? codec
+}
 
 /**
  * 根据 ID 查找预设（返回浅拷贝，防止调用方意外突变污染全局预设表）

@@ -415,6 +415,13 @@ export interface ElectronAPI {
   removeBackendErrorListeners?: () => void
   readLogFile?: (opts: { file: string; lines?: number }) => Promise<{ success: boolean; content: string; path?: string; error?: string; size?: number }>
   openLogFolder?: () => Promise<{ success: boolean; error?: string }>
+  /** 导出脱敏诊断包 zip（日志尾部 + settings 快照，禁 Cookie/Token） */
+  exportDiagnosticPack?: () => Promise<{
+    success: boolean
+    path?: string
+    error?: string
+    canceled?: boolean
+  }>
 
   // 退出清理：主进程通知渲染进程清理所有房间
   onCleanupAllRooms?: (callback: () => void) => () => void
