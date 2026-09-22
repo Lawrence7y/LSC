@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -94,6 +95,7 @@ class LeaseManager:
 
     def __init__(self, policy: LeasePolicy | None = None) -> None:
         self._policy = policy or LeasePolicy()
+        self._lock = threading.RLock()
         self._active: dict[str, StreamLease] = {}
         self._room_generations: dict[str, int] = {}
         self._consumed_families: set[str] = set()
@@ -153,7 +155,8 @@ class LeaseManager:
             refresh_deadline_mono=now + refresh_offset,
             generation=generation,
         )
-        self._active[lease_id] = lease
+        with self._lock:
+            self._active[lease_id] = lease
         _log.debug(
             "lease issued %s room=%s exp=%.0fs refresh=%.0fs",
             lease_id, room_id, ttl, refresh_at,
@@ -264,7 +267,8 @@ class LeaseManager:
         return bool(family) and family in self._consumed_families
 
     def drop(self, lease_id: str) -> None:
-        self._active.pop(lease_id, None)
+        with self._lock:
+            self._active.pop(lease_id, None)
 
     def prune(self, *, now: float) -> list[str]:
         """Remove expired/revoked leases and return their ids."""

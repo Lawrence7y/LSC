@@ -1,16 +1,25 @@
 # Pre-commit hooks for LSC project
 # Install: pip install pre-commit && pre-commit install
 # Run manually: pre-commit run --all-files
+#
+# 2026-09-18：这份配置此前从未生效（.git/hooks/pre-commit 不存在），且 pin 的
+# ruff v0.5.0 比 CI/本地（0.15.16）落后 10 个 minor 版本 —— 规则集不同，
+# 本地绿 ≠ CI 绿。现在三处（本地 ruff / 本钩子 / ci.yml lint job）钉同一版本。
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.5.0
+    rev: v0.15.16
     hooks:
+      # 只跑 `ruff check`，与 CI 的阻塞项 `ruff check lsc/ python-backend/ tests/` 完全同源。
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]
-        files: ^(lsc|python-backend)/.*\.py$
-      - id: ruff-format
-        files: ^(lsc|python-backend)/.*\.py$
+        files: ^(lsc|python-backend|tests)/.*\.py$
+      # ruff-format 已移除：本仓库从未被 ruff format 过，实测
+      # `ruff format --check lsc/ python-backend/` = 99/109 个文件会被重排。
+      # 装上等于让每次提交顺带重排无关文件、污染 git blame。
+      # 若要引入，必须先单独提一次全量格式化 commit 并同步 CI，再解开这条注释：
+      # - id: ruff-format
+      #   files: ^(lsc|python-backend)/.*\.py$
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

@@ -84,7 +84,7 @@ class HeadlessRecordingController:
         crf: int,
         param_mode: str = "crf",
         bitrate: str = "",
-        bitrate_unit: str = "M",
+        bitrate_unit: str = "kbps",
         input_args: list[str] | None = None,
         resolution: str = "",
         framerate: str = "",
@@ -139,6 +139,21 @@ class HeadlessRecordingController:
         return False, "", "", err
 
     @staticmethod
+    def _normalize_video_bitrate(bitrate: str, bitrate_unit: str) -> str:
+        """把 UI 的码率+单位翻译成 FFmpeg 的 `-b:v` 值（与 orchestrator._build_recording_profile 同口径）。
+
+        ``kbps`` → ``8000k``，``Mbps`` → ``8M``；已带 k/K/M/m 后缀时原样保留。
+        禁止再拼出 ``8000M``/``8000kbps`` 这类错误单位。
+        """
+        raw = (bitrate or "8000").strip()
+        unit = (bitrate_unit or "kbps").strip()
+        if raw.endswith(("k", "K", "M", "m")):
+            return raw
+        if unit == "Mbps":
+            return f"{raw}M"
+        return f"{raw}k"
+
+    @staticmethod
     def _build_encoder_args(
         encoder: str,
         crf: int,
@@ -157,7 +172,7 @@ class HeadlessRecordingController:
         args: list[str] = ["-c:v", encoder or "h264_nvenc"]
         mode = (param_mode or "").strip()
         if mode in ("自定义码率", "码率限制"):
-            args += ["-b:v", f"{bitrate or '8000'}{bitrate_unit or 'kbps'}"]
+            args += ["-b:v", HeadlessRecordingController._normalize_video_bitrate(bitrate, bitrate_unit)]
         elif mode != "不限制":
             args += ["-crf", str(int(crf))]      # 默认（含 "CRF 质量"）走 CRF
         if encoder and encoder.endswith("_nvenc"):
@@ -256,9 +271,19 @@ class HeadlessRecordingController:
                 )
             except Exception as exc:
                 _log.exception("Headless export_clip raised: %s", exc)
+                # 必须用关键字：位置参数顺序是
+                # (success, output_path, clip_index, title)，此前按 4 个位置传
+                # 把 "" 塞进了 int 字段 clip_index（mypy arg-type 抓到），
+                # 而 title 也丢了。本路径的回调暂时不读这两个字段，所以
+                # 故障没暴露 —— 但类型契约已经破了。
                 result = ExportResult(
-                    False, "", "", "",
-                    error=f"导出异常：{exc}", file_size_mb=0.0, thumbnail_path="",
+                    success=False,
+                    output_path="",
+                    clip_index=0,
+                    title=name or "clip_0",
+                    error=f"导出异常：{exc}",
+                    file_size_mb=0.0,
+                    thumbnail_path="",
                 )
 
             with self._export_lock:

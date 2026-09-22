@@ -27,7 +27,14 @@ from lsc.core.services.fmp4_segments import Fmp4SegmentParser
 from lsc.platforms.base import headers_to_ffmpeg_input_args
 from lsc.platforms.redaction import redact_command, redact_text
 from lsc.utils.gpu_ffmpeg import scale_cuda_available
-from lsc.utils.process_launcher import kill_process_tree, prepare_launch, set_stream_nonblocking
+from lsc.utils.process_launcher import (
+    forget_child,
+    kill_process_tree,
+    note_child,
+    prepare_launch,
+    set_stream_nonblocking,
+    spawn_slot,
+)
 
 _log = get_logger(__name__)
 
@@ -172,6 +179,12 @@ class MseStreamer:
         self._crf_value = crf_value
         cfg = load_config()
         self._ffmpeg_path = cfg.ffmpeg_path or shutil.which("ffmpeg") or "ffmpeg"
+        # 预览软编回退 CRF 与共享进样同源（LscConfig.shared_ingest_preview_crf，默认 23）。
+        # 旧实现这里硬编码 28，而 shared_ingest 的回退取同一个配置键（默认 23），
+        # 同一路直播在两种预览模式下的回退画质因此不一致（双基线）。
+        # 注意：正常路径的 CRF 由 room_handler._PREVIEW_QUALITY_PRESETS 按预览画质档位
+        # （原画 20 / 高清 26 / 标清 30 / 流畅 32）显式传入，这里只是缺省兜底。
+        self._fallback_crf = max(1, int(getattr(cfg, "shared_ingest_preview_crf", 23) or 23))
         self._process: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -278,6 +291,26 @@ class MseStreamer:
             self._stderr_thread.join(timeout=2)
         self._stderr_thread = None
 
+    @staticmethod
+    def _bitrate_kbps(video_bitrate: str, default_k: int = 2500) -> int:
+        """把 '2500k'/'2.5M'/'2500kbps' 解析成 kbps；失败用默认值，绝不抛 ValueError。"""
+        raw = (video_bitrate or "").strip().lower().replace("kbps", "").replace("_", "")
+        if not raw:
+            return default_k
+        try:
+            if raw.endswith("m"):
+                return int(float(raw[:-1]) * 1000)
+            if raw.endswith("k"):
+                return int(float(raw[:-1]))
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return default_k
+
+    @staticmethod
+    def _bitrate_arg(video_bitrate: str, default: str = "2500k") -> str:
+        raw = (video_bitrate or "").strip()
+        return raw if raw else default
+
     def _try_start(
         self,
         *,
@@ -375,13 +408,13 @@ class MseStreamer:
                 "-tune", "ll",          # 低延迟
                 "-rc", "cbr",
                 "-b:v", self._video_bitrate or "2500k",
-                "-maxrate", str(int((self._video_bitrate or "2500k").replace("k", "")) * 12 // 10) + "k",
-                "-bufsize", str(int((self._video_bitrate or "2500k").replace("k", "")) * 2) + "k",
+                "-maxrate", str(MseStreamer._bitrate_kbps(self._video_bitrate) * 12 // 10) + "k",
+                "-bufsize", str(MseStreamer._bitrate_kbps(self._video_bitrate) * 2) + "k",
             ]
         else:
-            crf = self._crf_value or 28
+            crf = self._crf_value or self._fallback_crf
             bitrate = self._video_bitrate or "1500k"
-            max_bitrate = str(int(bitrate.replace("k", "")) * 4 // 3) + "k"
+            max_bitrate = str(self._bitrate_kbps(bitrate, 1500) * 4 // 3) + "k"
             cmd += [
                 "-c:v", "libx264",
                 "-preset", "veryfast",
@@ -455,7 +488,11 @@ class MseStreamer:
                 popen_kwargs["creationflags"] = creation_flags
             if cwd:
                 popen_kwargs["cwd"] = cwd
-            self._process = subprocess.Popen(cmd, **popen_kwargs)
+            # 全局派生闸（CLAUDE.md §7.4）：预览正是 2026-09-15 冻结事故里被争抢的一方，
+            # 启动瞬间必须计入中央账。名额只在 Popen 期间占用，随后转 note_child 记账。
+            with spawn_slot("preview", timeout_sec=10.0):
+                self._process = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603
+                note_child(self._process, "preview")
             set_stream_nonblocking(self._process.stdout)
             set_stream_nonblocking(self._process.stderr)
         except Exception as exc:
@@ -534,6 +571,7 @@ class MseStreamer:
         """清理 FFmpeg 进程（不停止读取线程），用于启动失败时的进程回收。"""
         proc = self._process
         if proc is not None:
+            forget_child(proc)  # 中央账（§7.4）：进程即将不存在，必须先注销
             try:
                 if proc.poll() is None:
                     kill_process_tree(proc)
@@ -558,6 +596,7 @@ class MseStreamer:
         self._running = False
         proc = self._process
         if proc is not None:
+            forget_child(proc)  # 中央账（§7.4）：进程即将不存在，必须先注销
             try:
                 proc.terminate()
                 try:

@@ -14,7 +14,7 @@ from threading import Lock, Thread
 from lsc import get_logger
 from lsc.config import LscConfig
 from lsc.platforms.redaction import redact_text
-from lsc.utils.process_launcher import kill_process_tree
+from lsc.utils.process_launcher import forget_child, kill_process_tree, note_child, spawn_slot
 
 _log = get_logger(__name__)
 
@@ -484,21 +484,27 @@ class StreamCapture:
         env, creation_flags, cwd = prepare_launch(self.ffmpeg)
 
         try:
-            proc = subprocess.Popen(  # noqa: S603
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-                cwd=cwd,
-                creationflags=creation_flags,
-            )
+            # 全局派生闸（CLAUDE.md §7.4）。**fail_open=True 是刻意的**：录制被闸拒绝
+            # 意味着用户丢一整场数据，比争抢本身更糟，所以这里"削峰但不否决"——
+            # 等 8s 拿不到名额就记 WARNING + 计数后照常启动。
+            # 名额只覆盖 Popen 瞬间，`with` 退出即归还，不做存活记账 ⇒ 无泄漏风险。
+            with spawn_slot("record", timeout_sec=8.0, fail_open=True):
+                proc = subprocess.Popen(  # noqa: S603
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    cwd=cwd,
+                    creationflags=creation_flags,
+                )
             set_stream_nonblocking(proc.stderr)
             with self._lock:
                 self._process = proc
+                note_child(proc, "record")
                 self._generation += 1
                 self._output_path = output_path
                 self._dvr_output_path = dvr_path
@@ -726,6 +732,8 @@ class StreamCapture:
         with self._lock:
             proc = self._process
             self._process = None
+            if proc is not None:
+                forget_child(proc)
         if proc:
             pid = proc.pid
             try:

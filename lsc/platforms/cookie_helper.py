@@ -51,7 +51,8 @@ def _encrypt_dpapi(data: bytes) -> bytes:
         import win32crypt  # type: ignore[import-untyped]
         encrypted = win32crypt.CryptProtectData(data, "LSC_COOKIE", None, None, None, 0)
         if encrypted:
-            return _DPAPI_PREFIX + encrypted
+            # win32crypt 无 stub，返回按 Any 处理；显式转 bytes 把边界钉住
+            return _DPAPI_PREFIX + bytes(encrypted)
     except Exception as exc:
         _log.debug("DPAPI 加密不可用/失败: %s", exc)
     return data
@@ -65,7 +66,7 @@ def _decrypt_dpapi(data: bytes) -> bytes:
             encrypted = data[len(_DPAPI_PREFIX):]
             decrypted = win32crypt.CryptUnprotectData(encrypted, None, None, None, 0)
             if decrypted and decrypted[1]:
-                return decrypted[1]
+                return bytes(decrypted[1])
         except Exception as exc:
             _log.warning("DPAPI 凭据解密失败: %s", exc)
             return b"{}"
@@ -554,7 +555,7 @@ def save_cookies(cookies: dict[str, str], platform: str = "bilibili", *, encrypt
     should_encrypt = (
         encrypt
         if encrypt is not None
-        else os.environ.get("LSC_ENCRYPT_COOKIES", "").strip().lower() in ("1", "true", "yes")
+        else os.environ.get("LSC_ENCRYPT_COOKIES", "1").strip().lower() not in ("0", "false", "no")
     )
     if should_encrypt:
         raw_payload = json.dumps(cookies, indent=2, ensure_ascii=False).encode("utf-8")

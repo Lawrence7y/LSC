@@ -7,9 +7,19 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from http.client import HTTPMessage
+from typing import IO, Any, Protocol
 from urllib.parse import urlencode, urlparse
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import (
+    HTTPRedirectHandler,
+    OpenerDirector,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
+from urllib.response import addinfourl
+
+from lsc.utils.coerce import try_float
 
 from .redaction import redact_text, redact_url
 
@@ -17,6 +27,9 @@ ERROR_UNSUPPORTED_URL = "unsupported_url"
 ERROR_OFFLINE = "offline"
 ERROR_RESTRICTED = "restricted"
 ERROR_PARSE_FAILED = "parse_failed"
+# 平台侧结构变更（页面/接口字段不再是解析器假设的样子）—— 与"网络失败"必须区分：
+# 前者重试与让用户查网络都没用，只有更新解析规则才能恢复。见 registry.parse_stream 的分类。
+ERROR_PARSER_STALE = "parser_stale"
 
 _log = logging.getLogger(__name__)
 
@@ -79,7 +92,15 @@ def _validate_network_url(url: str) -> None:
 class _SafeRedirectHandler(HTTPRedirectHandler):
     """Reject unsafe redirect targets before urllib opens the next hop."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> Request | None:
         _validate_network_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -94,7 +115,7 @@ _SAFE_OPENER = build_opener(
 )
 
 
-def _opener_for_proxy(proxy_url: str = ""):
+def _opener_for_proxy(proxy_url: str = "") -> OpenerDirector:
     """Build a safe redirect-checking opener with an optional scoped proxy."""
     proxy = str(proxy_url or "").strip()
     if not proxy:
@@ -151,11 +172,11 @@ def open_http_stream(
     headers: dict[str, str] | None = None,
     timeout: float = 15.0,
     proxy_url: str = "",
-):
+) -> addinfourl:
     """Open a public HTTP(S) URL for binary streaming. Caller must close."""
     _validate_network_url(url)
     request = Request(url, headers=headers or {})
-    response = _opener_for_proxy(proxy_url).open(request, timeout=timeout)
+    response: addinfourl = _opener_for_proxy(proxy_url).open(request, timeout=timeout)
     try:
         _validate_network_url(response.geturl() or url)
     except Exception:
@@ -329,6 +350,8 @@ def headers_to_ffmpeg_input_args(headers: dict[str, str] | None) -> list[str]:
     def _blob_for(hdrs: dict[str, str]) -> str:
         return "".join(f"{key}: {value}\r\n" for key, value in hdrs.items())
 
+    if any(k.lower() == "cookie" for k in clean_headers):
+        clean_headers = {k: v for k, v in clean_headers.items() if k.lower() != "cookie"}
     header_blob = _blob_for(clean_headers)
     blob_bytes = len(header_blob.encode("utf-8", errors="replace"))
     if blob_bytes > _FFMPEG_HEADERS_MAX_BYTES:
@@ -377,7 +400,9 @@ def network_timeout_args(
     a convenient override for both phases.  Values are clamped to prevent a
     malformed platform response from disabling the deadline entirely.
     """
-    context = dict(network_context or {})
+    # 本地拷贝，不动 `Mapping[str, object]` 这条对外契约；只是让下面的
+    # float()/int() 取值不必每处再 cast 一次。
+    context: dict[str, Any] = dict(network_context or {})
 
     def _value(key: str, fallback: float) -> float:
         raw = context.get(key, fallback)
@@ -388,10 +413,7 @@ def network_timeout_args(
         return max(0.1, min(300.0, value))
 
     shared = context.get("timeout_sec")
-    try:
-        shared_value = float(shared) if shared not in (None, "") else None
-    except (TypeError, ValueError):
-        shared_value = None
+    shared_value = try_float(shared) if shared not in (None, "") else None
     connect_default = shared_value if shared_value is not None else default_connect_sec
     read_default = shared_value if shared_value is not None else default_read_sec
     connect_sec = _value("connect_timeout_sec", connect_default)
@@ -460,9 +482,22 @@ class PlatformAdapter(Protocol):
     local variables inside ``parse`` and be returned via :class:`StreamInfo`.
     """
 
-    platform: str
-    display_name: str
-    capabilities: Any
+    # 三个成员必须是**只读属性**声明。写成普通可变属性（`platform: str`）时，
+    # 用 `@property` 实现的适配器全部不满足协议 —— 实测 9 个内置适配器
+    # 无一能通过 `PlatformAdapter` 检查（mypy: "expected settable variable,
+    # got read-only attribute"）。后果不只是 registry 那一行报错：这条协议
+    # 纸面上存在、实际永远匹配不上，**新写一个漏了 parse() 的适配器也不会被拦**。
+    @property
+    def platform(self) -> str:
+        """Platform identifier (e.g. 'bilibili')."""
+
+    @property
+    def display_name(self) -> str:
+        """Human-readable platform name."""
+
+    @property
+    def capabilities(self) -> Any:
+        """Declarative capabilities for this platform."""
 
     def can_handle(self, url: str) -> bool:
         """Return whether this adapter owns the URL."""

@@ -21,6 +21,7 @@ import traceback
 import urllib.request
 import zipfile
 from pathlib import Path
+from types import TracebackType
 
 _log = logging.getLogger("lsc.dependency_manager")
 
@@ -87,20 +88,37 @@ os.environ["PYTHONPATH"] = os.pathsep.join(
     part for part in (_site_packages_text, _existing_pythonpath) if part
 )
 
-# FFmpeg 下载源：GitHub 加速代理回退链（国内直连 GitHub 极慢/易超时）
-# ghfast.top → gh-proxy.com → GitHub 直连兜底
-_FFMPEG_URLS = [
+# FFmpeg 下载源：默认只走 GitHub 官方 BtbN 构建。
+# 第三方加速代理（ghfast / gh-proxy）仅在显式设置 LSC_FFMPEG_ALLOW_MIRRORS=1 时启用，
+# 且仍强制 SHA-256 钉死（LSC_FFMPEG_SHA256），禁止默认信任加速链。
+_FFMPEG_OFFICIAL_URL = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+    "latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+)
+_FFMPEG_MIRROR_URLS = [
     "https://ghfast.top/https://github.com/BtbN/FFmpeg-Builds/releases/download/"
     "latest/ffmpeg-master-latest-win64-gpl-shared.zip",
     "https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/"
     "latest/ffmpeg-master-latest-win64-gpl-shared.zip",
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/"
-    "latest/ffmpeg-master-latest-win64-gpl-shared.zip",
 ]
-_FFMPEG_URL = _FFMPEG_URLS[-1]  # 兼容旧引用（单 URL）
 
-# Python 包国内镜像（pypi 官方在国内极慢/易超时）
-_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+def _ffmpeg_download_urls() -> list[str]:
+    """官方优先；加速代理仅 opt-in，且永远排在官方之后作为回退。"""
+    urls = [_FFMPEG_OFFICIAL_URL]
+    if os.environ.get("LSC_FFMPEG_ALLOW_MIRRORS", "").strip().lower() in ("1", "true", "yes"):
+        urls.extend(_FFMPEG_MIRROR_URLS)
+    return urls
+
+
+# 兼容旧引用（单 URL）
+_FFMPEG_URLS = [_FFMPEG_OFFICIAL_URL]
+_FFMPEG_URL = _FFMPEG_OFFICIAL_URL
+
+# Python 包索引：默认官方 PyPI；国内镜像需 LSC_PIP_INDEX_URL 显式指定
+_PIP_INDEX_URL = os.environ.get(
+    "LSC_PIP_INDEX_URL", "https://pypi.org/simple"
+).strip() or "https://pypi.org/simple"
 
 # ──────────────────────────────────────────────────────────────────────
 # 进度报告
@@ -123,7 +141,11 @@ def _emit(event: str, **kwargs: object) -> None:
         pass
 
 
-def _log_unhandled_exception(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+def _log_unhandled_exception(
+    exc_type: type[BaseException],
+    exc: BaseException,
+    tb: TracebackType | None,
+) -> None:
     """将启动级异常写入安装日志，供 NSIS 失败提示后的人工排查。"""
     try:
         _INSTALL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -348,7 +370,10 @@ def _pip_install_requirements(requirements_path: Path, phase_name: str) -> bool:
         _emit_error(phase_name, f"启动 pip 失败: {exc}")
         return False
 
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        # 用显式判断而非 assert：`python -O` 会整条移除 assert（CLAUDE.md §11.4）。
+        _emit_error(phase_name, "pip 子进程未提供 stdout 管道，无法跟踪安装进度")
+        return False
     installed_count = 0
     total_packages = _count_requirements(requirements_path)
 
@@ -592,7 +617,7 @@ def download_ffmpeg() -> bool:
                 _emit_progress(phase, int(percent), 100, f"下载中... {percent:.0f}%")
 
         last_error: Exception | None = None
-        for url in _FFMPEG_URLS:
+        for url in _ffmpeg_download_urls():
             try:
                 urllib.request.urlretrieve(url, zip_path, reporthook=_progress_hook)
                 if zip_path.stat().st_size > 1024 * 1024:  # 至少 1MB，过滤错误页
@@ -609,7 +634,7 @@ def download_ffmpeg() -> bool:
         else:
             raise RuntimeError(f"全部下载源失败: {last_error}")
 
-        # 计算并校验 SHA-256 摘要
+        # 计算并校验 SHA-256 摘要（默认强制；LSC_FFMPEG_SHA256 钉死具体产物）
         import hashlib
         hasher = hashlib.sha256()
         with open(zip_path, "rb") as f:
@@ -617,10 +642,29 @@ def download_ffmpeg() -> bool:
                 hasher.update(chunk)
         calc_sha256 = hasher.hexdigest()
         expected_sha256 = os.environ.get("LSC_FFMPEG_SHA256", "").strip().lower()
-        if expected_sha256 and calc_sha256.lower() != expected_sha256:
-            raise RuntimeError(f"FFmpeg SHA-256 校验失败: 期望 {expected_sha256}, 实际 {calc_sha256}")
+        allow_unverified = os.environ.get("LSC_ALLOW_UNVERIFIED_FFMPEG", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if expected_sha256:
+            if calc_sha256.lower() != expected_sha256:
+                raise RuntimeError(
+                    f"FFmpeg SHA-256 校验失败: 期望 {expected_sha256}, 实际 {calc_sha256}"
+                )
+        elif not allow_unverified:
+            raise RuntimeError(
+                "拒绝安装未钉死哈希的 FFmpeg：请设置 LSC_FFMPEG_SHA256"
+                "（或调试环境设 LSC_ALLOW_UNVERIFIED_FFMPEG=1 跳过）"
+            )
 
-        _emit_progress(phase, 99, 100, f"校验成功 ({calc_sha256[:12]}...)，正在安全解压...")
+        if expected_sha256:
+            _emit_progress(phase, 99, 100, f"校验成功 ({calc_sha256[:12]}...)，正在安全解压...")
+        else:
+            _emit_progress(
+                phase, 99, 100,
+                f"未校验哈希（LSC_ALLOW_UNVERIFIED_FFMPEG）({calc_sha256[:12]}...)，正在安全解压...",
+            )
 
         # 安全解压（防御 Zip Slip 路径穿越漏洞）
         extracted_root = (tmp_dir / "extracted").resolve()

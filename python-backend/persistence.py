@@ -104,6 +104,30 @@ def _backup_existing(file_path: Path) -> None:
         _log.warning("备份 %s 失败（继续保存）: %s", file_path.name, exc)
 
 
+def room_payload_violation(rooms: object) -> str | None:
+    """返回房间列表的形状违规描述；None 表示可安全落盘。
+
+    `rooms.json` 是重启后恢复房间的**唯一**来源（P0 持久化文件）。WebSocket 入口
+    `handle_save_rooms` 已有自己的严格校验，但内部自动保存路径（controller 状态变化 ⇒
+    `schedule_save_rooms`）此前**不做任何形状检查**：一旦 controller 出 bug 吐出
+    非 dict 条目或缺 `room_id` 的条目，就会被原样写进文件，下次启动直接读不回房间。
+    这里刻意**只拒绝、不静默过滤** —— 丢掉条目本身就是数据丢失，宁可整次写入失败并留日志。
+    """
+    if not isinstance(rooms, list):
+        return f"顶层必须是列表，实际 {type(rooms).__name__}"
+    for index, room in enumerate(rooms):
+        if not isinstance(room, dict):
+            return f"第 {index} 个条目不是对象，实际 {type(room).__name__}"
+        # 持久层的身份判据比 WebSocket 入口宽松：老文件里 orchestrator 写的是
+        # `url`，handler 快照写的是 `room_url`，重启恢复只认这两个字段
+        # （room_handler._restore_rooms_from_disk）。这里只要三键之一为非空字符串，
+        # 否则拒绝整次写入 —— 一个连地址都没有的条目落盘 = 下次启动凭空少房间。
+        identity = room.get("room_id") or room.get("room_url") or room.get("url")
+        if not isinstance(identity, str) or not identity.strip():
+            return f"第 {index} 个条目既无 room_id 也无 room_url/url"
+    return None
+
+
 def save_rooms(
     rooms: list[dict[str, Any]],
     path: Path | str | None = None,
@@ -116,6 +140,10 @@ def save_rooms(
     替换前将上一版好文件备份为 .bak，供损坏时恢复。
     默认不 fsync（高频写合并场景）；flush_pending_saves / 显式 fsync=True 才刷盘。
     """
+    violation = room_payload_violation(rooms)
+    if violation is not None:
+        _log.error("拒绝保存房间配置（形状违规）: %s", violation)
+        return False
     file_path = Path(path) if path else ROOMS_FILE
     try:
         with _persist_lock:
@@ -200,7 +228,7 @@ def save_settings(
     *,
     fsync: bool = False,
 ) -> bool:
-    """将应用设置写入 JSON 文件（原子写入，进程内互斥）。"""
+    """将应用设置写入 JSON 文件（原子写入 + 覆盖前 .bak，进程内互斥）。"""
     file_path = Path(path) if path else SETTINGS_FILE
     try:
         with _persist_lock:
@@ -211,6 +239,9 @@ def save_settings(
                 f.flush()
                 if fsync:
                     os.fsync(f.fileno())
+            # 与 save_rooms 同口径：覆盖前把上一版好文件备份为 .bak
+            if file_path.exists():
+                _backup_existing(file_path)
             tmp_path.replace(file_path)
         _log.info("已保存设置到 %s", file_path.name)
         return True
@@ -252,11 +283,15 @@ def save_analysis_results(
     try:
         with _persist_lock:
             mtime = os.path.getmtime(video_path) if os.path.isfile(video_path) else 0.0
+            size = os.path.getsize(video_path) if os.path.isfile(video_path) else 0
             payload = {
                 "schema_version": _ANALYSIS_SCHEMA_VERSION,
                 "room_id": room_id,
                 "video_path": video_path,
                 "video_mtime": mtime,
+                # 第二证据：只看 mtime 会把"复制 / 搬目录 / 改名后 touch"这类
+                # 内容未变的触碰也判为过期，等于静默丢弃数小时的分析结果。
+                "video_size": size,
                 "mode": mode,
                 "analyzed_at": _now_iso(),
                 "analysis_time_sec": round(analysis_time_sec, 2),
@@ -353,6 +388,11 @@ def load_analysis_results(video_path: str) -> dict[str, Any] | None:
     try:
         with open(file_path, encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            # 侧车文件可能被旧版本写坏或被手工编辑过；顶层不是对象时后面所有
+            # `.get("highlights")` 都会 AttributeError，在这里就判它无效。
+            _log.warning("分析结果文件顶层不是对象，忽略: %s", file_path.name)
+            return None
         _log.info("已加载分析结果: %s (%d 段高光)", file_path.name, len(data.get("highlights", [])))
         return data
     except Exception as exc:
@@ -361,9 +401,14 @@ def load_analysis_results(video_path: str) -> dict[str, Any] | None:
 
 
 def is_analysis_stale(video_path: str, stored: dict[str, Any]) -> bool:
-    """校验已存分析结果是否过期（录制文件 mtime 变化即视为过期）。
+    """校验已存分析结果是否过期。
 
-    录制文件不存在、mtime 不匹配、或 stored 缺少 video_mtime 字段时返回 True。
+    判据是 **mtime 变化 + 体积变化 两个证据**，而不是单看 mtime：
+    复制录像、搬目录、moov 修复后重写容器都会推进 mtime 而内容（时长/帧）未变，
+    单 mtime 判据会把这些情况误判为"分析过期"，静默丢掉数小时的分析成果。
+    旧 sidecar 没有 `video_size` 字段时**保持原来的严格判据**，不因升级而放宽。
+
+    录制文件不存在、stored 缺 `video_mtime` 时返回 True。
     """
     if not os.path.isfile(video_path):
         _log.debug("分析结果过期: 录制文件不存在 %s", video_path)
@@ -374,11 +419,26 @@ def is_analysis_stale(video_path: str, stored: dict[str, Any]) -> bool:
         return True
     try:
         current_mtime = os.path.getmtime(video_path)
-        stale = abs(current_mtime - stored_mtime) > 0.5
-        if stale:
-            _log.info("分析结果已过期: mtime 变化 %.1fs", abs(current_mtime - stored_mtime))
-        return stale
-    except OSError as exc:
+        if abs(current_mtime - stored_mtime) <= 0.5:
+            return False
+        stored_size = stored.get("video_size")
+        if stored_size is None:
+            _log.info("分析结果已过期: mtime 变化且 sidecar 无 video_size 可比对")
+            return True
+        current_size = os.path.getsize(video_path)
+        if current_size == int(stored_size):
+            # 内容长度没变 ⇒ 只是被无害触碰（复制/搬移/touch），保留分析结果
+            _log.info(
+                "mtime 变化 %.1fs 但体积未变(%d B)，判定分析结果仍有效",
+                abs(current_mtime - stored_mtime), current_size,
+            )
+            return False
+        _log.info(
+            "分析结果已过期: mtime 变化且体积 %d -> %d",
+            int(stored_size), current_size,
+        )
+        return True
+    except (OSError, ValueError, TypeError) as exc:
         _log.warning("分析结果过期检查失败: %s", exc)
         return True
 

@@ -4,7 +4,10 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - 只为静态检查，运行时不导入内部路径
+    from websockets.legacy.server import WebSocketServer
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -173,7 +176,11 @@ class LSCWebSocketServer:
         self.clients: set = set()
         self.handlers: dict[str, Callable] = {}
         self.connect_handlers: list[Callable] = []
-        self._server = None
+        # 只给类型检查用：`WebSocketServer` 走 TYPE_CHECKING 导入（它在 websockets
+        # 12.x 是顶层导出、在别的版本里只剩 legacy.server 路径）。属性目标的注解
+        # CPython 不在运行时求值，实测 `self.x: Undefined | None = None` 不报错，
+        # 因此无需引号（引号会被 ruff UP037 判成冗余）。
+        self._server: WebSocketServer | None = None
         self._bound_port: int | None = None
         # client -> 首次发送超时的 monotonic 时刻；发送成功即清除
         self._slow_since: dict[Any, float] = {}
@@ -295,7 +302,26 @@ class LSCWebSocketServer:
             request_id = None
             # 速率限制检查
             if not await _check_rate_limit():
-                _log.warning("Rate limit exceeded, dropping message")
+                _log.warning("Rate limit exceeded, rejecting message with error frame")
+                try:
+                    data = json.loads(message)
+                    request_id = data.get('request_id')
+                    msg_type = data.get('type')
+                except Exception:
+                    request_id = None
+                    msg_type = None
+                try:
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'request_id': request_id,
+                        'data': {
+                            'error': 'rate_limited',
+                            'message': '消息过于频繁，已被限流，请稍后重试',
+                            'original_type': msg_type,
+                        },
+                    }, ensure_ascii=False))
+                except Exception:
+                    pass
                 return
             try:
                 data = json.loads(message)
@@ -659,6 +685,14 @@ def main():
     finally:
         try:
             manager.shutdown(timeout_sec=10.0)
+        except Exception:
+            pass
+        # 与 main.py.stop 同口径：冲刷 1s 去抖窗口内未落盘的 rooms.json
+        try:
+            from persistence import flush_pending_room_saves
+
+            if not flush_pending_room_saves(fsync=True):
+                print("[persistence] 房间配置最终落盘失败", flush=True)
         except Exception:
             pass
         try:

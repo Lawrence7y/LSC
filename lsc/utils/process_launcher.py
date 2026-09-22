@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -58,7 +59,8 @@ _ENV_WHITELIST = frozenset({
     "HOME", "SYSTEMROOT", "PATHEXT", "PYTHONUNBUFFERED",
     # PYTHONPATH 已从白名单移除：防止通过环境变量注入恶意 Python 模块路径
     "LSC_LOG_DIR", "LSC_BUNDLED_FFMPEG_DIR", "LSC_LOG_LEVEL",
-    "LSC_BILIBILI_COOKIES",
+    # 安全：禁止把平台 Cookie 环境变量传给子进程（进程表/子进程 env 可被同用户读取）
+    # 原 _ENV_WHITELIST 中的 LSC_BILIBILI_COOKIES 等已于批次1移除
     # #49: preserve CUDA-related env vars for multi-GPU NVENC selection
     "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER",
     "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
@@ -122,7 +124,7 @@ def prepare_launch(ffmpeg_path: str) -> tuple[dict[str, str], int, str | None]:
     return env, creation_flags, cwd
 
 
-def hidden_run_kwargs(**extra: object) -> dict[str, object]:
+def hidden_run_kwargs(**extra: object) -> dict[str, Any]:
     """Build kwargs for ``subprocess.run`` / ``Popen`` that hide consoles on Windows.
 
     Only injects ``creationflags`` when non-zero so POSIX callers stay clean.
@@ -145,12 +147,176 @@ def hidden_run_kwargs(**extra: object) -> dict[str, object]:
     return out
 
 
+# ── 全局派生闸与存活记账（CLAUDE.md §7.4）────────────────────────────
+# 事实：全仓 33 个 Popen / create_subprocess 调用点分布在 12 个文件，此前**没有任何
+# 总量上界**。已有的信号量取值全是 1 或 2（语义是"把某类操作串行化"），不是"给总量
+# 封顶"，且预览/录制/导出/probe 之间的预算互不记账。已记录的三次事故同形：
+# 2026-09-15 长预览冻结、2026-09-01 22:56 全房断流、2026-09-11 20:45 —— 都是太多
+# FFmpeg 同时启动/同时重连把机器压过临界点。这里是唯一的中央记账点。
+#
+# 设计边界（刻意为之）：
+#   * 名额只覆盖**启动瞬间**，长生命周期进程在 Popen 返回后立即 `note_child` 记账并
+#     释放名额 —— 否则一个录制进程会永久占着闸，12 房直接死锁。
+#   * 存活数超限只 WARNING 不强杀：杀掉正在录制的进程造成的数据损失比争抢更糟。
+#     强与不强的分界放在"还没开始"这一步（拿不到名额就拒绝启动）。
+MAX_CONCURRENT_SPAWNS = max(1, int(os.environ.get("LSC_MAX_CONCURRENT_SPAWNS", "2")))
+MAX_LIVE_CHILDREN = max(1, int(os.environ.get("LSC_MAX_LIVE_CHILDREN", "48")))
+
+_spawn_gate = threading.Semaphore(MAX_CONCURRENT_SPAWNS)
+_children_lock = threading.Lock()
+_live_children: dict[int, str] = {}
+_inflight_spawns = 0
+_rejected_spawn_total = 0
+_failopen_total = 0
+# 短命令（ffprobe / 抽帧 / OCR 预处理）走 `run_hidden`，**不占名额、只计数**：
+# 既要在诊断里看得见"这一场跑了多少短命令"，又不能再给分析热路径加时延。
+_transient_lock = threading.Lock()
+_transient_spawn_total = 0
+_transient_by_category: dict[str, int] = {}
+
+
+def _count_transient_spawn(category: str) -> None:
+    global _transient_spawn_total
+    with _transient_lock:
+        _transient_spawn_total += 1
+        _transient_by_category[category] = _transient_by_category.get(category, 0) + 1
+
+
+class SpawnBudgetExhausted(TimeoutError):
+    """全局派生闸在预算内无名额：调用方应按各自的失败路径处理（不得静默继续启动）。"""
+
+
+def spawn_slot(
+    category: str,
+    *,
+    timeout_sec: float = 30.0,
+    fail_open: bool = False,
+) -> _Slot:
+    """占一个全局派生名额。用法：``with spawn_slot("preview"): proc = Popen(...)``。
+
+    `run_hidden` 已内置本闸，长生命周期站点需自行包一层并在启动后
+    `note_child(proc, category)` / 退出时 `forget_child(proc)`。
+
+    `fail_open=True` 的语义是"**削峰但不否决**"：等不到名额时记 WARNING + 计数后照样放行。
+    给录制这类"启动失败 = 用户丢一整场数据"的路径必须用它；
+    预览/分析这类可重试的才允许硬拒绝（默认 `False` 抛 `SpawnBudgetExhausted`）。
+    """
+    return _Slot(category, timeout_sec, fail_open)
+
+
+class _Slot:
+    def __init__(self, category: str, timeout_sec: float, fail_open: bool = False) -> None:
+        self._category = category
+        self._timeout_sec = timeout_sec
+        self._fail_open = fail_open
+        self._held = False
+
+    def __enter__(self) -> _Slot:
+        global _inflight_spawns, _rejected_spawn_total, _failopen_total
+        if not _spawn_gate.acquire(timeout=self._timeout_sec):
+            with _children_lock:
+                if self._fail_open:
+                    _failopen_total += 1
+                    _log.warning(
+                        "派生闸 %ss 内无名额，放行（category=%s，存活=%s）",
+                        self._timeout_sec, self._category, _category_counts(),
+                    )
+                else:
+                    _rejected_spawn_total += 1
+                    _log.error(
+                        "全局派生闸 %ss 内无名额，拒绝启动（category=%s，存活=%s）",
+                        self._timeout_sec, self._category, _category_counts(),
+                    )
+            if not self._fail_open:
+                raise SpawnBudgetExhausted(
+                    f"系统资源紧张：{self._timeout_sec}s 内未取得 FFmpeg 派生名额"
+                    f"（category={self._category}）"
+                )
+            return self
+        with _children_lock:
+            _inflight_spawns += 1
+        self._held = True
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        global _inflight_spawns
+        if not self._held:
+            return
+        self._held = False
+        with _children_lock:
+            _inflight_spawns -= 1
+        _spawn_gate.release()
+
+
+def note_child(child: Any, category: str) -> Any:
+    """登记一个已启动的长生命周期子进程；调用方退出时必须 `forget_child`。"""
+    pid = getattr(child, "pid", None)
+    if pid is None:
+        return child
+    with _children_lock:
+        _live_children[int(pid)] = category
+        total = len(_live_children)
+    if total > MAX_LIVE_CHILDREN:
+        # 只告警不强杀：见上方设计边界。超限说明有站点忘了 forget_child 或房数失控。
+        _log.warning(
+            "存活 FFmpeg 进程数 %d 已超过软上限 %d（分类=%s）——"
+            "检查是否有派生点未调用 forget_child",
+            total, MAX_LIVE_CHILDREN, _category_counts(),
+        )
+    return child
+
+
+def forget_child(child: Any) -> None:
+    pid = getattr(child, "pid", None)
+    if pid is None:
+        return
+    with _children_lock:
+        _live_children.pop(int(pid), None)
+
+
+def _category_counts() -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for category in _live_children.values():
+        counts[category] = counts.get(category, 0) + 1
+    return counts
+
+
+def budget_snapshot() -> dict[str, Any]:
+    """中央记账点的可观测出口：给 runtime_health / 诊断包用。"""
+    with _children_lock:
+        with _transient_lock:
+            transient_total = _transient_spawn_total
+            transient_by_category = dict(_transient_by_category)
+        return {
+            "live_total": len(_live_children),
+            "live_by_category": dict(_category_counts()),
+            "live_soft_ceiling": MAX_LIVE_CHILDREN,
+            "inflight_spawns": _inflight_spawns,
+            "spawn_gate_capacity": MAX_CONCURRENT_SPAWNS,
+            "rejected_spawn_total": _rejected_spawn_total,
+            "failopen_total": _failopen_total,
+            # 短命令不受闸约束，但必须看得见量：分析吞吐异常时这是第一个要看的数
+            "transient_spawn_total": transient_total,
+            "transient_by_category": transient_by_category,
+        }
+
+
 def run_hidden(cmd: list[str] | tuple[str, ...], /, **kwargs: object) -> subprocess.CompletedProcess:
     """``subprocess.run`` with Windows ``CREATE_NO_WINDOW`` to avoid CMD flash.
 
     Continuous analysis fires many short FFmpeg/ffprobe calls; without this flag
     each invocation pops a console and steals focus / causes UI stutter.
+
+    **本函数不占派生名额**（只计数、不阻塞）。曾在这里包过一层全局闸，实测是把
+    持续分析打回半成品：闸的语义是"名额只覆盖启动瞬间"（见上方设计边界），
+    而 ``subprocess.run`` 会**把名额持有到整条命令结束** —— 一次 300s 的抽帧
+    就把 2 个名额占死，后面每个短探测各白等 5s 才 fail-open。现场后果：
+    `scan_throughput` 0.93 → 0.42、backlog 涨到 ~580s、单场 3 次 270s 扫描超时。
+    需要封顶的是长生命周期进程（预览/录制/进样/导出），它们已在各自站点用
+    ``spawn_slot`` 只闸启动瞬间；短命令路径一律不拦（与 main 行为一致）。
     """
+    spawn_category = str(kwargs.pop("spawn_category", "transient"))
+    _count_transient_spawn(spawn_category)
     return subprocess.run(cmd, **hidden_run_kwargs(**kwargs))  # type: ignore[arg-type, call-overload, no-any-return]  # noqa: S603
 
 

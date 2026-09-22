@@ -4,11 +4,13 @@ import logging
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from lsc.core.models import JianyingDraftOptions, JianyingDraftResult
+from lsc.utils.coerce import safe_float, try_float
 
 _log = logging.getLogger(__name__)
 
@@ -152,9 +154,7 @@ def _broadcast_gate_passed(
     if status in ("pending", "vision_confirmed") and end_is_authoritative:
         return True
     if status in ("pending", "refining") and include_pending:
-        if duration_anomaly:
-            return False
-        return True
+        return not duration_anomaly
     if status != "vision_confirmed":
         return False
     if audit != "passed":
@@ -163,9 +163,7 @@ def _broadcast_gate_passed(
         return False
     if duration_anomaly:
         return False
-    if str(end_by or "") not in _BROADCAST_VALID_END_BY:
-        return False
-    return True
+    return str(end_by or "") in _BROADCAST_VALID_END_BY
 
 
 def clip_source_usable(
@@ -303,18 +301,18 @@ def resolve_common_range(clip: dict[str, Any], ctx: Any) -> tuple[float, float, 
     # 兼容较早版本前端产生的手动切片：虽没有 recording_start_sec，仍可用
     # 入列时冻结的墙钟与录制媒体起点恢复录制轴。不能直接退回 preview start/end。
     if ctx is None:
-        try:
-            mark_in_value = float(mark_in)
-            mark_out_value = float(mark_out)
-            recording_start_mono = float(
-                clip.get("recording_media_start_mono")
-                if clip.get("recording_media_start_mono") is not None
-                else clip.get("recording_start_mono")
-            )
-            content_offset = float(clip.get("content_offset") or 0.0)
-        except (TypeError, ValueError):
-            pass
-        else:
+        recording_start_raw = clip.get("recording_media_start_mono")
+        if recording_start_raw is None:
+            recording_start_raw = clip.get("recording_start_mono")
+        mark_in_value = try_float(mark_in)
+        mark_out_value = try_float(mark_out)
+        recording_start_mono = try_float(recording_start_raw)
+        content_offset = safe_float(clip.get("content_offset"))
+        if (
+            mark_in_value is not None
+            and mark_out_value is not None
+            and recording_start_mono is not None
+        ):
             rs = max(0.0, mark_in_value - recording_start_mono - content_offset)
             re = max(0.0, mark_out_value - recording_start_mono - content_offset)
             if re > rs:
@@ -456,6 +454,21 @@ def build_session_draft(
 
     width, height = (1080, 1920) if options.vertical else (1920, 1080)
     draft_dir = os.path.join(draft_root, name)
+    backup_path = ""
+    existed = False
+
+    def _cleanup_failed_draft() -> None:
+        """清理本次半成品；若曾备份用户草稿则恢复回去。"""
+        nonlocal backup_path
+        if os.path.isdir(draft_dir):
+            shutil.rmtree(draft_dir, ignore_errors=True)
+        if backup_path and not os.path.isdir(draft_dir):
+            try:
+                os.rename(backup_path, draft_dir)
+            except OSError:
+                pass
+            backup_path = ""
+
     try:
         folder = draft.DraftFolder(draft_root)
         if not explicit_name:
@@ -471,12 +484,28 @@ def build_session_draft(
                 draft_dir = os.path.join(draft_root, name)
                 warnings.append(f"已存在同名草稿，本次写入「{name}」以免覆盖上一份")
         existed = folder.has_draft(name)
+        if existed:
+            # 覆盖前先旁路备份：任何失败路径都只清理本次半成品，
+            # 绝不能 rmtree 掉用户已有的草稿目录。
+            backup_name = f"{name}.bak_{int(time.time())}"
+            backup_path = os.path.join(draft_root, backup_name)
+            try:
+                os.rename(draft_dir, backup_path)
+                warnings.append(f"同名草稿已备份为「{backup_name}」")
+            except OSError as exc:
+                return JianyingDraftResult(
+                    success=False,
+                    error=f"同名草稿存在且无法备份，已取消覆盖: {exc}",
+                    error_code="write_failed",
+                    warnings=warnings,
+                    excluded_clips=list(excluded_clips),
+                )
         script = folder.create_draft(name, width, height, allow_replace=True)
         if existed:
             warnings.append("已覆盖同名草稿，若剪映中已打开请先关闭")
     except Exception as exc:
         _log.warning("剪映草稿初始化失败，清理半成品目录: %s", exc, exc_info=True)
-        shutil.rmtree(draft_dir, ignore_errors=True)
+        _cleanup_failed_draft()
         return JianyingDraftResult(
             success=False,
             error=f"剪映草稿初始化失败: {exc}",
@@ -499,7 +528,7 @@ def build_session_draft(
     if options.text_labels and options.include_clips:
         specs.append(TrackSpec(TrackType.text, "回合标签"))
     if not specs:
-        shutil.rmtree(draft_dir, ignore_errors=True)
+        _cleanup_failed_draft()
         return JianyingDraftResult(
             success=False,
             error="没有可生成的轨道",
@@ -511,7 +540,7 @@ def build_session_draft(
         script.append_tracks(specs)
     except Exception as exc:
         _log.warning("剪映草稿轨道创建失败，清理半成品目录: %s", exc, exc_info=True)
-        shutil.rmtree(draft_dir, ignore_errors=True)
+        _cleanup_failed_draft()
         return JianyingDraftResult(
             success=False,
             error=f"剪映草稿轨道创建失败: {exc}",
@@ -576,7 +605,7 @@ def build_session_draft(
 
         usable_clips: list[ClipDraftSource] = []
         for c in clips:
-            usable = clip_source_usable(
+            clip_usable = clip_source_usable(
                 precision=c.precision,
                 confirm_status=c.confirm_status,
                 include_pending=options.include_pending,
@@ -590,7 +619,9 @@ def build_session_draft(
                 duration_anomaly=c.duration_anomaly,
                 end_by=c.end_by,
             )
-            if usable:
+            # 不复用 `usable` 这个名字：上面它指的是"可用房间列表"，
+            # 这里是个布尔 —— 同名两种类型会让后面任何一次 `usable` 读取踩空。
+            if clip_usable:
                 usable_clips.append(c)
                 continue
             # 逐条留痕：此前只有一句聚合告警、连标签都不带，导出侧无法对账
@@ -705,7 +736,7 @@ def build_session_draft(
     except Exception as exc:
         # 任何构建/保存失败都要清理半成品目录，避免剪映注册损坏草稿
         _log.warning("剪映草稿生成失败，清理半成品目录: %s", exc, exc_info=True)
-        shutil.rmtree(draft_dir, ignore_errors=True)
+        _cleanup_failed_draft()
         return JianyingDraftResult(
             success=False,
             error=f"剪映草稿生成失败: {exc}",

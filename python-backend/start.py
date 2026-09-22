@@ -76,6 +76,14 @@ def main():
             manager.shutdown(timeout_sec=10.0)
         except Exception as exc:
             _log.warning("manager shutdown failed: %s", exc)
+        # 与 main.py.stop 同口径：1s 去抖窗口里未落盘的 rooms.json 必须冲刷
+        try:
+            from persistence import flush_pending_room_saves
+
+            if not flush_pending_room_saves(fsync=True):
+                _log.error("房间配置最终落盘失败")
+        except Exception as exc:
+            _log.error("房间配置最终落盘异常: %s", exc, exc_info=True)
         try:
             loop.call_soon_threadsafe(loop.stop)
         except Exception as exc:
