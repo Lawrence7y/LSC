@@ -201,3 +201,20 @@ diff_*.txt
 datasets/valorant_phase_broadcast*/
 lsc/analyzer/models/backups/
 docs/reports/*.json
+
+# Tool caches and stray local artifacts (never commit; a single `git add -A`
+# in this working tree would otherwise pull ~23MB of them in)
+.mypy_cache/
+.ruff_cache/
+artifacts/
+*.orig
+NVIDIA Corporation/
+~/
+
+# Playwright / browser-tooling captures. Previously only the *.png / *.log
+# inside them were covered by the generic rules above, so a `git add -A` still
+# dragged the page-snapshot YAML and pid files in (see
+# docs/reports/local-vs-github-20261018.md §7).
+.playwright-cli/
+output/playwright/
+.qoder_tmp_survey.md
