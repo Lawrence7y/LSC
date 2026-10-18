@@ -1284,7 +1284,7 @@ def detect_valorant_rounds_ocr(
             continue
 
         total_frames += len(frames)
-        for frame_index, (ts, img) in enumerate(frames):
+        for ts, img in frames:
             if cancel_check and cancel_check():
                 raise FFmpegCancelled("cancelled during ocr scan")
 

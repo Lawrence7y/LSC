@@ -22,7 +22,14 @@ from lsc.platforms.base import headers_to_ffmpeg_input_args, network_timeout_arg
 from lsc.platforms.failure import FailureKind, classify_failure
 from lsc.platforms.redaction import redact_text
 from lsc.recorder.manifest import ManifestStore, RecordingManifest
-from lsc.utils.process_launcher import kill_process_tree, prepare_launch
+from lsc.utils.coerce import safe_float
+from lsc.utils.process_launcher import (
+    forget_child,
+    kill_process_tree,
+    note_child,
+    prepare_launch,
+    spawn_slot,
+)
 
 _log = get_logger(__name__)
 STARTUP_PROBE_TIMEOUT_SEC = 15.0
@@ -94,7 +101,9 @@ def _uses_signed_http_pipe(url: str, network_context: Mapping[str, object] | Non
 
 
 def _is_signed_network_url(url: str, network_context: Mapping[str, object] | None = None) -> bool:
-    context = dict(network_context or {})
+    # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+    # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+    context: dict[str, Any] = dict(network_context or {})
     if bool(context.get("signed_url") or context.get("disable_http_reconnect")):
         return True
     lowered = str(url or "").lower()
@@ -110,7 +119,9 @@ def _network_input_args(
 ) -> list[str]:
     if not _is_network_url(url):
         return []
-    context = dict(network_context or {})
+    # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+    # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+    context: dict[str, Any] = dict(network_context or {})
     args = [
         *network_timeout_args(
             context,
@@ -441,7 +452,7 @@ class SharedRoomIngest:
         # Bytes read while preflighting a replacement upstream are handed to
         # the normal generation-checked reader instead of being discarded.
         self._upstream_prefetch: dict[int, bytes] = {}
-        self._lease_manager = None
+        self._lease_manager: object | None = None
         self._bound_lease_id = ""
         self._signed_http_opened_at = 0.0
         self._pending_lease: dict[str, Any] | None = None
@@ -489,18 +500,12 @@ class SharedRoomIngest:
 
     def _http_session_ttl_and_lead(self) -> tuple[float, float]:
         context = dict(self.network_context or {})
-        try:
-            ttl = float(context.get("http_session_ttl_sec") or 0.0)
-        except (TypeError, ValueError):
-            ttl = 0.0
-        try:
-            lead = float(context.get("lease_rotate_lead_sec") or 0.0)
-        except (TypeError, ValueError):
-            lead = 0.0
+        ttl = safe_float(context.get("http_session_ttl_sec") or 0.0)
+        lead = safe_float(context.get("lease_rotate_lead_sec") or 0.0)
         if ttl <= 0 and "huya.com" in str(self.url or "").lower():
             from lsc.platforms.capabilities import get_platform_capabilities
 
-            ttl = float(get_platform_capabilities("huya").expected_ttl_seconds or 0.0)
+            ttl = safe_float(get_platform_capabilities("huya").expected_ttl_seconds or 0.0)
         if ttl <= 0:
             return 0.0, 0.0
         if lead <= 0:
@@ -574,7 +579,7 @@ class SharedRoomIngest:
         with self._lock:
             return self._upstream_generation
 
-    def bind_lease(self, manager, lease_id: str) -> None:
+    def bind_lease(self, manager: object, lease_id: str) -> None:
         self._lease_manager = manager
         self._bound_lease_id = str(lease_id or "")
 
@@ -1380,7 +1385,13 @@ class SharedRoomIngest:
             )
             if error:
                 return error
-            assert candidate is not None
+            # _preflight_upstream 当前契约保证 error=="" 时 candidate 非 None，
+            # 但运行时校验不得用 assert（-O 模式下会被移除，之后 None 会传导到
+            # _start_stderr_reader(None) 才崩，2026-09-24 修复：§11.4-2）。
+            if candidate is None:
+                self.recording_error = "replace_upstream preflight returned no process"
+                _log.error("room=%s %s", self.room_id, self.recording_error)
+                return self.recording_error
             with self._lock:
                 self.url = str(url or "")
                 self.headers = dict(headers or {})
@@ -1508,7 +1519,23 @@ class SharedRoomIngest:
             popen_kwargs["creationflags"] = creation_flags
         if cwd:
             popen_kwargs["cwd"] = cwd
-        proc = subprocess.Popen(command, **popen_kwargs)  # noqa: S603
+        # 全局派生闸（CLAUDE.md §7.4）：**只闸启动瞬间**，`with` 退出即归还名额，
+        # 不做存活记账 ⇒ 不可能出现"某处忘了注销、后来全部起不来"。
+        # 超时取 6s：必须明显小于 `orchestrator.call` 的 10s 默认预算，否则上游恢复
+        # 若在编排线程上触发就会把整条 call 通道一起拖超时。
+        # ⚠️ **fail_open=True**：这里是**录制进样的重启/换线路径**，按闸自己的规矩
+        # "启动失败 = 用户丢一整场数据"的路径只能削峰不能否决 —— 拿不到名额时
+        # 照样起流并留 WARNING + 计数。现场见过硬拒后落成
+        # `upstream ffmpeg start failed` + `failure=TIMESTAMP_DISCONTINUITY`，
+        # 代价是丢一段录制，比多等一个名额贵得多。
+        with spawn_slot(f"shared_ingest:{self.room_id}", timeout_sec=6.0, fail_open=True):
+            proc = subprocess.Popen(command, **popen_kwargs)  # noqa: S603
+        # 中央派生账（CLAUDE.md §7.4）：Popen 后立即登记长生命周期进程。
+        # 生产 shared_ingest_enabled=True 下 12 房 ×（上游+录制 sink+预览 sink）
+        # 是 FFmpeg 主体，不记账 ⇒ budget_snapshot 对生产失明、
+        # MAX_LIVE_CHILDREN 软上限成死代码。注销在 _terminate_process_object
+        # （所有退出路径的唯一漏斗）。
+        note_child(proc, "shared_ingest")
         set_stream_nonblocking(proc.stdin)
         return proc
 
@@ -1622,10 +1649,7 @@ class SharedRoomIngest:
 
     def _signed_http_timeout_sec(self, network_context: Mapping[str, object] | None = None) -> float:
         context = dict(network_context or self.network_context or {})
-        try:
-            return max(5.0, float(context.get("read_timeout_sec") or 15.0))
-        except (TypeError, ValueError):
-            return 15.0
+        return max(5.0, safe_float(context.get("read_timeout_sec") or 15.0, 15.0))
 
     def _signed_http_proxy(self, network_context: Mapping[str, object] | None = None) -> str:
         context = dict(network_context or self.network_context or {})
@@ -1923,13 +1947,21 @@ class SharedRoomIngest:
                         )
                         try:
                             proc.terminate()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            # 树杀已失败、terminate 是最后手段：它的失败意味着
+                            # 进程可能残留，必须留痕（§11.4）。
+                            _log.debug(
+                                "shared preview stall terminate failed room=%s: %s",
+                                self.room_id, exc,
+                            )
                     try:
                         if proc.stdin:
                             proc.stdin.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log.debug(
+                            "shared preview stall stdin close failed room=%s: %s",
+                            self.room_id, exc,
+                        )
                     try:
                         if proc.stdout:
                             proc.stdout.close()
@@ -2020,6 +2052,14 @@ class SharedRoomIngest:
         # it has already cleared/terminated this sink and no failure callback
         # should be emitted. Never wait here: stop joins the watcher thread.
         if not self._recording_failover_lock.acquire(blocking=False):
+            # 持锁方通常是 stop_recording_sink 的 hot-failover 合并（最长
+            # 1800s）。丢掉回调是正确的，但必须留痕——否则合并窗口内的 sink
+            # 死亡在后端零证据（2026-09-24 审查修复）。
+            _log.warning(
+                "recording exit callback skipped room=%s: "
+                "failover lock held by concurrent stop",
+                self.room_id,
+            )
             return
         try:
             self._handle_recording_process_exit_locked(proc, error)
@@ -2266,8 +2306,13 @@ class SharedRoomIngest:
                             continue
                         try:
                             os.unlink(path)
-                        except OSError:
-                            pass
+                        except OSError as exc:
+                            # 合段成功后删旧分段：残留只多占磁盘，但会让"合并产物
+                            # 与分段并存"，留 debug 便于解释磁盘占用异常。
+                            _log.debug(
+                                "hot failover segment cleanup failed room=%s path=%s: %s",
+                                self.room_id, path, exc,
+                            )
                     with self._lock:
                         self._recording_path = original_path
                         self._recording_failover_source_paths.clear()
@@ -2297,8 +2342,9 @@ class SharedRoomIngest:
             for path in (descriptor_path, output_path):
                 try:
                     os.unlink(path)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    # 合并临时文件清理失败：下次合并会新建临时文件，这里只留痕
+                    _log.debug("hot failover temp cleanup failed room=%s path=%s: %s", self.room_id, path, exc)
 
     def _handle_preview_process_exit(self, proc: _FfmpegProcess, error: str) -> None:
         with self._preview_condition:
@@ -2403,7 +2449,11 @@ class SharedRoomIngest:
                     )
             self._join_thread(self._recording_input_thread)
             self._join_thread(self._recording_watch_thread)
-            self._merge_hot_failover_recording()
+        # hot-failover 合并（concat 最长 1800s）必须在 failover 锁**之外**执行：
+        # 持锁合并会让 _handle_recording_process_exit 在整个合并窗口内抢不到锁，
+        # 只能丢弃 sink 死亡通知。合并自身只用 self._lock 读写状态，不依赖该锁。
+        # 「不占编排线程」由 orchestrator 的 deferred stop 路径负责（CLAUDE.md §11.3）。
+        self._merge_hot_failover_recording()
 
     @staticmethod
     def _finalize_segmented_manifest(
@@ -2540,11 +2590,21 @@ class SharedRoomIngest:
 
     def _terminate_process_object(
         self,
-        proc: _FfmpegProcess,
+        proc: _FfmpegProcess | None,
         graceful_stdin: bool = False,
         *,
         deadline_monotonic: float | None = None,
     ) -> None:
+        if proc is None:
+            # 调用方在换线路径上可能拿到 None 旧进程；不先判就在这里变成
+            # "shared process cleanup failed" 的假告警。
+            return
+
+        # 中央账注销（CLAUDE.md §7.4）：这是所有退出路径（停止/崩溃/换线/
+        # 孤儿回收）的唯一漏斗，进程即将不存在时先记账出账，与 _launch_process
+        # 的 note_child 配对。幂等：进程已因崩溃被回收时 pop 不到条目也无害。
+        forget_child(proc)
+
         def remaining(fallback: float) -> float:
             if deadline_monotonic is None:
                 return fallback

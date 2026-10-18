@@ -240,9 +240,11 @@ class StreamCapture:
                 return
             for line in stderr:
                 self._stderr_tail.append(line.rstrip())
-        except Exception:
+        except Exception as exc:
             # Pipe closed or process already gone; reader exits cleanly.
-            pass
+            # 必须留 debug 日志：静默 pass 会让读线程死亡完全不可观测，
+            # 而它的死亡意味着 stderr 管道积压 → FFmpeg 阻塞 → 录制假停滞。
+            _log.debug("capture stderr reader exited pid=%s: %s", getattr(proc, "pid", "?"), exc)
 
     @classmethod
     def _acquire_stderr_executor(cls) -> ThreadPoolExecutor:
@@ -480,7 +482,7 @@ class StreamCapture:
         self._set_status(CaptureStatus.CONNECTING)
 
         # Build a clean environment and platform-specific launch flags
-        from lsc.utils.process_launcher import prepare_launch, set_stream_nonblocking
+        from lsc.utils.process_launcher import prepare_launch
         env, creation_flags, cwd = prepare_launch(self.ffmpeg)
 
         try:
@@ -501,7 +503,11 @@ class StreamCapture:
                     cwd=cwd,
                     creationflags=creation_flags,
                 )
-            set_stream_nonblocking(proc.stderr)
+            # 读侧保持**阻塞**：stderr 由专用读线程逐行消费（_stderr_reader_loop），
+            # 本就不会积压；设 O_NONBLOCK 反而让 `for line in stderr` 在无数据时
+            # 拿到 b'' 误判 EOF 提前退出，FFmpeg 随后写满 64KB 管道即阻塞，
+            # 表现为录制假停滞且无任何日志（CLAUDE.md §11.2 记载的同款坑，
+            # 2026-09-24 修复：此前读侧被误设非阻塞）。
             with self._lock:
                 self._process = proc
                 note_child(proc, "record")
@@ -644,6 +650,10 @@ class StreamCapture:
 
         # Close pipes of the process this stop() actually waited on.
         self._close_proc_pipes(proc)
+        # 中央账注销（CLAUDE.md §7.4）：与 start() 的 note_child 配对。
+        # 旧实现只在 _force_kill 里注销 ⇒ 每次正常停止泄漏一条 _live_children
+        # 记录，长期运行计数虚高（pid 复用后还可能误注销他人条目）。
+        forget_child(proc)
 
         if superseded:
             return CaptureResult(True, output_path)
@@ -690,6 +700,7 @@ class StreamCapture:
                 self._process = None
             # 关闭管道，防止文件描述符泄漏（与 stop() 路径保持一致）
             self._close_proc_pipes(proc)
+            forget_child(proc)  # 中央账注销（§7.4）：进程已退出，与 note_child 配对
             self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return exit_code
@@ -791,6 +802,7 @@ class StreamCapture:
                 self._process = None
             # 关闭管道，防止文件描述符泄漏（与 stop() 路径保持一致）
             self._close_proc_pipes(proc)
+            forget_child(proc)  # 中央账注销（§7.4）：进程已退出，与 note_child 配对
             self._release_stderr_executor_once()
             self._set_status(CaptureStatus.ERROR)
             return _friendly_ffmpeg_message(rc, self.stderr_tail)

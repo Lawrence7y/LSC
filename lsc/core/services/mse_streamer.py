@@ -32,7 +32,6 @@ from lsc.utils.process_launcher import (
     kill_process_tree,
     note_child,
     prepare_launch,
-    set_stream_nonblocking,
     spawn_slot,
 )
 
@@ -493,8 +492,12 @@ class MseStreamer:
             with spawn_slot("preview", timeout_sec=10.0):
                 self._process = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603
                 note_child(self._process, "preview")
-            set_stream_nonblocking(self._process.stdout)
-            set_stream_nonblocking(self._process.stderr)
+            # 读侧保持**阻塞**：stdout/stderr 各由专用读线程按阻塞 EOF 约定消费
+            # （read() 返回空 = 进程退出/管道关闭）。设 O_NONBLOCK 会让无数据时的
+            # read 返回 None/b'' 被判成 EOF、读线程提前退出 ⇒ 预览停滞到 15s
+            # watchdog 才报「流编码无响应」（CLAUDE.md §11.2 记载的同款坑，
+            # 2026-09-24 修复：此前读侧被误设非阻塞；写侧非阻塞属 shared_ingest
+            # 的 stdin 路径，不在这里）。
         except Exception as exc:
             _log.error("Failed to start FFmpeg: %s", exc)
             if self._on_error:
@@ -582,13 +585,15 @@ class MseStreamer:
                 try:
                     if proc.stdout:
                         proc.stdout.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 管道 close 失败在 Windows 上偶发（句柄已随进程退出回收）：
+                    # 清理路径允许静默，但按 §11.4 留 debug。
+                    _log.debug("MSE stdout close failed: %s", exc)
                 try:
                     if proc.stderr:
                         proc.stderr.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.debug("MSE stderr close failed: %s", exc)
                 self._process = None
 
     def stop(self) -> None:

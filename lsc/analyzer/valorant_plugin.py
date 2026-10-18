@@ -9,6 +9,7 @@ from typing import Any
 
 from lsc.analyzer.base import AnalyzerCapabilities, ScanWindow
 from lsc.platforms.redaction import redact_text
+from lsc.utils.coerce import try_float
 
 _log = logging.getLogger(__name__)
 
@@ -488,11 +489,7 @@ class ValorantAnalyzerPlugin:
             pressure=pressure,
             throughput_history=state.get("throughput_history"),
             kick_interval=float(state.get("kick_interval") or 60.0),
-            scan_cycle_sec=(
-                float(state.get("scan_cycle_sec"))
-                if state.get("scan_cycle_sec") is not None
-                else None
-            ),
+            scan_cycle_sec=try_float(state.get("scan_cycle_sec")),
             lookback_sec=state.get("incremental_lookback"),
             tail_lag_sec=state.get("tail_lag_sec"),
         )
@@ -653,7 +650,9 @@ class ValorantAnalyzerPlugin:
                     state["scan_succeeded"] = True
                     state["last_analyzed"] = window.end_sec
                     return []
-                merged_candidates: dict[str, dict[str, Any]] = {}
+                # 上面 deferred 分支里同名变量已带注解，且那条分支以 return 结束；
+                # 这里再写一遍注解就是 no-redef，丢掉注解让类型从上文推断。
+                merged_candidates = {}
                 for candidate in [*pending, *rounds]:
                     if not isinstance(candidate, dict):
                         continue

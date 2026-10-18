@@ -10,9 +10,10 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 _log = logging.getLogger(__name__)
 

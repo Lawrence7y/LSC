@@ -140,8 +140,10 @@ def detect_kill_events(
         - score: 置信度 (0.3-1.0)
     """
     try:
-        from rapidocr_onnxruntime import (
-            RapidOCR,  # type: ignore[import-untyped] # noqa: F401 - 检查模块可用性
+        # mypy 把 import-untyped 报在语句起始行，ignore 必须挂在这里；
+        # 挂在被导入的名字上等于没抑制。
+        from rapidocr_onnxruntime import (  # type: ignore[import-untyped]
+            RapidOCR,  # noqa: F401 - 检查模块可用性
         )
     except ImportError:
         _log.warning("rapidocr-onnxruntime 未安装，跳过 OCR 检测")

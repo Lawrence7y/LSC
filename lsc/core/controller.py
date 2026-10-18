@@ -332,8 +332,10 @@ class HeadlessRecordingController:
                     if proc is not None:
                         try:
                             kill_process_tree(proc)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            # 强杀失败只意味着进程可能残留；调用方按"已取消"返回，
+                            # 留 debug 便于事后核对孤儿进程。
+                            _log.debug("cancel_export kill failed id=%s: %s", export_id, exc)
                     return True
                 return False
             cancelled_any = False
@@ -343,6 +345,8 @@ class HeadlessRecordingController:
                     try:
                         kill_process_tree(proc)
                         cancelled_any = True
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # 单个导出进程强杀失败不阻断其余取消；残留进程由
+                        # killBackendAndWait 的进程树兜底，这里只留痕。
+                        _log.debug("cancel_export kill failed id=%s: %s", eid, exc)
             return cancelled_any

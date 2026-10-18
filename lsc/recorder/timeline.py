@@ -4,6 +4,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from lsc.utils.coerce import safe_int
+
 from .manifest import RecordingManifest, SegmentEntry
 
 
@@ -68,8 +70,8 @@ class TimelineMapper:
                 if not isinstance(gap, dict):
                     continue
                 try:
-                    sequence = int(gap.get("before_sequence", gap.get("sequence", 0)))
-                    duration = max(0, int(gap.get("duration_ms", 0) or 0))
+                    sequence = safe_int(gap.get("before_sequence", gap.get("sequence", 0)))
+                    duration = max(0, safe_int(gap.get("duration_ms", 0) or 0))
                 except (TypeError, ValueError):
                     continue
                 if sequence > 0 and duration:
@@ -126,6 +128,8 @@ class TimelineMapper:
         ):
             self._cursor_index += 1
         interval = self.intervals[self._cursor_index]
+        # 三个分支里两个是 float（value_ms 是浮点），首个是 int —— 统一按 float 声明
+        mapped_ms: float
         if value_ms < interval.media_start_ms:
             mapped_ms = interval.content_start_ms
         elif value_ms <= interval.media_end_ms:

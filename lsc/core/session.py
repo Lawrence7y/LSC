@@ -128,7 +128,9 @@ class RoomSession:
     # 首帧写入校正标记：recording_start_mono 首帧校正完成后置 True，避免重复校正
     # 录制启动时重置为 False（支持重连场景重新校正）
     _first_frame_corrected: bool = False
-    # 共享进样录制文件停滞检测（中频 tick 每 5s 检查，6 次无增长 ≈ 30s）
+    # 共享进样录制文件停滞检测：中频 tick（_MEDIUM_FREQ_INTERVAL=2，约 6s）按
+    # 房间交错（_STAGGER_GROUPS）触发，_SHARED_INGEST_STALL_CHECKS=4 次无增长，
+    # 单房折算约 24-36s（旧注释"每 5s 检查、6 次≈30s"与实现不符，2026-09-24 更正）
     _shared_ingest_last_file_size: int = 0
     _shared_ingest_stall_checks: int = 0
     # 预览 epoch ID：每次预览启动/重建时生成新 UUID，用于检测预览流版本变化

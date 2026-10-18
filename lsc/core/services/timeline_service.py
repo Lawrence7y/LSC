@@ -132,8 +132,15 @@ class TimelineService:
         self._invalidate_listeners: list[Callable[[str, str], None]] = []
 
     def add_invalidate_listener(self, callback: Callable[[str, str], None]) -> None:
-        """注册 timeline 失效回调（timeline_id, reason）。"""
+        """注册 timeline 失效回调（timeline_id, reason）。
+
+        幂等：同一 callback 重复注册只保留一份。这里此前是纯 append 且没有任何注销路径，
+        而 `invalidate_timeline` 会遍历整张表逐个调用 —— 注册方一旦在重连/重建时被再次装配，
+        同一事件就会被投递多次（重复广播 + 回调持有的旧引用被永久钉住无法回收）。
+        """
         with self._lock:
+            if callback in self._invalidate_listeners:
+                return
             self._invalidate_listeners.append(callback)
 
     def create_timeline(

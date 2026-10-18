@@ -22,6 +22,7 @@ from lsc.platforms.failure import (
     normalize_failure_kind,
 )
 from lsc.platforms.redaction import redact_mapping, redact_text
+from lsc.utils.coerce import try_float
 
 from .shared_ingest import SharedPreviewHandle, SharedRoomIngest
 
@@ -389,11 +390,7 @@ class IngestSupervisor:
                 else "INFO"
             ),
             lease_generation=generation,
-            retry_after_seconds=(
-                float((context or {}).get("retry_after"))
-                if isinstance((context or {}).get("retry_after"), (int, float))
-                else None
-            ),
+            retry_after_seconds=try_float((context or {}).get("retry_after")),
             safe_context=dict(context or {}),
         )
         callbacks = list(self._event_callbacks)
@@ -502,8 +499,10 @@ class IngestSupervisor:
                 self._wrap_preview_error(on_error)(error)
                 try:
                     handle.stop()
-                except Exception:
-                    pass
+                except Exception as stop_exc:
+                    # 启动失败路径的二次清理失败：主错误照常上抛，这里只留痕，
+                    # 防止"启动失败 + 清理也失败"在现场只剩主错误一条线。
+                    _log.debug("preview start failed cleanup failed: %s", stop_exc)
                 raise RuntimeError(error) from exc
             if result is not None and not bool(
                 getattr(result, "accepted", False) or getattr(result, "ok", result)
@@ -512,8 +511,8 @@ class IngestSupervisor:
                 self._wrap_preview_error(on_error)(error)
                 try:
                     handle.stop()
-                except Exception:
-                    pass
+                except Exception as stop_exc:
+                    _log.debug("preview rejected cleanup failed: %s", stop_exc)
                 raise RuntimeError(error)
         self._transition(
             IngestState.RUNNING
@@ -833,7 +832,11 @@ class IngestSupervisor:
         )
         return state
 
-    def health(self) -> dict[str, object]:
+    # 诊断快照是异构字典（int / bool / str / 枚举值混在一格里），与
+    # `process_launcher.budget_snapshot()`、`room_handler._system_stats_extra()` 同一类。
+    # 声明成 dict[str, object] 会让每个消费点都要 `int(health.get(k, 0) or 0)` 再被
+    # mypy 判一次 call-overload（实测 12 处），却不会带来任何真实约束。
+    def health(self) -> dict[str, Any]:
         ingest = self.ingest
         with self._lock:
             state = self._state.value

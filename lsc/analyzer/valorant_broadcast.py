@@ -11,7 +11,9 @@ import logging
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+from lsc.utils.coerce import try_float, try_int
 
 if TYPE_CHECKING:
     from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
@@ -1201,18 +1203,11 @@ def _split_family_base_key(round_key: object) -> str:
 def _split_fragment_index(item: dict[str, Any]) -> int | None:
     if not item.get("split_from_oversize"):
         return None
-    try:
-        return int(item.get("split_index"))
-    except (TypeError, ValueError):
-        return None
+    return try_int(item.get("split_index"))
 
 
 def _numeric(item: dict[str, Any], key: str) -> float | None:
-    try:
-        value = item.get(key)
-        return None if value is None else float(value)
-    except (TypeError, ValueError):
-        return None
+    return try_float(item.get(key))
 
 
 def _split_merge_geometry_ok(head: dict[str, Any], tail: dict[str, Any]) -> bool:
@@ -1221,7 +1216,9 @@ def _split_merge_geometry_ok(head: dict[str, Any], tail: dict[str, Any]) -> bool
     tail_start = _numeric(tail, "start")
     head_start = _numeric(head, "start")
     tail_end = _numeric(tail, "end")
-    if None in (head_end, tail_start, head_start, tail_end):
+    # 逐个 is-None 判断而不是 `None in (...)`：后者 mypy 不收窄，会在下面每个
+    # 减法处报 `float - None`（9 条 operator 错误），而这正是它没法证明安全的地方。
+    if head_end is None or tail_start is None or head_start is None or tail_end is None:
         return False
     # 头尾相接（块边界同点）——不接纳中间隔着内容的碎片，避免把两段拼成假回合
     if abs(head_end - tail_start) > _SPLIT_MERGE_GAP_SEC:
@@ -1321,10 +1318,9 @@ def _remember_finalized_spans(
     for item in items:
         if not isinstance(item, dict) or not _is_finalized_round(item):
             continue
-        try:
-            start = float(item.get("start"))
-            end = float(item.get("end"))
-        except (TypeError, ValueError):
+        start = _numeric(item, "start")
+        end = _numeric(item, "end")
+        if start is None or end is None:
             continue
         if end <= start:
             continue
@@ -1688,7 +1684,11 @@ def audit_broadcast_rounds(
         overlap_sec: float = 0.0,
     ) -> list[tuple[float, Any]]:
         if frame_provider is not None:
-            return frame_provider.get_frames(
+            # 注入的 frame_provider 是鸭子类型（Any），显式转回声明的
+            # list[(ts, frame)] 形状；运行时形状由 extract_frames_cancellable 同构保证。
+            return cast(
+                "list[tuple[float, Any]]",
+                frame_provider.get_frames(
                 video_path,
                 start_sec=start_sec,
                 end_sec=end_sec,
@@ -1696,7 +1696,8 @@ def audit_broadcast_rounds(
                 ffmpeg_path=ffmpeg_path,
                 cancel_check=cancel_check,
                 overlap_sec=overlap_sec,
-            )
+            ),
+        )
         return extract_frames_cancellable(
             video_path,
             start_sec=start_sec,
@@ -2339,7 +2340,7 @@ def audit_broadcast_rounds(
             # 与 `_dur >= last_dur+12`）永不再满足 → 候选永久滞留 → 收尾
             # `pending_audit` 恒真 → 无限补扫 / 卡死。finalize 阶段必须收敛，
             # 直接按无帧判定终态。
-            if lookahead_incomplete and not finalize:
+            if lookahead_incomplete and not finalize and available_end is not None:
                 item["broadcast_audit"] = "pending_lookahead"
                 item["broadcast_audit_scan_end"] = round(scan_end, 3)
                 item["broadcast_audit_available_end"] = round(float(available_end), 3)
@@ -2808,7 +2809,7 @@ def audit_broadcast_rounds(
                 retry_after_duration=float(available_end or effective_scan_end),
             )
             continue
-        if cutoff is None and lookahead_incomplete:
+        if cutoff is None and lookahead_incomplete and available_end is not None:
             item.pop("_audit_continue_ready", None)
             item["broadcast_audit"] = "pending_lookahead"
             item["broadcast_audit_scan_end"] = round(scan_end, 3)
@@ -3092,17 +3093,16 @@ def audit_broadcast_rounds_with_outcomes(
 
     remaining = [dict(item) for item in returned if isinstance(item, dict)]
     for original in rounds:
-        try:
-            start = round(float(original.get("start")), 3)
-        except (TypeError, ValueError):
-            start = None
+        original_start = _numeric(original, "start")
+        start = None if original_start is None else round(original_start, 3)
         match_index = next(
             (
                 index
                 for index, item in enumerate(remaining)
                 if start is not None
                 and isinstance(item.get("start"), (int, float))
-                and round(float(item["start"]), 3) == start
+                and (item_start := _numeric(item, "start")) is not None
+                and round(item_start, 3) == start
             ),
             None,
         )

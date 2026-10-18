@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from lsc.platforms.redaction import redact_text
 
@@ -112,7 +113,7 @@ class RecordingAsset:
         *,
         ffprobe_path: str,
         timeout: float,
-    ) -> tuple[bool, dict[str, object]]:
+    ) -> tuple[bool, dict[str, Any]]:  # ffprobe 明细是异构字典
         command = [
             ffprobe_path or "ffprobe",
             "-v", "error",

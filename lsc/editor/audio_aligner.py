@@ -1,37 +1,29 @@
 """音频互相关对齐模块。
 
-通过 FFmpeg 提取各房间的音频 PCM 数据，使用 numpy 互相关计算
-内容级时间偏移量，以最慢的直播为基准，为多房间导出对齐提供精确补偿。
+对**前端预览音频**（Web Audio 采集，约 8s）做 numpy 互相关，计算内容级时间偏移量，
+以进度最慢的直播为基准，为多房间导出对齐提供精确补偿。
+
+说明（2026-09-18）：从录制文件用 FFmpeg 提取音频的对齐路径（`extract_audio_pcm` /
+`align_rooms`）已删除 —— 它从未被业务代码调用，运行时对齐只走前端预览音频
+（见 CLAUDE.md §5.3、docs/FEATURE-INVENTORY.md §16）。
 """
 
 from __future__ import annotations
 
 import logging
-import subprocess
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 
-from lsc.platforms.base import headers_to_ffmpeg_input_args
-from lsc.utils.process_launcher import kill_process_tree, prepare_launch, set_stream_nonblocking
-
 _log = logging.getLogger(__name__)
 
-# 提取音频的时长（秒）—— 3 秒在 CDN 延迟差（通常 1-3s）下仍有足够重叠
-AUDIO_DURATION = 3.0
 # 采样率：16 kHz mono，人声频段足够，配合抛物线插值可达到亚毫秒精度
 SAMPLE_RATE = 16000
-# 录制文件读取时距离直播边缘的安全缓冲（秒）
-_SEEK_BUFFER = 2.0
 # 互相关置信度阈值（低于此值视为内容不相关，降级为 0 偏移）
 # 0.1 过低（环境噪声即可达到），0.3 可过滤不相关内容强行对齐
 _CORRELATION_THRESHOLD = 0.3
 _PAIRWISE_BRIDGE_THRESHOLD = 0.10
 _PAIRWISE_CONSISTENCY_TOLERANCE = 0.25
-# 最大并发音频提取数
-_MAX_EXTRACT_WORKERS = 6
 _ENVELOPE_FRAME_MS = 40
 _ENVELOPE_HOP_MS = 10
 _ENVELOPE_BASELINE_MS = 500
@@ -57,92 +49,6 @@ class AlignResult:
     method: str = ""
     correlation_scores: dict[str, float] = field(default_factory=dict)
     error: str = ""
-
-
-def _is_network_source(source: str) -> bool:
-    """判断 source 是否为网络流 URL（而非本地文件路径）。"""
-    return source.startswith(("http://", "https://", "rtmp://", "rtmps://", "rtsp://", "rtsp://"))
-
-
-def extract_audio_pcm(
-    ffmpeg_path: str,
-    source: str,
-    duration: float = AUDIO_DURATION,
-    sample_rate: int = SAMPLE_RATE,
-    seek: float = 0.0,
-    headers: dict[str, str] | None = None,
-) -> np.ndarray:
-    """使用 FFmpeg 提取音频为 mono PCM numpy float32 数组。
-
-    正常返回形状为 ``(duration * sample_rate,)`` 的数组，
-    提取失败或音频为空时返回空数组 ``array([])``。
-
-    对于网络直播流 URL，自动添加重连、超时等网络参数，
-    并禁用视频解码（``-vn``）以减少资源消耗。
-    """
-    cmd = [ffmpeg_path, "-y", "-loglevel", "warning"]
-
-    is_network = _is_network_source(source)
-    if is_network:
-        cmd += [
-            "-re",
-            "-thread_queue_size", "1024",
-            "-timeout", "10000000",
-            "-rw_timeout", "15000000",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-        ]
-
-    if headers:
-        cmd += headers_to_ffmpeg_input_args(headers)
-    if seek > 0:
-        cmd += ["-ss", f"{seek:.3f}"]
-    cmd += [
-        "-i", source,
-        "-vn",
-        "-map", "0:a?",
-        "-t", f"{duration:.1f}",
-        "-ar", str(sample_rate),
-        "-ac", "1",
-        "-f", "s16le",
-        "pipe:1",
-    ]
-    _log.info(
-        "开始提取音频: source=%s, seek=%.1fs, duration=%.1fs, rate=%dHz, network=%s",
-        source[:200], seek, duration, sample_rate, is_network,
-    )
-    try:
-        env, creation_flags, cwd = prepare_launch(ffmpeg_path)
-        popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.DEVNULL,
-            "env": env,
-        }
-        if creation_flags:
-            popen_kwargs["creationflags"] = creation_flags
-        if cwd:
-            popen_kwargs["cwd"] = cwd
-        proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603
-        set_stream_nonblocking(proc.stdout)
-        try:
-            raw, _ = proc.communicate(timeout=duration + 20)
-        except subprocess.TimeoutExpired:
-            kill_process_tree(proc)
-            proc.communicate()
-            _log.warning("FFmpeg 音频提取超时: source=%s", source[:200])
-            return np.array([], dtype=np.float32)
-    except Exception as exc:
-        _log.warning("FFmpeg 音频提取失败: source=%s, error=%s", source[:200], exc, exc_info=True)
-        return np.array([], dtype=np.float32)
-
-    if not raw:
-        _log.warning("音频提取为空: source=%s", source[:200])
-        return np.array([], dtype=np.float32)
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    _log.info("音频提取成功: source=%s, samples=%d (%.2fs)", source[:200], len(audio), len(audio) / sample_rate)
-    return audio
 
 
 def _parabolic_interpolation(correlation: np.ndarray, peak: int) -> float:
@@ -626,81 +532,3 @@ def align_audio_map(
         method=method,
         correlation_scores=scores,
     )
-
-
-def align_rooms(
-    rooms_data: list[dict[str, Any]],
-    ffmpeg_path: str,
-) -> AlignResult:
-    """对多个房间的音频进行互相关对齐。
-
-    参数
-    ----
-    rooms_data: 每项包含::
-
-        {
-            "room_id": str,
-            "source": str,           # 音频源路径/URL
-            "seek": float,           # 提取起始偏移（秒）
-            "is_recording": bool,    # 是否从录制文件提取
-            "headers": dict | None,  # 直播流请求头
-            "streamer_name": str,
-        }
-
-    ffmpeg_path: FFmpeg 可执行文件路径
-
-    返回
-    ----
-    AlignResult，其中 offsets 为各房间相对最慢房间的偏移量：
-    - 最慢房间 offset = 0
-    - 其他房间 offset = 该房间内容比最慢房间快多少秒（正数）
-    """
-    if len(rooms_data) < 2:
-        _log.warning("对齐房间不足: %d 个房间", len(rooms_data))
-        return AlignResult(success=False, error="至少需要 2 个有效房间才能对齐")
-
-    room_ids = [rd["room_id"] for rd in rooms_data]
-    _log.info("开始音频对齐: rooms=%s, method=%s", room_ids, "recording" if all(rd.get("is_recording") for rd in rooms_data) else "stream")
-
-    with ThreadPoolExecutor(max_workers=_MAX_EXTRACT_WORKERS) as pool:
-        futures: dict[str, Future[np.ndarray]] = {}
-        audio_data: dict[str, np.ndarray] = {}
-        for rd in rooms_data:
-            source_preview = rd["source"][:80] + "..." if len(rd["source"]) > 80 else rd["source"]
-            _log.info("提交音频提取: room=%s, source=%s, seek=%.1fs, recording=%s", rd["room_id"], source_preview, rd.get("seek", 0.0), rd.get("is_recording", False))
-            future = pool.submit(
-                extract_audio_pcm,
-                ffmpeg_path,
-                rd["source"],
-                AUDIO_DURATION,
-                SAMPLE_RATE,
-                seek=rd.get("seek", 0.0),
-                headers=rd.get("headers"),
-            )
-            futures[rd["room_id"]] = future
-
-        for rid, fut in futures.items():
-            try:
-                result = fut.result(timeout=AUDIO_DURATION + 25)
-                if result.size > 0:
-                    audio_data[rid] = result
-                else:
-                    _log.warning("房间 %s 音频为空，跳过", rid)
-            except Exception as exc:
-                _log.warning("房间 %s 音频提取失败: %s", rid, exc)
-
-    _log.info("音频提取完成: 成功=%d, 跳过=%d, 总房间=%d", len(audio_data), len(rooms_data) - len(audio_data), len(rooms_data))
-    valid_ids = list(audio_data.keys())
-    if len(valid_ids) < 2:
-        _log.warning("有效音频不足 2 路: %s", valid_ids)
-        return AlignResult(success=False, error="有效音频不足 2 路，无法互相关对齐")
-
-    method = "recording" if all(rd.get("is_recording") for rd in rooms_data) else "stream"
-    align_result = align_audio_map(audio_data, SAMPLE_RATE, method=method)
-    _log.info(
-        "对齐完成: reference=%s, method=%s, offsets=%s, scores=%s",
-        align_result.reference_room_id, method,
-        {k: f"{v:.4f}" for k, v in align_result.offsets.items()},
-        {k: f"{v:.3f}" for k, v in align_result.correlation_scores.items()},
-    )
-    return align_result
