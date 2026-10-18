@@ -77,6 +77,20 @@ PR 模板强制列出上述测试结果；CI 在 push/PR 时全量执行（`.git
 - 子进程环境变量白名单透传（`CLAUDE.md:730-731`）。
 - 强杀 FFmpeg 统一入口 `lsc/utils/process_launcher.py: kill_process_tree()`，**禁止 `proc.kill()`**（`CLAUDE.md:743`）。
 
+### 2.7 从异构字典取标量（硬性）
+
+- 从 ffprobe JSON / WS payload / sidecar / settings 取数字，一律用 `lsc/utils/coerce.py`：
+  `try_float` / `safe_float` / `try_int` / `safe_int`。**禁止再手写**
+  `try: float(d.get(k)) except (TypeError, ValueError): ...`。
+- 判据（`tests/test_coerce.py` 逐条钉住，负控 7/7 有效）：
+  - `None`、空串、`"abc"` ⇒ 回退；
+  - **`NaN` / `Inf` ⇒ 回退**（能 `float()` 成功，但会把时间轴算成 `nan` 并静默扩散）；
+  - **`bool` ⇒ 回退**（`int(True)==1` 会把误传的开关变成合法数值 1）；
+  - `try_int` 不截断小数：`2.7 → None`（索引/序号被静默截断会造成错位）。
+- 需要"缺失"与"0"区分时用 `try_*`（返回 `None`）并由调用方决定跳过；只有语义上
+  确实"取不到就当默认"才用 `safe_*`。
+- `lsc/` 侧 mypy 豁免已清零（2026-09-19）：新写函数必须有类型标注，否则 CI 直接红。
+
 ---
 
 ## 3. 错误处理规范（`CLAUDE.md:745-800`，2026-07-05 确立）
@@ -120,7 +134,7 @@ PR 模板强制列出上述测试结果；CI 在 push/PR 时全量执行（`.git
 - `tests/conftest.py` 自动注入 `QT_QPA_PLATFORM=offscreen` 并把仓库根与 `python-backend/` 加入 `sys.path`。
 - **硬件/外部依赖 mock 约定**：
   - 用 `monkeypatch.setattr(module, "attr", fake)` 依赖注入；
-  - 重量级调用打桩到函数级，如 `@patch("lsc.editor.audio_aligner.extract_audio_pcm")`；
+  - 重量级调用打桩到函数级，如 `@patch("lsc.editor.audio_aligner.compute_offset")`；
   - 环境开关用 `monkeypatch.setenv("LSC_WS_TOKEN", ...)`；
   - 测试不得依赖宿主机 FFmpeg/GPU：`sample_config` fixture 故意用不存在的 ffmpeg/ffprobe 路径使 `capture.start()` 确定性失败（`tests/conftest.py`）。
 - CI 强制：`pytest -v --cov=lsc --cov-report=xml --cov-report=term`。
@@ -193,3 +207,4 @@ PR 模板强制列出上述测试结果；CI 在 push/PR 时全量执行（`.git
 5. 导出直接使用 `mark_in/mark_out`（预览轴 currentTime）作为 `-ss` 参数（必须走墙钟映射）。
 6. 在 `mse_` 前缀之外自行拼接广播 kind。
 7. 新增 `settings.json` 键/协议消息而不同步前端类型（`WSPayloadMap`）与本文档。
+8. 手写 `float(d.get(k))` + `try/except` 取标量（必须用 §2.7 的 `lsc/utils/coerce.py`）。

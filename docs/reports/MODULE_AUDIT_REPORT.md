@@ -172,11 +172,11 @@ graph LR
 origin_mono = min(trusted_rooms.media_start_mono)
 
 # 预览轴到公共轴 Delta：
-preview_to_common_delta[room] = (capture_mono - origin_mono - preview_current_time[room]) 
+preview_to_common_delta[room] = (capture_mono - origin_mono - preview_current_time[room])
                                  + content_offset[room] - content_offset[ref]
 
 # 录制轴到公共轴 Delta（禁止叠加预览锚点，只叠加相对偏移与媒体起点）：
-recording_to_common_delta[room] = media_start_mono[room] + content_offset[room] 
+recording_to_common_delta[room] = media_start_mono[room] + content_offset[room]
                                   - content_offset[ref] - origin_mono
 ```
 - **关键设计意图**：
@@ -331,6 +331,10 @@ recording_to_common_delta[room] = media_start_mono[room] + content_offset[room]
   精确还原各房间真实的单调捕获时刻，彻底解决了“对齐后预览轴与导出轴错位 6~7 秒”的历史隐患。
 
 #### ⑤ 毫秒级播放速率平滑微调（Drift Correction）
+> **2026-09-18 更正（本节作废）**：`applyOffsetWithDriftCorrection` 自写入起**没有任何调用点**，
+> 前端落点走的是 Workbench 里的一次性 seek；该函数已删除。口径见
+> `docs/reports/debt-audit-20260918.md` §11.14。本节作为历史审计快照保留，但它列的"亮点"当时就不成立。
+
 - 前端在执行偏移补偿时，若直接调用 `video.currentTime = newTime`，在微小偏移下会引发画面跳变与音频爆音。
 - [`applyOffsetWithDriftCorrection`](file:///D:/Project/直播切片多人/lsc-electron/src/utils/previewAudioAligner.ts#L577) 采用“大偏移 Seek + 小残差播放速率调整”复合机制：
   - 残差在 $0.05\,\text{s}$ 以上时，将 `playbackRate` 控制在 $[0.95, 1.05]$ 区间平滑追赶，人眼与人耳完全无法察觉播放速率改变。

@@ -98,7 +98,7 @@
 **问题/风险**：
 - RecordingService 基本只服务测试/批量旁路：运行期串联录制仅用其 preflight_check，start_recording/stop/check_health/_build_extra_args 等未走 12 路工作台真实路径，存在维护面与运行面双份逻辑的漂移风险（RecordingService 复用 CaptureResult 形状，与 _SharedCaptureAdapter 形状并不一致）
 - 修复工具单点：recording_repair.repair_recording 用 subprocess.run capture_output 同步阻塞，timeout=600s 且经 recording_executor 排队，长时间修复会占用并发槽位的 executor（待核实是否影响其它录制操作）
-- SegmentRecorder(segmented.py) 被 feature-flag 独立于主要运行路径：真正运行沿是 SharedRoomIngest/IngestSupervisor 自己的 build_segmented_recording_command + _finalize_segmented_manifest，segmented.py 的 start/stop 多数场景未走通，两套分段实现并存有分叉风险（待核实 acceptance 与 v2 是否同构）
+- SegmentRecorder(segmented.py) 被 feature-flag 独立于主要运行路径：真正运行沿是 SharedRoomIngest/IngestSupervisor 自己的 build_segmented_recording_command + _finalize_segmented_manifest，segmented.py 的 start/stop 多数场景未走通，两套分段实现并存有分叉风险（**2026-09-18 核实并收口**：`segmented.py` 的 `SegmentedRecorder` 无任何生产 import，属死实现，已删除；生产分段写只此一套，见 `docs/reports/debt-audit-20260918.md` §11.16-B）
 - 重连状态机分散：可恢复性判断跨 capture.py/_friendly_ffmpeg_message、error_messages.is_recoverable_error、recovery_policy.should_force_recovery 三层，新增平台错误需多点同步修改才不致误判
 - 12 路上限仅为 recording_executor/Semaphore 软约束的分流，真正上限依赖 FlFmpeg 并行进程稳定性与磁盘吞吐，无显式进程数强校验兜底（待核实超限是否被 handler 层 forcheck）
 
@@ -163,7 +163,7 @@
 - 导出队列防御完整：6h 兜底超时防护 worker 永久占用槽位、精确定位/近似定位分级降级并在前端提示可能偏差数秒
 
 **问题/风险**：
-- 死代码：audio_aligner.align_rooms（从录制文件提音频）仅在测试/文档引用，业务全走预览流 align_audio_map，与 CLAUDE.md 断言一致需清理或明确废弃
+- 死代码：audio_aligner.align_rooms（从录制文件提音频）仅在测试/文档引用，业务全走预览流 align_audio_map，与 CLAUDE.md 断言一致需清理或明确废弃 → ✅ **2026-09-18 已删除**（连同 `extract_audio_pcm` 与三个专属常量）
 - 双通道对齐实现：room_handler.handle_align_preview_audio 与 alignment_handlers.py 各有一套（后者同样 create_timeline），存在两份并行对齐逻辑，逻辑重复有漂移风险（待核实二者是否都被前端调用）
 - export_handlers 内 _deferred_export_jobs 明确标注死代码（无人 append），与 room_handler 内的延后列表重复，容易误导后续接线
 - session-scope TimelineService 纯内存、不跨重启，且无定时清理——长期挂机若 timeline_id 无限增长且不失效会累积内存（需确认是否由 epoch 事件驱动回收）
@@ -187,7 +187,7 @@
 - 双轴锚点 build_room_snapshots_from_align：preview_to_common_delta=(align_mono-origin_mono-preview_current_time)+rel_delta，录制轴只含相对偏移；timeline_service.py:44-113
 - 后台漂移复核：持续分析 running 时每10min refreshAlignment(仅全房在直播沿，allowedLag≥offset+1.5)，finalizing 立即复核一次；Workbench/index.tsx:2175-2224
 
-**数据流**：用户点"一键对齐" → Workbench captureAndSendAlignment 逐房 captureAudio(8s) → align_preview_audio {rooms:[{room_id,sample_rate:16000,pcm_base64,diagnostics:{current_time,…}}]} → 后端 handle_align_preview_audio 校验(≤64房,20MB/房,采样率8k-48k一致,1-15s) → recording_executor 跑 align_audio_map → 返回 offsets/scores/reference_room_id → trusted≥2 时跨线程写 RoomSession(content_offset,align_group_id) + build_room_snapshots_from_align→create_timeline → 广播 timeline_ready → 返回 align_preview_audio_response(含 offsets/timeline)。前端据此 applyOffsetWithDriftCorrection；导出时 room_handler 6589/6640 用 content_offset 差值把主房回合映射到副房。旧路径 set_content_offset 由前端回传（现仅作兼容）。基线响应 server.py:223-226 包装成 {type:xxx_response}。
+**数据流**：用户点"一键对齐" → Workbench captureAndSendAlignment 逐房 captureAudio(8s) → align_preview_audio {rooms:[{room_id,sample_rate:16000,pcm_base64,diagnostics:{current_time,…}}]} → 后端 handle_align_preview_audio 校验(≤64房,20MB/房,采样率8k-48k一致,1-15s) → recording_executor 跑 align_audio_map → 返回 offsets/scores/reference_room_id → trusted≥2 时跨线程写 RoomSession(content_offset,align_group_id) + build_room_snapshots_from_align→create_timeline → 广播 timeline_ready → 返回 align_preview_audio_response(含 offsets/timeline)。前端据 offsets 调 utils/previewAlignment.applyAlignmentSeek 一次性 seek（2026-09-18 更正：原先写的 applyOffsetWithDriftCorrection 从未被调用，已删，见 debt-audit §11.14）；导出时 room_handler 6589/6640 用 content_offset 差值把主房回合映射到副房。旧路径 set_content_offset 由前端回传（现仅作兼容）。基线响应 server.py:223-226 包装成 {type:xxx_response}。
 
 **亮点**：
 - 多级置信防线：主波形相关(≥0.3)→瞬态包络(需 peak_ratio≥3.0)→跨语言一致性(双证据同lag)三级递进，避免无关音频/环境噪声强行对齐；compute_offset 设计严谨

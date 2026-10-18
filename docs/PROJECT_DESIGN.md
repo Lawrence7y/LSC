@@ -926,19 +926,25 @@ slowest_id = min(valid_ids, key=lambda rid: raw_offsets[rid])
 
 收到 `align_preview_audio_response` 后三件事并行：
 1. **回传 content_offset**：`send('set_content_offset', ...)` 给导出用
-2. **调整 video.currentTime**：偏移 > 0.05s 时 seek
+2. **调整 video.currentTime**：唯一入口 `lsc-electron/src/utils/previewAlignment.ts`
+   的 `applyAlignmentSeek`（绝对值 < 0.05s 判为"已对齐"不动播放头；否则
+   `currentTime - offset` 夹在已缓冲区间内）。可执行用例：
+   `src/utils/previewAlignment.test.ts`
 3. **自动静音快房间**：非参考房间静音，消除回声
 
 Toast：`已精确对齐 N 个直播间（置信度 X%），已静音 M 个快房间消除回声`
 
-### 11.4 漂移修正
+### 11.4 残余差修正（**当前未实现**）
 
-**位置**：`lsc-electron/src/utils/previewAudioAligner.ts:273-314`
+2026-09-18 核查更正：本节原先写的"`applyOffsetWithDriftCorrection`：seek 后测量残余差 →
+> 50ms 用 `playbackRate ±0.05` 持续修正 → 完成后恢复 1.0"**从未生效** —— 该函数自写入
+（v2.0.0）起没有任何调用点，一键对齐走的始终是 §11.3 的一次性 seek。函数与它的
+`WeakMap` 定时器已删除，避免"文档承诺、代码存在、运行时不成立"再次发生。
 
-`applyOffsetWithDriftCorrection`：
-- seek 后测量残余差
-- 若 > 50ms，用 `playbackRate ±0.05` 持续修正
-- 完成后恢复 `playbackRate = 1.0`
+现状与含义：预览的对齐精度 = 一次 seek 的落地精度（浏览器会吸附到可解码点，误差在
+几十到几百毫秒）。**导出不受影响**：导出补偿用的是后端 `content_offset` 数值，不经过
+播放头。若要把残余差补上，需要先做多房间真机验证（速率微调的观感、与预览停滞自愈的
+相互作用），再在 `applyAlignmentSeek` 之后追加一层。
 
 ---
 

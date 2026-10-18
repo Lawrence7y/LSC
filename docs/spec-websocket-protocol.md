@@ -228,7 +228,7 @@ save_settings, add_room,                                          # 幂等/去�
 | `export_progress` | `job_id, percent, elapsed?, total?, room_id?` | 导出进度（droppable） | `export_handlers.py:322` |
 | `clip_completed` | `job_id, output_path, thumbnail_path?, room_id?, label?, start?, end?, room_name?` | 导出成功（terminal） | `export_handlers.py:302` |
 | `clip_failed` | `job_id, error, room_id?, clip_id?` | 导出失败（terminal） | `export_handlers.py:243 等` |
-| `export_overall_progress` | `total, completed, percent, batch_id` | 批量导出总体进度 | `export_handlers.py:93` |
+| `export_overall_progress` | `total, completed, percent, batch_id` | 批量导出总体进度 —— **当前不可达**：`_reset_export_batch()`（唯一的 arm 点）没有任何调用方，`total` 恒为 0 即不广播；前端亦无监听者。helper 的 `batch_id` 丢赋值缺陷已于 2026-09-18 修复并被用例覆盖，真正接上需要先定批量协议（报告 §11.18-B） | `export_handlers.py:_notify_export_overall` |
 | `analysis_progress` | `room_id, stage, progress, detail` | 单次分析进度（droppable） | `room_handler.py:5638` |
 | `continuous_analysis_status` | 见 `ContinuousAnalysisStatus` 类型 | 持续分析状态（last-value） | `analysis_handlers.py:576` |
 | `continuous_highlights` | `room_id, highlights` | 持续分析高光入列（terminal）；多房映射失败时带 `mapping_fallback: true` + `error` | `room_handler.py:8133` |

@@ -18,9 +18,9 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
 |    - React + TypeScript + Vite + Ant Design + Zustand                                  |
 |    - 职责：用户交互、多房间工作台 UI、MSE 预览播放器、快捷键分发、导出队列管理                 |
 +----------------------------------------------------------------------------------------+
-                                         │ 
+                                         │
                                    WebSocket
-                                         │ 
+                                         │
 +----------------------------------------------------------------------------------------+
 | 2. 桥接与服务层 (Python Backend)                                                       |
 |    - asyncio WebSocket 服务器 (工作线程) + BroadcastHub (线程安全 FIFO 广播队列)                                   |
@@ -84,10 +84,13 @@ LSC 是一个多直播间录制切片系统，支持最多 **12路并发录制**
 
 *   **同步调用原语**：WebSocket 接收到前端请求后，调用 `orchestrator.call()`。该方法内部创建 `_CallRequest` 并通过线程安全队列投递，编排线程执行完毕后设置 `threading.Event` 唤醒工作线程。支持配置 `timeout`（默认 10.0 秒）。**超时语义**：超时仅标记 `cancelled` 并抛 `TimeoutError`，请求仍可能在编排线程执行——调用方必须把超时视为「结果未知」而非「未执行」，禁止盲目重试（重复副作用）。
 *   **状态广播分发**：主线程/编排线程的状态更新不能直接调用 asyncio，需要调用 `bridge.queue_broadcast(msg)`，将其写入线程安全的 FIFO 队列中。WebSocket 服务线程中的广播协程从队列中读取并推送至前端（`BroadcastHub`，队列上限 1000，满时按类型驱逐/扩容）。
+    *   **丢消息检测契约（2026-09-18 收口，见债务报告 §11.17）**：`_seq` **只发给关键消息**（不在 `_DROPPABLE_TYPES` 里的那些），且**发号与入队必须在同一把 `_seq_lock` 里完成** —— 两条不变式共同保证「队列内顺序 == 序列号顺序」，前端 `useWebSocket` 的 `_seq > last + 1` 缺号告警才有意义（否则倒序到达既不报警、还会把 `last` 拉低掩盖真缺口）。**新增广播类型时**：可丢弃的遥测类必须同时进 `_DROPPABLE_TYPES`，否则会占用号段并把设计内的丢弃放大成假告警。唤醒失败（asyncio loop 已关闭等）只计数 + 首次 WARN，快照经 `get_system_stats`/`low_tick` 的 `extra.broadcast` 出口可见。
 
 ### 2.2 WebSocket 协议规范
 
 WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式传入 `LSCWebSocketServer(port=9876)`；注意 `server.py` 中类默认值为 `19876`，两处常量不一致，改动端口时需同步）。
+
+> ⚠️ **三条并行的 WS 引导入口**（2026-09-18 审计）：`python-backend/main.py`（生产，端口 9876）、`server.py` 的 `__main__`/模块级 `server = LSCWebSocketServer()`（类默认 19876）、`python-backend/start.py`（第三入口，**零测试覆盖**）。前端靠后端 stdout 打印的端口动态连接（`websocketUrl.ts` 的 9876 只是兜底默认），所以生产可用；但"哪个入口在用"没有单一事实源，改端口必须三处同查。
 *   **端口自动回退**：若主端口被占用，会自动依次尝试备用端口 `19877`, `19878`, `19879`, `19880`。
 *   **高频消息优化**：
     *   在 Qt 主线程快速触发房间状态变更时，`rooms_updated` 消息会被连续合并（若队列里有连续的多条 `rooms_updated`，只广播最新的一条），以极大缓解前端 JSON 序列化与 React 重渲染的负载。
@@ -141,9 +144,9 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 | `audio_bitrate`| `"128k"` | 导出音频码率：`"96k"`、`"128k"`、`"256k"` 等。 |
 | `preview_quality`| `"高清"` | MSE 预览的转码分辨率参考预设。 |
 | `timeline_replay_seconds` | `300` | 时间线直播 DVR 回放缓存时长；`0` 关闭历史回放但保留播放所需短缓存，可选 `120`/`300`/`600` 秒。 |
-| `shared_ingest_enabled` | `False` | 是否启用共享进样模式（共享远端上游 FFmpeg，录制/预览各自独立 sink）。`True` 开启共享上游，`False` 使用独立双进程。 |
-| `shared_ingest_preview_crf` | `23` | 共享进样模式下预览流的 CRF 值（0-51），越低画质越高。默认 23。 |
-| `shared_ingest_preview_preset`| `"veryfast"` | 共享进样模式下预览流的编码预设。可选 `ultrafast`/`superfast`/`veryfast`/`faster`/`fast`/`medium` 等。 |
+| `shared_ingest_enabled` | `False`（代码默认） / **`True`（生产实际）** | 是否启用共享进样模式（共享远端上游 FFmpeg，录制/预览各自独立 sink）。`lsc/config.py:210` 默认 `True`，`python-backend/settings.json` 亦为 `true`，且 `register_room_handlers` 启动时 `_apply_shared_ingest_from_settings(load_settings())`（`room_handler.py:4599`）会覆盖 `LscConfig` ⇒ **生产实际走共享进样**。根目录 `lsc_config.json` 的 `false` 只在无 `settings.json` 时生效。⚠️ 本节 §7.3.1 以下按"独立双进程"描述的时序/CRF/并发结论，在生产配置下需按共享进样重新核对（2026-09-18 审计确认，见 `docs/reports/debt-audit-20260918.md` §7.2）。 |
+| `shared_ingest_preview_crf` | `23` | 预览软编**回退** CRF（0-51），越低画质越高。两种预览模式共用同一来源：`MseStreamer._fallback_crf` 与 `shared_ingest.start_preview` 都读本键（2026-09-18 前独立模式硬编码 28，与共享模式 23 构成双基线）。**正常路径的 CRF 由 `room_handler._PREVIEW_QUALITY_PRESETS` 按预览画质档位给出**（原画 20 / 高清 26 / 标清 30 / 流畅 32），本键只在调用方未传值时兜底。 |
+| `shared_ingest_preview_preset`| `"veryfast"` | 共享进样模式下预览流的编码预设（仅共享进样路径读取；独立模式 `MseStreamer` 固定 `veryfast`）。可选 `ultrafast`/`superfast`/`veryfast`/`faster`/`fast`/`medium` 等。 |
 | `export_max_concurrent` | `2` | 全局导出 FFmpeg 并发上限，合法值仅 `1` 或 `2`。由 `room_handler._export_semaphore` 限流。 |
 | `ocr_accel` | `"dml"` | `"auto"` / `"dml"` / `"cuda"` / `"cpu"`。持续分析 OCR 加速；默认 DirectML（Windows GPU），auto 会探针选最快并缓存。 |
 
@@ -162,6 +165,13 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 *   `parse(self, url: str) -> StreamInfo` - 解析直播间或流链接。
 
 > [!IMPORTANT]
+> **协议成员必须声明为只读 property**（`platform` / `display_name` / `capabilities`）。
+> 把它们写成可变属性（`platform: str`）会让**所有**以 `@property` 实现的适配器都不满足
+> `PlatformAdapter` —— 这条协议于是变成装饰性的：新写一个漏了 `parse()` 的适配器，
+> 静态检查也不会拦（2026-09-18 实测：9 个内置适配器无一满足该协议）。
+> 编译期守卫是 `registry._DEFAULT_ADAPTERS: tuple[PlatformAdapter, ...]` 这行标注，
+> 且 `lsc.platforms.registry` 的 mypy 豁免表里**不含** `assignment`，改回去 CI 即红。
+
 > **无状态约束**：为保证多线程环境下并发解析的安全，所有 PlatformAdapter 实例必须是**无状态**的。`parse()` 方法不得修改实例属性，且不能依赖跨调用共享的可变状态。所有的解析上下文（如 headers、临时 HTTP 响应）必须使用局部变量，并最终填充在 `StreamInfo` 返回。
 
 ### 4.2 缓存与性能控制
@@ -249,9 +259,9 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
                  (抛物线插值实现亚毫秒精度)
 ```
 
-*   **采样规范**：后端互相关算法窗提取各房间音频的 PCM 信号，采样率为 `16000Hz`（Mono，单声道，float32 编码），长度恒定为 **3.0秒** (`AUDIO_DURATION`)。
-*   **⭐ 音频来源（关键澄清）**：实际运行时的音频数据来自**预览流**，而非录制文件。前端通过 Web Audio API（AudioWorklet）从 `<video>` 元素捕获约 **8 秒** 的预览音频（对齐采集窗口），base64 编码后通过 `align_preview_audio` WebSocket 消息发送给后端。后端解码后直接调用 `compute_offset` 计算互相关（当前实现在 `handlers/alignment_handlers.py`，由 `register_room_handlers` 统一装配；`room_handler.py` 内旧版 `handle_align_preview_audio` 会被后注册的 `register_alignment_handlers` 覆盖，永不触发）。
-    *   `audio_aligner.py` 中虽存在 `align_rooms` 函数（支持从录制文件用 FFmpeg 提取音频），但**该函数从未被业务代码调用**（死代码）。
+*   **采样规范**：后端互相关算法读取的 PCM 信号采样率为 `16000Hz`（Mono，单声道，float32 编码）；窗口长度**由调用方决定** —— 运行时是前端采集的约 **8 秒**预览音频。旧文档写的「长度恒定 **3.0秒** (`AUDIO_DURATION`)」属录制文件提取路径的常量，该路径连同常量已于 2026-09-18 删除。
+*   **⭐ 音频来源（关键澄清）**：实际运行时的音频数据来自**预览流**，而非录制文件。前端通过 Web Audio API（AudioWorklet）从 `<video>` 元素捕获约 **8 秒** 的预览音频（对齐采集窗口），base64 编码后通过 `align_preview_audio` WebSocket 消息发送给后端。后端解码后直接调用 `compute_offset` 计算互相关（实现只在 `handlers/alignment_handlers.py:103`。`room_handler.py` 内的旧版 `handle_align_preview_audio` / `set_content_offset` 副本**已彻底删除**（2026-09-18 复核）；旧文档所述"会被后注册的 `register_alignment_handlers` 覆盖、永不触发"这一机制本身也不存在 —— `server.on` 对重复注册直接抛 `ValueError`）。
+    *   从录制文件用 FFmpeg 提取音频的旧路径（`align_rooms` / `extract_audio_pcm`）从未被业务代码调用，**已于 2026-09-18 删除**（连同 `AUDIO_DURATION` / `_SEEK_BUFFER` / `_MAX_EXTRACT_WORKERS` 三个只服务该路径的常量）。
     *   即：对齐算法的输入永远是**预览流的实时音频**，这与"预览流和录制流完全独立"的核心约束一致。
 *   **对齐基准选择**：通过 FFT 互相关计算，以**拉流进度最慢（内容最新、延迟最大）**的房间作为基准房间。
 *   **偏移量补偿公式**：
@@ -288,6 +298,24 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 
 > [!CAUTION]
 > **Ant Design 强样式覆盖**：由于 Ant Design 的 CSS-in-JS 在运行时注入样式的优先级不稳定，全局 `global.css` 中对于 `.ant-card`, `.ant-btn-primary`, `.ant-input`, `.ant-select-selector` 等组件均使用了 `!important` 强制约束主题渲染。在后续优化中，若切换为 Antd `ConfigProvider` token，必须确保在亮暗主题下各组件对比度和边框过渡无断层。
+
+### 6.2 底部时间线的房间绑定（P3-2，2026-09-18）
+
+底部控制栏的时间线**始终绑定到一个具体房间**，不允许「没绑房间」这个状态：旧实现在未勾选任何卡片时
+用 `room = selectedRoom`（undefined）驱动时间线，轴长恒为 `max(contentEnd,1)=1s`，点击/拖动落在这条 1s 空轴上
+什么也不会发生（现场曾被误判为缺陷：远 seek 静默无效）。
+
+*   **绑定优先级**：唯一勾选（`selectedRoomId`）> 多选时的首个勾选房间 > **自动跟随**那一路。
+*   **自动跟随规则**（`utils/timelineCoords.pickAutoBindRoomId`）：候选唯一才绑 —— 优先「录制中的房间」，
+    没有录制房时取「已开预览且已连接」的房间；**多个候选或无候选一律不猜**（返回 null）。
+    猜错房间比空轴更糟：时间线轴、切片色带与 seek 落点会落到用户没在看的那一路。
+*   **必须明示**：自动跟随时控制栏显示「未勾选房间：时间线自动跟随「{name}」，勾选卡片可切换」；
+    无候选可绑时**置灰且不可交互**（`opacity .45 + pointer-events:none`）并提示「勾选任一房间以启用回放轴」。
+*   **seek 与轴同源**：`resolveSeekTargets()` 在无勾选时优先返回自动绑定的房间（插在 `referenceRoomId` 之后、
+    `rooms[0]` 兜底之前），保证「看到的轴」与「跳转的房间」一致。
+*   只影响时间线的显示 / 寻道 / 提示，**不改变标记、切片与导出口径**。
+*   守卫：`tests/test_frontend_stability_guards.py::test_timeline_binds_a_room_when_nothing_is_checked`；夹具
+    `lsc-electron/src/utils/timelineCoords.test.ts`（唯一录制房 / 唯一预览房 / 多路不猜 / 录制优先 / 未连接不算 / 全空）。
 
 ---
 
@@ -354,21 +382,38 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
     且 `electron/main.ts` 的 `shouldSkipRendererConsole(message, level)` 对 `[MsePlayer]` 只过滤 INFO、放行
     WARN/ERROR 进 `debug.log`（旧实现把整个 `[MsePlayer]` 前缀过滤掉，而生产 `debug:false` 下 `_log` 本就是空操作
     ⇒ 这类事故现场零证据）。需要完整追踪时在 devtools 执行 `localStorage.setItem('lsc.mseDebug','1')` 后重开预览。
-*   🔻 **已知遗留**：`enable_preview` 在已推流时只回 `already streaming, init replayed`（不重建 sink），
-    所以前端目前无法强制重启后端预览 sink；若要「播放器自救失败后自动重开后端 sink」，需给 `enable_preview`
-    加 `restart: true`（带退避与次数上限）。另一个未定论项：渲染端媒体时钟为何在长预览后冻结（现场预览滞后从
-    -113s 涨到 -158s/3min，疑似 GPU/CPU 与持续分析争抢导致的追赶失败）—— 新的错误快照与 `[MsePlayer]` 追踪
-    是下一次定位的依据。
-*   守卫：`tests/test_preview_backpressure_watchdog.py`、`lsc-electron/src/services/mediaSourcePlayer.test.ts`。
+*   ✅ **已修（2026-09-18）：播放器自救耗尽后可自动重开后端 sink**。旧实现 `enable_preview` 在已推流时只回
+    `already streaming, init replayed`（不重建 sink），前端没有任何手段强制重启后端预览，用户只能手动关/开预览。
+    现在三层接通：① 后端 `handle_enable_preview` 接受 `restart: true`（`enabled=True` 时才生效）→
+    `_handle_mse_preview(force_restart=True)` 重建 sink 并换 `preview_epoch_id`；② `MsePlayer._trySinkRestart()`
+    在**硬重建预算用尽之后**有界地问一次（文件回看通道不问：没有后端 sink）；③ UI 层
+    `src/utils/previewRecovery.ts` 持**房间级预算**（10 分钟窗口内最多 2 次）决定是否发出 —— 播放器实例会随 epoch
+    重建而重置，只按实例计数会让「重建后再卡死」无限重启后端 FFmpeg。被拒、未接线、或后端重建失败时保持原口径报错
+    （不承诺自动恢复）：此时旧播放器会在下一个卡死 tick 按原文案报错，而重建成功的话新 epoch 会在几秒内重建播放器并
+    自动清掉错误遮罩 —— 即「先如实报错、再自愈」，不做静默挂起。
+*   🔻 **根因仍未定论**：渲染端媒体时钟为何在长预览后冻结（现场预览滞后从 -113s 涨到 -158s/3min，疑似 GPU/CPU 与
+    持续分析争抢导致的追赶失败）。
+*   ✅ **可诊断性已补（2026-09-18）**：旧实现的健康快照**只在 `_handleError` 里构造一次**，而卡死检测与
+    `updateend` 观测全走受 `_debug` 开关压制的 `_log` ⇒ 生产日志只有"死亡瞬间"，没有致死曲线，
+    上一行所谓的"下一次定位依据"当时并不成立。现在 `_warnFrozenProgression()` 在时钟连续冻结时每 5s
+    至多输出一条 `console.warn`（`main.ts` 放行 WARN 进 `debug.log`），带 **累计**冻结时长
+    （`_frozenSinceMs` —— 旧代码每轮把 `_lastStallTime` 归零，所以增长曲线从未被记录过）、
+    `mode=render-frozen|data-starved` 分型与完整健康快照。守卫：`mediaSourcePlayer.test.ts`。
+    ⚠️ 仍缺的是**全局资源准入控制**（见 §7.4）：没有它，日志能证明"争抢"但改不掉。
+*   守卫：`tests/test_preview_backpressure_watchdog.py`、`tests/test_frontend_stability_guards.py`
+    （`test_preview_sink_restart_wired_end_to_end`）、`lsc-electron/src/services/mediaSourcePlayer.test.ts`、
+    `lsc-electron/src/utils/previewRecovery.test.ts`。
 
 ### 7.3 预览流与录制流架构模式
 
 系统支持两种预览/录制架构模式，通过 `LscConfig.shared_ingest_enabled` 配置开关控制：
 
-#### 7.3.1 独立双进程模式（默认，`shared_ingest_enabled=False`）
+#### 7.3.1 独立双进程模式（`shared_ingest_enabled=False`）
 
 > [!NOTE]
-> 默认模式下，预览和录制是两条完全独立的 FFmpeg 进程和独立的直播流连接，互不干扰。
+> ⚠️ **这不是生产的实际形态**：`settings.json` 与 `lsc/config.py:210` 均为 `True`，启动时被
+> `_apply_shared_ingest_from_settings` 覆盖进 `LscConfig`（见 §3.2）。本节描述**关掉共享进样时**的行为，
+> 生产默认走 §7.3.2。独立模式下预览和录制是两条完全独立的 FFmpeg 进程和独立的直播流连接，互不干扰。
 
 ```
 直播 CDN
@@ -403,7 +448,7 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
 *   **录制输出**：`-c copy` 直拷到磁盘文件，保证录制画质无损。
 *   **预览输出**：`libx264` 软件编码，参数由 `shared_ingest_preview_crf`（默认 23）和 `shared_ingest_preview_preset`（默认 `veryfast`）控制。
 *   **进程生命周期**：`start_recording()` 和 `start_preview()` 可独立启动；停止任一 sink 不会关闭仍在使用的上游或另一 sink；`IngestSupervisor` 负责统一恢复。
-*   **错误检测**：`_read_preview_stdout_loop` 通过 `_planned_stop` 标志区分计划内关闭和意外退出，确保预览独享模式下进程死亡也能正确触发 `mse_error` 广播。
+*   **错误检测**：`_read_preview_stdout_loop` 靠 **proc identity 校验**（停止路径先清 `_preview_process` 引用再终止进程）区分计划内关闭和意外退出，确保预览独享模式下进程死亡也能正确触发 `mse_error` 广播。（2026-09-24 更正：文档旧称的 `_planned_stop` 标志在全仓不存在，实际机制是 identity 校验，语义等价。）
 *   **重连优化**：`_attempt_recording_reconnect` 对共享进程走快速路径（直接终止旧进程 + 创建新进程），避免 `stop_recording_sink` → preview-only → dual-output 的双重重启链。
 
 #### 7.3.3 通用约束（两种模式均适用）
@@ -423,6 +468,88 @@ WebSocket 统一绑定在 `localhost`，主端口为 `9876`（`main.py` 显式�
     3.  创建 `MseStreamer` 并调用 `start()`，FFmpeg 启动探测超时 2~8 秒（B站更长）
     4.  FFmpeg 首先输出 init 段（`ftyp+moov`），后端通过 `asyncio.run_coroutine_threadsafe` 异步广播 `mse_init` WebSocket 消息
     5.  后续 media 段（`moof+mdat`）持续以 `mse_segment` 消息推送，帧率约 30fps，每个 Fragment Duration = 1000ms
+
+### 7.4 资源并发预算与全局上界（2026-09-18 审计建档）
+
+系统可同时在跑：最多 12 路录制 + 4 路预览 + 导出 + OCR 抽帧 + 各类 probe。**已存在的显式上界只有这些**：
+
+| 上界 | 值 | 位置 |
+| :--- | :--- | :--- |
+| `MAX_ROOMS` | 12 | `orchestrator.py` 顶部常量（`config.py` 可覆盖），在 `add_room` 强制 |
+| `MAX_CONCURRENT_PREVIEWS` | 4 | `orchestrator.py` 顶部常量，在 `start_preview` 强制（MSE 路径另有 handler 层硬上限） |
+| 录制启动并发 | 2 | `room_handler.py:1205` `asyncio.Semaphore(2)` |
+| 导出并发 | 1 或 2 | `export_handlers.py:39`，跟随 `settings.export_max_concurrent` |
+| 录制盘预检 / 录制中底线 | 8 GiB / 2 GiB | `recording_service.py:770` / `orchestrator.py:71` |
+| MSE 分片解析缓冲 | 512 KiB（溢出阈值 ×2） | `mse_streamer.py:47` |
+| executor 线程 | rec 6 / bridge 8 / ai 2 / probe 4 | `room_handler.py:1196-1203` |
+
+**关键缺口（事实）**：**FFmpeg 进程总数没有任何全局上界**。全仓 33 个 `Popen`/`create_subprocess` 调用点分布在
+15 个文件；单房可同时持有上游 ingest + 录制 sink + 分段写 + 预览 muxer + 瞬时 probe + OCR 抽帧进程。
+上表里的预算**互不乘算、互不记账**；所有信号量的取值都是 1 或 2，即"**串行化某一类操作**"，
+而不是"**给总量封顶**"。probe 亦无全局闸：V2 的 `max_connect_concurrency` 是 per-room（12 房 × 2 = 24 路无协调并发连接）。
+
+**为什么这很重要**：`CLAUDE.md` 已记录三次同形事故 —— §7.2.2（2026-09-15 长预览冻结，:385 点名"持续分析争抢
+导致的追赶失败"）、§11.3（2026-09-01 22:56 全房断流）、§8.6.1（2026-09-11 20:45）。历次应对都是收紧一个
+局部信号量，**代码里不存在中央准入控制器**（`runtime_health.build_room_health` 是 per-room 的，只有
+`room_handler.py:4328/5097` 两个调用点）。§7.2.2 那条"根因仍未定论"最可能就落在这一层。
+
+**约束**：新增任何 FFmpeg 派生点都必须先回答它计入哪个预算；不得再新增一个 `Semaphore(1)` 当作总量控制。
+
+**中央派生闸（2026-09-18 落地）**：`lsc/utils/process_launcher.py` 的
+`spawn_slot(category, timeout_sec, fail_open)` + `note_child` / `forget_child` / `budget_snapshot()`。
+上限可由环境变量覆盖：`LSC_MAX_CONCURRENT_SPAWNS`（默认 2）、`LSC_MAX_LIVE_CHILDREN`（默认 48，只告警不强杀）。
+四条不可破坏的设计边界：
+
+1. **名额只覆盖启动瞬间**：长驻进程 `Popen` 返回后立即记账并释放，否则一个录制进程永久占闸会让 12 房死锁。
+2. **存活超限只 WARNING，不强杀**：杀掉正在录制的进程比争抢更糟。
+3. **`fail_open=True` 用于「拒绝即丢数据」的路径**（录制启动、短命令探测）：等不到名额就 WARNING + 计数后
+   照常放行，**绝不因我们自己的闸丢一场录制**；只有可重试的预览才用硬拒绝。
+4. **fail_open 路径绝不 release 未获取的名额**，否则闸会越放越宽（与 `capture.py:269`
+   「从未成功 acquire 过不得 release」是同一类错误）。已由用例锁住。
+
+当前覆盖面（`budget_snapshot()` 已挂进 `get_system_stats` 与 `low_tick` 系统快照广播）：
+
+| 站点 | 闸 | 形态 |
+| :--- | :--- | :--- |
+| `run_hidden`（短命令统一入口，覆盖 OCR 抽帧 / ffprobe / gpu 探测 / 修复等 6 个模块） | ✅ | fail-open，5s |
+| `MseStreamer`（预览） | ✅ | 硬拒绝；含存活记账与两条 teardown 注销 |
+| `shared_ingest._launch_process`（上游 + 录制/预览 sink + 换源，4 个调用点） | ✅ | **fail-open**，6s（须小于 `orchestrator.call` 的 10s 预算）。硬拒会丢一整场录制（实测落成 `upstream ffmpeg start failed` + `failure=TIMESTAMP_DISCONTINUITY`），按边界 #3 只削峰不否决 |
+| `recorder/capture.py`（独立录制 FFmpeg） | ✅ | fail-open，8s |
+| `exporter/clip.py` | ➖ 不需要 | 已被 `export_handlers._export_semaphore`(1-2) 限住 |
+| `platforms/probe.py` | ➖ 非生产路径 | 属 V2 暗发布（组件默认关）。同类的 `recorder/segmented.py` 已于 2026-09-18 删除：`SegmentedRecorder` 无任何生产 import，生产分段写走 `shared_ingest.build_segmented_recording_command` |
+| `handlers/room_utils.py` | ➖ 无派生点 | 只有 `safe_terminate` 的 `Popen` 类型注解 |
+
+### 7.5 平台降级可观测性与平台自检（2026-09-18）
+
+平台接入层是产品唯一入口，但它过去的失效**只写日志、不进任何聚合出口**：解析器被
+改版打掉、虎牙 SDK 链接改写回退、Cookie 实测失效，用户侧都表现为"房间转圈/预览黑屏"。
+
+| 出口 | 内容 | 位置 |
+| :--- | :--- | :--- |
+| `get_system_stats` / `low_tick` 广播的 `platform_degradation` | `{platform: {kind: count}}`，由 `lsc/platforms/diagnostics.py` 累计 | 构造点唯一：`room_handler._system_stats_extra()`（周期广播与按需查询共用，**不要**再各写一份 dict） |
+| 降级源 1 `parser_stale` | 适配器抛 `KeyError/IndexError/TypeError/AttributeError` ⇒ 结构性失效，与网络故障分开定性（`base.ERROR_PARSER_STALE`） | `registry.parse_stream` 唯一分类点，9 个适配器共用 |
+| 降级源 2 `sdk_query_fallback` | 虎牙直播链接改写未生效 ⇒ 回退到"只推一段 GOP 就 EOF"的网页 token；按原因各告警一次 | `huya._fallback_to_web_token` |
+| 降级源 3 `credential_auth_failure` | **实测**登录态被拒/过期 | 唯一入口 `credentials.invalidate_credentials_on_auth_failure`；两个观测期共用：resolve 期（`resolver`）与 ingest 期（`recovery_policy.mark_failed_candidate`，10 个调用方的收口） |
+
+**凭据的两种状态必须分开表述**：`get_*_cookie_status()` 的 `configured/count/keys` 只读
+文件，回答"用户贴过没有"；`credential_status` / `credential_invalidated_at` /
+`credential_invalidated_reason` 来自运行时观测，回答"这份 Cookie 还算不算数"。
+**贴过 ≠ 有效**。展示层（`Settings/CookieStatusLine`）只在 `configured` 为真时把 INVALID
+显示成"实测已失效"，避免给不需要凭据的平台报假信号。
+
+**平台自检**：`run_platform_self_check {source_url, quality?}` →
+`{success, report}`，复用 `lsc/platforms/acceptance.py` 那套控制面验收
+（resolve → probe → lease）。安全边界是硬约束：`record_dir=""` +
+`recording=False` + `preview=False`（不启 FFmpeg、不落盘，即 acceptance 文档里的
+"CI 可安全执行"档）；跑在 `run_in_executor(None, …)`；同一时刻只允许一个在飞；
+URL 判据由 `room_handler` **注入** `_room_url_shape`，与添加房间同源，不允许自检
+成为绕过校验的第二入口。设置页「平台凭证 Cookie」卡片底部有对应面板。
+
+**停机链的不变量**（`main.stop()`）：放行主线程的 `self._main_stop.set()` 必须在
+`try/finally` 里，任何前置清理步骤（含 `WebSocketServer.close()`、
+`flush_pending_room_saves`）抛什么都不能阻止它 —— 否则主线程停在 `wait()` 上，
+表现就是"退出应用后 python 后端进程残留"。注意 `WebSocketServer.close()` 是**同步**
+方法，不能塞进 `run_coroutine_threadsafe`（会抛 `TypeError`）。
 
 ---
 
@@ -536,15 +663,24 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
 当用户同时对多个房间标记相同事件（如同一精彩片段的多视角），系统通过以下方式实现对齐批量导出：
 
 1.  用户点击工作台"一键对齐"按钮，前端通过 Web Audio API 从各房间的 `<video>` 元素（**预览流**）捕获约 **8 秒** 预览音频，base64 编码后发送 `align_preview_audio` 消息到后端。
-2.  后端 `handle_align_preview_audio` 调用 `audio_aligner.py` 的 `compute_offset` 计算各房间相对于"进度最慢"基准房间的 `content_offset`，返回给前端。
-3.  前端将 `content_offset` 通过 `set_content_offset` 消息回传后端，存入 `room.content_offset` 字段。
+2.  后端 `handle_align_preview_audio` 调用 `audio_aligner.py` 的 `align_audio_map`（内部两两 `compute_offset`）计算各房间相对于"进度最慢"基准房间的 `content_offset`，返回给前端。**出口做 `max(0.0, raw - slowest)` 归一，因此返回的 offsets 恒 ≥ 0，最慢房间为 0** —— 这条跨语言约定是前端"要不要动播放头"判断的依据。
+3.  前端将 `content_offset` 通过 `set_content_offset` 消息回传后端，存入 `room.content_offset` 字段；同时把偏移落到预览播放头，**唯一入口是 `lsc-electron/src/utils/previewAlignment.ts` 的 `applyAlignmentSeek(video, offset)`**（`|offset| < 0.05` 判为已对齐不动播放头；否则 `currentTime - offset` 夹在已缓冲区间内；用例 `previewAlignment.test.ts`）。禁止在组件里再内联一份 seek —— 内联版本曾长期是"跑不到任何测试"的死区。
 4.  导出时，每个房间使用各自的 `content_offset` 调整导出入/出点（通过墙钟映射公式 + FFmpeg `-ss` 参数），使导出的多路视频在画面内容层面完全对齐。
 5.  所有房间并行提交导出任务，受全局导出 semaphore（§5.2）限制自动排队。
 
 > [!NOTE]
-> 对齐算法的音频输入**始终来自预览流**（前端 `<video>`），而非录制文件。`audio_aligner.py` 中的 `align_rooms` 函数（支持从录制文件提取音频）从未被业务代码调用。这与"预览流和录制流完全独立"的核心约束一致。
+> 对齐算法的音频输入**始终来自预览流**（前端 `<video>`），而非录制文件。从录制文件提取音频的旧路径（`align_rooms` / `extract_audio_pcm`）从未被业务代码调用，已于 2026-09-18 删除。这与"预览流和录制流完全独立"的核心约束一致。
+
+> [!NOTE]
+> **预览的对齐精度 = 一次 seek 的落地精度**（浏览器会吸附到可解码点，误差几十到几百毫秒）。
+> 旧文档所列的"seek 后量残余差、用 `playbackRate ±5%` 平滑追赶"（`applyOffsetWithDriftCorrection`）
+> 自写入起从未被调用，2026-09-18 已连同其 `WeakMap` 定时器删除。**导出不受影响**：导出补偿用的是
+> `room.content_offset` 数值，不经过播放头。若将来要补残余差，接在 `applyAlignmentSeek` 之后，
+> 且必须先有多房间真机验证（速率微调观感、与 §7.2.2 停滞强扫的相互作用）。
 
 ### 8.6 持续分析（多房间同步）
+
+*   **模式能力约束（2026-09-18 收口，债务报告 §11.18-D）**：粗扫分支只覆盖 `game='valorant' + mode='valorant_round'`，且 `GenericAnalyzerPlugin` 声明 `realtime_continuous=False`（它只有 `analyze_file` 的录制后路径）。因此 `start_continuous_analysis` **启动侧有能力闸**：其它组合直接返回 `{'success': False, 'error': '当前只有「无畏契约 · 回合」模式支持直播中持续分析…'}`。修前它会照常启动循环，每轮落到恒返回 `[]` 的废弃兼容包装 —— UI 进度在走、日志每轮 WARN、结果永远 0 条。用例：`tests/test_continuous_analysis_capability_gate.py`。给新 analyzer 加持续分析时必须同时把 `_do_scan` 的分支与 `realtime_continuous` 打开。**遗留（产品决定）**：前端「通用」档在持续分析入口仍可选，只是会被后端拒绝并提示；要在 UI 上禁用该选项需产品确认。
 
 *   **只分析主房录制文件**；副房通过 `_map_highlight_to_room`（`recording_start_mono` + `content_offset` 差值）映射后 `clip_queued`。
 *   **分析导出 Modal**：打开期间 `continuousTargetRoomIds` **持续跟随当前多选/单选**（`selectedRoomIds` 变化即重写，守卫测试 `test_continuous_modal_syncs_target_rooms_while_open` 固化该契约；旧「打开时快照冻结」语义已废弃）。主房 Radio 与确认启动时的 `target_room_ids` **必须同源**（一律用 `continuousTargetRooms` / `continuousTargetRoomIds`），禁止在 `selectedRoomList` 与该列表间切换导致「只能选一间 / 只分析一间」。
@@ -599,7 +735,7 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
     *   **审计结果永不丢失（2026-09-08）**：后台审计批超预算（`_BCAST_REFINE_KEEP_MAX_SEC`）
         中止、被粗扫抢占或抽帧异常时，已定稿回合必须随 `_publish_refine_results` 发布，
         不得随 executor 线程丢弃（实测：120s 预算中止整批 `vision_confirmed` 丢失，列表
-        永久停在 `pending_lookahead`）；`refine_abort` 只中止未完成部分。发布时 
+        永久停在 `pending_lookahead`）；`refine_abort` 只中止未完成部分。发布时
         `current_dur` 以 `max(_dur, recorded_duration)` 兜底，防止主循环游标回退重扫。
     *   **在线审计存活性（2026-09-11）**：超长候选（>150s）分裂后**一轮只推进一个子块**
         （`max_media_step_sec` 非空时其余子块以 `pending` 交回队列）；分裂块门禁预取窗口
@@ -773,9 +909,12 @@ export_end   = mark_out_wallclock - recording_start_mono - content_offset
       用 `Fmp4BoxSplitter` 切成 init/media 段后直喂 `MsePlayer`。**不启动任何 FFmpeg**，
       无 review 会话/epoch/窗口/并发名额 ⇒ 不存在驱逐、EOF 常驻进程与"回不去"的残留状态。
     *   数据源：`dvr_output_path`（`.dvr.mp4` 镜像）优先，缺失时回退 `record_output_path`。
-      **⚠️ 实测现状（2026-09-11）**：镜像只在 legacy `lsc/recorder/capture.py` 路径实现，
-      当前 V2 录制走 `lsc/core/services/shared_ingest.py`（无镜像输出）⇒ `dvr_output_path` 恒为空串，
-      回看源实际**永远是 `record_output_path`**。这仍然可用：V2 主录制本身就是
+      **⚠️ 实测现状（2026-09-18 更正）**：旧表述"`dvr_output_path` 恒为空串"**不成立** ——
+      `lsc/recorder/capture.py:333-359` 在 `dvr_mirror_enabled`（`lsc/config.py:213 = True`）时会预检可写并
+      追加 `.dvr.mp4` 镜像，`orchestrator.py:2615` 经 `_present_dvr_mirror`（:2889，磁盘存在才返回）读回，
+      定稿改名在 :2922/2930 同步。但**共享进样路径（`shared_ingest.py`）不产出镜像**，而生产默认正是共享进样
+      （§3.2）⇒ 本机 `dvr_output_path` 通常为空、回看实际读 `record_output_path`；非共享路径下可以非空。
+      守卫：`tests/test_dvr_mirror_and_review_removal.py`。这仍然可用：V2 主录制本身就是
       `frag_keyframe+empty_moov+default_base_moof`（moov 一次写定、边录边可解析），
       与镜像格式一致。改 V2 主输出的 `-movflags` 前必须重新评估回看与 OCR 抽帧。
     *   白名单：主进程启动读 `settings.json.output_dir`；全新环境无该文件时，前端用**后端下发的
@@ -1029,13 +1168,9 @@ Electron 应用使用 `electron-builder` 进行打包：
       ? path.join(process.resourcesPath, 'python-backend')
       : path.join(__dirname, '../../../python-backend');
     ```
-*   HTML 入口加载判定：
+*   HTML 入口加载判定（2026-09-24 更正：实际实现**不分支** isPackaged，两条路径都解析到同一个 `__dirname/../../dist/index.html`；打包后 `__dirname` 已在 app.asar 内，与旧文档的 `resourcesPath/app.asar/...` 写法等价但只有一处事实源）：
     ```typescript
-    if (isPackaged) {
-      mainWindow.loadFile(path.join(process.resourcesPath, 'app.asar', 'dist', 'index.html'));
-    } else {
-      mainWindow.loadFile(path.join(__dirname, '../../dist/index.html'));
-    }
+    mainWindow.loadFile(path.join(__dirname, '../../dist/index.html'));
     ```
 
 #### 10.3.2 依赖安装后下载机制（运行时下载）
@@ -1084,11 +1219,11 @@ Electron 应用使用 `electron-builder` 进行打包：
 *   **Qt 消息重定向**：~~`qInstallMessageHandler`~~ —— 系统已全面迁离 PySide6（python-backend 无 Qt 导入），该条不再适用。
 *   **日志轮转机制**：日志文件大小限制为 **2MB**，最大备份数为 **5个**，采用 `RotatingFileHandler` 滚动覆盖（另带 gzip 压缩），确保不会因长期挂机导致磁盘爆满。
 *   **优雅停机保护**（2026-08 子系统审查核实：`stop.signal` 信号文件机制已不存在，以下为当前实际实现）：
-    *   **父进程存活 watchdog**：Electron 以 `LSC_PARENT_PID` 环境变量注入后端；`main.py` 主循环轮询父进程存活，父进程退出即触发 `stop()`（flush rooms.json 未落盘写入 + 正常停 FFmpeg）。Electron 侧 `killBackendAndWait` 轮询等待（≤4s）后再用进程树强杀兜底，防止 FFmpeg 僵尸进程残留挂载占用端口。
+    *   **父进程存活 watchdog**：Electron 以 `LSC_PARENT_PID` 环境变量注入后端；`main.py` 主循环轮询父进程存活，父进程退出即触发 `stop()`（flush rooms.json 未落盘写入 + 正常停 FFmpeg）。Electron 侧 `killBackendAndWait` 优雅退出等待 **5s**、`restart-backend` 路径 **8s**（2026-09-24 更正：旧文档的"≤4s"已不符）；Windows 上**先** `taskkill /T /F` 再轮询等待（比"先等再强杀"更稳，但顺序与旧文档相反）。
     *   POSIX 环境下先发 `SIGTERM`，如果 3 秒内未退出再调度 `SIGKILL`，采用非阻塞的轮询检测，防止同步忙等待阻塞 Electron UI 主线程。
     *   导出取消/录制停止等强杀 FFmpeg 的统一入口为 `lsc/utils/process_launcher.py: kill_process_tree()`（Windows `taskkill /T /F`；POSIX `SIGTERM → 3s → SIGKILL`），禁止直接 `proc.kill()`。
 *   **WS 慢客户端剔除契约**（2026-09-01 22:56 全房断流事故后收紧）：`server.py` 广播单次 send 超时（2s）**只记录变慢起点，禁止踢人**；持续慢超过 **15s** 才剔除，发送成功即清除标记，硬异常（连接已关）立即剔除。渲染进程单次卡顿（React 大快照重渲染/GC）曾致唯一客户端被 1s 超时踢出 → 全部房间预览同时停滞且恢复失败。
-*   **主动重连落地段禁止占用编排线程**：`_do_proactive_reconnect`（URL 过期主动刷新）的重启段（URL 刷新 + FFmpeg 首帧探测，可达 10-30s）必须投递 `self._worker_pool` 并以 `_run_in_background=True` 执行，与常规重连线程路径一致；编排线程内联执行会冻结全部 `orchestrator.call`（含预览恢复）直至 10s 超时。
+*   **主动重连整链禁止占用编排线程**：`_do_proactive_reconnect`（URL 过期主动刷新）的**停止段 + 重启段**（停止旧进样 ≈16s、URL 刷新 + FFmpeg 首帧探测可达 10-30s）必须整体投递 `self._worker_pool` 并内部以 `_run_in_background=True` 执行，与常规重连线程路径一致；编排线程内联执行会冻结全部 `orchestrator.call`（含预览恢复）直至 10s 超时。2026-09-24 修复：此前停止段是内联的（最坏 ~16s 冻结）。V2 监督恢复的 `recover` 回调同样传 `_background=True`（`run_recovery` 在调用方线程同步执行回调）。
 *   **subprocess 文本模式强制 UTF-8**：`hidden_run_kwargs` 对 text 模式自动注入 `encoding="utf-8", errors="replace"`；绕过该 helper 的 `subprocess.run(text=True)` 调用必须显式传 encoding，否则中文 Windows GBK locale 下 `_readerthread` 抛 `UnicodeDecodeError` 且 `communicate()` 拿不到输出。
 
 ### 11.4 错误处理与异常捕获规范
@@ -1155,16 +1290,19 @@ Electron 应用使用 `electron-builder` 进行打包：
 
 | 符号 / 位置 | 状态 | 说明 |
 | :--- | :--- | :--- |
-| `audio_aligner.py: align_rooms` | 死代码 | 从录制文件提音频的路径，业务全走预览流 `align_audio_map`（见 §5.3）。 |
-| `core/services/mse_sender.py: MseSender` | 仅测试引用 | 生产 MSE 走二进制帧（`python-backend/mse_ws_frames.py` + `broadcast_bytes`）。 |
-| `core/services/export_service.py: ExportService` | 仅测试引用 | 真实导出统一走 `export_handlers` 的 asyncio 全局队列。 |
-| `utils/cancellable_ffmpeg.py: CancellableFFmpeg` | 仅测试引用 | 产品导出仍用裸 `subprocess.Popen` + 自绘 watchdog。 |
-| `utils/error_stats.py: ErrorStats` | 无业务调用 | 错误统计预留模块，仅测试引用。 |
+| ~~`audio_aligner.py: align_rooms`~~ | ✅ **已删除（2026-09-18）** | 从录制文件提音频的路径，业务全走预览流 `align_audio_map`（见 §5.3）。连同 `extract_audio_pcm`、`_is_network_source` 与三个专属常量一并移除，测试同步删除 6 条。 |
+| ~~`core/services/mse_sender.py: MseSender`~~ | ✅ **已删除（2026-09-18）** | 96 行。生产 MSE 走二进制帧（`python-backend/mse_ws_frames.py` + `broadcast_bytes`），该类只被自己的测试引用。 |
+| ~~`core/services/export_service.py: ExportService`~~ | ✅ **已删除（2026-09-18）** | 449 行。真实导出统一走 `export_handlers` 的 asyncio 全局队列。同批把 `lsc/core/__init__.py` 收敛为纯包声明（它 re-export 的 8 个名字全仓 `from lsc.core import X` 命中数为 0）。 |
+| ~~`utils/cancellable_ffmpeg.py: CancellableFFmpeg`~~ | ✅ **已删除（2026-09-18）** | 93 行。产品导出仍用裸 `subprocess.Popen` + 自绘 watchdog。**同文件的 `FFmpegCancelled` 是活异常类型**（`frame_provider.py` / `valorant_broadcast.py` / `valorant_ocr_rounds.py` 均在抛），模块保留。 |
+| ~~`utils/error_stats.py: ErrorStats`~~ | ✅ **已删除（2026-09-18）** | 106 行预留模块，零业务调用。 |
+| ~~`core/services/frame_capture.py`~~ | ✅ **已删除（2026-09-18）** | 262 行，**原清单未收录**：`FrameCaptureWorker` 生产零 import，仅 `test_resource_caps.py` 一条用例引用。 |
+| ~~`analyzer/valorant_observer_scoreboard.py`~~ | ✅ **已删除（2026-09-18）** | 224 行，**原清单未收录**：生产零 import，仅自身测试文件引用。 |
+| ~~`analyzer/sound_detector.py`~~ | ✅ **已删除（2026-09-18）** | 299 行。生产零引用；唯一"引用"是 `test_continuous_analysis_guards.py` 里一条把它当文本读的用例 + 一条直接测其私有函数的用例，两条一并删除。 |
+| `analyzer/generic_plugin.py: scan_window` | 恒返回空 | 只更新扫描游标，持续分析主路径不再使用。⚠️ 原清单把 `scene_analysis` 与 `sound_detector` 并列为"遗留分支（约 900 行）"，**其中 `scene_analysis` 的判断是错的**：它有 14 处生产引用（`generic_plugin.py:32` 与 `room_handler.py:1428/3807/3811` 的兼容包装），**不得删除**（实测覆盖率仅 6%，是覆盖问题不是死活问题）。 |
 | ~~`room_handler.py` 的 `start_continuous_analysis` / `stop_continuous_analysis` 等 8 个覆盖死 handler~~ | **条目已失效（2026-09-05 核实）** | `server.on()` 现对重复注册抛 `ValueError`（server.py:102-108），覆盖注册在语义上已不可能；相关 handler 已全部迁至子模块（analysis/alignment/recording/export/timeline/jianying_handlers），room_handler 内 41 个 `@server.on` 无重复。 |
-| `analyzer/generic_plugin.py: scan_window` | 恒返回空 | 只更新扫描游标，持续分析主路径不再使用；`scene_analysis` / `sound_detector` 为遗留分支（约 900 行）。 |
-| `export_handlers._deferred_export_jobs` | **条目已失效** | 队列现位于 `room_handler.py`（`_deferred_export_jobs`），有活的生产者与消费者 `_flush_deferred_exports`（逐项容错：单项异常上报失败并回滚去重标记，不丢剩余任务）。 |
+| `export_handlers._deferred_export_jobs` | **条目已失效** | 队列现位于 `room_handler.py`（`_deferred_export_jobs`），有活的生产者与消费者 `_flush_deferred_exports`（逐项容错：单项异常上报失败并回滚去重标记，不丢剩余任务）。2026-09-18 复核：:556 定义、:7517 入队、:7590/:7598 消费、:7636 回队，**确为活代码**。 |
 
-**另注（文档≠代码，均已在上文相关章节标注）**：`stop.signal` 优雅停机机制不存在（实为 `LSC_PARENT_PID` watchdog，§11.3）；`PYTHONPATH` 已移出环境白名单（§11.2）；`output_dir` 默认值两处不一致（§3.2）；WS 端口 `9876`（main.py）与类默认 `19876`（server.py）不一致（§2.2）。
+**另注（文档≠代码，均已在上文相关章节标注）**：`stop.signal` 优雅停机机制不存在（实为 `LSC_PARENT_PID` watchdog，§11.3）；`PYTHONPATH` 已移出环境白名单（§11.2）；`output_dir` 默认值已全仓统一为 `~/LSC/output`（8 处默认实测一致，`~/LSC/recordings` 仅存在于过期文档自述）；WS 端口除 `9876`（main.py）/ `19876`（server.py 类默认）外还有**第三个引导入口** `python-backend/start.py`（§2.2）。
 
 ---
 
@@ -1210,18 +1348,31 @@ pytest -v
 # 检查特定模块覆盖率
 pytest -v --cov=lsc --cov-report=term
 
-# Ruff 代码静态检查
-ruff check lsc/
+# Ruff 代码静态检查（口径 = CI 阻塞项，全仓，不是只 lsc/）
+ruff check .
 
-# Mypy 静态类型校验
-mypy lsc/
+# Mypy 静态类型校验（口径 = CI 阻塞项，覆盖 lsc + python-backend 共 105 文件）
+mypy --show-error-codes
 ```
 
-### 13.2 前端类型与打包检查
+> 本地跑这两条与 CI 必须同版本：`ruff==0.15.16`、`mypy==2.1.0`（三处钉死：
+> `ci.yml`、`.pre-commit-config.yaml`、本地）。mypy 的存量债务以
+> `pyproject.toml` 的"模块 × 错误码"棘轮豁免，**新代码不在豁免名单内**；
+> 清完一种就把该码从豁免里删掉。
+
+### 13.2 前端类型与测试检查
 ```bash
-# 静态类型非编译校验
+# 静态类型非编译校验（两个工程都要过）
 npx tsc --noEmit
+npx tsc --noEmit --project tsconfig.electron.json
+
+# 前端单测 + 守卫（CI 的 frontend-tests job 跑的就是这条，ubuntu/windows 双矩阵）
+npm test
 ```
+
+> `src/i18n/coverage.test.ts` 是硬约束：源码里每个中文 `t('…')` 文案都必须在
+> `en.part.*.ts` 里有键，否则英文界面会漏出中文。**新增文案必须同时补词典**，
+> 这条以前只在本地跑、CI 从不执行。
 
 ### 13.3 本地调试与日志定位
 *   **前端渲染进程控制台**：`Ctrl + Shift + I` 唤出 Chrome DevTools。
