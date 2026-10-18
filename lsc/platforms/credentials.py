@@ -15,7 +15,9 @@ from .cookie_helper import (
     get_douyin_cookies,
     get_huya_cookies,
 )
-from .redaction import redact_headers
+from .diagnostics import note_degradation
+from .failure import FailureKind, normalize_failure_kind
+from .redaction import redact_headers, redact_text
 
 _log = logging.getLogger(__name__)
 
@@ -150,7 +152,10 @@ class LegacyCredentialProvider:
     }
 
     def __init__(self) -> None:
-        self._invalidated: set[tuple[str, str]] = set()
+        # key -> (失效时刻 epoch_sec, 原因)。此前是 set[tuple]，`invalidate()`
+        # 把传进来的 `reason` 直接 `del` 掉 —— 于是"凭据实测失效"这件事既查不到
+        # 原因也查不到时间，Settings 只能显示"配置了/没配置"。
+        self._invalidated: dict[tuple[str, str], tuple[float, str]] = {}
         self._state_lock = threading.RLock()
 
     @classmethod
@@ -233,8 +238,9 @@ class LegacyCredentialProvider:
         account_ref: str = "default",
     ) -> CredentialContext:
         with self._state_lock:
-            self._invalidated.discard(
-                (str(platform or "").lower(), str(account_ref or "default"))
+            self._invalidated.pop(
+                (str(platform or "").lower(), str(account_ref or "default")),
+                None,
             )
         return self.get_context(platform, account_ref, "RESOLVE")
 
@@ -244,11 +250,23 @@ class LegacyCredentialProvider:
         account_ref: str = "default",
         reason: str = "",
     ) -> None:
-        del reason
+        key = (str(platform or "").lower(), str(account_ref or "default"))
         with self._state_lock:
-            self._invalidated.add(
-                (str(platform or "").lower(), str(account_ref or "default"))
-            )
+            self._invalidated[key] = (time.time(), str(reason or ""))
+
+    def invalidation_info(
+        self,
+        platform: str,
+        account_ref: str = "default",
+    ) -> dict[str, Any]:
+        """实测失效的时间与原因；未被标记失效时返回空 dict。"""
+        key = (str(platform or "").lower(), str(account_ref or "default"))
+        with self._state_lock:
+            entry = self._invalidated.get(key)
+        if entry is None:
+            return {}
+        at, reason = entry
+        return {"invalidated_at": at, "invalidated_reason": reason}
 
     @staticmethod
     def redact(value: object) -> str:
@@ -259,6 +277,63 @@ class LegacyCredentialProvider:
 
 _default_provider: LegacyCredentialProvider | None = None
 _default_provider_lock = threading.Lock()
+
+
+def invalidate_credentials_on_auth_failure(
+    provider: CredentialProvider | None,
+    platform: str,
+    account_ref: str,
+    failure_kind: object,
+    *,
+    reason: str = "",
+) -> bool:
+    """把一次"实测被拒/已过期"落到凭据状态与降级计数上。**唯一入口**。
+
+    两条观测路径共用它：resolve 期（`resolver` 探测/选择线路）与
+    ingest 期（`recovery_policy.mark_failed_candidate`，10 个调用方）。此前这条
+    判据只存在于 resolver 里，录制中途才暴露的登录失效就没人标记 —— 表现是
+    Settings 里 Cookie 永远显示"已配置"，用户不知道该重贴。
+
+    只认 AUTH_REQUIRED / AUTH_EXPIRED：CDN 403 与签名过期描述的是那条 URL，
+    不是账号。provider 缺 invalidate 时静默跳过（兼容小型/第三方实现）。
+    返回是否真的做了标记。
+    """
+    kind: FailureKind
+    try:
+        kind = normalize_failure_kind(failure_kind)
+    except Exception:
+        return False
+    if kind not in {FailureKind.AUTH_REQUIRED, FailureKind.AUTH_EXPIRED}:
+        return False
+    # 刻意不按 capabilities.credential_kinds 预先拦一刀：`test_platform_probe_and_resolver`
+    # 三条用例锁定的既有契约就是"resolve 期看到 AUTH_* 就标记该平台该账号"，
+    # 与平台是否声明需要凭据无关（direct 平台同样会被登录墙挡）。
+    # "是否需要向用户提示"属于展示层判断，见 Settings 的 CookieStatusLine：
+    # 只有在**确实配过**Cookie 时才把 INVALID 显示成"实测已失效"。
+    invalidate = getattr(provider, "invalidate", None)
+    detail = redact_text(str(reason or kind.value))
+    marked = False
+    if callable(invalidate):
+        try:
+            invalidate(str(platform or ""), account_ref=account_ref, reason=detail)
+            marked = True
+        except Exception as exc:
+            # Credential invalidation must never mask the structured media error.
+            # The provider owns its own redaction boundary; avoid logging inputs.
+            _log.warning(
+                "credential invalidation failed platform=%s kind=%s: %s",
+                platform,
+                kind.value,
+                redact_text(exc),
+            )
+    if note_degradation(str(platform or ""), "credential_auth_failure", reason=kind.value):
+        _log.warning(
+            "platform_degradation: %s 凭据实测失效（%s），需要用户重新粘贴有效登录态；"
+            "同类失效后续只累计计数。",
+            platform,
+            kind.value,
+        )
+    return marked
 
 
 def get_default_credential_provider() -> LegacyCredentialProvider:

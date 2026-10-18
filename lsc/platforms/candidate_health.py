@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import Any
 
 from .models import ProbeResult, StreamCandidate
 
@@ -32,7 +33,9 @@ class CandidateHealthSnapshot:
 
 
 def _safe_profile(network_context: Mapping[str, object] | None) -> str:
-    context = dict(network_context or {})
+    # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+    # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+    context: dict[str, Any] = dict(network_context or {})
     return str(
         context.get("profile")
         or context.get("proxy_url")

@@ -10,6 +10,8 @@ from types import ModuleType
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
+from lsc.utils.coerce import try_float
+
 from .base import (
     DEFAULT_USER_AGENT,
     ERROR_OFFLINE,
@@ -197,7 +199,9 @@ class DouyinAdapter(BasePlatformAdapter):
     ) -> str:
         """通过用户sec_uid获取直播间ID。"""
         from urllib.error import HTTPError, URLError
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")
@@ -214,7 +218,7 @@ class DouyinAdapter(BasePlatformAdapter):
                 f"&browser_name=Chrome&browser_version=120.0.0.0&sec_uid={sec_uid}"
             )
 
-            request_kwargs: dict[str, object] = {
+            request_kwargs: dict[str, Any] = {
                 "headers": self._headers_with_cookies(cookies),
             }
             if context:
@@ -253,8 +257,10 @@ class DouyinAdapter(BasePlatformAdapter):
         """从用户页面HTML中提取直播间ID。"""
         url = f"https://www.douyin.com/user/{sec_uid}"
         try:
-            context = dict(network_context or {})
-            request_kwargs: dict[str, object] = {
+            # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+            # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+            context: dict[str, Any] = dict(network_context or {})
+            request_kwargs: dict[str, Any] = {
                 "headers": self._headers_with_cookies(cookies),
             }
             if context:
@@ -309,7 +315,9 @@ class DouyinAdapter(BasePlatformAdapter):
                     ERROR_RESTRICTED,
                 )
             module = self._load_script_module()
-            context = dict(network_context or {})
+            # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+            # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+            context: dict[str, Any] = dict(network_context or {})
             if context:
                 proxy_url = str(
                     context.get("proxy_url")
@@ -482,10 +490,10 @@ class DouyinAdapter(BasePlatformAdapter):
     def _context_timeout(context: Mapping[str, object], *, default: int) -> int:
         """Return a bounded adapter timeout without leaking untrusted values."""
         raw = context.get("timeout_sec", context.get("read_timeout_sec", default))
-        try:
-            return max(1, min(300, int(float(raw))))
-        except (TypeError, ValueError):
+        parsed = try_float(raw)
+        if parsed is None:
             return default
+        return max(1, min(300, int(parsed)))
 
     def _failed(
         self,

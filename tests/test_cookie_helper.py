@@ -122,7 +122,9 @@ def test_save_bilibili_cookies_from_text_writes_file(tmp_path, monkeypatch):
     )
     assert status["configured"] is True
     assert status["count"] == 2
-    saved = json.loads((tmp_path / ".lsc" / "cookies" / "bilibili.json").read_text(encoding="utf-8"))
+    saved_path = tmp_path / ".lsc" / "cookies" / "bilibili.json"
+    assert saved_path.is_file()
+    saved = cookie_helper.load_cookies_from_file(str(saved_path))
     assert saved["SESSDATA"] == "s1"
 
 
@@ -174,7 +176,7 @@ def test_save_huya_cookies_from_text_writes_file(tmp_path, monkeypatch):
     )
     assert status["configured"] is True
     assert status["count"] == 2
-    saved = json.loads((tmp_path / ".lsc" / "cookies" / "huya.json").read_text(encoding="utf-8"))
+    saved = cookie_helper.load_cookies_from_file(str(tmp_path / ".lsc" / "cookies" / "huya.json"))
     assert saved["udb_uid"] == "1"
 
 

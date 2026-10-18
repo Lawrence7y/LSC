@@ -5,9 +5,14 @@ import logging
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - 只为类型检查，本模块不在运行时用这个类型
+    from .base import PlatformAdapter
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
+
+from lsc.utils.coerce import safe_float
 
 from .candidate_health import CandidateHealthStore, get_default_candidate_health_store
 from .capabilities import get_platform_capabilities, uses_ingest_probe
@@ -16,6 +21,7 @@ from .credentials import (
     CredentialProvider,
     CredentialStatus,
     get_default_credential_provider,
+    invalidate_credentials_on_auth_failure,
 )
 from .failure import (
     FailureKind,
@@ -181,10 +187,7 @@ def _candidate_from_url(
     if not safe:
         return None
     default_confidence = 0.3 if platform == "generic" else 0.65
-    try:
-        confidence = float(raw.get("confidence", default_confidence) or default_confidence)
-    except (TypeError, ValueError):
-        confidence = 0.5
+    confidence = safe_float(raw.get("confidence", default_confidence) or default_confidence, 0.5)
     parsed = urlparse(url)
     path = (parsed.path or "").lower()
     protocol = str(raw.get("protocol") or raw.get("format") or "").lower()
@@ -326,7 +329,7 @@ def _candidates_from_stream_info(info: Any) -> tuple[StreamCandidate, ...]:
 
 def _parse_with_credential_context(
     source_url: str,
-    adapters: Iterable[object] | None,
+    adapters: Iterable[PlatformAdapter] | None,
     context: CredentialContext,
     force_refresh: bool,
 ) -> Any:
@@ -369,49 +372,10 @@ def _merge_credential_headers(info: Any, context: CredentialContext) -> Any:
     return info
 
 
-def _invalidate_credentials_on_auth_failure(
-    provider: CredentialProvider | None,
-    platform: str,
-    account_ref: str,
-    failure_kind: FailureKind,
-    *,
-    reason: str = "",
-) -> None:
-    """Invalidate only credentials proven to be rejected or expired.
-
-    CDN 403/signature failures are deliberately excluded: those describe the
-    selected media URL, not necessarily the account cookie.  Providers are
-    optional for compatibility with small test/third-party implementations.
-    """
-    if failure_kind not in {
-        FailureKind.AUTH_REQUIRED,
-        FailureKind.AUTH_EXPIRED,
-    }:
-        return
-    invalidate = getattr(provider, "invalidate", None)
-    if not callable(invalidate):
-        return
-    try:
-        invalidate(
-            platform,
-            account_ref=account_ref,
-            reason=redact_text(reason or failure_kind.value),
-        )
-    except Exception as exc:
-        # Credential invalidation must never mask the structured media error.
-        # The provider owns its own redaction boundary; avoid logging inputs.
-        _log.warning(
-            "credential invalidation failed platform=%s kind=%s: %s",
-            platform,
-            failure_kind.value,
-            redact_text(exc),
-        )
-
-
 def resolve_stream_v2(
     request: ResolveRequest | str,
     *,
-    adapters: Iterable[object] | None = None,
+    adapters: Iterable[PlatformAdapter] | None = None,
     credential_provider: CredentialProvider | None = None,
 ) -> ResolveResult:
     """Resolve any registered platform into a V2 candidate set.
@@ -544,7 +508,7 @@ def resolve_stream_v2(
             redact_url(source_url),
             safe_error,
         )
-        _invalidate_credentials_on_auth_failure(
+        invalidate_credentials_on_auth_failure(
             provider,
             platform,
             request.account_ref,
@@ -616,7 +580,7 @@ def resolve_stream_v2(
     )
     error = _error_from_stream_info(info)
     if error is not None and error.refresh_credentials:
-        _invalidate_credentials_on_auth_failure(
+        invalidate_credentials_on_auth_failure(
             provider,
             resolved_platform,
             request.account_ref,
@@ -668,7 +632,7 @@ def resolve_candidates(
     source_url: str,
     *,
     force_refresh: bool = False,
-    adapters: Iterable[object] | None = None,
+    adapters: Iterable[PlatformAdapter] | None = None,
     credential_provider: CredentialProvider | None = None,
 ) -> ResolveResult:
     return resolve_stream_v2(
@@ -775,13 +739,15 @@ def select_stream_lease(
         return None
     provider = credential_provider or get_default_credential_provider()
     for probe in probe_results.values():
+        # 上一行用 getattr 容忍缺字段，这里就不能直接点属性——同一个对象不能
+        # 一半容错一半不容错，否则 None/简版 ProbeResult 会在这条循环里炸。
         kind = normalize_failure_kind(getattr(probe, "failure_kind", ""))
-        _invalidate_credentials_on_auth_failure(
+        invalidate_credentials_on_auth_failure(
             provider,
             result.platform,
             account_ref,
             kind,
-            reason=probe.failure_detail,
+            reason=str(getattr(probe, "failure_detail", "") or ""),
         )
     candidate = select_best_candidate(
         result.candidates,
@@ -804,20 +770,23 @@ def select_stream_lease(
     if lease_manager.is_expired(lease, now=lease_now):
         lease_manager.drop(lease.lease_id)
         return None
-    probe = probe_results.get(candidate.candidate_id)
-    if probe is not None:
+    # 换个名字：`probe` 上面已经是 `for probe in probe_results.values()` 的循环变量
+    # （非空 ProbeResult），同名再赋一个可空的 .get() 结果会让静态检查把两者当
+    # 同一个类型，也会让读者以为下面读的是循环里那一个。
+    chosen_probe = probe_results.get(candidate.candidate_id)
+    if chosen_probe is not None:
         lease.probe_summary = {
-            "first_packet_ms": probe.first_packet_ms,
-            "probe_duration_ms": probe.probe_duration_ms,
-            "protocol": probe.protocol,
-            "container": probe.container,
-            "has_video": probe.has_video,
-            "has_audio": probe.has_audio,
-            "timestamp_ok": probe.timestamp_ok,
-            "redirect_count": probe.redirect_count,
-            "retry_after_seconds": probe.retry_after_seconds,
-            "server_id": probe.server_id,
-            "cdn_id": probe.cdn_id,
+            "first_packet_ms": chosen_probe.first_packet_ms,
+            "probe_duration_ms": chosen_probe.probe_duration_ms,
+            "protocol": chosen_probe.protocol,
+            "container": chosen_probe.container,
+            "has_video": chosen_probe.has_video,
+            "has_audio": chosen_probe.has_audio,
+            "timestamp_ok": chosen_probe.timestamp_ok,
+            "redirect_count": chosen_probe.redirect_count,
+            "retry_after_seconds": chosen_probe.retry_after_seconds,
+            "server_id": chosen_probe.server_id,
+            "cdn_id": chosen_probe.cdn_id,
         }
     return lease
 

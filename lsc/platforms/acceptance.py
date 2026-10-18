@@ -516,9 +516,9 @@ def _run_lifecycle(
         initial_health = supervisor.health()
 
         def recover_startup(
-            health: Mapping[str, object],
+            health: dict[str, Any],
             is_healthy: Callable[[Mapping[str, object]], bool],
-        ) -> tuple[bool, Mapping[str, object]]:
+        ) -> tuple[bool, dict[str, Any]]:
             """Try a small, supervisor-bounded number of startup repairs.
 
             A signed URL can pass ffprobe and still be rejected by the real
@@ -960,6 +960,9 @@ def run_acceptance(
         # avoids handing control back to the supervisor's backoff after the
         # first FFmpeg startup probe failure, while still bounding work by the
         # resolver's finite candidate set.
+        # 三条分支分别产出 StreamLease 或 None，且循环内以 `is None` 判过；
+        # 不声明出来的话首个分支的赋值会把变量钉成非空类型。
+        candidate_lease: StreamLease | None
         for candidate in ordered_candidates:
             if ingest_recovery:
                 if candidate.candidate_id == preferred_lease.candidate.candidate_id:
@@ -972,9 +975,13 @@ def run_acceptance(
                         requested_quality=options.requested_quality,
                     )
             else:
+                # 探测缺失时不能再塞 `{id: None}`：`select_stream_lease` 会
+                # `for probe in probe_results.values()` 然后取 probe.failure_detail，
+                # 一个 None 值就是 AttributeError。契约写的是 Mapping[str, ProbeResult]。
+                next_probe = next_probes.get(candidate.candidate_id)
                 candidate_lease = select_stream_lease(
                     replace(next_result, candidates=(candidate,)),
-                    {candidate.candidate_id: next_probes.get(candidate.candidate_id)},
+                    {candidate.candidate_id: next_probe} if next_probe is not None else {},
                     room_id=options.room_id,
                     lease_manager=manager,
                     requested_quality=options.requested_quality,

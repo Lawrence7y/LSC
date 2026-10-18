@@ -227,6 +227,9 @@ export const enPartUi: Record<string, string> = {
   '播放速率（Shift + , 降档 / Shift + . 升档）': 'Playback rate (Shift+, slower / Shift+. faster)',
   '回到直播实时沿（时间线贴右，恢复跟播）': 'Jump to the live edge (pin the timeline right and resume following)',
   '当前在回看已录制文件，没有实时沿可跳': 'You are reviewing a recorded file; there is no live edge to jump to',
+  // ── ControlBar：未勾选房间时的时间线绑定（P3-2）──
+  '未勾选房间：时间线自动跟随「{name}」，勾选卡片可切换': 'No room checked: the timeline is following “{name}”; check a card to switch',
+  '未勾选房间：勾选任一房间以启用回放轴（时间线跟随所选房间）': 'No room checked: check a room to enable the replay timeline (it follows the selected room)',
 
   // ── RefreshButton ──
   '刷新暂不可用：请等待当前刷新完成': 'Refresh is unavailable: wait for the current refresh to finish',

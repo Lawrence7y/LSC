@@ -11,9 +11,17 @@ import logging
 import threading
 import time
 from collections.abc import Iterable, Mapping
+from typing import Any
 from urllib.parse import urlparse
 
-from .base import ERROR_PARSE_FAILED, ERROR_UNSUPPORTED_URL, PlatformAdapter, StreamInfo
+from . import diagnostics as _platform_diagnostics
+from .base import (
+    ERROR_PARSE_FAILED,
+    ERROR_PARSER_STALE,
+    ERROR_UNSUPPORTED_URL,
+    PlatformAdapter,
+    StreamInfo,
+)
 from .bilibili import BilibiliAdapter
 from .direct import DirectAdapter
 from .douyin import DouyinAdapter
@@ -21,6 +29,7 @@ from .douyu import DouyuAdapter
 from .generic import GenericPageAdapter
 from .huya import HuyaAdapter
 from .kuaishou import KuaishouAdapter
+from .models import ProbeResult, ResolveResult, StreamLease
 from .redaction import redact_text, redact_url
 from .stream_expiry import is_stream_url_expiring
 from .weibo import WeiboAdapter
@@ -280,6 +289,30 @@ def parse_stream(
 
         try:
             info = adapter.parse(clean_url)
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            # 结构类异常 = 平台改了页面/接口，解析器假设的字段不在了。
+            # 这类**不是网络故障**：让用户检查网络是误导，重试也不会好。
+            # 唯一集中分类点，9 个适配器都走这里，不在各适配器里重复判断。
+            info = StreamInfo(
+                platform=adapter.platform,
+                room_url=clean_url,
+                is_live=False,
+                error=(
+                    f"{adapter.display_name} 页面结构可能已变更，解析器需要更新"
+                    f"（不是网络问题）: {type(exc).__name__}: {redact_text(exc)}"
+                ),
+                error_code=ERROR_PARSER_STALE,
+            )
+            _log.error(
+                "parser appears stale for %s (%s): %s: %s",
+                adapter.platform, redact_url(clean_url)[:60],
+                type(exc).__name__, redact_text(exc),
+            )
+            # 只计数不再补一条日志：上面那条 ERROR 已经带了平台/URL/异常类型，
+            # 计数的作用是把"改版打掉解析器"送到 system_stats 聚合出口。
+            _platform_diagnostics.note_degradation(
+                adapter.platform, ERROR_PARSER_STALE, reason=type(exc).__name__,
+            )
         except Exception as exc:
             info = StreamInfo(
                 platform=adapter.platform,
@@ -333,35 +366,35 @@ def select_quality(info: StreamInfo | Mapping[str, object], quality_preset: str)
     return stream_url, selected_quality
 
 
-def resolve_stream_v2(*args, **kwargs):
+def resolve_stream_v2(*args: Any, **kwargs: Any) -> ResolveResult:
     """Lazy Registry entry for the V2 compatibility resolver."""
     from .resolver import resolve_stream_v2 as _resolve_stream_v2
 
     return _resolve_stream_v2(*args, **kwargs)
 
 
-def probe_candidates(*args, **kwargs):
+def probe_candidates(*args: Any, **kwargs: Any) -> dict[str, ProbeResult]:
     """Lazy Registry entry for bounded real-media probing."""
     from .resolver import probe_candidates as _probe_candidates
 
     return _probe_candidates(*args, **kwargs)
 
 
-def select_stream_lease(*args, **kwargs):
+def select_stream_lease(*args: Any, **kwargs: Any) -> StreamLease | None:
     """Lazy Registry entry for selecting a lease after probing."""
     from .resolver import select_stream_lease as _select_stream_lease
 
     return _select_stream_lease(*args, **kwargs)
 
 
-def select_ingest_lease(*args, **kwargs):
+def select_ingest_lease(*args: Any, **kwargs: Any) -> StreamLease | None:
     """Lazy Registry entry for issuing a lease without a remote media probe."""
     from .resolver import select_ingest_lease as _select_ingest_lease
 
     return _select_ingest_lease(*args, **kwargs)
 
 
-def resolve_playable_lease(*args, **kwargs):
+def resolve_playable_lease(*args: Any, **kwargs: Any) -> StreamLease | None:
     """Lazy Registry entry for ingest-or-probe lease selection."""
     from .resolver import resolve_playable_lease as _resolve_playable_lease
 

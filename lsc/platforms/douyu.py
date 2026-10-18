@@ -13,6 +13,8 @@ from urllib.request import Request
 
 _log = logging.getLogger(__name__)
 
+from lsc.utils.coerce import safe_int
+
 from .base import (
     DEFAULT_USER_AGENT,
     ERROR_OFFLINE,
@@ -79,7 +81,9 @@ class DouyuAdapter(BasePlatformAdapter):
         _log.info("Douyu: parsing %s", redact_url(url)[:80])
         clean_url = (url or "").strip()
         headers = dict(request_headers or DOUYU_HEADERS)
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")
@@ -306,10 +310,7 @@ class DouyuAdapter(BasePlatformAdapter):
             return ""
         if not isinstance(payload, dict):
             return ""
-        try:
-            error = int(payload.get("error") if payload.get("error") is not None else 0)
-        except (TypeError, ValueError):
-            error = -1
+        error = safe_int(payload.get("error"), -1)
         if error != 0:
             _log.info("Douyu preview rid=%s error=%s", rid, error)
             return ""

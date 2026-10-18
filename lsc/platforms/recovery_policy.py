@@ -1,10 +1,27 @@
 """Platform-owned recovery hints used by generic runtime code."""
 from __future__ import annotations
 
+import logging
 from urllib.parse import urlparse
 
 from .capabilities import get_platform_capabilities, uses_ingest_probe
+from .credentials import (
+    get_default_credential_provider,
+    invalidate_credentials_on_auth_failure,
+)
 from .failure import FailureKind, classify_failure, is_recoverable_failure
+
+_log = logging.getLogger(__name__)
+
+
+def _account_ref_of(stream_info: object, raw: object) -> str:
+    """凭据作用域账号：优先 raw.account_ref，退回 stream_info.account_ref。"""
+    if isinstance(raw, dict):
+        ref = str(raw.get("account_ref") or "").strip()
+        if ref:
+            return ref
+    return str(getattr(stream_info, "account_ref", "") or "default") or "default"
+
 
 
 def should_force_refresh_when_recording(stream_info: object | None) -> bool:
@@ -119,6 +136,19 @@ def mark_failed_candidate(
         if not raw_profile and isinstance(raw_network_context, dict):
             raw_profile = raw_network_context.get("profile")
         network_profile = network_profile or str(raw_profile or "")
+
+    if kind in {FailureKind.AUTH_REQUIRED, FailureKind.AUTH_EXPIRED}:
+        # 观测到"要登录/登录已失效" = 凭据活性的实测证据。判据与计数都在
+        # `credentials.invalidate_credentials_on_auth_failure` 这一个入口里，
+        # 与 resolver 的 resolve 期观测共用；这里只补上 ingest 期这一路。
+        # 不改变本函数的返回语义（下面照旧走到 `return False`）。
+        invalidate_credentials_on_auth_failure(
+            get_default_credential_provider(),
+            platform,
+            _account_ref_of(stream_info, raw),
+            kind,
+            reason=str(error or ""),
+        )
 
     health_recorded = False
     if isinstance(raw, dict) and raw.get("v2") and raw.get("candidate_id"):

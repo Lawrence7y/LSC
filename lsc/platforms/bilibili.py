@@ -286,7 +286,9 @@ class BilibiliAdapter(BasePlatformAdapter):
         Uses a HEAD request with no redirect following to read the Location
         header directly, avoiding a full page download.
         """
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")
@@ -319,7 +321,9 @@ class BilibiliAdapter(BasePlatformAdapter):
     ) -> dict[str, Any]:
         headers = dict(headers or _build_headers_with_cookies())
         _log.debug("Bilibili: fetch_json %s", redact_url(url)[:100])
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")
@@ -471,4 +475,3 @@ class BilibiliAdapter(BasePlatformAdapter):
     ) -> StreamInfo:
         """Failed result always carries Bilibili request headers (cookies)."""
         return super()._failed(url, error, error_code, headers=_build_headers_with_cookies(), raw=raw)
-

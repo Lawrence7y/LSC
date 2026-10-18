@@ -2,9 +2,17 @@
 from __future__ import annotations
 
 import ipaddress
+from http.client import HTTPMessage
+from typing import IO
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import (
+    BaseHandler,
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 _BLOCKED_HOSTNAMES = {
     "localhost",
@@ -48,7 +56,16 @@ def validate_public_url(url: str) -> tuple[bool, str]:
 class _NoRedirectHandler(HTTPRedirectHandler):
     """Expose redirect targets without allowing urllib to open them."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> Request | None:
+        # 返回 None 表示这一跳不再交给 urllib 自动打开，重定向目标由调用方校验。
         return None
 
 
@@ -69,12 +86,14 @@ def validate_redirect_chain(
     failure kind instead of duplicating transport policy here.
     """
     current = str(url or "").strip()
-    opener_kwargs = [_NoRedirectHandler()]
+    # build_opener 收任意 BaseHandler：声明成具体子类列表会让 append(ProxyHandler)
+    # 与 *展开两处都报错，用公共基类才是它真实的契约。
+    opener_handlers: list[BaseHandler] = [_NoRedirectHandler()]
     if proxy_url:
-        opener_kwargs.append(
+        opener_handlers.append(
             ProxyHandler({"http": proxy_url, "https": proxy_url})
         )
-    opener = build_opener(*opener_kwargs)
+    opener = build_opener(*opener_handlers)
     for _hop in range(max(0, int(max_redirects)) + 1):
         safe, reason = validate_public_url(current)
         if not safe:

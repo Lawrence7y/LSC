@@ -79,7 +79,9 @@ class XiaohongshuAdapter(BasePlatformAdapter):
         clean_url = (url or "").strip()
         parsed = urlparse(clean_url)
         headers = dict(request_headers or XHS_HEADERS)
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
 
         if parsed.netloc.lower() in _SHORT_LINK_HOSTS:
             expanded = self._expand_short_link(
@@ -222,7 +224,9 @@ class XiaohongshuAdapter(BasePlatformAdapter):
         headers: Mapping[str, str] | None = None,
         network_context: Mapping[str, object] | None = None,
     ) -> str:
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")
@@ -248,7 +252,9 @@ class XiaohongshuAdapter(BasePlatformAdapter):
         network_context: Mapping[str, object] | None = None,
     ) -> str:
         """Follow xhslink.com redirects to a www.xiaohongshu.com live URL."""
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")

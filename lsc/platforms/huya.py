@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlsplit, urlu
 
 _log = logging.getLogger(__name__)
 
+from . import diagnostics as _platform_diagnostics
 from .base import (
     DEFAULT_USER_AGENT,
     ERROR_OFFLINE,
@@ -82,6 +83,24 @@ _HUYA_SDK_CONSTANTS = {
 }
 
 
+def _fallback_to_web_token(reason: str, raw: str) -> str:
+    """回退到网页播放器 token，并把这次回退记下来。
+
+    回退本身就是故障形状：网页 token 打开只会拿到一段 GOP 然后 EOF，正是
+    `build_huya_live_query` 要解决的问题。此前它静默返回，虎牙改版的表现
+    就是"预览播几秒没了"，日志里查不到任何原因。现在每个原因告警一次，
+    并计入 `system_stats.platform_degradation`，可被顶栏/日志聚合看到。
+    """
+    if _platform_diagnostics.note_degradation("huya", "sdk_query_fallback", reason=reason):
+        _log.warning(
+            "虎牙 SDK 直播链接改写未生效（reason=%s），已回退到网页播放器 token："
+            "该地址大概率只推一段 GOP 后 EOF。若此条在改版后集中出现，"
+            "需要核对 fm/wsTime 结构与 _HUYA_SDK_CONSTANTS。",
+            reason,
+        )
+    return raw
+
+
 def build_huya_live_query(anti_code: str, stream_name: str, *, ratio: int = 0) -> str:
     """Rebuild the FLV query as a mobile/SDK live pull.
 
@@ -89,25 +108,30 @@ def build_huya_live_query(anti_code: str, stream_name: str, *, ratio: int = 0) -
     yields a finite GOP dump (often via ``302_type=extreme_cold_aggr``) and
     then EOF. Streamlink/yt-dlp derive a new secret from ``fm`` + ``wsTime``
     + ``seqid``/``u``; that socket stays open on working CDN lines.
-    Incomplete anti-codes fall back to the original query unchanged.
+    Incomplete anti-codes fall back to the original query unchanged — each
+    fallback reason is logged once and counted (see ``_fallback_to_web_token``).
     """
     raw = html.unescape(str(anti_code or "").strip())
     name = str(stream_name or "").strip()
-    if not raw or not name:
+    if not raw:
         return raw
+    if not name:
+        return _fallback_to_web_token("missing_stream_name", raw)
     params = dict(parse_qsl(raw, keep_blank_values=True))
     fm = str(params.get("fm") or "")
     ws_time = str(params.get("wsTime") or "")
     ctype = str(params.get("ctype") or "huya_live")
     fs = str(params.get("fs") or "")
     if not fm or not ws_time:
-        return raw
+        return _fallback_to_web_token("missing_fm_or_wsTime", raw)
     try:
         prefix = base64.b64decode(unquote(fm).encode()).decode().split("_")[0]
-    except Exception:
-        return raw
+    except Exception as exc:
+        # 解码失败通常意味着 fm 的编码换了 —— 这是改版信号，不是网络问题。
+        _log.debug("huya fm decode failed: %s", redact_text(exc))
+        return _fallback_to_web_token("fm_not_decodable", raw)
     if not prefix:
-        return raw
+        return _fallback_to_web_token("empty_prefix", raw)
     uid = random.randint(12340000, 12349999)
     convert_uid = (uid << 8 | uid >> (32 - 8)) & 0xFFFFFFFF
     timestamp = int(time.time() * 1000)
@@ -163,8 +187,11 @@ def _scope_key(room_key: str = "", network_profile: str = "") -> tuple[str, str]
             raw_room = urlunsplit(
                 (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        # 规范化失败不是清理路径：key 会退化成未规范化形态，mark_cdn_bad 的
+        # CDN 黑名单作用域随之失配（§7.5 的 sdk_query_fallback 降级观测相关），
+        # 必须留痕（2026-09-24 修复：此前静默 pass）。
+        _log.warning("huya scope key normalization failed raw=%r: %s", raw_room, exc)
     return (
         raw_room.rstrip("/").lower() or "*",
         str(network_profile or "").strip() or "default",
@@ -416,7 +443,9 @@ class HuyaAdapter(BasePlatformAdapter):
         headers: Mapping[str, str] | None = None,
         network_context: Mapping[str, object] | None = None,
     ) -> str:
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")

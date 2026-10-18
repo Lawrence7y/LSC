@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .base import (
@@ -177,7 +178,9 @@ class WeiboAdapter(BasePlatformAdapter):
         headers: Mapping[str, str] | None = None,
         network_context: Mapping[str, object] | None = None,
     ) -> str:
-        context = dict(network_context or {})
+        # 本地拷贝：对外契约仍是 Mapping[str, object]，只是本地取标量时
+        # 不必每处再 cast。见 `lsc/platforms/base.py` 同一写法。
+        context: dict[str, Any] = dict(network_context or {})
         proxy_url = str(
             context.get("proxy_url")
             or context.get("http_proxy")

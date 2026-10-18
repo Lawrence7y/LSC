@@ -9,8 +9,9 @@ import subprocess
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from types import SimpleNamespace
 from urllib.parse import urlparse
+
+from lsc.utils.coerce import safe_float, try_float
 
 from .base import headers_to_ffmpeg_input_args, network_timeout_args
 from .failure import classify_failure
@@ -237,18 +238,10 @@ class ProbeService:
              and item.get("codec_type") == "audio"),
             {},
         )
-        try:
-            duration = float(fmt.get("duration"))
-        except (TypeError, ValueError):
-            duration = 0.0
-        try:
-            stream_duration = float(video.get("duration"))
-        except (TypeError, ValueError):
-            stream_duration = 0.0
-        try:
-            bitrate = int(float(fmt.get("bit_rate")))
-        except (TypeError, ValueError):
-            bitrate = -1
+        duration = safe_float(fmt.get("duration"))
+        stream_duration = safe_float(video.get("duration"))
+        bitrate_raw = try_float(fmt.get("bit_rate"))
+        bitrate = -1 if bitrate_raw is None else int(bitrate_raw)
         has_video = bool(video)
         has_audio = bool(audio)
         packet_timestamps: list[float] = []
@@ -261,11 +254,11 @@ class ProbeService:
             except (TypeError, ValueError):
                 pass
             for key in ("pts_time", "dts_time"):
-                try:
-                    value = float(packet.get(key))
-                except (TypeError, ValueError):
+                # try_float 已经把 NaN/Inf 归到"取不出来"，所以这里不再需要 `value == value`
+                value = try_float(packet.get(key))
+                if value is None:
                     continue
-                if value == value and value not in packet_timestamps:
+                if value not in packet_timestamps:
                     packet_timestamps.append(value)
         packet_span = (
             max(packet_timestamps) - min(packet_timestamps)
@@ -344,8 +337,12 @@ class ProbeService:
         *,
         timeout: float,
         cancellation: object,
-    ) -> SimpleNamespace:
-        """Run ffprobe while allowing a token to terminate the child process."""
+    ) -> subprocess.CompletedProcess[str]:
+        """Run ffprobe while allowing a token to terminate the child process.
+
+        返回真实的 `CompletedProcess` 而不是 `SimpleNamespace` 鸭子类型：调用方
+        与 `subprocess.run` 分支共用同一个变量，两种形状混用等于埋一个漂移点。
+        """
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -371,10 +368,13 @@ class ProbeService:
                     stdout, stderr = process.communicate(
                         timeout=min(0.2, remaining),
                     )
-                    return SimpleNamespace(
-                        returncode=process.returncode,
-                        stdout=stdout,
-                        stderr=stderr,
+                    return subprocess.CompletedProcess(
+                        command,
+                        # communicate() 之后子进程必已被回收；这里只是把
+                        # Optional[int] 收敛成 CompletedProcess 要的 int。
+                        process.returncode if process.returncode is not None else -1,
+                        stdout,
+                        stderr,
                     )
                 except subprocess.TimeoutExpired:
                     continue
@@ -472,10 +472,7 @@ def score_candidate(
         confidence = 0.0
     score += max(0.0, min(100.0, quality_rank)) * 0.5
     score += max(0.0, min(1.0, confidence)) * 10.0
-    try:
-        cdn_health = float(candidate.raw_metadata.get("cdn_health_score", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        cdn_health = 0.0
+    cdn_health = safe_float(candidate.raw_metadata.get("cdn_health_score", 0.0) or 0.0)
     score += max(-100.0, min(100.0, cdn_health))
     if result.has_audio:
         score += 40.0
@@ -511,10 +508,7 @@ def select_best_candidate(
         if not result.ok:
             continue
         raw_history = candidate.raw_metadata.get("history_score", 0.0)
-        try:
-            history_score = float(raw_history or 0.0)
-        except (TypeError, ValueError):
-            history_score = 0.0
+        history_score = safe_float(raw_history or 0.0)
         score = score_candidate(
             candidate,
             result,

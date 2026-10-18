@@ -4614,8 +4614,14 @@ def restore_persisted_rooms(manager: RoomOrchestrator) -> int:
                     continue
                 try:
                     setattr(room, field, float(value))
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    # 持久化里的 content_offset 非法：保留默认值继续恢复其余
+                    # 字段，但必须留痕——静默跳过会让对齐偏移"恢复后莫名归零"
+                    # 完全无法解释（2026-09-24 修复）。
+                    _log.warning(
+                        "restore room %s field=%s invalid value=%r ignored: %s",
+                        normalized_url, field, value, exc,
+                    )
             for field in ("align_group_id", "category"):
                 value = item.get(field)
                 if isinstance(value, str):
@@ -7033,8 +7039,10 @@ def register_room_handlers(server, bridge):
                                 stderr_tail = ''
                                 try:
                                     stderr_tail = (streamer._last_stderr or '').strip()[:300]
-                                except AttributeError:
-                                    pass
+                                except AttributeError as exc:
+                                    # 诊断字段缺失不影响停止流程，但 stderr 尾部是
+                                    # 启动失败定位的主要证据，留 debug。
+                                    _log.debug("读取 streamer stderr 尾部失败: %s", exc)
                                 try:
                                     streamer.stop()
                                 except Exception as exc:
@@ -7120,8 +7128,9 @@ def register_room_handlers(server, bridge):
                         stderr_tail = ''
                         try:
                             stderr_tail = (streamer._last_stderr or '').strip()[:300]
-                        except AttributeError:
-                            pass
+                        except AttributeError as exc:
+                            # 诊断字段缺失不影响停止流程，留 debug 保住可观测性
+                            _log.debug("读取 streamer stderr 尾部失败 (start): %s", exc)
                         # 清理已启动的 FFmpeg 进程和管道，防止资源泄漏
                         try:
                             streamer.stop()
@@ -7195,7 +7204,7 @@ def register_room_handlers(server, bridge):
                         except Exception as stop_exc:
                             _log.debug("停止泄漏 streamer 失败 (cleanup): %s", stop_exc)
                         _stop_idle_shared_ingest(room_id, reason="preview state sync failed")
-                    return {'success': False, 'room_id': room_id, 'error': f'预览状态同步失败：{exc}'}
+                    return {'success': False, 'room_id': room_id, 'error': f'预览状态同步失败：{humanize_error(str(exc))}'}
                 _note_mse_reconnect_event(room_id, "accepted")
                 # streaming phase 由首个 init 段到达时广播（_push_mse_segment），
                 # 此处仅重置 live 标志；启动期间 phase 保持 probing，避免
@@ -7651,7 +7660,8 @@ def register_room_handlers(server, bridge):
                     'data': {
                         'room_id': job['room_id'],
                         'job_id': job['job_id'],
-                        'error': f"延后导出任务异常: {exc}",
+                        # clip_failed 始终通知（§11.4）：FFmpeg 原文转友好提示
+                        'error': f"延后导出任务异常: {humanize_error(str(exc))}",
                     },
                 })
                 continue
