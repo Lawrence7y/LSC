@@ -105,12 +105,10 @@ def finalization_requires_full_rescan(
         if float(end) > float(start)
     ]
     # 从未成功覆盖任何区间时只能从 0 起扫。
-    if not ranges:
-        return True
     # 只要已有任意 coverage，收尾就应基于 coverage 账本补真实缺口 + 尾部，
     # 而不是因为某个中间缺口/一次 scan_error 就把已扫过的历史整段重扫。
     # scan_error 只表示某个窗口失败，失败窗口本身会作为 uncovered gap 被补扫。
-    return False
+    return not ranges
 
 
 def classify_boundary_quality(

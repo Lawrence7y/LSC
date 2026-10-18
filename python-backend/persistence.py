@@ -133,20 +133,34 @@ def save_rooms(
     path: Path | str | None = None,
     *,
     fsync: bool = False,
+    save_seq: int | None = None,
 ) -> bool:
     """将房间列表写入 JSON 文件。
 
     使用临时文件 + 替换的方式尽量减少写坏文件的概率；
     替换前将上一版好文件备份为 .bak，供损坏时恢复。
     默认不 fsync（高频写合并场景）；flush_pending_saves / 显式 fsync=True 才刷盘。
+
+    ``save_seq``：schedule_save_rooms 分配的单调序号。两个 flush 线程可能
+    以旧 payload 后写（Timer 已触发时 cancel() 失效 + 写盘慢），把
+    rooms.json 退回旧快照——丢一次房间增删。带序号时在 ``_persist_lock``
+    内做"跳过过期"判定，保证落盘的永远是已调度序列里的最新快照
+    （2026-09-24 修复）。
     """
     violation = room_payload_violation(rooms)
     if violation is not None:
         _log.error("拒绝保存房间配置（形状违规）: %s", violation)
         return False
+    global _rooms_write_count, _rooms_saved_seq
     file_path = Path(path) if path else ROOMS_FILE
     try:
         with _persist_lock:
+            if save_seq is not None and save_seq < _rooms_saved_seq:
+                # 更新的快照已落盘（或正在落盘）：这一份是过期的，跳过
+                _log.debug(
+                    "跳过过期房间快照 seq=%s（已落盘 seq=%s）", save_seq, _rooms_saved_seq
+                )
+                return True
             _ensure_dir(file_path.parent)
             tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
             payload = {"rooms": rooms}
@@ -157,8 +171,9 @@ def save_rooms(
                     os.fsync(f.fileno())
             _backup_existing(file_path)
             tmp_path.replace(file_path)
-            global _rooms_write_count
             _rooms_write_count += 1
+            if save_seq is not None and save_seq > _rooms_saved_seq:
+                _rooms_saved_seq = save_seq
         _log.info("已保存 %d 个房间到 %s", len(rooms), file_path.name)
         return True
     except Exception as exc:
@@ -168,8 +183,14 @@ def save_rooms(
 
 _rooms_write_count = 0
 _FSYNC_EVERY_N_WRITES = 5
+# 单调保存序号：schedule 时分配、落盘时在 _persist_lock 内比对。
+# 只由 _persist_lock 保护（读写都在 save_rooms 的锁内）。
+_rooms_saved_seq = 0
+# 已分配（不一定已落盘）的序号：schedule 侧单调递增
+_rooms_save_seq = 0
 _save_rooms_timer: threading.Timer | None = None
-_pending_rooms_payload: tuple[list[dict[str, Any]], Path] | None = None
+# payload: (rooms 快照, 路径, 单调序号)
+_pending_rooms_payload: tuple[list[dict[str, Any]], Path, int] | None = None
 _schedule_lock = threading.Lock()
 
 
@@ -180,12 +201,13 @@ def schedule_save_rooms(
     delay_sec: float = 1.0,
 ) -> None:
     """1 秒内多次保存合并为一次；到期后写入，每 N 次才 fsync。"""
-    global _save_rooms_timer, _pending_rooms_payload
+    global _save_rooms_timer, _pending_rooms_payload, _rooms_save_seq
     file_path = Path(path) if path else ROOMS_FILE
     # 拷贝列表，避免调用方后续原地改动污染待写快照
     snapshot = [dict(r) for r in rooms]
     with _schedule_lock:
-        _pending_rooms_payload = (snapshot, file_path)
+        _rooms_save_seq += 1
+        _pending_rooms_payload = (snapshot, file_path, _rooms_save_seq)
         if _save_rooms_timer is not None:
             _save_rooms_timer.cancel()
         timer = threading.Timer(delay_sec, _flush_scheduled_rooms)
@@ -202,9 +224,9 @@ def _flush_scheduled_rooms() -> None:
         _save_rooms_timer = None
     if pending is None:
         return
-    rooms, file_path = pending
+    rooms, file_path, save_seq = pending
     do_fsync = (_rooms_write_count + 1) % _FSYNC_EVERY_N_WRITES == 0
-    save_rooms(rooms, file_path, fsync=do_fsync)
+    save_rooms(rooms, file_path, fsync=do_fsync, save_seq=save_seq)
 
 
 def flush_pending_room_saves(*, fsync: bool = True) -> bool:
@@ -218,8 +240,8 @@ def flush_pending_room_saves(*, fsync: bool = True) -> bool:
         _pending_rooms_payload = None
     if pending is None:
         return True
-    rooms, file_path = pending
-    return save_rooms(rooms, file_path, fsync=fsync)
+    rooms, file_path, save_seq = pending
+    return save_rooms(rooms, file_path, fsync=fsync, save_seq=save_seq)
 
 
 def save_settings(

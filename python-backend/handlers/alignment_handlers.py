@@ -15,15 +15,17 @@ import os
 import time
 
 import numpy as np
-from handlers.room_utils import expand_user_path
-from handlers.timeline_handlers import timeline_to_dict
 from persistence import SETTINGS_FILE
 
+from handlers.room_utils import expand_user_path
+from handlers.timeline_handlers import timeline_to_dict
 from lsc.core.recording_layout import bind_rooms_to_bundle
 from lsc.core.services.timeline_service import (
     build_room_snapshots_from_align,
     get_timeline_service,
 )
+from lsc.utils.coerce import safe_float
+from lsc.utils.error_messages import humanize_error
 
 _log = logging.getLogger('lsc.handlers')
 # 前端响应 watchdog 为 30 秒，后端必须提前返回明确错误，不能与前端同时超时。
@@ -158,15 +160,9 @@ def register_alignment_handlers(
                     diagnostics.get('sample_count'),
                     diagnostics.get('capture_reason'),
                 )
-                try:
-                    _pct = float(diagnostics.get('current_time'))
-                except (TypeError, ValueError):
-                    _pct = 0.0
-                _capture_end_ms = 0.0
-                try:
-                    _capture_end_ms = float(diagnostics.get('capture_end_epoch_ms'))
-                except (TypeError, ValueError):
-                    pass
+                # 统一走 `lsc.utils.coerce.safe_float`，不再各处手写 try/except
+                _pct = safe_float(diagnostics.get('current_time'))
+                _capture_end_ms = safe_float(diagnostics.get('capture_end_epoch_ms'))
                 if room_id and _pct > 0.0:
                     preview_cur_time[room_id] = _pct
                 if room_id and _capture_end_ms > 0.0:
@@ -445,4 +441,6 @@ def register_alignment_handlers(
             return response
         except Exception as exc:
             _align_log.error("预览音频对齐失败: %s", exc, exc_info=True)
-            return {'success': False, 'error': str(exc)}
+            # 该 handler 其余校验分支都是友好中文，唯独 except 分支原文透传：
+            # 统一走 humanize_error（§11.4，2026-09-24 修复）
+            return {'success': False, 'error': humanize_error(str(exc))}

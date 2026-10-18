@@ -73,8 +73,10 @@ class _CompressedRotatingFileHandler(logging.handlers.RotatingFileHandler):
                     with open(sfn, 'rb') as f_in, gzip.open(dfn, 'wb') as f_out:
                         shutil.copyfileobj(f_in, f_out)
                     os.remove(sfn)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    # 轮转压缩失败会让旧日志以未压缩形态残留：不影响运行，但吃掉
+                    # 备份配额时等于静默丢历史日志，留 debug 便于对账。
+                    logging.getLogger(__name__).debug("log rotation compress failed %s: %s", sfn, exc)
 
 
 def _setup_logging() -> logging.Logger:
@@ -183,8 +185,10 @@ def _heal_orphan_recordings(manager) -> list[str]:
         settings_dir = (load_settings() or {}).get("output_dir")
         if settings_dir:
             roots.append(str(settings_dir))
-    except Exception:  # noqa: BLE001 - 读不到配置不影响"用房间目录自愈"这条路
-        pass
+    except Exception as exc:  # noqa: BLE001 - 读不到配置不影响"用房间目录自愈"这条路
+        # 自愈路径会退化成只用房间目录：不致命，但本地媒体白名单可能漏掉
+        # 配置里的 output_dir 根，留 debug 便于解释"回看偶发不可用"。
+        _log.debug("local media root bootstrap from settings failed: %s", exc)
     try:
         rooms = manager.list_rooms()
     except Exception:  # noqa: BLE001 - 房间枚举失败不影响自愈以外的启动流程
@@ -207,6 +211,7 @@ _install_exception_hook(_log)
 
 
 from broadcast_hub import BroadcastHub
+from persistence import flush_pending_room_saves
 from server import LSCWebSocketServer
 
 from lsc.core.orchestrator import RoomOrchestrator
@@ -260,9 +265,14 @@ class LSCWebSocketBackend:
         """在工作线程中运行 WebSocket 服务器。"""
         from handlers.room_handler import register_room_handlers, restore_persisted_rooms
 
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._stop_event = asyncio.Event()
+        # 用局部变量持有 loop/event：`self._loop` / `self._stop_event` 的类型是
+        # 「可空」（在 __init__ 里先置 None），本函数之外没人再改赋值，但 mypy 无法
+        # 从"三行之前刚 new 出来"推出非 None，于是每个用法点都报 union-attr。
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        stop_event = asyncio.Event()
+        self._stop_event = stop_event
 
         try:
             restored = restore_persisted_rooms(self.manager)
@@ -288,12 +298,12 @@ class LSCWebSocketBackend:
         register_room_handlers(self.server, self.bridge)
 
         # 启动广播推送任务
-        broadcaster = self._loop.create_task(self._broadcast_coroutine())
+        broadcaster = loop.create_task(self._broadcast_coroutine())
 
         async def _serve():
             """包装 server.start()，附加 stop_event 等待，使其可被停止。"""
-            serve_task = self._loop.create_task(self.server.start())
-            stop_task = self._loop.create_task(self._stop_event.wait())
+            serve_task = loop.create_task(self.server.start())
+            stop_task = loop.create_task(stop_event.wait())
             try:
                 # 哪个先完成都触发停止：server.start 异常退出 或 stop_event 被 set
                 await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -304,11 +314,14 @@ class LSCWebSocketBackend:
                         t.cancel()
                         try:
                             await t
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                        except asyncio.CancelledError:
+                            pass  # 主动取消：控制流，非错误
+                        except Exception as exc:
+                            # 被取消的任务自身抛错：照常放行停机，但留痕
+                            _log.debug("cancelled task raised: %s", exc)
 
         try:
-            self._loop.run_until_complete(_serve())
+            loop.run_until_complete(_serve())
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -317,10 +330,10 @@ class LSCWebSocketBackend:
             broadcaster.cancel()
             try:
                 # 给 broadcaster 一点时间清理
-                self._loop.run_until_complete(asyncio.gather(broadcaster, return_exceptions=True))
+                loop.run_until_complete(asyncio.gather(broadcaster, return_exceptions=True))
             except Exception as exc:
                 _log.debug("操作异常（已忽略）: %s", exc)
-            self._loop.close()
+            loop.close()
             _log.info("WebSocket server thread exited")
 
     async def _broadcast_coroutine(self):
@@ -345,9 +358,13 @@ class LSCWebSocketBackend:
                     # 脱敏边界与 2s/15s 慢客户端契约（单次超时只标记、持续慢才剔除、
                     # 硬异常立即剔除）。旧本地实现是 1s 超时 + 单次异常立即踢人，
                     # 违反 2026-09 收紧契约（渲染进程单次卡顿被踢 → 全房预览停摆）。
+                    # _seq/_coalesced 必须一并透传：§2.1 的缺号告警此前因
+                    # 只转发 type/data 而整体空转（顶层序列号被丢弃）。
                     await self.server.broadcast(
                         str(msg.get('type', '')),
                         msg.get('data'),
+                        seq=msg.get('_seq'),
+                        coalesced=msg.get('_coalesced'),
                     )
             except Exception:
                 _log.exception("broadcast error, retrying in 1s")
@@ -405,23 +422,46 @@ class LSCWebSocketBackend:
             self.manager.shutdown(timeout_sec=10.0)
         except Exception as exc:
             _log.warning("manager shutdown failed: %s", exc, exc_info=True)
-        # 1) 通知 WebSocket 服务器停止接受新连接
-        if self.server._server is not None and self._loop is not None and not self._loop.is_closed():
-            try:
-                asyncio.run_coroutine_threadsafe(self.server._server.close(), self._loop)
-            except RuntimeError:
-                pass
-        # 2) set stop_event 让 _serve() 的 await 返回，run_until_complete 正常退出
-        if self._stop_event is not None and self._loop is not None and not self._loop.is_closed():
-            try:
-                self._loop.call_soon_threadsafe(self._stop_event.set)
-            except RuntimeError:
-                pass
-        # 3) 解除主线程 wait
-        self._main_stop.set()
+        # 1)/2) 通知 ws 层停机。**这两步绝不能挡住第 3 步**：
+        #    旧写法把同步的 `WebSocketServer.close()` 塞进
+        #    `run_coroutine_threadsafe`（实测 `iscoroutinefunction(close) is False`），
+        #    于是每次退出都抛 `TypeError: A coroutine object is required`，而下面
+        #    只 `except RuntimeError` —— 异常冲出 stop()，第 3 步的
+        #    `_main_stop.set()` 永远不执行，主线程永久卡在 `wait()` 上。
+        #    表现就是"退出应用后 python 后端进程残留"。
+        #    现在：改用 `call_soon_threadsafe` 在循环线程上调 close()，并把
+        #    1)/2) 整体放进 try/finally —— 清理链的后半段必须无条件执行。
+        try:
+            srv = self.server._server
+            if srv is not None and self._loop is not None and not self._loop.is_closed():
+                try:
+                    self._loop.call_soon_threadsafe(srv.close)
+                except Exception as exc:
+                    # 不只抓 RuntimeError：停机路径上任何异常都不能往上逃，
+                    # 否则后面的 join / 落盘都要少做一步。
+                    _log.warning("通知 WebSocket server 关闭失败: %s", exc)
+            # 2) set stop_event 让 _serve() 的 await 返回，run_until_complete 正常退出
+            if self._stop_event is not None and self._loop is not None and not self._loop.is_closed():
+                try:
+                    self._loop.call_soon_threadsafe(self._stop_event.set)
+                except Exception as exc:
+                    _log.warning("set stop_event 失败: %s", exc)
+        finally:
+            # 3) 解除主线程 wait —— 无条件
+            self._main_stop.set()
         # 4) 等待 ws 线程结束（最多 3 秒）
         if self._ws_thread is not None:
             self._ws_thread.join(timeout=3.0)
+        # 5) 落盘合并窗口里尚未写出的房间配置。schedule_save_rooms 有 1s 去抖，
+        #    关停前 1s 内的增删/排序若不冲刷就静默丢失（rooms.json 是 P0 持久化）。
+        #    放在 handler/manager 关停之后：此时不会再有新的 schedule 投递。
+        try:
+            if not flush_pending_room_saves(fsync=True):
+                _log.error("房间配置最终落盘失败（rooms.json 可能落后于内存状态）")
+        except Exception as exc:
+            # 捕获面刻意宽于 OSError：这是 stop() 的最后一步，抛出去只会把
+            # "退出"变成"退出 + 一条看不懂的 traceback"，落盘结果并不会更好。
+            _log.error("房间配置最终落盘异常: %s", exc, exc_info=True)
         _log.info("LSC Electron backend stopped")
 
 

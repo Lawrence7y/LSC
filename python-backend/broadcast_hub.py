@@ -7,17 +7,18 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from typing import Any
 
+from lsc.platforms.diagnostics import note_degradation
 from lsc.platforms.redaction import redact_mapping, redact_text
 
 _log = logging.getLogger(__name__)
 
-_TERMINAL_TYPES = frozenset({
-    "clip_completed", "clip_failed",
-    "recording_stopped", "recording_started",
-    "reconnect_failed", "continuous_highlights",
-})
+# 降级计数走平台层同一个注册表（`lsc/platforms/diagnostics`）：键空间固定为
+# ("backend", kind)，与解析器过期 / Cookie 失效等一起在 `system_stats` 里可见。
+_DEGRADATION_KEY = "backend"
+
 # continuous_analysis_status 不列入：phase 迁移（stopping/idle）属关键状态，
 # 丢弃会导致前端按钮状态与后端任务槽脱节（启动被拒/「点两次」）。
 # drain 端对该类型做 last-value coalesce，不丢也不会积压。
@@ -37,6 +38,15 @@ class BroadcastHub:
         self._broadcast_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
         self._wake = threading.Event()
         self._seq = 0  # 广播序列号，前端用于检测丢消息
+        # 序列号的分配必须与入队**同一把锁**：生产者是 orchestrator 线程 + 一批
+        # executor 线程，原先 `self._seq += 1` 与 `put_nowait` 之间没有任何同步，
+        # 于是队列顺序可以与序列号顺序不一致 —— 前端 `useWebSocket` 只在
+        # `_seq > last + 1` 时报缺号，倒序到达既不报警、还会把 last 拉低从而
+        # **掩盖真正的缺口**。这条防线当时是假信号（见债务报告 §7.4 / §11.17）。
+        self._seq_lock = threading.Lock()
+        self._dropped_droppable = 0
+        self._terminal_drops = 0
+        self._wake_failures = 0
         self._async_loop: Any = None
         self._async_wake: Any = None
         self._subscribe_orchestrator_events()
@@ -64,7 +74,20 @@ class BroadcastHub:
         try:
             loop.call_soon_threadsafe(event.set)
         except RuntimeError:
-            _log.debug("notify_broadcast: event loop closed")
+            # 唤醒失败 = 消息已在队列里但没人会被叫醒去取。原先只 `_log.debug`，
+            # 生产日志里根本看不见（debug 被过滤），表现就是"前端卡在旧状态"。
+            # 计数 + 首次 WARN：饱和/退出阶段的重复失败不再刷屏，但一定留痕。
+            self._wake_failures += 1
+            if note_degradation(
+                _DEGRADATION_KEY, "broadcast_wake_lost", reason="event_loop_closed"
+            ):
+                _log.warning(
+                    "broadcast wake lost: asyncio loop closed; queued broadcasts will "
+                    "only be delivered on the next successful wake (further repeats counted)"
+                )
+        except Exception:  # noqa: BLE001 — 唤醒失败不能把异常抛回生产者（executor 线程会直接死亡）
+            self._wake_failures += 1
+            _log.warning("broadcast wake raised unexpectedly", exc_info=True)
 
     def _on_connect_finished(self, room_id: str, success: bool, error: str) -> None:
         """房间连接完成，将结果推入广播队列。"""
@@ -121,68 +144,131 @@ class BroadcastHub:
         except queue.Empty:
             return None
 
+    def _offer_locked(self, msg: dict[str, Any], *, block: bool = False, timeout: float | None = None) -> bool:
+        """**持锁**分配序列号并入队；返回是否成功入队。
+
+        两条不变式，缺一条前端的丢消息判定就不成立：
+        ① 只给非 `_DROPPABLE_TYPES` 的消息发号 —— 遥测类被主动丢弃是设计行为，
+           不该在"关键消息缺号"这条告警里制造假缺口；
+        ② 队列内顺序 == 序列号顺序 —— 所以发号和 `put` 必须在同一次持锁里完成。
+        入队失败时**不提交**号段（不留假缺口）。
+        """
+        critical = msg.get('type') not in _DROPPABLE_TYPES
+        nxt = self._seq + 1
+        if critical:
+            msg['_seq'] = nxt
+        try:
+            if block:
+                self._broadcast_queue.put(msg, block=True, timeout=timeout)
+            else:
+                self._broadcast_queue.put_nowait(msg)
+        except queue.Full:
+            msg.pop('_seq', None)
+            return False
+        if critical:
+            self._seq = nxt
+        return True
+
+    def _offer(self, msg: dict[str, Any]) -> bool:
+        """`_offer_locked` 的加锁入口（成功时顺带唤醒 broadcaster）。"""
+        with self._seq_lock:
+            ok = self._offer_locked(msg)
+        if ok:
+            self.notify_broadcast()
+        return ok
+
     def queue_broadcast(self, msg: dict[str, Any]) -> None:
         """线程安全地投递一条广播消息到队列，供 WebSocket 线程消费。"""
         msg_type = msg.get('type')
-        # 附加序列号，前端用于检测丢消息
-        self._seq += 1
-        msg['_seq'] = self._seq
-        try:
-            self._broadcast_queue.put_nowait(msg)
+        if self._offer(msg):
             _log.debug("queued broadcast: type=%s", msg_type or '?')
-            self.notify_broadcast()
             return
-        except queue.Full:
-            pass
 
         if msg_type in _DROPPABLE_TYPES:
-            _log.debug(
-                "broadcast queue full, dropping droppable message: type=%s",
-                msg_type or '?',
-            )
+            self._dropped_droppable += 1
+            if note_degradation(
+                _DEGRADATION_KEY, "broadcast_queue_full_drop", reason=str(msg_type or '?')
+            ):
+                _log.warning(
+                    "broadcast queue full, dropping droppable message type=%s "
+                    "(关键消息不会走这条路径；重复丢弃只计数)",
+                    msg_type or '?',
+                )
             return
 
         self._enqueue_preserving_terminal(msg)
 
+    def broadcast_health(self) -> dict[str, Any]:
+        """广播通道自检快照（进 `system_stats.extra`，现场复盘用）。"""
+        with self._seq_lock:
+            return {
+                'seq': self._seq,
+                'queued': self._broadcast_queue.qsize(),
+                'queue_maxsize': self._broadcast_queue.maxsize,
+                'dropped_droppable': self._dropped_droppable,
+                'terminal_dropped': self._terminal_drops,
+                'wake_failures': self._wake_failures,
+            }
+
     def _enqueue_preserving_terminal(self, msg: dict[str, Any]) -> None:
         """Evict droppable messages to make room; never discard terminal types."""
         msg_type = msg.get('type')
-        survivors: list[dict[str, Any]] = []
-        while True:
-            try:
-                item = self._broadcast_queue.get_nowait()
-            except queue.Empty:
-                break
-            if item.get('type') not in _DROPPABLE_TYPES:
-                survivors.append(item)
+        # 排空→重放→入队整段持锁：否则别的生产者会插进来，把刚建立的
+        # "队列顺序 == 序列号顺序"再打乱（`_offer_locked` 的不变式 ②）。
+        with self._seq_lock:
+            survivors: list[dict[str, Any]] = []
+            while True:
+                try:
+                    item = self._broadcast_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item.get('type') not in _DROPPABLE_TYPES:
+                    survivors.append(item)
 
-        for item in survivors:
-            try:
-                self._broadcast_queue.put_nowait(item)
-            except queue.Full:
-                # 排空→重放窗口内其他生产者并发填回了队列：
-                # 放不下的幸存者直接丢弃并记日志，绝不能让异常沿
-                # queue_broadcast 逃逸杀死调用线程（executor 线程会直接死亡）。
-                _log.warning("broadcast queue refill race, dropping survivor: type=%s", item.get('type'))
-                break
+            for item in survivors:
+                try:
+                    self._broadcast_queue.put_nowait(item)
+                except queue.Full:
+                    # 放不下的幸存者直接丢弃并记日志，绝不能让异常沿
+                    # queue_broadcast 逃逸杀死调用线程（executor 线程会直接死亡）。
+                    _log.warning("broadcast queue refill race, dropping survivor: type=%s", item.get('type'))
+                    break
 
-        try:
-            self._broadcast_queue.put_nowait(msg)
+            if self._offer_locked(msg):
+                queued = True
+            else:
+                queued = False
+        if queued:
             _log.debug("queued broadcast after eviction: type=%s", msg_type or '?')
             self.notify_broadcast()
             return
-        except queue.Full:
-            pass
 
+        # 饱和慢路径：**不**长时间持序列号锁（否则一个线程等 5s 会把所有生产者
+        # 一起堵死）。先扩容，再有界重试非阻塞入队；始终进不去时做一次不带号
+        # 的阻塞入队 —— 宁可这条不参与前端的缺号判定（无 `_seq` 即被跳过），
+        # 也不要像原实现那样在 `put` 超时后把关键消息整条丢掉。
         self._expand_broadcast_queue()
+        _log.error(
+            "broadcast queue saturated, retrying critical message enqueue: type=%s",
+            msg_type or '?',
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if self._offer(msg):
+                return
+            time.sleep(0.05)
+        msg.pop('_seq', None)
         try:
             self._broadcast_queue.put(msg, block=True, timeout=5.0)
+            self.notify_broadcast()
             _log.error(
-                "broadcast queue expanded and blocked to enqueue critical message: type=%s",
+                "broadcast queue still full after expansion, enqueued critical message "
+                "without sequence number: type=%s",
                 msg_type or '?',
             )
-            self.notify_broadcast()
         except queue.Full:
+            self._terminal_drops += 1
+            note_degradation(_DEGRADATION_KEY, "broadcast_terminal_dropped", reason=str(msg_type or '?'))
             _log.error(
                 "broadcast queue still full after expansion, terminal message may be delayed: type=%s",
                 msg_type or '?',
@@ -190,23 +276,35 @@ class BroadcastHub:
 
     def _expand_broadcast_queue(self) -> None:
         """Replace the broadcast queue with a larger one, preserving queued items."""
-        old_queue = self._broadcast_queue
-        old_max = old_queue.maxsize
-        # 限制最大队列大小为 5000，防止无界增长导致 OOM
-        new_max = min(old_max + max(old_max // 4, 100), 5000)
-        new_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=new_max)
-        dropped = 0
-        while True:
-            try:
-                new_queue.put_nowait(old_queue.get_nowait())
-            except queue.Empty:
-                break
-            except queue.Full:
-                # 新队列已满，丢弃最旧的消息
+        # 换队列期间必须挡住其它生产者：否则别的线程往**旧**队列里塞，
+        # 这条消息就随旧队列一起蒸发（而且已经发过号 ⇒ 前端看到缺口却查不到原因）。
+        with self._seq_lock:
+            old_queue = self._broadcast_queue
+            old_max = old_queue.maxsize
+            # 限制最大队列大小为 5000，防止无界增长导致 OOM
+            new_max = min(old_max + max(old_max // 4, 100), 5000)
+            new_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=new_max)
+            dropped = 0
+            while True:
                 try:
-                    old_queue.get_nowait()
-                    dropped += 1
+                    new_queue.put_nowait(old_queue.get_nowait())
                 except queue.Empty:
                     break
-        self._broadcast_queue = new_queue
-        _log.error("broadcast queue expanded: maxsize %d -> %d (dropped %d)", old_max, new_max, dropped)
+                except queue.Full:
+                    # 新队列已满：只能丢最旧的；带号的说明它是关键消息，单独计数
+                    try:
+                        lost = old_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    dropped += 1
+                    if '_seq' in lost:
+                        self._terminal_drops += 1
+                        note_degradation(
+                            _DEGRADATION_KEY,
+                            "broadcast_terminal_dropped",
+                            reason=str(lost.get('type') or '?'),
+                        )
+            self._broadcast_queue = new_queue
+            _log.error(
+                "broadcast queue expanded: maxsize %d -> %d (dropped %d)", old_max, new_max, dropped
+            )

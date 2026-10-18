@@ -714,8 +714,9 @@ def download_ffmpeg() -> bool:
         # 清理临时文件
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            # ignore_errors 下 rmtree 正常不抛；真抛了说明环境异常，留痕
+            _log.debug("ffmpeg tmp cleanup failed %s: %s", tmp_dir, exc)
 
 
 # ──────────────────────────────────────────────────────────────────────

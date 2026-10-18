@@ -367,9 +367,15 @@ def _derive_room_deltas_from_clips(clips: list[dict]) -> dict[str, float]:
     deltas: dict[str, list[float]] = {}
     for c in clips:
         rid = c.get("room_id")
+        raw_start = c.get("start")
+        raw_common = c.get("common_start")
+        if raw_start is None or raw_common is None:
+            # 缺字段就整条跳过：换成 safe_float(0.0) 会把"缺失"伪装成"0 秒"，
+            # 下面的 `start < 0` 拦不住它，均值会被 0 拉偏。
+            continue
         try:
-            start = float(c.get("start"))
-            common = float(c.get("common_start"))
+            start = float(raw_start)
+            common = float(raw_common)
         except (TypeError, ValueError):
             continue
         if not rid or start < 0 or common < 0:
@@ -976,19 +982,19 @@ def _collect_draft_inputs(
                 clip_sources.append(src)
     elif clip_ids:
         for cid in clip_ids:
-            snap = timeline_svc.get_clip_snapshot(cid)
-            if snap is None:
+            clip_snap = timeline_svc.get_clip_snapshot(cid)
+            if clip_snap is None:
                 warnings.append(f"切片 {cid} 不存在或已过期，已跳过")
                 continue
             clip_sources.append(
                 ClipDraftSource(
-                    clip_id=snap.clip_id,
-                    common_start=snap.common_start,
-                    common_end=snap.common_end,
+                    clip_id=clip_snap.clip_id,
+                    common_start=clip_snap.common_start,
+                    common_end=clip_snap.common_end,
                     label=str(labels.get(cid) or "回合"),
                     precision="exact",
                     confirm_status="user_confirmed",
-                    room_id=str(snap.room_id or ""),
+                    room_id=str(clip_snap.room_id or ""),
                 )
             )
 

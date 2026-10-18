@@ -463,16 +463,28 @@ class LSCWebSocketServer:
             return_exceptions=True,
         )
 
-    async def broadcast(self, message_type: str, data: Any):
+    async def broadcast(self, message_type: str, data: Any, seq: int | None = None, coalesced: int | None = None):
         """广播消息给所有客户端。
 
         高频消息（mse_segment/mse_init/rooms_updated/export_progress）不记录 INFO，
         避免日志文件被淹没。确保 INFO 中 MSE 分片记录为 0。
+
+        ``seq``：CLAUDE.md §2.1 的广播序列号（BroadcastHub 在队列入队时分配），
+        注入 ``data._seq`` 供前端缺号检测消费；``coalesced``：drain 合并时该
+        消息所在桶被合并掉的条数，前端据此把「设计内塌号」与「真丢消息」
+        区分开（只有无法解释的缺口才触发全量同步）。
         """
         if not self.clients:
             return
 
         safe_data = _redact_public_payload(data)
+        if isinstance(safe_data, dict) and (seq is not None or coalesced is not None):
+            # 注入到脱敏后的新 dict，不改动调用方传入的对象
+            safe_data = dict(safe_data)
+            if seq is not None:
+                safe_data['_seq'] = int(seq)
+            if coalesced is not None:
+                safe_data['_coalesced'] = int(coalesced)
         message = _json_dumps({
             'type': message_type,
             'data': safe_data
@@ -610,6 +622,7 @@ def drain_merge_broadcasts(bridge):
 
     coalesced: dict[str, dict[str, Any]] = {}
     order: list[str] = []
+    dropped: dict[str, int] = {}
     for msg in messages:
         msg_type = msg.get('type', '')
         data = msg.get('data') if isinstance(msg.get('data'), dict) else {}
@@ -620,8 +633,22 @@ def drain_merge_broadcasts(bridge):
             key = keyed if keyed is not None else f"{msg_type}:{id(msg)}"
         if key not in coalesced:
             order.append(key)
-        coalesced[key] = msg
-    return [coalesced[k] for k in order]
+            coalesced[key] = msg
+        else:
+            # last-value 合并：被合并掉的旧消息其顶层 _seq 随之消失 ⇒ 前端
+            # 按原始序列号看会出现"设计内塌号"。在幸存消息上记账
+            # （_coalesced = 本桶合并掉几条），前端按此预算解释缺口，
+            # 只对无法解释的塌号报警（CLAUDE.md §2.1）。
+            dropped[key] = dropped.get(key, 0) + 1
+            coalesced[key] = msg
+    result: list[dict[str, Any]] = []
+    for key in order:
+        msg = coalesced[key]
+        if dropped.get(key):
+            msg = dict(msg)
+            msg['_coalesced'] = dropped[key]
+        result.append(msg)
+    return result
 
 
 def main():
@@ -649,16 +676,30 @@ def main():
         wake = asyncio.Event()
         bridge.bind_async_wake(loop, wake)
         while True:
-            merged = drain_merge_broadcasts(bridge)
-            if not merged:
-                wake.clear()
-                try:
-                    await asyncio.wait_for(wake.wait(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            for msg in merged:
-                await server.broadcast(msg.get('type'), msg.get('data', {}))
+            try:
+                merged = drain_merge_broadcasts(bridge)
+                if not merged:
+                    wake.clear()
+                    try:
+                        await asyncio.wait_for(wake.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                for msg in merged:
+                    # _seq/_coalesced 透传：§2.1 缺号告警此前因只转发 type/data
+                    # 而整体空转（顶层序列号在广播协程被丢弃）。
+                    await server.broadcast(
+                        msg.get('type'),
+                        msg.get('data', {}),
+                        seq=msg.get('_seq'),
+                        coalesced=msg.get('_coalesced'),
+                    )
+            except Exception:
+                # 广播循环不得因单条意外异常永久停播：不可序列化对象/网络抖动
+                # 杀死协程后队列只进不出，前端停在旧状态且后端无恢复路径
+                # （main.py 主入口的同款兜底，2026-09-24 补齐）。
+                _log.exception("broadcast error in __main__ entry, retrying in 1s")
+                await asyncio.sleep(1)
 
     async def _start_export_queue():
         """启动全局导出队列 worker。"""
@@ -686,19 +727,21 @@ def main():
         try:
             manager.shutdown(timeout_sec=10.0)
         except Exception:
-            pass
+            _log.exception("manager shutdown failed")
         # 与 main.py.stop 同口径：冲刷 1s 去抖窗口内未落盘的 rooms.json
         try:
             from persistence import flush_pending_room_saves
 
             if not flush_pending_room_saves(fsync=True):
                 print("[persistence] 房间配置最终落盘失败", flush=True)
+                _log.error("flush_pending_room_saves returned False: rooms.json 未落盘")
         except Exception:
-            pass
+            # 房间配置丢失的最后一道防线：静默 pass 会让故障零证据
+            _log.exception("flush_pending_room_saves raised: rooms.json 未落盘")
         try:
             loop.call_soon_threadsafe(loop.stop)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("loop stop failed: %s", exc)
 
 
 if __name__ == '__main__':

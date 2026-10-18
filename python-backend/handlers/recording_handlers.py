@@ -11,12 +11,80 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any
 
 from lsc.utils.error_messages import humanize_error
 
 _log = logging.getLogger('lsc.handlers')
+
+_STOP_CONFIRM_POLL_SEC = 1.0
+# 现场证据（2026-09-19 16:17）：16:17:22 下发停止 → 16:17:32 跨线程调用超时
+# → 16:17:34 才真正合段定稿。给 8s 回查窗口，留 4 倍余量。
+_STOP_CONFIRM_MAX_WAIT_SEC = 8.0
+
+
+def read_room_recording_status(manager, room_id: str) -> dict[str, Any]:
+    """录制状态快照：优先走**不经 ``call()``** 的 ``get_recording_status``。
+
+    编排线程忙的时候，任何经 ``call()`` 的读法（含 ``get_room``）都会跟着超时，
+    于是"读结果"本身变成第二个故障点 —— 启动侧已经因为这个改用快照读取
+    （见 ``get_recording_status`` 的 docstring），停止侧此前没有。
+    """
+    status_reader = getattr(manager, 'get_recording_status', None)
+    if callable(status_reader):
+        try:
+            status = status_reader(room_id)
+            if isinstance(status, dict):
+                return status
+        except Exception as exc:  # noqa: BLE001 - 读状态失败要退回房间快照
+            _log.warning(
+                "[录制] get_recording_status failed, fallback to room snapshot: room=%s, error=%s",
+                room_id,
+                exc,
+            )
+
+    room = manager.get_room(room_id)
+    if room is None:
+        return {}
+    return {
+        'exists': True,
+        'is_recording': bool(getattr(room, 'is_recording', False)),
+        'last_error': str(getattr(room, 'last_error', '') or ''),
+        'streamer_name': str(getattr(room, 'streamer_name', '') or ''),
+        'platform_name': str(getattr(room, 'platform_name', '') or ''),
+        'preview_enabled': bool(getattr(room, 'preview_enabled', False)),
+    }
+
+
+async def wait_recording_stopped(
+    status_fn,
+    room_id: str,
+    *,
+    executor=None,
+    poll_sec: float = _STOP_CONFIRM_POLL_SEC,
+    max_wait_sec: float = _STOP_CONFIRM_MAX_WAIT_SEC,
+) -> bool:
+    """跨线程停止调用超时后，回查录制**是否真的停了**。
+
+    `manager.call(...)` 超时只表示"没在预算内拿到返回值"，停止动作仍在编排线程上
+    继续跑完。把它直接答成失败，用户就会在录像其实已完好定稿时看到"停止录制失败"。
+    房间被移除（`exists` 为假）同样按"已停"处理 —— 录制不可能还在进行。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = time.monotonic() + max_wait_sec
+    while True:
+        status = await loop.run_in_executor(executor, status_fn, room_id)
+        if not isinstance(status, dict):
+            return False
+        if not status.get('exists', True):
+            return True
+        if not status.get('is_recording', False):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(poll_sec)
 
 
 def register_recording_handlers(
@@ -27,6 +95,7 @@ def register_recording_handlers(
     broadcast_rooms,
     bridge_executor,
     recording_executor,
+    repair_executor,
     recording_semaphore,
     recording_starting: set,
     recording_wait_queue: list,
@@ -172,29 +241,7 @@ def register_recording_handlers(
                 recording_wait_queue.remove(room_id)
 
         def _read_recording_status() -> dict[str, Any]:
-            status_reader = getattr(manager, 'get_recording_status', None)
-            if callable(status_reader):
-                try:
-                    status = status_reader(room_id)
-                    if isinstance(status, dict):
-                        return status
-                except Exception as exc:
-                    _rec_log.warning(
-                        "[录制] get_recording_status failed, fallback to room snapshot: room=%s, error=%s",
-                        room_id,
-                        exc,
-                    )
-
-            room = manager.get_room(room_id)
-            if room is None:
-                return {}
-            return {
-                'is_recording': bool(getattr(room, 'is_recording', False)),
-                'last_error': str(getattr(room, 'last_error', '') or ''),
-                'streamer_name': str(getattr(room, 'streamer_name', '') or ''),
-                'platform_name': str(getattr(room, 'platform_name', '') or ''),
-                'preview_enabled': bool(getattr(room, 'preview_enabled', False)),
-            }
+            return read_room_recording_status(manager, room_id)
 
         recording_status = await asyncio.get_running_loop().run_in_executor(
             recording_executor, _read_recording_status
@@ -258,8 +305,18 @@ def register_recording_handlers(
             )
         except Exception as exc:
             _log.error("停止录制异常: room_id=%s, error=%s", room_id, exc)
-            broadcast_rooms()
-            return {'success': False, 'error': humanize_error(str(exc))}
+            # 超时 ≠ 失败：停止仍在编排线程上继续跑完（实测超时后 2s 才定稿）。
+            # 先回查真实状态，只有"确实还在录"才答失败，否则把这次操作按成功回。
+            stopped = await wait_recording_stopped(
+                lambda rid: read_room_recording_status(manager, rid),
+                room_id,
+                executor=bridge_executor,
+            )
+            if not stopped:
+                broadcast_rooms()
+                return {'success': False, 'error': humanize_error(str(exc))}
+            _log.warning("停止录制调用超时但回查已停止: room_id=%s", room_id)
+            success = True
         _log.info("停止录制完成: room_id=%s, success=%s", room_id, success)
 
         with recording_history_lock:
@@ -274,7 +331,15 @@ def register_recording_handlers(
             save_recording_history(recording_history)
 
         broadcast_rooms()
-        room = manager.get_room(room_id)
+        # 取路径也要经线程池：`get_room` 走 ``call()``，编排线程仍忙时会在这里再超时
+        # 一次，把已经停成功的请求整个打成异常。读不到就如实回空路径，不影响 success。
+        try:
+            room = await asyncio.get_running_loop().run_in_executor(
+                bridge_executor, manager.get_room, room_id
+            )
+        except Exception as exc:  # noqa: BLE001 - 路径读不到不改变"已停止"这一结论
+            _log.warning("停止录制后读取房间快照失败: room_id=%s, error=%s", room_id, exc)
+            room = None
         return {
             'success': bool(success),
             'room_id': room_id,
@@ -300,8 +365,9 @@ def register_recording_handlers(
             return {'success': False, 'error': '录制文件不存在'}
 
         from lsc.utils.recording_repair import repair_recording
+        # 走专用 repair 池：同步修复可长达 600s，绝不能占住录制启动用的 rec 池
         repaired = await asyncio.get_running_loop().run_in_executor(
-            recording_executor, lambda: repair_recording(path)
+            repair_executor, lambda: repair_recording(path)
         )
         if repaired:
             return {'success': True, 'path': repaired}

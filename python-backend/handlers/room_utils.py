@@ -24,13 +24,6 @@ def expand_user_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def parse_fps(fps_str: str) -> float:
     if not fps_str or fps_str == '原画':
         return 0.0
@@ -133,7 +126,7 @@ def is_auto_exportable_valorant_round(hl: dict) -> bool:
     if hl.get('confirm_status') in ('user_confirmed', 'ocr_confirmed', 'vision_confirmed'):
         if hl.get('is_buy_phase', False):
             return False
-        duration = hl.get('end', 0) - hl.get('start', 0)
+        duration = float(hl.get('end', 0) or 0) - float(hl.get('start', 0) or 0)
         return duration >= 2.0
     return False
 

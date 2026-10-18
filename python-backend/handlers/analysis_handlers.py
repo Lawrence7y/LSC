@@ -27,6 +27,7 @@ from persistence import (
     save_finalization_job,
 )
 
+from lsc.analyzer.registry import get_analyzer
 from lsc.analyzer.valorant_profile import (
     inspect_valorant_profile,
     normalize_valorant_profile,
@@ -549,6 +550,14 @@ def register_analysis_handlers(
                     "completed_at": time.time(),
                 }
             analysis_time = time.monotonic() - t0
+            # 落盘前重取一次路径：分析可能跑几分钟，期间录像会定稿改名
+            # （`_录制中.mp4` → `_至_….mp4`）。沿用启动时捕获的旧名，sidecar 就写到
+            # 一个已不存在的录像名上，永不会被 `get_analysis_result` 读回。
+            analysis_storage_path = (
+                getattr(room, 'record_manifest_path', '')
+                or getattr(room, 'record_output_path', '')
+                or analysis_storage_path
+            )
             save_analysis_results(
                 analysis_storage_path,
                 room_id,
@@ -700,6 +709,12 @@ def register_analysis_handlers(
                     _h.setdefault("transcript", "")
 
                 analysis_time = time.monotonic() - t0
+                # 同上：落盘前重取路径，避免归档改名后写出孤儿 sidecar
+                analysis_storage_path = (
+                    getattr(main_room, 'record_manifest_path', '')
+                    or getattr(main_room, 'record_output_path', '')
+                    or analysis_storage_path
+                )
                 save_analysis_results(
                     analysis_storage_path, main_room_id, mode, highlights,
                     analysis_time_sec=analysis_time, weights=weights if weights else None,
@@ -847,6 +862,21 @@ def register_analysis_handlers(
         )
         if not main_room_id:
             return {'error': 'room_id is required'}
+
+        # 能力闸（2026-09-18 债务收口 §11.18-D）：持续分析的扫描实现目前**只覆盖**
+        # `game='valorant' + mode='valorant_round'`（见 `room_handler._do_scan` 的分支），
+        # 且 `GenericAnalyzerPlugin` 自己声明 `realtime_continuous=False`（它只有
+        # `analyze_file` 的录制后路径）。修前这里照样启动循环：每轮落到
+        # `_detect_rounds_by_audio_rhythm` 那个恒返回 [] 的废弃兼容包装 ⇒ UI 进度在走、
+        # 日志每轮 WARN、结果永远 0 条，用户以为"在分析"。现在按声明如实拦下。
+        plugin = get_analyzer(game)
+        scan_path_supported = game == 'valorant' and mode == 'valorant_round'
+        if not scan_path_supported or not plugin.capabilities().realtime_continuous:
+            return {
+                'success': False,
+                'error': '当前只有「无畏契约 · 回合」模式支持直播中持续分析；'
+                         '通用场景请先停止录制再做场景分析',
+            }
 
         requested_target_ids = [str(room_id) for room_id in target_room_ids if room_id]
         if main_room_id not in requested_target_ids:

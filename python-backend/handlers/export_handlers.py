@@ -21,6 +21,7 @@ from typing import Any
 from lsc.config import ExportProfile
 from lsc.core.recording_layout import resolve_clip_output_dir
 from lsc.core.services.mse_streamer import _check_nvenc
+from lsc.utils.coerce import safe_float
 from lsc.utils.error_messages import humanize_error
 
 _log = logging.getLogger('lsc.handlers')
@@ -105,6 +106,9 @@ def _reset_export_batch(total: int, batch_id: str) -> None:
     with _export_stats_lock:
         _export_total = total
         _export_completed = 0
+        # 2026-09-18 修：`batch_id` 形参此前被接收后直接丢弃 ⇒ `_notify_export_overall`
+        # 广播的 `batch_id` 永远是上一次的残留（初值空串），前端无法把进度归到批次。
+        _export_batch_id = batch_id
 
 # §8.2 降级补偿：无墙钟快照时用固定 preview_latency 近似预览流相对录制流的延迟
 _PREVIEW_LATENCY_FALLBACK = 2.0
@@ -262,14 +266,17 @@ async def _export_queue_worker_impl():
                         _export_in_flight -= 1
         except Exception as exc:
             _log.error("导出队列异常：%s", exc, exc_info=True)
+            # clip_failed 是 §11.4 点名"始终通知"的关键事件：FFmpeg 原文不得
+            # 直接弹给用户，经 humanize_error 转中文友好提示（2026-09-24 修复）。
+            friendly_error = humanize_error(str(exc))
             if job_id:
                 with _export_jobs_lock:
                     export_jobs.pop(job_id, None)
                 room_id = job.get('room_id', '')
-                _set_export_job_state(job_id, 'failed', room_id=room_id, error=f'导出异常：{exc}')
+                _set_export_job_state(job_id, 'failed', room_id=room_id, error=f'导出异常：{friendly_error}')
                 server = _ctx['server']  # type: ignore[index]
                 asyncio.run_coroutine_threadsafe(server.broadcast('clip_failed', {
-                    'room_id': room_id, 'job_id': job_id, 'error': f'导出异常：{exc}',
+                    'room_id': room_id, 'job_id': job_id, 'error': f'导出异常：{friendly_error}',
                 }), asyncio.get_running_loop())
         finally:
             _export_queue.task_done()
@@ -693,8 +700,8 @@ def register_export_handlers(
     async def handle_export_clip(data):
         """导出视频切片 — 统一入队到全局导出队列。"""
         room_id = data.get('room_id')
-        start_sec = _safe_float(data.get('start', 0))
-        end_sec = _safe_float(data.get('end', 0))
+        start_sec = safe_float(data.get('start', 0))
+        end_sec = safe_float(data.get('end', 0))
         label = data.get('label', 'clip')
         preset_id = data.get('preset_id', '')
         job_id = data.get('job_id', '')
@@ -776,13 +783,6 @@ def register_export_handlers(
             return {'success': False, 'error': 'job_ids must be a list', 'jobs': []}
         job_ids = [str(job_id) for job_id in raw_ids[:100] if str(job_id)]
         return {'success': True, 'jobs': _get_export_job_states(job_ids)}
-
-
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def get_queue_export():
