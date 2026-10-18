@@ -90,6 +90,28 @@ export function pickReferenceRoomId(
 }
 
 /**
+ * P3-2（2026-09-18）：未勾选任何房间时，底部时间线可以自动跟随哪个房间。
+ *
+ * 规则刻意保守：**候选唯一才自动绑定**。多个候选返回 null，由 UI 提示用户勾选 —— 猜错房间比
+ * 空轴更糟（时间线轴、切片色带、seek 会落到用户没在看的那一路）。
+ * 候选优先级：录制中的房间 > 已开预览且已连接（有画面、有轴）的房间。
+ */
+export function pickAutoBindRoomId<
+  T extends {
+    room_id: string
+    is_recording?: boolean
+    preview_enabled?: boolean
+    is_connected?: boolean
+  },
+>(rooms: readonly T[]): string | null {
+  const recording = rooms.filter((room) => room.is_recording)
+  const candidates = recording.length > 0
+    ? recording
+    : rooms.filter((room) => room.preview_enabled && room.is_connected)
+  return candidates.length === 1 ? candidates[0].room_id : null
+}
+
+/**
  * 长内容滑动窗：仅当 playhead 越出 [prevWs, prevWs+maxWindow] 时平移，
  * 禁止 playhead - 0.15*max 这种持续钉位（会导致拖拽时圆点相对位置不动）。
  */

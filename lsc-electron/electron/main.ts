@@ -871,17 +871,13 @@ function spawnBackend(): void {
     }
   }
 
-  // 捕获 stdout/stderr 写入日志
-  if (backendProcess.stdout) {
-    backendProcess.stdout.on('data', consumeBackendOutput)
-  }
-  if (backendProcess.stderr) {
-    backendProcess.stderr.on('data', consumeBackendOutput)
-  }
-
-  // 子进程意外退出时记录退出码
-  backendProcess.on('exit', (code, signal) => {
-    writeLog(`[backend-exit] code=${code} signal=${signal}\n`)
+  // 子进程意外退出 / spawn 失败时统一清理（幂等，可被 exit 与 error 双调）
+  const goneProc = backendProcess
+  const handleBackendGone = (label: string) => {
+    // 身份守卫：若这期间又 spawn 了新后端（restart-backend 竞态），
+    // 旧进程的迟到事件不得把新句柄清掉。
+    if (backendProcess !== goneProc) return
+    writeLog(`[backend-gone] ${label}\n`)
     try {
       backendLogStream?.end()
     } catch (err) {
@@ -900,10 +896,29 @@ function spawnBackend(): void {
     } catch {
       // 状态文件可能已由下一实例接管。
     }
+  }
+
+  // 捕获 stdout/stderr 写入日志
+  if (backendProcess.stdout) {
+    backendProcess.stdout.on('data', consumeBackendOutput)
+  }
+  if (backendProcess.stderr) {
+    backendProcess.stderr.on('data', consumeBackendOutput)
+  }
+
+  // 子进程意外退出时记录退出码
+  backendProcess.on('exit', (code, signal) => {
+    writeLog(`[backend-exit] code=${code} signal=${signal}\n`)
+    handleBackendGone(`exit code=${code} signal=${signal}`)
   })
 
   backendProcess.on('error', (err) => {
     writeLog(`[backend-error] ${err}\n`)
+    // spawn 失败（解释器缺失/被 AV 拦截）时 Node 不保证再发 exit：句柄不置空
+    // 会让 spawnBackend 的存活守卫恒真 ⇒ 后端再也起不来，只能等
+    // restart-backend 的 killBackendAndWait(8s) 超时才恢复（2026-09-24 修复）。
+    // 清理与 exit 同口径且幂等（双调无害）。
+    handleBackendGone(`error ${err}`)
   })
 }
 
@@ -1934,22 +1949,83 @@ function createWindow() {
     appLog(logLevel, 'renderer', message);
   });
 
-  // 加载失败自动重试（处理 Vite 开发服务器竞态）
+  // 加载失败 / 渲染崩溃的自愈（2026-09-24 修复）：
+  // 修前 did-fail-load 的重试被 VITE_DEV_SERVER_URL 门死为 dev-only、
+  // render-process-gone 只打日志 ⇒ 生产环境 GPU 崩溃或 dist 资源异常时，
+  // 进程+托盘活着但**没有任何窗口**，用户只能任务管理器杀进程。
+  let _readyToShowFired = false
   let _loadRetries = 0
   const _MAX_LOAD_RETRIES = 3
+
+  const _loadEntry = (): Promise<void> => {
+    const devUrl = process.env.VITE_DEV_SERVER_URL
+    if (devUrl) return mainWindow!.loadURL(devUrl)
+    const indexPath = path.join(__dirname, '../../dist/index.html')
+    return mainWindow!.loadFile(indexPath)
+  }
+
+  // 先建后销：销毁旧窗口再创建会有 zero-window 瞬态，可能触发
+  // window-all-closed 把整个应用退掉
+  const _recreateWindow = () => {
+    appLog('WARN', 'createWindow', '重建主窗口（先建后销）')
+    const previous = mainWindow
+    createWindow()
+    if (previous && !previous.isDestroyed()) {
+      previous.destroy()
+    }
+  }
+
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
     appLog('ERROR', 'createWindow', `LOAD FAILED: code=${errorCode} desc=${errorDescription} url=${validatedURL}`);
     const retriable = [-3, -102, -106, -111] // ERR_NETWORK_CHANGED, CONNECTION_REFUSED, CONNECTION_RESET, CONNECTION_CLOSED
-    if (retriable.includes(errorCode) && process.env.VITE_DEV_SERVER_URL && _loadRetries < _MAX_LOAD_RETRIES) {
+    // 生产同样重试：修前只有 dev 分支会重试，生产的一次性 loadFile 失败后
+    // 窗口永远停在 show:false
+    if (retriable.includes(errorCode) && _loadRetries < _MAX_LOAD_RETRIES) {
       _loadRetries++
       const delay = Math.pow(2, _loadRetries - 1) * 1000
       appLog('WARN', 'createWindow', `正在重试加载 (${_loadRetries}/${_MAX_LOAD_RETRIES})，${delay}ms 后重试`)
-      setTimeout(() => mainWindow!.loadURL(process.env.VITE_DEV_SERVER_URL!), delay)
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        _loadEntry().catch(err => {
+          appLog('ERROR', 'createWindow', `重试加载失败: ${err.message}`)
+        })
+      }, delay)
+    } else if (!_readyToShowFired && retriable.includes(errorCode)) {
+      // 重试耗尽仍未出首帧：重建窗口（旧渲染体可能已损坏，空窗口无意义）
+      appLog('ERROR', 'createWindow', '加载重试耗尽且无首帧，重建窗口')
+      _recreateWindow()
     }
   })
 
-  mainWindow.webContents.on('render-process-gone' as any, () => {
-    appLog('ERROR', 'createWindow', `RENDERER CRASHED`);
+  mainWindow.webContents.on('render-process-gone' as any, (_event: any, details: any) => {
+    const reason = details?.reason || 'unknown'
+    const exitCode = details?.exitCode
+    appLog('ERROR', 'createWindow', `RENDERER CRASHED reason=${reason} code=${exitCode}`);
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      _recreateWindow()
+      return
+    }
+    // 未出首帧就崩溃：直接重建比 reload 更干净
+    if (!_readyToShowFired) {
+      _recreateWindow()
+      return
+    }
+    // 已出首帧：优先 reload 保住窗口（后端仍在跑，重连后会 rooms_loaded 全量同步）
+    if (_loadRetries < _MAX_LOAD_RETRIES) {
+      _loadRetries++
+      const delay = Math.pow(2, _loadRetries - 1) * 1000
+      appLog('WARN', 'createWindow', `渲染崩溃，${delay}ms 后重载 (${_loadRetries}/${_MAX_LOAD_RETRIES})`)
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) {
+          _recreateWindow()
+          return
+        }
+        mainWindow.webContents.reloadIgnoringCache()
+      }, delay)
+    } else {
+      appLog('ERROR', 'createWindow', '崩溃重载次数耗尽，重建窗口')
+      _recreateWindow()
+    }
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -1965,6 +2041,7 @@ function createWindow() {
   }
 
   mainWindow.once('ready-to-show', () => {
+    _readyToShowFired = true
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show();
       appLog('INFO', 'createWindow', '窗口准备就绪并显示');

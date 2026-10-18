@@ -1,171 +1,21 @@
 import { useEffect, useState } from 'react'
 import { Alert, Card, Typography, Popover } from 'antd'
 import { ContinuousAnalysisStatus } from '@/types'
-import { calculateConfirmedAnalysisPercent, inFlightScanWindow } from '@/utils/analysisProgress'
-import { useI18n, type I18nT } from '@/i18n'
+import {
+  confirmedAnalysisPercent,
+  derivePrimaryStatus,
+  formatDuration,
+  formatFps,
+  formatThroughput,
+  hasFixedScanRange,
+  inFlightScanWindow,
+  ROUND_PHASE_LABEL,
+  type Tone,
+} from '@/utils/analysisProgress'
+import type { ClipExportSummary as ExportSummary } from '@/utils/clipExportPolicy'
+import { useI18n } from '@/i18n'
 import { HexParticleProgress } from '@/components/HexParticleProgress'
 
-export interface ExportSummary {
-  /** 切片列表中待确认的条数（不是导出入队） */
-  pendingConfirm: number
-  /** 已进入导出队列 */
-  queued: number
-  exporting: number
-  completed: number
-  failed: number
-  /** 切片列表条数（入列） */
-  listed: number
-}
-
-function formatDuration(seconds: number) {
-  if (!Number.isFinite(seconds) || seconds <= 0) return '0s'
-  const total = Math.floor(seconds)
-  const h = Math.floor(total / 3600)
-  const m = Math.floor((total % 3600) / 60)
-  const s = total % 60
-  return h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`
-}
-
-function formatThroughput(value: number | undefined) {
-  return Number.isFinite(value) ? `${Number(value).toFixed(2)}x` : '–'
-}
-
-function formatFps(value: number | undefined) {
-  return Number.isFinite(value) && Number(value) > 0 ? `${Number(value).toFixed(1)} FPS` : '–'
-}
-
-const ROUND_PHASE_LABEL: Record<string, string> = {
-  unknown: '寻找回合',
-  buy: '买枪期',
-  pre_combat: '等待开战',
-  combat: '交战中',
-  post_combat: '等待结束',
-  intermission: '局间暂停',
-}
-
-type Tone = 'idle' | 'active' | 'warning' | 'success' | 'error'
-
-interface PrimaryStatus {
-  verb: string
-  detail: string
-  tone: Tone
-  /** 引导动作：confirm=去确认切片 */
-  nextAction?: 'confirm'
-}
-
-/**
- * 单一状态推导入口：把 phase / analysis_stage / scan_reason / round_phase
- * 多套后端状态收敛为「动词 + 一句人话 + 语气」，compact 与卡片模式共用。
- * 注意：`stage === 'xxx'` 等比较分支中的中文字符串是后端协议值，禁止翻译。
- */
-function derivePrimaryStatus(current: ContinuousAnalysisStatus, summary: ExportSummary, t: I18nT): PrimaryStatus {
-  const stage = current.analysis_stage ?? ''
-  const listed = summary.listed || (current.total_highlights ?? 0)
-  const cpuFallback = current.provider === 'CPUExecutionProvider'
-    || current.provider_warning?.includes('CPUExecutionProvider')
-
-  if (current.phase === 'stalled' || current.stalled) {
-    return {
-      verb: t('未检测到对局'),
-      detail: current.round_phase_detail || t('连续重锚无 buy 信号，已暂停扫描'),
-      tone: 'warning',
-    }
-  }
-  if (current.phase === 'error' && current.finalization_recoverable) {
-    return { verb: t('收尾失败'), detail: t('尾部回合未补完，可点击恢复收尾继续补扫'), tone: 'error' }
-  }
-  if (current.phase === 'checkpoint_saved' || current.finalization_state === 'checkpoint_saved') {
-    return { verb: t('收尾待恢复'), detail: t('收尾检查点已保存，点击恢复继续补扫；这不是已完成'), tone: 'warning' }
-  }
-  if (current.phase === 'error' || current.error) {
-    return { verb: t('持续分析异常'), detail: current.error ?? t('请重试或查看日志'), tone: 'error' }
-  }
-  if (current.phase === 'completed') {
-    if (summary.pendingConfirm > 0) {
-      return { verb: t('分析完成'), detail: t('入列 {listed} 回合 · {pending} 条待确认', { listed, pending: summary.pendingConfirm }), tone: 'warning', nextAction: 'confirm' }
-    }
-    return { verb: t('已完成'), detail: t('入列 {listed} 回合', { listed }), tone: 'success' }
-  }
-  if (current.phase === 'stopping' || stage === '停止中') {
-    return { verb: t('停止中…'), detail: t('等待扫描退出并释放任务槽'), tone: 'idle' }
-  }
-  if (stage === '异常退出' || stage === '视觉模型不可用') {
-    return { verb: t('分析异常退出'), detail: t('请重新启动持续分析，或查看日志排查原因'), tone: 'error' }
-  }
-  if (stage === '收尾失败') {
-    return { verb: t('收尾失败'), detail: t('可重新启动持续分析'), tone: 'error' }
-  }
-  if (current.degraded_mode === 'audio_only' || stage === '降级追赶') {
-    return {
-      verb: t('降级追赶中'),
-      detail: t('上一轮扫描超时，已切换短窗音频分析并继续推进'),
-      tone: 'warning',
-    }
-  }
-  if (current.last_scan_error) {
-    return {
-      verb: t('扫描恢复中'),
-      detail: t('上一轮超时 · 已自动缩小分析窗口'),
-      tone: 'warning',
-    }
-  }
-  if (cpuFallback) {
-    return {
-      verb: t('CPU 慢速分析'),
-      detail: t('GPU 推理不可用，分析可能逐渐落后录制'),
-      tone: 'warning',
-    }
-  }
-  if (stage === '等待收尾') {
-    return { verb: t('等待收尾'), detail: t('请先停录后再完成收尾扫描'), tone: 'idle', nextAction: undefined }
-  }
-  if (current.phase === 'finalizing' || stage === '收尾中') {
-    const elapsed = Math.floor(current.scan_elapsed_sec ?? 0)
-    return {
-      verb: t('收尾中'),
-      detail: elapsed > 0
-        ? t('最终回合确认 · 已运行 {elapsed}s（首次约 1–2 分钟）', { elapsed })
-        : t('停录后做一次收尾扫描，尾部回合补入列表'),
-      tone: 'active',
-    }
-  }
-  if (stage === '等待新录制') {
-    return { verb: t('等待录制'), detail: t('开始录制后自动跟进分析'), tone: 'idle' }
-  }
-  if (stage === '等待可分析片段' || stage === '等待新片段') {
-    return { verb: t('等待片段'), detail: t('录制写入中，凑够窗口即扫描'), tone: 'idle' }
-  }
-  const detectedPart = Number.isFinite(current.last_detected_in_sec)
-    && Number.isFinite(current.last_detected_out_sec)
-    ? t('最近切片：入 {in} · 出 {out}', {
-      in: formatDuration(current.last_detected_in_sec!),
-      out: formatDuration(current.last_detected_out_sec!),
-    })
-    : ''
-  const window = inFlightScanWindow(current)
-  const windowPart = window
-    ? t('本窗 {from}–{to}', { from: formatDuration(window.from), to: formatDuration(window.to) })
-    : ''
-  const reasonPart = current.scan_reason === 'audio_increment'
-    ? t('音频推进')
-    : current.scan_reason === 'finalize'
-      ? t('收尾')
-      : ''
-  const phasePart = current.mode === 'valorant_round'
-    ? (current.round_phase_detail || t(ROUND_PHASE_LABEL[current.round_phase || ''] || ''))
-    : ''
-  // 音频待复核回合数（P3: 回合边界精度指示，旧称待调）
-  // 待调：保持向后兼容 guard 断言
-  const audioPendingPart = (current.audio_pending_rounds ?? 0) > 0
-    ? t('{count} 个待 OCR 复核', { count: current.audio_pending_rounds ?? 0 })
-    : ''
-  return {
-    verb: current.scan_running ? t('扫描中') : t('运行中'),
-    detail: [windowPart, detectedPart, reasonPart, phasePart, audioPendingPart].filter(Boolean).join(' · '),
-    tone: 'active',
-    nextAction: summary.pendingConfirm > 0 ? 'confirm' : undefined,
-  }
-}
 
 const TONE_COLOR: Record<Tone, string> = {
   idle: 'var(--text-tertiary)',
@@ -260,12 +110,9 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
   const recorded = current.recorded_duration ?? 0
   const lagSec = current.analysis_lag_sec ?? Math.max(0, recorded - analyzed)
   const scanWindow = inFlightScanWindow(current)
-  const hasFixedScanRange = !current.running
-    || current.phase === 'finalizing'
-    || current.phase === 'completed'
-  const livePercent = calculateConfirmedAnalysisPercent(analyzed, recorded)
+  const fixedRange = hasFixedScanRange(current)
   // 直播录制的终点持续向后移动；即便暂时追平，也不能用 100% 暗示任务完成。
-  const confirmedPercent = hasFixedScanRange ? livePercent : Math.min(98, livePercent)
+  const confirmedPercent = confirmedAnalysisPercent(analyzed, recorded, fixedRange)
   const listed = summary.listed || (current.total_highlights ?? 0)
   const pendingN = summary.pendingConfirm > 0 ? summary.pendingConfirm : (current.pending_rounds ?? 0)
   const exportActive = summary.queued > 0 || summary.exporting > 0 || summary.failed > 0
@@ -516,7 +363,7 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
         {/* ② 实时时序与跟进窗口 (Timeline Duration) */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0, fontSize: 11 }}>
           <span style={{ color: 'var(--text-tertiary)' }}>
-            {!hasFixedScanRange ? t('实时跟进') : t('扫描')}
+            {!fixedRange ? t('实时跟进') : t('扫描')}
           </span>
           <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 500, color: 'var(--text-secondary)' }}>
             {formatDuration(analyzed)} / {formatDuration(recorded)}
@@ -639,7 +486,7 @@ export function AnalysisProgress({ status, compact = false, exportSummary, onGoT
               <div style={{ width: `${confirmedPercent}%`, height: '100%', background: TONE_COLOR[ps.tone === 'idle' ? 'active' : ps.tone], borderRadius: 'var(--radius-xs, 6px)', transition: 'width 0.5s ease' }} />
             </div>
             <Typography.Text type="secondary">
-              {!hasFixedScanRange ? `${t('实时跟进')} · ` : ''}
+              {!fixedRange ? `${t('实时跟进')} · ` : ''}
               {t('后台已确认分析 {analyzed} / 已录 {recorded}', { analyzed: formatDuration(analyzed), recorded: formatDuration(recorded) })}
               {scanWindow ? ` · ${t('本窗 {from}–{to}', { from: formatDuration(scanWindow.from), to: formatDuration(scanWindow.to) })}` : ''}
               {current.scan_running ? ` · ${t('本轮扫描已用 {sec}', { sec: formatDuration(current.scan_elapsed_sec ?? 0) })}` : ''}

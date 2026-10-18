@@ -560,61 +560,7 @@ export function getAligner(): PreviewAudioAligner {
   return _instance
 }
 
-// ── 漂移修正 ──────────────────────────────────────────────────────
-// 模块级可取消定时器，防止多次对齐堆叠。
-// WeakMap：video 元素销毁后键自动释放，避免短生命周期元素被 Map 持有泄漏。
-const _driftCorrectionTimers: WeakMap<HTMLVideoElement, ReturnType<typeof setTimeout>> = new WeakMap()
-
-export function cancelDriftCorrection(video: HTMLVideoElement): void {
-  const timer = _driftCorrectionTimers.get(video)
-  if (timer) {
-    clearTimeout(timer)
-    _driftCorrectionTimers.delete(video)
-    video.playbackRate = 1.0
-  }
-}
-
-export function applyOffsetWithDriftCorrection(video: HTMLVideoElement, offset: number): void {
-  // 先取消之前的漂移修正
-  cancelDriftCorrection(video)
-
-  const originalTime = video.currentTime
-  const newTime = Math.max(originalTime - offset, 0)
-
-  if (Math.abs(newTime - originalTime) < 0.05) return
-
-  let seeked = false
-
-  const onSeeked = () => {
-    if (seeked) return
-    seeked = true
-    video.removeEventListener('seeked', onSeeked)
-
-    const actualTime = video.currentTime
-    const appliedOffset = originalTime - actualTime
-    const residual = offset - appliedOffset
-
-    if (Math.abs(residual) > 0.05) {
-      // 缩小 playbackRate 调整范围到 [0.95, 1.05]，用户不可感知
-      const maxCorrection = 0.05
-      const correctionDuration = Math.abs(residual) / maxCorrection
-      const rate = residual > 0 ? 1 - maxCorrection : 1 + maxCorrection
-      video.playbackRate = rate
-      const timer = setTimeout(() => {
-        video.playbackRate = 1.0
-        _driftCorrectionTimers.delete(video)
-      }, correctionDuration * 1000)
-      _driftCorrectionTimers.set(video, timer)
-    }
-  }
-
-  video.addEventListener('seeked', onSeeked)
-  try {
-    video.currentTime = newTime
-  } catch {
-    video.removeEventListener('seeked', onSeeked)
-  }
-  video.play().catch((e) => {
-    console.warn('[PreviewAudioAligner] video.play() failed after drift seek:', e)
-  })
-}
+// 对齐偏移落到播放头的唯一入口在 `previewAlignment.applyAlignmentSeek`。
+// 这里曾有 55 行 `applyOffsetWithDriftCorrection`（seek 后量残余差、用 playbackRate ±5%
+// 平滑追赶），从写下来那天起就没有任何调用点，却有三份文档按"前端就是这么落的"描述它。
+// 已删；残余差修正若要真做，需多房间真机验证速率微调的观感后再上。

@@ -45,11 +45,18 @@ def test_add_clip_and_export_snapshot_content_offset() -> None:
     clip_type = types.split("export interface ClipSegment", 1)[1].split("export interface StreamInfo", 1)[0]
     assert "content_offset" in clip_type
 
+    # 快照 `content_offset` 的构造本体 2026-09-19 搬进 `utils/manualClip.ts`
+    # （由 `manualClip.test.ts` 断言"缺失按 0 / 有值原样冻结"），这里守"添加路径确实走它"。
     add_body = workbench.split("const handleAddClip = useCallback", 1)[1].split("}, [addClip])", 1)[0]
-    assert "content_offset:" in add_body
+    assert "buildManualClip(room" in add_body
+    manual_clip = (ROOT / "lsc-electron/src/utils/manualClip.ts").read_text(encoding="utf-8")
+    assert "content_offset: room.content_offset ?? 0," in manual_clip
 
+    # 导出请求里冻结 content_offset 的本体现在在 utils/clipExportFlow.ts
     export_many = workbench.split("const handleExportMany", 1)[1].split("const handleOpenExportFile", 1)[0]
-    assert "content_offset: clip.content_offset" in export_many
+    assert "buildExportRequest(clip," in export_many
+    flow = (ROOT / "lsc-electron/src/utils/clipExportFlow.ts").read_text(encoding="utf-8")
+    assert "content_offset: clip.content_offset," in flow
 
     export_clip = handler.split("async def handle_export_clip", 1)[1].split("@server.on(", 1)[0]
     assert "content_offset" in export_clip

@@ -44,7 +44,7 @@ def test_first_allocation_is_monotonic_per_room(monkeypatch):
     labels = [helper(f"{rid}:k{i}", rid, "EDG夺冠回顾", i, is_first=True) for i in range(1, 5)]
     assert len(set(labels)) == 4, f"首发标签必须互不相同: {labels}"
     # 序号必须随分配单调递增（R01→R02→R03→R04）
-    indexes = [int(l.rsplit("R", 1)[1]) for l in labels]
+    indexes = [int(label.rsplit("R", 1)[1]) for label in labels]
     assert indexes == sorted(indexes) and len(set(indexes)) == 4
 
 

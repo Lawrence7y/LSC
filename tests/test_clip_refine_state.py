@@ -169,7 +169,8 @@ def test_save_bilibili_cookies_rejects_oversized_input():
 
 def test_cookie_save_refreshes_invalidated_provider(monkeypatch):
     """Saving replacement cookies must clear the provider revoke marker."""
-    from lsc.platforms import cookie_helper, credentials
+    from handlers import credential_handlers as ch
+
     from lsc.platforms.credentials import CredentialStatus
 
     refreshed: list[str] = []
@@ -179,12 +180,8 @@ def test_cookie_save_refreshes_invalidated_provider(monkeypatch):
             refreshed.append(platform)
             return SimpleNamespace(status=CredentialStatus.AVAILABLE)
 
-    monkeypatch.setattr(
-        cookie_helper,
-        "save_douyin_cookies_from_text",
-        lambda _raw: {"count": 1},
-    )
-    monkeypatch.setattr(credentials, "get_default_credential_provider", lambda: Provider())
+    monkeypatch.setattr(ch, "save_douyin_cookies_from_text", lambda _raw: {"count": 1})
+    monkeypatch.setattr(ch, "get_default_credential_provider", lambda: Provider())
     server, _ = _register_refine_handlers()
 
     result = asyncio.run(
@@ -197,7 +194,8 @@ def test_cookie_save_refreshes_invalidated_provider(monkeypatch):
 
 
 def test_bilibili_cookie_save_refreshes_invalidated_provider(monkeypatch):
-    from lsc.platforms import cookie_helper, credentials
+    from handlers import credential_handlers as ch
+
     from lsc.platforms.credentials import CredentialStatus
 
     refreshed: list[str] = []
@@ -207,12 +205,8 @@ def test_bilibili_cookie_save_refreshes_invalidated_provider(monkeypatch):
             refreshed.append(platform)
             return SimpleNamespace(status=CredentialStatus.AVAILABLE)
 
-    monkeypatch.setattr(
-        cookie_helper,
-        "save_bilibili_cookies_from_text",
-        lambda _raw: {"count": 1},
-    )
-    monkeypatch.setattr(credentials, "get_default_credential_provider", lambda: Provider())
+    monkeypatch.setattr(ch, "save_bilibili_cookies_from_text", lambda _raw: {"count": 1})
+    monkeypatch.setattr(ch, "get_default_credential_provider", lambda: Provider())
     server, _ = _register_refine_handlers()
 
     result = asyncio.run(
@@ -238,7 +232,8 @@ def test_save_huya_cookies_rejects_oversized_input():
 
 
 def test_huya_cookie_save_refreshes_invalidated_provider(monkeypatch):
-    from lsc.platforms import cookie_helper, credentials
+    from handlers import credential_handlers as ch
+
     from lsc.platforms.credentials import CredentialStatus
 
     refreshed: list[str] = []
@@ -248,12 +243,8 @@ def test_huya_cookie_save_refreshes_invalidated_provider(monkeypatch):
             refreshed.append(platform)
             return SimpleNamespace(status=CredentialStatus.AVAILABLE)
 
-    monkeypatch.setattr(
-        cookie_helper,
-        "save_huya_cookies_from_text",
-        lambda _raw: {"count": 1},
-    )
-    monkeypatch.setattr(credentials, "get_default_credential_provider", lambda: Provider())
+    monkeypatch.setattr(ch, "save_huya_cookies_from_text", lambda _raw: {"count": 1})
+    monkeypatch.setattr(ch, "get_default_credential_provider", lambda: Provider())
     server, _ = _register_refine_handlers()
 
     result = asyncio.run(

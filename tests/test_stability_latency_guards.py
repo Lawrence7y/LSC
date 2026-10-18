@@ -11,9 +11,29 @@ TIMELINE_HANDLERS = (ROOT / "python-backend" / "handlers" / "timeline_handlers.p
 RECORDING_SERVICE = (ROOT / "lsc" / "core" / "services" / "recording_service.py").read_text(encoding="utf-8")
 MSE_STREAMER = (ROOT / "lsc" / "core" / "services" / "mse_streamer.py").read_text(encoding="utf-8")
 SHARED_INGEST = (ROOT / "lsc" / "core" / "services" / "shared_ingest.py").read_text(encoding="utf-8")
+CAPTURE = (ROOT / "lsc" / "recorder" / "capture.py").read_text(encoding="utf-8")
 USE_WS = (ROOT / "lsc-electron" / "src" / "hooks" / "useWebSocket.ts").read_text(encoding="utf-8")
 APP_STORE = (ROOT / "lsc-electron" / "src" / "store" / "appStore.ts").read_text(encoding="utf-8")
 WORKBENCH = (ROOT / "lsc-electron" / "src" / "pages" / "Workbench" / "index.tsx").read_text(encoding="utf-8")
+
+
+def test_read_side_pipes_stay_blocking():
+    """读侧不得设 O_NONBLOCK（2026-09-24 修复，CLAUDE.md §11.2）。
+
+    stdout/stderr 各由专用读线程按阻塞 EOF 约定消费；非阻塞让无数据时的
+    read 返回 None/b'' 被误判 EOF，读线程提前退出 ⇒ 预览停滞到 15s
+    watchdog 才报错 / capture 的 stderr 线程死后 FFmpeg 写满管道假停滞。
+    """
+    assert "set_stream_nonblocking" not in MSE_STREAMER
+    assert "set_stream_nonblocking" not in CAPTURE
+    # 写侧（shared_ingest stdin）的非阻塞 + BlockingIOError 重试是正确的，保留
+    assert "set_stream_nonblocking(proc.stdin)" in SHARED_INGEST
+    assert "BlockingIOError" in SHARED_INGEST
+
+
+def test_capture_stderr_reader_exit_is_logged():
+    """stderr 读线程退出必须留 debug 日志：它的死亡不可观测 = 录制假停滞无证据。"""
+    assert "capture stderr reader exited" in CAPTURE
 
 
 def test_export_start_failure_broadcasts_clip_failed():

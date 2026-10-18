@@ -8,7 +8,9 @@ import type { RoomPipelineHealth, RoomSession, RuntimeEventPayload } from '@/typ
 export const wsClient = _wsClient
 import { useAppStore } from '@/store/appStore'
 import { removePlayhead } from '@/utils/playheadStore'
+import { MseCacheStore } from '@/utils/mseCacheStore'
 import { performShutdownCleanup } from '@/utils/shutdownCleanup'
+import { clearSinkRestartBudget } from '@/utils/previewRecovery'
 import { t } from '@/i18n'
 
 /**
@@ -28,9 +30,6 @@ let _initialConnectStarted = false
 let _sharedHandlersRefCount = 0
 let _sharedHandlersCleanup: (() => void) | null = null
 let _shutdownCleanupPromise: Promise<void> | null = null
-
-// 广播序列号追踪：检测丢消息并触发强制同步
-let _lastBroadcastSeq: number | null = null
 
 // Runtime events may arrive after a reconnect or alongside a room snapshot.
 // Keep the newest generation/timestamp per room so stale events cannot roll
@@ -125,17 +124,8 @@ const _mseInitRetryTimers: Record<string, ReturnType<typeof setTimeout>> = {}
 
 // 模块级 MSE init 段缓存：消除 mse_init 早于 VideoPreview 挂载到达的竞态。
 // key = roomId, value = ArrayBuffer init segment
-const _mseInitCache: Record<string, ArrayBuffer> = {}
-const _mseInitCacheTime: Record<string, number> = {}
-
-// 模块级 MSE media 段缓存：消除 mse_segment 早于 VideoPreview 挂载到达的竞态。
-// key = roomId, value = ArrayBuffer media segments（最多 10 个，约 5 秒）。
-// player 注册时会回放缓存，避免初始几秒丢帧导致黑屏。
-const _mseSegmentCache: Record<string, ArrayBuffer[]> = {}
-const _mseSegmentCacheTime: Record<string, number> = {}
-const _MSE_SEGMENT_CACHE_MAX = 10
-const _MSE_SEGMENT_CACHE_MAX_BYTES = 64 * 1024 * 1024
-let _mseSegmentCacheBytes = 0
+// MSE init / media 段的有界存储（TTL、单房段数上限、跨房总字节上限与字节计数）
+// 收在 `utils/mseCacheStore`；这里只保留 TTL 常量与模块级单例。
 const _MSE_CACHE_TTL_MS = 5 * 60 * 1000
 // mse_segment 接收 watchdog：按房间记录最后接收时间，超时按房间恢复预览
 const _lastMseSegmentTimePerRoom: Map<string, number> = new Map()
@@ -148,6 +138,10 @@ const _MSE_WATCHDOG_RECOVERY_COOLDOWN_MS = 15000
 const _MSE_WATCHDOG_MAX_FAILS = 3
 let _mseWatchdogTimer: ReturnType<typeof setInterval> | null = null
 
+// 模块级 MSE media 段缓存：消除 mse_segment 早于 VideoPreview 挂载到达的竞态；
+// player 注册时会回放缓存，避免初始几秒丢帧导致黑屏。
+const _mseCache = new MseCacheStore({ ttlMs: _MSE_CACHE_TTL_MS })
+
 /** 断连时写操作被丢弃的用户可见提示（useWebSocket.send 统一弹出） */
 export const DISCONNECTED_SEND_WARNING = t('未连接后端，操作未发送')
 
@@ -157,15 +151,7 @@ let _lastSystemStatsAt = 0
 
 /** 清理某房间的 MSE 缓存与重试定时器（预览关闭/房间移除时调用）。 */
 export function clearMseRoomCache(roomId: string): void {
-  delete _mseInitCache[roomId]
-  delete _mseInitCacheTime[roomId]
-  const segments = _mseSegmentCache[roomId]
-  if (segments) {
-    _mseSegmentCacheBytes -= segments.reduce((sum, item) => sum + item.byteLength, 0)
-    _mseSegmentCacheBytes = Math.max(0, _mseSegmentCacheBytes)
-  }
-  delete _mseSegmentCache[roomId]
-  delete _mseSegmentCacheTime[roomId]
+  _mseCache.clearRoom(roomId)
   if (_mseInitRetryTimers[roomId]) {
     clearTimeout(_mseInitRetryTimers[roomId])
     delete _mseInitRetryTimers[roomId]
@@ -173,6 +159,8 @@ export function clearMseRoomCache(roomId: string): void {
   _lastMseSegmentTimePerRoom.delete(roomId)
   delete _mseWatchdogLastRecovery[roomId]
   delete _mseWatchdogFailCount[roomId]
+  // 乱序 runtime_event 的水位也随房间一起清，否则死房间条目永久滞留
+  _lastRuntimeEventByRoom.delete(roomId)
   // 清除该房间旧一代的 init 重试计数；否则新文件 epoch 可能继承
   // 旧直播的 10 次上限，明明收到新流仍被判定为 retry exhausted。
   if (window.__mseInitRetryCount) {
@@ -183,73 +171,30 @@ export function clearMseRoomCache(roomId: string): void {
 }
 
 function _pruneExpiredMseCache(): void {
-  const now = Date.now()
-  for (const roomId of Object.keys(_mseInitCache)) {
-    const ts = _mseInitCacheTime[roomId] ?? 0
-    if (now - ts > _MSE_CACHE_TTL_MS) {
-      delete _mseInitCache[roomId]
-      delete _mseInitCacheTime[roomId]
-    }
-  }
-  for (const roomId of Object.keys(_mseSegmentCache)) {
-    const ts = _mseSegmentCacheTime[roomId] ?? 0
-    if (now - ts > _MSE_CACHE_TTL_MS) {
-      const segments = _mseSegmentCache[roomId]
-      _mseSegmentCacheBytes -= segments?.reduce((sum, item) => sum + item.byteLength, 0) ?? 0
-      delete _mseSegmentCache[roomId]
-      delete _mseSegmentCacheTime[roomId]
-    }
-  }
-  _mseSegmentCacheBytes = Math.max(0, _mseSegmentCacheBytes)
+  _mseCache.pruneExpired(Date.now())
 }
 
-// 定期清理过期 MSE 缓存，避免 segment 缓存先过期时需等待下次 cache 调用才清理
-setInterval(_pruneExpiredMseCache, 60_000)
+// 定期清理过期 MSE 缓存，避免 segment 缓存先过期时需等待下次 cache 调用才清理。
+// 句柄留出来：vitest 每个用例文件都会挂一个不肯退出的 interval，拖住 worker
+// 进程；生产渲染进程里它是常驻轮询（可接受），但测试侧必须可收口。
+const _mseCachePruneTimer = setInterval(_pruneExpiredMseCache, 60_000)
+
+/** 测试与热重载用：停掉模块级 MSE 缓存清理轮询 */
+export function stopMseCachePruning(): void {
+  clearInterval(_mseCachePruneTimer)
+}
 
 export function _cacheMseInit(roomId: string, buffer: ArrayBuffer): void {
-  _pruneExpiredMseCache()
-  _mseInitCache[roomId] = buffer
-  _mseInitCacheTime[roomId] = Date.now()
-  // 最多缓存 20 个房间的 init 段，避免内存无限增长
-  const keys = Object.keys(_mseInitCache)
-  if (keys.length > 20) {
-    const oldest = keys.sort((a, b) => (_mseInitCacheTime[a] ?? 0) - (_mseInitCacheTime[b] ?? 0))[0]
-    if (oldest) clearMseRoomCache(oldest)
-  }
+  _mseCache.cacheInit(roomId, buffer, Date.now())
 }
 
 export function _cacheMseSegment(roomId: string, buffer: ArrayBuffer): void {
-  _pruneExpiredMseCache()
-  if (!_mseSegmentCache[roomId]) {
-    _mseSegmentCache[roomId] = []
-  }
-  _mseSegmentCacheTime[roomId] = Date.now()
-  const arr = _mseSegmentCache[roomId]
-  arr.push(buffer)
-  _mseSegmentCacheBytes += buffer.byteLength
-  // 超出上限丢弃最旧
-  while (arr.length > _MSE_SEGMENT_CACHE_MAX) {
-    const removed = arr.shift()
-    if (removed) _mseSegmentCacheBytes -= removed.byteLength
-  }
-  // 跨房间总量也受限，优先淘汰最久未更新的房间。
-  while (_mseSegmentCacheBytes > _MSE_SEGMENT_CACHE_MAX_BYTES) {
-    const oldest = Object.keys(_mseSegmentCacheTime)
-      .filter(key => (_mseSegmentCache[key]?.length ?? 0) > 0)
-      .sort((a, b) => (_mseSegmentCacheTime[a] ?? 0) - (_mseSegmentCacheTime[b] ?? 0))[0]
-    if (!oldest) break
-    clearMseRoomCache(oldest)
-  }
+  _mseCache.cacheSegment(roomId, buffer, Date.now())
 }
 
 /** 取出并清空某房间的 media 段缓存，供 player 注册时回放。 */
 function _drainMseSegmentCache(roomId: string): ArrayBuffer[] {
-  const arr = _mseSegmentCache[roomId]
-  if (!arr || arr.length === 0) return []
-  delete _mseSegmentCache[roomId]
-  _mseSegmentCacheBytes -= arr.reduce((sum, item) => sum + item.byteLength, 0)
-  _mseSegmentCacheBytes = Math.max(0, _mseSegmentCacheBytes)
-  return arr
+  return _mseCache.drainSegments(roomId)
 }
 
 /**
@@ -265,7 +210,7 @@ export function drainPendingMseSegments(roomId: string): ArrayBuffer[] {
  * 供 VideoPreview 创建 player 时优先用缓存 init 段 feedInit，
  * 避免等待 request_mse_init 往返。 */
 export function getMseInitCache(roomId: string): ArrayBuffer | null {
-  return _mseInitCache[roomId] ?? null
+  return _mseCache.getInit(roomId) ?? null
 }
 
 function _decodeBase64Segment(b64Data: string): ArrayBuffer {
@@ -379,6 +324,10 @@ function _attachSharedWebSocketHandlers(): () => void {
         if (!incomingIds.has(prev.room_id)) {
           clearMseRoomCache(prev.room_id)
           _lastRuntimeEventByRoom.delete(prev.room_id)
+          // 房间消失后其 uiState（preview_phase / review 通道态 / 错误槽）与
+          // sink 重建预算只进不出，长挂机会持续积灰（2026-09-24 修复）。
+          useAppStore.getState().dropRoomUiState(prev.room_id)
+          clearSinkRestartBudget(prev.room_id)
         }
       }
       const retryCounts = window.__mseInitRetryCount
@@ -403,15 +352,10 @@ function _attachSharedWebSocketHandlers(): () => void {
       }
     }
   }
+  // 广播序列号缺号检测已移至 wsClient 全局入口（websocket.ts 的
+  // _noteBroadcastSeq）： rooms_updated 是可丢弃类型、设计上就不发 _seq，
+  // 挂在这里的检测永远不会触发，纯属死代码（2026-09-24 审查修复）。
   const unsubRoomsUpdated = wsClient.on('rooms_updated', (data: any) => {
-    // 检测广播序列号是否连续，发现丢消息时触发强制同步
-    if (data && typeof data._seq === 'number') {
-      if (_lastBroadcastSeq !== null && data._seq > _lastBroadcastSeq + 1) {
-        // 序列号不连续，有消息丢失，请求全量同步
-        wsClient.send('get_rooms', {})
-      }
-      _lastBroadcastSeq = data._seq
-    }
     handleRooms(data)
   })
   const unsubRoomsLoaded = wsClient.on('rooms_loaded', handleRooms)
@@ -667,7 +611,7 @@ function _attachSharedWebSocketHandlers(): () => void {
       const roomId = data.room_id
 
       // 后端尚未就绪，但前端可能已通过 mse_init 广播收到了 init 段
-      const cachedInit = _mseInitCache[roomId]
+      const cachedInit = _mseCache.getInit(roomId)
       if (cachedInit) {
         try {
           const registry = window.__msePlayers as Record<string, any> | undefined
@@ -757,7 +701,7 @@ function _attachSharedWebSocketHandlers(): () => void {
       } else if (fails >= 2) {
         msgApi().warning({ content: t('预览恢复中'), key: `mse-stall-${r.room_id}`, duration: 3 })
         wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })
-      } else if (_mseInitCache[r.room_id]) {
+      } else if (_mseCache.getInit(r.room_id)) {
         wsClient.send('request_mse_init', { room_id: r.room_id })
       } else {
         wsClient.send('enable_preview', { room_id: r.room_id, enabled: true, mode: 'mse' })

@@ -115,3 +115,83 @@ export const CLIP_EXPORT_STATE_HINT: Record<ClipExportStateCode, string> = {
   REJECTED: '赛事审计判定不是有效回合，已被排除（人工确认也不会复活）',
   BLOCKED: '时长异常或坐标无效，无法导出',
 }
+
+export function isApproximateClip(c: ClipSegment): boolean {
+  if (c.clip_snapshot_id || c.mark_precision === 'exact') return false
+  if (c.is_ai_highlight && c.mark_precision !== 'approximate') return false
+  return (
+    c.mark_precision === 'approximate' ||
+    (c.mark_precision !== 'exact' &&
+      (c.mark_in_wallclock == null || c.mark_out_wallclock == null))
+  )
+}
+
+export function resolveManualRecordingRange(room: {
+  mark_in_wallclock?: number | null
+  mark_out_wallclock?: number | null
+  recording_media_start_mono?: number | null
+  recording_start_mono?: number | null
+  content_offset?: number
+}): { start: number; end: number } | null {
+  const markIn = room.mark_in_wallclock
+  const markOut = room.mark_out_wallclock
+  const recordingStart = room.recording_media_start_mono ?? room.recording_start_mono
+  if (
+    typeof markIn !== 'number' || !Number.isFinite(markIn)
+    || typeof markOut !== 'number' || !Number.isFinite(markOut)
+    || typeof recordingStart !== 'number' || !Number.isFinite(recordingStart)
+  ) {
+    return null
+  }
+  const offset = typeof room.content_offset === 'number' && Number.isFinite(room.content_offset)
+    ? room.content_offset
+    : 0
+  const start = Math.max(0, markIn - recordingStart - offset)
+  const end = Math.max(0, markOut - recordingStart - offset)
+  return end > start ? { start, end } : null
+}
+
+export function clipSnapshotJobId(clipId: string): string {
+  return `clip-${clipId.slice(0, 8)}`
+}
+
+/** 底部状态条用的导出摘要（原来在 Workbench 的 useMemo 里内联，2026-09-19 搬来）。 */
+export interface ClipExportSummary {
+  /** 切片列表中待确认的条数（不是导出入队） */
+  pendingConfirm: number
+  /** 已进入导出队列 */
+  queued: number
+  exporting: number
+  completed: number
+  failed: number
+  /** 切片列表条数（入列） */
+  listed: number
+}
+
+/**
+ * 聚合切片列表成导出摘要。判据里最容易写错的一条：**`export_status === 'pending'`
+ * 是"待确认"，不能计入 `queued`（导出入队）** —— 一旦计入，用户会在一个都没导出的
+ * 时候看到"已在队列"。`exported` 是老字段（无 `export_status` 时才算完成）。
+ */
+export function summarizeClipExport(clips: readonly ClipSegment[]): ClipExportSummary {
+  const summary: ClipExportSummary = {
+    pendingConfirm: 0,
+    queued: 0,
+    exporting: 0,
+    completed: 0,
+    failed: 0,
+    listed: clips.length,
+  }
+  for (const clip of clips) {
+    const needsTune = clip.confirm_status === 'pending' || clip.confirm_status === 'refining'
+    if (needsTune || clip.export_status === 'pending') {
+      summary.pendingConfirm += 1
+    }
+    const status = clip.export_status ?? (clip.exported ? 'completed' : undefined)
+    // pending = 待确认，不算导出入队
+    if (status === 'queued' || status === 'exporting' || status === 'completed' || status === 'failed') {
+      summary[status] += 1
+    }
+  }
+  return summary
+}

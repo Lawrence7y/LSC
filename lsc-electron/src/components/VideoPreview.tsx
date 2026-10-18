@@ -9,8 +9,10 @@ import {
 } from '@/hooks/useWebSocket'
 import { LocalFileMseSource } from '@/services/localFileMseSource'
 import { useAppStore } from '@/store/appStore'
+import { noteSinkRestart, shouldRequestSinkRestart } from '@/utils/previewRecovery'
 import { getAligner } from '@/utils/previewAudioAligner'
 import { isMuteSyncSuppressed, withMuteSyncSuppressed } from '@/utils/muteSyncGuard'
+import { previewPhaseCopy, shouldRebuildLivePlayer } from '@/utils/previewLifecycle'
 import { useI18n } from '@/i18n'
 import {
   DEFAULT_TIMELINE_REPLAY_SECONDS,
@@ -32,7 +34,7 @@ interface VideoPreviewProps {
   /** Whether MSE preview is active (when false, show placeholder) */
   active: boolean
   /** WebSocket send function for controlling backend */
-  send: (type: string, data: any) => void
+  send: (type: string, data: any) => void | boolean
   /** Called when MSE player is ready */
   onReady?: (player: MsePlayer) => void
   /** Called on error */
@@ -281,18 +283,17 @@ export function VideoPreview({
     const mode = previewMode ?? 'live_mse'
     const epoch = previewEpochId ?? ''
     const prev = previewSourceRef.current
+    const nextSource = { mode, epoch }
 
-    if (prev !== null) {
-      const epochChanged = epoch !== '' && prev.epoch !== epoch
-      // 只有直播 epoch 真正变化才触发 LivePlayer 重建与缓存清理（review 由独立 ReviewPlayer 承载）
-      if (epochChanged) {
-        disposePlayerFully()
-        clearMseRoomCache(roomId)
-        setPlayerGeneration((g) => g + 1)
-      }
+    // 只有直播 epoch 真正变化才重建与清缓存；mode 在 live ↔ review 间切换不拆 LivePlayer
+    // （判据本体在 `utils/previewLifecycle`，由 `previewLifecycle.test.ts` 断言）。
+    if (shouldRebuildLivePlayer(prev, nextSource)) {
+      disposePlayerFully()
+      clearMseRoomCache(roomId)
+      setPlayerGeneration((g) => g + 1)
     }
 
-    previewSourceRef.current = { mode, epoch }
+    previewSourceRef.current = nextSource
   }, [active, roomId, previewMode, previewEpochId, disposePlayerFully])
 
   // Auto-start when active. Deps are limited to [active, roomId, playerGeneration];
@@ -371,6 +372,31 @@ export function VideoPreview({
       },
       onBackpressure: (bpState, pending) => {
         sendRef.current('mse_backpressure', { room_id: roomId, state: bpState, pending })
+      },
+      onRequestSinkRestart: (reason) => {
+        // 恢复阶梯最后一层：请求后端重建预览 sink（旧实现前端发不出这个请求，
+        // 只能让用户手动关/开预览 —— CLAUDE.md §7.2.2 遗留项）。
+        // 房间级预算记在模块里：播放器实例会随 preview_epoch_id 重建而重置，
+        // 只在实例内计数会让「重建后再卡死」无限重启后端 FFmpeg。
+        if (!shouldRequestSinkRestart(roomId)) {
+          console.warn(`[VideoPreview] 预览自救重开已超预算，不再重启后端 sink: room=${roomId}`)
+          return false
+        }
+        const sent = sendRef.current('enable_preview', {
+          room_id: roomId,
+          enabled: true,
+          mode: 'mse',
+          restart: true,
+        })
+        if (sent === false) {
+          console.warn(`[VideoPreview] 未连接后端，预览自救重开请求未发送: room=${roomId}`)
+          return false
+        }
+        noteSinkRestart(roomId)
+        console.warn(
+          `[VideoPreview] 播放器自救耗尽，已请求重启后端预览 sink: room=${roomId} reason=${reason}`,
+        )
+        return true
       },
       onSourceOpen: () => {
         // MediaSource.sourceopen 触发后 video.src 已绑定到新 MediaSource，
@@ -749,15 +775,8 @@ export function VideoPreview({
     !reviewVisible &&
     state !== 'playing'
 
-  // 阶段进度文案：首次刷新流地址可能需要等待上游解析完成
-  const phaseText =
-    previewPhase === 'refreshing_url' ? t('正在刷新流地址…') :
-    previewPhase === 'probing' ? t('正在探测/转码…') :
-    t('正在拉流/转码…')
-  const phaseHint =
-    previewPhase === 'refreshing_url'
-      ? t('首次刷新可能需要 10–30 秒')
-      : null
+  // 阶段进度文案：首次刷新流地址可能需要等待上游解析完成（判据在 utils/previewLifecycle）
+  const { text: phaseText, hint: phaseHint } = previewPhaseCopy(previewPhase, t)
 
   return (
     <div

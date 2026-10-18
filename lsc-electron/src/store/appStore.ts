@@ -65,6 +65,8 @@ interface AppActions {
   setRooms: (rooms: RoomSession[]) => void
   addRoom: (room: RoomSession) => void
   removeRoom: (roomId: string) => void
+  /** 只清房间的 uiState 条目（房间已从整表消失时的长跑卫生，不动 rooms/selection）。 */
+  dropRoomUiState: (roomId: string) => void
   updateRoom: (roomId: string, updates: Partial<RoomSession>) => void
   updateRoomIncremental: (roomId: string, roomData: RoomSession) => void
   setSelectedRoomId: (roomId: string | null) => void
@@ -245,6 +247,13 @@ export const useAppStore = create<AppState & AppActions>((set) => ({
           state.selectedRoomId === roomId ? null : state.selectedRoomId,
         uiState: remainingUiState,
       }
+    }),
+
+  dropRoomUiState: (roomId) =>
+    set((state) => {
+      if (!(roomId in state.uiState)) return state
+      const { [roomId]: _droppedUiState, ...remainingUiState } = state.uiState
+      return { uiState: remainingUiState }
     }),
 
   updateRoom: (roomId, updates) =>

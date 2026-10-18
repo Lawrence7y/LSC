@@ -43,6 +43,11 @@ export interface TimelineViewModel {
 
 interface ControlBarProps {
   room: RoomSession | undefined
+  /**
+   * P3-2：未勾选任何房间时，时间线自动跟随的房间名。
+   * 有值时控制栏明示「跟的是谁」，避免轴悄悄换了一路而用户不知道。
+   */
+  autoBoundRoomName?: string | null
   multiSelectCount?: number
   loopPreview?: boolean
   clips?: ClipSegment[]
@@ -102,6 +107,7 @@ interface ControlBarProps {
  * 但只有影响控制栏渲染的字段变化时才需要重新渲染。
  */
 function areControlBarPropsEqual(prev: ControlBarProps, next: ControlBarProps): boolean {
+  if (prev.autoBoundRoomName !== next.autoBoundRoomName) return false
   if (prev.multiSelectCount !== next.multiSelectCount) return false
   if (prev.loopPreview !== next.loopPreview) return false
   if (prev.clips !== next.clips) return false
@@ -185,6 +191,7 @@ function parseTimecode(text: string): number | null {
 
 export const ControlBar = memo(function ControlBar({
   room,
+  autoBoundRoomName = null,
   multiSelectCount = 0,
   loopPreview = false,
   clips = [],
@@ -563,42 +570,60 @@ export const ControlBar = memo(function ControlBar({
           </span>
         </div>
       )}
-      <Timeline
-        duration={trackDuration}
-        currentTime={displayCurrent}
-        markIn={displayMarkIn}
-        markOut={displayMarkOut}
-        buffered={displayCurrent}
-        clips={roomClips}
-        highlights={timelineHighlights}
-        waveformPeaks={timelineView?.waveformPeaks}
-        onHighlightClick={onHighlightClick
-          ? (h) => onHighlightClick({
-            ...h,
-            start: h.start + windowStart,
-            end: h.end + windowStart,
-          })
-          : undefined}
-        windowStart={windowStart}
-        onSeek={onSeek}
-        onScrubStart={onScrubStart}
-        onScrubEnd={onScrubEnd}
-        onScrubMove={onScrubMove}
-        onMarkerDrag={onMarkerDrag}
-        onMarkerDragEnd={onMarkerDragEnd}
-        onDeleteMarker={onDeleteMarker}
-        activeRefine={activeRefine}
-        dvrStart={dvrStart ?? null}
-        dvrReplay={dvrReplay ?? null}
-        bufferedRanges={bufferedRanges}
-        followLive={followLive}
-        isScrubbing={isScrubbing}
-        height={60}
-        zoomLevel={zoomLevel}
-        onZoomChange={onZoomChange}
-        analysisProgress={analysisProgress}
-        scanRange={scanRange}
-      />
+      {/* P3-2：未勾选房间时不再静默退化成 0-1s 假轴 —— 自动跟随时说明跟的是谁，无候选时说明要先勾选 */}
+      {autoBoundRoomName && (
+        <div className="control-bar__meta-row">
+          <span className="control-bar__hint control-bar__hint--muted">
+            {t('未勾选房间：时间线自动跟随「{name}」，勾选卡片可切换', { name: autoBoundRoomName })}
+          </span>
+        </div>
+      )}
+      {!room && multiSelectCount === 0 && (
+        <div className="control-bar__meta-row">
+          <span className="control-bar__hint control-bar__hint--muted">
+            {t('未勾选房间：勾选任一房间以启用回放轴（时间线跟随所选房间）')}
+          </span>
+        </div>
+      )}
+      {/* 没有可绑定的房间时，时间线整体置灰且不可交互：旧实现仍可点击，点下去什么也不发生（静默失效） */}
+      <div style={!room && multiSelectCount === 0 ? { opacity: 0.45, pointerEvents: 'none' } : undefined}>
+        <Timeline
+          duration={trackDuration}
+          currentTime={displayCurrent}
+          markIn={displayMarkIn}
+          markOut={displayMarkOut}
+          buffered={displayCurrent}
+          clips={roomClips}
+          highlights={timelineHighlights}
+          waveformPeaks={timelineView?.waveformPeaks}
+          onHighlightClick={onHighlightClick
+            ? (h) => onHighlightClick({
+              ...h,
+              start: h.start + windowStart,
+              end: h.end + windowStart,
+            })
+            : undefined}
+          windowStart={windowStart}
+          onSeek={onSeek}
+          onScrubStart={onScrubStart}
+          onScrubEnd={onScrubEnd}
+          onScrubMove={onScrubMove}
+          onMarkerDrag={onMarkerDrag}
+          onMarkerDragEnd={onMarkerDragEnd}
+          onDeleteMarker={onDeleteMarker}
+          activeRefine={activeRefine}
+          dvrStart={dvrStart ?? null}
+          dvrReplay={dvrReplay ?? null}
+          bufferedRanges={bufferedRanges}
+          followLive={followLive}
+          isScrubbing={isScrubbing}
+          height={60}
+          zoomLevel={zoomLevel}
+          onZoomChange={onZoomChange}
+          analysisProgress={analysisProgress}
+          scanRange={scanRange}
+        />
+      </div>
 
       {/* 控制与走带工具排 */}
       <div style={{
@@ -613,7 +638,7 @@ export const ControlBar = memo(function ControlBar({
         {/* 左侧：播放走带控制 + 选区入出点 */}
         <Space size={3} wrap align="center">
           <Tooltip title={t('后退 10 秒')}>
-            <Button 
+            <Button
               type="text" size="small"
               icon={<StepBackwardOutlined />}
               onClick={onSeekBack}
@@ -621,9 +646,9 @@ export const ControlBar = memo(function ControlBar({
               style={{ width: 28, height: 28, borderRadius: 'var(--radius-xs)' }}
             />
           </Tooltip>
-          
+
           <Tooltip title={isPlaying ? t('暂停 (空格)') : t('播放 (空格)')}>
-            <Button 
+            <Button
               type="text" size="small"
               icon={isPlaying ? <PauseCircleOutlined style={{ color: 'var(--brand-400)' }} /> : <PlayCircleOutlined />}
               onClick={onPlayPause}
@@ -631,9 +656,9 @@ export const ControlBar = memo(function ControlBar({
               style={{ width: 32, height: 28, fontSize: 18, borderRadius: 'var(--radius-xs)' }}
             />
           </Tooltip>
-          
+
           <Tooltip title={t('前进 10 秒')}>
-            <Button 
+            <Button
               type="text" size="small"
               icon={<StepForwardOutlined />}
               onClick={onSeekFwd}
@@ -660,7 +685,7 @@ export const ControlBar = memo(function ControlBar({
 
           {/* 入点与出点标记 */}
           <Tooltip title={t('标记入点 (I) · 打在播放头处')}>
-            <Button 
+            <Button
               type="text" size="small"
               icon={<AimOutlined style={{ color: 'var(--state-success)' }} />}
               onClick={onMarkIn}
@@ -683,9 +708,9 @@ export const ControlBar = memo(function ControlBar({
               {formatTime(room.mark_in)}
             </span>
           )}
-          
+
           <Tooltip title={t('标记出点 (O) · 打在播放头处')}>
-            <Button 
+            <Button
               type="text" size="small"
               icon={<AimOutlined style={{ color: 'var(--state-error)' }} />}
               onClick={onMarkOut}
@@ -855,7 +880,7 @@ export const ControlBar = memo(function ControlBar({
           {/* 核心主按钮：添加切片 */}
           <Tooltip title={addClipTip}>
             <span style={{ display: 'inline-flex' }}>
-              <Button 
+              <Button
                 type={canAddClip ? 'primary' : 'default'}
                 size="small"
                 icon={<ScissorOutlined />}

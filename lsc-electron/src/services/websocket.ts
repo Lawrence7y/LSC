@@ -145,6 +145,13 @@ export class WebSocketClient {
   private heartbeatCheckTimer: ReturnType<typeof setInterval> | null = null
   // 当前僵死 episode 是否已广播过 backend_crashed（防止 5s 轮询重复 emit）
   private _heartbeatCrashEmitted = false
+  // CLAUDE.md §2.1 广播序列号追踪：按已见最大 seq 记，用于识别真丢关键消息。
+  // 后端重启会从 0 重新发号，故每次认证成功都复位，否则旧 seq 会让新连接
+  // 全程判成"倒序到达"而掩盖真实缺口。
+  private _lastBroadcastSeq: number | null = null
+  // drain 端 last-value 合并塌掉的序列号预算：合并是设计内行为（见
+  // server.drain_merge_broadcasts 的 _coalesced），不得谎报缺号。
+  private _knownCoalescedSeq = 0
   private readonly usesDynamicBackendUrl: boolean
 
   constructor(url: string | null = null) {
@@ -257,6 +264,10 @@ export class WebSocketClient {
             this.isConnected = true
             this.reconnectAttempts = 0
             this.pendingConnect = null
+            // 后端重启后序列号从 0 重新发号：复位追踪状态，否则旧连接的
+            // 大 seq 会让新连接全程判成"倒序/巨缺口"而掩盖真实丢消息
+            this._lastBroadcastSeq = null
+            this._knownCoalescedSeq = 0
             this.flushQueue()
             // P3-2: 启动心跳检测
             this._startHeartbeatCheck()
@@ -277,14 +288,25 @@ export class WebSocketClient {
 
         socket.onmessage = (event) => {
           const handleText = (text: string) => {
+            let message: { type: string; data: unknown }
             try {
-              const message: { type: string; data: unknown } = JSON.parse(text)
+              message = JSON.parse(text)
+            } catch (err) {
+              // 解析失败只可能是对端发了非 JSON：与分发失败分开报错，
+              // 否则现场排查会被"Failed to parse"引向错误方向
+              console.error('Failed to parse WebSocket message:', err)
+              return
+            }
+            try {
               // P3-2: 更新心跳时间
               if (message.type === 'heartbeat') {
                 this.lastHeartbeat = Date.now()
               }
               // 僵死 episode 期间收到任何消息 → 后端恢复
               this._noteBackendAlive()
+              // CLAUDE.md §2.1：所有带 _seq 的关键消息都参与缺号检测
+              // （不能只挂 rooms_updated——它是可丢弃类型，设计上就不发号）
+              this._noteBroadcastSeq(message.type, message.data)
               if (isDev) {
                 if (!isHighFrequencyWsType(message.type)) {
                   console.log(`[WebSocket] Received message type=${message.type}, data=`, truncateLogData(message.data))
@@ -292,7 +314,8 @@ export class WebSocketClient {
               }
               this.emit(message.type, message.data)
             } catch (err) {
-              console.error('Failed to parse WebSocket message:', err)
+              // 分发阶段最后防线（emit 内部已逐 handler 隔离，正常到不了这里）
+              console.error(`Failed to dispatch WebSocket message type=${message?.type}:`, err)
             }
           }
 
@@ -420,6 +443,42 @@ export class WebSocketClient {
     this.emit('backend_revived', null)
   }
 
+  /**
+   * CLAUDE.md §2.1 广播序列号缺号检测。
+   *
+   * 后端 BroadcastHub 入队时给关键消息（非 _DROPPABLE_TYPES）分配自增 _seq，
+   * 经 server.broadcast 注入 data._seq 下发。规则：
+   * - seq 不大于已见最大值 ⇒ 合并后的幸存消息乱序到达，正常；
+   * - 正向缺口先用 _knownCoalescedSeq 预算解释（drain 端按 key 做 last-value
+   *   合并是设计内塌号，幸存消息带 _coalesced 记账）；
+   * - 仍无法解释的缺口 ⇒ 判定真丢关键消息，触发 get_rooms 全量同步。
+   */
+  private _noteBroadcastSeq(type: string, data: unknown): void {
+    if (!data || typeof data !== 'object') return
+    const payload = data as { _seq?: unknown; _coalesced?: unknown }
+    if (typeof payload._seq !== 'number') return
+    const seq = payload._seq
+    const coalesced = typeof payload._coalesced === 'number' && payload._coalesced > 0
+      ? payload._coalesced
+      : 0
+    this._knownCoalescedSeq += coalesced
+    if (this._lastBroadcastSeq !== null && seq > this._lastBroadcastSeq + 1) {
+      const gap = seq - this._lastBroadcastSeq - 1
+      const explained = Math.min(gap, this._knownCoalescedSeq)
+      if (gap - explained > 0) {
+        console.warn(
+          `[WebSocket] 广播序列号缺号: last=${this._lastBroadcastSeq} got=${seq} `
+          + `未解释缺口=${gap - explained} (type=${type})，触发全量同步`,
+        )
+        this.send('get_rooms', {})
+      }
+      this._knownCoalescedSeq -= explained
+    }
+    if (this._lastBroadcastSeq === null || seq > this._lastBroadcastSeq) {
+      this._lastBroadcastSeq = seq
+    }
+  }
+
   // 重连成功后将队列中暂存的消息依次发送
   private flushQueue() {
     while (this.messageQueue.length > 0) {
@@ -437,12 +496,13 @@ export class WebSocketClient {
   /**
    * 发送消息。若连接未就绪，消息会进入断连队列等待重连后 flush。
    *
-   * 队列上限为 {@link maxQueueSize}（100 条），超出时丢弃最旧消息，保留最新。
+   * 队列上限为 {@link maxQueueSize}（100 条），满了**拒绝新的一条**（返回 false），
+   * 已排队的更早指令保持 FIFO —— 丢最旧会让"已经告诉调用方已发出"的那条静默消失。
    * 当 {@link ws} 处于 OPEN 状态时直接通过 WebSocket.send() 发出。
    *
    * @param type - 消息类型标识，用于 on() 路由分发
    * @param data - 消息载荷
-   * @returns 已发送或已入队返回 true；断连且不可入队时返回 false
+   * @returns 已发送或已入队返回 true；断连且不可入队（含队列已满）时返回 false
    */
   send(type: string, data: unknown): boolean {
     if (isDev) {
@@ -462,9 +522,12 @@ export class WebSocketClient {
         console.warn(`[WebSocket] Dropping stale message while disconnected: ${type}`)
         return false
       }
-      // 断连时入队，超出上限丢弃最旧的消息
+      // 断连时入队。队列满时**拒绝新消息并返回 false**（原先是丢最旧的一条后照样
+      // 返回 true —— 那条被丢的消息调用方已当成"已发出"，属静默丢失；丢最新反而
+      // 保住 FIFO 与"先发的指令先落地"的语义，并由调用方的 DISCONNECTED_SEND_WARNING 报出来）
       if (this.messageQueue.length >= this.maxQueueSize) {
-        this.messageQueue.shift()
+        console.warn(`[WebSocket] Outbox full (${this.maxQueueSize}), refusing to queue: ${type}`)
+        return false
       }
       this.messageQueue.push(payload)
       console.warn('WebSocket not connected, queuing message')
@@ -504,7 +567,17 @@ export class WebSocketClient {
   }
 
   private emit(event: string, data: any): void {
-    this.handlers.get(event)?.forEach(handler => handler(data))
+    // 逐 handler 隔离：一个订阅者抛异常不得掐断同类型其余监听者
+    // （曾把 rooms_updated 的后续处理器整场跳过 → 丢房间/丢切片入列），
+    // 且异常必须能在日志里区分「分发失败」与「消息解析失败」
+    // （2026-09-24 修复：此前异常逃到 handleText 的 catch，被误报为解析失败）。
+    this.handlers.get(event)?.forEach(handler => {
+      try {
+        handler(data)
+      } catch (err) {
+        console.error(`[WebSocket] handler failed for event=${event}:`, err)
+      }
+    })
   }
 
   /**

@@ -3,7 +3,9 @@ import {
   Fmp4BoxSplitter,
   readAscii,
   readBoxHeader,
+  readTfdtSeconds,
   type Fmp4MediaSegment,
+  type Fmp4TrackInfo,
 } from './fmp4Box'
 import { isLocalMediaAvailable, localMediaInfo, localMediaRead } from './localMediaReader'
 
@@ -59,6 +61,18 @@ const DEFAULT_POLL_MS = 500
 const DEFAULT_FIRST_FRAME_TIMEOUT_MS = 8000
 /** 定位时向前搜索的最大窗口（字节）：8Mbps≈1MB/s，16MB≈16s，覆盖多个 fragment */
 const SEEK_BACK_WINDOW_BYTES = 16 * 1024 * 1024
+/**
+ * 定位落点的容忍差（秒），**单向**：只接受"落在目标上或略早于目标"。
+ * 晚于目标会真的跳过内容（用户看到的就是"轴切了但画面跳过了那一段"），
+ * 早一点则只是多顺序读几段。
+ */
+const LOCATE_SLACK_SEC = 20
+/**
+ * 稀疏检查点探测轮数上限。每轮读一整个定位窗口（16MB 级），所以这是**成本**
+ * 参数：对 30 分钟的录像（约 1.5GB / 16MB ≈ 90 个窗口）二分只需 ⌈log2(90)⌉ = 7 轮，
+ * 取 4 已经能把落点误差压到分钟级以内，再多就是拿首次出画时间换精度。
+ */
+const MAX_LOCATE_PROBE_ROUNDS = 4
 /** follow 模式下文件短暂消失（归档改名）的容忍次数 */
 const MAX_MISSING_RETRIES = 12
 /**
@@ -89,6 +103,9 @@ interface FileIndex {
 }
 
 const _indexCache = new Map<string, FileIndex>()
+// 长挂机 + 多房间多文件回看时缓存只进不出：每条含 init 字节 + fragment 条目
+// 数组，seek 多次后可达数千条。FIFO 驱逐封顶（2026-09-24 修复）。
+const _INDEX_CACHE_MAX_ENTRIES = 8
 
 /** 供测试与诊断：清空模块级索引缓存 */
 export function clearLocalFileIndexCache(): void {
@@ -97,9 +114,20 @@ export function clearLocalFileIndexCache(): void {
 
 function getIndex(path: string): FileIndex {
   const existing = _indexCache.get(path)
-  if (existing) return existing
+  if (existing) {
+    // LRU：命中即移到队尾，避免正在回看的热文件被淘汰
+    _indexCache.delete(path)
+    _indexCache.set(path, existing)
+    return existing
+  }
   const fresh: FileIndex = { entries: [], offsets: new Set<number>(), scannedTo: 0, bytesPerSec: 0 }
   _indexCache.set(path, fresh)
+  // Map 保持插入序：超出上限时淘汰最久未访问的条目。
+  while (_indexCache.size > _INDEX_CACHE_MAX_ENTRIES) {
+    const oldest = _indexCache.keys().next()
+    if (oldest.done) break
+    _indexCache.delete(oldest.value)
+  }
   return fresh
 }
 
@@ -114,16 +142,68 @@ function noteRate(index: FileIndex): void {
   if (dt > 0.2 && db > 0) index.bytesPerSec = db / dt
 }
 
-/** 按索引 + 平均码率把目标时间外推为字节位置（纯函数） */
+/** 按索引把目标时间换算为字节位置（纯函数） */
 export function estimateByteOffset(index: { entries: IndexEntry[]; bytesPerSec: number }, targetSec: number): number {
   if (index.entries.length === 0) return 0
   let best = index.entries[0]
+  let next: IndexEntry | undefined
   for (const entry of index.entries) {
-    if (entry.tPtsSec <= targetSec + 1e-3) best = entry
+    if (entry.tPtsSec <= targetSec + 1e-3) {
+      best = entry
+      continue
+    }
+    next = entry
+    break
   }
   if (best.tPtsSec > targetSec) return best.offset
+  // 目标被两个已知锚点**夹住**时用这两点做局部线性插值：变码率录像里
+  // "头部平均码率"和落点附近的真实码率可以差几倍，而相邻锚点间的斜率就是本地码率。
+  if (
+    next !== undefined
+    && next.tPtsSec > best.tPtsSec
+    && next.offset > best.offset
+  ) {
+    const spanSec = next.tPtsSec - best.tPtsSec
+    const spanBytes = next.offset - best.offset
+    return Math.floor(best.offset + ((targetSec - best.tPtsSec) / spanSec) * spanBytes)
+  }
   if (index.bytesPerSec <= 0) return best.offset
   return Math.floor(best.offset + (targetSec - best.tPtsSec) * index.bytesPerSec)
+}
+
+/** 一次定位探测的结果：合法 fragment 边界（绝对字节）与它的时间（文件轴秒） */
+export interface BoundaryProbe {
+  offset: number
+  timeSec: number
+}
+
+/**
+ * 读出的窗口里找合法 fragment 边界，并读出该 fragment 的时间。
+ *
+ * 刻意复用主路径的两个既有判据（`findFragmentBoundary` 定边界、
+ * `readTfdtSeconds` 定时间），**不新引第二套 box 解析** —— 这条路上有三次
+ * 真机事故换来的守卫，多一套解析就多一处会漂移的地方。
+ */
+export function probeBoundaryTime(
+  buffer: Uint8Array,
+  baseOffset: number,
+  track: Fmp4TrackInfo | null,
+): BoundaryProbe | null {
+  if (!track) return null
+  const boundary = findFragmentBoundary(buffer, baseOffset)
+  if (boundary == null) return null
+  let at = boundary - baseOffset
+  // fragment 可能以 styp 开头：沿 box 链最多走 3 步找 moof
+  for (let hop = 0; hop < 3; hop += 1) {
+    const header = readBoxHeader(buffer, at)
+    if (!header || header.end > buffer.length) return null
+    if (header.type === 'moof') {
+      const timeSec = readTfdtSeconds(buffer.subarray(header.start, header.end), track)
+      return timeSec == null ? null : { offset: boundary, timeSec }
+    }
+    at = header.end
+  }
+  return null
 }
 
 /** 索引里的时间空洞容忍度（秒）：超过则说明目标不在已扫描区间内，需要外推定位 */
@@ -456,6 +536,15 @@ export class LocalFileMseSource {
       }
       for (;;) {
         if (!this._alive) return
+        // 前瞻窗口已被未喂出的分段占满时**先排空、再决定要不要读**：出画后的那处
+        // break 只在读完一块之后生效，而 `_pump` 每 pollMs 重入一次，于是"播放头停住"
+        // （用户暂停、或 §7.1 的时钟冻结）会以每轮 1 块的速度把整份录像堆进
+        // JS 堆 —— 小时级录像直接 OOM。先 drain 是因为播放头恢复推进时
+        // 必须在这里重新开窗，否则提前 return 会把读盘和喂段一起钉死。
+        if (this._sawMedia) {
+          this._drainQueue()
+          if (this._queue.length > 0 && this._isAheadOfPlayback()) return
+        }
         info = await localMediaInfo(this._path)
         if (!info.ok) {
           if (this._follow && this._missingCount < MAX_MISSING_RETRIES) {
@@ -626,32 +715,103 @@ export class LocalFileMseSource {
     this._queue = []
   }
 
-  /** 有界定位：按平均码率外推 → 窗口内回退到合法 fragment 边界 → 从该处继续顺序读取 */
+  /**
+   * 定位窗口的左端：右端**必须**收敛在外推位置处。
+   *
+   * 继续向右扩窗口会落到文件末尾，使回看起点大幅晚于目标时间
+   * （实测偏晚 ~1000s）。这条几何约束不随补探轮数改变。
+   */
+  private _locateWindowStart(estimate: number, size: number): number {
+    const windowEnd = Math.min(size, Math.max(0, estimate))
+    return Math.max(0, windowEnd - SEEK_BACK_WINDOW_BYTES)
+  }
+
+  /** 在外推位置左侧的窗口里探一个 (合法边界, 时间) 锚点 */
+  private async _probeLocateWindow(estimate: number, size: number): Promise<BoundaryProbe | null> {
+    const windowStart = this._locateWindowStart(estimate, size)
+    const windowLen = Math.max(0, Math.min(size, Math.max(0, estimate)) - windowStart)
+    if (windowLen <= 0) return null
+    const win = await readSeekWindow(this._path, windowStart, windowLen)
+    if (!this._alive || !win) return null
+    return probeBoundaryTime(win, windowStart, this._splitter.track)
+  }
+
+  /**
+   * 把探测到的 (时间, 字节) 登记进索引。
+   *
+   * 只登记"这个字节处确实有个 fragment，时间是 T"这一事实，**不声称覆盖了
+   * 哪个区间** —— 覆盖判据仍由 `findCoveringFragment` 的相邻间隔规则把关。
+   * 登记之后 `estimateByteOffset` 就能在锚点之间做局部插值，用户来回拖轴时
+   * 后续 seek 也直接受益（稀疏检查点是跨会话缓存的，见 `_indexCache`）。
+   */
+  private _noteProbeAnchor(probe: BoundaryProbe): void {
+    if (this._index.offsets.has(probe.offset)) return
+    this._index.offsets.add(probe.offset)
+    const last = this._index.entries[this._index.entries.length - 1]
+    this._index.entries.push({ tPtsSec: probe.timeSec, offset: probe.offset })
+    if (last && probe.timeSec < last.tPtsSec) {
+      this._index.entries.sort((a, b) => a.tPtsSec - b.tPtsSec)
+    }
+    noteRate(this._index)
+  }
+
+  /**
+   * 有界定位：外推 → 探合法 fragment 边界并读它的时间 → 把它当稀疏检查点在
+   * 字节轴上二分（至多 {@link MAX_LOCATE_PROBE_ROUNDS} 轮）→ 从落点继续顺序读取。
+   *
+   * 为什么必须补探：单次外推用的是**头部平均码率**。2026-09-13 现场那种
+   * "前段低码率 + 后段高码率"的录像里，外推会**严重低估**字节位置，剩下的
+   * 几百万字节全靠顺序扫描 —— 表现是"点了一下轴，画面半天不动"。
+   * 落点时间一读出来我们就知道是早了还是晚了，二分与码率无关。
+   */
   private async _seekToFileTime(targetFileSec: number, size: number): Promise<void> {
     if (this._index.entries.length === 0) return
     const covering = findCoveringFragment(this._index.entries, targetFileSec)
     const covered = covering != null
+    let probes = 0
     if (covering) {
       this._readOffset = covering.offset
     } else {
-      const estimate = estimateByteOffset(this._index, targetFileSec)
-      // 窗口右端必须收敛在"外推位置"处：继续向右扩会落到文件末尾，
-      // 使回看起点大幅晚于目标时间（实测偏晚 ~1000s）。
-      const windowEnd = Math.min(size, Math.max(0, estimate))
-      const windowStart = Math.max(0, windowEnd - SEEK_BACK_WINDOW_BYTES)
-      const windowLen = Math.max(0, windowEnd - windowStart)
-      let start = windowStart
-      if (windowLen > 0) {
-        const win = await readSeekWindow(this._path, windowStart, windowLen)
-        if (this._alive && win) {
-          const boundary = findFragmentBoundary(win, windowStart)
-          if (boundary != null) start = boundary
+      // 第一枪仍用外推（等码率录像一发命中，行为与今天一致）；落点时间一读出来，
+      // 就把它当成**稀疏检查点**，在 [lo, hi] 之间二分。二分与码率无关，因此
+      // 变码率录像（前段静止、后段高运动）不再退化成几百万字节的顺序扫描。
+      let lo = 0
+      let hi = Math.max(0, size - 1)
+      let estimate = Math.min(Math.max(0, estimateByteOffset(this._index, targetFileSec)), hi)
+      let start = this._locateWindowStart(estimate, size)
+      // 优先落在"等于或早于目标"的那个检查点上；一个都没有时退到最早探到的点
+      let bestBefore: BoundaryProbe | null = null
+      let firstProbe: BoundaryProbe | null = null
+      for (let round = 0; round < MAX_LOCATE_PROBE_ROUNDS; round += 1) {
+        const probed = await this._probeLocateWindow(estimate, size)
+        probes += 1
+        if (!this._alive) return
+        if (!probed) break
+        if (firstProbe === null) firstProbe = probed
+        this._noteProbeAnchor(probed)
+        const delta = targetFileSec - probed.timeSec
+        if (delta >= 0 && delta <= LOCATE_SLACK_SEC) {
+          bestBefore = probed
+          break
         }
+        if (delta < 0) {
+          // 落点晚于目标：右界收到这个 fragment 之前
+          hi = Math.min(hi, Math.max(0, probed.offset - 1))
+        } else {
+          // 落点早于目标超过容忍差：左界抬到它之后，并记下候选
+          if (probed.offset > (bestBefore?.offset ?? -1)) bestBefore = probed
+          lo = Math.max(lo, probed.offset + 1)
+        }
+        if (hi <= lo) break
+        estimate = Math.floor((lo + hi) / 2)
+        start = this._locateWindowStart(estimate, size)
       }
+      const landing = bestBefore ?? firstProbe
+      if (landing) start = landing.offset
       this._readOffset = Math.max(0, start)
     }
     console.info(
-      `[LocalFileMseSource] 定位: 目标(文件轴) ${targetFileSec.toFixed(1)}s -> 字节 ${this._readOffset} / 文件 ${size}B，covered=${covered}`,
+      `[LocalFileMseSource] 定位: 目标(文件轴) ${targetFileSec.toFixed(1)}s -> 字节 ${this._readOffset} / 文件 ${size}B，covered=${covered}，探测=${probes}次`,
     )
     this._jumpTo(this._readOffset)
   }

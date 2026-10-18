@@ -96,4 +96,4 @@ def test_room_session_drops_review_fields_and_adds_dvr_path() -> None:
         "preview_review_start_sec",
         "recording_review",
     ):
-        assert gone not in source, "RoomSession 不应再保留回看通道字段: %s" % gone
+        assert gone not in source, f"RoomSession 不应再保留回看通道字段: {gone}"

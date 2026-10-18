@@ -98,7 +98,9 @@
           "!**/__pycache__/**",
           "!*.pyc",
           "!recover_and_backfill_broadcast.py",
-          "!verify_live_session.py"
+          "!verify_live_session.py",
+          "!run_and_export.py",
+          "!run_full_export.py"
         ]
       },
       {

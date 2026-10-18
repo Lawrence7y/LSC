@@ -20,6 +20,12 @@ export interface MsePlayerOptions {
   onSourceOpen?: () => void
   /** pending 过高/回落时通知（用于后端背压） */
   onBackpressure?: (state: 'pause' | 'resume', pending: number) => void
+  /**
+   * 恢复阶梯的最后一层：请求重建后端预览 sink（UI 层发送 enable_preview {restart:true}）。
+   * 返回 true = 请求已发出，调用方不要再报错（后端会换 preview_epoch_id，前端据此重建播放器）。
+   * 仅直播通道使用：文件回看没有后端 sink，实现方应直接返回 false。
+   */
+  onRequestSinkRestart?: (reason: string) => boolean
   debug?: boolean
 }
 
@@ -121,6 +127,14 @@ export class MsePlayer {
   private _userPaused = false
   // 卡顿检测：记录上次 currentTime 变化的时间和位置
   private _stallCheckTimer: ReturnType<typeof setInterval> | null = null
+  /**
+   * 本轮连续冻结的起点（播放头真实前进即清零）。
+   * `_lastStallTime` 每轮恢复后被重置，只能给出"距上次尝试多久"；
+   * 现场需要的是累计冻结时长（2026-09-15 的滞后从 -113s 一路涨到 -158s）。
+   */
+  private _frozenSinceMs = 0
+  /** 冻结过程 WARN 的节流时刻，避免 500ms tick 把 debug.log 刷爆 */
+  private _lastFrozenWarnAtMs = 0
   private _lastStallTime = 0
   private _lastStallPosition = 0
   // 数据饥饿检测：记录 buffer 末端最后增长时间，超过阈值判定为流中断
@@ -152,6 +166,12 @@ export class MsePlayer {
   private readonly _hardResetLimit = 2
   private _lastHardResetAt = 0
   private readonly _hardResetCooldownMs = 5 * 60 * 1000
+  // 后端 sink 重建请求（恢复阶梯最后一层）：重建 MediaSource 也救不回来的管线级卡死，
+  // 在客户端已经无解，重开后端预览是用户唯一的手动自救手段（CLAUDE.md §7.2.2 遗留项）。
+  // 每个播放器实例最多请求一次：后端重建会换 preview_epoch_id → 前端重建播放器 → 计数归零，
+  // 因此房间级预算由 UI 层（utils/previewRecovery）兜底，防止无限重启后端 FFmpeg。
+  private _sinkRestartRequested = false
+  private _onRequestSinkRestart?: (reason: string) => boolean
   // 当前 MSE 实际保留时长。0（关闭 DVR）映射为短安全缓存，而不是完全无缓存。
   // 配额压力下会被自适应缩减（见 _handleQuotaExceeded），故与"用户设置值"分开记。
   private _replayBufferSeconds: number
@@ -169,6 +189,7 @@ export class MsePlayer {
     this._onError = options.onError
     this._onSourceOpen = options.onSourceOpen
     this._onBackpressure = options.onBackpressure
+    this._onRequestSinkRestart = options.onRequestSinkRestart
     this._debug = options.debug ?? false
     this._isFile = options.isFile === true
     this.channel = options.channel ?? (this._isFile ? 'review' : 'live')
@@ -375,15 +396,21 @@ export class MsePlayer {
     let next: 'pause' | 'resume' | null = null
     if (!this._backpressurePaused && pending >= this._backpressurePauseAt) {
       next = 'pause'
-      this._backpressurePaused = true
     } else if (this._backpressurePaused && pending <= this._backpressureResumeAt) {
       next = 'resume'
-      this._backpressurePaused = false
     }
     if (!next) return
     const now = Date.now()
-    if (now - this._lastBackpressureSentAt < this._backpressureMinIntervalMs) return
+    // 节流只作用于 pause（削峰发送频率）。resume 是「后端别再丢该房 media」
+    // 的恢复信号，被节流丢弃会让后端停留在暂停态继续丢弃分片，直到 20s
+    // 自愈才恢复 —— 2026-09-15 事故签名的弱化复现（2026-09-24 修复）。
+    if (next === 'pause' && now - this._lastBackpressureSentAt < this._backpressureMinIntervalMs) {
+      return
+    }
     this._lastBackpressureSentAt = now
+    // 状态翻转必须与「确实发出」绑定：翻在前、发在后（或根本发不出去）时，
+    // 前端认为已 resume、后端仍在暂停 —— 两侧状态背离且没有自愈路径。
+    this._backpressurePaused = next === 'pause'
     try {
       this._onBackpressure(next, pending)
     } catch (e) {
@@ -1149,6 +1176,39 @@ export class MsePlayer {
   }
 
   /**
+   * 恢复阶梯的最后一层：有界地请求重建后端预览 sink。
+   *
+   * 为什么需要：本地重建 MediaSource 也救不回管线级卡死时，用户唯一的手动自救手段是
+   * 「重新开启预览」——旧实现前端发不出任何「强制重启后端 sink」的请求，后端只会回
+   * 'already streaming, init replayed'（CLAUDE.md §7.2.2 遗留项）。
+   *
+   * 只负责「有界地问一次」：是否允许（房间级预算/冷却）由 UI 层实现决定，避免这一层
+   * 耦合 WebSocket 与设置。
+   *
+   * @returns true = 已请求后端重建（调用方不要再报错）；false = 无人接单，按原口径报错
+   */
+  private _trySinkRestart(reason: string): boolean {
+    if (this._isFile) return false // 文件回看没有后端 sink，重建无意义
+    if (this._sinkRestartRequested) return false
+    const request = this._onRequestSinkRestart
+    if (!request) return false
+    let accepted = false
+    try {
+      accepted = request(reason) === true
+    } catch (e) {
+      this._log(`sink restart callback failed: ${e}`)
+      accepted = false
+    }
+    if (!accepted) return false
+    this._sinkRestartRequested = true
+    this._log(`Sink restart requested (${reason}): 等待后端重建预览流`)
+    // 刻意不进入 error 终态：后端重建成功后前端按新 preview_epoch_id 重建播放器并等新 init；
+    // 若后端重启失败/无数据，新播放器的加载超时与缓冲停滞防线会如期报错（不承诺自动恢复）。
+    this._setState('loading')
+    return true
+  }
+
+  /**
    * 离开 backpressure 暂停态时**必须**通知后端恢复推送。
    *
    * 否则后端会一直丢弃该房所有 media 段（room_handler._mse_push_paused），前端永远拿不到
@@ -1164,6 +1224,35 @@ export class MsePlayer {
       this._log(`backpressure resume callback failed: ${e}`)
     }
     this._log(`backpressure resume emitted (${reason})`)
+  }
+
+  /**
+   * 把「冻结恶化过程」写进日志。
+   *
+   * 生产环境 `_log` 受 `_debug` 开关压制，只有 `_handleError` 那条 console.error
+   * 能进 debug.log —— 它记录的是死亡瞬间，拿不到致死过程：2026-09-15 现场那条
+   * "预览滞后从 -113s 涨到 -158s/3min" 的曲线就是这么漏掉的，导致根因至今未定论。
+   * 每 5s 至多一条，并按缓冲是否仍在增长分型：
+   * render-frozen = 数据在到、渲染端时钟不动；data-starved = 管道本身断了。
+   */
+  private _warnFrozenProgression(): void {
+    const now = Date.now()
+    if (now - this._lastFrozenWarnAtMs < 5000) return
+    this._lastFrozenWarnAtMs = now
+    const video = this._video
+    const bufEnd = video && video.buffered.length
+      ? video.buffered.end(video.buffered.length - 1)
+      : 0
+    const bufIdleMs = this._lastBufferEndTime > 0 ? now - this._lastBufferEndTime : -1
+    const starved = bufIdleMs > this._bufferStallTimeoutMs
+    const frozenSec = this._frozenSinceMs > 0 ? (now - this._frozenSinceMs) / 1000 : 0
+    console.warn(
+      `[MsePlayer] WARN: clock frozen total=${frozenSec.toFixed(1)}s `
+      + `mode=${starved ? 'data-starved' : 'render-frozen'} `
+      + `bufGap=${(bufEnd - (video ? video.currentTime : 0)).toFixed(1)}s `
+      + `bufIdle=${bufIdleMs < 0 ? '-' : (bufIdleMs / 1000).toFixed(1)}s | `
+      + this._healthSnapshot(),
+    )
   }
 
   /** 错误时的健康快照：现场 debug:false 时 _log 全被吞掉，错误必须自带上下文。 */
@@ -1265,16 +1354,19 @@ export class MsePlayer {
         // currentTime 真实前进：播放恢复正常，重置强制 seek 计数与冻结标志
         this._forcedSeekRecoveryCount = 0
         this._playExhausted = false
+        this._frozenSinceMs = 0
         return
       }
       if (this._lastStallTime === 0) {
         this._lastStallTime = Date.now()
+        if (this._frozenSinceMs === 0) this._frozenSinceMs = this._lastStallTime
         return
       }
       const stallDuration = Date.now() - this._lastStallTime
       if (stallDuration < 1500) return
 
       // 超过 1.5 秒卡顿，尝试恢复
+      this._warnFrozenProgression()
       this._log(`Stall detected (${(stallDuration / 1000).toFixed(1)}s), attempting recovery`)
       this._lastStallTime = 0
 
@@ -1313,6 +1405,8 @@ export class MsePlayer {
         this._log(`Stall recovery limit reached (${this._stallRecoveryCount}/${this._stallRecoveryLimit})`)
         // 最后一层自愈：重建 MediaSource。seek/play() 救不了卡死的解码器，重建可以。
         if (this._tryHardResetRecovery('stall recovery exhausted')) return
+        // 重建预算耗尽：再问一次「能否重开后端 sink」（有界，见 _trySinkRestart）。
+        if (this._trySinkRestart('stall recovery exhausted')) return
         this._handleError('预览恢复失败，请手动重新开启预览')
         return
       }
@@ -1337,6 +1431,7 @@ export class MsePlayer {
         if (this._forcedSeekRecoveryCount > this._stallRecoveryLimit) {
           this._log(`Forced seek recovery limit reached (${this._forcedSeekRecoveryCount}/${this._stallRecoveryLimit})`)
           if (this._tryHardResetRecovery('forced seek recovery exhausted')) return
+          if (this._trySinkRestart('forced seek recovery exhausted')) return
           this._handleError('预览恢复失败，请手动重新开启预览')
           return
         }
