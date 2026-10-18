@@ -240,11 +240,14 @@ def get_repair_suggestion(error_msg: str) -> str | None:
     return None
 
 
-def humanize_error_with_suggestion(raw: str) -> dict[str, str]:
+def humanize_error_with_suggestion(raw: str) -> dict[str, str | None]:
     """返回带修复建议的错误信息。
 
     Returns:
         {"message": 友好错误信息, "suggestion": 修复建议或 None}
+
+    `suggestion` 可为 None（没有匹配到修复建议），返回类型必须写出来：
+    此前声明成 dict[str, str]，与自己的 docstring 矛盾，调用方按 str 用就踩空。
     """
     message = humanize_error(raw)
     suggestion = get_repair_suggestion(raw)

@@ -8,11 +8,6 @@ from .manifest import (
     RecordingManifest,
     SegmentEntry,
 )
-from .segmented import (
-    SegmentedRecorder,
-    SegmentedStartResult,
-    SegmentedStopResult,
-)
 from .timeline import TimelineInterval, TimelineMapper
 
 __all__ = [
@@ -20,9 +15,6 @@ __all__ = [
     "ManifestStore",
     "RecordingManifest",
     "SegmentEntry",
-    "SegmentedRecorder",
-    "SegmentedStartResult",
-    "SegmentedStopResult",
     "RecordingAsset",
     "TimelineInterval",
     "TimelineMapper",

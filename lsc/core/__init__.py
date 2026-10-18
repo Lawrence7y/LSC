@@ -1,36 +1,6 @@
 """LSC 核心领域层 — 纯业务逻辑，无 GUI 依赖。
 
-此模块包含：
-- 领域模型（models）：RecordingSession, Clip, ExportProfile 等
-- 服务接口（services）：RecordingService, ExportService 等 Protocol
-- 服务实现：RecordingServiceImpl, ExportServiceImpl 等
-
-设计原则：
-1. 核心层不依赖 PySide6 / Qt，便于单元测试和复用
-2. 所有状态变更通过返回值或回调，不依赖 Qt 信号
-3. 领域模型使用 dataclass，保持简单纯粹
+只做包声明，不做再导出：历史上这里 re-export 了 Clip/ExportService 等名字，
+但全仓 `from lsc.core import X` 命中数为 0（一律走 `lsc.core.models` 等具体子模块），
+空转的 barrel 会让人误改这里就以为改到了实现。
 """
-
-from lsc.core.models import (
-    Clip,
-    ExportOptions,
-    RecordingSession,
-    RecordingStatus,
-    RoomInfo,
-    StreamQuality,
-)
-from lsc.core.services.export_service import ExportService
-from lsc.core.services.recording_service import RecordingService
-from lsc.core.session import RoomSession
-
-__all__ = [
-    "Clip",
-    "ExportOptions",
-    "ExportService",
-    "RecordingService",
-    "RecordingSession",
-    "RecordingStatus",
-    "RoomInfo",
-    "RoomSession",
-    "StreamQuality",
-]
