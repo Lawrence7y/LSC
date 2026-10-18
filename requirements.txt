@@ -7,7 +7,11 @@
 # Electron 为唯一前端，后端为纯 Python，不需要任何 Qt 运行时。
 
 # Python WebSocket backend (Electron version)
-websockets>=12.0
+# 上界 <13 是硬约束：websockets 13+ 的顶层 serve 是 asyncio 新实现，
+# ServerConnection 没有 request_headers（Origin 校验被 hasattr 静默跳过）、
+# Server.close() 变协程（call_soon_threadsafe 同步调用变 no-op）。
+# server.py 的 legacy 实现假设全部依赖 12.x（2026-09-24 钉版）。
+websockets>=12.0,<13
 
 # Audio cross-correlation alignment (numpy-based FFT)
 numpy>=1.24,<3

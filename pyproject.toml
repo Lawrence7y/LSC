@@ -1,6 +1,6 @@
 [project]
 name = "lsc"
-version = "1.0.16"
+version = "1.0.17"
 description = "Live Stream Clipper - 多直播间切片系统"
 requires-python = ">=3.10"
 # 开发仍推荐 `pip install -r requirements.txt`
@@ -73,7 +73,15 @@ disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 follow_imports = "silent"
-files = ["lsc"]
+files = ["lsc", "python-backend"]
+# 2026-09-18：python-backend 正式纳入类型检查。此前它被排除的理由写在下面这条
+# 注释里（"目录名含连字符，不是合法包名"），但真正的阻塞物是
+# `python-backend/__init__.py` 那个只有一行注释的残留文件 —— 目录本来就不是包
+# （靠 sys.path 平铺导入 `handlers.*`），有 `__init__.py` 反而让 mypy 坚持把它
+# 当包解析并报"非法包名"。删掉那个文件 + 指定 mypy_path 即可检查。
+# 收益是即时的：范围一开，31 条非机械类型错误立刻浮出，其中
+# `main.stop()` 那条（func-returns-value）是一个每次都发生的退出挂起缺陷。
+mypy_path = "python-backend"
 exclude = [
     "tests/",
     "docs/",
@@ -82,10 +90,102 @@ exclude = [
     "lsc-electron/",
     "scripts/",
 ]
-# python-backend 含连字符，非合法 Python 包名，mypy 无法直接检查
-# 通过 MYPYPATH 环境变量或 namespace_packages 配置可后续接入
 namespace_packages = true
 
 [[tool.mypy.overrides]]
 module = "psutil"
 ignore_missing_imports = true
+
+# CI 的 lint job 不装 numpy/websockets（只为类型检查拉 40MB+ 的编译轮子不值），
+# 沿用 psutil 的既有做法：只忽略"找不到第三方 stub"，不影响我们自己代码的检查。
+[[tool.mypy.overrides]]
+module = ["numpy", "websockets", "websockets.*", "onnxruntime"]
+ignore_missing_imports = true
+
+# ── mypy 债务棘轮（2026-09-18 生成，2026-09-19 收敛；docs/reports/debt-audit-20260918.md §2.1/§11.22）─
+# CI 的 mypy 步骤已从 `|| echo ::warning::`（全仓静默放行）改为**阻塞**。
+# 下面每个模块只禁用**它当前实际触发的错误码**（而不是 ignore_errors），
+# 因此在这些文件里引入**新类型**的类型错误仍会被 CI 卡住；修完一种就把该码删掉，
+# 全仓 0 error 后整段删除。
+# 2026-09-19 现状（关掉全部豁免实测）：**245 条，且全部是 `no-untyped-def`、全部在
+# python-backend**（room_handler 131 / analysis_handlers 22 / server 18 /
+# export_handlers 18 / main 10 / alignment_handlers 9 / 其余零散）。
+# `lsc/` 侧已经**一条豁免都不剩**：
+#   arg-type 23 → 0：这些全是 `float(d.get(k))` 从异构字典取标量。没有到处写 cast，
+#       而是收进 `lsc/utils/coerce.py`（try_float/safe_float/try_int/safe_int）一处口径，
+#       顺带把 python-backend 里三份手抄的 `safe_float` 也并了过去。口径比原来更严：
+#       NaN/Inf/bool 一律回退（旧实现全部放行，`nan` 会静默扩散进时间轴与打分）。
+#   no-untyped-def 12 → 0：补标注时暴露并修掉 4 处真实的类型不符 ——
+#       urllib 重定向处理器第二个参数是 `IO[bytes]` 不是响应对象、headers 是
+#       `HTTPMessage`、`open_http_stream` 原本返回 Any（调用方对它的属性访问全都不检）、
+#       `SharedRoomIngest._lease_manager` 因初始化写成 `= None` 而被推断成 None 类型。
+# 剩下的 245 条不是刷签名能解决的：WS 处理器的 payload/返回值需要一份 TypedDict 契约
+# （债务报告 §11.6），否则补完标注只是把 `Any` 从参数挪到局部变量。属立项工作。
+
+# ── mypy 债务棘轮：python-backend（2026-09-18 纳入范围）───────────────────────────────────────
+# 范围刚打开时合计 261 errors / 17 files，全部是 `no-untyped-def`（WS 处理器
+# 与启动脚本基本没写签名）。这里只禁这一种码：python-backend 里的**其它类型**
+# 错误、以及这些文件里新出现的其它码型，CI 一律照红不误。
+# 注意：`main` / `server` / `start` / `persistence` 是平铺导入下的顶层模块名，
+# 若将来新增同名包，这条豁免会顺带盖到它 —— 收敛时请优先处理。
+# 清完一个模块的签名就把整段 override 删掉；全仓归零后删除全部豁免。
+
+[[tool.mypy.overrides]]
+module = "dependency_manager"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "full_pipeline_test"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "handlers.alignment_handlers"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "handlers.analysis_handlers"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "handlers.export_handlers"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "handlers.jianying_handlers"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "handlers.recording_handlers"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "handlers.room_handler"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "handlers.timeline_handlers"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "main"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "monitor_continuous_analysis"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "persistence"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "profile_continuous_analysis"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "server"
+disable_error_code = ["no-untyped-def"]
+
+[[tool.mypy.overrides]]
+module = "start"
+disable_error_code = ["no-untyped-def"]
