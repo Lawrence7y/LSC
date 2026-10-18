@@ -16,6 +16,8 @@ from pathlib import Path
 
 from lsc.exporter.jianying_draft import (
     _BROADCAST_VALID_END_BY as DRAFT_VALID_END_BY,
+)
+from lsc.exporter.jianying_draft import (
     clip_allowed_for_draft,
 )
 

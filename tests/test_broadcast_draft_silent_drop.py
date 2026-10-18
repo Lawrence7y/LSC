@@ -19,8 +19,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from handlers import jianying_handlers
+
 from lsc.core.models import JianyingDraftOptions
 from lsc.exporter.jianying_draft import build_session_draft
 

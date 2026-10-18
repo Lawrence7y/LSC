@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 
 from scripts.valorant_vision.build_retrain_manifests import (
+    CLASSES,
     _base_name,
     build,
-    CLASSES,
 )
 
 

@@ -73,6 +73,42 @@ def test_call_rejects_when_pending_full(orch):
         t.join(5)
 
 
+def test_call_waits_for_a_slot_instead_of_failing(orch):
+    """槽位被占满但随后排空时，第 9 个调用要等到位子，而不是当场失败。
+
+    真实形状：用户一次添加 8~12 个房间，`add_room` 由线程池并发投递，
+    瞬时 pending 会超过 `_MAX_PENDING_REQUESTS`。立即抛错等于把正常的
+    背压变成「添加房间失败」。这里手工占满 8 个槽位，验证第 9 个调用
+    在槽位释放后成功，而不是抛 too busy。
+    """
+    for _ in range(RoomOrchestrator._MAX_PENDING_REQUESTS):
+        assert orch._acquire_pending_slot(time.monotonic() + 2.0) is True
+
+    outcome: list[object] = []
+
+    def _worker() -> None:
+        try:
+            outcome.append(orch.call(lambda: "done", timeout=5.0))
+        except Exception as exc:  # noqa: BLE001 - 断言用
+            outcome.append(exc)
+
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    try:
+        # 0.2s 是"槽位仍全被占住"这个前提的 stimulus，不是生产阈值：
+        # 真被派发也只会晚于它，不会因为放大而漏判。
+        time.sleep(0.2)
+        assert not outcome, "槽位占满时不应已完成调用"
+        for _ in range(RoomOrchestrator._MAX_PENDING_REQUESTS):
+            orch._release_pending_slot()
+        thread.join(5.0)
+        assert outcome == ["done"]
+    finally:
+        thread.join(1.0)
+    with orch._pending_lock:
+        assert orch._pending_count == 0
+
+
 def test_is_stream_offline_error():
     from lsc.core.orchestrator import _is_stream_offline_error
     assert _is_stream_offline_error("直播间已结束")
@@ -425,11 +461,10 @@ def test_finalize_and_commit_recording_is_idempotent(tmp_path):
 def test_finalize_and_commit_recording_keeps_source_on_persistent_busy(tmp_path, monkeypatch):
     """源长时间被占用：保留「录制中」名并告警，绝不复制出副本。"""
     from datetime import datetime
-    from pathlib import Path
     from types import SimpleNamespace
 
-    import lsc.core.recording_layout as layout
     import lsc.core.orchestrator as orch_mod
+    import lsc.core.recording_layout as layout
 
     # 不真的等 5s
     monkeypatch.setattr(orch_mod, "_FINALIZE_LAYOUT_TIMEOUT_SEC", 0.0)

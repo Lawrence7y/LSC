@@ -176,7 +176,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  帧数: baseline {base['frame_count']} / candidate {cand['frame_count']}"
               f"   来源会话数: {base['source_session_count']} / {cand['source_session_count']}")
         print(f"  {'指标':<18}{'baseline':>12}{'candidate':>12}{'变化':>10}   {'门禁':<8}")
-        for (bname, bval, bthr, bok), (cname, cval, cthr, cok) in zip(base_gates, cand_gates):
+        for (bname, bval, _bthr, _bok), (_cname, cval, cthr, cok) in zip(
+            base_gates, cand_gates, strict=True,
+        ):
             delta = cval - bval
             flag = "PASS" if cok else f"FAIL(需 {cthr:.2f})"
             print(f"  {bname:<18}{bval:>12.4f}{cval:>12.4f}{delta:>+10.4f}   {flag:<8}")
@@ -189,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         summary[split] = {"baseline": base, "candidate": cand,
                           "gate_rows": [{"check": n, "baseline": b, "candidate": c,
                                          "threshold": t, "passed": ok}
-                                        for (n, b, t, _), (_n, c, _t2, ok) in zip(base_gates, cand_gates)]}
+                                        for (n, b, t, _), (_n, c, _t2, ok) in zip(base_gates, cand_gates, strict=True)]}
 
     print("\n" + "=" * 92)
     print("判读提示")

@@ -20,8 +20,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from handlers import jianying_handlers, room_handler
+
 from lsc.exporter.jianying_draft import clip_allowed_for_draft
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -212,7 +212,8 @@ def test_sibling_lookup_falls_back_to_parent_key():
     round-000071-s1(862.0-874.3) 必须报"兄弟已覆盖回合"，而不是 NEVER_AUDITED。"""
     parent = {"round_key": "round-000071", "broadcast_audit": "passed",
               "end_by": "broadcast_exclusion", "end_quality": "precise"}
-    lookup = lambda key: parent if key == "round-000071" else None
+    def lookup(key):
+        return parent if key == "round-000071" else None
     clip = {"round_key": "round-000071-s1", "confirm_status": "pending",
             "broadcast_audit": "pending_lookahead", "end_by": "next_prep"}
     assert jianying_handlers._skip_reason_code(
@@ -279,9 +280,7 @@ def test_reconcile_rejected_text_maps_to_rejected_code():
 
 def test_rejection_reason_prefers_audit_over_ok_gate():
     """入点门禁通过（"ok"）时不得把 "ok" 当拒绝原因（前端会显示「已拒绝(ok)」）。"""
-    helper = getattr(room_handler, "_rejection_reason", None)
-    if helper is None:
-        pytest.skip("_rejection_reason 未实现")
+    helper = room_handler._rejection_reason
     assert helper({"broadcast_start_gate": "ok", "broadcast_audit": "rejected_no_stable_combat"}) == (
         "rejected_no_stable_combat"
     )
@@ -316,9 +315,7 @@ def test_export_recovers_finalized_clip_and_reports_reason_codes(case):
 
 def test_scan_path_terminals_are_projected_into_durable_state():
     """C2：扫描通路定稿必须同时进 durable 账本（否则收尾 sidecar 缺条目）。"""
-    projected = getattr(room_handler, "_project_scan_audit_terminals", None)
-    if projected is None:
-        pytest.skip("C2 未实现（夹具 A 的改前状态）")
+    projected = room_handler._project_scan_audit_terminals
 
     highlights = [
         {  # 现场 20:43:26 的 105：已定稿，却只进 listed
@@ -364,9 +361,7 @@ def test_scan_path_terminals_are_projected_into_durable_state():
 
 def test_analysis_save_path_follows_finalize_rename(tmp_path):
     """C3：归档改名后必须写新名 sidecar，否则「至_」文件的分析快照永远停在改名那一刻。"""
-    sync = getattr(room_handler, "_sync_analysis_save_path", None)
-    if sync is None:
-        pytest.skip("C3 未实现")
+    sync = room_handler._sync_analysis_save_path
 
     old = tmp_path / "2026-09-11_20-10-29_录制中.mp4"
     new = tmp_path / "2026-09-11_20-10-29_至_2026-09-11_20-38-42.mp4"
@@ -393,9 +388,7 @@ def test_analysis_save_path_follows_finalize_rename(tmp_path):
 
 def test_listed_without_terminal_detection():
     """C6：listed 里有、却无终态也不在待审计队列的回合必须被识别出来。"""
-    helper = getattr(room_handler, "_listed_items_without_terminal", None)
-    if helper is None:
-        pytest.skip("C6 未实现")
+    helper = room_handler._listed_items_without_terminal
 
     state = {
         "listed_clips": {
@@ -432,9 +425,7 @@ def test_finalize_completion_waits_for_listed_terminals():
 
 def test_authority_snapshot_survives_task_pop(case):
     """C1：任务态没了，权威快照仍必须能回答「这条 round_key 属于当前录制 epoch」。"""
-    snapshots = getattr(room_handler, "_last_authority_snapshots", None)
-    if snapshots is None:
-        pytest.skip("C1 未实现（夹具 A 的改前状态）")
+    snapshots = room_handler._last_authority_snapshots
     snap = snapshots.get(ROOM_ID)
     assert snap is not None and snap["listed_clips"]
     # 105 的终态审计字段必须来自权威快照，而不是 20:37 的旧 sidecar

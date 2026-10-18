@@ -20,8 +20,8 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from train_weighted_distill import (  # noqa: E402
-    LABELS,
     INPUT_SIZE,
+    LABELS,
     NORMALIZE_MEAN,
     NORMALIZE_STD,
     Sample,
@@ -32,7 +32,6 @@ from train_weighted_distill import (  # noqa: E402
     apply_hard_sample_weights,
     collect_samples,
 )
-
 
 # 运行时**后处理契约**：这些键不由训练产生，而是推理侧的行为声明
 # （融合权重 / 类专属稳定阈值）。教师模型靠它们决定"怎么把概率变成标签"，

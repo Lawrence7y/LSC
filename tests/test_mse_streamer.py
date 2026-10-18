@@ -48,9 +48,9 @@ def test_mse_streamer_file_mode_skips_network_flags() -> None:
         on_init_segment=lambda _b: None,
         on_media_segment=lambda _b: None,
     )
-    with patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch.object(
-        mse_mod, "set_stream_nonblocking"
-    ), patch("lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen):
+    with patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch(
+        "lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen
+    ):
         streamer.start(startup_probe_timeout=0.2)
 
     assert "-reconnect" not in captured_cmd
@@ -83,9 +83,9 @@ def test_mse_streamer_file_mode_start_offset_adds_copyts_and_ss() -> None:
         on_init_segment=lambda _b: None,
         on_media_segment=lambda _b: None,
     )
-    with patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch.object(
-        mse_mod, "set_stream_nonblocking"
-    ), patch("lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen):
+    with patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch(
+        "lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen
+    ):
         streamer.start(startup_probe_timeout=0.2)
 
     assert "-copyts" in captured_cmd
@@ -140,8 +140,8 @@ def test_try_start_probe_timeout_with_403_stderr_fails() -> None:
     streamer._read_segments = lambda: None
 
     with patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch.object(
-        mse_mod, "set_stream_nonblocking"
-    ), patch.object(mse_mod.subprocess, "Popen", return_value=proc):
+        mse_mod.subprocess, "Popen", return_value=proc
+    ):
         try:
             ok = streamer._try_start(hwaccel_mode="", use_nvenc=False, startup_probe_timeout=0.3)
         finally:
@@ -172,8 +172,8 @@ def test_try_start_probe_timeout_without_error_assumes_success() -> None:
     streamer._read_segments = lambda: None
 
     with patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch.object(
-        mse_mod, "set_stream_nonblocking"
-    ), patch.object(mse_mod.subprocess, "Popen", return_value=proc):
+        mse_mod.subprocess, "Popen", return_value=proc
+    ):
         try:
             ok = streamer._try_start(hwaccel_mode="", use_nvenc=False, startup_probe_timeout=0.2)
         finally:
@@ -238,9 +238,9 @@ def test_file_review_start_uses_libx264_even_when_nvenc_available() -> None:
     )
     with patch.object(mse_mod, "_check_nvenc", return_value=True), patch.object(
         mse_mod, "scale_cuda_available", return_value=True
-    ), patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch.object(
-        mse_mod, "set_stream_nonblocking"
-    ), patch("lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen):
+    ), patch.object(mse_mod, "prepare_launch", return_value=(None, 0, None)), patch(
+        "lsc.core.services.mse_streamer.subprocess.Popen", _FakePopen
+    ):
         streamer.start(startup_probe_timeout=0.2)
 
     assert "h264_nvenc" not in captured_cmd

@@ -65,7 +65,7 @@ def main() -> None:
     per_hit = Counter()
     conf_sum = defaultdict(float)
     low_conf = 0
-    for (p, y), row in zip(samples, probs):
+    for (_p, y), row in zip(samples, probs, strict=True):
         pred = int(row.argmax())
         per_total[y] += 1
         conf_sum[y] += float(row[y])

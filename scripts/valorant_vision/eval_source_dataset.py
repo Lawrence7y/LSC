@@ -41,11 +41,14 @@ from eval_gates import (
     compute_round_report,
     round_report_to_dict,
 )
+
 from lsc.analyzer.valorant_broadcast import (
     _predict_broadcast_batch,
-    _stable_visual_label,
     _stabilize_broadcast_samples,
+    _stable_visual_label,
 )
+
+
 def imread(p: Path):
     if cv2 is None or np is None:
         raise RuntimeError("numpy and opencv-python are required for frame evaluation")
@@ -162,7 +165,7 @@ def evaluate(
             if mode == "broadcast_runtime"
             else clf.predict_batch(sub_images)
         )
-        for idx, p_dist in zip(valid_indices, probs):
+        for idx, p_dist in zip(valid_indices, probs, strict=True):
             if mode == "broadcast_runtime":
                 pred_cls, confidence = _stable_visual_label(
                     p_dist,
@@ -294,14 +297,20 @@ def evaluate(
             all_passed = False
         print(f"  [{status}] {name:<20}: {val:.4f} (gate {op} {thresh:.4f}, support={support})")
 
-    if not failures:
-        print("\n=> ALL RELEASE GATES PASSED")
-    else:
-        print("\n=> SOME GATES FAILED")
+    # `gates` above and eval_gates.check_all_gates() are two tables over the same
+    # five thresholds. check_all_gates is a superset (it also gates per-source
+    # macro F1), so `not failures` already implies `all_passed`. The AND is a
+    # tripwire, not a behaviour change: if the tables ever drift and this loop
+    # prints a FAIL the shared checker misses, promotion must not proceed.
+    gates_passed = all_passed and not failures
 
-    # The release decision is shared with eval_gates instead of duplicating a
-    # second set of thresholds in this script. ``all_passed`` above is retained
-    # in the console output for backward-compatible readability.
+    if gates_passed:
+        print("\n=> ALL RELEASE GATES PASSED")
+    elif all_passed:
+        print("\n=> SOME GATES FAILED  (由 check_all_gates 判定制裁，本脚本指标表全部 PASS)")
+    else:
+        print("\n=> SOME GATES FAILED  (本脚本指标表存在 FAIL，与共享裁决表分叉，需人工核对)")
+
     return {
         **classification,
         # Keep the historical key for existing report consumers.
@@ -315,7 +324,7 @@ def evaluate(
         "gate_failures": [
             {"check": item.check, "message": item.message} for item in failures
         ],
-        "gates_passed": not failures,
+        "gates_passed": gates_passed,
         "predictions": raw_predictions,
     }
 

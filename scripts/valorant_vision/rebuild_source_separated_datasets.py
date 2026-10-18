@@ -28,9 +28,7 @@ MANIFEST_POV = ROOT / "scripts" / "valorant_vision" / "manifest_pov.jsonl"
 def _is_broadcast(stem: str) -> bool:
     if "broadcast" in stem or stem.startswith("pakki_"):
         return True
-    if any(k in stem for k in ("yuezi", "valorant_esports", "hanghang", "binggan", "pakki")):
-        return True
-    return False
+    return any(k in stem for k in ("yuezi", "valorant_esports", "hanghang", "binggan", "pakki"))
 
 
 def _extract_broadcast_session(stem: str) -> tuple[str, bool]:

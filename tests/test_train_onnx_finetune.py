@@ -58,7 +58,7 @@ def test_export_meta_inherits_teacher_runtime_contract(tmp_path) -> None:
     assert meta["class_stable_prob"] == {"replay": 0.77}
     assert meta["broadcast_input_fusion"] == {"full_frame_weight": 0.7, "top_hud_weight": 0.3}
     # 训练产物自身的字段必须保留，且不得把教师的训练统计串进来
-    assert meta["train_count"] if "train_count" in meta else True
+    assert meta.get("train_count", True)
     assert "sha256" not in meta
 
 

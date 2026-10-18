@@ -252,7 +252,7 @@ DELETED_SYMBOLS = (
 
 @pytest.mark.parametrize("symbol", DELETED_SYMBOLS)
 def test_review_channel_symbols_are_gone(symbol) -> None:
-    assert symbol not in ROOM_HANDLER, "review 通道符号应已删除: %s" % symbol
+    assert symbol not in ROOM_HANDLER, f"review 通道符号应已删除: {symbol}"
 
 
 def test_review_channel_fields_are_gone() -> None:
@@ -263,7 +263,7 @@ def test_review_channel_fields_are_gone() -> None:
         "review_window_end_sec",
         "preview_review_start_sec",
     ):
-        assert gone not in ROOM_HANDLER, "review 通道字段应已删除: %s" % gone
+        assert gone not in ROOM_HANDLER, f"review 通道字段应已删除: {gone}"
         assert gone not in SESSION
 
 
@@ -291,7 +291,7 @@ def test_mse_channel_review_routing_is_gone() -> None:
 
 def test_review_handlers_are_declarative_stubs() -> None:
     for handler in ("start_recording_review", "close_recording_review"):
-        body = ROOM_HANDLER.split("@server.on('%s')" % handler, 1)[1].split("@server.on(", 1)[0]
+        body = ROOM_HANDLER.split(f"@server.on('{handler}')", 1)[1].split("@server.on(", 1)[0]
         assert "deprecated: use local file playback" in body
         assert "'success': False" in body
         # 桩里不得残留任何流 / 会话 / 房间状态操作

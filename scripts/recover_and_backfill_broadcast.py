@@ -25,21 +25,18 @@ PY_BACKEND = ROOT / "python-backend"
 if str(PY_BACKEND) not in sys.path:
     sys.path.insert(0, str(PY_BACKEND))
 
-from lsc.analyzer.valorant_broadcast import (
-    audit_broadcast_rounds,
-    _expand_oversize_candidates,
-)
+# handlers.room_handler imports
+from handlers import room_handler
+
+from lsc.analyzer.valorant_broadcast import audit_broadcast_rounds
 from lsc.analyzer.valorant_ocr_rounds import detect_valorant_rounds_ocr
-from lsc.core.models import JianyingDraftOptions
+from lsc.core.models import JianyingDraftOptions, JianyingDraftResult
 from lsc.exporter.jianying_draft import (
     ClipDraftSource,
     RoomDraftSource,
     build_session_draft,
 )
 from lsc.utils.recording_repair import repair_recording
-
-# handlers.room_handler imports
-from handlers import room_handler
 
 logging.basicConfig(
     level=logging.INFO,

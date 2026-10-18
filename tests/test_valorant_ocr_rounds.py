@@ -1397,6 +1397,7 @@ def _stub_center_ocr(monkeypatch, text: str) -> None:
 def test_replay_banner_vetoes_prep_and_end(monkeypatch) -> None:
     """命中回放/慢动作水印时必须否决 prep/end，不得把回放当边界。"""
     import numpy as np
+
     import lsc.analyzer.valorant_ocr_rounds as mod
 
     frame = np.zeros((360, 640, 3), dtype=np.uint8)

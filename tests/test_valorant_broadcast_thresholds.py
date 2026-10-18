@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from lsc.analyzer.valorant_broadcast import (
     _predict_broadcast_batch,
-    _stable_visual_label,
     _stabilize_broadcast_samples,
+    _stable_visual_label,
 )
 
 

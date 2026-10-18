@@ -1,5 +1,6 @@
 """Test resolve_real_video_path helper."""
 from pathlib import Path
+
 from lsc.utils.helpers import resolve_real_video_path
 
 

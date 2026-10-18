@@ -17,7 +17,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 MODEL_NAME = "valorant_phase_v1"
 
 

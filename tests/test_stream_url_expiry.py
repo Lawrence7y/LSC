@@ -9,6 +9,7 @@ from lsc.core.orchestrator import (
     _should_proactively_refresh_stream,
 )
 
+
 def _now() -> float:
     return time.time()
 

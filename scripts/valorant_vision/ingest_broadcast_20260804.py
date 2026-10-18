@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+
 from lsc.analyzer.valorant_frame_classifier import ValorantFrameClassifier
 
 ANN = Path.home() / "LSC" / "datasets" / "valorant_phase" / "annotate"
@@ -113,7 +114,7 @@ def main() -> None:
             batch_meta.append((fp, ts))
             if len(batch_imgs) >= 32 or i == len(frames):
                 probs_batch = clf.predict_batch(batch_imgs)
-                for (fp2, ts2), probs in zip(batch_meta, probs_batch):
+                for (fp2, ts2), probs in zip(batch_meta, probs_batch, strict=True):
                     idx = int(probs.argmax())
                     pred = LABELS_ORDER[idx]
                     conf = float(probs[idx])

@@ -56,4 +56,7 @@ def test_room_handler_system_stats_include_ingest_diagnostics() -> None:
     source = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
 
     assert "def _ingest_diagnostics()" in source
-    assert "collect_system_stats(output_dir, extra=_ingest_diagnostics())" in source
+    # 断言不变量而非整行排版：进 extra 的必须是"共享进样诊断 + §7.4 派生闸账本"两项
+    assert "collect_system_stats(" in source
+    assert "**_ingest_diagnostics()," in source
+    assert "'ffmpeg_budget': budget_snapshot()" in source

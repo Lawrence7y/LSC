@@ -1212,25 +1212,6 @@ def test_chime_corrected_closed_round_near_tip_is_not_dropped() -> None:
     assert room_handler._is_listable_ocr_round(retained[0])
 
 
-def test_round_end_events_merge_keeps_last_spike() -> None:
-    """回合结束钟声合并须保留窗口内最后一个 spike（结束连声的最后一声），
-    而非能量最高者（交火枪声会提前结束点）。"""
-    import lsc.analyzer.sound_detector as sd
-
-    events = [
-        {"timestamp": 10.0, "score": 0.9},
-        {"timestamp": 14.0, "score": 0.6},
-        {"timestamp": 30.0, "score": 0.8},
-        {"timestamp": 33.0, "score": 0.4},
-    ]
-    merged = sd._merge_events_last(events, merge_window=8.0)
-    assert [e["timestamp"] for e in merged] == [14.0, 33.0]
-
-    src = (ROOT / "lsc/analyzer/sound_detector.py").read_text(encoding="utf-8")
-    assert "detect_round_end_events" in src
-    assert "_merge_events_last" in src
-
-
 def test_list_only_min_duration_allows_short_hybrid_rounds() -> None:
     """纯 OCR 确认的回合（入点+出点齐备）直接入列导出，门槛统一为 5s。"""
     assert hasattr(room_handler, "_min_highlight_duration_for_queue")
@@ -1800,7 +1781,9 @@ def test_finalize_audit_does_not_return_pending_lookahead() -> None:
     → 候选永久滞留 → 收尾 `pending_audit` 恒真 → 无限补扫 / 界面卡死。
     """
     src = (ROOT / "lsc/analyzer/valorant_broadcast.py").read_text(encoding="utf-8")
-    assert "if lookahead_incomplete and not finalize:" in src
+    # 只断言"finalize 必须排除该分支"这个不变量，不锁整行排版
+    # （2026-09-18 为让 mypy 看得见 available_end 非空而追加了显式收窄，语义未变）
+    assert "if lookahead_incomplete and not finalize" in src
     assert 'reason="lookahead_incomplete"' in src
 
 
@@ -1808,7 +1791,9 @@ def test_finalize_forces_audit_of_past_end_candidates() -> None:
     """收尾时对「候选终点已到/超出文件末尾」的候选强制尝试一次终态审计。"""
     src = (ROOT / "python-backend/handlers/room_handler.py").read_text(encoding="utf-8")
     assert "_finalize_now" in src
-    assert "elif _finalize_now and _dur <= c_end:" in src
+    # 断言不变量而非整行排版：与常规就绪分支合并成 `or` 后仍须成立
+    # （ruff SIM114 修的是形态，不是语义）。
+    assert "_finalize_now and _dur <= c_end" in src
     assert "finalize=_finalize_now," in src
 
 

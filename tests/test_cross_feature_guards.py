@@ -191,13 +191,20 @@ def test_aligning_mutex_blocks_mark_add_and_export() -> None:
 
 
 def test_confirm_clip_filters_disconnected_targets() -> None:
-    """Task 7: 确认目标集过滤断连房并优先 continuousTargetRoomIds。"""
+    """Task 7: 确认目标集过滤断连房并优先 continuousTargetRoomIds。
+
+    判据本体 2026-09-19 搬进 `utils/clipConfirmPolicy.selectSyncTargetRooms`，
+    由 `clipConfirmPolicy.test.ts` 逐条断言（负控 13/13，§11.31）：
+    冻结目标集优先 → 同对齐组 → **空**（禁止退回全量已连接房）、剔掉断连/不存在/本房间。
+    这里只守 Workbench 确实把房间表与冻结集交出去、且 `syncTargets:false` 时不传。
+    """
     body = _handle_confirm_clip_body(_workbench_source())
 
     assert "continuousTargetRoomIds" in body
-    assert "is_connected" in body
-    assert "clip.room_id" in body
-    assert "align_group_id" in body
+    assert "selectSyncTargetRooms({" in body
+    assert "rooms: store.rooms," in body
+    assert "clipRoomId: clip.room_id ?? ''," in body
+    assert "syncTargets" in body
 
 
 def test_batch_stop_warns_when_continuous_analysis_running() -> None:

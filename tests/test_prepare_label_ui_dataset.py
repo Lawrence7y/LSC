@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-from scripts.valorant_vision.prepare_label_ui_dataset import build_queue
 from scripts.valorant_vision.ingest_recording_frames import _video_id
+from scripts.valorant_vision.prepare_label_ui_dataset import build_queue
 
 
 def test_build_queue_keeps_dataset_labels_as_review_hints(tmp_path) -> None:

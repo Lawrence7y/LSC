@@ -33,6 +33,8 @@ for extra in (ROOT, ROOT / "python-backend"):
     if str(extra) not in sys.path:
         sys.path.insert(0, str(extra))
 
+from continuous_finalization import boundary_quality_reason_code  # noqa: E402
+
 from lsc.core.models import JianyingDraftOptions  # noqa: E402
 from lsc.core.recording_layout import (  # noqa: E402
     _IN_PROGRESS_STEM_FORMAT,
@@ -46,7 +48,6 @@ from lsc.exporter.jianying_draft import (  # noqa: E402
     build_session_draft,
     clip_allowed_for_draft,
 )
-from continuous_finalization import boundary_quality_reason_code  # noqa: E402
 
 # 侧车里的候选字段 → ClipDraftSource / 门禁需要的字段名（尽量原样透传）
 _AUDIT_FIELDS = (

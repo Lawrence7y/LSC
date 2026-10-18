@@ -224,5 +224,5 @@ def test_refine_worker_reserves_ready_candidates_first() -> None:
 
     assert "target_list = ready_indices if ready_indices else probe_indices" in src
     assert "if c.get('_audit_continue_ready'):" in src
-    # 收尾期强制定稿兜底不得被批次改动破坏
-    assert "elif _finalize_now and _dur <= c_end:" in src
+    # 收尾期强制定稿兜底不得被批次改动破坏（只断言判据本身，不锁行排版）
+    assert "_finalize_now and _dur <= c_end" in src

@@ -8,14 +8,15 @@ import numpy as np
 import pytest
 
 from lsc.editor.audio_aligner import (
-    AUDIO_DURATION,
     SAMPLE_RATE,
     _parabolic_interpolation,
     align_audio_map,
-    align_rooms,
     compute_offset,
-    extract_audio_pcm,
 )
+
+# 合成信号窗口长度（秒）。原 AUDIO_DURATION 属已删除的「录制文件对齐」路径
+# （extract_audio_pcm / align_rooms，2026-09-18 删除），测试自持该常量。
+AUDIO_DURATION = 3.0
 
 
 def _noise_signal(duration: float, sample_rate: int = SAMPLE_RATE, seed: int = 42) -> np.ndarray:
@@ -210,123 +211,6 @@ class TestParabolicInterpolation:
         corr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         assert _parabolic_interpolation(corr, 0) == 0.0
         assert _parabolic_interpolation(corr, 2) == 2.0
-
-
-class TestExtractAudioPcm:
-    """FFmpeg 音频提取测试（使用 mock 避免实际调用 FFmpeg）。"""
-
-    @patch("subprocess.Popen")
-    def test_returns_empty_array_on_ffmpeg_failure(self, mock_popen):
-        """FFmpeg 失败时返回空数组。"""
-        mock_proc = mock_popen.return_value
-        mock_proc.stdout = None
-        mock_proc.wait.side_effect = Exception("FFmpeg error")
-
-        result = extract_audio_pcm("ffmpeg", "/fake/path.mp4", duration=5.0)
-        assert result.size == 0
-
-    @patch("subprocess.Popen")
-    def test_returns_empty_array_on_empty_output(self, mock_popen):
-        """FFmpeg 输出为空时返回空数组。"""
-        mock_proc = mock_popen.return_value
-        mock_proc.stdout.read.return_value = b""
-        mock_proc.wait.return_value = None
-
-        result = extract_audio_pcm("ffmpeg", "/fake/path.mp4", duration=5.0)
-        assert result.size == 0
-
-
-class TestAlignRooms:
-    """align_rooms 集成测试（mock extract_audio_pcm）。"""
-
-    def test_less_than_two_rooms_returns_failure(self):
-        """不足 2 个房间应返回失败。"""
-        result = align_rooms([], "ffmpeg")
-        assert result.success is False
-        assert "至少需要" in result.error
-
-    def test_single_room_returns_failure(self):
-        """1 个房间应返回失败。"""
-        rooms = [{"room_id": "r1", "source": "/fake.mp4", "seek": 0.0, "is_recording": True}]
-        result = align_rooms(rooms, "ffmpeg")
-        assert result.success is False
-
-    @patch("lsc.editor.audio_aligner.extract_audio_pcm")
-    def test_two_rooms_normalizes_offsets(self, mock_extract):
-        """2 个房间时，偏移量应正确归一化（最慢房间 offset=0）。"""
-        long_signal = _noise_signal(AUDIO_DURATION + 2.0, seed=1)
-        fastest = _shifted_window(long_signal, 0.0, AUDIO_DURATION)
-        slower1 = _shifted_window(long_signal, 1.0, AUDIO_DURATION)
-
-        mock_extract.side_effect = [fastest, slower1]
-
-        rooms = [
-            {"room_id": "r1", "source": "/a.mp4", "seek": 0.0, "is_recording": True},
-            {"room_id": "r2", "source": "/b.mp4", "seek": 0.0, "is_recording": True},
-        ]
-        result = align_rooms(rooms, "ffmpeg")
-        assert result.success is True
-        assert result.reference_room_id == "r2"
-        assert result.offsets["r1"] == pytest.approx(1.0, abs=0.1)
-        assert result.offsets["r2"] == 0.0
-        assert result.method == "recording"
-
-    @patch("lsc.editor.audio_aligner.extract_audio_pcm")
-    def test_three_rooms_finds_slowest_reference(self, mock_extract):
-        """3 个房间时，最慢的房间应作为基准 (offset=0)。"""
-        long_signal = _noise_signal(AUDIO_DURATION + 2.0, seed=10)
-        fastest = _shifted_window(long_signal, 0.0, AUDIO_DURATION)
-        slower05 = _shifted_window(long_signal, 0.5, AUDIO_DURATION)
-        slower1 = _shifted_window(long_signal, 1.0, AUDIO_DURATION)
-
-        mock_extract.side_effect = [fastest, slower05, slower1]
-
-        rooms = [
-            {"room_id": "r1", "source": "/a.mp4", "seek": 0.0, "is_recording": True},
-            {"room_id": "r2", "source": "/b.mp4", "seek": 0.0, "is_recording": True},
-            {"room_id": "r3", "source": "/c.mp4", "seek": 0.0, "is_recording": True},
-        ]
-        result = align_rooms(rooms, "ffmpeg")
-        assert result.success is True
-        assert result.reference_room_id == "r3"
-        assert result.offsets["r3"] == 0.0
-        assert result.offsets["r1"] == pytest.approx(1.0, abs=0.1)
-        assert result.offsets["r2"] == pytest.approx(0.5, abs=0.1)
-
-    @patch("lsc.editor.audio_aligner.extract_audio_pcm")
-    def test_extraction_failure_skips_room(self, mock_extract):
-        """某个房间提取失败时，仍使用剩余房间对齐。"""
-        long_signal = _noise_signal(AUDIO_DURATION + 2.0, seed=20)
-        audio_a = _shifted_window(long_signal, 0.0, AUDIO_DURATION)
-        audio_c = _shifted_window(long_signal, 1.0, AUDIO_DURATION)
-
-        mock_extract.side_effect = [audio_a, Exception("fail"), audio_c]
-
-        rooms = [
-            {"room_id": "r1", "source": "/a.mp4", "seek": 0.0, "is_recording": True},
-            {"room_id": "r2", "source": "/b.mp4", "seek": 0.0, "is_recording": True},
-            {"room_id": "r3", "source": "/c.mp4", "seek": 0.0, "is_recording": True},
-        ]
-        result = align_rooms(rooms, "ffmpeg")
-        assert result.success is True
-        assert result.reference_room_id == "r3"
-        assert result.offsets["r1"] == pytest.approx(1.0, abs=0.1)
-        assert result.offsets["r3"] == 0.0
-        assert "r2" not in result.offsets
-
-    @patch("lsc.editor.audio_aligner.extract_audio_pcm")
-    def test_stream_method_when_not_all_recording(self, mock_extract):
-        """非全部录制时，method 应为 'stream'。"""
-        audio = _noise_signal(AUDIO_DURATION)
-        mock_extract.return_value = audio
-
-        rooms = [
-            {"room_id": "r1", "source": "/a.mp4", "seek": 0.0, "is_recording": True},
-            {"room_id": "r2", "source": "http://stream", "seek": 0.0, "is_recording": False},
-        ]
-        result = align_rooms(rooms, "ffmpeg")
-        assert result.success is True
-        assert result.method == "stream"
 
 
 class TestPairwiseAudioMapAlignment:

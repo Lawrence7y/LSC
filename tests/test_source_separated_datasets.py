@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from scripts.valorant_vision.extract_frames import ManifestRow, run_extraction
 from scripts.valorant_vision.rebuild_source_separated_datasets import (
     _assign_split,
     _extract_timestamp,
     _is_broadcast,
 )
-from scripts.valorant_vision.extract_frames import ManifestRow, run_extraction
 
 
 def test_hard_mined_timestamp_uses_original_t_tag() -> None:

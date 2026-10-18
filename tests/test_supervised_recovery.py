@@ -39,7 +39,10 @@ def test_v2_reconnect_is_serialized_by_supervisor(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "_attempt_recording_reconnect",
-        lambda target, _error: (setattr(target, "is_recording", True), setattr(target, "is_reconnecting", False)),
+        lambda target, _error, **_kwargs: (
+            setattr(target, "is_recording", True),
+            setattr(target, "is_reconnecting", False),
+        ),
     )
     assert orchestrator._start_recording_reconnect_thread(room, "connection reset") is True
     assert supervisor.calls == ["CONNECTION_RESET"]

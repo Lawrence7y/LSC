@@ -120,7 +120,6 @@ def _write_image(path: Path, image) -> None:
 
 def crop_roi(image, box: tuple[float, float, float, float]):
     """按归一化 (x, y, w, h) 裁出原生分辨率裁剪；非法区域返回 None。"""
-    import cv2
 
     height, width = image.shape[:2]
     x0, y0, bw, bh = box
@@ -193,7 +192,7 @@ def check(data_dir: Path, sample: int, seed: int) -> dict:
                             {"frame": str(path), "roi": roi, "frame_label": label,
                              "marker_text": text, "marker_score": round(score, 4)}
                         )
-    for name, stats in report["rois"].items():
+    for _name, stats in report["rois"].items():
         total = max(stats["total"], 1)
         stats["positive_rate"] = round(stats["positive"] / total, 4)
     report["conflict_count"] = len(report["conflicts"])

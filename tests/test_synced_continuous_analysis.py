@@ -256,9 +256,14 @@ def test_stop_continuous_analysis_accepts_synced_target_room_id(tmp_path, monkey
 
     async def scenario():
         room_handler.register_room_handlers(server, bridge)
+        # 显式受支持的组合：持续分析的扫描实现只覆盖 valorant + valorant_round，
+        # 而 handler 的 `mode` 默认值是 'scene'（会被启动侧能力闸拒，见 §11.18-D）。
+        # 本用例测的是 stop 的目标房语义，故把模式钉成受支持的那个。
         start = await server.handlers["start_continuous_analysis"]({
             "main_room_id": "main",
             "target_room_ids": ["main", "side"],
+            "mode": "valorant_round",
+            "game": "valorant",
         })
         stop = await server.handlers["stop_continuous_analysis"]({"room_id": "side"})
         return start, stop
@@ -379,5 +384,3 @@ def test_new_rounds_includes_pending_to_confirmed_update() -> None:
     assert fresh[0]["start"] == current[0]["start"]
     assert fresh[0]["end"] == current[0]["end"]
     assert fresh[0]["round_key"] == "hybrid-003"
-
-

@@ -212,16 +212,42 @@ class TestAnalysisPersistence:
         os.remove(video)
         assert is_analysis_stale(video, loaded) is True
 
-    def test_is_stale_mtime_changed(self, tmp_path: Path):
+    def test_is_not_stale_when_only_mtime_changed(self, tmp_path: Path):
+        """只改 mtime、体积未变 ⇒ 仍算有效（2026-09-18 契约变更）。
+
+        旧断言在这里期望 True，但那正是被修掉的缺陷：复制录像、搬目录、
+        moov 修复后重写容器都会推进 mtime 而内容未变，单 mtime 判据会静默
+        丢掉数小时的分析结果。现在要求 mtime + 体积两个证据同时变化。
+        """
         video = self._make_video(tmp_path)
         save_analysis_results(video, "room1", "combined", [])
         loaded = load_analysis_results(video)
 
-        # Manually set the video mtime to be in the past (beyond 1.0s threshold)
         old_mtime = os.path.getmtime(video) - 5.0
         os.utime(video, (old_mtime, old_mtime))
-        # The stored mtime is from save time; 5s difference > 1.0s threshold
+        assert is_analysis_stale(video, loaded) is False
+
+    def test_is_stale_when_mtime_and_size_changed(self, tmp_path: Path):
+        video = self._make_video(tmp_path)
+        save_analysis_results(video, "room1", "combined", [])
+        loaded = load_analysis_results(video)
+
+        with open(video, "ab") as fh:
+            fh.write(b"additional-recording-bytes")
+        future = os.path.getmtime(video) + 5.0
+        os.utime(video, (future, future))
         assert is_analysis_stale(video, loaded) is True
+
+    def test_is_stale_mtime_changed_without_size_evidence(self, tmp_path: Path):
+        """老 sidecar 没有 video_size ⇒ 保持原来的严格判据，不因升级而放宽。"""
+        video = self._make_video(tmp_path)
+        save_analysis_results(video, "room1", "combined", [])
+        loaded = load_analysis_results(video)
+        legacy = {k: v for k, v in loaded.items() if k != "video_size"}
+
+        future = os.path.getmtime(video) + 5.0
+        os.utime(video, (future, future))
+        assert is_analysis_stale(video, legacy) is True
 
     def test_is_not_stale_when_mtime_same(self, tmp_path: Path):
         video = self._make_video(tmp_path)

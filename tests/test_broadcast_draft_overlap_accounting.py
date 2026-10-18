@@ -36,7 +36,7 @@ class _FakeTimerange:
         self.start = start
         self.duration = duration
 
-    def overlaps(self, other: "_FakeTimerange") -> bool:
+    def overlaps(self, other: _FakeTimerange) -> bool:
         return not (self.start + self.duration <= other.start or other.start + other.duration <= self.start)
 
 

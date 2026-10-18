@@ -270,3 +270,29 @@ class TestTimelineServiceAtomicAlignment:
             found = service.get_active_timeline_for_room(rid)
             assert found is not None
             assert found.timeline_id == ctx.timeline_id
+
+
+def test_invalidate_listener_registration_is_idempotent() -> None:
+    """同一 callback 重复注册必须只投递一次。
+
+    `add_invalidate_listener` 此前是纯 append 且无注销路径，而 invalidate_timeline
+    遍历整张表逐个调用：注册方在重连/重建时被再次装配，同一失效事件就会被投递多次。
+    """
+    svc = TimelineService()
+    seen: list[tuple[str, str]] = []
+
+    def listener(timeline_id: str, reason: str) -> None:
+        seen.append((timeline_id, reason))
+
+    svc.add_invalidate_listener(listener)
+    svc.add_invalidate_listener(listener)
+    svc.add_invalidate_listener(listener)
+
+    ctx = svc.create_timeline(
+        "room-a",
+        {"room-a": RoomTimeSnapshot(room_id="room-a", align_confidence=0.9)},
+        ["room-a"],
+    )
+    assert ctx is not None
+    svc.invalidate_timeline(ctx.timeline_id, "epoch_reset")
+    assert len(seen) == 1, f"回调被重复投递 {len(seen)} 次"
